@@ -1442,3 +1442,84 @@ async fn the_credential_never_reaches_a_dto_an_error_or_a_persisted_row() {
     .expect_err("no such session");
     assert!(!refused.message.contains(FAKE_KEY));
 }
+
+// ---------------------------------------------------------------------------
+// The live coach wiring, both surfaces (#164, PR #165 review R6/R7)
+// ---------------------------------------------------------------------------
+
+mod source_scan;
+
+/// The two coach composition sites, as `(file, the fn that opens the site, the
+/// call that closes it)`.
+///
+/// Both wrappers resolve a live credential and construct a live transport, so
+/// neither is reachable from an offline test — and they are exactly where the two
+/// surfaces drifted: until #164 the desktop built `compose_config` (the composer's
+/// 4 096-token cap and 0.2 temperature) while `pulse coach` sent 0.0 and the CLI
+/// reasoning constant, and until PR #165's review round each built its provider
+/// inline, where swapping `single_attempt` for `new` would have passed every gate.
+const COACH_SITES: [(&str, &str, &str); 2] = [
+    (
+        "src/cli/coach.rs",
+        "pub async fn run_coach(",
+        "run_coach_with(",
+    ),
+    (
+        "src/tauri/commands.rs",
+        "pub async fn coach_turn(",
+        "coach_turn_core(",
+    ),
+];
+
+/// Read the wiring block of one coach site: the wrapper's body up to the call that
+/// hands off to its transport-free core.
+fn coach_site_wiring(relative: &str, opens: &str, closes: &str) -> String {
+    let code = source_scan::blank_comments(&source_scan::read_source(relative));
+    let start = code
+        .find(opens)
+        .unwrap_or_else(|| panic!("{relative} no longer declares `{opens}`"));
+    let body = &code[start..];
+    let end = body
+        .find(closes)
+        .unwrap_or_else(|| panic!("{relative}'s `{opens}` no longer reaches `{closes}`"));
+    body[..end].to_owned()
+}
+
+/// BOTH coach sites build the SHARED coach transport and the SHARED coach config.
+///
+/// A source scan because neither site can be reached offline, and because the
+/// property is about which constructor is named, not about what a value ends up
+/// being: an inline `OpenAiCompatProvider::new(...)` here would still compile, still
+/// pass every other test, and quietly restore the retrying, 60-second, 4 096-token
+/// posture that #164 is about.
+#[test]
+fn both_coach_sites_build_the_shared_transport_and_config() {
+    for (relative, opens, closes) in COACH_SITES {
+        let wiring = coach_site_wiring(relative, opens, closes);
+
+        assert!(
+            wiring.contains("coach_provider("),
+            "{relative}'s `{opens}` must build its transport through the shared \
+             `coach_transport::coach_provider` so both coach surfaces send the same \
+             retry, timeout and endpoint posture"
+        );
+        assert!(
+            wiring.contains("coach_config("),
+            "{relative}'s `{opens}` must build the shared `coach_config` so both \
+             coach surfaces send the same cap and temperature"
+        );
+        for banned in [
+            "compose_config(",
+            "OpenAiCompatProvider::new(",
+            "single_attempt(",
+            "single_attempt_with_base_url(",
+        ] {
+            assert!(
+                !wiring.contains(banned),
+                "{relative}'s `{opens}` names `{banned}` — a coach turn's transport \
+                 and config are chosen once, in `adapters::llm::coach_transport`, \
+                 not re-derived at each surface (#164, review R6)"
+            );
+        }
+    }
+}

@@ -17,3 +17,8 @@ pub(crate) mod attributed;
 // adapters, so the Tauri ring no longer reaches into `mod cli` — the debug surface
 // — for a type the product path needs.
 pub(crate) mod capturing;
+// PR #165 (review R5/R6): the coach turn's transport posture and chat knobs. Both
+// coach surfaces — the `pulse coach` debug verb and the desktop `coach_turn` bus
+// command — build their provider and their `LlmConfig` here, so the product ring
+// no longer imports them from `mod cli` and the two cannot drift apart again.
+pub(crate) mod coach_transport;

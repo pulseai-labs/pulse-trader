@@ -275,6 +275,16 @@ the child `StrategyVersion` on accept is `r1.s4`'s path.
   traders actually accept in real sessions, and #124's token posture once the
   coach's larger prompts hit `glm-5.3-flash`.
 
+> **Note (2026-09-06, #164 / PR #165).** The token-posture half of that re-check is
+> resolved. The `r1.s4` acceptance walk hit it exactly as anticipated — a coach turn
+> spent the whole 4096-token cap reasoning and emitted no tool call, recorded as
+> `ZeroCalls` — and the coach now has its own cap (`COACH_MAX_TOKENS`, 16 384) and its
+> own transport timeout (100s, inside the 120s turn guard, with a 20s reserve for the
+> guard-wrapped ledger write). Three consecutive real turns on the same run then ended
+> with one tool call each. The `SetParam`-sufficiency half stays open: two of those
+> three turns recorded `record_inapplicable` for a regime filter no numeric leaf can
+> express, which is this ADR's own trigger for revisiting structural mutations.
+
 ## Alternatives considered
 
 **Structural mutations in `r1` (add/remove a condition, swap an indicator, change

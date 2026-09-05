@@ -1,6 +1,7 @@
 //! Shared source-scanner support for the test binaries that assert on Rust
 //! source text (`candle_repository`'s port-boundary guards, `tauri_backtest`'s
-//! `save_run` and application-ring guards).
+//! `save_run` and application-ring guards, and `tauri_coach`'s coach-wiring
+//! guard over both coach composition sites).
 //!
 //! A `tests/<dir>/mod.rs` module rather than another test binary: cargo compiles
 //! only `tests/*.rs` as test targets, so this file is linked into each binary

@@ -71,11 +71,13 @@ const DEMO_TEMPERATURE: f32 = 0.2;
 /// close demo saw an empty reply at 256 and a real one at ~343). Keep generous
 /// headroom past the reasoning.
 ///
-/// Shared with `pulse coach` rather than re-guessed there (#124's reasoning-burn
-/// class): the coach's own `2_048` was a second, undocumented answer to the same
-/// question, and the failure it buys is quiet — a turn that spends its budget
-/// thinking and emits no tool call is recorded as `ZeroCalls`, which reads as a
-/// model that declined rather than a cap that was too small.
+/// `llm-check`'s ONLY — the coach shared it until #164 and no longer does
+/// (`adapters::llm::coach_transport::COACH_MAX_TOKENS`, 16 384). This verb sends a
+/// one-sentence prompt and the coach sends a whole backtest, so one number was never
+/// going to be right for both, and the failure the wrong one buys is quiet: a turn
+/// that spends its budget thinking and emits no tool call is recorded as
+/// `ZeroCalls`, which reads as a model that declined rather than a cap that was too
+/// small (#124's reasoning-burn class).
 pub(crate) const REASONING_MAX_TOKENS: u32 = 4096;
 
 /// The fixed demo prompt used when the operator gives no prompt argument.

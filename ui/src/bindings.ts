@@ -131,10 +131,10 @@ export const commands = {
 	 *  the ledger row's `prompt_version` is a true answer to "which prompt produced
 	 *  this?" — including when an operator's `$PULSE_PROMPT_DIR/coach.md` overlay won.
 	 * 
-	 *  **The transport makes ONE attempt per turn** ([`OpenAiCompatProvider::single_attempt`]),
-	 *  matching `pulse coach`: a turn records one exchange and names one ledger row, and
-	 *  the retrying default would put three upstream attempts and their cost behind that
-	 *  one record.
+	 *  **The transport makes ONE attempt per turn** at the coach's own request timeout
+	 *  ([`coach_provider`]), the same constructor `pulse coach` builds through: a turn
+	 *  records one exchange and names one ledger row, and the retrying default would put
+	 *  three upstream attempts and their cost behind that one record.
 	 * 
 	 *  # Errors
 	 * 

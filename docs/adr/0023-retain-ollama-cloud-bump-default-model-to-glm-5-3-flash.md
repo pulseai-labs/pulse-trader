@@ -137,6 +137,16 @@ over a scratch database:
 - **No secret leaked into the ledger** (NFR-6): zero rows with an `sk-`-shaped
   string in `prompt_messages` or `completion`.
 
+> **Note (2026-09-06, #164 / PR #165).** The `output_tokens >= 4096` detector above
+> reads the composer's cap, which is still 4096. It is not the coach's: the coach now
+> asks for `COACH_MAX_TOKENS` (16 384), so a truncated COACH turn shows
+> `output_tokens = 16384`, not 4096, and the literal check returns zero rows for it.
+> Stated generally, the truncation detector is `output_tokens >= the caller's cap` —
+> per surface, not per repository. The evidence: the #164 walk's two `zero_calls`
+> turns hit exactly 4096 under the old shared cap, and the raw provider response for
+> the reproduction carried `finish_reason: "length"` with an empty `content` and a
+> non-empty `reasoning` field. Nothing above is retracted; the detector is scoped.
+
 That is the composer's full path exercised on the new default, not a transport
 smoke test.
 

@@ -8,11 +8,14 @@
 //!
 //! This is the ONE place the coach's concrete stack is assembled, keeping every
 //! layer generic underneath — the `run_compose` precedent, with the coach's own
-//! prompt and tools:
+//! prompt and tools. The transport posture and the chat knobs are NOT chosen here:
+//! they are the desktop rail's too, so they live in
+//! [`adapters::llm::coach_transport`](crate::adapters::llm::coach_transport) and
+//! this root builds through it (#164, PR #165 review R5):
 //!
 //! ```text
 //! resolve_llm_api_key()  →  ApiKey (opaque; carries the CredentialSource label)
-//!                      →  OpenAiCompatProvider::{new|with_base_url}(key)
+//! coach_transport::coach_provider(key, base_url)   ← one attempt, coach timeout
 //!                      →  RedactingLoggingProvider::new(inner, capturing, clock, redactor, prices)
 //!                         .with_created_by(CoachLlm).with_key_source(source)
 //!                         .with_prompt_version(Some(sha256(resolved coach.md)))   ← audit C2
@@ -49,7 +52,7 @@ use anyhow::Context as _;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteCoachTurnSource, SqliteCoachingRepo, SqliteLlmCallRepo};
 use crate::adapters::llm::attributed::AttributedProvider;
-use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
+use crate::adapters::llm::coach_transport::{coach_config, coach_provider};
 use crate::adapters::llm::redacting_logging::RedactingLoggingProvider;
 use crate::agent::config::load_coach_prompt_from;
 use crate::agent::{DEFAULT_MAX_DSL_BYTES, DEFAULT_TURN_TIMEOUT, LlmCallCapture};
@@ -60,8 +63,8 @@ use crate::domain::Redactor;
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
     BacktestRunId, Clock, CoachFailure, CoachTurnSource, CoachingRepository, CoachingSession,
-    CoachingSessionId, CredentialSource, LlmBackend, LlmCallRepository, LlmConfig, LlmProvider,
-    PriceTable, SessionOutcome,
+    CoachingSessionId, CredentialSource, LlmCallRepository, LlmConfig, LlmProvider, PriceTable,
+    SessionOutcome,
 };
 
 use crate::adapters::llm::capturing::CapturingRepo;
@@ -260,10 +263,6 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
     let transport =
         crate::agent::config::load_llm_transport().context("loading the [llm] transport config")?;
     let prices = crate::agent::config::load_price_table().context("loading the price table")?;
-    let model = transport
-        .model
-        .clone()
-        .unwrap_or_else(|| super::compose::COMPOSE_MODEL.to_owned());
     let provider = coach_provider(key.expose(), transport.base_url.as_deref());
 
     let clock = SystemClock;
@@ -281,17 +280,12 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
         prices,
         clock,
         key_source,
-        config: LlmConfig {
-            backend: LlmBackend::Ollama,
-            model,
-            temperature: 0.0,
-            // The shared reasoning-model cap, not a second private guess at it
-            // (#124): GLM spends thinking tokens against this budget BEFORE the
-            // tool call, so a tight cap produces a turn with no tool call — which
-            // this taxonomy records as `ZeroCalls`, indistinguishable from a model
-            // that genuinely declined to propose.
-            max_tokens: super::llm::REASONING_MAX_TOKENS,
-        },
+        // The coach's own knobs, shared with the desktop rail (#164): GLM spends
+        // thinking tokens against the cap BEFORE the tool call, so a cap sized for
+        // a one-sentence `llm-check` prompt produces a turn with no tool call —
+        // which this taxonomy records as `ZeroCalls`, indistinguishable from a
+        // model that genuinely declined to propose.
+        config: coach_config(transport.model.as_deref()),
         // The live arm honours the operator's `$PULSE_PROMPT_DIR/coach.md` overlay
         // — the whole point of the resolved-bytes prompt version (audit C2) is that
         // an overlay edit changes what the coach says AND what the ledger records.
@@ -425,48 +419,5 @@ fn no_ledger_reason(outcome: &CoachCliOutcome) -> &'static str {
             failure: CoachFailure::Interrupted { .. },
         } => "this process finalized an abandoned claim and made no call of its own",
         _ => "the turn failed before any provider call",
-    }
-}
-
-/// The coach's transport: ONE upstream attempt per turn (PR #128, finding H1).
-///
-/// `run_turn` records one exchange and names one ledger row, and it neither retries
-/// nor nudges (grill L3). The adapter's default posture retries a transient 429/5xx
-/// twice, which would put three upstream attempts — and their cost — behind that one
-/// record. The composer and `llm-check` keep the retrying default: neither records
-/// one exchange per attempt.
-///
-/// A function rather than an inline `match` because the posture is otherwise
-/// unobservable: this is the seam the unit test asserts against.
-fn coach_provider(api_key: &str, base_url: Option<&str>) -> OpenAiCompatProvider {
-    match base_url {
-        Some(url) => {
-            OpenAiCompatProvider::single_attempt_with_base_url(api_key.to_owned(), url.to_owned())
-        }
-        None => OpenAiCompatProvider::single_attempt(api_key.to_owned()),
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::coach_provider;
-
-    /// The coach's transport posture is chosen HERE, so it is proven here (PR #128,
-    /// finding H1). `OpenAiCompatProvider` cannot enforce it — a caller reaching for
-    /// `new` still retries — which is exactly why the composition site is the thing
-    /// worth asserting.
-    #[test]
-    fn the_live_coach_provider_makes_one_attempt_per_turn() {
-        assert_eq!(
-            coach_provider("k", None).max_retries(),
-            0,
-            "the default endpoint attempts once"
-        );
-        assert_eq!(
-            coach_provider("k", Some("https://example.test/v1")).max_retries(),
-            0,
-            "and a [llm].base_url override does not restore retries"
-        );
     }
 }

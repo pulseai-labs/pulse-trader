@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The coach turn got its own output cap, transport timeout and temperature.** A
+  coach turn on `glm-5.3-flash` spent the whole 4096-token cap reasoning and emitted
+  no tool call, which the taxonomy could only record as `ZeroCalls` — a cap that was
+  too small, reading as a model that declined. Refs
+  [#164](https://github.com/pulseai-labs/pulse-trader/issues/164),
+  [#124](https://github.com/pulseai-labs/pulse-trader/issues/124).
+
+  - **Output cap 4096 → 16384, for the coach only.** The composer and `llm-check`
+    keep 4096. Real turns need 5 615–9 074 output tokens before their tool call.
+  - **Coach transport timeout 60s → 100s, again for the coach only**, sitting inside
+    the unchanged 120s turn guard with a 20s reserve for the ledger write that
+    follows the response. Worst-case wall time per turn rises accordingly.
+  - **Desktop coach temperature 0.2 → 0.0**, unified with `pulse coach`: the rail was
+    wired to the composer's config and sent a different temperature than the CLI for
+    the same question.
+  - Both coach surfaces now build one shared config and one shared provider
+    constructor, so the two cannot drift apart again. The coach's request fingerprint
+    changes with the cap and the temperature — a turn asked under a different cap is a
+    different request — and no prompt text, schema or migration changed.
+
 - **Default LLM model bumped `glm-5.2` → `glm-5.3-flash`** on Ollama Cloud. The
   provider, endpoint (`https://ollama.com/v1`), credential (`OLLAMA_API_KEY`) and
   ledger backend label are all unchanged — this moves a model id and its price row.
