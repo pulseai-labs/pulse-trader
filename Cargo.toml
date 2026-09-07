@@ -171,3 +171,25 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
+
+# ---------------------------------------------------------------------------
+# SMOKE ONLY — drop before merge.
+#
+# Points every resolved `pulsehive` crate at the local PulseHive 2.1 release
+# candidate so this branch can prove the downstream migration compiles and
+# tests green BEFORE 2.1.0 publishes to crates.io. The `=2.0.2` requirement
+# above is deliberately left alone — a `[patch]` entry overrides the source,
+# not the version requirement, and the RC still carries `version = "2.0.2"`,
+# so the requirement matches and the patch applies.
+#
+# `pulsehive-anthropic` is absent on purpose: `features = ["openai"]` keeps it
+# out of the resolved graph. `pulsehive-db` is absent because it is an external
+# crate, not a member of the RC workspace.
+#
+# At release close this whole block is deleted and the pin above moves to
+# `=2.1.0`.
+[patch.crates-io]
+pulsehive = { path = "/Users/draco/projects/PulseHive/pulsehive/pulsehive" }
+pulsehive-core = { path = "/Users/draco/projects/PulseHive/pulsehive/pulsehive-core" }
+pulsehive-openai = { path = "/Users/draco/projects/PulseHive/pulsehive/pulsehive-openai" }
+pulsehive-runtime = { path = "/Users/draco/projects/PulseHive/pulsehive/pulsehive-runtime" }
