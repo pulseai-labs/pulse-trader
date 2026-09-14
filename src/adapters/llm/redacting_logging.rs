@@ -22,8 +22,13 @@
 //! and still gets its row (PR #169, R1): the scrubbed error detail rides
 //! `completion` (kind, provider body and all) and the usage is what the error
 //! exposes — zero, since a `PulseHive` transport error carries no token counts.
-//! Only a failure that happens BEFORE the inner call (the pre-flight price
-//! check, the ledger insert itself) produces no row.
+//! A failure that happens BEFORE the call leaves this process produces no row —
+//! the pre-flight price check, the ledger insert itself, and any inner
+//! `Config`/`Local` fault, which by the port's own taxonomy is THIS process
+//! faulting rather than the provider answering (PR #169, round 2: the Tauri
+//! compose path's cancellation guard refuses as `Local` without calling its
+//! inner provider, and a zero-token row for that refusal would be a phantom
+//! provider round-trip in the accounting ledger).
 //!
 //! The [`Redactor`] is deliberately scoped (audit ch1): it strips (a)
 //! API-key-shaped tokens and (b) caller-declared tagged secret VALUES, and does
@@ -160,6 +165,19 @@ where
         let prompt_copy = messages.clone();
         let result = self.inner.chat(messages, tools, config).await;
 
+        // A row is owed only for an error that represents an actual provider
+        // attempt (PR #169, round 2): `Provider`/`MalformedToolCall` are the
+        // transport faults — billed round-trips that errored upstream.
+        // `Config`/`Local` are THIS process faulting before the call left it —
+        // e.g. the Tauri compose path's `RefusingProvider` answering `chat()`
+        // as `Local` WITHOUT calling its inner provider when the event sink
+        // dies between turns — so writing a zero-token row for one would book a
+        // phantom provider round-trip in the ledger. The refusal passes through
+        // to the caller unchanged; only the row is skipped.
+        if matches!(&result, Err(LlmError::Config(_) | LlmError::Local(_))) {
+            return result;
+        }
+
         // A call that reached the provider is a billed round-trip whether it
         // answered or errored (PR #169, R1): under PulseHive 3.0.0 a billed
         // HTTP 200 with a truncated tool call arrives as `Err`, and an early
@@ -226,6 +244,7 @@ where
 mod tests {
     use super::{RedactingLoggingProvider, Redactor};
     use crate::adapters::clock::FakeClock;
+    use crate::cli::compose::COMPOSE_CANCELLED;
     use crate::domain::redaction::REDACTED;
     use crate::domain::strategy::CreatedBy;
     use crate::domain::{
@@ -704,6 +723,125 @@ mod tests {
         assert!(
             !received.lock().expect("received lock").is_empty(),
             "the inner provider really was called"
+        );
+    }
+
+    /// Round-2 sibling: a plain [`LlmError::Provider`] transport fault (timeout,
+    /// connect, HTTP status) is the other billed-call shape — the row still lands.
+    #[tokio::test]
+    async fn a_transport_fault_still_reaches_the_ledger() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let provider = FailingProvider {
+            received: Arc::clone(&received),
+            error: LlmError::Provider(
+                "request_failed after 3 attempt(s): connect timeout (HTTP 0)".to_owned(),
+            ),
+        };
+        let repo = RecordingRepo {
+            saved: Arc::clone(&saved),
+        };
+        let decorator = RedactingLoggingProvider::new(
+            provider,
+            repo,
+            FakeClock::at(1_700_000_000_000),
+            Redactor::default(),
+            prices(),
+        );
+
+        let err = decorator
+            .chat(vec![Message::user("a prompt")], &[], &config())
+            .await
+            .expect_err("the inner error passes through to the caller");
+        assert!(matches!(err, LlmError::Provider(_)));
+
+        let saved = saved.lock().expect("saved lock").clone();
+        assert_eq!(saved.len(), 1, "the billed call is still a ledger row");
+        let call = &saved[0];
+        assert_eq!(call.input_tokens, 0);
+        assert_eq!(call.output_tokens, 0);
+        assert_eq!(call.cost, Decimal::ZERO);
+        let completion = call.completion.as_deref().expect("the error is stored");
+        assert!(
+            completion.contains("request_failed"),
+            "the error kind reaches the row: {completion}"
+        );
+    }
+
+    /// PR #169, round 2: an error raised BEFORE the call left this process is
+    /// not a provider attempt, and no ledger row may be written for it. The
+    /// Tauri compose path's `RefusingProvider` answers `chat()` with
+    /// [`LlmError::Local`] — WITHOUT calling its inner provider — when the event
+    /// sink dies between turns; persisting a zero-token row for that refusal
+    /// would book a phantom provider round-trip in the accounting ledger. The
+    /// R1 row is owed to transport faults (`Provider`/`MalformedToolCall`)
+    /// only — `Config`/`Local` are this process faulting, never an upstream
+    /// answer.
+    #[tokio::test]
+    async fn a_refusal_before_the_provider_writes_no_row() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let provider = FailingProvider {
+            received: Arc::clone(&received),
+            // The exact refusal `RefusingProvider` emits (src/tauri/commands.rs).
+            error: LlmError::Local(COMPOSE_CANCELLED.to_owned()),
+        };
+        let repo = RecordingRepo {
+            saved: Arc::clone(&saved),
+        };
+        let decorator = RedactingLoggingProvider::new(
+            provider,
+            repo,
+            FakeClock::at(1_700_000_000_000),
+            Redactor::default(),
+            prices(),
+        );
+
+        let err = decorator
+            .chat(vec![Message::user("a prompt")], &[], &config())
+            .await
+            .expect_err("the refusal passes through to the caller unchanged");
+        assert!(matches!(err, LlmError::Local(_)));
+
+        assert!(
+            !received.lock().expect("received lock").is_empty(),
+            "the wrapper WAS invoked — the refusal is its answer"
+        );
+        assert!(
+            saved.lock().expect("saved lock").is_empty(),
+            "no ledger row may be written for a call that never reached the provider"
+        );
+    }
+
+    /// An inner `Config` fault is the other never-dispatched shape: a provider
+    /// that discovers a missing credential at call time faults in THIS process,
+    /// and nothing was billed.
+    #[tokio::test]
+    async fn an_inner_config_fault_writes_no_row() {
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let provider = FailingProvider {
+            received: Arc::new(Mutex::new(Vec::new())),
+            error: LlmError::Config("keychain entry absent".to_owned()),
+        };
+        let repo = RecordingRepo {
+            saved: Arc::clone(&saved),
+        };
+        let decorator = RedactingLoggingProvider::new(
+            provider,
+            repo,
+            FakeClock::at(1_700_000_000_000),
+            Redactor::default(),
+            prices(),
+        );
+
+        let err = decorator
+            .chat(vec![Message::user("a prompt")], &[], &config())
+            .await
+            .expect_err("the config fault passes through");
+        assert!(matches!(err, LlmError::Config(_)));
+        assert!(
+            saved.lock().expect("saved lock").is_empty(),
+            "a pre-dispatch config fault is not a billed round-trip"
         );
     }
 

@@ -719,8 +719,15 @@ pub struct ComposeDeps<P, R, S, C> {
 /// the compose loop** — so cancellation is delivered at the next seam the loop
 /// must pass through: the provider. When a `send_event` fails the shared latch
 /// trips, every subsequent `chat()` refuses, and the composer ends the run with
-/// a provider error, which the core maps to `cancelled: true` (never a
-/// `BusError`). No orphaned compose runs emitting into nothing.
+/// an error, which the core maps to `cancelled: true` (never a `BusError`).
+/// No orphaned compose runs emitting into nothing.
+///
+/// The refusal is [`LlmError::Local`], not [`LlmError::Provider`] — the typed
+/// "this process faulted, not the provider" marker. The call never left the
+/// process, so nothing was billed, and the redacting + cost-logging decorator
+/// writes `llm_call` rows only for transport faults (PR #169, round 2): a
+/// `Provider`-shaped refusal would persist a phantom zero-token round-trip in
+/// the accounting ledger.
 struct RefusingProvider<P> {
     /// The wrapped (live or faked) provider.
     inner: P,
@@ -742,7 +749,9 @@ where
         let inner = &self.inner;
         async move {
             if tripped.load(Ordering::SeqCst) {
-                return Err(LlmError::Provider(COMPOSE_CANCELLED.to_owned()));
+                // `Local`, not `Provider`: this refusal never reached a
+                // provider, so it must not mint an `llm_call` ledger row.
+                return Err(LlmError::Local(COMPOSE_CANCELLED.to_owned()));
             }
             inner.chat(messages, tools, config).await
         }
