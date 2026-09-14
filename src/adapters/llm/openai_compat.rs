@@ -447,7 +447,8 @@ mod tests {
         to_hive_config, to_hive_message, to_hive_tool_def,
     };
     use crate::domain::{
-        LlmBackend, LlmConfig, LlmError, Message, ReasoningEffort, ToolCall, ToolDefinition,
+        LlmBackend, LlmConfig, LlmError, LlmProvider, Message, ReasoningEffort, ToolCall,
+        ToolDefinition,
     };
     use pulsehive::error::PulseHiveError;
     use pulsehive::llm::{
@@ -455,6 +456,7 @@ mod tests {
         Message as HiveMessage, ReasoningEffort as HiveReasoningEffort,
         TokenUsage as HiveTokenUsage, ToolCall as HiveToolCall,
     };
+    use std::sync::{Arc, Mutex};
 
     fn sample_config() -> LlmConfig {
         LlmConfig {
@@ -592,19 +594,152 @@ mod tests {
     ///
     /// The SDK's other new request knobs stay unset too: a per-call timeout or retry
     /// budget would override the provider-level posture, and `tool_choice` forces
-    /// nothing on this endpoint (#166).
+    /// nothing on this endpoint (#166). What the request BODY looks like on the wire
+    /// is asserted by the exchange below — this one pins the config mapping only.
     #[test]
     fn an_unset_reasoning_effort_maps_to_none_and_serializes_nothing() {
         let hive = to_hive_config(&sample_config());
         assert_eq!(hive.reasoning_effort, None);
-        let wire = serde_json::to_value(&hive).expect("serialize the hive config");
-        assert!(
-            wire.get("reasoning_effort").is_none(),
-            "an unset effort is absent from the serialized request config: {wire}"
-        );
         assert!(hive.timeout_secs.is_none(), "no per-call timeout override");
         assert!(hive.max_retries.is_none(), "no per-call retry override");
         assert!(hive.tool_choice.is_none(), "no tool_choice (#166)");
+    }
+
+    /// The canned chat completion the [`WireSink`] answers every POST with.
+    const CANNED_COMPLETION: &str = r#"{"id":"cmpl-test","choices":[{"message":{"content":"ok","tool_calls":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+
+    /// A loopback HTTP sink: accepts connections on 127.0.0.1, answers each POST
+    /// with a canned 200 chat completion, and records the request HEAD and BODY
+    /// verbatim — so a test can read what the provider actually put on the wire
+    /// (R7), which no re-serialization of the SDK's config can show.
+    struct WireSink {
+        base_url: String,
+        /// Each accepted request as `(head, body)`.
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl WireSink {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("local addr").port();
+            let requests: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&requests);
+            let server = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let captured = Arc::clone(&captured);
+                    std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 8192];
+                        let headers_end = loop {
+                            let Ok(n) = stream.read(&mut chunk) else {
+                                return;
+                            };
+                            if n == 0 {
+                                return; // a probe or a dropped connection — not a request.
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..headers_end]).into_owned();
+                        let content_length: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().ok())
+                                    .flatten()
+                            })
+                            .expect("a JSON POST carries Content-Length");
+                        while buf.len() - headers_end < content_length {
+                            let n = stream.read(&mut chunk).expect("read the body");
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        let body = String::from_utf8_lossy(
+                            &buf[headers_end..headers_end + content_length],
+                        )
+                        .into_owned();
+                        captured.lock().unwrap().push((head, body));
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            CANNED_COMPLETION.len(),
+                            CANNED_COMPLETION
+                        );
+                        let _ = stream.write_all(reply.as_bytes());
+                    });
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                requests,
+                server,
+            }
+        }
+    }
+
+    /// R7: "the composer's request body is unchanged" must rest on the bytes on
+    /// the wire, not on a re-serialized SDK config. Drive a REAL exchange through
+    /// the whole adapter — `to_hive_config`/`to_hive_message` into the SDK's own
+    /// request build — against the loopback sink, and read what was `POST`ed.
+    #[tokio::test]
+    async fn an_unset_reasoning_effort_puts_no_key_on_the_wire() {
+        let sink = WireSink::start();
+        let provider = OpenAiCompatProvider::with_base_url("test-key", &sink.base_url);
+
+        provider
+            .chat(vec![Message::user("hi")], &[], &sample_config())
+            .await
+            .expect("the canned 200 exchange completes");
+
+        // A SET effort lands on the wire as the SDK's snake_case tag — the other
+        // half of the same claim (the coach's `"low"` is spelled out, not absent).
+        let with_effort = LlmConfig {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..sample_config()
+        };
+        provider
+            .chat(vec![Message::user("hi")], &[], &with_effort)
+            .await
+            .expect("the second exchange completes");
+
+        let requests = sink.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "one request per chat call");
+        let (head, unset_body) = &requests[0];
+        assert!(
+            head.starts_with("POST /v1/chat/completions "),
+            "the request targets the chat-completions endpoint: {head}"
+        );
+        let unset_body: serde_json::Value =
+            serde_json::from_str(unset_body).expect("the wire body is JSON");
+        let unset = unset_body.as_object().expect("the body is an object");
+        assert!(
+            !unset.contains_key("reasoning_effort"),
+            "an unset effort sends NO key — the 2.0.2-era body is unchanged: {unset_body}"
+        );
+        // The rest of the request is the request the composer always sent.
+        assert_eq!(unset["model"], "gpt-oss:120b");
+        assert_eq!(unset["max_tokens"], 256);
+        assert!(
+            unset.get("tools").is_none(),
+            "an empty tool list is omitted: {unset_body}"
+        );
+        assert!(
+            unset.get("tool_choice").is_none(),
+            "no tool_choice (#166): {unset_body}"
+        );
+
+        let set_body: serde_json::Value =
+            serde_json::from_str(&requests[1].1).expect("the second wire body is JSON");
+        assert_eq!(
+            set_body["reasoning_effort"], "low",
+            "a set effort spells out on the wire: {set_body}"
+        );
+        drop(sink.server);
     }
 
     #[test]

@@ -1309,6 +1309,58 @@ fn the_request_fingerprint_of_a_fixed_fixture_matches_its_pinned_digest() {
     assert_eq!(digest, digest.to_lowercase(), "the digest is lowercase hex");
 }
 
+/// R6: the `{:?}` feed element is the Debug spelling of the Option — the pinned
+/// fixture above carries `None`, but every REAL coach request feeds `Some(Low)`,
+/// and a `ReasoningEffort` variant rename would move every live fingerprint
+/// without touching a single pinned value. Pin the spellings by name and the
+/// `Some(Low)` fixture's digest outright.
+const PINNED_SOME_LOW_FIXTURE_DIGEST: &str =
+    "b1052ff086fb32e3318bf9853d196e27b949d4a79f5fc5d973b1f5bd86fe3efa";
+
+#[test]
+fn the_some_low_effort_spelling_and_digest_are_pinned() {
+    // The feed element for the effort is `format!("{:?}", config.reasoning_effort)`
+    // — pin both spellings so a variant rename cannot slip the fingerprint.
+    assert_eq!(
+        format!("{:?}", Option::<pulse::ReasoningEffort>::None),
+        "None",
+        "the fixture effort's feed spelling"
+    );
+    assert_eq!(
+        format!("{:?}", Some(pulse::ReasoningEffort::Low)),
+        "Some(Low)",
+        "the effort every real coach turn feeds"
+    );
+
+    let tools = fixture_tools();
+    let config = LlmConfig {
+        reasoning_effort: Some(pulse::ReasoningEffort::Low),
+        ..fixture_config()
+    };
+    let digest = coach_request_fingerprint(
+        "FIXTURE COACH PROMPT\n",
+        "FIXTURE RENDERED CONTEXT\n",
+        &tools,
+        Some("pv-fixture"),
+        &config,
+    );
+    assert_eq!(
+        digest,
+        reference_digest(
+            "FIXTURE COACH PROMPT\n",
+            "FIXTURE RENDERED CONTEXT\n",
+            &tools,
+            Some("pv-fixture"),
+            &config,
+        ),
+        "the Some(Low) feed is the same ordered length-prefixed one"
+    );
+    assert_eq!(
+        digest, PINNED_SOME_LOW_FIXTURE_DIGEST,
+        "the Some(Low) fixture's digest is pinned byte for byte"
+    );
+}
+
 /// One whole fingerprint feed, so a case below can change exactly ONE element and
 /// stay readable.
 struct Feed {
