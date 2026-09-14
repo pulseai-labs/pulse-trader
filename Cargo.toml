@@ -29,7 +29,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 anyhow = "1"
 # WI-1.1.1.02 (binance bulk ingest): HTTP client, archive decode, CSV parse,
 # async runtime, and CHECKSUM (SHA256) verification.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+# `http2` and `system-proxy` are declared EXPLICITLY: pulsehive-openai 2.0.2 used
+# to pull reqwest 0.12 with them unified on, and 3.0.0 no longer pulls reqwest at
+# all — without them the Binance client silently loses both (PR #169, F1).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "system-proxy"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
