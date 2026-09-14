@@ -49,6 +49,12 @@ const REDACTED: &str = "[REDACTED]";
 /// The nudge appended after a text-only (no-`tool_call`) model turn.
 const TEXT_ONLY_NUDGE: &str = "You did not call a builder tool. Respond only by calling exactly \
     one builder tool to make progress, or call finalize_strategy once every piece is set.";
+/// The nudge appended after a tool call the provider could not READ: under
+/// `PulseHive` 3.0.0 a truncated or non-object `arguments` string arrives as the
+/// typed `MalformedToolCall` error, not a dispatchable call — 2.0.2 defaulted
+/// the args to `{}` and let the tool answer with correctable `FieldError`s.
+const MALFORMED_TOOL_CALL_NUDGE: &str = "Your previous tool call's arguments could not be read as \
+    a JSON object. Call the builder tool again with its arguments as one complete JSON object.";
 
 /// A shared, append-only buffer of the `LlmCallId`s minted during one compose run.
 ///
@@ -213,7 +219,26 @@ impl<P: LlmProvider> Composer<P> {
         let start = self.captured_len();
 
         for _ in 0..self.max_turns {
-            let response = self.chat_turn(messages.clone()).await?;
+            let response = match self.chat_turn(messages.clone()).await {
+                Ok(response) => response,
+                // A tool call the provider could not READ is fed back like one
+                // the builder REJECTED — correctable, never compose-aborting
+                // (B1/R2). The SDK's error carries only the raw arguments — no
+                // call id or name — so no honest `tool_result` can be keyed to
+                // it; the correction rides the same user-message channel as
+                // `TEXT_ONLY_NUDGE`, and it counts as NoProgress exactly like a
+                // rejected call did under 2.0.2, so the repeated-failure guard
+                // still bounds the loop.
+                Err(ComposerError::Provider(LlmError::MalformedToolCall(detail))) => {
+                    messages.push(Message::user(malformed_tool_call_nudge(&detail)));
+                    consecutive_failures += 1;
+                    if consecutive_failures >= self.max_consecutive_failures {
+                        return Err(ComposerError::NotFinalized);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match process_turn(&mut builder, &mut messages, &mut events, on_event, response) {
                 TurnOutcome::Finalized(validated) => {
                     let llm_call_ids = self.captured_since(start);
@@ -374,7 +399,9 @@ fn process_turn(
 ///
 /// An unknown name is a correctable `tool_result` (the model re-tries), not a hard
 /// error; a malformed-args parse failure is already correctable inside each tool
-/// (never an `.unwrap()` on `tool_call.arguments`). Returns `(content, made_progress)`.
+/// (never an `.unwrap()` on `tool_call.arguments`); and a call so malformed the
+/// PROVIDER could not read it is fed back by the compose loop before it ever
+/// reaches here (B1). Returns `(content, made_progress)`.
 fn dispatch_tool(builder: &mut StrategyBuilder, call: &ToolCall) -> (String, bool) {
     let outcome = match call.name.as_str() {
         "create_strategy" => create_strategy(builder, call.arguments.clone()),
@@ -458,6 +485,16 @@ fn truncate(text: &str, max_chars: usize) -> String {
 /// reads back to correct its next call.
 fn errors_to_content(errors: &[FieldError]) -> String {
     serde_json::to_string(errors).unwrap_or_else(|_| String::from("[correctable tool errors]"))
+}
+
+/// The correction fed back after a tool call the provider could not read — the
+/// nudge plus the provider's own detail, truncated like every other echoed
+/// argument so a huge body cannot blow up the context.
+fn malformed_tool_call_nudge(detail: &str) -> String {
+    format!(
+        "{MALFORMED_TOOL_CALL_NUDGE} Provider detail: {}",
+        truncate(detail, 480)
+    )
 }
 
 /// A correctable message for an unknown tool name (the model re-tries).
@@ -661,8 +698,10 @@ mod tests {
     /// A scripted `LlmProvider` double: returns queued responses turn-by-turn, records
     /// every `messages` vec it saw, and mints one `LlmCallId` per call into the shared
     /// capture buffer (simulating the decorator + capturing ledger repo 2.05 wires).
+    /// A script slot may also be an `Err` — a transport fault, billed like any call
+    /// that reached the provider (the decorator writes its row either way).
     struct FakeProvider {
-        scripts: Mutex<VecDeque<LlmResponse>>,
+        scripts: Mutex<VecDeque<Result<LlmResponse, LlmError>>>,
         default: LlmResponse,
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
         captured: LlmCallCapture,
@@ -675,9 +714,16 @@ mod tests {
             responses: Vec<LlmResponse>,
             captured: &LlmCallCapture,
         ) -> (Self, Arc<Mutex<Vec<Vec<Message>>>>) {
+            Self::scripted_results(responses.into_iter().map(Ok).collect(), captured)
+        }
+
+        fn scripted_results(
+            results: Vec<Result<LlmResponse, LlmError>>,
+            captured: &LlmCallCapture,
+        ) -> (Self, Arc<Mutex<Vec<Vec<Message>>>>) {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let fake = Self {
-                scripts: Mutex::new(responses.into()),
+                scripts: Mutex::new(results.into()),
                 default: text_resp("(script exhausted)"),
                 seen: Arc::clone(&seen),
                 captured: Arc::clone(captured),
@@ -729,7 +775,7 @@ mod tests {
                 let mut scripts = self.scripts.lock().unwrap();
                 scripts.pop_front()
             };
-            Ok(next.unwrap_or_else(|| self.default.clone()))
+            next.unwrap_or_else(|| Ok(self.default.clone()))
         }
     }
 
@@ -923,6 +969,83 @@ mod tests {
         });
         assert!(fed_back, "the FieldError must be fed back as a tool result");
         assert_eq!(outcome.version.created_by, CreatedBy::ComposerLlm);
+    }
+
+    /// B1/R2: under `PulseHive` 2.0.2 a malformed or non-object `arguments` string
+    /// reached the tool as `{}` and came back a correctable `tool_result`; under
+    /// 3.0.0 the SDK raises `MalformedToolCall` before a `ToolCall` exists. The
+    /// compose must still correct, not abort: the failure is fed back to the
+    /// model, counted like a rejected call, and the loop goes on.
+    #[tokio::test]
+    async fn a_malformed_tool_call_is_fed_back_not_fatal() {
+        let captured: LlmCallCapture = Arc::new(Mutex::new(Vec::new()));
+        let script: Vec<Result<LlmResponse, LlmError>> = vec![
+            Ok(call_resp(
+                "c1",
+                "create_strategy",
+                json!({ "name": "RSI Oversold", "direction": "long" }),
+            )),
+            // Turn 2: the shape a billed HTTP 200 with truncated arguments
+            // takes — the SDK's typed error, mapped to the domain variant at
+            // the adapter.
+            Err(LlmError::MalformedToolCall(
+                "malformed_tool_call after 1 attempt(s): the arguments are not a JSON object (HTTP 200)"
+                    .to_owned(),
+            )),
+            // The model re-issues its calls correctly and the compose finishes.
+            Ok(call_resp(
+                "c3",
+                "add_entry_signal",
+                json!({
+                    "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
+                    "op": "lt",
+                    "right": { "source": "constant", "value": "30" }
+                }),
+            )),
+            Ok(call_resp(
+                "c4",
+                "add_filter",
+                json!({
+                    "left": { "source": "price", "price_field": "close" },
+                    "op": "gt",
+                    "right": { "source": "indicator", "indicator": "ema", "period": 200 }
+                }),
+            )),
+            Ok(call_resp(
+                "c5",
+                "set_exit_rules",
+                json!({ "stop_loss_pct": "0.05", "take_profit_r": "2" }),
+            )),
+            Ok(call_resp(
+                "c6",
+                "set_risk_params",
+                json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+            )),
+            Ok(call_resp("c7", "finalize_strategy", json!({}))),
+        ];
+        let (fake, seen) = FakeProvider::scripted_results(script, &captured);
+        let composer = composer_over(fake, Arc::clone(&captured));
+
+        let outcome = composer
+            .compose("RSI oversold on BTC", &mut |_| {})
+            .await
+            .expect("a malformed tool call is correctable, not fatal");
+
+        // The failure was fed back to the model as a correction...
+        let seen = seen.lock().unwrap();
+        let fed_back = seen.iter().flatten().any(|message| {
+            matches!(
+                message,
+                Message::User { content } if content.contains("malformed")
+            )
+        });
+        assert!(
+            fed_back,
+            "the malformed call must be fed back for the model to correct"
+        );
+        // ...and every call — the errored one included — is in the version's
+        // provenance: a billed call is a billed call (R1).
+        assert_eq!(outcome.llm_call_ids.len(), 7);
     }
 
     #[tokio::test]
