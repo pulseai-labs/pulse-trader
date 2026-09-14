@@ -321,13 +321,16 @@ fn to_hive_tool_def(tool: &ToolDefinition) -> HiveToolDefinition {
 /// label unused on a direct `OpenAICompatibleProvider` call (set to the backend tag
 /// for legibility); `model` flows through (the composition root sets the demo model,
 /// which `OpenAIConfig` also carries as the fallback).
+///
+/// Built through `PulseHive`'s constructor and `with_*` builders because the type is
+/// `#[non_exhaustive]` since 3.0.0. The builders set exactly the fields named here;
+/// every field this does not name keeps the constructor's `None`, so the SDK's own
+/// per-call timeout and retry overrides stay unset and the provider-level posture
+/// holds.
 fn to_hive_config(config: &LlmConfig) -> HiveLlmConfig {
-    HiveLlmConfig {
-        provider: "ollama".to_owned(),
-        model: config.model.clone(),
-        temperature: config.temperature,
-        max_tokens: config.max_tokens,
-    }
+    HiveLlmConfig::new("ollama", config.model.clone())
+        .with_temperature(config.temperature)
+        .with_max_tokens(config.max_tokens)
 }
 
 /// Translate a `PulseHive` [`LlmResponse`](HiveLlmResponse) back into the
@@ -364,11 +367,13 @@ fn from_hive_usage(usage: &HiveTokenUsage) -> TokenUsage {
 
 /// Map a [`PulseHiveError`] into the `PulseTrader` port error.
 ///
-/// The thin transport only ever yields `PulseHiveError::Llm` (every error path in
-/// the OpenAI-compatible provider's `chat` uses it); it maps to
-/// [`LlmError::Provider`], preserving the message verbatim. Any other variant (not
-/// reachable on this path) also maps to `Provider` defensively, so the mapping is
-/// total and the domain never learns `PulseHive`'s error type.
+/// Since `PulseHive` 3.0.0 the provider's transport faults (timeout, connect, HTTP
+/// status, unparseable body, truncated tool call) arrive as
+/// `PulseHiveError::LlmTransport`, whose `Display` deliberately omits the provider's
+/// response body; only a request-build failure is still a bare `PulseHiveError::Llm`.
+/// `Llm` maps to [`LlmError::Provider`] with its message verbatim and every other
+/// variant maps to `Provider` by its `Display`, so the mapping is total, the domain
+/// never learns `PulseHive`'s error type, and a provider body never crosses this seam.
 fn map_hive_error(error: PulseHiveError) -> LlmError {
     match error {
         PulseHiveError::Llm(message) => LlmError::Provider(message),
@@ -498,18 +503,18 @@ mod tests {
 
     #[test]
     fn from_hive_response_maps_content_usage_and_tool_calls() {
-        let hive = HiveLlmResponse {
-            content: Some("pong".to_owned()),
-            tool_calls: vec![HiveToolCall {
+        let hive = HiveLlmResponse::new(
+            Some("pong".to_owned()),
+            vec![HiveToolCall {
                 id: "c1".to_owned(),
                 name: "noop".to_owned(),
                 arguments: serde_json::json!({}),
             }],
-            usage: HiveTokenUsage {
+            HiveTokenUsage {
                 input_tokens: 11,
                 output_tokens: 4,
             },
-        };
+        );
         let response = from_hive_response(hive);
         assert_eq!(response.content.as_deref(), Some("pong"));
         assert_eq!(response.tool_calls.len(), 1);
