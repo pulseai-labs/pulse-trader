@@ -398,11 +398,12 @@ fn print_outcome(outcome: &CoachCliOutcome) {
 /// Why a session names no ledger row.
 ///
 /// A missing `llm_call_id` used to print "the turn failed before any provider
-/// call" unconditionally, which is FALSE for the two failures that reach the
-/// provider and come back with nothing to bill — a transport fault and a timeout
-/// (PR #128, finding 5). The operator reading this line is deciding whether a
-/// billed call happened; the answer has to come from the recorded failure, not
-/// from the NULL alone.
+/// call" unconditionally, which is FALSE for a failure that reaches the
+/// provider (PR #128, finding 5). The operator reading this line is deciding
+/// whether a billed call happened; the answer has to come from the recorded
+/// failure, not from the NULL alone. Under #169's R1 a transport fault writes
+/// its row, so `NULL` beside `TransportFailure` now means the row was LOST (a
+/// wiring fault), which this line still reports honestly.
 fn no_ledger_reason(outcome: &CoachCliOutcome) -> &'static str {
     match &outcome.session.outcome {
         SessionOutcome::Failed {

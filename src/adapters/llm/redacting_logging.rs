@@ -18,6 +18,13 @@
 //!    bytes), timestamped from the injected [`Clock`]; and
 //! 4. returns the inner [`LlmResponse`] to the caller, unchanged.
 //!
+//! A call that ERRORED after reaching the provider is still a billed round-trip
+//! and still gets its row (PR #169, R1): the scrubbed error detail rides
+//! `completion` (kind, provider body and all) and the usage is what the error
+//! exposes — zero, since a `PulseHive` transport error carries no token counts.
+//! Only a failure that happens BEFORE the inner call (the pre-flight price
+//! check, the ledger insert itself) produces no row.
+//!
 //! The [`Redactor`] is deliberately scoped (audit ch1): it strips (a)
 //! API-key-shaped tokens and (b) caller-declared tagged secret VALUES, and does
 //! NOT free-text-regex numbers/balances (which share no lexical shape — a
@@ -151,15 +158,32 @@ where
         // OQ-A: the inner provider gets the REAL, un-redacted prompt AND tools; we
         // keep a copy of the messages only to scrub the persisted record.
         let prompt_copy = messages.clone();
-        let response = self.inner.chat(messages, tools, config).await?;
+        let result = self.inner.chat(messages, tools, config).await;
+
+        // A call that reached the provider is a billed round-trip whether it
+        // answered or errored (PR #169, R1): under PulseHive 3.0.0 a billed
+        // HTTP 200 with a truncated tool call arrives as `Err`, and an early
+        // return here left the spend with no ledger row. The error rides
+        // `completion` — its kind and provider body included — scrubbed like
+        // every other stored string; the SDK's error exposes no usage, so the
+        // row records the tokens that are visible (zero), not invented ones.
+        let (usage, completion) = match &result {
+            Ok(response) => (
+                response.usage,
+                response.content.as_ref().map(|c| self.redactor.redact(c)),
+            ),
+            Err(error) => (
+                TokenUsage::default(),
+                Some(self.redactor.redact(&error.to_string())),
+            ),
+        };
 
         // Cost from usage times the price table — model already validated above.
-        let cost = self.prices.cost(&config.model, &response.usage)?;
+        let cost = self.prices.cost(&config.model, &usage)?;
         let cost_currency = self.prices.currency().to_owned();
 
         // Redact the STORED copy (prompt + completion) — never the sent bytes.
         let prompt_messages = self.redactor.redact_messages(&prompt_copy);
-        let completion = response.content.as_ref().map(|c| self.redactor.redact(c));
 
         let now_ms = self.clock.now_ms();
         let created_at = DateTime::from_timestamp_millis(now_ms)
@@ -171,8 +195,8 @@ where
             model: config.model.clone(),
             prompt_messages,
             completion,
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
             cost,
             cost_currency,
             created_at,
@@ -187,12 +211,13 @@ where
         self.repo
             .save_call(&call)
             .await
-            // LOCAL, not `Provider`: the provider answered; it is our ledger write
-            // that failed. A caller that records provider faults as domain outcomes
-            // (the coach) must be able to tell the two apart (PR #128, finding 5).
+            // LOCAL, not `Provider`: the provider answered (or faulted); it is our
+            // ledger write that failed. A caller that records provider faults as
+            // domain outcomes (the coach) must be able to tell the two apart
+            // (PR #128, finding 5).
             .map_err(|e| LlmError::Local(format!("llm_call persist failed: {e}")))?;
 
-        Ok(response)
+        result
     }
 }
 
@@ -230,6 +255,26 @@ mod tests {
         ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
             self.received.lock().expect("received lock").push(messages);
             std::future::ready(Ok(self.response.clone()))
+        }
+    }
+
+    /// A provider whose `chat` returns a transport error — the shape a billed
+    /// HTTP 200 takes under `PulseHive` 3.0.0 when the tool arguments cannot be
+    /// read into a call. The call happened; no usable response came back.
+    struct FailingProvider {
+        received: Arc<Mutex<Vec<Vec<Message>>>>,
+        error: LlmError,
+    }
+
+    impl LlmProvider for FailingProvider {
+        fn chat(
+            &self,
+            messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _config: &LlmConfig,
+        ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
+            self.received.lock().expect("received lock").push(messages);
+            std::future::ready(Err(self.error.clone()))
         }
     }
 
@@ -600,6 +645,65 @@ mod tests {
         assert!(
             saved.lock().expect("saved lock").is_empty(),
             "no ledger row may be written when the model is unpriced"
+        );
+    }
+
+    /// R1: a call that reached the provider and came back a transport error is
+    /// still a billed round-trip — under `PulseHive` 3.0.0 a malformed tool call
+    /// is `Err`, and an early `?` here left the spend with no ledger row.
+    #[tokio::test]
+    async fn a_billed_call_that_errors_still_reaches_the_ledger() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let provider = FailingProvider {
+            received: Arc::clone(&received),
+            error: LlmError::MalformedToolCall(format!(
+                "malformed_tool_call after 1 attempt(s): the arguments are not a JSON object \
+                 (HTTP 200) | body: {{\"api_key\": \"{FAKE_KEY}\""
+            )),
+        };
+        let repo = RecordingRepo {
+            saved: Arc::clone(&saved),
+        };
+        let decorator = RedactingLoggingProvider::new(
+            provider,
+            repo,
+            FakeClock::at(1_700_000_000_000),
+            Redactor::default(),
+            prices(),
+        );
+
+        let err = decorator
+            .chat(vec![Message::user("a prompt")], &[], &config())
+            .await
+            .expect_err("the inner error passes through to the caller");
+
+        // The caller's error is unchanged — the row is a side effect, not a rewrite.
+        assert!(matches!(err, LlmError::MalformedToolCall(_)));
+
+        let saved = saved.lock().expect("saved lock").clone();
+        assert_eq!(saved.len(), 1, "the billed call is still a ledger row");
+        let call = &saved[0];
+        // The SDK's transport error exposes no usage — the row records the
+        // tokens that are visible (zero), never invented numbers.
+        assert_eq!(call.input_tokens, 0);
+        assert_eq!(call.output_tokens, 0);
+        assert_eq!(call.cost, Decimal::ZERO);
+        // The failure rides `completion`, scrubbed: the kind names the error
+        // and the body's canary is gone.
+        let completion = call.completion.as_deref().expect("the error is stored");
+        assert!(
+            completion.contains("malformed_tool_call"),
+            "the error kind reaches the row: {completion}"
+        );
+        assert!(
+            !completion.contains(FAKE_KEY),
+            "the stored detail is still scrubbed: {completion}"
+        );
+        assert!(completion.contains(REDACTED), "not redacted: {completion}");
+        assert!(
+            !received.lock().expect("received lock").is_empty(),
+            "the inner provider really was called"
         );
     }
 

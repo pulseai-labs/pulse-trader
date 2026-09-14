@@ -132,9 +132,10 @@ pub(crate) enum AttributedCallError {
     /// managed to write a row for the attempt — a transport fault can be billed.
     #[error("{error}")]
     Provider {
-        /// What went wrong. [`LlmError::Provider`] is a TRANSPORT fault (a recorded
-        /// coaching outcome); the other two are this process faulting on the call
-        /// path and are not coaching outcomes at all (PR #128, finding 5).
+        /// What went wrong. [`LlmError::Provider`] and
+        /// [`LlmError::MalformedToolCall`] are TRANSPORT faults (recorded
+        /// coaching outcomes); `Config`/`Local` are this process faulting on the
+        /// call path and are not coaching outcomes at all (PR #128, finding 5).
         error: LlmError,
         /// The ledger row the attempt minted, if any.
         llm_call_id: Option<LlmCallId>,

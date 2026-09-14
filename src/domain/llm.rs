@@ -239,6 +239,18 @@ pub enum LlmError {
     /// error here).
     #[error("llm provider error: {0}")]
     Provider(String),
+    /// A provider fault the caller can CORRECT: the model emitted a tool call
+    /// whose arguments could not be read as a JSON object — under `PulseHive`
+    /// 3.0.0 a billed HTTP 200 with truncated or non-object `arguments` arrives
+    /// as the typed `LlmErrorKind::MalformedToolCall`, not a dispatchable call.
+    ///
+    /// Kept a variant of its own (rather than a string prefix on [`Provider`])
+    /// so the composer's correctable path matches on TYPE — an SDK rename of
+    /// the kind breaks this build instead of silently reverting to an abort.
+    /// The detail carries the kind, message, status, `finish_reason` and the
+    /// provider `body` — the fields `Display` deliberately omits.
+    #[error("llm provider error: {0}")]
+    MalformedToolCall(String),
     /// Missing / invalid configuration (e.g. an absent keychain secret bubbling
     /// up, or an unknown model in the [`PriceTable`]).
     #[error("llm config error: {0}")]
@@ -456,6 +468,7 @@ mod tests {
     fn llm_error_is_serde_roundtrippable_and_displays() {
         for err in [
             LlmError::Provider("boom".to_owned()),
+            LlmError::MalformedToolCall("not an object".to_owned()),
             LlmError::Config("nope".to_owned()),
         ] {
             let json = serde_json::to_string(&err).expect("serialize LlmError");

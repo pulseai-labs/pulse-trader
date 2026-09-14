@@ -637,8 +637,11 @@ where
             let call_id = provider.attempted_call_id().map_err(attribution_error)?;
             return settle_failure(sessions, session_id, call_id, failure).await;
         }
+        // A malformed tool call is a transport fault from the turn's view (PR #169,
+        // R3): one coach turn is one attempt, so the correctable retry lives only
+        // in the composer — here it is recorded, not corrected.
         Ok(Err(AttributedCallError::Provider {
-            error: LlmError::Provider(detail),
+            error: LlmError::Provider(detail) | LlmError::MalformedToolCall(detail),
             llm_call_id,
         })) => {
             // r1.s2.w4: a TRANSPORT fault is a RECORDED outcome. The error text is

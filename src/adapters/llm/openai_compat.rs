@@ -31,9 +31,10 @@ use std::time::Duration;
 
 use pulsehive::error::PulseHiveError;
 use pulsehive::llm::{
-    LlmConfig as HiveLlmConfig, LlmProvider as HiveLlmProvider, LlmResponse as HiveLlmResponse,
-    Message as HiveMessage, ReasoningEffort as HiveReasoningEffort, TokenUsage as HiveTokenUsage,
-    ToolCall as HiveToolCall, ToolDefinition as HiveToolDefinition,
+    LlmConfig as HiveLlmConfig, LlmError as HiveLlmError, LlmErrorKind as HiveLlmErrorKind,
+    LlmProvider as HiveLlmProvider, LlmResponse as HiveLlmResponse, Message as HiveMessage,
+    ReasoningEffort as HiveReasoningEffort, TokenUsage as HiveTokenUsage, ToolCall as HiveToolCall,
+    ToolDefinition as HiveToolDefinition,
 };
 use pulsehive::pulsehive_openai::{OpenAICompatibleProvider, OpenAIConfig};
 
@@ -391,14 +392,50 @@ fn from_hive_usage(usage: &HiveTokenUsage) -> TokenUsage {
 /// status, unparseable body, truncated tool call) arrive as
 /// `PulseHiveError::LlmTransport`, whose `Display` deliberately omits the provider's
 /// response body; only a request-build failure is still a bare `PulseHiveError::Llm`.
-/// `Llm` maps to [`LlmError::Provider`] with its message verbatim and every other
-/// variant maps to `Provider` by its `Display`, so the mapping is total, the domain
-/// never learns `PulseHive`'s error type, and a provider body never crosses this seam.
+/// `Llm` maps to [`LlmError::Provider`] with its message verbatim. `LlmTransport`
+/// keeps what `Display` drops — the kind as the variant (the correctable
+/// `MalformedToolCall` becomes [`LlmError::MalformedToolCall`], every other kind a
+/// `Provider`), plus the `finish_reason` and verbatim `body` folded into the detail
+/// by [`transport_detail`]. Any remaining variant maps to `Provider` by its
+/// `Display`, so the mapping is total and the domain never learns `PulseHive`'s
+/// error type.
 fn map_hive_error(error: PulseHiveError) -> LlmError {
     match error {
         PulseHiveError::Llm(message) => LlmError::Provider(message),
+        PulseHiveError::LlmTransport(transport) => {
+            let detail = transport_detail(&transport);
+            match transport.kind {
+                // The ONE correctable kind: a tool call the model can re-emit.
+                // Named by variant — not by sniffing the kind back out of a
+                // formatted string — so an SDK rename breaks this build rather
+                // than silently reverting the composer to an abort (R2/R3).
+                HiveLlmErrorKind::MalformedToolCall => LlmError::MalformedToolCall(detail),
+                _ => LlmError::Provider(detail),
+            }
+        }
         other => LlmError::Provider(other.to_string()),
     }
+}
+
+/// The detail a transport error carries across the seam (R3): the SDK's own
+/// `Display` — `<kind> after <n> attempt(s): <message> (HTTP <status>)` — plus
+/// the two fields `Display` deliberately omits, the `finish_reason` and the
+/// verbatim provider `body`, appended so the provider's answer survives into
+/// the ledger row and the recorded failure. Whatever the body echoes — a quoted
+/// credential, request content — is scrubbed at the at-rest boundary (the
+/// decorator redacts the stored `completion`; the coach redacts the recorded
+/// `TransportFailure` detail), never here: this string is also the LIVE error
+/// the caller logs.
+fn transport_detail(error: &HiveLlmError) -> String {
+    use std::fmt::Write;
+    let mut detail = error.to_string();
+    if let Some(finish_reason) = &error.finish_reason {
+        let _ = write!(detail, " | finish_reason: {finish_reason}");
+    }
+    if let Some(body) = &error.body {
+        let _ = write!(detail, " | body: {body}");
+    }
+    detail
 }
 
 #[cfg(test)]
@@ -414,9 +451,9 @@ mod tests {
     };
     use pulsehive::error::PulseHiveError;
     use pulsehive::llm::{
-        LlmResponse as HiveLlmResponse, Message as HiveMessage,
-        ReasoningEffort as HiveReasoningEffort, TokenUsage as HiveTokenUsage,
-        ToolCall as HiveToolCall,
+        LlmError as HiveLlmError, LlmErrorKind as HiveLlmErrorKind, LlmResponse as HiveLlmResponse,
+        Message as HiveMessage, ReasoningEffort as HiveReasoningEffort,
+        TokenUsage as HiveTokenUsage, ToolCall as HiveToolCall,
     };
 
     fn sample_config() -> LlmConfig {
@@ -600,6 +637,63 @@ mod tests {
             matches!(&err, LlmError::Provider(message) if message == "upstream 500"),
             "expected Provider(\"upstream 500\"), got {err:?}"
         );
+    }
+
+    /// R3: the SDK's transport error carries what its `Display` deliberately
+    /// omits — the kind, the provider `body` and the `finish_reason`. The domain
+    /// detail keeps all three so the ledger row and the coach failure still say
+    /// what the provider answered (the scrub happens at the at-rest boundary).
+    #[test]
+    fn a_transport_error_carries_its_kind_body_and_finish_reason() {
+        // The billed-HTTP-200 shape: a truncated tool-call argument string,
+        // status 200, the raw arguments in `body`, `finish_reason: length`.
+        let sdk_error = HiveLlmError::new(
+            HiveLlmErrorKind::MalformedToolCall,
+            "the arguments are not a JSON object",
+        )
+        .with_status(200)
+        .with_attempts(1)
+        .with_body("{\"name\": \"x\",")
+        .with_finish_reason("length");
+        let err = map_hive_error(PulseHiveError::llm_transport(sdk_error));
+
+        // The kind is typed, not sniffed back out of a string — the composer
+        // matches this variant to keep the failure correctable (B1).
+        let detail = match err {
+            LlmError::MalformedToolCall(detail) => detail,
+            other => panic!("expected MalformedToolCall, got {other:?}"),
+        };
+        assert!(detail.contains("malformed_tool_call"), "kind: {detail}");
+        assert!(
+            detail.contains("the arguments are not a JSON object"),
+            "message: {detail}"
+        );
+        assert!(
+            detail.contains("{\"name\": \"x\","),
+            "the provider body survives: {detail}"
+        );
+        assert!(
+            detail.contains("length"),
+            "the finish reason survives: {detail}"
+        );
+        assert!(detail.contains("200"), "the status survives: {detail}");
+    }
+
+    /// A non-correctable transport kind keeps the same detail but stays a plain
+    /// provider error — only `MalformedToolCall` gets its own variant.
+    #[test]
+    fn a_non_correctable_transport_error_keeps_its_body_as_provider() {
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body("upstream exploded");
+        let err = map_hive_error(PulseHiveError::llm_transport(sdk_error));
+        match err {
+            LlmError::Provider(detail) => {
+                assert!(detail.contains("server"), "kind: {detail}");
+                assert!(detail.contains("upstream exploded"), "body: {detail}");
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
     }
 
     /// One coach turn is one upstream attempt (PR #128, finding H1).
