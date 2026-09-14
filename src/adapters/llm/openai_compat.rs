@@ -32,13 +32,14 @@ use std::time::Duration;
 use pulsehive::error::PulseHiveError;
 use pulsehive::llm::{
     LlmConfig as HiveLlmConfig, LlmProvider as HiveLlmProvider, LlmResponse as HiveLlmResponse,
-    Message as HiveMessage, TokenUsage as HiveTokenUsage, ToolCall as HiveToolCall,
-    ToolDefinition as HiveToolDefinition,
+    Message as HiveMessage, ReasoningEffort as HiveReasoningEffort, TokenUsage as HiveTokenUsage,
+    ToolCall as HiveToolCall, ToolDefinition as HiveToolDefinition,
 };
 use pulsehive::pulsehive_openai::{OpenAICompatibleProvider, OpenAIConfig};
 
 use crate::domain::{
-    LlmConfig, LlmError, LlmProvider, LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition,
+    LlmConfig, LlmError, LlmProvider, LlmResponse, Message, ReasoningEffort, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 
 /// The DEFAULT Ollama Cloud OpenAI-compatible base URL (provider pivot 2026-07-10 —
@@ -327,10 +328,29 @@ fn to_hive_tool_def(tool: &ToolDefinition) -> HiveToolDefinition {
 /// every field this does not name keeps the constructor's `None`, so the SDK's own
 /// per-call timeout and retry overrides stay unset and the provider-level posture
 /// holds.
+///
+/// `reasoning_effort` crosses field by field ([`to_hive_effort`]); an unset one stays
+/// unset, and the SDK leaves an unset effort off the wire.
 fn to_hive_config(config: &LlmConfig) -> HiveLlmConfig {
-    HiveLlmConfig::new("ollama", config.model.clone())
+    let hive = HiveLlmConfig::new("ollama", config.model.clone())
         .with_temperature(config.temperature)
-        .with_max_tokens(config.max_tokens)
+        .with_max_tokens(config.max_tokens);
+    match config.reasoning_effort {
+        Some(effort) => hive.with_reasoning_effort(to_hive_effort(effort)),
+        None => hive,
+    }
+}
+
+/// Translate a `PulseTrader` [`ReasoningEffort`] onto the `PulseHive` variant of the
+/// same name. Exhaustive over OUR enum, so a variant added to it cannot compile
+/// until it is given an SDK spelling here.
+const fn to_hive_effort(effort: ReasoningEffort) -> HiveReasoningEffort {
+    match effort {
+        ReasoningEffort::Minimal => HiveReasoningEffort::Minimal,
+        ReasoningEffort::Low => HiveReasoningEffort::Low,
+        ReasoningEffort::Medium => HiveReasoningEffort::Medium,
+        ReasoningEffort::High => HiveReasoningEffort::High,
+    }
 }
 
 /// Translate a `PulseHive` [`LlmResponse`](HiveLlmResponse) back into the
@@ -389,10 +409,13 @@ mod tests {
         OLLAMA_TIMEOUT, OpenAiCompatProvider, from_hive_response, map_hive_error, provider_config,
         to_hive_config, to_hive_message, to_hive_tool_def,
     };
-    use crate::domain::{LlmBackend, LlmConfig, LlmError, Message, ToolCall, ToolDefinition};
+    use crate::domain::{
+        LlmBackend, LlmConfig, LlmError, Message, ReasoningEffort, ToolCall, ToolDefinition,
+    };
     use pulsehive::error::PulseHiveError;
     use pulsehive::llm::{
-        LlmResponse as HiveLlmResponse, Message as HiveMessage, TokenUsage as HiveTokenUsage,
+        LlmResponse as HiveLlmResponse, Message as HiveMessage,
+        ReasoningEffort as HiveReasoningEffort, TokenUsage as HiveTokenUsage,
         ToolCall as HiveToolCall,
     };
 
@@ -402,6 +425,7 @@ mod tests {
             model: "gpt-oss:120b".to_owned(),
             temperature: 0.3,
             max_tokens: 256,
+            reasoning_effort: None,
         }
     }
 
@@ -499,6 +523,51 @@ mod tests {
         assert_eq!(hive.model, "gpt-oss:120b");
         assert!((hive.temperature - 0.3).abs() < f32::EPSILON);
         assert_eq!(hive.max_tokens, 256);
+    }
+
+    /// The reasoning effort crosses the seam field by field, each of our variants onto
+    /// the SDK's same-named one (#164): a domain type at every call site, the SDK's
+    /// type only here.
+    #[test]
+    fn to_hive_config_carries_the_reasoning_effort() {
+        for (ours, theirs) in [
+            (ReasoningEffort::Minimal, HiveReasoningEffort::Minimal),
+            (ReasoningEffort::Low, HiveReasoningEffort::Low),
+            (ReasoningEffort::Medium, HiveReasoningEffort::Medium),
+            (ReasoningEffort::High, HiveReasoningEffort::High),
+        ] {
+            let config = LlmConfig {
+                reasoning_effort: Some(ours),
+                ..sample_config()
+            };
+            let hive = to_hive_config(&config);
+            assert_eq!(hive.reasoning_effort, Some(theirs));
+            assert_eq!(
+                hive.model, "gpt-oss:120b",
+                "the effort rides with the other knobs"
+            );
+            assert_eq!(hive.max_tokens, 256);
+        }
+    }
+
+    /// An UNSET effort stays unset and puts nothing on the wire, so the composer's and
+    /// `llm-check`'s requests are the bytes they were before the field existed.
+    ///
+    /// The SDK's other new request knobs stay unset too: a per-call timeout or retry
+    /// budget would override the provider-level posture, and `tool_choice` forces
+    /// nothing on this endpoint (#166).
+    #[test]
+    fn an_unset_reasoning_effort_maps_to_none_and_serializes_nothing() {
+        let hive = to_hive_config(&sample_config());
+        assert_eq!(hive.reasoning_effort, None);
+        let wire = serde_json::to_value(&hive).expect("serialize the hive config");
+        assert!(
+            wire.get("reasoning_effort").is_none(),
+            "an unset effort is absent from the serialized request config: {wire}"
+        );
+        assert!(hive.timeout_secs.is_none(), "no per-call timeout override");
+        assert!(hive.max_retries.is_none(), "no per-call retry override");
+        assert!(hive.tool_choice.is_none(), "no tool_choice (#166)");
     }
 
     #[test]

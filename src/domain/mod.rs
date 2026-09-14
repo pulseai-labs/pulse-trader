@@ -169,8 +169,8 @@ pub use secret::{ApiKey, CredentialSource, CredentialStatus};
 // surface — an un-re-exported public domain type is a `dead_code` BUILD error
 // under `deny(warnings)`. 1.02–1.04 consume these through the `LlmProvider` port.
 pub use llm::{
-    LlmBackend, LlmConfig, LlmError, LlmResponse, Message, ModelPrice, PriceTable, TokenUsage,
-    ToolCall,
+    LlmBackend, LlmConfig, LlmError, LlmResponse, Message, ModelPrice, PriceTable, ReasoningEffort,
+    TokenUsage, ToolCall,
 };
 // VS-1.3.2 work-2.01: the additive tool-calling transport type (FR-23 / FR-3).
 // Appended as its own line (NOT folded into the block above) so the parallel 2.03

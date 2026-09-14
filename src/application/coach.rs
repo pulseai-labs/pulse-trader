@@ -323,7 +323,8 @@ pub enum CoachTurnError {
 /// 4. the prompt version the ledger row will carry, or the empty string when none;
 /// 5. the behaviour-affecting `LlmConfig` fields, in this fixed order: the model,
 ///    then the sampling control (`temperature`, in its round-trip decimal form),
-///    then the length control (`max_tokens`).
+///    then the length control (`max_tokens`), then the reasoning control
+///    (`reasoning_effort`, in its `{:?}` form: `None`, or e.g. `Some(Low)`).
 ///
 /// **What is deliberately NOT in it.** Credentials, base URLs, API keys and price
 /// data — none is a property of the REQUEST, and a fingerprint that changed when a
@@ -364,6 +365,10 @@ pub fn coach_request_fingerprint(
     // and lose the distinction between an integral and a fractional setting.
     feed(format!("{:?}", config.temperature).as_bytes());
     feed(config.max_tokens.to_string().as_bytes());
+    // `{:?}` spells an unset effort `None` and a set one `Some(Low)`: always one
+    // element, so the feed's shape does not depend on whether an effort was chosen
+    // (#164).
+    feed(format!("{:?}", config.reasoning_effort).as_bytes());
 
     hex::encode(hasher.finalize())
 }

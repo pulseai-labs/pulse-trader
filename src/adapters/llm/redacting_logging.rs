@@ -266,6 +266,7 @@ mod tests {
             model: "gpt-oss:120b".to_owned(),
             temperature: 0.2,
             max_tokens: 256,
+            reasoning_effort: None,
         }
     }
 
@@ -581,6 +582,7 @@ mod tests {
             model: "unpriced-model".to_owned(),
             temperature: 0.2,
             max_tokens: 64,
+            reasoning_effort: None,
         };
 
         let err = decorator

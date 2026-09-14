@@ -59,6 +59,7 @@ pub fn config() -> LlmConfig {
         model: "glm-5.3-flash".to_owned(),
         temperature: 0.0,
         max_tokens: 2_048,
+        reasoning_effort: None,
     }
 }
 

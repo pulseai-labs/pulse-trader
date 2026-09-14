@@ -1213,6 +1213,7 @@ fn fixture_config() -> LlmConfig {
         model: "fixture-model".to_owned(),
         temperature: 0.0,
         max_tokens: 2_048,
+        reasoning_effort: None,
     }
 }
 
@@ -1241,6 +1242,7 @@ fn reference_digest(
     feed(config.model.as_bytes());
     feed(format!("{:?}", config.temperature).as_bytes());
     feed(config.max_tokens.to_string().as_bytes());
+    feed(format!("{:?}", config.reasoning_effort).as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -1275,7 +1277,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
 /// the fingerprint is the single-flight key, and a silent change to it silently
 /// stops two identical requests from recognizing each other.
 const PINNED_FIXTURE_DIGEST: &str =
-    "85a1d0ff148a9f03ec7b032c86979a79fb35b077d3153bc4dce1d9477b62b978";
+    "3b21dd3d26051d31e819388af6b2ea0894a365b573d2da478de665a39bb00261";
 
 #[test]
 fn the_request_fingerprint_of_a_fixed_fixture_matches_its_pinned_digest() {
@@ -1387,6 +1389,10 @@ fn the_request_fingerprint_changes_when_any_feed_element_changes() {
         (
             "the token cap",
             Feed::edited(|f| f.config.max_tokens = 2_049),
+        ),
+        (
+            "the reasoning effort",
+            Feed::edited(|f| f.config.reasoning_effort = Some(pulse::ReasoningEffort::Low)),
         ),
     ];
 

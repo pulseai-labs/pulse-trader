@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use crate::adapters::llm::openai_compat::{OLLAMA_MODEL_ID, OpenAiCompatProvider};
 use crate::agent::DEFAULT_TURN_TIMEOUT;
-use crate::domain::{LlmBackend, LlmConfig};
+use crate::domain::{LlmBackend, LlmConfig, ReasoningEffort};
 
 /// The coach's RESPONSE TOKEN CAP — the coach's own answer to the question, not the
 /// CLI reasoning constant it used to borrow (#164).
@@ -62,6 +62,21 @@ pub(crate) const COACH_MAX_TOKENS: u32 = 16_384;
 /// and neither was chosen on purpose. Like the cap, this feeds the request
 /// fingerprint.
 pub(crate) const COACH_TEMPERATURE: f32 = 0.0;
+
+/// The coach's REASONING EFFORT — `low`, the one request field that bounds a
+/// glm-5.3-flash coach turn (#164).
+///
+/// [`COACH_MAX_TOKENS`] does not: the model reasons against the cap before it calls
+/// a tool, and on ollama.com/glm-5.3-flash an unconstrained coach turn spent 554 to
+/// 58 296 characters of reasoning on one prompt at temperature 0.0, and once (d12
+/// walk 4, run `e58578d8`) exhausted the whole 16 384-token cap with no tool call.
+/// Replayed with `reasoning_effort: "low"`, the same prompt came back in 230–299
+/// completion tokens with a clean `propose_mutation`, in 2.5s (probe, 2026-09-06).
+///
+/// The coach's alone: the composer and `llm-check` send no effort, so their request
+/// bodies are the ones they sent before the field existed. Like the cap and the
+/// temperature, it feeds the request fingerprint.
+pub(crate) const COACH_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
 /// The coach's REQUEST TIMEOUT, in seconds — longer than the 60s every other
 /// surface sends, and shorter than the turn guard by exactly
@@ -101,10 +116,10 @@ const _: () =
 /// from (`cli::coach::run_coach` and `tauri::commands::coach_turn`).
 ///
 /// MODEL resolves the config `[llm].model` override → the shipped
-/// [`OLLAMA_MODEL_ID`] fallback; the CAP and the TEMPERATURE are the coach's own
-/// ([`COACH_MAX_TOKENS`] / [`COACH_TEMPERATURE`]). The composer keeps its own
-/// config untouched — a coach turn and a composer step are not the same size of
-/// question.
+/// [`OLLAMA_MODEL_ID`] fallback; the CAP, the TEMPERATURE and the REASONING EFFORT
+/// are the coach's own ([`COACH_MAX_TOKENS`] / [`COACH_TEMPERATURE`] /
+/// [`COACH_REASONING_EFFORT`]). The composer keeps its own config untouched — a
+/// coach turn and a composer step are not the same size of question.
 ///
 /// The fallback is the ADAPTER's model const rather than `cli::compose`'s so that
 /// nothing in the product path reaches into the CLI ring for it; `agent::config`'s
@@ -117,6 +132,7 @@ pub(crate) fn coach_config(model_override: Option<&str>) -> LlmConfig {
         model: model_override.unwrap_or(OLLAMA_MODEL_ID).to_owned(),
         temperature: COACH_TEMPERATURE,
         max_tokens: COACH_MAX_TOKENS,
+        reasoning_effort: Some(COACH_REASONING_EFFORT),
     }
 }
 
@@ -146,10 +162,10 @@ pub(crate) fn coach_provider(api_key: &str, base_url: Option<&str>) -> OpenAiCom
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        COACH_LEDGER_WRITE_MARGIN_SECS, COACH_MAX_TOKENS, COACH_TEMPERATURE, COACH_TIMEOUT_SECS,
-        DEFAULT_TURN_TIMEOUT, coach_config, coach_provider,
+        COACH_LEDGER_WRITE_MARGIN_SECS, COACH_MAX_TOKENS, COACH_REASONING_EFFORT,
+        COACH_TEMPERATURE, COACH_TIMEOUT_SECS, DEFAULT_TURN_TIMEOUT, coach_config, coach_provider,
     };
-    use crate::domain::LlmBackend;
+    use crate::domain::{LlmBackend, ReasoningEffort};
 
     /// The coach's OUTPUT CAP is its own constant, and the coach config is the one
     /// place both surfaces read it from (#164). The old wiring answered the same
@@ -180,6 +196,22 @@ mod tests {
             COACH_TEMPERATURE.to_bits(),
             0.0_f32.to_bits(),
             "one deterministic posture for both surfaces"
+        );
+    }
+
+    /// The coach asks for a LOW reasoning budget on every turn, whatever the model
+    /// (#164). The constant's doc carries the probe that chose it.
+    #[test]
+    fn the_coach_config_asks_for_a_low_reasoning_effort() {
+        assert_eq!(COACH_REASONING_EFFORT, ReasoningEffort::Low);
+        assert_eq!(
+            coach_config(None).reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            coach_config(Some("kimi-k2.6")).reasoning_effort,
+            Some(COACH_REASONING_EFFORT),
+            "a model override does not drop the effort"
         );
     }
 
@@ -237,6 +269,11 @@ mod tests {
             composer.temperature.to_bits(),
             0.2_f32.to_bits(),
             "and keeps its 0.2 sampling temperature"
+        );
+        assert_eq!(
+            composer.reasoning_effort, None,
+            "and sends no reasoning effort, so its request body is the one it sent \
+             before the coach asked for one (#164)"
         );
         assert!(
             COACH_MAX_TOKENS > composer.max_tokens,

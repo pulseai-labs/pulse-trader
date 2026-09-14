@@ -459,6 +459,7 @@ fn chat_config() -> LlmConfig {
         model: "glm-5.2".to_owned(),
         temperature: 0.2,
         max_tokens: 256,
+        reasoning_effort: None,
     }
 }
 
