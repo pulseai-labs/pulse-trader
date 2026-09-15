@@ -71,17 +71,19 @@ feature-depth = 1
 # yanked crates are denied
 yanked = "deny"
 # VS-1.3.1 work-1.03 (ADR-0011/0012): scope UNMAINTAINED advisories to workspace-level
-# only — mirrors the identical policy in PulseDB's own deny.toml. Rationale: the
-# `pulsehive =2.0.2 features=["openai"]` graph links `pulsehive-core`/`-runtime`, which
-# use `pulsehive-db` (the agent-memory substrate) UNCONDITIONALLY. `pulsehive-db` in turn
-# pulls two crates flagged UNMAINTAINED (the lowest RUSTSEC class — informational, NOT
-# vulnerabilities, no safe upgrade): `bincode 1.3.3` (via the third-party `hnsw_rs` vector
-# index; RUSTSEC-2025-0141) and `paste 1.0.15` (via `tokenizers`; RUSTSEC-2024-0436).
-# PulseDB already migrated its OWN storage bincode->postcard (ADR-006) and accepts these
-# residual THIRD-PARTY transitives via `unmaintained = "workspace"`; PulseTrader adopts the
-# same supply-chain policy rather than being stricter than its own upstream. This still
-# FAILS the gate on: any actual vulnerability (RUSTSEC advisory-class), any yanked crate,
-# and any unmaintained crate that is a first-party/workspace dependency.
+# only — mirrors the identical policy in PulseDB's own deny.toml. Rationale: every
+# UNMAINTAINED hit left in this graph (the lowest RUSTSEC class — informational, NOT
+# vulnerabilities, no safe upgrade) is a THIRD-PARTY transitive of the desktop shell,
+# none a direct dependency: `paste 1.0.15` via specta / tauri-specta (RUSTSEC-2024-0436),
+# the `unic-*` family via tauri-utils -> urlpattern (RUSTSEC-2025-0075, -0080, -0081,
+# -0098, -0100), and `proc-macro-error 1.0.4` via Tauri's Linux GTK stack (glib-macros;
+# RUSTSEC-2024-0370). The policy was adopted for `pulsehive =2.0.2`, whose graph linked
+# `pulsehive-db` and with it `bincode 1.3.3` (via `hnsw_rs`; RUSTSEC-2025-0141);
+# `pulsehive =3.0.0 features=["openai"]` no longer pulls `pulsehive-db`, so that hit is
+# gone. PulseTrader keeps its upstream's supply-chain policy rather than being stricter
+# than it; tightening it is the operator's call. This still FAILS the gate on: any actual
+# vulnerability (RUSTSEC advisory-class), any yanked crate, and any unmaintained crate
+# that is a first-party/workspace dependency.
 unmaintained = "workspace"
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
@@ -163,15 +165,13 @@ exceptions = [
     # into this proprietary (publish = false) binary is authorized — the copyleft
     # obligation does not bind the copyright holder to themselves (ADR-0011). Scoped
     # per-crate so any OTHER (third-party) AGPL dep still fails the gate until
-    # consciously reviewed. Only the crates the `=2.0.2 features=["openai"]` graph
+    # consciously reviewed. Only the crates the `=3.0.0 features=["openai"]` graph
     # actually pulls are listed; `pulsehive-anthropic` is NOT in the graph and is
-    # deliberately omitted. `pulsehive-db` resolves to the crates.io 0.4.0 the
-    # published pulsehive-core 2.0.2 depends on.
+    # deliberately omitted. `pulsehive-runtime` and `pulsehive-db` left the graph with
+    # the 3.0.0 bump, and their exceptions left with them.
     { allow = ["AGPL-3.0-only"], crate = "pulsehive" },
     { allow = ["AGPL-3.0-only"], crate = "pulsehive-core" },
-    { allow = ["AGPL-3.0-only"], crate = "pulsehive-runtime" },
     { allow = ["AGPL-3.0-only"], crate = "pulsehive-openai" },
-    { allow = ["AGPL-3.0-only"], crate = "pulsehive-db" },
 ]
 
 # Some crates don't have (easily) machine readable licensing information,

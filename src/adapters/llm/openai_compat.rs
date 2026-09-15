@@ -31,14 +31,16 @@ use std::time::Duration;
 
 use pulsehive::error::PulseHiveError;
 use pulsehive::llm::{
-    LlmConfig as HiveLlmConfig, LlmProvider as HiveLlmProvider, LlmResponse as HiveLlmResponse,
-    Message as HiveMessage, TokenUsage as HiveTokenUsage, ToolCall as HiveToolCall,
+    LlmConfig as HiveLlmConfig, LlmError as HiveLlmError, LlmErrorKind as HiveLlmErrorKind,
+    LlmProvider as HiveLlmProvider, LlmResponse as HiveLlmResponse, Message as HiveMessage,
+    ReasoningEffort as HiveReasoningEffort, TokenUsage as HiveTokenUsage, ToolCall as HiveToolCall,
     ToolDefinition as HiveToolDefinition,
 };
 use pulsehive::pulsehive_openai::{OpenAICompatibleProvider, OpenAIConfig};
 
 use crate::domain::{
-    LlmConfig, LlmError, LlmProvider, LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition,
+    LlmConfig, LlmError, LlmProvider, LlmResponse, Message, ReasoningEffort, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 
 /// The DEFAULT Ollama Cloud OpenAI-compatible base URL (provider pivot 2026-07-10 —
@@ -116,6 +118,14 @@ fn provider_config(
 /// manual/demo concern — MASTER-SPEC §9.4).
 pub struct OpenAiCompatProvider {
     inner: OpenAICompatibleProvider,
+    /// The configured `[llm].base_url` verbatim, kept so [`chat`](Self::chat)
+    /// can refuse an undispatchable endpoint as [`LlmError::Config`] BEFORE the
+    /// SDK builds a request (PR #169, round 3): the SDK surfaces that failure
+    /// only inside `send`, as a bare `PulseHiveError::Llm`, which the seam maps
+    /// to `Provider` — a phantom billed call for a request that never left the
+    /// process. The `PulseHive` config view sanitizes userinfo out of the URL;
+    /// the check must run on the string the SDK will actually dial.
+    base_url: String,
     /// The retry posture this provider was built with, kept ONLY under `cfg(test)`.
     ///
     /// It is evidence, not runtime state: `PulseHive`'s provider does not surface
@@ -237,8 +247,10 @@ impl OpenAiCompatProvider {
         let max_retries = config.max_retries;
         #[cfg(test)]
         let timeout_secs = config.timeout_secs;
+        let base_url = config.base_url.clone();
         Self {
             inner: OpenAICompatibleProvider::new(config),
+            base_url,
             #[cfg(test)]
             max_retries,
             #[cfg(test)]
@@ -254,6 +266,30 @@ impl LlmProvider for OpenAiCompatProvider {
         tools: &[ToolDefinition],
         config: &LlmConfig,
     ) -> Result<LlmResponse, LlmError> {
+        // Preflight the one request input we control — the configured
+        // `base_url` — BEFORE the SDK builds a request (PR #169, round 3).
+        // An undispatchable endpoint surfaces inside `send` as a bare
+        // `PulseHiveError::Llm`, which `map_hive_error` cannot tell from a
+        // billed post-dispatch fault; as `Provider` the decorator would book a
+        // phantom zero-token row for a request that never left the process.
+        // Caught here it is `Config` — this process faulting. The check mirrors
+        // `chat_completions_url()` plus reqwest's `IntoUrl`/scheme rules, so it
+        // rejects exactly the URLs `send` would reject as builder errors, and
+        // it never echoes the URL itself (userinfo may carry a credential).
+        let endpoint = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        match reqwest::Url::parse(&endpoint) {
+            Ok(url) if url.has_host() && matches!(url.scheme(), "http" | "https") => {}
+            Ok(_) => {
+                return Err(LlmError::Config(
+                    "configured llm base_url is not an absolute http(s) URL with a host".to_owned(),
+                ));
+            }
+            Err(reason) => {
+                return Err(LlmError::Config(format!(
+                    "configured llm base_url is not a dispatchable URL: {reason}"
+                )));
+            }
+        }
         let hive_messages: Vec<HiveMessage> = messages.into_iter().map(to_hive_message).collect();
         // Translate the advertised tool defs field-by-field (anti-corruption per-field
         // pattern, NOT a serde round-trip). An empty slice crosses as an empty Vec —
@@ -321,12 +357,34 @@ fn to_hive_tool_def(tool: &ToolDefinition) -> HiveToolDefinition {
 /// label unused on a direct `OpenAICompatibleProvider` call (set to the backend tag
 /// for legibility); `model` flows through (the composition root sets the demo model,
 /// which `OpenAIConfig` also carries as the fallback).
+///
+/// Built through `PulseHive`'s constructor and `with_*` builders because the type is
+/// `#[non_exhaustive]` since 3.0.0. The builders set exactly the fields named here;
+/// every field this does not name keeps the constructor's `None`, so the SDK's own
+/// per-call timeout and retry overrides stay unset and the provider-level posture
+/// holds.
+///
+/// `reasoning_effort` crosses field by field ([`to_hive_effort`]); an unset one stays
+/// unset, and the SDK leaves an unset effort off the wire.
 fn to_hive_config(config: &LlmConfig) -> HiveLlmConfig {
-    HiveLlmConfig {
-        provider: "ollama".to_owned(),
-        model: config.model.clone(),
-        temperature: config.temperature,
-        max_tokens: config.max_tokens,
+    let hive = HiveLlmConfig::new("ollama", config.model.clone())
+        .with_temperature(config.temperature)
+        .with_max_tokens(config.max_tokens);
+    match config.reasoning_effort {
+        Some(effort) => hive.with_reasoning_effort(to_hive_effort(effort)),
+        None => hive,
+    }
+}
+
+/// Translate a `PulseTrader` [`ReasoningEffort`] onto the `PulseHive` variant of the
+/// same name. Exhaustive over OUR enum, so a variant added to it cannot compile
+/// until it is given an SDK spelling here.
+const fn to_hive_effort(effort: ReasoningEffort) -> HiveReasoningEffort {
+    match effort {
+        ReasoningEffort::Minimal => HiveReasoningEffort::Minimal,
+        ReasoningEffort::Low => HiveReasoningEffort::Low,
+        ReasoningEffort::Medium => HiveReasoningEffort::Medium,
+        ReasoningEffort::High => HiveReasoningEffort::High,
     }
 }
 
@@ -364,32 +422,110 @@ fn from_hive_usage(usage: &HiveTokenUsage) -> TokenUsage {
 
 /// Map a [`PulseHiveError`] into the `PulseTrader` port error.
 ///
-/// The thin transport only ever yields `PulseHiveError::Llm` (every error path in
-/// the OpenAI-compatible provider's `chat` uses it); it maps to
-/// [`LlmError::Provider`], preserving the message verbatim. Any other variant (not
-/// reachable on this path) also maps to `Provider` defensively, so the mapping is
-/// total and the domain never learns `PulseHive`'s error type.
+/// Since `PulseHive` 3.0.0 the provider's transport faults (timeout, connect, HTTP
+/// status, unparseable body, truncated tool call) arrive as
+/// `PulseHiveError::LlmTransport`, whose `Display` deliberately omits the provider's
+/// response body; only a request-build failure is still a bare `PulseHiveError::Llm`.
+/// The build failure a bad `[llm].base_url` would raise here is already
+/// intercepted as [`LlmError::Config`] in [`chat`](LlmProvider::chat) — the
+/// pre-dispatch check above — so a bare `Llm` reaching this map is a billed
+/// call's fault. `Llm` maps to [`LlmError::Provider`] with its message verbatim. `LlmTransport`
+/// keeps what `Display` drops — the kind as the variant (the correctable
+/// `MalformedToolCall` becomes [`LlmError::MalformedToolCall`], every other kind a
+/// `Provider`), plus the `finish_reason` and verbatim `body` folded into the detail
+/// by [`transport_detail`]. Any remaining variant maps to `Provider` by its
+/// `Display`, so the mapping is total and the domain never learns `PulseHive`'s
+/// error type.
 fn map_hive_error(error: PulseHiveError) -> LlmError {
     match error {
         PulseHiveError::Llm(message) => LlmError::Provider(message),
+        PulseHiveError::LlmTransport(transport) => {
+            let detail = transport_detail(&transport);
+            match transport.kind {
+                // The ONE correctable kind: a tool call the model can re-emit.
+                // Named by variant — not by sniffing the kind back out of a
+                // formatted string — so an SDK rename breaks this build rather
+                // than silently reverting the composer to an abort (R2/R3).
+                HiveLlmErrorKind::MalformedToolCall => LlmError::MalformedToolCall(detail),
+                _ => LlmError::Provider(detail),
+            }
+        }
         other => LlmError::Provider(other.to_string()),
     }
+}
+
+/// The byte bound on a transport error's detail (PR #169, round 3).
+///
+/// The provider controls `body` and it is unbounded, yet the detail lands
+/// verbatim in the immutable `llm_call.completion` row — and again in the
+/// coach's failure record — so it is cut here, at the boundary where it is
+/// built, rather than trusting every consumer to bound it later.
+const TRANSPORT_DETAIL_MAX_BYTES: usize = 4096;
+
+/// The explicit marker a cut detail ends in, so a reader can tell the provider
+/// body was truncated rather than complete.
+const DETAIL_TRUNCATED: &str = "[truncated]";
+
+/// The detail a transport error carries across the seam (R3): the SDK's own
+/// `Display` — `<kind> after <n> attempt(s): <message> (HTTP <status>)` — plus
+/// the two fields `Display` deliberately omits, the `finish_reason` and the
+/// verbatim provider `body`, appended so the provider's answer survives into
+/// the ledger row and the recorded failure. Whatever the body echoes — a quoted
+/// credential, request content — is scrubbed at the at-rest boundary (the
+/// decorator redacts the stored `completion`; the coach redacts the recorded
+/// `TransportFailure` detail), never here: this string is also the LIVE error
+/// the caller logs.
+fn transport_detail(error: &HiveLlmError) -> String {
+    use std::fmt::Write;
+    let mut detail = error.to_string();
+    if let Some(finish_reason) = &error.finish_reason {
+        let _ = write!(detail, " | finish_reason: {finish_reason}");
+    }
+    if let Some(body) = &error.body {
+        let _ = write!(detail, " | body: {body}");
+    }
+    bound_transport_detail(detail)
+}
+
+/// Bound the assembled detail to [`TRANSPORT_DETAIL_MAX_BYTES`], cutting at a
+/// UTF-8 char boundary and ending a cut detail in [`DETAIL_TRUNCATED`].
+///
+/// The bound exists for the provider-controlled `body` — everything before it
+/// is SDK-produced and short — but it applies to the whole string so no field
+/// added later can silently unbound it again.
+fn bound_transport_detail(detail: String) -> String {
+    if detail.len() <= TRANSPORT_DETAIL_MAX_BYTES {
+        return detail;
+    }
+    let mut end = TRANSPORT_DETAIL_MAX_BYTES - DETAIL_TRUNCATED.len();
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = detail[..end].to_owned();
+    out.push_str(DETAIL_TRUNCATED);
+    out
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        COACH_MAX_RETRIES, Duration, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES, OLLAMA_MODEL_ID,
-        OLLAMA_TIMEOUT, OpenAiCompatProvider, from_hive_response, map_hive_error, provider_config,
-        to_hive_config, to_hive_message, to_hive_tool_def,
+        COACH_MAX_RETRIES, DETAIL_TRUNCATED, Duration, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES,
+        OLLAMA_MODEL_ID, OLLAMA_TIMEOUT, OpenAiCompatProvider, TRANSPORT_DETAIL_MAX_BYTES,
+        from_hive_response, map_hive_error, provider_config, to_hive_config, to_hive_message,
+        to_hive_tool_def,
     };
-    use crate::domain::{LlmBackend, LlmConfig, LlmError, Message, ToolCall, ToolDefinition};
+    use crate::domain::{
+        LlmBackend, LlmConfig, LlmError, LlmProvider, Message, ReasoningEffort, ToolCall,
+        ToolDefinition,
+    };
     use pulsehive::error::PulseHiveError;
     use pulsehive::llm::{
-        LlmResponse as HiveLlmResponse, Message as HiveMessage, TokenUsage as HiveTokenUsage,
-        ToolCall as HiveToolCall,
+        LlmError as HiveLlmError, LlmErrorKind as HiveLlmErrorKind, LlmResponse as HiveLlmResponse,
+        Message as HiveMessage, ReasoningEffort as HiveReasoningEffort,
+        TokenUsage as HiveTokenUsage, ToolCall as HiveToolCall,
     };
+    use std::sync::{Arc, Mutex};
 
     fn sample_config() -> LlmConfig {
         LlmConfig {
@@ -397,6 +533,7 @@ mod tests {
             model: "gpt-oss:120b".to_owned(),
             temperature: 0.3,
             max_tokens: 256,
+            reasoning_effort: None,
         }
     }
 
@@ -496,20 +633,198 @@ mod tests {
         assert_eq!(hive.max_tokens, 256);
     }
 
+    /// The reasoning effort crosses the seam field by field, each of our variants onto
+    /// the SDK's same-named one (#164): a domain type at every call site, the SDK's
+    /// type only here.
+    #[test]
+    fn to_hive_config_carries_the_reasoning_effort() {
+        for (ours, theirs) in [
+            (ReasoningEffort::Minimal, HiveReasoningEffort::Minimal),
+            (ReasoningEffort::Low, HiveReasoningEffort::Low),
+            (ReasoningEffort::Medium, HiveReasoningEffort::Medium),
+            (ReasoningEffort::High, HiveReasoningEffort::High),
+        ] {
+            let config = LlmConfig {
+                reasoning_effort: Some(ours),
+                ..sample_config()
+            };
+            let hive = to_hive_config(&config);
+            assert_eq!(hive.reasoning_effort, Some(theirs));
+            assert_eq!(
+                hive.model, "gpt-oss:120b",
+                "the effort rides with the other knobs"
+            );
+            assert_eq!(hive.max_tokens, 256);
+        }
+    }
+
+    /// An UNSET effort stays unset and puts nothing on the wire, so the composer's and
+    /// `llm-check`'s requests are the bytes they were before the field existed.
+    ///
+    /// The SDK's other new request knobs stay unset too: a per-call timeout or retry
+    /// budget would override the provider-level posture, and `tool_choice` forces
+    /// nothing on this endpoint (#166). What the request BODY looks like on the wire
+    /// is asserted by the exchange below — this one pins the config mapping only.
+    #[test]
+    fn an_unset_reasoning_effort_maps_to_none_and_serializes_nothing() {
+        let hive = to_hive_config(&sample_config());
+        assert_eq!(hive.reasoning_effort, None);
+        assert!(hive.timeout_secs.is_none(), "no per-call timeout override");
+        assert!(hive.max_retries.is_none(), "no per-call retry override");
+        assert!(hive.tool_choice.is_none(), "no tool_choice (#166)");
+    }
+
+    /// The canned chat completion the [`WireSink`] answers every POST with.
+    const CANNED_COMPLETION: &str = r#"{"id":"cmpl-test","choices":[{"message":{"content":"ok","tool_calls":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+
+    /// A loopback HTTP sink: accepts connections on 127.0.0.1, answers each POST
+    /// with a canned 200 chat completion, and records the request HEAD and BODY
+    /// verbatim — so a test can read what the provider actually put on the wire
+    /// (R7), which no re-serialization of the SDK's config can show.
+    struct WireSink {
+        base_url: String,
+        /// Each accepted request as `(head, body)`.
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl WireSink {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let port = listener.local_addr().expect("local addr").port();
+            let requests: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&requests);
+            let server = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let captured = Arc::clone(&captured);
+                    std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 8192];
+                        let headers_end = loop {
+                            let Ok(n) = stream.read(&mut chunk) else {
+                                return;
+                            };
+                            if n == 0 {
+                                return; // a probe or a dropped connection — not a request.
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..headers_end]).into_owned();
+                        let content_length: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().ok())
+                                    .flatten()
+                            })
+                            .expect("a JSON POST carries Content-Length");
+                        while buf.len() - headers_end < content_length {
+                            let n = stream.read(&mut chunk).expect("read the body");
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        let body = String::from_utf8_lossy(
+                            &buf[headers_end..headers_end + content_length],
+                        )
+                        .into_owned();
+                        captured.lock().unwrap().push((head, body));
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            CANNED_COMPLETION.len(),
+                            CANNED_COMPLETION
+                        );
+                        let _ = stream.write_all(reply.as_bytes());
+                    });
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                requests,
+                server,
+            }
+        }
+    }
+
+    /// R7: "the composer's request body is unchanged" must rest on the bytes on
+    /// the wire, not on a re-serialized SDK config. Drive a REAL exchange through
+    /// the whole adapter — `to_hive_config`/`to_hive_message` into the SDK's own
+    /// request build — against the loopback sink, and read what was `POST`ed.
+    #[tokio::test]
+    async fn an_unset_reasoning_effort_puts_no_key_on_the_wire() {
+        let sink = WireSink::start();
+        let provider = OpenAiCompatProvider::with_base_url("test-key", &sink.base_url);
+
+        provider
+            .chat(vec![Message::user("hi")], &[], &sample_config())
+            .await
+            .expect("the canned 200 exchange completes");
+
+        // A SET effort lands on the wire as the SDK's snake_case tag — the other
+        // half of the same claim (the coach's `"low"` is spelled out, not absent).
+        let with_effort = LlmConfig {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..sample_config()
+        };
+        provider
+            .chat(vec![Message::user("hi")], &[], &with_effort)
+            .await
+            .expect("the second exchange completes");
+
+        let requests = sink.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "one request per chat call");
+        let (head, unset_body) = &requests[0];
+        assert!(
+            head.starts_with("POST /v1/chat/completions "),
+            "the request targets the chat-completions endpoint: {head}"
+        );
+        let unset_body: serde_json::Value =
+            serde_json::from_str(unset_body).expect("the wire body is JSON");
+        let unset = unset_body.as_object().expect("the body is an object");
+        assert!(
+            !unset.contains_key("reasoning_effort"),
+            "an unset effort sends NO key — the 2.0.2-era body is unchanged: {unset_body}"
+        );
+        // The rest of the request is the request the composer always sent.
+        assert_eq!(unset["model"], "gpt-oss:120b");
+        assert_eq!(unset["max_tokens"], 256);
+        assert!(
+            unset.get("tools").is_none(),
+            "an empty tool list is omitted: {unset_body}"
+        );
+        assert!(
+            unset.get("tool_choice").is_none(),
+            "no tool_choice (#166): {unset_body}"
+        );
+
+        let set_body: serde_json::Value =
+            serde_json::from_str(&requests[1].1).expect("the second wire body is JSON");
+        assert_eq!(
+            set_body["reasoning_effort"], "low",
+            "a set effort spells out on the wire: {set_body}"
+        );
+        drop(sink.server);
+    }
+
     #[test]
     fn from_hive_response_maps_content_usage_and_tool_calls() {
-        let hive = HiveLlmResponse {
-            content: Some("pong".to_owned()),
-            tool_calls: vec![HiveToolCall {
+        let hive = HiveLlmResponse::new(
+            Some("pong".to_owned()),
+            vec![HiveToolCall {
                 id: "c1".to_owned(),
                 name: "noop".to_owned(),
                 arguments: serde_json::json!({}),
             }],
-            usage: HiveTokenUsage {
+            HiveTokenUsage {
                 input_tokens: 11,
                 output_tokens: 4,
             },
-        };
+        );
         let response = from_hive_response(hive);
         assert_eq!(response.content.as_deref(), Some("pong"));
         assert_eq!(response.tool_calls.len(), 1);
@@ -526,6 +841,164 @@ mod tests {
             matches!(&err, LlmError::Provider(message) if message == "upstream 500"),
             "expected Provider(\"upstream 500\"), got {err:?}"
         );
+    }
+
+    /// PR #169, round 3: a configured `[llm].base_url` reqwest cannot dispatch
+    /// on must fault as [`LlmError::Config`] BEFORE the SDK ever builds a
+    /// request. The SDK raises that request-build failure only inside `send`,
+    /// as bare `PulseHiveError::Llm`, which `map_hive_error` cannot tell from
+    /// a billed post-dispatch fault — so as `Provider` it would ledger a
+    /// phantom zero-token row for a request that never left this process.
+    ///
+    /// Fully offline: a rejected URL can never produce a request, so there is
+    /// nothing to listen for.
+    #[tokio::test]
+    async fn an_invalid_configured_base_url_is_config_not_provider() {
+        for bad in [
+            // Unparsable even after the `/chat/completions` append (reqwest
+            // `IntoUrl` -> `Url::parse` fails). NB `scheme://`-alone inputs
+            // are NOT here: `https://` + the appended route normalizes to
+            // `https://chat/…` — dispatchable, and its Connect fault is
+            // correctly `Provider`.
+            "not a url",
+            "http://[::1",
+            "://no-scheme",
+            // A host-less absolute URL (`IntoUrl::has_host` fails).
+            "file:///etc/hosts",
+            // A scheme reqwest rejects at execute (`url_bad_scheme`).
+            "ftp://example.test/v1",
+        ] {
+            let provider = OpenAiCompatProvider::with_base_url("test-key", bad);
+            let err = provider
+                .chat(vec![Message::user("hi")], &[], &sample_config())
+                .await
+                .expect_err("an undispatchable base_url must error");
+            assert!(
+                matches!(err, LlmError::Config(_)),
+                "base_url {bad:?} must fault as Config (this process), got {err:?}"
+            );
+        }
+        // The coach's single-attempt ctor validates the same way.
+        let err = OpenAiCompatProvider::single_attempt_with_base_url("k", "not a url")
+            .chat(vec![Message::user("hi")], &[], &sample_config())
+            .await
+            .expect_err("the coach ctor checks its endpoint too");
+        assert!(matches!(err, LlmError::Config(_)));
+    }
+
+    /// R3: the SDK's transport error carries what its `Display` deliberately
+    /// omits — the kind, the provider `body` and the `finish_reason`. The domain
+    /// detail keeps all three so the ledger row and the coach failure still say
+    /// what the provider answered (the scrub happens at the at-rest boundary).
+    #[test]
+    fn a_transport_error_carries_its_kind_body_and_finish_reason() {
+        // The billed-HTTP-200 shape: a truncated tool-call argument string,
+        // status 200, the raw arguments in `body`, `finish_reason: length`.
+        let sdk_error = HiveLlmError::new(
+            HiveLlmErrorKind::MalformedToolCall,
+            "the arguments are not a JSON object",
+        )
+        .with_status(200)
+        .with_attempts(1)
+        .with_body("{\"name\": \"x\",")
+        .with_finish_reason("length");
+        let err = map_hive_error(PulseHiveError::llm_transport(sdk_error));
+
+        // The kind is typed, not sniffed back out of a string — the composer
+        // matches this variant to keep the failure correctable (B1).
+        let detail = match err {
+            LlmError::MalformedToolCall(detail) => detail,
+            other => panic!("expected MalformedToolCall, got {other:?}"),
+        };
+        assert!(detail.contains("malformed_tool_call"), "kind: {detail}");
+        assert!(
+            detail.contains("the arguments are not a JSON object"),
+            "message: {detail}"
+        );
+        assert!(
+            detail.contains("{\"name\": \"x\","),
+            "the provider body survives: {detail}"
+        );
+        assert!(
+            detail.contains("length"),
+            "the finish reason survives: {detail}"
+        );
+        assert!(detail.contains("200"), "the status survives: {detail}");
+    }
+
+    /// A non-correctable transport kind keeps the same detail but stays a plain
+    /// provider error — only `MalformedToolCall` gets its own variant.
+    #[test]
+    fn a_non_correctable_transport_error_keeps_its_body_as_provider() {
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body("upstream exploded");
+        let err = map_hive_error(PulseHiveError::llm_transport(sdk_error));
+        match err {
+            LlmError::Provider(detail) => {
+                assert!(detail.contains("server"), "kind: {detail}");
+                assert!(detail.contains("upstream exploded"), "body: {detail}");
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    /// PR #169, round 3: the provider controls `body` and it is unbounded, but
+    /// the detail lands verbatim in the immutable `llm_call.completion` row
+    /// (and the coach's failure record) — so the detail is cut to
+    /// [`TRANSPORT_DETAIL_MAX_BYTES`], ending in an explicit marker so a reader
+    /// can tell it was truncated rather than complete.
+    #[test]
+    fn a_huge_provider_body_is_bounded_with_a_truncation_marker() {
+        let body = "x".repeat(TRANSPORT_DETAIL_MAX_BYTES * 4);
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body(body);
+        let detail = match map_hive_error(PulseHiveError::llm_transport(sdk_error)) {
+            LlmError::Provider(detail) => detail,
+            other => panic!("expected Provider, got {other:?}"),
+        };
+        assert!(
+            detail.len() <= TRANSPORT_DETAIL_MAX_BYTES,
+            "the detail must stay within the bound: {} bytes",
+            detail.len()
+        );
+        assert!(
+            detail.ends_with(DETAIL_TRUNCATED),
+            "a cut detail must end in the explicit marker: …{}",
+            &detail[detail.len() - 64..]
+        );
+        // The SDK-produced head survives the cut.
+        assert!(detail.contains("server"), "the kind is kept: {detail}");
+
+        // A body that fits is carried verbatim — no marker, byte-for-byte.
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body("upstream exploded");
+        let detail = match map_hive_error(PulseHiveError::llm_transport(sdk_error)) {
+            LlmError::Provider(detail) => detail,
+            other => panic!("expected Provider, got {other:?}"),
+        };
+        assert!(
+            detail.contains("| body: upstream exploded"),
+            "a small body is verbatim: {detail}"
+        );
+        assert!(
+            !detail.contains(DETAIL_TRUNCATED),
+            "an uncut detail carries no marker: {detail}"
+        );
+
+        // A multi-byte char must not be split by the byte bound.
+        let body = "é".repeat(TRANSPORT_DETAIL_MAX_BYTES);
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body(body);
+        let detail = match map_hive_error(PulseHiveError::llm_transport(sdk_error)) {
+            LlmError::Provider(detail) => detail,
+            other => panic!("expected Provider, got {other:?}"),
+        };
+        assert!(detail.len() <= TRANSPORT_DETAIL_MAX_BYTES);
+        assert!(detail.ends_with(DETAIL_TRUNCATED));
     }
 
     /// One coach turn is one upstream attempt (PR #128, finding H1).

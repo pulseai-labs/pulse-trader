@@ -29,7 +29,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 anyhow = "1"
 # WI-1.1.1.02 (binance bulk ingest): HTTP client, archive decode, CSV parse,
 # async runtime, and CHECKSUM (SHA256) verification.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+# `http2` and `system-proxy` are declared EXPLICITLY: pulsehive-openai 2.0.2 used
+# to pull reqwest 0.12 with them unified on, and 3.0.0 no longer pulls reqwest at
+# all — without them the Binance client silently loses both (PR #169, F1).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "system-proxy"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
@@ -60,13 +63,13 @@ sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-toki
 # not in the engine/dep fingerprint, unlike sqlx.
 uuid = { version = "1", features = ["v4", "serde"] }
 # VS-1.3.1 work-1.03: the PulseHive OpenAI-compatible transport backing the GLM
-# adapter (README C8 / ADR-0012 thin transport). EXACT `=2.0.2` pin (OQ-B — the
-# verified head-of-line published on crates.io); `=` holds the dependency
-# determinism discipline. `features = ["openai"]` pulls the -core/-runtime/-openai/
-# -db graph (NOT -anthropic). Imported ONLY from `src/adapters/llm/glm.rs` (the
-# anti-corruption layer — AC-6). Its transitive graph must NOT bump
-# rust_decimal/ta/polars (OQ-C lockfile guard).
-pulsehive = { version = "=2.0.2", features = ["openai"] }
+# adapter (README C8 / ADR-0012 thin transport). EXACT `=3.0.0` pin (#164 — the
+# first release whose request config can carry `reasoning_effort`); `=` holds the
+# dependency determinism discipline. `features = ["openai"]` pulls the -core/-openai
+# graph only (NOT -anthropic; since 3.0.0 not -runtime/-db either). Imported ONLY
+# from `src/adapters/llm/openai_compat.rs` (the anti-corruption layer — AC-6). Its transitive
+# graph must NOT bump rust_decimal/ta/polars (OQ-C lockfile guard).
+pulsehive = { version = "=3.0.0", features = ["openai"] }
 # VS-1.3.1 work-1.03: macOS Keychain READ accessor for the GLM API key (FR-1 /
 # NFR-5, decision 5). Pinned to keyring 3.x: its `Entry::new` + `get_password`
 # bind DIRECTLY to the macOS keychain (default features), so no store-registration

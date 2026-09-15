@@ -323,7 +323,8 @@ pub enum CoachTurnError {
 /// 4. the prompt version the ledger row will carry, or the empty string when none;
 /// 5. the behaviour-affecting `LlmConfig` fields, in this fixed order: the model,
 ///    then the sampling control (`temperature`, in its round-trip decimal form),
-///    then the length control (`max_tokens`).
+///    then the length control (`max_tokens`), then the reasoning control
+///    (`reasoning_effort`, in its `{:?}` form: `None`, or e.g. `Some(Low)`).
 ///
 /// **What is deliberately NOT in it.** Credentials, base URLs, API keys and price
 /// data — none is a property of the REQUEST, and a fingerprint that changed when a
@@ -364,6 +365,10 @@ pub fn coach_request_fingerprint(
     // and lose the distinction between an integral and a fractional setting.
     feed(format!("{:?}", config.temperature).as_bytes());
     feed(config.max_tokens.to_string().as_bytes());
+    // `{:?}` spells an unset effort `None` and a set one `Some(Low)`: always one
+    // element, so the feed's shape does not depend on whether an effort was chosen
+    // (#164).
+    feed(format!("{:?}", config.reasoning_effort).as_bytes());
 
     hex::encode(hasher.finalize())
 }
@@ -632,8 +637,11 @@ where
             let call_id = provider.attempted_call_id().map_err(attribution_error)?;
             return settle_failure(sessions, session_id, call_id, failure).await;
         }
+        // A malformed tool call is a transport fault from the turn's view (PR #169,
+        // R3): one coach turn is one attempt, so the correctable retry lives only
+        // in the composer — here it is recorded, not corrected.
         Ok(Err(AttributedCallError::Provider {
-            error: LlmError::Provider(detail),
+            error: LlmError::Provider(detail) | LlmError::MalformedToolCall(detail),
             llm_call_id,
         })) => {
             // r1.s2.w4: a TRANSPORT fault is a RECORDED outcome. The error text is

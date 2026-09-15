@@ -114,6 +114,7 @@ fn config() -> LlmConfig {
         model: "gpt-oss:120b".to_owned(),
         temperature: 0.2,
         max_tokens: 1024,
+        reasoning_effort: None,
     }
 }
 

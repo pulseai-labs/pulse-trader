@@ -1213,6 +1213,7 @@ fn fixture_config() -> LlmConfig {
         model: "fixture-model".to_owned(),
         temperature: 0.0,
         max_tokens: 2_048,
+        reasoning_effort: None,
     }
 }
 
@@ -1241,6 +1242,7 @@ fn reference_digest(
     feed(config.model.as_bytes());
     feed(format!("{:?}", config.temperature).as_bytes());
     feed(config.max_tokens.to_string().as_bytes());
+    feed(format!("{:?}", config.reasoning_effort).as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -1275,7 +1277,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
 /// the fingerprint is the single-flight key, and a silent change to it silently
 /// stops two identical requests from recognizing each other.
 const PINNED_FIXTURE_DIGEST: &str =
-    "85a1d0ff148a9f03ec7b032c86979a79fb35b077d3153bc4dce1d9477b62b978";
+    "3b21dd3d26051d31e819388af6b2ea0894a365b573d2da478de665a39bb00261";
 
 #[test]
 fn the_request_fingerprint_of_a_fixed_fixture_matches_its_pinned_digest() {
@@ -1305,6 +1307,58 @@ fn the_request_fingerprint_of_a_fixed_fixture_matches_its_pinned_digest() {
         "the fixture's digest is pinned byte for byte"
     );
     assert_eq!(digest, digest.to_lowercase(), "the digest is lowercase hex");
+}
+
+/// R6: the `{:?}` feed element is the Debug spelling of the Option — the pinned
+/// fixture above carries `None`, but every REAL coach request feeds `Some(Low)`,
+/// and a `ReasoningEffort` variant rename would move every live fingerprint
+/// without touching a single pinned value. Pin the spellings by name and the
+/// `Some(Low)` fixture's digest outright.
+const PINNED_SOME_LOW_FIXTURE_DIGEST: &str =
+    "b1052ff086fb32e3318bf9853d196e27b949d4a79f5fc5d973b1f5bd86fe3efa";
+
+#[test]
+fn the_some_low_effort_spelling_and_digest_are_pinned() {
+    // The feed element for the effort is `format!("{:?}", config.reasoning_effort)`
+    // — pin both spellings so a variant rename cannot slip the fingerprint.
+    assert_eq!(
+        format!("{:?}", Option::<pulse::ReasoningEffort>::None),
+        "None",
+        "the fixture effort's feed spelling"
+    );
+    assert_eq!(
+        format!("{:?}", Some(pulse::ReasoningEffort::Low)),
+        "Some(Low)",
+        "the effort every real coach turn feeds"
+    );
+
+    let tools = fixture_tools();
+    let config = LlmConfig {
+        reasoning_effort: Some(pulse::ReasoningEffort::Low),
+        ..fixture_config()
+    };
+    let digest = coach_request_fingerprint(
+        "FIXTURE COACH PROMPT\n",
+        "FIXTURE RENDERED CONTEXT\n",
+        &tools,
+        Some("pv-fixture"),
+        &config,
+    );
+    assert_eq!(
+        digest,
+        reference_digest(
+            "FIXTURE COACH PROMPT\n",
+            "FIXTURE RENDERED CONTEXT\n",
+            &tools,
+            Some("pv-fixture"),
+            &config,
+        ),
+        "the Some(Low) feed is the same ordered length-prefixed one"
+    );
+    assert_eq!(
+        digest, PINNED_SOME_LOW_FIXTURE_DIGEST,
+        "the Some(Low) fixture's digest is pinned byte for byte"
+    );
 }
 
 /// One whole fingerprint feed, so a case below can change exactly ONE element and
@@ -1387,6 +1441,10 @@ fn the_request_fingerprint_changes_when_any_feed_element_changes() {
         (
             "the token cap",
             Feed::edited(|f| f.config.max_tokens = 2_049),
+        ),
+        (
+            "the reasoning effort",
+            Feed::edited(|f| f.config.reasoning_effort = Some(pulse::ReasoningEffort::Low)),
         ),
     ];
 

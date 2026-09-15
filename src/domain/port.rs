@@ -1481,6 +1481,7 @@ mod llm_provider_tests {
             model: "gpt-oss:120b".to_owned(),
             temperature: 0.5,
             max_tokens: 128,
+            reasoning_effort: None,
         };
         provider
             .chat(vec![Message::user("ping")], &[], &config)

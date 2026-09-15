@@ -469,7 +469,7 @@ pub use application::backtest::{
 // these through the `LlmProvider` port + the value/cost types.
 pub use domain::{
     LlmBackend, LlmCall, LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, Message,
-    ModelPrice, PriceTable, TokenUsage, ToolCall,
+    ModelPrice, PriceTable, ReasoningEffort, TokenUsage, ToolCall,
 };
 // VS-1.3.2 work-2.01: the additive tool-calling transport type (FR-23 / FR-3).
 // Mirror of the `domain/mod.rs` re-export (REQUIRED — the dead-code gotcha: the

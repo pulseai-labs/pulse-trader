@@ -258,6 +258,7 @@ async fn no_persisted_llm_call_field_contains_the_value() {
                 model: "glm-5.2".to_owned(),
                 temperature: 0.2,
                 max_tokens: 256,
+                reasoning_effort: None,
             },
         )
         .await

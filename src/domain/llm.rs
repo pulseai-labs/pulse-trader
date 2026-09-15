@@ -9,8 +9,8 @@
 //! `serde`/`serde_json`/`rust_decimal`/`thiserror`.
 //!
 //! - [`Message`] / [`ToolCall`] / [`TokenUsage`] / [`LlmResponse`] /
-//!   [`LlmConfig`] / [`LlmBackend`] — the request/response/config value types
-//!   (README C2).
+//!   [`LlmConfig`] / [`LlmBackend`] / [`ReasoningEffort`] — the
+//!   request/response/config value types (README C2).
 //! - [`LlmError`] — the dedicated, `String`-payload, serde-serializable port
 //!   error (README C3), mirroring the dedicated
 //!   [`ExchangeError`](crate::domain::exchange::ExchangeError) precedent (audit
@@ -182,6 +182,13 @@ pub struct LlmConfig {
     pub temperature: f32,
     /// The response token cap.
     pub max_tokens: u32,
+    /// The reasoning budget to ask a reasoning model for, or `None` to send nothing
+    /// and leave it to the model (#164).
+    ///
+    /// Absent from the serialized form when `None`, so a config serialized before
+    /// the field existed loads unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// The typed backend selector (README C2, FR-23 "config flag").
@@ -196,6 +203,25 @@ pub enum LlmBackend {
     /// Ollama Cloud (`gpt-oss:120b`), reached via `PulseHive`'s OpenAI-compatible
     /// transport in the 2.01 adapter (the VS-1.3.2 provider pivot from GLM).
     Ollama,
+}
+
+/// How much a reasoning model may think before it answers — the OpenAI-standard
+/// `reasoning_effort` request field (#164).
+///
+/// Owned here so the SDK's type never reaches a call site (ADR-0012 insulation); the
+/// adapter maps it field by field. Serializes as its `snake_case` tag, e.g. `"low"`,
+/// the same discipline as [`LlmBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// The least reasoning the model will do.
+    Minimal,
+    /// A low reasoning budget.
+    Low,
+    /// A balanced reasoning budget.
+    Medium,
+    /// The highest reasoning budget.
+    High,
 }
 
 /// The dedicated `LlmProvider` port error (README C3).
@@ -213,6 +239,18 @@ pub enum LlmError {
     /// error here).
     #[error("llm provider error: {0}")]
     Provider(String),
+    /// A provider fault the caller can CORRECT: the model emitted a tool call
+    /// whose arguments could not be read as a JSON object — under `PulseHive`
+    /// 3.0.0 a billed HTTP 200 with truncated or non-object `arguments` arrives
+    /// as the typed `LlmErrorKind::MalformedToolCall`, not a dispatchable call.
+    ///
+    /// Kept a variant of its own (rather than a string prefix on [`Provider`])
+    /// so the composer's correctable path matches on TYPE — an SDK rename of
+    /// the kind breaks this build instead of silently reverting to an abort.
+    /// The detail carries the kind, message, status, `finish_reason` and the
+    /// provider `body` — the fields `Display` deliberately omits.
+    #[error("llm provider error: {0}")]
+    MalformedToolCall(String),
     /// Missing / invalid configuration (e.g. an absent keychain secret bubbling
     /// up, or an unknown model in the [`PriceTable`]).
     #[error("llm config error: {0}")]
@@ -306,7 +344,10 @@ impl PriceTable {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{LlmBackend, LlmConfig, LlmError, Message, ModelPrice, PriceTable, TokenUsage};
+    use super::{
+        LlmBackend, LlmConfig, LlmError, Message, ModelPrice, PriceTable, ReasoningEffort,
+        TokenUsage,
+    };
     use rust_decimal::Decimal;
     use std::collections::HashMap;
 
@@ -355,6 +396,7 @@ mod tests {
             model: "gpt-oss:120b".to_owned(),
             temperature: 0.5,
             max_tokens: 512,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&cfg).expect("serialize LlmConfig");
         assert!(
@@ -365,10 +407,68 @@ mod tests {
         assert_eq!(cfg, back);
     }
 
+    /// An UNSET reasoning effort is not serialized, and a config serialized before
+    /// the field existed still loads with it unset (#164): the field is additive.
+    #[test]
+    fn an_unset_reasoning_effort_is_omitted_and_an_old_config_still_loads() {
+        let cfg = LlmConfig {
+            backend: LlmBackend::Ollama,
+            model: "glm-5.3-flash".to_owned(),
+            temperature: 0.0,
+            max_tokens: 16_384,
+            reasoning_effort: None,
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize LlmConfig");
+        assert!(
+            !json.contains("reasoning_effort"),
+            "an unset effort puts nothing in the serialized config: {json}"
+        );
+        let pre_effort =
+            r#"{"backend":"ollama","model":"glm-5.3-flash","temperature":0.0,"max_tokens":16384}"#;
+        let loaded: LlmConfig =
+            serde_json::from_str(pre_effort).expect("a pre-effort config still loads");
+        assert_eq!(loaded, cfg);
+    }
+
+    /// The effort serializes as its `snake_case` tag, the same discipline as
+    /// [`LlmBackend`], and round-trips on the config.
+    #[test]
+    fn reasoning_effort_serializes_as_its_snake_case_tag() {
+        for (effort, tag) in [
+            (ReasoningEffort::Minimal, "\"minimal\""),
+            (ReasoningEffort::Low, "\"low\""),
+            (ReasoningEffort::Medium, "\"medium\""),
+            (ReasoningEffort::High, "\"high\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&effort).expect("serialize ReasoningEffort"),
+                tag
+            );
+            let back: ReasoningEffort =
+                serde_json::from_str(tag).expect("deserialize ReasoningEffort");
+            assert_eq!(back, effort);
+        }
+        let cfg = LlmConfig {
+            backend: LlmBackend::Ollama,
+            model: "glm-5.3-flash".to_owned(),
+            temperature: 0.0,
+            max_tokens: 16_384,
+            reasoning_effort: Some(ReasoningEffort::Low),
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize LlmConfig");
+        assert!(
+            json.contains("\"reasoning_effort\":\"low\""),
+            "effort tag: {json}"
+        );
+        let back: LlmConfig = serde_json::from_str(&json).expect("deserialize LlmConfig");
+        assert_eq!(back, cfg);
+    }
+
     #[test]
     fn llm_error_is_serde_roundtrippable_and_displays() {
         for err in [
             LlmError::Provider("boom".to_owned()),
+            LlmError::MalformedToolCall("not an object".to_owned()),
             LlmError::Config("nope".to_owned()),
         ] {
             let json = serde_json::to_string(&err).expect("serialize LlmError");

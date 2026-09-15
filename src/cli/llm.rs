@@ -117,6 +117,7 @@ fn demo_config() -> LlmConfig {
         model: DEMO_MODEL.to_owned(),
         temperature: DEMO_TEMPERATURE,
         max_tokens: REASONING_MAX_TOKENS,
+        reasoning_effort: None,
     }
 }
 
@@ -406,6 +407,13 @@ mod tests {
         let config = demo_config();
         assert_eq!(config.backend, LlmBackend::Ollama);
         assert_eq!(config.model, DEMO_MODEL);
+    }
+
+    #[test]
+    fn the_llm_check_config_sends_no_reasoning_effort() {
+        // #164: the reasoning effort is the COACH's knob. `llm-check` leaves it unset,
+        // so its request body is the one it sent before the field existed.
+        assert_eq!(demo_config().reasoning_effort, None);
     }
 
     #[test]

@@ -1085,13 +1085,34 @@ async fn a_transport_failure_is_recorded_rather_than_returned() {
     // One call was attempted, and it is not retried (grill L3).
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
 
-    // No usable exchange came back, so this process priced nothing and the turn
-    // correlates no ledger row (audit C3). The attempt itself DID happen — NULL here
-    // records the absent correlation, not an absent call or an absent upstream
-    // charge.
+    // The call WAS billed — under #169's R1 the decorator writes the row for an
+    // errored attempt too, carrying the scrubbed detail in `completion` and the
+    // tokens that are visible (zero; a transport error exposes no usage).
+    let llm_call_id = outcome
+        .session
+        .llm_call_id
+        .clone()
+        .expect("a billed transport fault names its ledger row");
+    let (stored_detail, input_tokens, output_tokens): (Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT completion, input_tokens, output_tokens FROM llm_call WHERE id = ?1",
+    )
+    .bind(llm_call_id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .expect("read the errored call's row");
+    let stored_detail = stored_detail.expect("the errored call stores its detail");
     assert!(
-        outcome.session.llm_call_id.is_none(),
-        "a transport fault yields no LlmCall row"
+        stored_detail.contains("503"),
+        "the row keeps the provider's error text: {stored_detail}"
+    );
+    assert!(
+        !stored_detail.contains(TRANSPORT_CANARY),
+        "the row's detail is scrubbed: {stored_detail}"
+    );
+    assert_eq!(
+        (input_tokens, output_tokens),
+        (0, 0),
+        "a transport error exposes no usage — visible tokens only"
     );
 
     assert_persisted(&db, &outcome).await;

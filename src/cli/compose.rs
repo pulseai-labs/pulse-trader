@@ -355,6 +355,7 @@ pub(crate) fn compose_config(model_override: Option<&str>) -> LlmConfig {
         model: model_override.unwrap_or(COMPOSE_MODEL).to_owned(),
         temperature: COMPOSE_TEMPERATURE,
         max_tokens: COMPOSE_MAX_TOKENS,
+        reasoning_effort: None,
     }
 }
 

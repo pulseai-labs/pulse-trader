@@ -99,7 +99,8 @@ impl<P> AttributedProvider<P> {
 
     /// At most one id since `start` — the rule for a call that produced no usable
     /// response. Zero is legitimate (a timeout can strike before the decorator
-    /// writes; a transport fault produces nothing to price); several never is.
+    /// writes); one is the common case (a transport fault is still a billed call
+    /// and still writes its row, PR #169 R1); several never is.
     fn at_most_one(&self, start: usize) -> Result<Option<LlmCallId>, AttributedCallError> {
         let mut ids = self.ids_since(start)?;
         match ids.len() {
