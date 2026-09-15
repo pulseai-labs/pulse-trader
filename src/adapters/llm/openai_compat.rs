@@ -118,6 +118,14 @@ fn provider_config(
 /// manual/demo concern — MASTER-SPEC §9.4).
 pub struct OpenAiCompatProvider {
     inner: OpenAICompatibleProvider,
+    /// The configured `[llm].base_url` verbatim, kept so [`chat`](Self::chat)
+    /// can refuse an undispatchable endpoint as [`LlmError::Config`] BEFORE the
+    /// SDK builds a request (PR #169, round 3): the SDK surfaces that failure
+    /// only inside `send`, as a bare `PulseHiveError::Llm`, which the seam maps
+    /// to `Provider` — a phantom billed call for a request that never left the
+    /// process. The `PulseHive` config view sanitizes userinfo out of the URL;
+    /// the check must run on the string the SDK will actually dial.
+    base_url: String,
     /// The retry posture this provider was built with, kept ONLY under `cfg(test)`.
     ///
     /// It is evidence, not runtime state: `PulseHive`'s provider does not surface
@@ -239,8 +247,10 @@ impl OpenAiCompatProvider {
         let max_retries = config.max_retries;
         #[cfg(test)]
         let timeout_secs = config.timeout_secs;
+        let base_url = config.base_url.clone();
         Self {
             inner: OpenAICompatibleProvider::new(config),
+            base_url,
             #[cfg(test)]
             max_retries,
             #[cfg(test)]
@@ -256,6 +266,30 @@ impl LlmProvider for OpenAiCompatProvider {
         tools: &[ToolDefinition],
         config: &LlmConfig,
     ) -> Result<LlmResponse, LlmError> {
+        // Preflight the one request input we control — the configured
+        // `base_url` — BEFORE the SDK builds a request (PR #169, round 3).
+        // An undispatchable endpoint surfaces inside `send` as a bare
+        // `PulseHiveError::Llm`, which `map_hive_error` cannot tell from a
+        // billed post-dispatch fault; as `Provider` the decorator would book a
+        // phantom zero-token row for a request that never left the process.
+        // Caught here it is `Config` — this process faulting. The check mirrors
+        // `chat_completions_url()` plus reqwest's `IntoUrl`/scheme rules, so it
+        // rejects exactly the URLs `send` would reject as builder errors, and
+        // it never echoes the URL itself (userinfo may carry a credential).
+        let endpoint = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        match reqwest::Url::parse(&endpoint) {
+            Ok(url) if url.has_host() && matches!(url.scheme(), "http" | "https") => {}
+            Ok(_) => {
+                return Err(LlmError::Config(
+                    "configured llm base_url is not an absolute http(s) URL with a host".to_owned(),
+                ));
+            }
+            Err(reason) => {
+                return Err(LlmError::Config(format!(
+                    "configured llm base_url is not a dispatchable URL: {reason}"
+                )));
+            }
+        }
         let hive_messages: Vec<HiveMessage> = messages.into_iter().map(to_hive_message).collect();
         // Translate the advertised tool defs field-by-field (anti-corruption per-field
         // pattern, NOT a serde round-trip). An empty slice crosses as an empty Vec —
@@ -392,7 +426,10 @@ fn from_hive_usage(usage: &HiveTokenUsage) -> TokenUsage {
 /// status, unparseable body, truncated tool call) arrive as
 /// `PulseHiveError::LlmTransport`, whose `Display` deliberately omits the provider's
 /// response body; only a request-build failure is still a bare `PulseHiveError::Llm`.
-/// `Llm` maps to [`LlmError::Provider`] with its message verbatim. `LlmTransport`
+/// The build failure a bad `[llm].base_url` would raise here is already
+/// intercepted as [`LlmError::Config`] in [`chat`](LlmProvider::chat) — the
+/// pre-dispatch check above — so a bare `Llm` reaching this map is a billed
+/// call's fault. `Llm` maps to [`LlmError::Provider`] with its message verbatim. `LlmTransport`
 /// keeps what `Display` drops — the kind as the variant (the correctable
 /// `MalformedToolCall` becomes [`LlmError::MalformedToolCall`], every other kind a
 /// `Provider`), plus the `finish_reason` and verbatim `body` folded into the detail
@@ -772,6 +809,49 @@ mod tests {
             matches!(&err, LlmError::Provider(message) if message == "upstream 500"),
             "expected Provider(\"upstream 500\"), got {err:?}"
         );
+    }
+
+    /// PR #169, round 3: a configured `[llm].base_url` reqwest cannot dispatch
+    /// on must fault as [`LlmError::Config`] BEFORE the SDK ever builds a
+    /// request. The SDK raises that request-build failure only inside `send`,
+    /// as bare `PulseHiveError::Llm`, which `map_hive_error` cannot tell from
+    /// a billed post-dispatch fault — so as `Provider` it would ledger a
+    /// phantom zero-token row for a request that never left this process.
+    ///
+    /// Fully offline: a rejected URL can never produce a request, so there is
+    /// nothing to listen for.
+    #[tokio::test]
+    async fn an_invalid_configured_base_url_is_config_not_provider() {
+        for bad in [
+            // Unparsable even after the `/chat/completions` append (reqwest
+            // `IntoUrl` -> `Url::parse` fails). NB `scheme://`-alone inputs
+            // are NOT here: `https://` + the appended route normalizes to
+            // `https://chat/…` — dispatchable, and its Connect fault is
+            // correctly `Provider`.
+            "not a url",
+            "http://[::1",
+            "://no-scheme",
+            // A host-less absolute URL (`IntoUrl::has_host` fails).
+            "file:///etc/hosts",
+            // A scheme reqwest rejects at execute (`url_bad_scheme`).
+            "ftp://example.test/v1",
+        ] {
+            let provider = OpenAiCompatProvider::with_base_url("test-key", bad);
+            let err = provider
+                .chat(vec![Message::user("hi")], &[], &sample_config())
+                .await
+                .expect_err("an undispatchable base_url must error");
+            assert!(
+                matches!(err, LlmError::Config(_)),
+                "base_url {bad:?} must fault as Config (this process), got {err:?}"
+            );
+        }
+        // The coach's single-attempt ctor validates the same way.
+        let err = OpenAiCompatProvider::single_attempt_with_base_url("k", "not a url")
+            .chat(vec![Message::user("hi")], &[], &sample_config())
+            .await
+            .expect_err("the coach ctor checks its endpoint too");
+        assert!(matches!(err, LlmError::Config(_)));
     }
 
     /// R3: the SDK's transport error carries what its `Display` deliberately

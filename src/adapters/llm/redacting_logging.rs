@@ -813,6 +813,45 @@ mod tests {
         );
     }
 
+    /// PR #169, round 3: an invalid configured `[llm].base_url` faults in THIS
+    /// process before any request is built — so no ledger row may be written
+    /// for it. Driven through a REAL [`OpenAiCompatProvider`] (not a fake
+    /// error) so the `Config` classification asserted here is the adapter's
+    /// own: the SDK surfaces that request-build failure as a bare
+    /// `PulseHiveError::Llm`, which used to cross the seam as `Provider` and
+    /// book a phantom zero-token row for a call that never left the process.
+    #[tokio::test]
+    async fn a_pre_dispatch_base_url_fault_writes_no_row() {
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let repo = RecordingRepo {
+            saved: Arc::clone(&saved),
+        };
+        let provider = crate::adapters::llm::openai_compat::OpenAiCompatProvider::with_base_url(
+            "test-key",
+            "not a url",
+        );
+        let decorator = RedactingLoggingProvider::new(
+            provider,
+            repo,
+            FakeClock::at(1_700_000_000_000),
+            Redactor::default(),
+            prices(),
+        );
+
+        let err = decorator
+            .chat(vec![Message::user("a prompt")], &[], &config())
+            .await
+            .expect_err("the undispatchable endpoint faults in this process");
+        assert!(
+            matches!(err, LlmError::Config(_)),
+            "expected Config, got {err:?}"
+        );
+        assert!(
+            saved.lock().expect("saved lock").is_empty(),
+            "a request that never left the process must not reach the ledger"
+        );
+    }
+
     /// An inner `Config` fault is the other never-dispatched shape: a provider
     /// that discovers a missing credential at call time faults in THIS process,
     /// and nothing was billed.
