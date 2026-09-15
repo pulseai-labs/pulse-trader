@@ -454,6 +454,18 @@ fn map_hive_error(error: PulseHiveError) -> LlmError {
     }
 }
 
+/// The byte bound on a transport error's detail (PR #169, round 3).
+///
+/// The provider controls `body` and it is unbounded, yet the detail lands
+/// verbatim in the immutable `llm_call.completion` row — and again in the
+/// coach's failure record — so it is cut here, at the boundary where it is
+/// built, rather than trusting every consumer to bound it later.
+const TRANSPORT_DETAIL_MAX_BYTES: usize = 4096;
+
+/// The explicit marker a cut detail ends in, so a reader can tell the provider
+/// body was truncated rather than complete.
+const DETAIL_TRUNCATED: &str = "[truncated]";
+
 /// The detail a transport error carries across the seam (R3): the SDK's own
 /// `Display` — `<kind> after <n> attempt(s): <message> (HTTP <status>)` — plus
 /// the two fields `Display` deliberately omits, the `finish_reason` and the
@@ -472,16 +484,36 @@ fn transport_detail(error: &HiveLlmError) -> String {
     if let Some(body) = &error.body {
         let _ = write!(detail, " | body: {body}");
     }
-    detail
+    bound_transport_detail(detail)
+}
+
+/// Bound the assembled detail to [`TRANSPORT_DETAIL_MAX_BYTES`], cutting at a
+/// UTF-8 char boundary and ending a cut detail in [`DETAIL_TRUNCATED`].
+///
+/// The bound exists for the provider-controlled `body` — everything before it
+/// is SDK-produced and short — but it applies to the whole string so no field
+/// added later can silently unbound it again.
+fn bound_transport_detail(detail: String) -> String {
+    if detail.len() <= TRANSPORT_DETAIL_MAX_BYTES {
+        return detail;
+    }
+    let mut end = TRANSPORT_DETAIL_MAX_BYTES - DETAIL_TRUNCATED.len();
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = detail[..end].to_owned();
+    out.push_str(DETAIL_TRUNCATED);
+    out
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        COACH_MAX_RETRIES, Duration, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES, OLLAMA_MODEL_ID,
-        OLLAMA_TIMEOUT, OpenAiCompatProvider, from_hive_response, map_hive_error, provider_config,
-        to_hive_config, to_hive_message, to_hive_tool_def,
+        COACH_MAX_RETRIES, DETAIL_TRUNCATED, Duration, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES,
+        OLLAMA_MODEL_ID, OLLAMA_TIMEOUT, OpenAiCompatProvider, TRANSPORT_DETAIL_MAX_BYTES,
+        from_hive_response, map_hive_error, provider_config, to_hive_config, to_hive_message,
+        to_hive_tool_def,
     };
     use crate::domain::{
         LlmBackend, LlmConfig, LlmError, LlmProvider, Message, ReasoningEffort, ToolCall,
@@ -909,6 +941,64 @@ mod tests {
             }
             other => panic!("expected Provider, got {other:?}"),
         }
+    }
+
+    /// PR #169, round 3: the provider controls `body` and it is unbounded, but
+    /// the detail lands verbatim in the immutable `llm_call.completion` row
+    /// (and the coach's failure record) — so the detail is cut to
+    /// [`TRANSPORT_DETAIL_MAX_BYTES`], ending in an explicit marker so a reader
+    /// can tell it was truncated rather than complete.
+    #[test]
+    fn a_huge_provider_body_is_bounded_with_a_truncation_marker() {
+        let body = "x".repeat(TRANSPORT_DETAIL_MAX_BYTES * 4);
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body(body);
+        let detail = match map_hive_error(PulseHiveError::llm_transport(sdk_error)) {
+            LlmError::Provider(detail) => detail,
+            other => panic!("expected Provider, got {other:?}"),
+        };
+        assert!(
+            detail.len() <= TRANSPORT_DETAIL_MAX_BYTES,
+            "the detail must stay within the bound: {} bytes",
+            detail.len()
+        );
+        assert!(
+            detail.ends_with(DETAIL_TRUNCATED),
+            "a cut detail must end in the explicit marker: …{}",
+            &detail[detail.len() - 64..]
+        );
+        // The SDK-produced head survives the cut.
+        assert!(detail.contains("server"), "the kind is kept: {detail}");
+
+        // A body that fits is carried verbatim — no marker, byte-for-byte.
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body("upstream exploded");
+        let detail = match map_hive_error(PulseHiveError::llm_transport(sdk_error)) {
+            LlmError::Provider(detail) => detail,
+            other => panic!("expected Provider, got {other:?}"),
+        };
+        assert!(
+            detail.contains("| body: upstream exploded"),
+            "a small body is verbatim: {detail}"
+        );
+        assert!(
+            !detail.contains(DETAIL_TRUNCATED),
+            "an uncut detail carries no marker: {detail}"
+        );
+
+        // A multi-byte char must not be split by the byte bound.
+        let body = "é".repeat(TRANSPORT_DETAIL_MAX_BYTES);
+        let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
+            .with_status(503)
+            .with_body(body);
+        let detail = match map_hive_error(PulseHiveError::llm_transport(sdk_error)) {
+            LlmError::Provider(detail) => detail,
+            other => panic!("expected Provider, got {other:?}"),
+        };
+        assert!(detail.len() <= TRANSPORT_DETAIL_MAX_BYTES);
+        assert!(detail.ends_with(DETAIL_TRUNCATED));
     }
 
     /// One coach turn is one upstream attempt (PR #128, finding H1).
