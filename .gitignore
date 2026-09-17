@@ -22,6 +22,12 @@ CLAUDE.md
 AGENTS.md
 .codex/
 .mcp.json
+# Agent working directories — process state, not product. The superpowers
+# plugin writes its SDD ledger and review diffs here when a session runs in
+# this repo; they belong to the private AI workspace (see PUBLIC_BOUNDARY.md).
+# Found untracked-but-unignored at the Release 1 boundary audit and moved out;
+# this line keeps them out.
+.superpowers/
 
 # Local dev/testing secrets + config — NEVER committed (this is a PUBLIC repo).
 # Real GLM/Z.AI credentials live here (gitignored) + in the macOS Keychain

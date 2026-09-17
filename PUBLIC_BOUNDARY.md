@@ -7,6 +7,28 @@ states rules and patterns, never the contents of anything withheld.
 licence (PolyForm Noncommercial 1.0, see `LICENSE`) restricts commercial use;
 `COMMERCIAL.md` covers commercial terms.
 
+## Machine-checkable rules
+<!-- Executed by the release-close boundary audit
+     (close/references/boundary-audit.md) at every release close. That file
+     is authoritative for which repos run these rules, which trees they are
+     matched against, and what each arm does with a finding — do not restate
+     any of it here. -->
+never-tracked: **/.env, **/.env.*, **/*.pem, **/*.key, **/id_rsa*
+never-tracked: **/secrets/**, **/credentials.json
+never-tracked: **/SPEC.md, docs/planning/**
+never-tracked: **/.superpowers/**, **/.claude/**
+fixtures-must-be: synthetic
+
+**One known tracked exception, so the rejection is pre-written:** the env rule
+matches `.env.example`, which is tracked on purpose and holds variable *names*,
+never values — it is the "shape of every configurable input" this file
+sanctions below. A close that raises it rejects it in one sentence.
+
+## Working-tree hygiene allowlist
+<!-- Classes of untracked sensitive files known to exist in local clones,
+     named by PATTERN only — never by content description. -->
+- `.env*` (untracked, gitignored)
+
 ## What lives here
 
 - The engine, the strategy DSL, the agent and its tool definitions, the CLI, the
@@ -41,7 +63,9 @@ licence (PolyForm Noncommercial 1.0, see `LICENSE`) restricts commercial use;
   contents of a private override are not, and nothing in this repository should
   be edited to embed them.
 - **Planning and process material.** Specs, roadmaps, retrospectives, memory
-  bank and session artifacts live in the private AI workspace, not here.
+  bank and session artifacts live in the private AI workspace, not here. That
+  includes agent working directories — `.superpowers/`, `.claude/` — which are
+  process state, not product.
 
 ## The rule for contributors
 
