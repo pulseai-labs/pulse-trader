@@ -26,6 +26,8 @@ vi.mock("../bindings", () => ({
     // answers except through this mock.
     coachTurn: vi.fn(),
     coachDecide: vi.fn(),
+    // r2.s1.w4 C3: the child-vs-parent comparison, mocked on the same terms.
+    compareChildRun: vi.fn(),
   },
 }));
 
@@ -35,6 +37,7 @@ import type {
   BusError,
   CoachDecisionDto,
   CoachSessionDto,
+  CompareChildRunDto,
   HistogramBinDto,
   LibraryOverview,
   LibraryVersion,
@@ -46,6 +49,7 @@ import { resolveRoute } from "../routes";
 
 const catalogMock = vi.mocked(commands.libraryOverview);
 const runMock = vi.mocked(commands.runBacktestVersion);
+const compareMock = vi.mocked(commands.compareChildRun);
 
 // ---------------------------------------------------------------------------
 // Fixtures — shaped exactly like the generated types, values chosen to be
@@ -57,6 +61,9 @@ function catalogVersion(id: string, parentId: string | null): LibraryVersion {
     id,
     parentId,
     createdAt: "2026-08-20T10:00:00.000Z",
+    createdBy: "human",
+    agentName: null,
+    hypothesis: null,
     dsl: {
       name: "RSI Oversold",
       direction: "long",
@@ -221,13 +228,13 @@ const RUN_ERROR: BusError = {
   // can only pass through the structured `run_id` field, never prose parsing.
   code: "data",
   message: "The saved run could not be read back.",
-  run_id: "run-51234", session_id: null,
+  run_id: "run-51234", session_id: null, child_run_id: null,
 };
 
 const CATALOG_ERROR: BusError = {
   code: "internal",
   message: "The library read failed.",
-  run_id: null, session_id: null,
+  run_id: null, session_id: null, child_run_id: null,
 };
 
 /** Render + wait for the catalog to land, then click Run on the seeded
@@ -251,6 +258,7 @@ async function renderRun(
 beforeEach(() => {
   catalogMock.mockReset();
   runMock.mockReset();
+  compareMock.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1117,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
         message: "coach turn sess-elsewhere for this run has not settled yet; check again to see where it got to",
         run_id: null,
         session_id: "sess-elsewhere",
+        child_run_id: null,
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
@@ -1145,7 +1154,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
     await renderRun(SEEDED_RUN);
     coachTurnMock.mockResolvedValue({
       status: "error",
-      error: { code: "internal", message: "the provider is unreachable", run_id: null, session_id: null },
+      error: { code: "internal", message: "the provider is unreachable", run_id: null, session_id: null, child_run_id: null },
     });
     fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
 
@@ -1160,7 +1169,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
     await openRail(proposedSession());
     coachDecideMock.mockResolvedValue({
       status: "error",
-      error: { code: "validation", message: "`abc` is not a whole-number period", run_id: null, session_id: null },
+      error: { code: "validation", message: "`abc` is not a whole-number period", run_id: null, session_id: null, child_run_id: null },
     });
 
     fireEvent.click(screen.getByRole("button", { name: /^modify$/i }));
@@ -1183,6 +1192,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
         message: "coach turn sess-other for this run has not settled yet; check again",
         run_id: null,
         session_id: null,
+        child_run_id: null,
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
@@ -1251,7 +1261,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
       error: {
         code: "busy",
         message: "a coach operation for session `sess-77` is already running",
-        run_id: null, session_id: null,
+        run_id: null, session_id: null, child_run_id: null,
       },
     });
 
@@ -1270,5 +1280,174 @@ describe("BacktestLabScreen (the coach rail)", () => {
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
 
     expect(screen.queryByRole("region", { name: /coach/i })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r2.s1.w4 — C2 refetch on focus + C3 compare with parent
+// ---------------------------------------------------------------------------
+
+/** A catalog where the child version carries one persisted run — the shape the
+ * Library serves after `pulse mcp`'s `run_backtest` writes it. */
+const CHILD_CATALOG: LibraryOverview = {
+  strategies: [
+    {
+      id: "strat-alpha",
+      name: "Alpha Wave",
+      createdAt: "2026-08-01T09:00:00.000Z",
+      pinnedVersionId: null,
+      versions: [
+        catalogVersion("v-alpha-1", null),
+        {
+          ...catalogVersion("v-alpha-2", "v-alpha-1"),
+          recentRuns: [
+            {
+              id: "run-child-1",
+              createdAt: "2026-08-22T09:00:00.000Z",
+              expectancy: "20.250",
+              trades: 6,
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+const COMPARE_DTO: CompareChildRunDto = {
+  childVersionId: "v-alpha-2",
+  parentVersionId: "v-alpha-1",
+  childRunId: "run-child-1",
+  parentRunId: "run-parent-1",
+  before: PARENT_SUMMARY,
+  after: CHILD_SUMMARY,
+  inputsDiffer: true,
+  inputsNote: "child run predates recorded inputs — inputs cannot be compared",
+};
+
+const COMPARE_REFUSAL: BusError = {
+  code: "not_found",
+  message: "parent version v-alpha-1 has no run to compare against",
+  run_id: null,
+  session_id: null,
+  child_run_id: null,
+};
+
+describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
+  it("compares the selected child's latest run with its parent's, badge on when inputs differ", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CHILD_CATALOG });
+    compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
+    render(<BacktestLabScreen />);
+
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+
+    await waitFor(() => {
+      expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
+    });
+    const table = await screen.findByRole("table", { name: /before and after/i });
+    expect(table.textContent).toContain("-10.515625");
+    expect(table.textContent).toContain("20.250");
+
+    const badge = screen.getByText("inputs differ");
+    expect(badge.className).toContain("badge-inputs-differ");
+    expect(badge.getAttribute("title")).toBe(COMPARE_DTO.inputsNote);
+  });
+
+  it("renders the same table with NO badge when the runs' inputs match", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CHILD_CATALOG });
+    compareMock.mockResolvedValue({
+      status: "ok",
+      data: { ...COMPARE_DTO, inputsDiffer: false, inputsNote: null },
+    });
+    render(<BacktestLabScreen />);
+
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    const table = await screen.findByRole("table", { name: /before and after/i });
+    expect(table.textContent).toContain("20.250");
+    expect(screen.queryByText("inputs differ")).toBeNull();
+  });
+
+  it("shows the typed refusal's reason instead of the table", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CHILD_CATALOG });
+    compareMock.mockResolvedValue({ status: "error", error: COMPARE_REFUSAL });
+    render(<BacktestLabScreen />);
+
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+
+    await screen.findByText(/has no run to compare against/i);
+    expect(screen.queryByRole("table", { name: /before and after/i })).toBeNull();
+  });
+
+  it("offers no comparison for a root version, nor for a child with no run", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    render(<BacktestLabScreen />);
+
+    // v-alpha-1 is selected by default and is a ROOT — nothing to compare with.
+    // v-alpha-2 has a parent but no recent run in this catalog.
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("table", { name: /before and after/i })).toBeNull();
+    });
+    expect(compareMock).not.toHaveBeenCalled();
+  });
+
+  it("re-compares on the fresh run after Run completes", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CHILD_CATALOG });
+    compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
+    runMock.mockResolvedValue({
+      status: "ok",
+      data: { ...SEEDED_RUN, runId: "run-fresh", strategyVersionId: "v-alpha-2" },
+    });
+    render(<BacktestLabScreen />);
+
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await waitFor(() => {
+      expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
+    await screen.findByText("run-fresh");
+
+    await waitFor(() => {
+      expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-fresh" });
+    });
+  });
+});
+
+describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
+  it("refetches the catalog when the window regains focus, and keeps the selection", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    render(<BacktestLabScreen />);
+    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "v-alpha-2" } });
+    const callsOnMount = catalogMock.mock.calls.length;
+
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() => {
+      expect(catalogMock.mock.calls.length).toBeGreaterThan(callsOnMount);
+    });
+    expect(select.value).toBe("v-alpha-2");
+  });
+
+  it("falls back to the first option when the selected version is gone after a refetch", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    render(<BacktestLabScreen />);
+    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "v-alpha-2" } });
+
+    // The refetched catalog no longer carries the selected version.
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        strategies: [{ ...CATALOG.strategies[0], versions: [catalogVersion("v-alpha-1", null)] }],
+      },
+    });
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() => {
+      expect(select.value).toBe("v-alpha-1");
+    });
   });
 });

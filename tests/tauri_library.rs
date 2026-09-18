@@ -15,10 +15,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pulse::{
-    BacktestInputs, BacktestResult, BacktestRunRepository, CreatedBy, DataVersion, DesktopState,
-    EngineFingerprint, EquityCurve, FundingConfig, NewVersion, Pair, RegimeBreakdown,
-    SkippedEntryCounts, SnapshotSelection, StrategyRepository, SummaryStats, Timeframe, VersionId,
-    library_overview_core,
+    AgentHypothesis, AgentName, BacktestInputs, BacktestResult, BacktestRunRepository, CreatedBy,
+    DataVersion, DesktopState, EngineFingerprint, EquityCurve, FundingConfig, NewAgentSubmission,
+    NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, StrategyRepository,
+    SummaryStats, Timeframe, VersionId, library_overview_core,
 };
 
 /// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
@@ -308,4 +308,102 @@ async fn an_empty_database_lists_no_strategies() {
         overview.strategies.is_empty(),
         "a fresh database reads as zero strategies — the screen's empty state (G4)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// r2.s1.w4 C1 — provenance and hypothesis on the wire
+// ---------------------------------------------------------------------------
+
+/// Every version carries its `created_by` label; an `external_agent` version
+/// additionally carries the submission's normalized agent name and trimmed
+/// hypothesis. A human version carries `human` and no submission fields, and an
+/// agent version whose submission row is absent is NOT an error — the label
+/// still reads `external_agent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provenance_and_hypothesis_reach_the_wire_per_version_kind() {
+    let (state, _tmp, alpha_versions, _beta_root) = seeded_state().await;
+    let strategies = state.strategy_repo();
+    let alpha_id = strategies
+        .list_strategies(true)
+        .await
+        .expect("list strategies")
+        .into_iter()
+        .find(|s| s.name == "Alpha")
+        .expect("Alpha is seeded")
+        .id;
+
+    // An external-agent child of va3 with a submission row (the w1 audit seam).
+    let (agent_version, _submission) = strategies
+        .create_agent_version(
+            NewVersion {
+                strategy_id: alpha_id.clone(),
+                parent_version_id: Some(alpha_versions[2].clone()),
+                dsl_json: RSI_DSL.to_owned(),
+                created_by: CreatedBy::ExternalAgent,
+                creating_llm_call_ids: vec![],
+            },
+            NewAgentSubmission {
+                agent_name: AgentName::parse("Claude-Code").expect("valid agent name"),
+                hypothesis: AgentHypothesis::parse("  A wider stop cuts noise exits.  ")
+                    .expect("valid hypothesis"),
+            },
+        )
+        .await
+        .expect("create the agent version");
+
+    // An `external_agent` version WITHOUT a submission row. `create_version`
+    // does not guard `created_by`, so this is exactly the migration-era /
+    // hand-written shape the projection must tolerate rather than fail on.
+    let bare_agent = strategies
+        .create_version(NewVersion {
+            strategy_id: alpha_id,
+            parent_version_id: Some(agent_version.id.clone()),
+            dsl_json: RSI_DSL.to_owned(),
+            created_by: CreatedBy::ExternalAgent,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create a submission-less agent version");
+
+    let overview = library_overview_core(&state)
+        .await
+        .expect("the library read succeeds over the seeded db");
+    let alpha = overview
+        .strategies
+        .iter()
+        .find(|s| s.name == "Alpha")
+        .expect("Alpha is listed");
+    let wire = |id: &VersionId| {
+        alpha
+            .versions
+            .iter()
+            .find(|v| v.id == id.as_str())
+            .unwrap_or_else(|| panic!("version {} in the overview", id.as_str()))
+    };
+
+    let agent = wire(&agent_version.id);
+    assert_eq!(agent.created_by, "external_agent");
+    assert_eq!(
+        agent.agent_name.as_deref(),
+        Some("claude-code"),
+        "the submission's normalized (lowercased) name reaches the wire"
+    );
+    assert_eq!(
+        agent.hypothesis.as_deref(),
+        Some("A wider stop cuts noise exits."),
+        "the hypothesis crosses trimmed, exactly as the submission stored it"
+    );
+
+    let human = wire(&alpha_versions[0]);
+    assert_eq!(human.created_by, "human");
+    assert_eq!(human.agent_name, None);
+    assert_eq!(human.hypothesis, None);
+
+    let bare = wire(&bare_agent.id);
+    assert_eq!(bare.created_by, "external_agent");
+    assert_eq!(
+        bare.agent_name, None,
+        "a missing submission row is not an error"
+    );
+    assert_eq!(bare.hypothesis, None);
 }
