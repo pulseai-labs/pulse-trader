@@ -217,8 +217,17 @@ async fn run_tools_return_the_seeded_run() {
     assert_eq!(exported["rows"], 1);
     let path = PathBuf::from(exported["path"].as_str().expect("export path"));
     assert!(path.is_absolute(), "export path is absolute: {path:?}");
+    // Canonical-vs-canonical: `Exports::create` canonicalizes the exports dir
+    // deliberately, so a `--data-dir` under a symlinked root (macOS `/var` →
+    // `/private/var`, or a TMPDIR symlink) resolves differently from the raw
+    // fixture path. The assertion's meaning is unchanged — the export lands
+    // under the `--data-dir` the server was given.
+    let canonical_store = fixture
+        .store_dir
+        .canonicalize()
+        .expect("canonicalize the fixture --data-dir");
     assert!(
-        path.starts_with(&fixture.store_dir),
+        path.starts_with(&canonical_store),
         "export under --data-dir"
     );
     let csv = std::fs::read_to_string(&path).expect("read trades csv");
