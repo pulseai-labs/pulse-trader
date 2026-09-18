@@ -476,3 +476,40 @@ async fn unknown_arguments_are_refused_at_the_boundary() {
 
     client.cancel().await.expect("cancel session");
 }
+
+/// G5/T19: every tool that takes an identifier resolves it through the shared
+/// resolve-and-refuse seam — an unknown `version_id`/`run_id` is a field
+/// refusal, never a successful empty result. The cited case: `list_runs`
+/// returned `[]` for a version that does not exist, so a typo read as "no
+/// runs yet".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_identifiers_refuse_instead_of_returning_empty() {
+    let (_fixture, client) = seeded_fixture().await;
+
+    let err = call_err(&client, "list_runs", json!({"version_id": "ver-unknown"})).await;
+    assert_eq!(
+        err["field"], "version_id",
+        "an unknown version attaches to version_id: {err}"
+    );
+    assert!(
+        err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no such strategy version")),
+        "an unknown version is refused, not listed empty: {err}"
+    );
+
+    // The seam covers the sibling read tools — the same refusal shape on both
+    // identifier kinds.
+    let err = call_err(&client, "get_version", json!({"version_id": "ver-unknown"})).await;
+    assert_eq!(err["field"], "version_id");
+    let err = call_err(&client, "get_run", json!({"run_id": "run-unknown"})).await;
+    assert_eq!(err["field"], "run_id");
+    assert!(
+        err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no such backtest run")),
+        "an unknown run is refused, not read empty: {err}"
+    );
+
+    client.cancel().await.expect("cancel session");
+}

@@ -19,6 +19,7 @@ use rmcp::{ErrorData as McpError, tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{SqliteBacktestRunRepo, SqliteStrategyRepo};
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
@@ -31,11 +32,11 @@ use crate::application::mcp_read::{
 use crate::application::mcp_write::{
     SubmitError, SubmitRequest, SubmitTarget, submit_agent_version,
 };
-use crate::domain::strategy::VersionId;
+use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow, CompiledValue,
-    DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, StrategyRepository, Timeframe,
-    ValidationCode,
+    DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun, StrategyRepository,
+    Timeframe, ValidationCode,
 };
 
 use super::PulseMcp;
@@ -218,6 +219,44 @@ fn parse_run_id(raw: String) -> Result<BacktestRunId, String> {
     }
 }
 
+/// The shared resolve-and-refuse seam for wire-supplied `version_id` args
+/// (G5/T19): every tool that takes a strategy-version identifier loads it
+/// here, so an unknown id refuses with `{"field": "version_id"}` rather than
+/// degenerating into a successful empty result. `submit_strategy_version`'s
+/// `parent_version_id` and `run_backtest`'s `version_id` resolve inside their
+/// application use cases (`resolve_target`, `resolve_default_request`), which
+/// refuse through the same field-error shape — routing them through this
+/// helper too would only double the read.
+async fn resolve_version(
+    strategies: &SqliteStrategyRepo<SystemClock>,
+    raw: String,
+) -> Result<StrategyVersion, CallToolResult> {
+    match strategies.get_version(&VersionId::new(raw)).await {
+        Ok(Some(version)) => Ok(version),
+        Ok(None) => Err(field_error("version_id", "no such strategy version")),
+        Err(e) => Err(tool_error(e)),
+    }
+}
+
+/// The `run_id` half of the seam: [`parse_run_id`]'s single-path-component
+/// rule (F4 — the id is joined verbatim into the export path) AND existence —
+/// `get_trades`/`list_runs_for_version` return empty collections for unknown
+/// ids, so without this check a typo reads as a genuine empty result.
+async fn resolve_run(
+    runs: &SqliteBacktestRunRepo<SystemClock>,
+    raw: String,
+) -> Result<PersistedRun, CallToolResult> {
+    let run_id = match parse_run_id(raw) {
+        Ok(id) => id,
+        Err(e) => return Err(field_error("run_id", e)),
+    };
+    match runs.get_run(&run_id).await {
+        Ok(Some(run)) => Ok(run),
+        Ok(None) => Err(field_error("run_id", "no such backtest run")),
+        Err(e) => Err(tool_error(e)),
+    }
+}
+
 /// Parse one RFC 3339 window bound to epoch millis.
 fn parse_rfc3339_ms(raw: &str) -> Result<i64, String> {
     chrono::DateTime::parse_from_rfc3339(raw)
@@ -348,13 +387,13 @@ impl PulseMcp {
         Parameters(args): Parameters<GetVersionArgs>,
     ) -> Result<CallToolResult, McpError> {
         let repo = SqliteStrategyRepo::new(self.state.db.pool().clone());
-        match repo.get_version(&VersionId::new(args.version_id)).await {
-            Ok(Some(version)) => Ok(CallToolResult::structured(
-                serde_json::to_value(version_detail(&version)).unwrap_or_else(|_| json!({})),
-            )),
-            Ok(None) => Ok(field_error("version_id", "no such strategy version")),
-            Err(e) => Ok(tool_error(e)),
-        }
+        let version = match resolve_version(&repo, args.version_id).await {
+            Ok(version) => version,
+            Err(result) => return Ok(result),
+        };
+        Ok(CallToolResult::structured(
+            serde_json::to_value(version_detail(&version)).unwrap_or_else(|_| json!({})),
+        ))
     }
 
     /// List the runs recorded against a strategy version.
@@ -370,9 +409,15 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<ListRunsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let version_id = VersionId::new(args.version_id);
+        // Resolve first: `list_runs_for_version` returns `[]` for an unknown
+        // version, which a typo would silently read as "no runs yet" (G5).
+        let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
+        let version = match resolve_version(&strategies, args.version_id).await {
+            Ok(version) => version,
+            Err(result) => return Ok(result),
+        };
         let repo = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
-        let summaries = match repo.list_runs_for_version(&version_id).await {
+        let summaries = match repo.list_runs_for_version(&version.id).await {
             Ok(s) => s,
             Err(e) => return Ok(tool_error(e)),
         };
@@ -403,14 +448,12 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<GetRunArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let run_id = BacktestRunId::new(args.run_id);
         let repo = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
-        let run = match repo.get_run(&run_id).await {
-            Ok(Some(run)) => run,
-            Ok(None) => return Ok(field_error("run_id", "no such backtest run")),
-            Err(e) => return Ok(tool_error(e)),
+        let run = match resolve_run(&repo, args.run_id).await {
+            Ok(run) => run,
+            Err(result) => return Ok(result),
         };
-        let trades = match repo.get_trades(&run_id).await {
+        let trades = match repo.get_trades(&run.id).await {
             Ok(t) => t,
             Err(e) => return Ok(tool_error(e)),
         };
@@ -432,17 +475,12 @@ impl PulseMcp {
         // component AND name a real run — `get_trades` returns an empty vec
         // for an unknown id, which would otherwise write a header-only export
         // indistinguishable from a genuine zero-trade run.
-        let run_id = match parse_run_id(args.run_id) {
-            Ok(id) => id,
-            Err(e) => return Ok(field_error("run_id", e)),
-        };
         let repo = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
-        match repo.get_run(&run_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return Ok(field_error("run_id", "no such backtest run")),
-            Err(e) => return Ok(tool_error(e)),
-        }
-        let trades = match repo.get_trades(&run_id).await {
+        let run = match resolve_run(&repo, args.run_id).await {
+            Ok(run) => run,
+            Err(result) => return Ok(result),
+        };
+        let trades = match repo.get_trades(&run.id).await {
             Ok(t) => t,
             Err(e) => return Ok(tool_error(e)),
         };
@@ -450,7 +488,7 @@ impl PulseMcp {
         match self
             .state
             .exports
-            .write_csv("export_trades", run_id.as_str(), &csv)
+            .write_csv("export_trades", run.id.as_str(), &csv)
         {
             Ok(path) => Ok(CallToolResult::structured(json!({
                 "path": path,
