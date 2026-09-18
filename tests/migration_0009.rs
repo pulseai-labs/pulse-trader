@@ -127,6 +127,7 @@ async fn seed_parents(pool: &SqlitePool) {
 
     for (id, by) in [
         ("ver-ext", "\"external_agent\""),
+        ("ver-ext-2", "\"external_agent\""),
         ("ver-coach", "\"coach_llm\""),
         ("ver-human", "\"human\""),
     ] {
@@ -493,24 +494,37 @@ async fn agent_name_and_hypothesis_bounds_are_checked_in_schema() {
     .await
     .expect("the boundary lengths are storable");
 
+    // The negative rows MUST target an `external_agent` version — the kind
+    // trigger aborts a `ver-human` insert before the CHECKs are ever
+    // evaluated, so aiming them there would prove nothing. `ver-ext-2` keeps
+    // `ver-ext`'s UNIQUE(version_id) free for `sub-max` above; every other
+    // constraint on these rows is valid, so the length CHECK is the ONLY
+    // thing that can refuse them.
     for (label, name, hyp) in [
         ("an empty agent_name", "", "a hypothesis"),
         ("a 65-char agent_name", &"n".repeat(65), "a hypothesis"),
         ("an empty hypothesis", "claude-code", ""),
         ("a 2001-char hypothesis", "claude-code", &"h".repeat(2001)),
     ] {
+        let err = sqlx::query(
+            "INSERT INTO agent_submission (id, version_id, agent_name, hypothesis, created_at) \
+             VALUES (?1, 'ver-ext-2', ?2, ?3, '2026-08-29T00:00:00.000Z')",
+        )
+        .bind(format!("sub-bad-{label}"))
+        .bind(name)
+        .bind(hyp)
+        .execute(pool)
+        .await
+        .expect_err("{label} must be refused");
+        // …by the length CHECK specifically, not the kind trigger (whose
+        // RAISE message names itself) or the UNIQUE.
+        let message = match &err {
+            sqlx::Error::Database(db) => db.message().to_owned(),
+            other => panic!("{label} produced a non-database error: {other}"),
+        };
         assert!(
-            sqlx::query(
-                "INSERT INTO agent_submission (id, version_id, agent_name, hypothesis, created_at) \
-                 VALUES ('sub-bad', 'ver-human', ?1, ?2, '2026-08-29T00:00:00.000Z')",
-            )
-            .bind(name)
-            .bind(hyp)
-            .execute(pool)
-            .await
-            .is_err(),
-            "{label} must fail the CHECK (the kind trigger would also abort on \
-             ver-human, but the CHECK is evaluated over NEW regardless)"
+            message.contains("CHECK constraint failed"),
+            "{label} must fail the length CHECK, got: {message}"
         );
     }
 }
