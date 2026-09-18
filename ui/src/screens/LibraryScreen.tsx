@@ -42,7 +42,14 @@ const NODE_PAD = 8;
 const COL_W = 158;
 const ROW_H = 78;
 
-/** Which version the details pane is showing. */
+/** Which version the details pane is showing — the ids, not a payload object,
+ * so a focus refetch re-renders the pane from the fresher `overview` (F5). */
+interface SelectionId {
+  strategyId: string;
+  versionId: string;
+}
+
+/** The resolved selection the details pane renders. */
 interface Selection {
   strategyName: string;
   label: string;
@@ -53,7 +60,7 @@ export default function LibraryScreen() {
   const [overview, setOverview] = useState<LibraryOverview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [selection, setSelection] = useState<Selection | null>(null);
+  const [selected, setSelected] = useState<SelectionId | null>(null);
   const [paneHost, setPaneHost] = useState<HTMLElement | null>(null);
 
   /**
@@ -63,7 +70,9 @@ export default function LibraryScreen() {
    * `alive` is the caller's: the mount effect passes its own cleanup flag so a
    * response arriving after unmount sets no state. A refetch never clears the
    * selection — a version selected from the previous payload stays selected,
-   * and the details pane re-renders from the fresher object.
+   * and the details pane re-renders from the fresher object. A successful read
+   * also clears a stale error — a recovered backend must not leave the
+   * library hidden behind a dead read (F5).
    */
   const load = useCallback(async (alive: () => boolean = () => true): Promise<void> => {
     try {
@@ -71,6 +80,7 @@ export default function LibraryScreen() {
       if (!alive()) return;
       if (result.status === "ok") {
         setOverview(result.data);
+        setError(null);
       } else {
         setError(result.error.message);
       }
@@ -97,6 +107,22 @@ export default function LibraryScreen() {
   useEffect(() => {
     setPaneHost(document.getElementById(DETAILS_PANE_ID));
   }, []);
+
+  // F5: the selection is resolved against the FRESHEST overview — a refetch
+  // swaps `overview` and this memo re-derives the version object, so the
+  // details pane never renders a stale payload. A version absent from the
+  // fresh payload resolves to null (the hint), not a phantom.
+  const selection = useMemo<Selection | null>(() => {
+    if (selected === null || overview === null) return null;
+    const strategy = overview.strategies.find((s) => s.id === selected.strategyId);
+    const version = strategy?.versions.find((v) => v.id === selected.versionId);
+    if (strategy === undefined || version === undefined) return null;
+    return {
+      strategyName: strategy.name,
+      label: versionLabels(strategy.versions).get(version.id) ?? "?",
+      version,
+    };
+  }, [selected, overview]);
 
   if (error !== null) {
     return (
@@ -145,8 +171,10 @@ export default function LibraryScreen() {
               onToggle={() =>
                 setExpanded((current) => ({ ...current, [strategy.id]: !(current[strategy.id] === true) }))
               }
-              onSelect={(label, version) => setSelection({ strategyName: strategy.name, label, version })}
-              selectedId={selection?.version.id ?? null}
+              onSelect={(version) =>
+                setSelected({ strategyId: strategy.id, versionId: version.id })
+              }
+              selectedId={selected?.versionId ?? null}
             />
           ))}
         </div>
@@ -171,7 +199,7 @@ function StrategyCard({
   strategy: LibraryStrategy;
   expanded: boolean;
   onToggle: () => void;
-  onSelect: (label: string, version: LibraryVersion) => void;
+  onSelect: (version: LibraryVersion) => void;
   selectedId: string | null;
 }) {
   const labels = versionLabels(strategy.versions);
@@ -310,7 +338,7 @@ function VersionTree({
 }: {
   strategy: LibraryStrategy;
   labels: Map<string, string>;
-  onSelect: (label: string, version: LibraryVersion) => void;
+  onSelect: (version: LibraryVersion) => void;
   selectedId: string | null;
 }) {
   const placed = useMemo(() => layoutTree(strategy.versions), [strategy]);
@@ -376,7 +404,7 @@ function VersionTree({
               width: NODE_W,
               height: NODE_H,
             }}
-            onClick={() => onSelect(labels.get(v.id) ?? "?", v)}
+            onClick={() => onSelect(v)}
           />
         );
       })}

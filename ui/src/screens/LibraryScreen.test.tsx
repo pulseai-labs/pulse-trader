@@ -366,3 +366,109 @@ describe("LibraryScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// F5 (r2.s1 review) — the two stale-state defects in `load`
+// ---------------------------------------------------------------------------
+
+function busError(message: string) {
+  return {
+    status: "error" as const,
+    error: { code: "data", message, run_id: null, session_id: null, child_run_id: null },
+  };
+}
+
+describe("LibraryScreen (F5 — a recovered read clears the error)", () => {
+  it("a failed refetch no longer hides the library once the backend recovers", async () => {
+    // The mount read succeeds; a later focus refetch fails, then the next
+    // focus refetch succeeds — the screen must render the recovered payload,
+    // not stay hidden behind the dead read's error line.
+    overviewMock
+      .mockResolvedValueOnce({ status: "ok", data: SEEDED })
+      .mockResolvedValueOnce(busError("the store read failed"))
+      .mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+    await screen.findByText("Alpha Wave");
+
+    fireEvent(window, new Event("focus"));
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.queryByText("Alpha Wave")).toBeNull();
+
+    // `useRefetchOnFocus` throttles both signals to one call per second —
+    // jump the clock past the window so this second focus actually refetches.
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(Number.MAX_SAFE_INTEGER);
+    fireEvent(window, new Event("focus"));
+    nowSpy.mockRestore();
+
+    expect(await screen.findByText("Alpha Wave")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a mount-time failure is cleared by the first successful refetch", async () => {
+    overviewMock
+      .mockResolvedValueOnce(busError("the store read failed"))
+      .mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+    expect(await screen.findByRole("alert")).toBeTruthy();
+
+    fireEvent(window, new Event("focus"));
+    expect(await screen.findByText("Alpha Wave")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("LibraryScreen (F5 — the details pane re-renders from the fresh payload)", () => {
+  it("a focus refetch swaps the selected version's object — new stats, runs and hypothesis, never the stale row", async () => {
+    // The same tree, but v-alpha-2's payload moved on: fresh stats (so the
+    // pane's KPI + recent-run row change), an external_agent provenance and a
+    // hypothesis the stale object did not carry.
+    const fresh: LibraryOverview = {
+      strategies: [
+        {
+          ...SEEDED.strategies[0],
+          versions: [
+            SEEDED.strategies[0].versions[0],
+            version(
+              "v-alpha-2",
+              "v-alpha-1",
+              stats("+0.99R", "55.0%", 70),
+              "+0.69R",
+              "external_agent",
+              "claude-code",
+              "A wider stop cuts noise exits.",
+            ),
+            SEEDED.strategies[0].versions[2],
+          ],
+        },
+        SEEDED.strategies[1],
+      ],
+    };
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v2"));
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const inPane = within(pane);
+    // The STALE object is what the pane shows first — KPI and run row both.
+    expect((await inPane.findAllByText("+0.42R")).length).toBeGreaterThan(0);
+    expect(inPane.queryByText("Hypothesis")).toBeNull();
+
+    overviewMock.mockResolvedValue({ status: "ok", data: fresh });
+    fireEvent(window, new Event("focus"));
+
+    // The selection survives — by ID — and the pane renders the fresher
+    // object: new expectancy, new win rate, and the hypothesis block the
+    // stale object lacked.
+    await waitFor(() => {
+      expect(inPane.getAllByText("+0.99R").length).toBeGreaterThan(0);
+    });
+    expect(inPane.getByText("55.0%")).toBeTruthy();
+    expect(await inPane.findByText("A wider stop cuts noise exits.")).toBeTruthy();
+    expect(inPane.queryByText("+0.42R")).toBeNull();
+    expect(inPane.getByText("Alpha Wave")).toBeTruthy();
+    expect(inPane.getByText("v2")).toBeTruthy();
+  });
+});

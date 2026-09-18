@@ -1485,7 +1485,7 @@ function AcceptedPanel({
         </p>
       )}
       {accepted.after !== null && (
-        <CompareTable before={accepted.before} after={accepted.after as SummaryDto} />
+        <CompareTable before={accepted.before} after={accepted.after} />
       )}
       <p className="coach-session-line mono">session {session.sessionId}</p>
     </div>
