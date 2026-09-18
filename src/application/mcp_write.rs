@@ -14,8 +14,8 @@
 //!
 //! The ring's boundary rules apply unchanged: no infrastructure type appears
 //! here — the repository is the w1 port and the write path is its
-//! `create_agent_version`, so a failed validation leaves the database
-//! untouched.
+//! `create_agent_version` / `create_agent_strategy_version`, so a failed
+//! validation leaves the database untouched.
 
 use crate::domain::strategy::{
     AgentName, AgentSubmission, CreatedBy, Hypothesis, NewAgentSubmission, NewVersion, StrategyId,
@@ -30,7 +30,8 @@ pub enum SubmitTarget {
     /// A child of an existing version (the normal discovery-loop step).
     Parent(VersionId),
     /// The first version of a NEW strategy — root submits must not collide with
-    /// an existing name (`list_strategies(false)` is the authority).
+    /// an existing name (the write transaction's in-lock re-check is the
+    /// authority; `strategy.name` carries no schema-level UNIQUE).
     Root {
         /// The exact strategy name to create.
         strategy_name: String,
@@ -110,11 +111,11 @@ pub enum SubmitError {
 ///
 /// Stages run in the declared order; every failure before the write leaves the
 /// database untouched. For `Parent` the write is a single
-/// [`StrategyRepository::create_agent_version`] call. For `Root` it is
-/// `create_strategy` then `create_agent_version` — the document has already
-/// validated and compiled, so the only failure between them is storage, which
-/// surfaces as [`SubmitError::Data`] naming the orphan strategy id (a recorded
-/// limitation; the spec's Out of scope).
+/// [`StrategyRepository::create_agent_version`] call. For `Root` it is a single
+/// [`StrategyRepository::create_agent_strategy_version`] call — the name check,
+/// the strategy row, its root version and the submission commit or roll back as
+/// one transaction, so a taken name is refused under the write lock and a
+/// failed write can never leave an orphan strategy behind.
 ///
 /// # Errors
 ///
@@ -163,8 +164,9 @@ where
         message: e.to_string(),
     })?;
 
-    // 8. Write. `Parent` is one port call; `Root` is create-then-write, the
-    // `cli/compose.rs` two-call shape.
+    // 8. Write. Each arm is ONE port call — `Parent` adds the version to an
+    // existing strategy, `Root` creates strategy + version + submission
+    // atomically (the name check is inside that transaction, not a pre-read).
     let submission = NewAgentSubmission {
         agent_name,
         hypothesis,
@@ -191,31 +193,23 @@ where
             })
         }
         SubmitTarget::Root { strategy_name } => {
-            let strategy = strategies
-                .create_strategy(&strategy_name, None, &[])
+            let (strategy, version, submission) = strategies
+                .create_agent_strategy_version(&strategy_name, dsl_json, submission)
                 .await
-                .map_err(SubmitError::Data)?;
-            let strategy_id = strategy.id.clone();
-            let (version, submission) = strategies
-                .create_agent_version(
-                    NewVersion {
-                        strategy_id: strategy_id.clone(),
-                        parent_version_id: None,
-                        dsl_json,
-                        created_by: CreatedBy::ExternalAgent,
-                        creating_llm_call_ids: vec![],
+                .map_err(|e| match e {
+                    // The caller-correctable refusal keeps the wire's
+                    // `strategy_name` field path; every other repository
+                    // failure is storage.
+                    DataError::StrategyNameTaken { name } => SubmitError::Field {
+                        path: "strategy_name".to_owned(),
+                        message: format!("a strategy named {name} already exists"),
                     },
-                    submission,
-                )
-                .await
-                .map_err(|source| SubmitError::Data(DataError::Db(format!(
-                    "{source} (the strategy {} was created; its version write failed — the row is orphaned)",
-                    strategy_id.as_str()
-                ))))?;
+                    other => SubmitError::Data(other),
+                })?;
             Ok(SubmitOutcome {
                 version,
                 submission,
-                strategy_id,
+                strategy_id: strategy.id,
             })
         }
     }
@@ -224,10 +218,12 @@ where
 /// Resolve the submit target to `(strategy_id, parent_version_id)`.
 ///
 /// `Parent` requires the parent version to exist (its `strategy_id` is the
-/// child's owner). `Root` refuses an existing strategy name — `create_strategy`
-/// itself does not enforce uniqueness, so the check lives here against
-/// `list_strategies(false)` — and returns an empty `StrategyId` placeholder the
-/// write stage replaces once the row exists.
+/// child's owner). `Root` resolves to an empty `StrategyId` placeholder with
+/// no read at all: the name-uniqueness refusal is decided inside
+/// [`StrategyRepository::create_agent_strategy_version`]'s transaction — a
+/// `list_strategies` check here would be a check-then-act race (a concurrent
+/// same-named create landing between the read and the write passes the check
+/// and produces a duplicate).
 async fn resolve_target<S>(
     strategies: &S,
     target: &SubmitTarget,
@@ -247,18 +243,6 @@ where
                 })?;
             Ok((parent.strategy_id.clone(), Some(parent.id.clone())))
         }
-        SubmitTarget::Root { strategy_name } => {
-            let existing = strategies
-                .list_strategies(false)
-                .await
-                .map_err(SubmitError::Data)?;
-            if existing.iter().any(|s| s.name == *strategy_name) {
-                return Err(SubmitError::Field {
-                    path: "strategy_name".to_owned(),
-                    message: format!("a strategy named {strategy_name} already exists"),
-                });
-            }
-            Ok((StrategyId::new(""), None))
-        }
+        SubmitTarget::Root { .. } => Ok((StrategyId::new(""), None)),
     }
 }

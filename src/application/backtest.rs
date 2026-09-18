@@ -1250,6 +1250,15 @@ mod tests {
             unimplemented!("FakeStrategies only implements get_version")
         }
 
+        async fn create_agent_strategy_version(
+            &self,
+            _strategy_name: &str,
+            _dsl_json: String,
+            _submission: NewAgentSubmission,
+        ) -> Result<(Strategy, StrategyVersion, AgentSubmission), DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
         async fn get_agent_submission(
             &self,
             _version_id: &VersionId,

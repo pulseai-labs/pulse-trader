@@ -57,6 +57,19 @@ pub enum DataError {
         path: String,
     },
 
+    /// An agent root submit asked for a `strategy` name that is already taken
+    /// (r2.s1.w3). The refusal is decided inside the write transaction under
+    /// the write lock — an atomic re-check, not a `list_strategies` pre-read a
+    /// concurrent create could interleave with. `strategy.name` carries no
+    /// schema-level UNIQUE (same-named human strategies are legal), so the
+    /// check lives at this write boundary, the only place collision-freedom is
+    /// promised.
+    #[error("a strategy named {name} already exists")]
+    StrategyNameTaken {
+        /// The colliding name.
+        name: String,
+    },
+
     /// A SQLite/sqlx failure (connection, query, trigger ABORT). The sqlx error is
     /// flattened to a message so the domain stays free of `sqlx::Error` (VS-1.1.4
     /// work-1.01; sqlx lives only in `adapters::db`). A `RAISE(ABORT, ...)` from

@@ -597,6 +597,25 @@ impl StrategyRepository for InjectingStrategyRepo {
         self.inner.create_agent_version(request, submission)
     }
 
+    fn create_agent_strategy_version(
+        &self,
+        strategy_name: &str,
+        dsl_json: String,
+        submission: pulse::NewAgentSubmission,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (
+                pulse::Strategy,
+                pulse::StrategyVersion,
+                pulse::AgentSubmission,
+            ),
+            DataError,
+        >,
+    > + Send {
+        self.inner
+            .create_agent_strategy_version(strategy_name, dsl_json, submission)
+    }
+
     fn get_agent_submission(
         &self,
         version_id: &VersionId,

@@ -460,6 +460,191 @@ async fn get_agent_submission_returns_none_for_a_coach_version() {
     );
 }
 
+// ---- r2.s1.w3 (F3): the root submit is ONE atomic write ----------------------
+//
+// `create_agent_strategy_version` commits the `strategy` row, its root
+// `external_agent` version and the `agent_submission` in a single
+// `BEGIN IMMEDIATE` transaction, with the name-uniqueness check inside the
+// same lock. The old `list_strategies` + `create_strategy` +
+// `create_agent_version` sequence was a check-then-act race (two concurrent
+// submits both pass the pre-read) AND could orphan a `strategy` row when the
+// version write failed.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_root_writes_strategy_version_and_submission_as_one_commit() {
+    let (repo, pool, _tmp) = repo().await;
+
+    let (strategy, version, submission) = repo
+        .create_agent_strategy_version("AgentRoot", canonical_json(), a_submission())
+        .await
+        .expect("the triple commit succeeds");
+
+    // The three rows agree on their relationships.
+    assert_eq!(strategy.name, "AgentRoot");
+    assert!(
+        strategy.owner.is_none() && strategy.tags.is_empty(),
+        "an agent root is a bare strategy — owner/tags are human-library metadata"
+    );
+    assert_eq!(version.strategy_id, strategy.id);
+    assert_eq!(
+        version.parent_version_id, None,
+        "a root version has no parent"
+    );
+    assert_eq!(version.created_by, CreatedBy::ExternalAgent);
+    assert!(version.creating_llm_call_ids.is_empty());
+    assert_eq!(submission.version_id, version.id);
+
+    // Read-back through the defended paths agrees.
+    let fetched = repo
+        .get_version(&version.id)
+        .await
+        .unwrap()
+        .expect("the root version reads back");
+    assert_eq!(fetched, version, "the version round-trips byte-identical");
+    assert_eq!(
+        repo.get_agent_submission(&version.id)
+            .await
+            .unwrap()
+            .expect("the submission reads back"),
+        submission
+    );
+
+    // Exactly the three rows exist — nothing half-written.
+    let strategies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_submission")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((strategies, versions, submissions), (1, 1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_agent_strategy_version_refuses_a_taken_name_and_writes_nothing() {
+    let (repo, pool, _tmp) = repo().await;
+    // A same-named HUMAN strategy is legal data — and it is exactly what a
+    // root submit must not clobber.
+    repo.create_strategy("Taken", Some("alice"), &[])
+        .await
+        .unwrap();
+
+    let err = repo
+        .create_agent_strategy_version("Taken", canonical_json(), a_submission())
+        .await
+        .expect_err("a taken name is refused under the write lock");
+    match err {
+        DataError::StrategyNameTaken { name } => {
+            assert_eq!(name, "Taken", "the refusal names the colliding name");
+        }
+        other => panic!("expected DataError::StrategyNameTaken, got {other:?}"),
+    }
+
+    // The refusal rolled back cleanly: the human strategy is the ONLY row.
+    let strategies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(strategies, 1, "no second strategy row was written");
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, 0, "no orphan version row");
+    let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_submission")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(submissions, 0, "no orphan submission row");
+}
+
+/// THE race regression: N concurrent root submits on one name — exactly one
+/// commits. `BEGIN IMMEDIATE` serializes the writers; every loser's in-lock
+/// re-check sees the winner's committed `strategy` row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_name_root_writes_commit_exactly_one() {
+    const RACERS: usize = 6;
+
+    let (repo, pool, _tmp) = repo().await;
+    let repo = std::sync::Arc::new(repo);
+    let mut handles = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        let repo = repo.clone();
+        handles.push(tokio::spawn(async move {
+            repo.create_agent_strategy_version("Racer", canonical_json(), a_submission())
+                .await
+        }));
+    }
+
+    let mut committed = 0usize;
+    let mut refused = 0usize;
+    for handle in handles {
+        match handle.await.expect("racer joins") {
+            Ok(_) => committed += 1,
+            Err(DataError::StrategyNameTaken { name }) => {
+                assert_eq!(name, "Racer");
+                refused += 1;
+            }
+            Err(other) => panic!("a racer failed with neither commit nor refusal: {other:?}"),
+        }
+    }
+    assert_eq!(committed, 1, "exactly one racer commits the name");
+    assert_eq!(
+        refused,
+        RACERS - 1,
+        "every loser is refused, not duplicated"
+    );
+
+    // The committed state is one consistent triple — never two same-named
+    // strategies and never a strategy without its root version.
+    let named: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy WHERE name = 'Racer'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(named, 1, "one strategy row carries the name");
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, 1, "exactly the winner's root version");
+    let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_submission")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(submissions, 1, "exactly the winner's submission");
+}
+
+/// The document pipeline runs BEFORE the transaction: an invalid DSL leaves
+/// the store untouched (no strategy, no version, no submission).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_agent_strategy_version_refuses_an_invalid_document_before_the_store() {
+    let (repo, pool, _tmp) = repo().await;
+
+    assert!(
+        repo.create_agent_strategy_version(
+            "BadDoc",
+            "{\"schema_version\":\"1.0.0\"}".to_owned(),
+            a_submission(),
+        )
+        .await
+        .is_err(),
+        "a document that will not load/validate is refused"
+    );
+
+    for table in ["strategy", "strategy_version", "agent_submission"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a refused document wrote no {table} row");
+    }
+}
+
 // ---- binary smoke test (AC-5): clap→dispatch→repo wiring end-to-end ----------
 
 #[test]

@@ -352,6 +352,39 @@ pub trait StrategyRepository {
         submission: NewAgentSubmission,
     ) -> impl Future<Output = Result<(StrategyVersion, AgentSubmission), DataError>> + Send;
 
+    /// Create a NEW `strategy` row, its root `external_agent` version, and the
+    /// `agent_submission` audit row in ONE `BEGIN IMMEDIATE` transaction
+    /// (r2.s1.w3): either all three rows exist afterwards or none does.
+    ///
+    /// The name-uniqueness refusal is part of the atomic write — the `strategy`
+    /// name is re-read under the `BEGIN IMMEDIATE` write lock — so two
+    /// concurrent root submits can never both pass the way the `list_strategies`
+    /// pre-read followed by `create_strategy` + `create_agent_version` let them
+    /// (two writers both pass the pre-read; a failed version write orphans the
+    /// strategy). `strategy.name` carries no schema-level UNIQUE — same-named
+    /// human strategies are legal and may already exist — so the constraint is
+    /// enforced here, at the only write boundary that promises it.
+    ///
+    /// `parent_version_id` / `created_by` / `creating_llm_call_ids` are absent
+    /// by construction: a root version has no parent, writes as
+    /// [`CreatedBy::ExternalAgent`], and names no `LlmCall` rows — the same
+    /// refusals [`create_agent_version`](Self::create_agent_version) validates,
+    /// made structural. Agent roots are bare strategies: `owner` is `NULL` and
+    /// `tags` is `[]` (they are human-library metadata).
+    ///
+    /// # Errors
+    ///
+    /// - [`DataError::StrategyNameTaken`] when a `strategy` row already carries
+    ///   `strategy_name` — decided under the write lock.
+    /// - [`DataError`] on a store failure or an invalid DSL (the same
+    ///   load → validate → canonicalize pipeline `create_agent_version` runs).
+    fn create_agent_strategy_version(
+        &self,
+        strategy_name: &str,
+        dsl_json: String,
+        submission: NewAgentSubmission,
+    ) -> impl Future<Output = Result<(Strategy, StrategyVersion, AgentSubmission), DataError>> + Send;
+
     /// Fetch the `agent_submission` audit row for a version (`Ok(None)` when the
     /// version has none — e.g. a human- or coach-authored version).
     ///
@@ -1242,6 +1275,49 @@ mod repository_tests {
                 .expect("submissions lock")
                 .insert(version.id.as_str().to_owned(), submission.clone());
             Ok((version, submission))
+        }
+
+        async fn create_agent_strategy_version(
+            &self,
+            strategy_name: &str,
+            dsl_json: String,
+            submission: NewAgentSubmission,
+        ) -> Result<(Strategy, StrategyVersion, AgentSubmission), DataError> {
+            // The fake's `Mutex` plays the adapter's `BEGIN IMMEDIATE` write
+            // lock: the name check and the strategy insert happen under one
+            // hold, so the fake honours the same collision-free contract.
+            let strat = {
+                let mut strategies = self.strategies.lock().expect("strategies lock");
+                if strategies.values().any(|s| s.name == strategy_name) {
+                    return Err(DataError::StrategyNameTaken {
+                        name: strategy_name.to_owned(),
+                    });
+                }
+                let strat = Strategy {
+                    id: StrategyId::new(self.next_id("strat")),
+                    name: strategy_name.to_owned(),
+                    tags: vec![],
+                    owner: None,
+                    pinned_version_id: None,
+                    archived: false,
+                    created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                };
+                strategies.insert(strat.id.as_str().to_owned(), strat.clone());
+                strat
+            };
+            let (version, submission) = self
+                .create_agent_version(
+                    NewVersion {
+                        strategy_id: strat.id.clone(),
+                        parent_version_id: None,
+                        dsl_json,
+                        created_by: CreatedBy::ExternalAgent,
+                        creating_llm_call_ids: vec![],
+                    },
+                    submission,
+                )
+                .await?;
+            Ok((strat, version, submission))
         }
 
         fn get_agent_submission(
