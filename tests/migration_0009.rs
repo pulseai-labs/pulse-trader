@@ -111,11 +111,15 @@ async fn db_at_0009() -> (TempDir, Db) {
     (tmp, db)
 }
 
-/// The FK parents every new shape needs: one strategy, its versions in the three
-/// provenance forms the kind trigger distinguishes, and the runs claims attach
-/// to. `created_by` carries the serde-JSON form the adapter writes
-/// (`"external_agent"` WITH its quotes) — the `agent_submission_version_kind`
-/// trigger compares against exactly that literal.
+/// The FK parents every new shape needs: one strategy, its versions in the two
+/// 0008-representable provenance forms the kind trigger distinguishes, and the
+/// runs claims attach to. `created_by` carries the serde-JSON form the adapter
+/// writes (WITH its quotes) — the `agent_submission_version_kind` trigger
+/// compares against exactly that literal.
+///
+/// The `external_agent` versions are a separate seed: a BARE one (no
+/// `agent_submission`) is a state the 0009 DOWN migration now refuses, so only
+/// tests that need them opt in via [`seed_agent_versions`].
 async fn seed_parents(pool: &SqlitePool) {
     sqlx::query(
         "INSERT INTO strategy (id, name, tags, archived, created_at) \
@@ -125,12 +129,7 @@ async fn seed_parents(pool: &SqlitePool) {
     .await
     .expect("seed strategy");
 
-    for (id, by) in [
-        ("ver-ext", "\"external_agent\""),
-        ("ver-ext-2", "\"external_agent\""),
-        ("ver-coach", "\"coach_llm\""),
-        ("ver-human", "\"human\""),
-    ] {
+    for (id, by) in [("ver-coach", "\"coach_llm\""), ("ver-human", "\"human\"")] {
         sqlx::query(
             "INSERT INTO strategy_version \
              (id, strategy_id, parent_version_id, dsl_schema_version, dsl, dsl_original, \
@@ -148,6 +147,26 @@ async fn seed_parents(pool: &SqlitePool) {
 
     for run in ["run-1", "run-2"] {
         seed_run(pool, run, "ver-human").await;
+    }
+}
+
+/// Two `external_agent` versions — `ver-ext` and `ver-ext-2` — written the way
+/// the generic `create_version` path can: BARE, with no `agent_submission`
+/// row. A state 0008 cannot deserialize, so the down migration refuses it.
+async fn seed_agent_versions(pool: &SqlitePool) {
+    for id in ["ver-ext", "ver-ext-2"] {
+        sqlx::query(
+            "INSERT INTO strategy_version \
+             (id, strategy_id, parent_version_id, dsl_schema_version, dsl, dsl_original, \
+              version_hash, created_by, creating_llm_call_ids, created_at) \
+             VALUES (?1, 'strat-1', NULL, '1.0.0', '{}', '{}', ?2, '\"external_agent\"', '[]', \
+                     '2026-08-29T00:00:00.000Z')",
+        )
+        .bind(id)
+        .bind(format!("hash-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed external_agent strategy_version");
     }
 }
 
@@ -258,6 +277,10 @@ async fn migration_0009_preserves_every_pre_0009_row() {
     let (_tmp, _path, db) = db_at_0008().await;
     let pool = db.pool();
     seed_parents(pool).await;
+    // An `external_agent` row written around the adapter is a legitimate
+    // pre-0009 row: forward migration must carry it unchanged (it is the DOWN
+    // direction that cannot represent it).
+    seed_agent_versions(pool).await;
 
     // One pending claim per run — the most pending rows a 0009-conformant db
     // may ever hold — plus a settled one, across two runs.
@@ -411,6 +434,7 @@ async fn migration_0009_refuses_a_db_with_two_pending_claims_on_one_run() {
 async fn an_agent_submission_belongs_only_to_an_external_agent_version() {
     let (_tmp, db) = db_at_0009().await;
     let pool = db.pool();
+    seed_agent_versions(pool).await;
 
     insert_submission(
         pool,
@@ -455,6 +479,7 @@ async fn an_agent_submission_belongs_only_to_an_external_agent_version() {
 async fn an_agent_submission_is_immutable_once_written() {
     let (_tmp, db) = db_at_0009().await;
     let pool = db.pool();
+    seed_agent_versions(pool).await;
     insert_submission(pool, "sub-1", "ver-ext", "claude-code", "a hypothesis")
         .await
         .expect("seed");
@@ -480,6 +505,7 @@ async fn an_agent_submission_is_immutable_once_written() {
 async fn agent_name_and_hypothesis_bounds_are_checked_in_schema() {
     let (_tmp, db) = db_at_0009().await;
     let pool = db.pool();
+    seed_agent_versions(pool).await;
 
     // Boundaries land; just outside them aborts.
     let name_64 = "a".repeat(64);
@@ -783,18 +809,31 @@ async fn a_pending_claim_alone_does_not_block_the_downgrade() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lossy_downgrade_is_refused_transactionally() {
     // Each seed is a state 0008 cannot represent. The down migration must refuse
-    // the WHOLE downgrade rather than drop the row that carries the state.
-    for (label, seed) in [
-        ("an agent submission", LossySeed::AgentSubmission),
-        ("a windowed run", LossySeed::WindowedRun),
+    // the WHOLE downgrade rather than drop the row that carries the state — and
+    // the refusal's message must name THAT seed's guard, not a sibling's.
+    for (label, seed, reason) in [
+        (
+            "an agent submission",
+            LossySeed::AgentSubmission,
+            "agent_submission",
+        ),
+        (
+            "a bare external_agent version",
+            LossySeed::BareAgentVersion,
+            "external_agent",
+        ),
+        ("a windowed run", LossySeed::WindowedRun, "date window"),
     ] {
         let (_tmp, db) = db_at_0009().await;
         let pool = db.pool();
         seed.apply(pool).await;
 
+        let err = undo_to(pool, 8)
+            .await
+            .expect_err("{label} cannot be represented under 0008, so the downgrade must refuse");
         assert!(
-            undo_to(pool, 8).await.is_err(),
-            "{label} cannot be represented under 0008, so the downgrade must refuse"
+            err.to_string().contains(reason),
+            "{label}: the refusal names its own guard, got: {err}"
         );
 
         // Transactional: the row that blocked the downgrade is untouched, the
@@ -814,6 +853,16 @@ async fn a_lossy_downgrade_is_refused_transactionally() {
                     .await
                     .unwrap();
                 assert_eq!(n, 1, "{label}: the submission row is not dropped");
+            }
+            LossySeed::BareAgentVersion => {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM strategy_version \
+                     WHERE created_by = '\"external_agent\"'",
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                assert_eq!(n, 2, "{label}: the external_agent versions survive");
             }
             LossySeed::WindowedRun => {
                 let bounds: (Option<i64>, Option<i64>) = sqlx::query_as(
@@ -840,6 +889,7 @@ async fn a_lossy_downgrade_is_refused_transactionally() {
 #[derive(Clone, Copy)]
 enum LossySeed {
     AgentSubmission,
+    BareAgentVersion,
     WindowedRun,
 }
 
@@ -847,9 +897,13 @@ impl LossySeed {
     async fn apply(&self, pool: &SqlitePool) {
         match self {
             Self::AgentSubmission => {
+                seed_agent_versions(pool).await;
                 insert_submission(pool, "sub-1", "ver-ext", "claude-code", "a hypothesis")
                     .await
                     .expect("seed");
+            }
+            Self::BareAgentVersion => {
+                seed_agent_versions(pool).await;
             }
             Self::WindowedRun => {
                 insert_run_with_window(

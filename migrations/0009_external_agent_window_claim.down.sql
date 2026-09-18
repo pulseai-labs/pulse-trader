@@ -2,11 +2,16 @@
 --
 -- ADR-0018 asks a down migration to be TRUTHFUL, which for this one means it
 -- has to answer "can 0008 hold what is in these tables?" before it does
--- anything. Two states say no:
+-- anything. Three states say no:
 --
 --   * an `agent_submission` row — 0008 has no table for the external-agent
 --     audit record, and dropping it would erase the only durable link between
 --     an `external_agent` version and the agent + hypothesis that produced it;
+--   * a `strategy_version` row with `created_by = '"external_agent"'` — the
+--     0008-era `CreatedBy` enum has no such variant, so a downgraded binary
+--     cannot deserialize the row at all. The generic `create_version` path
+--     can write a BARE external-agent version (no `agent_submission`), so the
+--     submission check alone does not cover this state;
 --   * a `backtest_run` row carrying `window_from_ms`/`window_to_ms` — 0008 has
 --     no column for the window the run consumed, and NULLing it would falsify
 --     the run's recorded inputs (the same invented-fact argument that kept
@@ -35,6 +40,12 @@ BEGIN
   SELECT RAISE(ABORT, 'migration 0009 down: an agent_submission row exists and 0008 has no table for it; refusing rather than discarding the external-agent audit record');
 END;
 
+CREATE TRIGGER _0009_down_guard_agent_version BEFORE INSERT ON _0009_down_guard
+WHEN NEW.reason = 'external_agent_version'
+BEGIN
+  SELECT RAISE(ABORT, 'migration 0009 down: a strategy_version has created_by=''external_agent'' and the 0008 binary cannot deserialize it; refusing rather than stranding a row it cannot read');
+END;
+
 CREATE TRIGGER _0009_down_guard_window BEFORE INSERT ON _0009_down_guard
 WHEN NEW.reason = 'windowed_run'
 BEGIN
@@ -45,10 +56,15 @@ INSERT INTO _0009_down_guard (reason)
 SELECT 'agent_submission' FROM agent_submission LIMIT 1;
 
 INSERT INTO _0009_down_guard (reason)
+SELECT 'external_agent_version' FROM strategy_version
+WHERE created_by = '"external_agent"' LIMIT 1;
+
+INSERT INTO _0009_down_guard (reason)
 SELECT 'windowed_run' FROM backtest_run
 WHERE window_from_ms IS NOT NULL OR window_to_ms IS NOT NULL LIMIT 1;
 
 DROP TRIGGER _0009_down_guard_submission;
+DROP TRIGGER _0009_down_guard_agent_version;
 DROP TRIGGER _0009_down_guard_window;
 DROP TABLE _0009_down_guard;
 
