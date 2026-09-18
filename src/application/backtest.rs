@@ -48,10 +48,10 @@ use crate::domain::backtest::EquityCurve;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
-    CandleSeriesRepository, DataError, DataVersion, EngineFingerprint, ExchangeAdapter,
-    ExchangeError, FundingConfig, Pair, PersistedRun, PreparedBacktest, SnapshotSelection,
-    StrategyRepository, SymbolFilters, Timeframe, Trade, ValidatedDsl, ValidationErrors, compile,
-    validate,
+    CandleSeriesRepository, CandleWindow, DataError, DataVersion, EngineFingerprint,
+    ExchangeAdapter, ExchangeError, FundingConfig, Pair, PersistedRun, PreparedBacktest,
+    SnapshotSelection, StrategyRepository, SymbolFilters, Timeframe, Trade, ValidatedDsl,
+    ValidationErrors, compile, validate,
 };
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
@@ -60,6 +60,18 @@ use crate::adapters::backtest::{BacktestConfig, run_backtest};
 // Request
 // ---------------------------------------------------------------------------
 
+/// The exact snapshots a run loads instead of `HEAD` (r2.s1.w3, a14): the
+/// `data_version`s an earlier persisted run recorded, so a follow-up run is
+/// comparable with the run it iterates on rather than whatever `HEAD` happens
+/// to point at now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPins {
+    /// The primary snapshot's `data_version`.
+    pub primary: DataVersion,
+    /// The HTF snapshot's `data_version`, when the source run used one.
+    pub htf: Option<DataVersion>,
+}
+
 /// What a caller asks for: one persisted version, one pair, one primary timeframe,
 /// an optional higher timeframe, and the exact cost configuration.
 ///
@@ -67,6 +79,12 @@ use crate::adapters::backtest::{BacktestConfig, run_backtest};
 /// costs); the CLI builds one from its flags. Neither can express a strategy the
 /// database does not hold — the flow is version-id-only by construction, which is
 /// what keeps every run attributable to an immutable `StrategyVersion` (ADR-0010).
+///
+/// r2.s1.w3 adds two optional refinements: `snapshots` pins the exact
+/// `data_version`s to load instead of `HEAD` (the resolver's output), and
+/// `window` slices both series to `[from_ms, to_ms)` on `open_time` at load
+/// time — indicators warm up inside the window and the window is recorded on
+/// the run's `inputs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacktestRequest {
     /// The immutable strategy version to run.
@@ -79,6 +97,11 @@ pub struct BacktestRequest {
     pub htf_timeframe: Option<Timeframe>,
     /// Starting equity and the cost model, exactly as the engine will receive it.
     pub config: BacktestConfig,
+    /// Exact `data_version`s to load instead of `HEAD`; `None` loads `HEAD`.
+    pub snapshots: Option<SnapshotPins>,
+    /// The half-open candle window `[from_ms, to_ms)` to slice both series to;
+    /// `None` runs the whole snapshot.
+    pub window: Option<CandleWindow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +245,25 @@ pub enum BacktestAppError {
         expected: i64,
         /// What was found instead.
         found: i64,
+    },
+
+    /// A windowed run's PRIMARY slice came up empty: no candle's `open_time`
+    /// fell inside `[from_ms, to_ms)` (r2.s1.w3). Refused before the engine
+    /// runs — an empty window is a bad argument, not a zero-trade run, and no
+    /// row is written.
+    #[error(
+        "windowed backtest on {pair} {} has no candles in [{from_ms}, {to_ms}) — the window is empty",
+        timeframe.binance_interval()
+    )]
+    WindowEmpty {
+        /// The pair whose sliced primary series was empty.
+        pair: Pair,
+        /// The primary timeframe that was sliced.
+        timeframe: Timeframe,
+        /// The inclusive lower bound (epoch ms).
+        from_ms: i64,
+        /// The exclusive upper bound (epoch ms).
+        to_ms: i64,
     },
 
     /// Symbol filters could not be resolved.
@@ -733,22 +775,48 @@ where
     let primary_tf = request.primary_timeframe;
     let htf_tf = request.htf_timeframe;
     let config = request.config;
+    let pins = request.snapshots.clone();
+    let window = request.window.clone();
 
     let joined = tokio::task::spawn_blocking(move || -> Result<EngineOutput, BacktestAppError> {
-        let primary = load_head_series(&candles, &pair, primary_tf, PreSaveStage::PrimarySnapshot)?;
-        let htf = match htf_tf {
-            Some(tf) => Some(load_head_series(
+        let mut primary = load_series(
+            &candles,
+            &pair,
+            primary_tf,
+            pins.as_ref().map(|p| &p.primary),
+            PreSaveStage::PrimarySnapshot,
+        )?;
+        let mut htf = match htf_tf {
+            Some(tf) => Some(load_series(
                 &candles,
                 &pair,
                 tf,
+                pins.as_ref().and_then(|p| p.htf.as_ref()),
                 PreSaveStage::HtfSnapshot,
             )?),
             None => None,
         };
+        // ruling 1 (r2.s1.w3): slice BOTH series to `[from_ms, to_ms)` AFTER the
+        // whole-snapshot gap check. The engine only ever sees the window's
+        // candles, so indicators warm up inside the window and nothing forces a
+        // flat at `to`. An empty PRIMARY slice is a refusal — an empty HTF
+        // slice is legal (every aligned HTF bar is simply `None`).
+        if let Some(w) = &window {
+            primary = primary.windowed(w);
+            if primary.candles.is_empty() {
+                return Err(BacktestAppError::WindowEmpty {
+                    pair: pair.clone(),
+                    timeframe: primary_tf,
+                    from_ms: w.from_ms,
+                    to_ms: w.to_ms,
+                });
+            }
+            htf = htf.map(|series| series.windowed(w));
+        }
         let filters: SymbolFilters = exchange.symbol_filters(&pair)?;
         // Provenance from the series the engine is ABOUT to consume, so the
         // prepared run and the row it becomes name the same snapshots.
-        let inputs = inputs_from_run(&primary, htf.as_ref(), &config);
+        let inputs = inputs_from_run(&primary, htf.as_ref(), &config, window);
         let prepared = prepare_backtest(
             &validated,
             inputs,
@@ -773,24 +841,42 @@ where
     }
 }
 
-/// Load one `HEAD` snapshot and refuse it if the engine cannot interpret it.
-fn load_head_series<C>(
+/// Load one snapshot — the pinned `data_version` when `pin` names one, else
+/// `HEAD` — and refuse it if the engine cannot interpret it.
+///
+/// The pinned branch is the [`coach_decision`](crate::application::coach_decision)
+/// `load_named_snapshot` shape: a run that iterates on a prior run replays the
+/// exact snapshots that run recorded, never whatever `HEAD` points at now. Gap
+/// validation stays on the WHOLE snapshot either way (unchanged; `r2.s3` owns
+/// fold-aware handling) — the window slice happens after this function returns.
+fn load_series<C>(
     candles: &C,
     pair: &Pair,
     timeframe: Timeframe,
+    pin: Option<&DataVersion>,
     stage: PreSaveStage,
 ) -> Result<CandleSeries, BacktestAppError>
 where
     C: CandleSeriesRepository,
 {
-    let series = candles
-        .load_head(pair, timeframe)
-        .map_err(|source| BacktestAppError::PreSaveRead { stage, source })?
-        .ok_or_else(|| BacktestAppError::SnapshotMissing {
-            pair: pair.clone(),
-            timeframe,
-        })?
-        .series;
+    let series = match pin {
+        Some(version) => {
+            candles
+                .load_version(pair, timeframe, version)
+                .map_err(|source| BacktestAppError::PreSaveRead { stage, source })?
+                .series
+        }
+        None => {
+            candles
+                .load_head(pair, timeframe)
+                .map_err(|source| BacktestAppError::PreSaveRead { stage, source })?
+                .ok_or_else(|| BacktestAppError::SnapshotMissing {
+                    pair: pair.clone(),
+                    timeframe,
+                })?
+                .series
+        }
+    };
     // Structural corruption and spacing gaps are both refusals: the engine and the
     // indicator stream assume a contiguous series and neither detects nor fills a
     // hole, so a gapped snapshot would skew signals, holding periods and funding
@@ -811,10 +897,14 @@ where
 
 /// Provenance from the series the engine consumed and the config it ran with — no
 /// second `HEAD` read, which would record what is current rather than what ran.
+/// The `window` is the caller's request, recorded verbatim: the sliced series
+/// still names the whole snapshot's `data_version`, so the window columns are
+/// what distinguish this run's coverage from an unwindowed one.
 fn inputs_from_run(
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
     config: &BacktestConfig,
+    window: Option<CandleWindow>,
 ) -> BacktestInputs {
     BacktestInputs {
         pair: primary.pair.clone(),
@@ -829,9 +919,124 @@ fn inputs_from_run(
         taker_fee_bps: config.taker_fee_bps,
         slippage_bps: config.slippage_bps,
         funding: FundingConfig::SnapshotRates,
-        // r2.s1.w1: no run path consumes a candle window yet — the engine still
-        // reads the whole snapshot, which is exactly what `None` records.
-        window: None,
+        window,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The a14 default-input resolver (r2.s1.w3)
+// ---------------------------------------------------------------------------
+
+/// One resolver for "what should this version run with?" — the MCP
+/// `run_backtest` tool and the desktop `run_backtest_version` command call the
+/// same function, so a defaulted run resolves identically on both surfaces.
+///
+/// Precedence: the version's **parent's** latest persisted run → the version's
+/// own latest persisted run → the application defaults (`BTCUSDT`, `M15`, `H4`,
+/// `BacktestConfig::default()`, `HEAD`). A run whose `inputs` is `None` (a
+/// pre-0006 row) is skipped, never an error. From a run the resolver takes the
+/// pair, the timeframes, the taker/slippage bps and [`SnapshotPins`] naming the
+/// run's exact `data_version`s — an agent run is then comparable with the run
+/// it iterates on. `window` is NEVER inherited: it is always the caller's.
+///
+/// # Errors
+///
+/// [`BacktestAppError::VersionNotFound`] when the version does not exist, and
+/// [`BacktestAppError::PreSaveRead`] when a repository read fails.
+pub async fn resolve_default_request<S, R>(
+    strategies: &S,
+    runs: &R,
+    version_id: &VersionId,
+    window: Option<CandleWindow>,
+) -> Result<BacktestRequest, BacktestAppError>
+where
+    S: StrategyRepository,
+    R: BacktestRunRepository,
+{
+    let version = strategies
+        .get_version(version_id)
+        .await
+        .map_err(|source| BacktestAppError::PreSaveRead {
+            stage: PreSaveStage::StrategyVersion,
+            source,
+        })?
+        .ok_or_else(|| BacktestAppError::VersionNotFound(version_id.clone()))?;
+
+    let inherited = match version.parent_version_id.as_ref() {
+        Some(parent_id) => match latest_run_inputs(runs, parent_id).await? {
+            found @ Some(_) => found,
+            None => latest_run_inputs(runs, version_id).await?,
+        },
+        None => latest_run_inputs(runs, version_id).await?,
+    };
+
+    Ok(match inherited {
+        Some(inputs) => request_from_inputs(version_id, inputs, window),
+        None => BacktestRequest {
+            version_id: version_id.clone(),
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: Some(Timeframe::H4),
+            config: BacktestConfig::default(),
+            snapshots: None,
+            window,
+        },
+    })
+}
+
+/// The version's latest persisted run's `inputs`, when it has a usable row.
+/// `inputs: None` (a pre-0006 row) reads the same as no run at all — skipped,
+/// never an error.
+async fn latest_run_inputs<R>(
+    runs: &R,
+    version_id: &VersionId,
+) -> Result<Option<BacktestInputs>, BacktestAppError>
+where
+    R: BacktestRunRepository,
+{
+    let run = runs
+        .latest_run_for_version(version_id)
+        .await
+        .map_err(|source| BacktestAppError::PreSaveRead {
+            stage: PreSaveStage::PriorRun,
+            source,
+        })?;
+    Ok(run.and_then(|run| run.inputs))
+}
+
+/// Build the request off a prior run's recorded inputs: pair, timeframes,
+/// taker/slippage bps, and `SnapshotPins` naming the exact `data_version`s the
+/// prior run consumed. `starting_equity` stays the app default — comparability
+/// lives in the snapshots and the cost model, and the spec enumerates exactly
+/// these fields. The window is the caller's, never the prior run's.
+fn request_from_inputs(
+    version_id: &VersionId,
+    inputs: BacktestInputs,
+    window: Option<CandleWindow>,
+) -> BacktestRequest {
+    let BacktestInputs {
+        pair,
+        primary,
+        htf,
+        taker_fee_bps,
+        slippage_bps,
+        ..
+    } = inputs;
+    BacktestRequest {
+        version_id: version_id.clone(),
+        pair,
+        primary_timeframe: primary.timeframe,
+        htf_timeframe: htf.as_ref().map(|selection| selection.timeframe),
+        config: BacktestConfig {
+            taker_fee_bps,
+            slippage_bps,
+            ..BacktestConfig::default()
+        },
+        snapshots: Some(SnapshotPins {
+            primary: primary.data_version,
+            htf: htf.map(|selection| selection.data_version),
+        }),
+        window,
     }
 }
 
@@ -840,10 +1045,26 @@ fn inputs_from_run(
 mod tests {
     use super::{
         BacktestAppError, HISTOGRAM_BIN_COUNT, HISTOGRAM_BIN_WIDTH_STR, ReadBackFailure,
-        ReadBackStage, histogram_bin_width, project_histogram,
+        ReadBackStage, SnapshotPins, histogram_bin_width, project_histogram,
+        resolve_default_request,
     };
-    use crate::domain::{BacktestRunId, DataError};
+    use crate::adapters::backtest::BacktestConfig;
+    use crate::domain::strategy::{
+        AgentSubmission, CreatedBy, NewAgentSubmission, NewVersion, Strategy, StrategyId,
+        StrategyVersion, VersionId,
+    };
+    use crate::domain::{
+        BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CandleWindow,
+        Comparator, Condition, DataError, DataVersion, Direction, ExitRule, FundingConfig,
+        IndicatorSpec, Pair, PersistedRun, RegimeBreakdown, RiskParams, RunSummary, SchemaVersion,
+        SkippedEntryCounts, SnapshotSelection, StrategyDsl, StrategyRepository, SummaryStats,
+        SweepableValue, Timeframe, Trade, ValueSource,
+    };
+    use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::sync::Mutex;
 
     fn d(s: &str) -> Decimal {
         s.parse().unwrap()
@@ -904,5 +1125,417 @@ mod tests {
             pre_save.persisted_run_id().is_none(),
             "a pre-save failure has no row to name"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_default_request — local fakes + precedence tests
+    // -----------------------------------------------------------------------
+    //
+    // In-memory `StrategyRepository`/`BacktestRunRepository` stubs in the
+    // `port.rs` test-mod style: only the reads the resolver performs are real;
+    // every other method is an `unimplemented!` stub.
+
+    /// Minimal lookup over `get_version` — the only `StrategyRepository` read
+    /// `resolve_default_request` performs.
+    #[derive(Default)]
+    struct FakeStrategies {
+        versions: Mutex<HashMap<String, StrategyVersion>>,
+    }
+
+    impl FakeStrategies {
+        fn insert(&self, version: StrategyVersion) {
+            self.versions
+                .lock()
+                .unwrap()
+                .insert(version.id.as_str().to_owned(), version);
+        }
+    }
+
+    impl StrategyRepository for FakeStrategies {
+        async fn create_strategy(
+            &self,
+            _name: &str,
+            _owner: Option<&str>,
+            _tags: &[String],
+        ) -> Result<Strategy, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn get_strategy(&self, _id: &StrategyId) -> Result<Option<Strategy>, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn list_strategies(
+            &self,
+            _include_archived: bool,
+        ) -> Result<Vec<Strategy>, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn rename_strategy(
+            &self,
+            _id: &StrategyId,
+            _new_name: &str,
+        ) -> Result<Strategy, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn set_tags(
+            &self,
+            _id: &StrategyId,
+            _tags: &[String],
+        ) -> Result<Strategy, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn set_pinned_version(
+            &self,
+            _id: &StrategyId,
+            _version_id: Option<&VersionId>,
+        ) -> Result<Strategy, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn archive_strategy(
+            &self,
+            _id: &StrategyId,
+            _archived: bool,
+        ) -> Result<Strategy, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn create_version(&self, _request: NewVersion) -> Result<StrategyVersion, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        fn get_version(
+            &self,
+            id: &VersionId,
+        ) -> impl Future<Output = Result<Option<StrategyVersion>, DataError>> + Send {
+            std::future::ready(Ok(self.versions.lock().unwrap().get(id.as_str()).cloned()))
+        }
+
+        async fn list_versions(
+            &self,
+            _strategy_id: &StrategyId,
+        ) -> Result<Vec<StrategyVersion>, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn version_tree(
+            &self,
+            _strategy_id: &StrategyId,
+        ) -> Result<Vec<StrategyVersion>, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn create_agent_version(
+            &self,
+            _request: NewVersion,
+            _submission: NewAgentSubmission,
+        ) -> Result<(StrategyVersion, AgentSubmission), DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+
+        async fn get_agent_submission(
+            &self,
+            _version_id: &VersionId,
+        ) -> Result<Option<AgentSubmission>, DataError> {
+            unimplemented!("FakeStrategies only implements get_version")
+        }
+    }
+
+    /// Flat run store; `latest_run_for_version` returns the most recently
+    /// pushed row for the version, matching the adapter's `created_at DESC`
+    /// read without depending on timestamp strings.
+    #[derive(Default)]
+    struct FakeRuns {
+        runs: Mutex<Vec<PersistedRun>>,
+    }
+
+    impl FakeRuns {
+        fn push(&self, run: PersistedRun) {
+            self.runs.lock().unwrap().push(run);
+        }
+    }
+
+    impl BacktestRunRepository for FakeRuns {
+        async fn save_run(
+            &self,
+            _strategy_version_id: &VersionId,
+            _inputs: &BacktestInputs,
+            _result: &BacktestResult,
+            _summary: &SummaryStats,
+            _starting_equity: Decimal,
+        ) -> Result<BacktestRunId, DataError> {
+            unimplemented!("FakeRuns only implements latest_run_for_version")
+        }
+
+        async fn get_run(&self, _id: &BacktestRunId) -> Result<Option<PersistedRun>, DataError> {
+            unimplemented!("FakeRuns only implements latest_run_for_version")
+        }
+
+        fn latest_run_for_version(
+            &self,
+            strategy_version_id: &VersionId,
+        ) -> impl Future<Output = Result<Option<PersistedRun>, DataError>> + Send {
+            std::future::ready(Ok(self
+                .runs
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|run| run.strategy_version_id == *strategy_version_id)
+                .cloned()))
+        }
+
+        async fn list_runs_for_version(
+            &self,
+            _strategy_version_id: &VersionId,
+        ) -> Result<Vec<RunSummary>, DataError> {
+            unimplemented!("FakeRuns only implements latest_run_for_version")
+        }
+
+        async fn get_trades(&self, _id: &BacktestRunId) -> Result<Vec<Trade>, DataError> {
+            unimplemented!("FakeRuns only implements latest_run_for_version")
+        }
+    }
+
+    /// The smallest DSL `StrategyVersion` can carry — `port.rs`'s
+    /// `canonical_dsl` shape.
+    fn canonical_dsl() -> StrategyDsl {
+        StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "RSI Oversold".to_owned(),
+            direction: Direction::Long,
+            entry: Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    spec: IndicatorSpec::Rsi {
+                        period: SweepableValue::Fixed(14),
+                    },
+                },
+                op: Comparator::Lt,
+                rhs: ValueSource::Constant {
+                    value: Decimal::new(30, 0),
+                },
+            },
+            filters: vec![],
+            exits: vec![ExitRule::TakeProfit {
+                target_r: SweepableValue::Fixed(Decimal::new(2, 0)),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
+            },
+        }
+    }
+
+    fn version(id: &str, parent: Option<&str>) -> StrategyVersion {
+        StrategyVersion {
+            id: VersionId::new(id),
+            strategy_id: StrategyId::new("strat-1"),
+            parent_version_id: parent.map(VersionId::new),
+            dsl_schema_version: SchemaVersion::CURRENT,
+            dsl: canonical_dsl(),
+            dsl_original: "{}".to_owned(),
+            version_hash: "deadbeef".to_owned(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    fn persisted_run(version_id: &VersionId, inputs: Option<BacktestInputs>) -> PersistedRun {
+        PersistedRun {
+            id: BacktestRunId::new(format!("run-{}", version_id.as_str())),
+            strategy_version_id: version_id.clone(),
+            inputs,
+            schema_version: 1,
+            created_at: "2026-06-30T00:00:00.000Z".to_owned(),
+            engine_fingerprint: "fp".to_owned(),
+            engine_target: "target".to_owned(),
+            result_content_hash: "hash".to_owned(),
+            starting_equity: Decimal::new(10_000, 0),
+            net_pnl: Decimal::ZERO,
+            fees_total: Decimal::ZERO,
+            funding_total: Decimal::ZERO,
+            slippage_total: Decimal::ZERO,
+            summary: SummaryStats::default(),
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: SkippedEntryCounts::new(),
+        }
+    }
+
+    /// Recorded inputs distinguishable from the app defaults (non-default bps,
+    /// non-`HEAD` snapshot names) so a pin in the resolved request is proof of
+    /// which tier supplied it.
+    fn recorded_inputs(
+        primary_v: &str,
+        htf_v: Option<&str>,
+        taker: i64,
+        slippage: i64,
+    ) -> BacktestInputs {
+        BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new(primary_v),
+            },
+            htf: htf_v.map(|v| SnapshotSelection {
+                timeframe: Timeframe::H4,
+                data_version: DataVersion::new(v),
+            }),
+            taker_fee_bps: Decimal::new(taker, 0),
+            slippage_bps: Decimal::new(slippage, 0),
+            funding: FundingConfig::SnapshotRates,
+            window: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_parent_run_wins_over_the_versions_own() {
+        let strategies = FakeStrategies::default();
+        strategies.insert(version("child-1", Some("parent-1")));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("parent-1"),
+            Some(recorded_inputs("v-parent", Some("v-parent-htf"), 7, 2)),
+        ));
+        runs.push(persisted_run(
+            &VersionId::new("child-1"),
+            Some(recorded_inputs("v-own", None, 4, 1)),
+        ));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(request.version_id.as_str(), "child-1");
+        assert_eq!(request.primary_timeframe, Timeframe::M15);
+        assert_eq!(request.htf_timeframe, Some(Timeframe::H4));
+        assert_eq!(request.config.taker_fee_bps, Decimal::new(7, 0));
+        assert_eq!(request.config.slippage_bps, Decimal::new(2, 0));
+        assert_eq!(
+            request.snapshots,
+            Some(SnapshotPins {
+                primary: DataVersion::new("v-parent"),
+                htf: Some(DataVersion::new("v-parent-htf")),
+            }),
+            "the parent's recorded data_versions pin the load, not the child's"
+        );
+        assert_eq!(request.window, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_uses_the_versions_own_run_when_parent_has_none() {
+        let strategies = FakeStrategies::default();
+        strategies.insert(version("child-1", Some("parent-1")));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("child-1"),
+            Some(recorded_inputs("v-own", Some("v-own-htf"), 5, 3)),
+        ));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(
+            request.snapshots,
+            Some(SnapshotPins {
+                primary: DataVersion::new("v-own"),
+                htf: Some(DataVersion::new("v-own-htf")),
+            }),
+            "the parent has no run, so the version's own latest run supplies the request"
+        );
+        assert_eq!(request.config.taker_fee_bps, Decimal::new(5, 0));
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_skips_runs_whose_inputs_are_none() {
+        // A pre-0006 row (`inputs: None`) reads the same as no run at all: the
+        // parent's unusable latest is skipped and the version's own run wins.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version("child-1", Some("parent-1")));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(&VersionId::new("parent-1"), None));
+        runs.push(persisted_run(
+            &VersionId::new("child-1"),
+            Some(recorded_inputs("v-own", None, 4, 1)),
+        ));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(
+            request.snapshots,
+            Some(SnapshotPins {
+                primary: DataVersion::new("v-own"),
+                htf: None,
+            }),
+            "the parent's pre-0006 row is skipped, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_falls_back_to_app_defaults() {
+        // No parent, no runs at all → the app defaults, HEAD (no pins), and
+        // whatever window the caller passed.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version("orphan-1", None));
+        let runs = FakeRuns::default();
+        let window = CandleWindow::new(1_000, 2_000).unwrap();
+
+        let request = resolve_default_request(
+            &strategies,
+            &runs,
+            &VersionId::new("orphan-1"),
+            Some(window.clone()),
+        )
+        .await
+        .expect("resolve");
+
+        assert_eq!(request.pair, Pair::new("BTCUSDT"));
+        assert_eq!(request.primary_timeframe, Timeframe::M15);
+        assert_eq!(request.htf_timeframe, Some(Timeframe::H4));
+        assert_eq!(request.config, BacktestConfig::default());
+        assert_eq!(request.snapshots, None, "no prior run → HEAD, never a pin");
+        assert_eq!(request.window, Some(window));
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_never_inherits_the_prior_runs_window() {
+        // The prior run recorded its own window; the resolver must still put
+        // the CALLER's window (here `None`) in the request.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version("child-1", Some("parent-1")));
+        let runs = FakeRuns::default();
+        let mut inherited = recorded_inputs("v-parent", None, 4, 1);
+        inherited.window = Some(CandleWindow::new(100, 200).unwrap());
+        runs.push(persisted_run(&VersionId::new("parent-1"), Some(inherited)));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(
+            request.window, None,
+            "a prior run's window is never inherited — it is always the caller's"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_unknown_version_is_version_not_found() {
+        let err = resolve_default_request(
+            &FakeStrategies::default(),
+            &FakeRuns::default(),
+            &VersionId::new("missing"),
+            None,
+        )
+        .await
+        .expect_err("an unknown version cannot resolve");
+
+        assert!(matches!(err, BacktestAppError::VersionNotFound(_)));
     }
 }

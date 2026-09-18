@@ -1,12 +1,17 @@
-//! The seven read tools of `pulse mcp` (r2.s1.w2).
+//! The nine tools of `pulse mcp` (r2.s1.w2, w3).
 //!
-//! Every tool is read-only: five query the strategy/run repositories and two
+//! Seven read tools (`w2`): five query the strategy/run repositories and two
 //! read the candle store, with exports landing under the per-process exports
-//! dir. `w3` appends the two write tools to this router.
+//! dir. Two write tools (`w3`): `submit_strategy_version` persists an
+//! agent-authored DSL variant through the application submit use case, and
+//! `run_backtest` runs a version through the shared application flow with an
+//! optional `[from, to)` candle window.
 //!
 //! Argument validation failures come back as tool errors in the
 //! `{"field", "message"}` shape (the spec's `FieldError` contract); store/repo
-//! failures carry just `message`.
+//! failures carry just `message`. A DSL validation failure carries EVERY
+//! `FieldError` under `errors[]` — the agent fixes one document, not one
+//! error at a time.
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -16,14 +21,21 @@ use serde_json::json;
 
 use crate::adapters::db::{SqliteBacktestRunRepo, SqliteStrategyRepo};
 use crate::adapters::indicators::engine::IndicatorEngine;
+use crate::application::backtest::{
+    BacktestAppError, resolve_default_request, run_version_backtest,
+};
 use crate::application::mcp_read::{
     parse_indicator_specs, run_detail, run_list_entry, strategy_entry, version_detail,
     version_entry,
 };
+use crate::application::mcp_write::{
+    SubmitError, SubmitRequest, SubmitTarget, submit_agent_version,
+};
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CompiledValue, DataError,
-    DataVersion, EvalContext, MfeMaeAggregates, Pair, StrategyRepository, Timeframe,
+    BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow, CompiledValue,
+    DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, StrategyRepository, Timeframe,
+    ValidationCode,
 };
 
 use super::PulseMcp;
@@ -106,6 +118,42 @@ pub(crate) struct ExportIndicatorsArgs {
     indicators: Vec<String>,
 }
 
+/// `submit_strategy_version` args (r2.s1.w3).
+///
+/// `dsl` is typed `serde_json::Map` so the advertised input schema says
+/// `type: object` — the application `SubmitRequest` keeps the wider `Value`
+/// and the use case serializes it to the stored `dsl_json` document.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SubmitStrategyVersionArgs {
+    /// The parent version this submission iterates on. Exactly one of
+    /// `parent_version_id` / `strategy_name` must be given.
+    #[serde(default)]
+    parent_version_id: Option<String>,
+    /// The name of a NEW strategy this submission roots. Exactly one of
+    /// `parent_version_id` / `strategy_name` must be given.
+    #[serde(default)]
+    strategy_name: Option<String>,
+    /// The DSL document as a JSON object.
+    dsl: serde_json::Map<String, serde_json::Value>,
+    /// The agent's stated hypothesis for this version (1–2000 chars).
+    hypothesis: String,
+}
+
+/// `run_backtest` args (r2.s1.w3). `from`/`to` are RFC 3339 UTC timestamps —
+/// both or neither.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RunBacktestArgs {
+    /// The strategy-version id to run.
+    version_id: String,
+    /// Inclusive window start, RFC 3339 (e.g. `2025-03-01T00:00:00Z`). Must be
+    /// paired with `to`.
+    #[serde(default)]
+    from: Option<String>,
+    /// Exclusive window end, RFC 3339. Must be paired with `from`.
+    #[serde(default)]
+    to: Option<String>,
+}
+
 /// One tool error in the `{"field", "message"}` shape.
 fn field_error(field: &str, message: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::structured_error(json!({ "field": field, "message": message.to_string() }))
@@ -131,6 +179,99 @@ fn parse_timeframe(raw: &str) -> Result<Timeframe, String> {
 fn parse_data_version(raw: Option<String>) -> Result<Option<DataVersion>, String> {
     raw.map(|tag| DataVersion::parse(tag).map_err(|e| format!("invalid data_version: {e}")))
         .transpose()
+}
+
+/// Parse one RFC 3339 window bound to epoch millis.
+fn parse_rfc3339_ms(raw: &str) -> Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.timestamp_millis())
+        .map_err(|e| format!("invalid RFC 3339 timestamp {raw:?}: {e}"))
+}
+
+/// The `run_backtest` `from`/`to` pair: both or neither, `from < to`, into the
+/// domain [`CandleWindow`]. Every refusal attaches to `window` (the pair is
+/// one argument semantically) except the unparseable bound, which names itself.
+fn parse_window(
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Option<CandleWindow>, CallToolResult> {
+    match (from, to) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(field_error(
+            "window",
+            "from and to must both be given, or neither — a window needs two bounds",
+        )),
+        (Some(from), Some(to)) => {
+            let from_ms = parse_rfc3339_ms(from).map_err(|e| field_error("from", e))?;
+            let to_ms = parse_rfc3339_ms(to).map_err(|e| field_error("to", e))?;
+            let window = CandleWindow::new(from_ms, to_ms)
+                .map_err(|e| field_error("window", format!("from must be before to: {e}")))?;
+            Ok(Some(window))
+        }
+    }
+}
+
+/// A [`ValidationCode`] as the wire's `snake_case` string, derived from `Debug`
+/// so a future `#[non_exhaustive]` variant still renders its own name.
+fn validation_code_snake(code: ValidationCode) -> String {
+    let pascal = format!("{code:?}");
+    let mut out = String::with_capacity(pascal.len() + 4);
+    for (i, c) in pascal.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Map a [`SubmitError`] onto the tool-error shapes: field errors keep their
+/// path, a DSL validation failure expands to `errors[]` carrying EVERY
+/// `FieldError`, and storage failures carry `message` only.
+fn submit_error_result(err: SubmitError) -> CallToolResult {
+    match err {
+        SubmitError::Field { path, message } => field_error(&path, message),
+        SubmitError::Load { path, message } | SubmitError::Compile { path, message } => {
+            field_error(path, message)
+        }
+        SubmitError::Validation(errors) => {
+            let details: Vec<serde_json::Value> = errors
+                .errors()
+                .iter()
+                .map(|e| {
+                    json!({
+                        "field": e.path,
+                        "code": validation_code_snake(e.code),
+                        "message": e.message,
+                    })
+                })
+                .collect();
+            CallToolResult::structured_error(json!({
+                "field": "dsl",
+                "message": format!("{} validation error(s)", details.len()),
+                "errors": details,
+            }))
+        }
+        SubmitError::Data(e) => tool_error(e),
+    }
+}
+
+/// Map a [`BacktestAppError`] onto the tool-error shapes for `run_backtest`:
+/// an empty window and a missing version name their argument, a stored-DSL
+/// failure names `dsl`, and everything else carries `message` only.
+fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
+    match err {
+        BacktestAppError::WindowEmpty { .. } => field_error("window", err),
+        BacktestAppError::VersionNotFound(_) => field_error("version_id", err),
+        BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
+            field_error("dsl", err)
+        }
+        _ => tool_error(err),
+    }
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -443,5 +584,129 @@ impl PulseMcp {
             }))),
             Err(e) => Ok(tool_error(e)),
         }
+    }
+
+    /// Persist an agent-authored DSL variant (r2.s1.w3).
+    ///
+    /// Exactly one target: `parent_version_id` clones under an existing
+    /// version; `strategy_name` roots a new strategy (duplicate names are
+    /// refused). The version writes as `created_by: external_agent` with an
+    /// `agent_submission` row carrying the resolved identity name and the
+    /// hypothesis. The identity is read once and the mutex guard dropped
+    /// before any `.await`.
+    #[tool(
+        description = "Submit a strategy DSL variant with a hypothesis: parent_version_id clones under an existing version, strategy_name roots a new strategy (exactly one). Persists the version as external_agent plus its agent_submission row."
+    )]
+    async fn submit_strategy_version(
+        &self,
+        Parameters(args): Parameters<SubmitStrategyVersionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // The identity is a lock-read, never an await-held guard.
+        let agent_name = self.identity_lock().name.clone();
+
+        let target = match (args.parent_version_id, args.strategy_name) {
+            (Some(parent_id), None) => SubmitTarget::Parent(VersionId::new(parent_id)),
+            (None, Some(strategy_name)) => SubmitTarget::Root { strategy_name },
+            (Some(_), Some(_)) => {
+                return Ok(field_error(
+                    "parent_version_id",
+                    "pass exactly one of parent_version_id or strategy_name, not both",
+                ));
+            }
+            (None, None) => {
+                return Ok(field_error(
+                    "parent_version_id",
+                    "exactly one of parent_version_id or strategy_name is required",
+                ));
+            }
+        };
+
+        let repo = SqliteStrategyRepo::new(self.state.db.pool().clone());
+        let outcome = match submit_agent_version(
+            &repo,
+            SubmitRequest {
+                target,
+                dsl: serde_json::Value::Object(args.dsl),
+                hypothesis: args.hypothesis,
+                agent_name,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => return Ok(submit_error_result(e)),
+        };
+
+        let mut payload = json!({
+            "version_id": outcome.version.id.as_str(),
+            "strategy_id": outcome.strategy_id.as_str(),
+            "version_hash": outcome.version.version_hash,
+            "created_by": "external_agent",
+            "agent_name": outcome.submission.agent_name.as_str(),
+            "submission_id": outcome.submission.id.as_str(),
+            "created_at": outcome.submission.created_at.to_rfc3339(),
+        });
+        if let Some(parent) = outcome.version.parent_version_id.as_ref() {
+            payload["parent_version_id"] = json!(parent.as_str());
+        }
+        Ok(CallToolResult::structured(payload))
+    }
+
+    /// Run a version through the shared backtest flow (r2.s1.w3).
+    ///
+    /// The request resolves through [`resolve_default_request`]: the version's
+    /// parent's latest run (then its own, then the app defaults) supplies the
+    /// pair, timeframes, cost model and exact snapshot pins. `from`/`to` are an
+    /// optional RFC 3339 window — both or neither — sliced at load time and
+    /// recorded on the run's `inputs.window`.
+    #[tool(
+        description = "Run a backtest of one strategy version. Optional from/to (RFC 3339, both or neither) slice the candles to [from, to). Defaults resolve from the version's parent run, then its own latest run, then app defaults."
+    )]
+    async fn run_backtest(
+        &self,
+        Parameters(args): Parameters<RunBacktestArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let window = match parse_window(args.from.as_deref(), args.to.as_deref()) {
+            Ok(window) => window,
+            Err(result) => return Ok(result),
+        };
+
+        let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
+        let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        let version_id = VersionId::new(args.version_id);
+        let request = match resolve_default_request(&strategies, &runs, &version_id, window).await {
+            Ok(request) => request,
+            Err(e @ BacktestAppError::VersionNotFound(_)) => {
+                return Ok(field_error("version_id", e));
+            }
+            Err(e) => return Ok(backtest_error_result(&e)),
+        };
+        let outcome = match run_version_backtest(
+            &strategies,
+            &self.state.candles,
+            &self.state.exchange,
+            &runs,
+            &request,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => return Ok(backtest_error_result(&e)),
+        };
+
+        let mut payload = json!({
+            "run_id": outcome.run.id.as_str(),
+            "version_id": outcome.run.strategy_version_id.as_str(),
+            "run": serde_json::to_value(run_detail(
+                &outcome.run,
+                &MfeMaeAggregates::from_trades(&outcome.trades),
+            ))
+            .unwrap_or_else(|_| json!({})),
+        });
+        // Only when Some — the wire never carries a null warning slot.
+        if let Some(warning) = outcome.fingerprint_warning.as_ref() {
+            payload["fingerprint_warning"] = json!(warning);
+        }
+        Ok(CallToolResult::structured(payload))
     }
 }

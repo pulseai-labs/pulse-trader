@@ -1,15 +1,18 @@
-//! `src/mcp/` — the `pulse mcp` delivery ring (r2.s1.w2).
+//! `src/mcp/` — the `pulse mcp` delivery ring (r2.s1.w2, w3).
 //!
 //! An MCP server over stdio: stdout carries ONLY protocol frames, diagnostics
 //! go to stderr, and the ring names no secrets/LLM adapter so the credential
 //! gate holds by construction (`scripts/check-mcp-boundary.sh` scans for it).
-//! The seven tools are all read-only; `w3` appends the two write tools to
-//! `tools.rs` and `w4` adds desktop parity.
+//! Seven read tools (`w2`) plus two write tools (`w3`):
+//! `submit_strategy_version` and the windowed `run_backtest`.
 //!
 //! The import boundary (enforced by the script): `crate::domain`,
-//! `crate::application`, `crate::adapters::{db, store, indicators, backtest}`
-//! and `rmcp` only — never `adapters::secrets`, `adapters::llm`, `agent`, or
-//! `cli`.
+//! `crate::application`, `crate::adapters::{db, store, indicators, backtest,
+//! broker}` and `rmcp` only — never `adapters::secrets`, `adapters::llm`,
+//! `agent`, or `cli`. `broker` names ONLY the symbol-filter surface
+//! (`BinanceAdapter::symbol_filters`) the shared backtest use case needs; the
+//! server still cannot place an order — the use case never sees a broker
+//! capability.
 
 pub(crate) mod export;
 pub(crate) mod identity;
@@ -27,6 +30,7 @@ use rmcp::service::RequestContext;
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool_handler};
 
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::db::Db;
 use crate::adapters::store::CandleStore;
 
@@ -47,6 +51,9 @@ pub(crate) struct McpState {
     pub(crate) exports: Exports,
     /// The flag-resolved identity (`Flag` or the not-yet-upgraded `Unknown`).
     pub(crate) identity: AgentIdentity,
+    /// The exchange adapter `run_backtest` needs for `symbol_filters` — its
+    /// ONLY surface here; the tool still cannot place an order (r2.s1.w3).
+    pub(crate) exchange: BinanceAdapter,
 }
 
 /// The `pulse mcp` server handler: the tool router lives in `tools.rs`, the
@@ -88,9 +95,12 @@ impl ServerHandler for PulseMcp {
         )
         .with_server_info(Implementation::new("pulse", env!("CARGO_PKG_VERSION")))
         .with_instructions(
-            "Read-only access to the PulseTrader strategy library, backtest runs, \
-             candle snapshots and indicator series, plus the pulse://dsl/schema \
-             grammar. Write tools land in a later work item.",
+            "Access to the PulseTrader strategy library and backtester. Read tools: \
+             list_strategies, get_version, list_runs, get_run, export_trades, \
+             export_candles, export_indicators. Write tools: submit_strategy_version \
+             (persist an agent-authored DSL variant with its hypothesis) and \
+             run_backtest (run a version, optionally windowed to [from, to)). The \
+             pulse://dsl/schema resource carries the DSL grammar.",
         )
     }
 

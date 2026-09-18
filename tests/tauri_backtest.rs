@@ -477,6 +477,8 @@ fn r1_request(version_id: &VersionId) -> pulse::BacktestRequest {
         primary_timeframe: Timeframe::M15,
         htf_timeframe: Some(Timeframe::H4),
         config: BacktestConfig::default(),
+        snapshots: None,
+        window: None,
     }
 }
 

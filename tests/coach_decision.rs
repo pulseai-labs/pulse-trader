@@ -349,6 +349,8 @@ async fn world_with_dsl(dsl_json: &str) -> World {
             primary_timeframe: Timeframe::M15,
             htf_timeframe: Some(Timeframe::H4),
             config: BacktestConfig::default(),
+            snapshots: None,
+            window: None,
         },
     )
     .await

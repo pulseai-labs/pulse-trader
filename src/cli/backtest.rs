@@ -235,6 +235,11 @@ where
         primary_timeframe: tf,
         htf_timeframe: htf,
         config,
+        // The CLI's explicit flags still drive the run directly — it does not
+        // resolve defaults off a prior run and has no `--from/--to` window
+        // surface this work item (the MCP tool does).
+        snapshots: None,
+        window: None,
     };
     let outcome = run_version_backtest(&strategies, repo, &BinanceAdapter::new(), &runs, &request)
         .await

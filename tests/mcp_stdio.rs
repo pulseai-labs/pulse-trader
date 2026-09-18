@@ -10,283 +10,22 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+mod support;
+
+use std::path::PathBuf;
 
 use pulse::{
-    BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CandleSeriesRepository,
-    CandleStore, CompiledValue, CreatedBy, DataVersion, Db, Direction, EngineFingerprint,
-    EquityCurve, EvalContext, ExitReason, Fill, FundingConfig, IndicatorEngine, IndicatorSpec,
-    MIGRATOR, NewVersion, Pair, Regime, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
-    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId, StrategyRepository, SummaryStats,
-    SweepableValue, Timeframe, Trade, TradeSource, VersionId,
+    CandleSeriesRepository, CandleStore, CompiledValue, EvalContext, IndicatorEngine,
+    IndicatorSpec, Pair, SweepableValue, Timeframe,
 };
-use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
-use rmcp::transport::child_process::TokioChildProcess;
+use rmcp::model::{ReadResourceRequestParams, ResourceContents};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use support::mcp::{
+    FIXTURE_STORE, MINIMAL_DSL, call, copy_tree, manifest, migrated_db, seeded_fixture,
+    spawn_client,
+};
 use tempfile::TempDir;
-use tokio::process::Command;
-
-/// The committed candle fixture (`BTCUSDT` 15m + 4h snapshots).
-const FIXTURE_STORE: &str = "tests/fixtures/btcusdt-1m-store";
-
-/// The same minimal, valid DSL the other CLI suites seed — compiles, so the
-/// stored `dsl` is a genuine current-schema object.
-const MINIMAL_DSL: &str = r#"{
-  "schema_version": "1.0.0",
-  "name": "RSI Oversold (mcp)",
-  "direction": "long",
-  "entry": {
-    "type": "Compare",
-    "lhs": { "type": "Indicator", "spec": { "indicator": "Rsi", "period": 14 } },
-    "op": "Lt",
-    "rhs": { "type": "Constant", "value": "30" }
-  },
-  "filters": [],
-  "exits": [
-    { "type": "StopLoss", "distance_pct": "0.05" },
-    { "type": "TakeProfit", "target_r": "2.0" }
-  ],
-  "risk": {
-    "risk_per_trade_pct": "0.01",
-    "max_leverage": "3"
-  }
-}"#;
-
-fn manifest(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
-}
-
-/// Recursively copy a directory tree (the fixture → tempdir, so exports and a
-/// hypothetical HEAD advance never touch the committed store).
-fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let src = entry.path();
-        let dst = to.join(entry.file_name());
-        if src.is_dir() {
-            copy_tree(&src, &dst);
-        } else {
-            std::fs::copy(&src, &dst).unwrap();
-        }
-    }
-}
-
-async fn migrated_db(tmp: &TempDir) -> (PathBuf, Db) {
-    let db_path = tmp.path().join("pulse.db");
-    let db = Db::with_path(&db_path).await.unwrap();
-    MIGRATOR.run(db.pool()).await.expect("run migrations");
-    (db_path, db)
-}
-
-/// One real trade: its own fields are ordinary (the aggregates must see them).
-fn seeded_trade() -> Trade {
-    let entry = Decimal::new(90_000, 0);
-    let exit = Decimal::new(91_100, 0);
-    Trade {
-        direction: Direction::Long,
-        qty: Decimal::new(1, 0),
-        entry_price: entry,
-        exit_price: exit,
-        entry_signal_time: 1_699_999_100_000,
-        entry_fill_time: 1_700_000_000_000,
-        exit_signal_time: 1_700_000_000_000,
-        exit_fill_time: 1_700_000_900_000,
-        fills: vec![
-            Fill {
-                price: entry,
-                qty: Decimal::new(1, 0),
-                time_ms: 1_700_000_000_000,
-                fee: Decimal::new(1, 2),
-            },
-            Fill {
-                price: exit,
-                qty: Decimal::new(1, 0),
-                time_ms: 1_700_000_900_000,
-                fee: Decimal::new(1, 2),
-            },
-        ],
-        fees_total: Decimal::new(2, 2),
-        funding_total: Decimal::ZERO,
-        slippage_total: Decimal::ZERO,
-        realized_pnl: Decimal::new(1100, 0),
-        realized_r: Decimal::new(2, 0),
-        mfe_r: Decimal::new(25, 1),
-        mae_r: Decimal::new(-5, 1),
-        exit_reason: ExitReason::TakeProfit,
-        source: TradeSource::Backtest,
-        regime: Regime::TrendingUp,
-    }
-}
-
-/// The inputs the seeded run records — `v-primary` is the `data_version` the
-/// assertions read back off the wire.
-fn seeded_inputs() -> BacktestInputs {
-    BacktestInputs {
-        pair: Pair::new("BTCUSDT"),
-        primary: SnapshotSelection {
-            timeframe: Timeframe::M15,
-            data_version: DataVersion::new("v-primary"),
-        },
-        htf: Some(SnapshotSelection {
-            timeframe: Timeframe::H4,
-            data_version: DataVersion::new("v-htf"),
-        }),
-        taker_fee_bps: Decimal::new(4, 0),
-        slippage_bps: Decimal::new(1, 0),
-        funding: FundingConfig::SnapshotRates,
-        window: None,
-    }
-}
-
-/// Everything the assertions need off the seed: `(parent version id, child
-/// version id, run id)`.
-type Seed = (VersionId, VersionId, BacktestRunId);
-
-/// Seed one strategy with a parent→child version pair, and one run (one trade)
-/// against the child, all through the repository layer the server reads.
-async fn seed(db: &Db) -> Seed {
-    let strategies = SqliteStrategyRepo::new(db.pool().clone());
-    let strategy = strategies
-        .create_strategy("MCP demo", Some("alice"), &["btc".to_owned()])
-        .await
-        .expect("create strategy");
-    let parent = strategies
-        .create_version(NewVersion {
-            strategy_id: StrategyId::new(strategy.id.as_str().to_owned()),
-            parent_version_id: None,
-            dsl_json: MINIMAL_DSL.to_owned(),
-            created_by: CreatedBy::Human,
-            creating_llm_call_ids: vec![],
-        })
-        .await
-        .expect("create parent version");
-    let child = strategies
-        .create_version(NewVersion {
-            strategy_id: StrategyId::new(strategy.id.as_str().to_owned()),
-            parent_version_id: Some(parent.id.clone()),
-            dsl_json: MINIMAL_DSL.replace("(mcp)", "(mcp child)"),
-            created_by: CreatedBy::ComposerLlm,
-            creating_llm_call_ids: vec![],
-        })
-        .await
-        .expect("create child version");
-
-    let trade = seeded_trade();
-    let inputs = seeded_inputs();
-    let summary = SummaryStats::from_trades(
-        std::slice::from_ref(&trade),
-        trade.realized_pnl,
-        trade.fees_total,
-        trade.funding_total,
-        &EquityCurve::default(),
-    );
-    let result = BacktestResult {
-        trades: vec![trade.clone()],
-        net_pnl: trade.realized_pnl,
-        fees_total: trade.fees_total,
-        funding_total: trade.funding_total,
-        slippage_total: trade.slippage_total,
-        regime_breakdown: RegimeBreakdown::new(),
-        skipped_entries: SkippedEntryCounts::new(),
-        engine_fingerprint: EngineFingerprint::current(),
-        summary,
-        equity_curve: EquityCurve::default(),
-    };
-    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
-    let run_id = runs
-        .save_run(
-            &child.id,
-            &inputs,
-            &result,
-            &result.summary,
-            Decimal::new(10_000, 0),
-        )
-        .await
-        .expect("save seeded run");
-    (parent.id, child.id, run_id)
-}
-
-/// `pulse mcp --db <db> --data-dir <store> --agent-name test-agent` over rmcp's
-/// child-process transport. The `()` handler is rmcp's minimal client.
-async fn spawn_client(
-    db_path: &Path,
-    data_dir: &Path,
-) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_pulse"));
-    command
-        .arg("mcp")
-        .arg("--db")
-        .arg(db_path)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--agent-name")
-        .arg("Test-Agent");
-    let transport = TokioChildProcess::builder(command)
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn pulse mcp")
-        .0;
-    ().serve(transport).await.expect("initialize handshake")
-}
-
-fn arguments(value: &Value) -> serde_json::Map<String, Value> {
-    value.as_object().expect("arguments object").clone()
-}
-
-/// Call a tool and return its `structuredContent`; fails the test on a wire or
-/// tool-level error instead of letting a `None` slide through.
-async fn call(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    name: &str,
-    args: Value,
-) -> Value {
-    let result = client
-        .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments(&args)))
-        .await
-        .unwrap_or_else(|e| panic!("tools/call {name} transport error: {e}"));
-    assert!(
-        result.is_error != Some(true),
-        "tools/call {name} returned is_error: {:?}",
-        result.content
-    );
-    result
-        .structured_content
-        .unwrap_or_else(|| panic!("tools/call {name} carried no structuredContent"))
-}
-
-/// The whole seeded fixture: db, copied store, and their tempdir guards.
-struct Fixture {
-    _tmp_db: TempDir,
-    _tmp_store: TempDir,
-    store_dir: PathBuf,
-    seed: Seed,
-}
-
-async fn seeded_fixture() -> (Fixture, rmcp::service::RunningService<rmcp::RoleClient, ()>) {
-    let tmp_db = TempDir::new().unwrap();
-    let (db_path, db) = migrated_db(&tmp_db).await;
-    let seed = seed(&db).await;
-    drop(db);
-
-    let tmp_store = TempDir::new().unwrap();
-    let store_dir = tmp_store.path().join("store");
-    copy_tree(&manifest(FIXTURE_STORE), &store_dir);
-
-    let client = spawn_client(&db_path, &store_dir).await;
-    (
-        Fixture {
-            _tmp_db: tmp_db,
-            _tmp_store: tmp_store,
-            store_dir,
-            seed,
-        },
-        client,
-    )
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tools_and_dsl_schema_resource_are_served() {
@@ -297,7 +36,8 @@ async fn tools_and_dsl_schema_resource_are_served() {
     copy_tree(&manifest(FIXTURE_STORE), &store_dir);
     let client = spawn_client(&db_path, &store_dir).await;
 
-    // Exactly the seven declared read tools — no more, no fewer.
+    // Exactly the nine declared tools — the seven read tools plus w3's two
+    // write tools, no more, no fewer.
     let tools = client.list_tools(None).await.expect("tools/list").tools;
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     names.sort_unstable();
@@ -311,8 +51,10 @@ async fn tools_and_dsl_schema_resource_are_served() {
             "get_version",
             "list_runs",
             "list_strategies",
+            "run_backtest",
+            "submit_strategy_version",
         ],
-        "the advertised tool set is exactly the seven read tools"
+        "the advertised tool set is exactly the nine declared tools"
     );
 
     // The one advertised resource, then its document body.
