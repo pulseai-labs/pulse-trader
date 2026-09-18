@@ -683,7 +683,7 @@ where
     // point somewhere else, which is the whole reason #110 exists. Both loads go
     // through the blocking pool (see `load_version_offthread`): same filesystem
     // I/O + Parquet decode as step 3, so the same off-runtime rule.
-    let primary = load_version_offthread(
+    let mut primary = load_version_offthread(
         candles.clone(),
         inputs.pair.clone(),
         inputs.primary.timeframe,
@@ -691,6 +691,16 @@ where
     )
     .await
     .map_err(|e| saved(ReadBackStage::PrimarySnapshot, ReadBackFailure::Data(e)))?;
+    // ruling 1 binds the read-back too: the engine consumed the WINDOWED slice
+    // of the snapshot the persisted inputs name, so the outcome answers from
+    // that same slice — `equity_curve()` opens at the window's first candle
+    // and no consumer sees candles the run did not. Slicing BEFORE the empty
+    // check keeps the refusal meaningful for a windowed run: a snapshot that
+    // no longer covers the window the run recorded is missing the run's data
+    // the same way an empty one is.
+    if let Some(w) = &inputs.window {
+        primary = primary.windowed(w);
+    }
     if primary.candles.is_empty() {
         // An empty reload cannot produce a truthful date range, and fabricating one
         // is exactly what the provenance header exists to prevent.
@@ -700,7 +710,7 @@ where
         ));
     }
 
-    let htf = match inputs.htf.as_ref() {
+    let mut htf = match inputs.htf.as_ref() {
         Some(selection) => Some(
             load_version_offthread(
                 candles,
@@ -713,6 +723,9 @@ where
         ),
         None => None,
     };
+    if let Some(w) = &inputs.window {
+        htf = htf.map(|series| series.windowed(w));
+    }
 
     let mfe = project_histogram(trades.iter().map(|t| t.mfe_r));
     // MAE is negated, not `abs()`d: a positive MAE would be a sign violation and

@@ -878,6 +878,92 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 3c. a windowed run's read-back returns only the candles it consumed
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_runs_read_back_is_sliced_to_the_persisted_window() {
+    let env = env();
+    let version_id = seed_version(&env).await;
+
+    // Candle-aligned bounds that trim the head of BOTH snapshots — the same
+    // shape `run_backtest`'s from/to produce over the MCP wire
+    // (tests/mcp_write.rs's windowed_call).
+    let store = env.store();
+    let complete = store
+        .load_head(&Pair::new("BTCUSDT"), Timeframe::M15)
+        .expect("load_head")
+        .expect("15m HEAD exists")
+        .series;
+    let from_ms = complete.candles[400].open_time;
+    let to_ms = complete.candles.last().expect("non-empty series").open_time;
+    let window = CandleWindow::new(from_ms, to_ms).expect("window");
+
+    let db = env.db().await;
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let mut request = r1_request(&version_id);
+    request.window = Some(window.clone());
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &request,
+    )
+    .await
+    .expect("the windowed run succeeds");
+
+    // The row records the window — and the outcome answers from exactly that
+    // slice, never the complete snapshot the pinned data_version loads.
+    assert_eq!(
+        outcome.inputs.window,
+        Some(window),
+        "the persisted inputs carry the requested window"
+    );
+    let expected_len = complete
+        .candles
+        .iter()
+        .filter(|c| c.open_time >= from_ms && c.open_time < to_ms)
+        .count();
+    assert!(
+        expected_len < complete.candles.len(),
+        "the window genuinely trims the snapshot (the test is not vacuous)"
+    );
+    assert_eq!(
+        outcome.primary.candles.len(),
+        expected_len,
+        "primary read back the windowed slice, not the complete snapshot"
+    );
+    assert!(
+        outcome
+            .primary
+            .candles
+            .iter()
+            .all(|c| c.open_time >= from_ms && c.open_time < to_ms),
+        "every read-back candle lies inside [from_ms, to_ms)"
+    );
+    assert_eq!(
+        outcome.primary.candles.first().map(|c| c.open_time),
+        Some(from_ms),
+        "equity_curve() opens at the window's first candle, not the snapshot's"
+    );
+    assert_eq!(
+        outcome.equity_curve().0.first().map(|p| p.time_ms),
+        Some(from_ms),
+        "the equity curve's leading point is the window start"
+    );
+
+    let htf = outcome.htf.expect("the r1 request records an htf");
+    assert!(
+        htf.candles
+            .iter()
+            .all(|c| c.open_time >= from_ms && c.open_time < to_ms),
+        "the htf read-back is sliced to the same window"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enum_tokens_match_the_stored_column_text_exactly() {
     let env = env();
