@@ -141,6 +141,17 @@ where
         path: e.path.clone(),
         message: e.message.clone(),
     })?;
+    // `strategy_name` is a scalar too: a blank name would land an unnamed
+    // strategy in the Library (the document's own `name` is covered by
+    // `validate` below — this is the row the Library lists).
+    if let SubmitTarget::Root { strategy_name } = &request.target
+        && strategy_name.trim().is_empty()
+    {
+        return Err(SubmitError::Field {
+            path: "strategy_name".to_owned(),
+            message: "strategy_name must not be blank".to_owned(),
+        });
+    }
 
     // 3. Target resolution.
     let (strategy_id, parent_version_id) = resolve_target(strategies, &request.target).await?;

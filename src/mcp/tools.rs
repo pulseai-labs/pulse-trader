@@ -43,6 +43,7 @@ use super::export;
 
 /// `list_strategies` args.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ListStrategiesArgs {
     /// Include archived strategies (default false).
     #[serde(default)]
@@ -51,6 +52,7 @@ pub(crate) struct ListStrategiesArgs {
 
 /// `get_version` args.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GetVersionArgs {
     /// The strategy-version id.
     version_id: String,
@@ -58,6 +60,7 @@ pub(crate) struct GetVersionArgs {
 
 /// `list_runs` args.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ListRunsArgs {
     /// The strategy-version id whose runs to list.
     version_id: String,
@@ -65,6 +68,7 @@ pub(crate) struct ListRunsArgs {
 
 /// `get_run` args.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GetRunArgs {
     /// The backtest run id.
     run_id: String,
@@ -72,6 +76,7 @@ pub(crate) struct GetRunArgs {
 
 /// `export_trades` args.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExportTradesArgs {
     /// The backtest run id whose trade log to export.
     run_id: String,
@@ -90,6 +95,7 @@ pub(crate) enum CandleExportFormat {
 
 /// `export_candles` args.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExportCandlesArgs {
     /// The trading pair symbol (e.g. `BTCUSDT`).
     pair: String,
@@ -105,6 +111,7 @@ pub(crate) struct ExportCandlesArgs {
 
 /// `export_indicators` args.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExportIndicatorsArgs {
     /// The trading pair symbol (e.g. `BTCUSDT`).
     pair: String,
@@ -124,6 +131,7 @@ pub(crate) struct ExportIndicatorsArgs {
 /// `type: object` — the application `SubmitRequest` keeps the wider `Value`
 /// and the use case serializes it to the stored `dsl_json` document.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SubmitStrategyVersionArgs {
     /// The parent version this submission iterates on. Exactly one of
     /// `parent_version_id` / `strategy_name` must be given.
@@ -142,6 +150,7 @@ pub(crate) struct SubmitStrategyVersionArgs {
 /// `run_backtest` args (r2.s1.w3). `from`/`to` are RFC 3339 UTC timestamps —
 /// both or neither.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunBacktestArgs {
     /// The strategy-version id to run.
     version_id: String,

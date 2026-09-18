@@ -18,12 +18,12 @@ use pulse::{
     CandleSeriesRepository, CandleStore, CompiledValue, EvalContext, IndicatorEngine,
     IndicatorSpec, Pair, SweepableValue, Timeframe,
 };
-use rmcp::model::{ReadResourceRequestParams, ResourceContents};
+use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use support::mcp::{
-    FIXTURE_STORE, MINIMAL_DSL, call, call_err, copy_tree, manifest, migrated_db, seeded_fixture,
-    spawn_client,
+    FIXTURE_STORE, MINIMAL_DSL, arguments, call, call_err, copy_tree, manifest, migrated_db,
+    seeded_fixture, spawn_client,
 };
 use tempfile::TempDir;
 
@@ -394,6 +394,84 @@ async fn export_trades_refuses_bad_and_unknown_run_ids_without_writing() {
         export_count(&exports_dir),
         before,
         "a refused run_id writes no export"
+    );
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// G2: serde's default unknown-field tolerance would silently drop a misspelled
+/// `form`/`to`/`data_version` — turning a windowed backtest into an UNWINDOWED
+/// full-history run, or a pinned export into a HEAD read. Every MCP arg struct
+/// carries `deny_unknown_fields`, so a typo is a protocol refusal, and the
+/// advertised `inputSchema` says `additionalProperties: false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_arguments_are_refused_at_the_boundary() {
+    let tmp_db = TempDir::new().unwrap();
+    let (db_path, _db) = migrated_db(&tmp_db).await;
+    let tmp_store = TempDir::new().unwrap();
+    let store_dir = tmp_store.path().join("store");
+    copy_tree(&manifest(FIXTURE_STORE), &store_dir);
+    let client = spawn_client(&db_path, &store_dir).await;
+
+    // The advertised schema itself refuses unknown keys — every one of the
+    // nine tools, not just the cited one.
+    let tools = client.list_tools(None).await.expect("tools/list").tools;
+    for tool in &tools {
+        assert_eq!(
+            tool.input_schema.get("additionalProperties"),
+            Some(&json!(false)),
+            "{} must advertise additionalProperties:false",
+            tool.name
+        );
+    }
+
+    // The P1 typo: `form` for `from`. Silently dropped, this would run an
+    // UNWINDOWED full-history backtest — now a refused call naming the field.
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("run_backtest".to_owned()).with_arguments(arguments(
+                &json!({
+                    "version_id": "ver-any",
+                    "form": "2025-03-01T00:00:00Z",
+                    "to": "2025-03-02T00:00:00Z",
+                }),
+            )),
+        )
+        .await
+        .expect("the refusal is a tool error, not a transport failure");
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "a misspelled `form` must be refused, not run unwindowed: {refused:?}"
+    );
+    let text = refused.content[0]
+        .as_text()
+        .expect("the refusal is a text block")
+        .text
+        .clone();
+    assert!(
+        text.contains("unknown field `form`"),
+        "the refusal names the misspelled field: {text}"
+    );
+
+    // Same shape on a read tool — a misspelled `data_version` would silently
+    // select HEAD instead of the pinned snapshot.
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("export_candles".to_owned()).with_arguments(arguments(
+                &json!({
+                    "pair": "BTCUSDT",
+                    "timeframe": "M15",
+                    "data_versio": "anything",
+                }),
+            )),
+        )
+        .await
+        .expect("the refusal is a tool error, not a transport failure");
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "a misspelled `data_version` must be refused, not read HEAD"
     );
 
     client.cancel().await.expect("cancel session");

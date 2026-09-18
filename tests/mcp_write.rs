@@ -287,6 +287,39 @@ async fn submit_duplicate_root_name_is_refused_and_creates_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_blank_root_name_is_refused_and_creates_nothing() {
+    let (fixture, client) = write_fixture().await;
+    let strategies_before = row_count(&fixture, "strategy").await;
+
+    // Empty, spaces, and tabs all trim to nothing — each must refuse rather
+    // than land an unnamed strategy row in the Library.
+    for name in ["", "   ", " \t "] {
+        let err = call_err(
+            &client,
+            "submit_strategy_version",
+            json!({
+                "strategy_name": name,
+                "dsl": variant_dsl("Blank"),
+                "hypothesis": "a blank root name should refuse",
+            }),
+        )
+        .await;
+        assert_eq!(err["field"], "strategy_name", "name {name:?}: {err}");
+        assert!(
+            err["message"].as_str().is_some_and(|m| m.contains("blank")),
+            "the refusal names the blank name: {err}"
+        );
+    }
+    assert_eq!(
+        row_count(&fixture, "strategy").await,
+        strategies_before,
+        "no strategy row was created"
+    );
+
+    client.cancel().await.expect("cancel session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_requires_exactly_one_target() {
     let (fixture, client) = write_fixture().await;
     let (_parent, child, _run) = &fixture.seed;
