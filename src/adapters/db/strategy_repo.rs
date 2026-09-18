@@ -189,6 +189,14 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
         let (_, created_at) = self.now_rfc3339()?;
         let tags_json = serde_json::to_string(tags).map_err(|e| DataError::Db(e.to_string()))?;
 
+        // INSERT + read-back in one transaction (G8): the defended read runs
+        // BEFORE commit, so a read failure rolls the insert back rather than
+        // reporting a committed write as failed.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
         sqlx::query!(
             "INSERT INTO strategy (id, name, tags, owner, pinned_version_id, archived, created_at) \
              VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
@@ -198,45 +206,21 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             owner,
             created_at,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| DataError::Db(e.to_string()))?;
-
-        self.get_strategy(&StrategyId::new(id))
+        let strategy = self
+            .fetch_strategy(&mut *tx, &StrategyId::new(&id))
             .await?
-            .ok_or_else(|| DataError::Db("created strategy vanished on read-back".to_owned()))
+            .ok_or_else(|| DataError::Db("created strategy vanished on read-back".to_owned()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        Ok(strategy)
     }
 
     async fn get_strategy(&self, id: &StrategyId) -> Result<Option<Strategy>, DataError> {
-        let id_str = id.as_str();
-        let row = sqlx::query!(
-            r#"SELECT
-                 id                AS "id!: String",
-                 name              AS "name!: String",
-                 tags              AS "tags!: String",
-                 owner             AS "owner?: String",
-                 pinned_version_id AS "pinned_version_id?: String",
-                 archived          AS "archived!: i64",
-                 created_at        AS "created_at!: String"
-               FROM strategy WHERE id = ?1"#,
-            id_str,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        match row {
-            None => Ok(None),
-            Some(r) => Ok(Some(Strategy {
-                id: StrategyId::new(r.id),
-                name: r.name,
-                tags: parse_json_str_array(&r.tags)?,
-                owner: r.owner,
-                pinned_version_id: r.pinned_version_id.map(VersionId::new),
-                archived: r.archived != 0,
-                created_at: parse_created_at(&r.created_at)?,
-            })),
-        }
+        self.fetch_strategy(&self.pool, id).await
     }
 
     async fn list_strategies(&self, include_archived: bool) -> Result<Vec<Strategy>, DataError> {
@@ -434,7 +418,10 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             .map_err(|e| DataError::Db(e.to_string()))?;
         let (_, created_at) = self.now_rfc3339()?;
 
-        // 3. INSERT + read-back in one transaction (gate-7 C5).
+        // 3. INSERT + read-back in one transaction (gate-7 C5). The defended
+        //    read runs on the transaction BEFORE commit (G8): a read failure
+        //    rolls the insert back — a reported error always means nothing was
+        //    persisted, never a committed write misreported as failed.
         let mut tx = self
             .pool
             .begin()
@@ -456,49 +443,18 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             },
         )
         .await?;
+        let version = self
+            .fetch_version(&mut *tx, &VersionId::new(&id))
+            .await?
+            .ok_or_else(|| DataError::Db("created version vanished on read-back".to_owned()))?;
         tx.commit()
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
-
-        self.get_version(&VersionId::new(id))
-            .await?
-            .ok_or_else(|| DataError::Db("created version vanished on read-back".to_owned()))
+        Ok(version)
     }
 
     async fn get_version(&self, id: &VersionId) -> Result<Option<StrategyVersion>, DataError> {
-        let id_str = id.as_str();
-        let row = sqlx::query!(
-            r#"SELECT
-                 id                    AS "id!: String",
-                 strategy_id           AS "strategy_id!: String",
-                 parent_version_id     AS "parent_version_id?: String",
-                 dsl_schema_version    AS "dsl_schema_version!: String",
-                 dsl_original          AS "dsl_original!: String",
-                 version_hash          AS "version_hash!: String",
-                 created_by            AS "created_by!: String",
-                 creating_llm_call_ids AS "creating_llm_call_ids!: String",
-                 created_at            AS "created_at!: String"
-               FROM strategy_version WHERE id = ?1"#,
-            id_str,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        match row {
-            None => Ok(None),
-            Some(r) => Ok(Some(self.row_to_version(VersionRow {
-                id: r.id,
-                strategy_id: r.strategy_id,
-                parent_version_id: r.parent_version_id,
-                dsl_schema_version: r.dsl_schema_version,
-                dsl_original: r.dsl_original,
-                version_hash: r.version_hash,
-                created_by: r.created_by,
-                creating_llm_call_ids: r.creating_llm_call_ids,
-                created_at: r.created_at,
-            })?)),
-        }
+        self.fetch_version(&self.pool, id).await
     }
 
     async fn list_versions(
@@ -630,22 +586,25 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             },
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|e| DataError::Db(e.to_string()))?;
 
-        // Read both halves back through the defended paths — `get_version`
-        // re-derives the hash; `get_agent_submission` re-validates the newtypes.
+        // Read both halves back through the defended paths ON THE TRANSACTION
+        // (G8/T23): `fetch_version` re-derives the hash; `fetch_submission`
+        // re-validates the newtypes. A read that fails here rolls the pair
+        // back — post-commit, a read error would have misreported a committed
+        // write as failed and made a retry double-write.
         let version = self
-            .get_version(&VersionId::new(id))
+            .fetch_version(&mut *tx, &VersionId::new(&id))
             .await?
             .ok_or_else(|| {
                 DataError::Db("created agent version vanished on read-back".to_owned())
             })?;
         let submission = self
-            .get_agent_submission(&version.id)
+            .fetch_submission(&mut *tx, &version.id)
             .await?
             .ok_or_else(|| DataError::Db("created submission vanished on read-back".to_owned()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
         Ok((version, submission))
     }
 
@@ -741,27 +700,28 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             },
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|e| DataError::Db(e.to_string()))?;
-
-        // Read all three rows back through the defended paths.
+        // Read all three rows back through the defended paths ON THE
+        // TRANSACTION (G8/T23) — before commit, so a read failure rolls the
+        // triple back rather than misreporting a committed write.
         let strategy = self
-            .get_strategy(&StrategyId::new(strategy_id))
+            .fetch_strategy(&mut *tx, &StrategyId::new(&strategy_id))
             .await?
             .ok_or_else(|| {
                 DataError::Db("created agent strategy vanished on read-back".to_owned())
             })?;
         let version = self
-            .get_version(&VersionId::new(id))
+            .fetch_version(&mut *tx, &VersionId::new(&id))
             .await?
             .ok_or_else(|| {
                 DataError::Db("created agent version vanished on read-back".to_owned())
             })?;
         let submission = self
-            .get_agent_submission(&version.id)
+            .fetch_submission(&mut *tx, &version.id)
             .await?
             .ok_or_else(|| DataError::Db("created submission vanished on read-back".to_owned()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
         Ok((strategy, version, submission))
     }
 
@@ -769,6 +729,124 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
         &self,
         version_id: &VersionId,
     ) -> Result<Option<AgentSubmission>, DataError> {
+        self.fetch_submission(&self.pool, version_id).await
+    }
+}
+
+/// The raw `strategy_version` column values as read from the DB — the input to
+/// [`SqliteStrategyRepo::row_to_version`]. A struct (not a long arg list) so the
+/// re-derive helper consumes one owned value and avoids a wide signature.
+struct VersionRow {
+    id: String,
+    strategy_id: String,
+    parent_version_id: Option<String>,
+    dsl_schema_version: String,
+    dsl_original: String,
+    version_hash: String,
+    created_by: String,
+    creating_llm_call_ids: String,
+    created_at: String,
+}
+
+impl<C: Clock> SqliteStrategyRepo<C> {
+    /// `get_strategy`'s SELECT + decode, run on `executor` — a pool for plain
+    /// reads, the transaction handle for the in-transaction write verification
+    /// (G8: the create paths verify BEFORE commit so a read failure rolls the
+    /// write back rather than reporting a committed write as failed).
+    async fn fetch_strategy<'e, E>(
+        &self,
+        executor: E,
+        id: &StrategyId,
+    ) -> Result<Option<Strategy>, DataError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let id_str = id.as_str();
+        let row = sqlx::query!(
+            r#"SELECT
+                 id                AS "id!: String",
+                 name              AS "name!: String",
+                 tags              AS "tags!: String",
+                 owner             AS "owner?: String",
+                 pinned_version_id AS "pinned_version_id?: String",
+                 archived          AS "archived!: i64",
+                 created_at        AS "created_at!: String"
+               FROM strategy WHERE id = ?1"#,
+            id_str,
+        )
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(Strategy {
+                id: StrategyId::new(r.id),
+                name: r.name,
+                tags: parse_json_str_array(&r.tags)?,
+                owner: r.owner,
+                pinned_version_id: r.pinned_version_id.map(VersionId::new),
+                archived: r.archived != 0,
+                created_at: parse_created_at(&r.created_at)?,
+            })),
+        }
+    }
+
+    /// `get_version`'s SELECT + defended decode on `executor` — see
+    /// [`fetch_strategy`](Self::fetch_strategy) for the executor split.
+    async fn fetch_version<'e, E>(
+        &self,
+        executor: E,
+        id: &VersionId,
+    ) -> Result<Option<StrategyVersion>, DataError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let id_str = id.as_str();
+        let row = sqlx::query!(
+            r#"SELECT
+                 id                    AS "id!: String",
+                 strategy_id           AS "strategy_id!: String",
+                 parent_version_id     AS "parent_version_id?: String",
+                 dsl_schema_version    AS "dsl_schema_version!: String",
+                 dsl_original          AS "dsl_original!: String",
+                 version_hash          AS "version_hash!: String",
+                 created_by            AS "created_by!: String",
+                 creating_llm_call_ids AS "creating_llm_call_ids!: String",
+                 created_at            AS "created_at!: String"
+               FROM strategy_version WHERE id = ?1"#,
+            id_str,
+        )
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(self.row_to_version(VersionRow {
+                id: r.id,
+                strategy_id: r.strategy_id,
+                parent_version_id: r.parent_version_id,
+                dsl_schema_version: r.dsl_schema_version,
+                dsl_original: r.dsl_original,
+                version_hash: r.version_hash,
+                created_by: r.created_by,
+                creating_llm_call_ids: r.creating_llm_call_ids,
+                created_at: r.created_at,
+            })?)),
+        }
+    }
+
+    /// `get_agent_submission`'s SELECT + defended decode on `executor` — see
+    /// [`fetch_strategy`](Self::fetch_strategy) for the executor split.
+    async fn fetch_submission<'e, E>(
+        &self,
+        executor: E,
+        version_id: &VersionId,
+    ) -> Result<Option<AgentSubmission>, DataError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let vid = version_id.as_str();
         let row = sqlx::query!(
             r#"SELECT
@@ -780,7 +858,7 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
                FROM agent_submission WHERE version_id = ?1"#,
             vid,
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await
         .map_err(|e| DataError::Db(e.to_string()))?;
 
@@ -802,24 +880,7 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             })),
         }
     }
-}
 
-/// The raw `strategy_version` column values as read from the DB — the input to
-/// [`SqliteStrategyRepo::row_to_version`]. A struct (not a long arg list) so the
-/// re-derive helper consumes one owned value and avoids a wide signature.
-struct VersionRow {
-    id: String,
-    strategy_id: String,
-    parent_version_id: Option<String>,
-    dsl_schema_version: String,
-    dsl_original: String,
-    version_hash: String,
-    created_by: String,
-    creating_llm_call_ids: String,
-    created_at: String,
-}
-
-impl<C: Clock> SqliteStrategyRepo<C> {
     /// Build a [`StrategyVersion`] from its raw column values, re-deriving `.dsl`
     /// from the verbatim `dsl_original` (#19) and rejecting a `version_hash`
     /// mismatch (audit-C5). All `get_version`/`list_versions`/`version_tree`

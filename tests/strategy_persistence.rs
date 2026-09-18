@@ -645,6 +645,103 @@ async fn create_agent_strategy_version_refuses_an_invalid_document_before_the_st
     }
 }
 
+// ---- G8/T23: a post-commit read fault must never report a committed write
+// ---- as failed --------------------------------------------------------------
+//
+// Pre-G8, `create_*` committed, then ran its defended read-back through the
+// pool — a transient pool fault after the commit made the caller see `Err` for
+// a write that had already landed, and a retry double-wrote (there is no
+// idempotency key). Now the read-back runs on the transaction's own
+// connection, before commit: a read failure rolls back, so `Err` always means
+// nothing was written.
+//
+// The fault is REAL rather than mocked into the repo: a one-connection pool
+// that discards every released connection and refuses every connect after the
+// first — under the old shape the post-commit `get_version` would hit a dead
+// pool on a committed write.
+
+/// A `(repo, db_path)` pair over a migrated tempfile where the pool opens ONE
+/// connection ever — after it is released (post-commit) every acquire fails.
+async fn dead_after_first_release_repo(
+    tmp: &TempDir,
+) -> (SqliteStrategyRepo<pulse::SystemClock>, std::path::PathBuf) {
+    let db_path = tmp.path().join("pulse.db");
+    {
+        let db = Db::with_path(&db_path)
+            .await
+            .expect("open db at tempfile path");
+        MIGRATOR.run(db.pool()).await.expect("migrate");
+    }
+
+    let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connects_in_hook = connects.clone();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |_conn, _meta| {
+            let connects = connects_in_hook.clone();
+            Box::pin(async move {
+                if connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(sqlx::Error::Io(std::io::Error::other(
+                        "injected connect fault",
+                    )))
+                }
+            })
+        })
+        // `Ok(false)` discards the tx's connection the instant it returns to
+        // the pool — the post-commit read would need a fresh connect.
+        .after_release(|_conn, _meta| Box::pin(async move { Ok(false) }))
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .foreign_keys(true),
+        )
+        .await
+        .expect("adversarial pool");
+    (SqliteStrategyRepo::new(pool), db_path)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_commit_read_fault_never_reports_a_committed_write_as_failed() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    // Root path: strategy + version + submission in one tx; the read-back
+    // shares the tx connection, so the dead post-commit pool is irrelevant.
+    let (root_repo, db_path) = dead_after_first_release_repo(&tmp).await;
+    let (strategy, version, submission) = root_repo
+        .create_agent_strategy_version("G8 Root", canonical_json(), a_submission())
+        .await
+        .expect("the write verified and committed before the pool went dead");
+
+    // Child path: version + submission under the root — same guarantee.
+    let (child_repo, _) = dead_after_first_release_repo(&tmp).await;
+    let (child_version, child_submission) = child_repo
+        .create_agent_version(
+            NewVersion {
+                strategy_id: strategy.id.clone(),
+                parent_version_id: Some(version.id.clone()),
+                dsl_json: canonical_json(),
+                created_by: CreatedBy::ExternalAgent,
+                creating_llm_call_ids: vec![],
+            },
+            a_submission(),
+        )
+        .await
+        .expect("the child write verified and committed before the pool went dead");
+
+    // The rows really landed — proven through a fresh, healthy pool.
+    let check_db = Db::with_path(&db_path).await.expect("reopen db");
+    let check = SqliteStrategyRepo::new(check_db.pool().clone());
+    for vid in [&version.id, &child_version.id] {
+        assert!(check.get_version(vid).await.unwrap().is_some());
+        assert!(check.get_agent_submission(vid).await.unwrap().is_some());
+    }
+    assert_eq!(submission.version_id, version.id);
+    assert_eq!(child_submission.version_id, child_version.id);
+}
+
 // ---- binary smoke test (AC-5): clap→dispatch→repo wiring end-to-end ----------
 
 #[test]
