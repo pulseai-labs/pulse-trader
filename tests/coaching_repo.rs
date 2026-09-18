@@ -25,12 +25,13 @@
 use chrono::{DateTime, SecondsFormat};
 use pulse::{
     AcceptFailureStage, BacktestRunId, CoachAcceptFailure, CoachAcceptanceRepository, CoachFailure,
-    CoachingRepository, CoachingSession, CoachingSessionId, Comparator, Condition, Db, Direction,
-    Disposition, ExitRule, FakeClock, Hypothesis, InMemoryCoachAcceptanceRepo, IndicatorSpec,
-    LlmCallId, MIGRATOR, MemoryCoachTurn, Mutation, MutationError, ParamValue, PreparedBacktest,
-    PreparedCoachAcceptance, Proposal, RiskParams, SchemaVersion, SeqIdSource, SessionOutcome,
-    SqliteCoachAcceptanceRepo, SqliteCoachingRepo, StrategyDsl, StrategyId, SweepableValue,
-    ValueSource, VersionId, apply,
+    CoachRequestFingerprint, CoachSessionClaim, CoachSessionClaimResult, CoachingRepository,
+    CoachingSession, CoachingSessionId, Comparator, Condition, Db, Direction, Disposition,
+    ExitRule, FakeClock, Hypothesis, InMemoryCoachAcceptanceRepo, IndicatorSpec,
+    InitialCoachOutcome, LlmCallId, MIGRATOR, MemoryCoachTurn, Mutation, MutationError, ParamValue,
+    PreparedBacktest, PreparedCoachAcceptance, Proposal, RiskParams, SchemaVersion, SeqIdSource,
+    SessionOutcome, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, StrategyDsl, StrategyId,
+    SweepableValue, ValueSource, VersionId, apply,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -1283,6 +1284,7 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
                 taker_fee_bps: Decimal::new(4, 0),
                 slippage_bps: Decimal::new(1, 0),
                 funding: pulse::FundingConfig::SnapshotRates,
+                window: None,
             },
             result: pulse::BacktestResult {
                 trades,
@@ -1428,5 +1430,134 @@ async fn the_in_memory_adapter_refuses_what_the_sqlite_one_refuses() {
             .await
             .is_err(),
         "and no accept failure to record against it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// r2.s1.w1 AC-4 / #158: one pending claim per run.
+//
+// `0009`'s `coaching_sessions_one_pending_per_run` partial unique index makes
+// the run the claim's second arbiter: two LIVE claims can never coexist on one
+// run, in any process. `claim_session` maps that violation to
+// `CoachSessionClaimResult::ExistingPending` carrying the WINNING session's row
+// — the same answer the process-local registry gives — and a claim that has
+// settled frees its run for the next turn.
+// ---------------------------------------------------------------------------
+
+fn a_claim(session: &str, run: &str, fp: &str) -> CoachSessionClaim {
+    CoachSessionClaim {
+        session_id: CoachingSessionId::new(session),
+        backtest_run_id: BacktestRunId::new(run),
+        strategy_version_id: VersionId::new("ver-1"),
+        request_fingerprint: CoachRequestFingerprint::new(fp).expect("a non-empty digest"),
+        created_at: now_rfc3339(),
+    }
+}
+
+/// A second pending claim on the same run does not land: the index refuses the
+/// insert and the adapter answers with the session that already holds the run —
+/// never an error, never the claimant's own (nonexistent) row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_pending_claim_on_the_same_run_returns_the_firsts_row() {
+    let (repo, pool, _tmp) = repo().await;
+    repo.claim_session(a_claim("sess-1", "run-1", "fp-a"))
+        .await
+        .expect("the first claim owns the run");
+
+    match repo
+        .claim_session(a_claim("sess-2", "run-1", "fp-b"))
+        .await
+        .expect("the run-level conflict is a typed answer, not an error")
+    {
+        CoachSessionClaimResult::ExistingPending(session) => {
+            assert_eq!(
+                session.id,
+                CoachingSessionId::new("sess-1"),
+                "ExistingPending carries the row that already holds the run"
+            );
+            assert_eq!(session.backtest_run_id, BacktestRunId::new("run-1"));
+            assert!(matches!(session.outcome, SessionOutcome::Pending));
+        }
+        other => panic!("expected ExistingPending with the first claim's row, got {other:?}"),
+    }
+
+    // The refused claim left no trace: one session row, and it is the winner's.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM coaching_sessions")
+        .fetch_one(&pool)
+        .await
+        .expect("count sessions");
+    assert_eq!(rows, 1, "the second claim was refused, not written");
+    let outcome: String =
+        sqlx::query_scalar("SELECT outcome FROM coaching_sessions WHERE id = 'sess-1'")
+            .fetch_one(&pool)
+            .await
+            .expect("the winner's row");
+    assert_eq!(outcome, "pending");
+}
+
+/// The index guards PENDING rows only: once the first claim settles, its run is
+/// free and a second claim on it lands as `Claimed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_first_claim_admits_a_second_on_the_same_run() {
+    let (repo, _pool, _tmp) = repo().await;
+    repo.claim_session(a_claim("sess-1", "run-1", "fp-a"))
+        .await
+        .expect("claim");
+    repo.finish_session(
+        &CoachingSessionId::new("sess-1"),
+        InitialCoachOutcome {
+            llm_call_id: None,
+            outcome: SessionOutcome::Failed {
+                failure: CoachFailure::ZeroCalls,
+            },
+        },
+    )
+    .await
+    .expect("the first claim settles");
+
+    match repo
+        .claim_session(a_claim("sess-2", "run-1", "fp-b"))
+        .await
+        .expect("a settled claim frees its run")
+    {
+        CoachSessionClaimResult::Claimed => {}
+        other => panic!("expected Claimed after the first claim settled, got {other:?}"),
+    }
+}
+
+/// The guard is per RUN, not global: pending claims on different runs coexist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_claims_on_different_runs_do_not_conflict() {
+    let (repo, _pool, _tmp) = repo().await;
+    repo.claim_session(a_claim("sess-1", "run-1", "fp-a"))
+        .await
+        .expect("claim run-1");
+
+    match repo
+        .claim_session(a_claim("sess-2", "run-2", "fp-b"))
+        .await
+        .expect("a different run is a different lane")
+    {
+        CoachSessionClaimResult::Claimed => {}
+        other => panic!("expected Claimed on a different run, got {other:?}"),
+    }
+}
+
+/// A same-id reclaim still reaches the identity path even when the run holds a
+/// DIFFERENT live claim: reusing `sess-1`'s id with a different fingerprint is
+/// the same `Err` it always was — the run-level guard must not turn it into an
+/// `ExistingPending` that laundered the collision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_id_reclaim_with_a_different_fingerprint_is_still_an_error() {
+    let (repo, _pool, _tmp) = repo().await;
+    repo.claim_session(a_claim("sess-1", "run-1", "fp-a"))
+        .await
+        .expect("claim");
+
+    assert!(
+        repo.claim_session(a_claim("sess-1", "run-1", "fp-b"))
+            .await
+            .is_err(),
+        "the id is already held by a turn with a different fingerprint"
     );
 }

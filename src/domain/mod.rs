@@ -87,7 +87,8 @@ pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 // can curate the crate surface — an un-re-exported public domain type is a
 // `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{
-    BacktestInputs, BacktestRunId, FundingConfig, PersistedRun, RunSummary, SnapshotSelection,
+    BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig, PersistedRun,
+    RunSummary, SnapshotSelection,
 };
 pub use candle::Candle;
 pub use clock::Clock;

@@ -320,6 +320,7 @@ mod tests {
             taker_fee_bps: Decimal::new(5, 2),
             slippage_bps: Decimal::new(2, 2),
             funding: FundingConfig::SnapshotRates,
+            window: None,
         };
 
         assert_eq!(

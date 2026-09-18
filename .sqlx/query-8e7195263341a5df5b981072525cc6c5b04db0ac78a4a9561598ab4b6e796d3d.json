@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 id         AS \"id!: String\",\n                 version_id AS \"version_id!: String\",\n                 agent_name AS \"agent_name!: String\",\n                 hypothesis AS \"hypothesis!: String\",\n                 created_at AS \"created_at!: String\"\n               FROM agent_submission WHERE version_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "version_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "agent_name!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "hypothesis!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8e7195263341a5df5b981072525cc6c5b04db0ac78a4a9561598ab4b6e796d3d"
+}

@@ -57,19 +57,22 @@ async fn columns_of(pool: &SqlitePool, table: &str) -> Vec<String> {
         .unwrap()
 }
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0005_*` and `0008_*` —
-/// the "older binary" that shipped `0007` while `0005` was still reserved.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0005_*`, `0008_*` and
+/// `0009_*` — the "older binary" that shipped `0007` while `0005` was still
+/// reserved.
 ///
 /// r1.s4.w4 added `0008` to the skip list, and it is not bookkeeping: `0008`
 /// REBUILDS the two tables `0005` creates, so a set holding `0008` without `0005`
 /// is not an older binary at all — it is an impossible one, and it fails with "no
-/// such table: `coaching_proposals`". The binary being simulated here predates both.
+/// such table: `coaching_proposals`". r2.s1.w1 adds `0009` for the same reason —
+/// its pending-claim index targets `coaching_sessions`, a `0005` table. The
+/// binary being simulated here predates all three.
 fn shipped_set_without_0005(dir: &Path) {
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("0005_") || name.starts_with("0008_") {
+        if name.starts_with("0005_") || name.starts_with("0008_") || name.starts_with("0009_") {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
@@ -254,17 +257,22 @@ async fn migration_0005_applies_to_a_database_already_at_0007() {
     );
     // The subject of this test is that `0005` APPLIED even though it sorts BELOW
     // the maximum the database already held — the reserved-number property. The
-    // maximum itself moved to 8 in r1.s4.w4 because the same run also applies
-    // `0008`, which the fixture withheld; asserting `Some(7)` here would now be
-    // asserting that `0008` did not run, which is a different (and false) claim.
+    // maximum itself moved to 9 across r1.s4.w4 and r2.s1.w1 because the same run
+    // also applies `0008` and `0009`, which the fixture withheld; asserting
+    // `Some(7)` here would now be asserting that they did not run, which is a
+    // different (and false) claim.
     assert!(
         applied.contains(&8),
         "0008 rides along in the same run: {applied:?}"
     );
+    assert!(
+        applied.contains(&9),
+        "0009 rides along in the same run: {applied:?}"
+    );
     assert_eq!(
         applied.iter().copied().max(),
-        Some(8),
-        "0005 is recorded at its own version, below the new maximum 0008 sets"
+        Some(9),
+        "0005 is recorded at its own version, below the new maximum 0009 sets"
     );
 
     assert!(

@@ -790,6 +790,7 @@ fn created_by_label(created_by: CreatedBy) -> String {
         CreatedBy::CoachLlm => "coach_llm",
         CreatedBy::AutoOptimizer => "auto_optimizer",
         CreatedBy::Migration => "migration",
+        CreatedBy::ExternalAgent => "external_agent",
     }
     .to_owned()
 }

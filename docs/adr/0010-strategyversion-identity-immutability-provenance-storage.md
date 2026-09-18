@@ -66,3 +66,45 @@ The slice already trusts SQL for the load-bearing immutability guarantee (trigge
 - **A normalized `LLMCall` table + junction now** — rejected for this slice: there is no `LLMCall` entity yet, so it would be a speculative schema with no producer. Denormalized JSON now + a recorded data-bearing cutover is the YAGNI-respecting path.
 - **Hard delete of strategies/versions** — rejected: archive-only preserves the immutable version tree and the audit trail the system-of-record exists to keep.
 - **All invariants in Rust only** — rejected as the *target* state (kept as the v1 *implementation* for speed): for a real-money system-of-record, critical invariants should be carried by the database so corruption is rejected at write regardless of the writer (#39).
+
+## Amendment — 2026-09-18 (r2.s1.w1, Proposed)
+
+*(Authored `Proposed`; flips `Accepted` at `r2.s1` spine close. Recorded with the
+shipped evidence: `migrations/0009_external_agent_window_claim` and
+`tests/migration_0009.rs`.)*
+
+**Provenance gains a sixth kind: `external_agent`.** `CreatedBy` closes over
+`human`, `composer_llm`, `coach_llm`, `auto_optimizer`, `migration`, and now
+`external_agent` — a version submitted by an agent running OUTSIDE this process
+(the `pulse mcp` surface recorded in ADR-0015's same-day amendment). The stored
+token is `"external_agent"`, joining the same serde vocabulary the other five
+occupy.
+
+**Its ledger is `agent_submission`, normalized from the start.** Decision 3's
+"denormalized now, normalized later" bet is not repeated here: where
+`creating_llm_call_ids` is a JSON array because `LlmCall` did not yet exist, the
+agent-submission shape is known whole on day one, so it lands as a real table —
+`id` PK, `version_id` `UNIQUE REFERENCES strategy_version(id)` (exactly one
+submission per version), `agent_name` and `hypothesis` (`CHECK`-bounded text),
+`created_at`. Two triggers make it append-only (`BEFORE UPDATE` / `BEFORE
+DELETE` each `RAISE(ABORT)`), and a third (`agent_submission_version_kind`)
+refuses a submission whose referenced version is not `created_by =
+'external_agent'` — the schema itself enforces the one-writer rule #39 asks the
+system-of-record to carry.
+
+**No `LlmCall` is written, and `creating_llm_call_ids` is `[]` for this kind.**
+An `LlmCall` row records an in-app provider call and its cost; an external
+agent's cost is external to the app — no call this process made, no tokens it
+billed, nothing the ledger can honestly name. The port refuses a non-empty
+`creating_llm_call_ids` on an `external_agent` version BEFORE touching the
+database (`SqliteStrategyRepo::create_agent_version`), so the denormalized
+column's contract — "ids of calls this app made" — is never lied to. Where a
+coach version's audit trail is `coaching_sessions` + `llm_call`, an external
+version's is `agent_submission` alone.
+
+**Touch surface unchanged.** `StrategyVersion`'s identity, immutability, and
+read-back rules are untouched: the version row is written by the existing
+`insert_version_row`, defended by the same triggers, and re-derived through the
+same `version_hash` check on read. `create_agent_version` is a second writer on
+the SAME contract — version and submission in one `BEGIN IMMEDIATE`
+transaction, both rows or neither — not a new shape of version.

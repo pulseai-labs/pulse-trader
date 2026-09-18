@@ -300,7 +300,7 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         // `INSERT .. ON CONFLICT DO NOTHING` takes the lock immediately instead of
         // upgrading a read snapshot, so two processes racing the same claim get a
         // clean winner rather than `SQLITE_BUSY_SNAPSHOT`.
-        let inserted = sqlx::query!(
+        let inserted = match sqlx::query!(
             "INSERT INTO coaching_sessions \
              (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
               failure_kind, failure_detail, schema_version, request_fingerprint) \
@@ -315,8 +315,23 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| DataError::Db(e.to_string()))?
-        .rows_affected();
+        {
+            Ok(result) => result.rows_affected(),
+            Err(e) => {
+                if !e
+                    .as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+                {
+                    return Err(DataError::Db(e.to_string()));
+                }
+                match self.pending_claim_holder(&id, &run).await? {
+                    Some(session) => {
+                        return Ok(CoachSessionClaimResult::ExistingPending(session));
+                    }
+                    None => 0,
+                }
+            }
+        };
 
         if inserted == 1 {
             return Ok(CoachSessionClaimResult::Claimed);
@@ -532,119 +547,7 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         &self,
         id: &CoachingSessionId,
     ) -> Result<Option<CoachingSession>, DataError> {
-        let id_str = id.as_str();
-        let row = sqlx::query!(
-            r#"SELECT
-                 id                  AS "id!: String",
-                 backtest_run_id     AS "backtest_run_id!: String",
-                 strategy_version_id AS "strategy_version_id!: String",
-                 created_at          AS "created_at!: String",
-                 llm_call_id         AS "llm_call_id?: String",
-                 outcome             AS "outcome!: String",
-                 failure_kind        AS "failure_kind?: String",
-                 failure_detail      AS "failure_detail?: String",
-                 schema_version      AS "schema_version!: i64"
-               FROM coaching_sessions WHERE id = ?1"#,
-            id_str,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        let Some(r) = row else { return Ok(None) };
-
-        // The stored schema_version is load-bearing — reject an unsupported tag
-        // hard (fail-closed, mirror `get_call`).
-        if r.schema_version != COACHING_SCHEMA_VERSION {
-            return Err(DataError::Db(format!(
-                "unsupported coaching_sessions schema version {}",
-                r.schema_version
-            )));
-        }
-
-        // `created_at` is a TEXT column, so nothing but this stops a row written
-        // around the adapter from reading back as a timestamp it is not (PR #128,
-        // finding H3; `get_call` already takes this posture). It is a CHECK, not a
-        // normalisation: the stored text is returned unchanged, because rewriting an
-        // audit value on read would make the row disagree with itself.
-        DateTime::parse_from_rfc3339(&r.created_at).map_err(|e| {
-            DataError::Db(format!(
-                "coaching_sessions `{}`: malformed created_at `{}`: {e}",
-                r.id, r.created_at
-            ))
-        })?;
-
-        let outcome = match r.outcome.as_str() {
-            // A claim, still open. `0008`'s CHECKs already forbid a pending row
-            // from naming a ledger call or a failure; the proposal is the one
-            // contradiction they cannot state (it lives in the other table), so the
-            // read fails closed on it rather than returning a claim that quietly
-            // owns an outcome.
-            OUTCOME_PENDING => {
-                if self.fetch_proposal(&r.id).await?.is_some() {
-                    return Err(DataError::Db(format!(
-                        "coaching_sessions `{}` is still pending and already carries a proposal",
-                        r.id
-                    )));
-                }
-                SessionOutcome::Pending
-            }
-            OUTCOME_PROPOSED => {
-                let proposal = self.fetch_proposal(&r.id).await?.ok_or_else(|| {
-                    DataError::Db(format!(
-                        "coaching_sessions `{}` records a proposal but has no proposal row",
-                        r.id
-                    ))
-                })?;
-                SessionOutcome::Proposed { proposal }
-            }
-            OUTCOME_FAILED => {
-                let detail = r.failure_detail.ok_or_else(|| {
-                    DataError::Db(format!(
-                        "coaching_sessions `{}` records a failure with no failure_detail",
-                        r.id
-                    ))
-                })?;
-                let stored_kind = r.failure_kind.ok_or_else(|| {
-                    DataError::Db(format!(
-                        "coaching_sessions `{}` records a failure with no failure_kind",
-                        r.id
-                    ))
-                })?;
-                let failure: CoachFailure =
-                    parse_json("coaching_sessions.failure_detail", &detail)?;
-                // `failure_kind` and `failure_detail` are written from the SAME
-                // value, so a row where they disagree was written around this
-                // adapter — and it is the QUERYABLE column that disagrees. A
-                // `failure_kind` index scan for `provider_timeout` that returns a
-                // row whose detail is a `zero_calls` is worse than an error: it is
-                // a wrong answer to an audit question. Fail closed, the posture the
-                // rest of this file already takes.
-                let decoded_kind = failure_kind(&failure);
-                if stored_kind != decoded_kind {
-                    return Err(DataError::Db(format!(
-                        "coaching_sessions `{}`: failure_kind `{stored_kind}` disagrees with \
-                         the recorded failure_detail (`{decoded_kind}`)",
-                        r.id
-                    )));
-                }
-                SessionOutcome::Failed { failure }
-            }
-            other => {
-                return Err(DataError::Db(format!(
-                    "coaching_sessions: unknown outcome `{other}`"
-                )));
-            }
-        };
-
-        Ok(Some(CoachingSession {
-            id: CoachingSessionId::new(r.id),
-            backtest_run_id: BacktestRunId::new(r.backtest_run_id),
-            strategy_version_id: VersionId::new(r.strategy_version_id),
-            created_at: r.created_at,
-            llm_call_id: r.llm_call_id.map(LlmCallId::new),
-            outcome,
-        }))
+        self.fetch_session(id).await
     }
 
     async fn list_sessions_for_run(
@@ -895,6 +798,179 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
 }
 
 impl<C: Clock> SqliteCoachingRepo<C> {
+    /// The session row for `id`, decoded fail-closed — [`CoachingRepository::get_session`]'s
+    /// body, extracted so `claim_session`'s run-level-conflict path can read a session
+    /// WITHOUT going through the trait (r2.s1.w1 / #158).
+    async fn fetch_session(
+        &self,
+        id: &CoachingSessionId,
+    ) -> Result<Option<CoachingSession>, DataError> {
+        let id_str = id.as_str();
+        let row = sqlx::query!(
+            r#"SELECT
+                 id                  AS "id!: String",
+                 backtest_run_id     AS "backtest_run_id!: String",
+                 strategy_version_id AS "strategy_version_id!: String",
+                 created_at          AS "created_at!: String",
+                 llm_call_id         AS "llm_call_id?: String",
+                 outcome             AS "outcome!: String",
+                 failure_kind        AS "failure_kind?: String",
+                 failure_detail      AS "failure_detail?: String",
+                 schema_version      AS "schema_version!: i64"
+               FROM coaching_sessions WHERE id = ?1"#,
+            id_str,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        let Some(r) = row else { return Ok(None) };
+
+        // The stored schema_version is load-bearing — reject an unsupported tag
+        // hard (fail-closed, mirror `get_call`).
+        if r.schema_version != COACHING_SCHEMA_VERSION {
+            return Err(DataError::Db(format!(
+                "unsupported coaching_sessions schema version {}",
+                r.schema_version
+            )));
+        }
+
+        // `created_at` is a TEXT column, so nothing but this stops a row written
+        // around the adapter from reading back as a timestamp it is not (PR #128,
+        // finding H3; `get_call` already takes this posture). It is a CHECK, not a
+        // normalisation: the stored text is returned unchanged, because rewriting an
+        // audit value on read would make the row disagree with itself.
+        DateTime::parse_from_rfc3339(&r.created_at).map_err(|e| {
+            DataError::Db(format!(
+                "coaching_sessions `{}`: malformed created_at `{}`: {e}",
+                r.id, r.created_at
+            ))
+        })?;
+
+        let outcome = match r.outcome.as_str() {
+            // A claim, still open. `0008`'s CHECKs already forbid a pending row
+            // from naming a ledger call or a failure; the proposal is the one
+            // contradiction they cannot state (it lives in the other table), so the
+            // read fails closed on it rather than returning a claim that quietly
+            // owns an outcome.
+            OUTCOME_PENDING => {
+                if self.fetch_proposal(&r.id).await?.is_some() {
+                    return Err(DataError::Db(format!(
+                        "coaching_sessions `{}` is still pending and already carries a proposal",
+                        r.id
+                    )));
+                }
+                SessionOutcome::Pending
+            }
+            OUTCOME_PROPOSED => {
+                let proposal = self.fetch_proposal(&r.id).await?.ok_or_else(|| {
+                    DataError::Db(format!(
+                        "coaching_sessions `{}` records a proposal but has no proposal row",
+                        r.id
+                    ))
+                })?;
+                SessionOutcome::Proposed { proposal }
+            }
+            OUTCOME_FAILED => {
+                let detail = r.failure_detail.ok_or_else(|| {
+                    DataError::Db(format!(
+                        "coaching_sessions `{}` records a failure with no failure_detail",
+                        r.id
+                    ))
+                })?;
+                let stored_kind = r.failure_kind.ok_or_else(|| {
+                    DataError::Db(format!(
+                        "coaching_sessions `{}` records a failure with no failure_kind",
+                        r.id
+                    ))
+                })?;
+                let failure: CoachFailure =
+                    parse_json("coaching_sessions.failure_detail", &detail)?;
+                // `failure_kind` and `failure_detail` are written from the SAME
+                // value, so a row where they disagree was written around this
+                // adapter — and it is the QUERYABLE column that disagrees. A
+                // `failure_kind` index scan for `provider_timeout` that returns a
+                // row whose detail is a `zero_calls` is worse than an error: it is
+                // a wrong answer to an audit question. Fail closed, the posture the
+                // rest of this file already takes.
+                let decoded_kind = failure_kind(&failure);
+                if stored_kind != decoded_kind {
+                    return Err(DataError::Db(format!(
+                        "coaching_sessions `{}`: failure_kind `{stored_kind}` disagrees with \
+                         the recorded failure_detail (`{decoded_kind}`)",
+                        r.id
+                    )));
+                }
+                SessionOutcome::Failed { failure }
+            }
+            other => {
+                return Err(DataError::Db(format!(
+                    "coaching_sessions: unknown outcome `{other}`"
+                )));
+            }
+        };
+
+        Ok(Some(CoachingSession {
+            id: CoachingSessionId::new(r.id),
+            backtest_run_id: BacktestRunId::new(r.backtest_run_id),
+            strategy_version_id: VersionId::new(r.strategy_version_id),
+            created_at: r.created_at,
+            llm_call_id: r.llm_call_id.map(LlmCallId::new),
+            outcome,
+        }))
+    }
+
+    /// The session holding `run`'s pending claim after the insert was refused by
+    /// `coaching_sessions_one_pending_per_run`, or `None` when OUR id already has
+    /// a row — in which case the identity path applies its usual rules.
+    ///
+    /// r2.s1.w1 / #158: the only uniqueness constraint an `ON CONFLICT(id) DO
+    /// NOTHING` insert can still hit is 0009's partial index — a `PRIMARY KEY`
+    /// conflict is suppressed by the arbiter. Whichever index SQLite checked
+    /// first decides the shape of the answer; a DIFFERENT pending row is the
+    /// run-level claim, reported verbatim — the same answer the process-local
+    /// registry gives.
+    async fn pending_claim_holder(
+        &self,
+        id: &str,
+        run: &str,
+    ) -> Result<Option<CoachingSession>, DataError> {
+        let ours = sqlx::query_scalar!(
+            r#"SELECT id AS "id!: String" FROM coaching_sessions WHERE id = ?1"#,
+            id,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+        if ours.is_some() {
+            return Ok(None);
+        }
+        let pending = sqlx::query_scalar!(
+            r#"SELECT id AS "id!: String" FROM coaching_sessions
+               WHERE backtest_run_id = ?1 AND outcome = 'pending'"#,
+            run,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+        match pending {
+            Some(pending_id) => Ok(Some(
+                self.fetch_session(&CoachingSessionId::new(&pending_id))
+                    .await?
+                    .ok_or_else(|| {
+                        DataError::Db(format!(
+                            "coach session claim `{id}`: the pending claim that \
+                             blocked the insert vanished before it could be read"
+                        ))
+                    })?,
+            )),
+            None => Err(DataError::Db(format!(
+                "coach session claim `{id}`: the pending claim that blocked the \
+                 insert settled before it could be read; retry the claim"
+            ))),
+        }
+    }
+
     /// The proposal row for a session, decoded into the domain type.
     async fn fetch_proposal(&self, session_id: &str) -> Result<Option<Proposal>, DataError> {
         let row = sqlx::query!(

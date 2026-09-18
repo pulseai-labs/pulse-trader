@@ -829,6 +829,9 @@ fn inputs_from_run(
         taker_fee_bps: config.taker_fee_bps,
         slippage_bps: config.slippage_bps,
         funding: FundingConfig::SnapshotRates,
+        // r2.s1.w1: no run path consumes a candle window yet — the engine still
+        // reads the whole snapshot, which is exactly what `None` records.
+        window: None,
     }
 }
 
