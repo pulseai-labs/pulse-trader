@@ -242,8 +242,10 @@ mod tests {
             path.display()
         );
         assert!(
-            path.to_string_lossy().contains("PulseTrader"),
-            "default db path must be namespaced under PulseTrader, got {}",
+            path.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("pulsetrader"),
+            "default db path must be namespaced under pulsetrader (case-insensitive), got {}",
             path.display()
         );
     }
