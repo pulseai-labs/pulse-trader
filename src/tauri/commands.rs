@@ -87,10 +87,11 @@ use crate::domain::CoachingSessionId;
 use crate::domain::Redactor;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, Clock, Comparator, Condition, CredentialStatus,
-    DataError, Direction, EngineFingerprint, ExitRule, IndicatorSpec, LlmCallRepository, LlmConfig,
-    LlmError, LlmProvider, LlmResponse, Message, PriceField, StrategyDsl, StrategyRepository,
-    SweepableValue, ToolDefinition, ValueSource,
+    BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, Clock, Comparator,
+    Condition, CredentialStatus, DataError, Direction, EngineFingerprint, ExitRule, IndicatorSpec,
+    LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse, Message, PriceField,
+    SnapshotSelection, StrategyDsl, StrategyRepository, SweepableValue, ToolDefinition,
+    ValueSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -1432,6 +1433,80 @@ pub async fn run_backtest_version(
     run_backtest_version_core(&state, request).await
 }
 
+/// A one-line, human-readable description of how two recorded
+/// [`BacktestInputs`] differ — each differing field named with both values,
+/// so the "inputs differ" badge's hover explains itself (G6). Window bounds
+/// render RFC 3339; a snapshot names `timeframe@data_version`.
+fn describe_input_differences(child: &BacktestInputs, parent: &BacktestInputs) -> String {
+    fn ms_rfc3339(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms).map_or_else(
+            || format!("{ms}ms"),
+            |dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true),
+        )
+    }
+    let selection = |sel: &SnapshotSelection| {
+        format!(
+            "{}@{}",
+            sel.timeframe.binance_interval(),
+            sel.data_version.as_str()
+        )
+    };
+    let opt_selection =
+        |sel: &Option<SnapshotSelection>| sel.as_ref().map_or_else(|| "none".to_owned(), selection);
+    let window = |w: &Option<CandleWindow>| match w {
+        None => "whole snapshot".to_owned(),
+        Some(w) => format!("[{}, {})", ms_rfc3339(w.from_ms), ms_rfc3339(w.to_ms)),
+    };
+
+    let mut diffs = Vec::new();
+    if child.pair != parent.pair {
+        diffs.push(format!(
+            "pair (child {}, parent {})",
+            child.pair, parent.pair
+        ));
+    }
+    if child.primary != parent.primary {
+        diffs.push(format!(
+            "primary snapshot (child {}, parent {})",
+            selection(&child.primary),
+            selection(&parent.primary)
+        ));
+    }
+    if child.htf != parent.htf {
+        diffs.push(format!(
+            "htf snapshot (child {}, parent {})",
+            opt_selection(&child.htf),
+            opt_selection(&parent.htf)
+        ));
+    }
+    if child.taker_fee_bps != parent.taker_fee_bps {
+        diffs.push(format!(
+            "taker fee bps (child {}, parent {})",
+            child.taker_fee_bps, parent.taker_fee_bps
+        ));
+    }
+    if child.slippage_bps != parent.slippage_bps {
+        diffs.push(format!(
+            "slippage bps (child {}, parent {})",
+            child.slippage_bps, parent.slippage_bps
+        ));
+    }
+    if child.funding != parent.funding {
+        diffs.push(format!(
+            "funding (child {:?}, parent {:?})",
+            child.funding, parent.funding
+        ));
+    }
+    if child.window != parent.window {
+        diffs.push(format!(
+            "window (child {}, parent {})",
+            window(&child.window),
+            window(&parent.window)
+        ));
+    }
+    format!("recorded inputs differ: {}", diffs.join(", "))
+}
+
 /// `compare_child_run`'s transport-free core (r2.s1.w4 C3) — a child's run
 /// beside its parent's LATEST run, for ANY child version.
 ///
@@ -1515,9 +1590,12 @@ pub async fn compare_child_run_core(
 
     // 4. `BacktestInputs` equality over the PERSISTED tuples — window included.
     //    A side with no recorded inputs cannot be proven equal, so it reads as
-    //    a difference whose note says which side lacks the provenance.
+    //    a difference whose note says which side lacks the provenance; when
+    //    BOTH sides carry inputs that differ, the note names the differing
+    //    fields so the badge's hover explains itself (G6).
     let (inputs_differ, inputs_note) = match (&child_run.inputs, &parent_run.inputs) {
-        (Some(child), Some(parent)) => (child != parent, None),
+        (Some(child), Some(parent)) if child == parent => (false, None),
+        (Some(child), Some(parent)) => (true, Some(describe_input_differences(child, parent))),
         (None, Some(_)) => (
             true,
             Some("child run predates recorded inputs — inputs cannot be compared".to_owned()),

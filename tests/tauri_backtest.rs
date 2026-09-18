@@ -1667,14 +1667,16 @@ async fn a_child_run_compares_with_its_parents_latest_run() {
 
 /// `inputs_differ` is the `BacktestInputs` equality verdict: a recorded window
 /// (the `run_backtest` shape) or a recosted run each differs from the parent's
-/// baseline. When both sides carry inputs there is no provenance note.
+/// baseline. When both sides carry inputs that differ, `inputs_note` names the
+/// differing fields — the badge's hover text (G6/T22).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inputs_differ_flags_a_windowed_or_recosted_child_run() {
     let env = env();
     let (parent, child) = seed_parent_and_agent_child(&env).await;
     save_run(&env, &parent, &seed_inputs(), 300).await;
 
-    // A windowed child run (the MCP `run_backtest` shape).
+    // A windowed child run (the MCP `run_backtest` shape) — the headline case:
+    // child windowed, parent whole-snapshot.
     let mut windowed = seed_inputs();
     windowed.window =
         Some(CandleWindow::new(1_735_689_600_000, 1_756_684_800_000).expect("valid window"));
@@ -1692,9 +1694,23 @@ async fn inputs_differ_flags_a_windowed_or_recosted_child_run() {
         dto.inputs_differ,
         "a recorded window the parent lacks is an inputs difference"
     );
-    assert_eq!(dto.inputs_note, None, "both runs carry inputs — no note");
+    let note = dto
+        .inputs_note
+        .expect("both runs carry inputs that differ — the note names the fields");
+    assert!(
+        note.contains("window"),
+        "the note names the differing field: {note}"
+    );
+    assert!(
+        note.contains("2025-01-01T00:00:00Z"),
+        "the child's window bound renders readably: {note}"
+    );
+    assert!(
+        note.contains("whole snapshot"),
+        "the parent's unwindowed side is named: {note}"
+    );
 
-    // A recosted child run differs the same way.
+    // A recosted child run differs the same way — the note names the cost field.
     let mut recosted = seed_inputs();
     recosted.taker_fee_bps = Decimal::new(8, 0);
     let child_run = save_run(&env, &child, &recosted, 420).await;
@@ -1709,6 +1725,11 @@ async fn inputs_differ_flags_a_windowed_or_recosted_child_run() {
     assert!(
         dto.inputs_differ,
         "a different taker_fee_bps is an inputs difference"
+    );
+    let note = dto.inputs_note.expect("the note names the differing field");
+    assert!(
+        note.contains("taker fee bps") && note.contains('8') && note.contains('4'),
+        "the note names the differing cost with both values: {note}"
     );
 }
 
