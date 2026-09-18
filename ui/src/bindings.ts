@@ -155,6 +155,15 @@ export const commands = {
 	 *  Returns a [`BusError`]; see [`coach_decide_core`].
 	 */
 	coachDecide: (request: CoachDecisionRequestDto) => typedError<CoachDecisionDto, BusError>(__TAURI_INVOKE("coach_decide", { request })),
+	/**
+	 *  `compare_child_run` — the Backtest Lab's child-vs-parent comparison
+	 *  (r2.s1.w4 C3).
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`compare_child_run_core`].
+	 */
+	compareChildRun: (request: CompareChildRunRequest) => typedError<CompareChildRunDto, BusError>(__TAURI_INVOKE("compare_child_run", { request })),
 };
 
 /* Types */
@@ -306,8 +315,8 @@ export type BacktestRunRequest = {
 /**
  *  The single serializable error shape that crosses the Tauri boundary.
  * 
- *  **Four fields, always all present** (r1.s3.w3 added `run_id`; r1.s4.w3's review
- *  added `session_id`), so the TypeScript
+ *  **Five fields, always all present** (r1.s3.w3 added `run_id`; r1.s4.w3's review
+ *  added `session_id`; r2.s1.w4 added `child_run_id`), so the TypeScript
  *  type generated from this struct describes every error the frontend can receive and
  *  one rendering path handles all of them. An ordinary error serializes
  *  `run_id: null` — the field is never skipped, because a field that sometimes
@@ -343,6 +352,17 @@ export type BusError = {
 	 *  that a screen must not parse prose to learn an id it has to act on.
 	 */
 	session_id: string | null,
+	/**
+	 *  The run id `compare_child_run` was asked about, on a `not_found` refusal
+	 *  (r2.s1.w4).
+	 * 
+	 *  `Some` only when the asked-for id itself is the thing that is missing —
+	 *  the same rule `run_id` follows: a screen must not parse prose to learn an
+	 *  id it has to report back. `None` for every other error, including the
+	 *  comparison's other refusals, where the run exists and it is the parent
+	 *  (or the parent's run) that does not.
+	 */
+	child_run_id: string | null,
 };
 
 /**
@@ -380,6 +400,16 @@ export type BusErrorCode =
  *  readability.
  */
 "busy" | 
+/**
+ *  A named thing the command was asked about is not there (r2.s1.w4).
+ * 
+ *  A family of its own rather than `Data`: `Data` says the store faulted,
+ *  which prescribes a retry, while this says the lookup came back empty —
+ *  the remedy is a different name, not another attempt at a store that is
+ *  working fine. First used by `compare_child_run` for an unknown run id,
+ *  a version with no parent, or a parent with no run to compare against.
+ */
+"not_found" | 
 /**  The shell itself: a dead channel, a failed startup, a bug. Not a domain family. */
 "internal";
 
@@ -563,6 +593,46 @@ export type CoachTurnRequestDto = {
 };
 
 /**
+ *  A child run beside its parent's latest run — the Backtest Lab's
+ *  before/after for ANY child version, not only a coach accept (r2.s1.w4 C3).
+ * 
+ *  `before` is always the parent's LATEST persisted run; `after` is the run
+ *  named in the request. `inputs_differ` is `BacktestInputs` equality over the
+ *  two persisted tuples — window included — and reads `true` when either side
+ *  predates recorded inputs, with `inputs_note` saying which.
+ */
+export type CompareChildRunDto = {
+	/**  The version the child run belongs to. */
+	childVersionId: string,
+	/**  The parent version the `before` run belongs to. */
+	parentVersionId: string,
+	/**  The run named in the request — the `after` half. */
+	childRunId: string,
+	/**  The parent's latest persisted run — the `before` half. */
+	parentRunId: string,
+	/**  The parent's latest run, in the coach DTO's cell shape. */
+	before: SummaryDto,
+	/**  The child run, in the same shape. */
+	after: SummaryDto,
+	/**  `parent.inputs != child.inputs`; `true` when either side is `None`. */
+	inputsDiffer: boolean,
+	/**  Why the inputs cannot be proven equal, when a side predates them. */
+	inputsNote: string | null,
+};
+
+/**
+ *  What `compare_child_run` is asked for: one persisted run id (r2.s1.w4 C3).
+ * 
+ *  Everything else — the run's version, that version's parent, the parent's
+ *  latest run — is resolved server-side so the screen never reconstructs a
+ *  lineage it was already shown.
+ */
+export type CompareChildRunRequest = {
+	/**  The child run to compare against its parent's latest run. */
+	childRunId: string,
+};
+
+/**
  *  The compact DSL summary a finalized run returns — the finalize summary
  *  card's data, rendered from the fields the persisted version actually
  *  carries (the `w3` "real fields" discipline: render what the DSL carries,
@@ -741,6 +811,23 @@ export type LibraryVersion = {
 	parentId: string | null,
 	/**  Creation timestamp (RFC3339 UTC, from the record). */
 	createdAt: string,
+	/**
+	 *  Who authored this version — the `created_by` label (`"human"`,
+	 *  `"composer_llm"`, `"coach_llm"`, `"external_agent"`, …). r2.s1.w4 C1.
+	 */
+	createdBy: string,
+	/**
+	 *  For an `external_agent` version, the submission's normalized agent name
+	 *  (the screen renders `external_agent · <agent name>`). `None` for every
+	 *  other provenance — and for an agent version whose `agent_submission`
+	 *  row is absent, which is reported, not guessed at.
+	 */
+	agentName: string | null,
+	/**
+	 *  For an `external_agent` version, the submission's stated hypothesis.
+	 *  `None` under the same two rules as [`Self::agent_name`].
+	 */
+	hypothesis: string | null,
 	/**  The version's DSL, rendered to summary lines. */
 	dsl: DslSummary,
 	/**

@@ -39,8 +39,8 @@ pub(crate) mod events;
 pub(crate) mod library;
 
 pub use backtest::{
-    BacktestRunDto, BacktestRunRequest, EquityPointDto, HistogramBinDto, HistogramDto,
-    RegimeCellDto, TradeRowDto, backtest_run_dto,
+    BacktestRunDto, BacktestRunRequest, CompareChildRunDto, CompareChildRunRequest, EquityPointDto,
+    HistogramBinDto, HistogramDto, RegimeCellDto, TradeRowDto, backtest_run_dto,
 };
 pub use coach::{
     AcceptFailureDto, AcceptedCoachDto, CoachActionDto, CoachCostDto, CoachDecisionDto,
@@ -50,8 +50,9 @@ pub use coach::{
 };
 pub use commands::{
     BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
-    DesktopState, OperationGuard, OperationKey, ShellInfo, StreamOutcome, compose_strategy_core,
-    demo_stream_core, library_overview_core, run_backtest_version_core, shell_info_core,
+    DesktopState, OperationGuard, OperationKey, ShellInfo, StreamOutcome, compare_child_run_core,
+    compose_strategy_core, demo_stream_core, library_overview_core, run_backtest_version_core,
+    shell_info_core,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -81,6 +82,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::run_backtest_version,
         commands::coach_turn,
         commands::coach_decide,
+        commands::compare_child_run,
     ])
 }
 

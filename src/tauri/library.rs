@@ -64,6 +64,17 @@ pub struct LibraryVersion {
     pub parent_id: Option<String>,
     /// Creation timestamp (RFC3339 UTC, from the record).
     pub created_at: String,
+    /// Who authored this version — the `created_by` label (`"human"`,
+    /// `"composer_llm"`, `"coach_llm"`, `"external_agent"`, …). r2.s1.w4 C1.
+    pub created_by: String,
+    /// For an `external_agent` version, the submission's normalized agent name
+    /// (the screen renders `external_agent · <agent name>`). `None` for every
+    /// other provenance — and for an agent version whose `agent_submission`
+    /// row is absent, which is reported, not guessed at.
+    pub agent_name: Option<String>,
+    /// For an `external_agent` version, the submission's stated hypothesis.
+    /// `None` under the same two rules as [`Self::agent_name`].
+    pub hypothesis: Option<String>,
     /// The version's DSL, rendered to summary lines.
     pub dsl: DslSummary,
     /// The latest persisted run's stats, or `None` when no run exists — the

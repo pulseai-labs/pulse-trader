@@ -34,12 +34,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use pulse::{
-    BacktestAppError, BacktestConfig, BacktestRunId, BacktestRunRepository, BacktestRunRequest,
-    Candle, CandleSeriesRepository, CandleStore, CreatedBy, DataError, DataVersion, Db,
-    DesktopState, HISTOGRAM_BIN_COUNT, NewVersion, Pair, PersistedRun, ReadBackFailure,
-    ReadBackStage, SqliteBacktestRunRepo, SqliteStrategyRepo, StoredCandleSeries, StrategyId,
-    StrategyRepository, SummaryStats, Timeframe, Trade, VersionId, histogram_bin_width,
-    project_histogram, run_backtest_version_core, run_version_backtest,
+    AgentHypothesis, AgentName, BacktestAppError, BacktestConfig, BacktestInputs, BacktestResult,
+    BacktestRunId, BacktestRunRepository, BacktestRunRequest, BusErrorCode, Candle,
+    CandleSeriesRepository, CandleStore, CandleWindow, CompareChildRunRequest, CreatedBy,
+    DataError, DataVersion, Db, DesktopState, EngineFingerprint, EquityCurve, FundingConfig,
+    HISTOGRAM_BIN_COUNT, NewAgentSubmission, NewVersion, Pair, PersistedRun, ReadBackFailure,
+    ReadBackStage, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
+    SqliteStrategyRepo, StoredCandleSeries, StrategyId, StrategyRepository, SummaryStats,
+    Timeframe, Trade, VersionId, compare_child_run_core, histogram_bin_width, project_histogram,
+    run_backtest_version_core, run_version_backtest,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -1313,6 +1316,348 @@ fn the_command_is_registered_once_in_the_append_only_list() {
         pulse::BUS_COMMANDS
             .iter()
             .filter(|c| **c == "run_backtest_version")
+            .count(),
+        1,
+        "registered exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. compare_child_run — a child's run beside its parent's latest (r2.s1.w4 C3)
+// ---------------------------------------------------------------------------
+
+/// A complete single-timeframe `BacktestInputs` — the shape every freshly saved
+/// run carries. The comparison's `inputs_differ` verdict comes off this tuple.
+fn seed_inputs() -> BacktestInputs {
+    BacktestInputs {
+        pair: Pair::new("BTCUSDT"),
+        primary: SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: DataVersion::new("v-primary"),
+        },
+        htf: None,
+        taker_fee_bps: Decimal::new(4, 0),
+        slippage_bps: Decimal::new(1, 0),
+        funding: FundingConfig::SnapshotRates,
+        window: None,
+    }
+}
+
+/// A persisted result with no trades — `save_run` re-derives the content hash
+/// from trades + totals and this persists cleanly, and the comparison reads
+/// headline stats off the run row, not the trades.
+fn trade_free_result() -> BacktestResult {
+    BacktestResult {
+        trades: vec![],
+        net_pnl: Decimal::ZERO,
+        fees_total: Decimal::ZERO,
+        funding_total: Decimal::ZERO,
+        slippage_total: Decimal::ZERO,
+        regime_breakdown: RegimeBreakdown::new(),
+        skipped_entries: SkippedEntryCounts::new(),
+        engine_fingerprint: EngineFingerprint::current(),
+        summary: SummaryStats::default(),
+        equity_curve: EquityCurve::default(),
+    }
+}
+
+/// Persist a run for `version_id` over `inputs`, reporting `expectancy_milli`
+/// so the before/after cells are distinguishable.
+async fn save_run(
+    env: &Env,
+    version_id: &VersionId,
+    inputs: &BacktestInputs,
+    expectancy_milli: i64,
+) -> BacktestRunId {
+    let db = env.db().await;
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    runs.save_run(
+        version_id,
+        inputs,
+        &trade_free_result(),
+        &SummaryStats {
+            expectancy: Decimal::new(expectancy_milli, 3),
+            win_rate: Decimal::new(500, 3),
+            trade_count: 12,
+            ..SummaryStats::default()
+        },
+        Decimal::new(10_000, 0),
+    )
+    .await
+    .expect("save run")
+}
+
+/// Seed a strategy with a Human ROOT version and an external-agent CHILD
+/// version written through the real submission path — the shape `pulse mcp`
+/// produces.
+async fn seed_parent_and_agent_child(env: &Env) -> (VersionId, VersionId) {
+    let state = env.cold_state().await;
+    let repo = state.strategy_repo();
+    let strat = repo
+        .create_strategy("Compare demo", Some("alice"), &["btc".to_owned()])
+        .await
+        .expect("create strategy");
+    let dsl = std::fs::read_to_string(manifest(GOLDEN_STRATEGY)).expect("read golden strategy");
+    let parent = repo
+        .create_version(NewVersion {
+            strategy_id: strat.id.clone(),
+            parent_version_id: None,
+            dsl_json: dsl.clone(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create parent version");
+    let (child, _submission) = repo
+        .create_agent_version(
+            NewVersion {
+                strategy_id: strat.id,
+                parent_version_id: Some(parent.id.clone()),
+                dsl_json: dsl,
+                created_by: CreatedBy::ExternalAgent,
+                creating_llm_call_ids: vec![],
+            },
+            NewAgentSubmission {
+                agent_name: AgentName::parse("claude-code").expect("valid agent name"),
+                hypothesis: AgentHypothesis::parse("a structural variant")
+                    .expect("valid hypothesis"),
+            },
+        )
+        .await
+        .expect("create agent child");
+    (parent.id, child.id)
+}
+
+/// The comparison reads the CHILD's asked-for run and the PARENT's LATEST run
+/// (not the asked-for one — the parent side is always "latest"), with headline
+/// stats projected from the persisted rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_run_compares_with_its_parents_latest_run() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+
+    // Two parent runs: the comparison must pick the LATEST, not the first.
+    let _stale_parent_run = save_run(&env, &parent, &seed_inputs(), 100).await;
+    let latest_parent_run = save_run(&env, &parent, &seed_inputs(), 300).await;
+    let child_run = save_run(&env, &child, &seed_inputs(), 420).await;
+
+    let state = env.cold_state().await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("the comparison succeeds");
+
+    assert_eq!(dto.child_run_id, child_run.as_str());
+    assert_eq!(dto.child_version_id, child.as_str());
+    assert_eq!(dto.parent_run_id, latest_parent_run.as_str());
+    assert_eq!(dto.parent_version_id, parent.as_str());
+    assert_eq!(dto.before.expectancy, "0.3");
+    assert_eq!(dto.after.expectancy, "0.42");
+    assert_eq!(dto.before.trade_count, 12);
+    assert_eq!(dto.after.trade_count, 12);
+    assert!(
+        !dto.inputs_differ,
+        "identical persisted inputs do not differ"
+    );
+    assert_eq!(dto.inputs_note, None);
+}
+
+/// `inputs_differ` is the `BacktestInputs` equality verdict: a recorded window
+/// (the `run_backtest` shape) or a recosted run each differs from the parent's
+/// baseline. When both sides carry inputs there is no provenance note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inputs_differ_flags_a_windowed_or_recosted_child_run() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+    save_run(&env, &parent, &seed_inputs(), 300).await;
+
+    // A windowed child run (the MCP `run_backtest` shape).
+    let mut windowed = seed_inputs();
+    windowed.window =
+        Some(CandleWindow::new(1_735_689_600_000, 1_756_684_800_000).expect("valid window"));
+    let child_run = save_run(&env, &child, &windowed, 420).await;
+    let state = env.cold_state().await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("comparison succeeds");
+    assert!(
+        dto.inputs_differ,
+        "a recorded window the parent lacks is an inputs difference"
+    );
+    assert_eq!(dto.inputs_note, None, "both runs carry inputs — no note");
+
+    // A recosted child run differs the same way.
+    let mut recosted = seed_inputs();
+    recosted.taker_fee_bps = Decimal::new(8, 0);
+    let child_run = save_run(&env, &child, &recosted, 420).await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("comparison succeeds");
+    assert!(
+        dto.inputs_differ,
+        "a different taker_fee_bps is an inputs difference"
+    );
+}
+
+/// A run saved WITHOUT inputs (the legacy/migration shape) is reported
+/// honestly: the inputs cannot be proven equal, so `inputs_differ` reads
+/// `true` and `inputs_note` names which side lacks the provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_without_recorded_inputs_reports_no_verdict() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+    let child_run = save_run(&env, &child, &seed_inputs(), 420).await;
+    save_run(&env, &parent, &seed_inputs(), 300).await;
+
+    // Write a second child run in the pre-0006 row shape: `backtest_run` is
+    // UPDATE/DELETE-immutable (0003) and `backtest_run_inputs_complete` refuses
+    // an all-NULL provenance INSERT (0006), so the row is cloned with the ten
+    // provenance columns NULL — exactly what a migration-era row stores and
+    // what `decode_inputs` reads as `inputs: None`. The completeness trigger is
+    // dropped for the insert on this throwaway database; `result_content_hash`
+    // does not cover inputs, so the clone stays hash-consistent.
+    let db = env.db().await;
+    sqlx::query("DROP TRIGGER backtest_run_inputs_complete")
+        .execute(db.pool())
+        .await
+        .expect("drop the insert-only provenance guard");
+    sqlx::query(
+        "INSERT INTO backtest_run (\
+         id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+         engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+         funding_total, slippage_total, expectancy, win_rate, profit_factor, \
+         gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
+         wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
+         regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+         pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
+         taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms) \
+         SELECT 'run-legacy-child', strategy_version_id, schema_version, created_at, \
+         engine_fingerprint, engine_target, result_content_hash, starting_equity, net_pnl, \
+         fees_total, funding_total, slippage_total, expectancy, win_rate, profit_factor, \
+         gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
+         wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
+         regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+         NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL \
+         FROM backtest_run WHERE id = ?1",
+    )
+    .bind(child_run.as_str())
+    .execute(db.pool())
+    .await
+    .expect("clone the run in the pre-provenance row shape");
+
+    let state = env.cold_state().await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: "run-legacy-child".to_owned(),
+        },
+    )
+    .await
+    .expect("comparison still succeeds");
+    assert!(
+        dto.inputs_differ,
+        "inputs that cannot be proven equal read as differing"
+    );
+    assert!(
+        dto.inputs_note.is_some(),
+        "the note explains the missing provenance"
+    );
+}
+
+/// The typed refusals name exactly what is missing, in `not_found`: an unknown
+/// run id carries the asked-for id in `child_run_id`; a ROOT version's run has
+/// no parent to compare with; a child whose parent has no run names the absent
+/// partner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_typed_refusals_name_what_is_missing() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+    let state = env.cold_state().await;
+
+    // Unknown run id → not_found carrying the asked-for id.
+    let err = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: "run-nonexistent".to_owned(),
+        },
+    )
+    .await
+    .expect_err("an unknown run id is a typed refusal");
+    assert_eq!(err.code, BusErrorCode::NotFound);
+    assert_eq!(err.child_run_id.as_deref(), Some("run-nonexistent"));
+
+    // A child run whose PARENT has no run → not_found.
+    let child_run = save_run(&env, &child, &seed_inputs(), 420).await;
+    let err = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect_err("a child with no parent run is a typed refusal");
+    assert_eq!(err.code, BusErrorCode::NotFound);
+    assert_eq!(err.child_run_id, None);
+    assert!(
+        err.message.contains("parent"),
+        "the reason names the missing side: {}",
+        err.message
+    );
+
+    // A ROOT version's run → not_found (there is no parent to compare with).
+    let root_run = save_run(&env, &parent, &seed_inputs(), 300).await;
+    let err = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: root_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect_err("a root version's run has no parent");
+    assert_eq!(err.code, BusErrorCode::NotFound);
+    assert!(
+        err.message.contains("no parent"),
+        "the reason names the absent parent: {}",
+        err.message
+    );
+
+    // Now the parent has a run — the same child run compares cleanly.
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("with a parent run present the comparison succeeds");
+    assert_eq!(dto.parent_version_id, parent.as_str());
+}
+
+#[test]
+fn the_compare_command_is_registered_once_in_the_append_only_list() {
+    assert!(
+        pulse::BUS_COMMANDS.contains(&"compare_child_run"),
+        "the command joins the single append-only registry: {:?}",
+        pulse::BUS_COMMANDS
+    );
+    assert_eq!(
+        pulse::BUS_COMMANDS
+            .iter()
+            .filter(|c| **c == "compare_child_run")
             .count(),
         1,
         "registered exactly once"

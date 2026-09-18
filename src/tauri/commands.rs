@@ -54,10 +54,13 @@ use crate::adapters::store::CandleStore;
 use crate::application::backtest::{resolve_default_request, run_version_backtest};
 use crate::domain::strategy::VersionId;
 
-use super::backtest::{BacktestRunDto, BacktestRunRequest, backtest_run_dto};
+use super::backtest::{
+    BacktestRunDto, BacktestRunRequest, CompareChildRunDto, CompareChildRunRequest,
+    backtest_run_dto,
+};
 use super::coach::{
     CoachDecisionDto, CoachDecisionRequestDto, CoachSessionDto, CoachTurnDeps, CoachTurnRequestDto,
-    coach_decide_core, coach_turn_core,
+    coach_decide_core, coach_turn_core, summary_dto,
 };
 use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -84,10 +87,10 @@ use crate::domain::CoachingSessionId;
 use crate::domain::Redactor;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
-    BacktestRunRepository, Clock, Comparator, Condition, CredentialStatus, DataError, Direction,
-    EngineFingerprint, ExitRule, IndicatorSpec, LlmCallRepository, LlmConfig, LlmError,
-    LlmProvider, LlmResponse, Message, PriceField, StrategyDsl, StrategyRepository, SweepableValue,
-    ToolDefinition, ValueSource,
+    BacktestRunId, BacktestRunRepository, Clock, Comparator, Condition, CredentialStatus,
+    DataError, Direction, EngineFingerprint, ExitRule, IndicatorSpec, LlmCallRepository, LlmConfig,
+    LlmError, LlmProvider, LlmResponse, Message, PriceField, StrategyDsl, StrategyRepository,
+    SweepableValue, ToolDefinition, ValueSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,6 +125,7 @@ pub const BUS_COMMANDS: &[&str] = &[
     "run_backtest_version",
     "coach_turn",
     "coach_decide",
+    "compare_child_run",
 ];
 
 // ---------------------------------------------------------------------------
@@ -476,7 +480,7 @@ pub async fn library_overview_core(state: &DesktopState) -> Result<LibraryOvervi
     let mut wire = Vec::with_capacity(strategies.len());
     for strategy in &strategies {
         let versions = strategies_repo.version_tree(&strategy.id).await?;
-        wire.push(library_strategy(strategy, &versions, &runs_repo).await?);
+        wire.push(library_strategy(strategy, &versions, &strategies_repo, &runs_repo).await?);
     }
     Ok(LibraryOverview { strategies: wire })
 }
@@ -486,9 +490,17 @@ pub async fn library_overview_core(state: &DesktopState) -> Result<LibraryOvervi
 /// `version_tree` guarantees parent-before-child, so a single forward pass can
 /// track the expectancies seen so far and compute each child's delta vs its
 /// (already-projected) parent without a second read.
+///
+/// Provenance rides along (r2.s1.w4 C1): every version carries its `created_by`
+/// label, and an `external_agent` version additionally carries its
+/// `agent_submission` row's name and hypothesis — one extra read per agent
+/// version, none for the rest. A missing submission row is reported, not
+/// invented: the label still reads `external_agent` and both optional fields
+/// stay `None`.
 async fn library_strategy(
     strategy: &Strategy,
     versions: &[StrategyVersion],
+    strategies: &SqliteStrategyRepo<SystemClock>,
     runs: &SqliteBacktestRunRepo<SystemClock>,
 ) -> Result<LibraryStrategy, BusError> {
     let mut expectancies: HashMap<&str, Decimal> = HashMap::new();
@@ -498,6 +510,17 @@ async fn library_strategy(
         let latest = runs.latest_run_for_version(&version.id).await?;
         let recent = runs.list_runs_for_version(&version.id).await?;
         let stats = latest.as_ref().map(|run| version_stats(&run.summary));
+
+        let (agent_name, hypothesis) = match version.created_by {
+            CreatedBy::ExternalAgent => match strategies.get_agent_submission(&version.id).await? {
+                Some(submission) => (
+                    Some(submission.agent_name.as_str().to_owned()),
+                    Some(submission.hypothesis.as_str().to_owned()),
+                ),
+                None => (None, None),
+            },
+            _ => (None, None),
+        };
 
         let delta_vs_parent = match (
             latest.as_ref(),
@@ -522,6 +545,9 @@ async fn library_strategy(
             created_at: version
                 .created_at
                 .to_rfc3339_opts(SecondsFormat::Millis, true),
+            created_by: created_by_label(version.created_by),
+            agent_name,
+            hypothesis,
             dsl: dsl_summary(&version.dsl),
             stats,
             delta_vs_parent,
@@ -1404,6 +1430,135 @@ pub async fn run_backtest_version(
     request: BacktestRunRequest,
 ) -> Result<BacktestRunDto, BusError> {
     run_backtest_version_core(&state, request).await
+}
+
+/// `compare_child_run`'s transport-free core (r2.s1.w4 C3) — a child's run
+/// beside its parent's LATEST run, for ANY child version.
+///
+/// Until this command the only before/after comparison on the bus was the
+/// coach accept's, which exists only for the child the coach just minted. An
+/// external agent's child has no coach session, so the comparison is resolved
+/// from the persisted rows themselves: the run the caller names, its version's
+/// parent, and the parent's latest run.
+///
+/// The verdict on comparability is honest rather than invented: `inputs_differ`
+/// is `BacktestInputs` equality over the two persisted tuples (window
+/// included), and when either side predates recorded inputs the flag reads
+/// `true` with `inputs_note` saying which side — "cannot be proven equal" is a
+/// difference, not an equality.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]. The three refusals are [`BusErrorCode::NotFound`]:
+/// an unknown run id (carrying the asked-for id in `child_run_id`), a version
+/// with no parent, and a parent with no run of its own.
+pub async fn compare_child_run_core(
+    state: &DesktopState,
+    request: CompareChildRunRequest,
+) -> Result<CompareChildRunDto, BusError> {
+    let runs = state.backtest_run_repo();
+    let strategies = state.strategy_repo();
+
+    // 1. The asked-for run. An id that names nothing is `not_found` carrying
+    //    the asked-for id — the refusal's field, not just its prose.
+    let child_run = runs
+        .get_run(&BacktestRunId::new(&request.child_run_id))
+        .await?
+        .ok_or_else(|| {
+            BusError::with_child_run_id(
+                BusErrorCode::NotFound,
+                format!("no backtest run {}", request.child_run_id),
+                request.child_run_id.clone(),
+            )
+        })?;
+
+    // 2. Its version must name a parent — a root has nothing to compare with.
+    let child_version = strategies
+        .get_version(&child_run.strategy_version_id)
+        .await?
+        .ok_or_else(|| {
+            BusError::new(
+                BusErrorCode::Data,
+                format!(
+                    "run {} belongs to version {} which no longer exists",
+                    child_run.id.as_str(),
+                    child_run.strategy_version_id.as_str()
+                ),
+            )
+        })?;
+    let parent_version_id = match &child_version.parent_version_id {
+        Some(parent) => parent.clone(),
+        None => {
+            return Err(BusError::new(
+                BusErrorCode::NotFound,
+                format!(
+                    "version {} has no parent — nothing to compare against",
+                    child_version.id.as_str()
+                ),
+            ));
+        }
+    };
+
+    // 3. The parent's LATEST run — the "before" half.
+    let parent_run = runs
+        .latest_run_for_version(&parent_version_id)
+        .await?
+        .ok_or_else(|| {
+            BusError::new(
+                BusErrorCode::NotFound,
+                format!(
+                    "parent version {} has no run to compare against",
+                    parent_version_id.as_str()
+                ),
+            )
+        })?;
+
+    // 4. `BacktestInputs` equality over the PERSISTED tuples — window included.
+    //    A side with no recorded inputs cannot be proven equal, so it reads as
+    //    a difference whose note says which side lacks the provenance.
+    let (inputs_differ, inputs_note) = match (&child_run.inputs, &parent_run.inputs) {
+        (Some(child), Some(parent)) => (child != parent, None),
+        (None, Some(_)) => (
+            true,
+            Some("child run predates recorded inputs — inputs cannot be compared".to_owned()),
+        ),
+        (Some(_), None) => (
+            true,
+            Some("parent run predates recorded inputs — inputs cannot be compared".to_owned()),
+        ),
+        (None, None) => (
+            true,
+            Some("neither run carries recorded inputs — inputs cannot be compared".to_owned()),
+        ),
+    };
+
+    Ok(CompareChildRunDto {
+        child_version_id: child_run.strategy_version_id.as_str().to_owned(),
+        parent_version_id: parent_version_id.as_str().to_owned(),
+        child_run_id: child_run.id.as_str().to_owned(),
+        parent_run_id: parent_run.id.as_str().to_owned(),
+        // The same `SummaryDto` projection the coach accept uses — one cell
+        // shape, so the compare table is one component.
+        before: summary_dto(&parent_run.summary)?,
+        after: summary_dto(&child_run.summary)?,
+        inputs_differ,
+        inputs_note,
+    })
+}
+
+/// `compare_child_run` — the Backtest Lab's child-vs-parent comparison
+/// (r2.s1.w4 C3).
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`compare_child_run_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn compare_child_run(
+    state: tauri::State<'_, DesktopState>,
+    request: CompareChildRunRequest,
+) -> Result<CompareChildRunDto, BusError> {
+    compare_child_run_core(&state, request).await
 }
 
 /// `coach_turn` — start or reload one coach turn for a persisted run (r1.s4.w3).

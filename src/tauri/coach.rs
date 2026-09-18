@@ -451,7 +451,10 @@ fn failure_dto(failure: &CoachFailure) -> CoachFailureDto {
 /// Project one persisted summary. Fallible for exactly one reason: a stored count
 /// that will not fit the wire refuses rather than rendering a plausible false
 /// number.
-fn summary_dto(summary: &SummaryStats) -> Result<SummaryDto, BusError> {
+///
+/// `pub(crate)` so `compare_child_run` (r2.s1.w4 C3) renders the same cell
+/// shape — one summary projection, one compare table.
+pub(crate) fn summary_dto(summary: &SummaryStats) -> Result<SummaryDto, BusError> {
     Ok(SummaryDto {
         trade_count: count("trade_count", summary.trade_count)?,
         win_count: count("win_count", summary.win_count)?,

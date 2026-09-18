@@ -583,12 +583,13 @@ pub use entry::{LaunchMode, launch_mode, launch_mode_from_env};
 // error, not a warning (the harvested gotcha).
 pub use crate::tauri::{
     BUS_COMMANDS, BacktestRunDto, BacktestRunRequest, BusError, BusErrorCode, BusEvent,
-    BusEventPayload, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
-    DesktopState, DslSummary, EquityPointDto, EventSink, HistogramBinDto, HistogramDto,
-    LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, RegimeCellDto, RunId,
-    ShellInfo, StreamOutcome, TradeRowDto, VersionStats, backtest_run_dto, compose_strategy_core,
-    demo_stream_core, export_bindings, library_overview_core, run_backtest_version_core,
-    run_desktop, shell_info_core,
+    BusEventPayload, CompareChildRunDto, CompareChildRunRequest, ComposeDeps, ComposeDslSummary,
+    ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EquityPointDto, EventSink,
+    HistogramBinDto, HistogramDto, LibraryOverview, LibraryRunSummary, LibraryStrategy,
+    LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
+    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core,
+    export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
+    shell_info_core,
 };
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the

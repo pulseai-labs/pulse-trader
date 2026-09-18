@@ -76,7 +76,7 @@ function bridgeError(error: unknown): BusResult<never> {
     error: {
       code: "internal",
       message: error instanceof Error ? error.message : String(error),
-      run_id: null, session_id: null,
+      run_id: null, session_id: null, child_run_id: null,
     } satisfies BusError,
   };
 }

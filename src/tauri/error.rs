@@ -58,14 +58,22 @@ pub enum BusErrorCode {
     /// carries no wire meaning; it sits beside the other non-domain code for
     /// readability.
     Busy,
+    /// A named thing the command was asked about is not there (r2.s1.w4).
+    ///
+    /// A family of its own rather than `Data`: `Data` says the store faulted,
+    /// which prescribes a retry, while this says the lookup came back empty —
+    /// the remedy is a different name, not another attempt at a store that is
+    /// working fine. First used by `compare_child_run` for an unknown run id,
+    /// a version with no parent, or a parent with no run to compare against.
+    NotFound,
     /// The shell itself: a dead channel, a failed startup, a bug. Not a domain family.
     Internal,
 }
 
 /// The single serializable error shape that crosses the Tauri boundary.
 ///
-/// **Four fields, always all present** (r1.s3.w3 added `run_id`; r1.s4.w3's review
-/// added `session_id`), so the TypeScript
+/// **Five fields, always all present** (r1.s3.w3 added `run_id`; r1.s4.w3's review
+/// added `session_id`; r2.s1.w4 added `child_run_id`), so the TypeScript
 /// type generated from this struct describes every error the frontend can receive and
 /// one rendering path handles all of them. An ordinary error serializes
 /// `run_id: null` — the field is never skipped, because a field that sometimes
@@ -97,6 +105,15 @@ pub struct BusError {
     /// result promises. The message names it too; the same rule as `run_id` applies,
     /// that a screen must not parse prose to learn an id it has to act on.
     pub session_id: Option<String>,
+    /// The run id `compare_child_run` was asked about, on a `not_found` refusal
+    /// (r2.s1.w4).
+    ///
+    /// `Some` only when the asked-for id itself is the thing that is missing —
+    /// the same rule `run_id` follows: a screen must not parse prose to learn an
+    /// id it has to report back. `None` for every other error, including the
+    /// comparison's other refusals, where the run exists and it is the parent
+    /// (or the parent's run) that does not.
+    pub child_run_id: Option<String>,
 }
 
 impl BusError {
@@ -108,6 +125,7 @@ impl BusError {
             message,
             run_id: None,
             session_id: None,
+            child_run_id: None,
         }
     }
 
@@ -119,6 +137,7 @@ impl BusError {
             message,
             run_id: Some(run_id),
             session_id: None,
+            child_run_id: None,
         }
     }
 
@@ -130,6 +149,19 @@ impl BusError {
             message,
             run_id: None,
             session_id: Some(session_id),
+            child_run_id: None,
+        }
+    }
+
+    /// The same, naming the run `compare_child_run` was asked about (r2.s1.w4).
+    #[must_use]
+    pub fn with_child_run_id(code: BusErrorCode, message: String, child_run_id: String) -> Self {
+        Self {
+            code,
+            message,
+            run_id: None,
+            session_id: None,
+            child_run_id: Some(child_run_id),
         }
     }
 

@@ -83,7 +83,85 @@ fn manifest_path(rel: &str) -> std::path::PathBuf {
 ///
 /// Pinned as a constant so the two places that assert it cannot drift apart, and so
 /// adding a field is a deliberate edit here rather than a quiet widening somewhere.
-const BUS_ERROR_KEYS: [&str; 4] = ["code", "message", "run_id", "session_id"];
+/// r2.s1.w4 added `child_run_id` for the same reason `run_id` exists — a
+/// `compare_child_run` refusal names the run id it was asked about, and a screen
+/// must not parse prose to learn it.
+const BUS_ERROR_KEYS: [&str; 5] = ["child_run_id", "code", "message", "run_id", "session_id"];
+
+/// Assert one mapped error serializes to the shared `BusError` shape and
+/// return its sorted key set for the cross-error uniformity check below.
+fn assert_bus_error_shape(label: &str, err: &BusError, expected_code: BusErrorCode) -> Vec<String> {
+    assert_eq!(
+        err.code, expected_code,
+        "{label} mapped to the wrong BusErrorCode"
+    );
+
+    let value =
+        serde_json::to_value(err).unwrap_or_else(|e| panic!("{label} must serialize to JSON: {e}"));
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{label} must serialize to a JSON OBJECT, got {value}"));
+
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    // r1.s3.w3 widened the shape to {code, message, run_id}; r1.s4.w3's review
+    // added `session_id` for the same reason `run_id` exists — a Busy refusal
+    // defers to a coach turn the caller must then RELOAD, and a screen that
+    // parses the id out of the prose is one rewording away from starting a
+    // second billable turn. The invariant this asserts is unchanged and, if
+    // anything, stronger: ONE key set for every error, so the frontend still
+    // renders with one code path. Both optional fields are ALWAYS present
+    // rather than skipped-when-absent — a field that sometimes vanishes reaches
+    // TypeScript as `undefined` while its generated type says `string | null`,
+    // which is exactly the mismatch this clause exists to stop.
+    assert_eq!(
+        keys, BUS_ERROR_KEYS,
+        "{label} must serialize to exactly {BUS_ERROR_KEYS:?}, got {keys:?}"
+    );
+    // No DOMAIN-family error can name a persisted run: only the application
+    // ring's saved-but-unreadable case knows a run id, and it is not in this set.
+    assert!(
+        object["run_id"].is_null(),
+        "{label} must carry a null run_id — only a saved-but-unreadable backtest \
+         has a row to name"
+    );
+    assert!(
+        object["child_run_id"].is_null(),
+        "{label} must carry a null child_run_id — only a compare_child_run refusal \
+         names the run it was asked about"
+    );
+
+    // `message` is the error's DISPLAY rendering, never a stringified `Debug`.
+    // The cheapest reliable tell for a leaked `Debug` is Rust variant syntax:
+    // `Parse("bad decimal")` / `UnknownSymbol(` etc.
+    let message = object["message"].as_str().unwrap_or_else(|| {
+        panic!(
+            "{label}: `message` must be a JSON string, got {}",
+            object["message"]
+        )
+    });
+    assert!(
+        !message.is_empty(),
+        "{label}: `message` must not be empty -- an empty error renders as nothing"
+    );
+    for debug_marker in ["\", ", "\")", "Parse(", "Config(", "UnknownSymbol(", "Db("] {
+        assert!(
+            !message.contains(debug_marker),
+            "{label}: `message` looks like a stringified Debug (contains {debug_marker:?}): \
+             {message}\nUse the error's Display rendering."
+        );
+    }
+
+    // `code` is a plain string discriminant the frontend can switch on -- not a
+    // nested object, not a number that would renumber if a variant is inserted.
+    assert!(
+        object["code"].is_string(),
+        "{label}: `code` must serialize as a string discriminant, got {}",
+        object["code"]
+    );
+
+    keys.iter().map(|k| (*k).to_owned()).collect()
+}
 
 #[test]
 fn domain_error_maps_to_one_serializable_shape() {
@@ -131,78 +209,10 @@ fn domain_error_maps_to_one_serializable_shape() {
     // The invariant: ONE shape. Every mapping serializes to an object with exactly
     // the same key set -- so the frontend renders errors with one code path and never
     // has to sniff which family an error came from.
-    let mut shapes: Vec<Vec<String>> = Vec::new();
-
-    for (label, err, expected_code) in &mapped {
-        assert_eq!(
-            &err.code, expected_code,
-            "{label} mapped to the wrong BusErrorCode"
-        );
-
-        let value = serde_json::to_value(err)
-            .unwrap_or_else(|e| panic!("{label} must serialize to JSON: {e}"));
-        let object = value
-            .as_object()
-            .unwrap_or_else(|| panic!("{label} must serialize to a JSON OBJECT, got {value}"));
-
-        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        // r1.s3.w3 widened the shape to {code, message, run_id}; r1.s4.w3's review
-        // added `session_id` for the same reason `run_id` exists — a Busy refusal
-        // defers to a coach turn the caller must then RELOAD, and a screen that
-        // parses the id out of the prose is one rewording away from starting a
-        // second billable turn. The invariant this asserts is unchanged and, if
-        // anything, stronger: ONE key set for every error, so the frontend still
-        // renders with one code path. Both optional fields are ALWAYS present
-        // rather than skipped-when-absent — a field that sometimes vanishes reaches
-        // TypeScript as `undefined` while its generated type says `string | null`,
-        // which is exactly the mismatch this clause exists to stop.
-        assert_eq!(
-            keys, BUS_ERROR_KEYS,
-            "{label} must serialize to exactly {BUS_ERROR_KEYS:?}, got {keys:?}"
-        );
-        // No DOMAIN-family error can name a persisted run: only the application
-        // ring's saved-but-unreadable case knows a run id, and it is not in this set.
-        assert!(
-            object["run_id"].is_null(),
-            "{label} must carry a null run_id — only a saved-but-unreadable backtest \
-             has a row to name"
-        );
-        shapes.push(
-            keys.iter()
-                .map(|k| (*k).to_owned())
-                .collect::<Vec<String>>(),
-        );
-
-        // `message` is the error's DISPLAY rendering, never a stringified `Debug`.
-        // The cheapest reliable tell for a leaked `Debug` is Rust variant syntax:
-        // `Parse("bad decimal")` / `UnknownSymbol(` etc.
-        let message = object["message"].as_str().unwrap_or_else(|| {
-            panic!(
-                "{label}: `message` must be a JSON string, got {}",
-                object["message"]
-            )
-        });
-        assert!(
-            !message.is_empty(),
-            "{label}: `message` must not be empty -- an empty error renders as nothing"
-        );
-        for debug_marker in ["\", ", "\")", "Parse(", "Config(", "UnknownSymbol(", "Db("] {
-            assert!(
-                !message.contains(debug_marker),
-                "{label}: `message` looks like a stringified Debug (contains {debug_marker:?}): \
-                 {message}\nUse the error's Display rendering."
-            );
-        }
-
-        // `code` is a plain string discriminant the frontend can switch on -- not a
-        // nested object, not a number that would renumber if a variant is inserted.
-        assert!(
-            object["code"].is_string(),
-            "{label}: `code` must serialize as a string discriminant, got {}",
-            object["code"]
-        );
-    }
+    let shapes: Vec<Vec<String>> = mapped
+        .iter()
+        .map(|(label, err, expected_code)| assert_bus_error_shape(label, err, *expected_code))
+        .collect();
 
     let first = &shapes[0];
     for (i, shape) in shapes.iter().enumerate() {
@@ -231,7 +241,10 @@ fn domain_error_maps_to_one_serializable_shape() {
 /// `busy` (`#141`'s single-flight refusal) and pins it here beside the others for
 /// exactly that reason: it is the one code the coach rail renders as a STATE — a
 /// transient "not settled yet, check again" — rather than as an error, so its
-/// spelling is load-bearing in a way the others' are not.
+/// spelling is load-bearing in a way the others' are not. r2.s1.w4 adds
+/// `not_found`, the refusal family for a named thing that is not there — first
+/// used by `compare_child_run` for an unknown run id, an absent parent, or a
+/// parent with no run.
 #[test]
 fn every_bus_error_code_serializes_as_its_pinned_token() {
     let pinned: Vec<(BusErrorCode, &str)> = vec![
@@ -242,6 +255,7 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
         (BusErrorCode::Llm, "llm"),
         (BusErrorCode::Composer, "composer"),
         (BusErrorCode::Busy, "busy"),
+        (BusErrorCode::NotFound, "not_found"),
         (BusErrorCode::Internal, "internal"),
     ];
 
@@ -268,10 +282,11 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
             | BusErrorCode::Llm
             | BusErrorCode::Composer
             | BusErrorCode::Busy
+            | BusErrorCode::NotFound
             | BusErrorCode::Internal => {}
         }
     }
-    assert_eq!(pinned.len(), 8, "every code is pinned exactly once");
+    assert_eq!(pinned.len(), 9, "every code is pinned exactly once");
 }
 
 /// The one crossable error that CAN name a persisted run. The shape test above
