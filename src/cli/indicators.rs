@@ -6,11 +6,13 @@
 
 use std::path::PathBuf;
 
-use crate::{
-    CandleSeriesRepository, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair,
-    SweepableValue,
-};
+use crate::{CandleSeriesRepository, CompiledValue, EvalContext, IndicatorEngine, Pair};
 use rust_decimal::Decimal;
+
+// r2.s1.w2: the `<kind>:<period>` parser moved to `crate::application::mcp_read`
+// so `pulse mcp` runs the same use case. The re-export keeps this viewer's call
+// sites — and its output — byte-identical.
+pub(crate) use crate::application::mcp_read::{IndicatorColumn, parse_indicator_specs};
 
 use super::parse_one_tf;
 
@@ -34,12 +36,6 @@ pub struct IndicatorsArgs {
     /// Maximum number of candle rows to print. Omitted means all rows.
     #[arg(long)]
     pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IndicatorColumn {
-    pub(crate) label: String,
-    pub(crate) spec: IndicatorSpec,
 }
 
 /// Load the `HEAD` snapshot through the repository port, stream the indicator
@@ -85,31 +81,6 @@ where
     Ok(())
 }
 
-pub(crate) fn parse_indicator_specs(raw: &[String]) -> anyhow::Result<Vec<IndicatorColumn>> {
-    let tokens = if raw.is_empty() {
-        ["rsi:14", "ema:50", "adx:14"]
-            .iter()
-            .map(|token| (*token).to_owned())
-            .collect::<Vec<_>>()
-    } else {
-        raw.to_vec()
-    };
-
-    // The engine dedups specs, but the viewer renders one column per flag — so
-    // repeated `--indicator` flags would print duplicate columns. Dedup here,
-    // order-preserving, keyed on the case-normalized `kind:period` label (which
-    // is 1:1 with the parsed spec for rsi/ema/adx).
-    let mut seen = std::collections::HashSet::new();
-    let mut columns = Vec::with_capacity(tokens.len());
-    for token in &tokens {
-        let column = parse_one_indicator(token)?;
-        if seen.insert(column.label.clone()) {
-            columns.push(column);
-        }
-    }
-    Ok(columns)
-}
-
 #[must_use]
 pub(crate) fn render_indicator_value(value: Option<Decimal>) -> String {
     value.map_or_else(|| BLANK.to_owned(), |value| value.normalize().to_string())
@@ -129,41 +100,6 @@ pub(crate) fn render_row(open_time: i64, values: &[Option<Decimal>]) -> String {
     cells.push(open_time.to_string());
     cells.extend(values.iter().copied().map(render_indicator_value));
     cells.join("\t")
-}
-
-fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
-    let (kind, period) = token.split_once(':').ok_or_else(|| {
-        anyhow::anyhow!("invalid --indicator {token:?}: expected <kind>:<period>")
-    })?;
-    let kind = kind.trim().to_ascii_lowercase();
-    let period = parse_period(token, period)?;
-    let fixed = SweepableValue::Fixed(period);
-    let spec = match kind.as_str() {
-        "rsi" => IndicatorSpec::Rsi { period: fixed },
-        "ema" => IndicatorSpec::Ema { period: fixed },
-        "adx" => IndicatorSpec::Adx { period: fixed },
-        "macd" => anyhow::bail!(
-            "invalid --indicator {token:?}: MACD needs fast/slow/signal and is not supported by <kind>:<period>"
-        ),
-        _ => anyhow::bail!(
-            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, or adx)"
-        ),
-    };
-    Ok(IndicatorColumn {
-        label: format!("{kind}:{period}"),
-        spec,
-    })
-}
-
-fn parse_period(token: &str, period: &str) -> anyhow::Result<u32> {
-    let period = period
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| anyhow::anyhow!("invalid --indicator {token:?}: period must be u32: {e}"))?;
-    if period == 0 {
-        anyhow::bail!("invalid --indicator {token:?}: period must be >= 1");
-    }
-    Ok(period)
 }
 
 fn current_values(engine: &IndicatorEngine, columns: &[IndicatorColumn]) -> Vec<Option<Decimal>> {
@@ -203,71 +139,7 @@ fn render_summary(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{parse_indicator_specs, render_header, render_indicator_value, render_row};
-    use crate::{IndicatorSpec, SweepableValue};
     use rust_decimal::Decimal;
-
-    fn fixed_period(spec: &IndicatorSpec) -> u32 {
-        match spec {
-            IndicatorSpec::Rsi { period }
-            | IndicatorSpec::Ema { period }
-            | IndicatorSpec::Adx { period } => match period {
-                SweepableValue::Fixed(period) => *period,
-                SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
-            },
-            IndicatorSpec::Macd { .. } => panic!("MACD is not part of kind:period parsing"),
-        }
-    }
-
-    #[test]
-    fn parses_indicator_flag_kind_and_period() {
-        let one = parse_indicator_specs(&["rsi:14".to_owned()]).expect("rsi:14 parses");
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0].label, "rsi:14");
-        assert!(matches!(one[0].spec, IndicatorSpec::Rsi { .. }));
-        assert_eq!(fixed_period(&one[0].spec), 14);
-
-        let repeated =
-            parse_indicator_specs(&["ema:50".to_owned(), "adx:14".to_owned()]).expect("parse");
-        assert_eq!(repeated.len(), 2);
-        assert_eq!(repeated[0].label, "ema:50");
-        assert!(matches!(repeated[0].spec, IndicatorSpec::Ema { .. }));
-        assert_eq!(fixed_period(&repeated[0].spec), 50);
-        assert_eq!(repeated[1].label, "adx:14");
-        assert!(matches!(repeated[1].spec, IndicatorSpec::Adx { .. }));
-        assert_eq!(fixed_period(&repeated[1].spec), 14);
-
-        let defaults = parse_indicator_specs(&[]).expect("defaults parse");
-        assert_eq!(
-            defaults
-                .iter()
-                .map(|column| column.label.as_str())
-                .collect::<Vec<_>>(),
-            ["rsi:14", "ema:50", "adx:14"]
-        );
-
-        // Repeated / case-variant specs dedup to one column each, order preserved
-        // (the viewer renders one column per surviving spec).
-        let deduped = parse_indicator_specs(&[
-            "rsi:14".to_owned(),
-            "RSI:14".to_owned(),
-            "ema:50".to_owned(),
-            "rsi:14".to_owned(),
-        ])
-        .expect("dedup parses");
-        assert_eq!(
-            deduped
-                .iter()
-                .map(|column| column.label.as_str())
-                .collect::<Vec<_>>(),
-            ["rsi:14", "ema:50"],
-            "duplicate / case-variant --indicator flags dedup, order preserved"
-        );
-
-        assert!(parse_indicator_specs(&["macd:12".to_owned()]).is_err());
-        assert!(parse_indicator_specs(&["bogus:14".to_owned()]).is_err());
-        assert!(parse_indicator_specs(&["rsi".to_owned()]).is_err());
-        assert!(parse_indicator_specs(&["rsi:0".to_owned()]).is_err());
-    }
 
     #[test]
     fn warmup_rows_render_as_blank() {

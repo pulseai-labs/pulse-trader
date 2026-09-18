@@ -20,7 +20,7 @@ use super::sweepable::SweepableValue;
 ///
 /// Serialized lowercase (`"long"` / `"short"`) to match the `Timeframe`
 /// serde-rename style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// A long (buy) strategy.
@@ -34,7 +34,7 @@ pub enum Direction {
 /// A plain (untagged) struct. Minimal by design — the two fields that change
 /// backtest results and are sweepable. Position-sizing math is the backtester's
 /// (Sprint 1.2); these are declarative inputs only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskParams {
     /// Fraction of account equity risked per trade as a **decimal fraction**
     /// (`0.01` = 1%), NOT a percentage-point number. With a `StopLoss` distance

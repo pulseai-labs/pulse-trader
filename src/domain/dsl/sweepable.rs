@@ -37,6 +37,29 @@ pub enum SweepableValue<T> {
     },
 }
 
+// r2.s1.w2: the `pulse://dsl/schema` resource publishes the ACCEPTED wire
+// shape, not the representable one — v1 accepts only `Fixed`, which serializes
+// as the bare `T`. The schema therefore delegates to `T` verbatim (inline, same
+// name/id) instead of describing the untagged `Fixed | Sweep` union: publishing
+// the sweep object shape would tell an external agent a rejected form is valid.
+impl<T: schemars::JsonSchema> schemars::JsonSchema for SweepableValue<T> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        T::schema_id()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        T::json_schema(generator)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
