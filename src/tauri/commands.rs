@@ -49,12 +49,10 @@ use chrono::SecondsFormat;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::adapters::backtest::BacktestConfig;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::store::CandleStore;
-use crate::application::backtest::{BacktestRequest, run_version_backtest};
+use crate::application::backtest::{resolve_default_request, run_version_backtest};
 use crate::domain::strategy::VersionId;
-use crate::domain::{Pair, Timeframe};
 
 use super::backtest::{BacktestRunDto, BacktestRunRequest, backtest_run_dto};
 use super::coach::{
@@ -1337,9 +1335,14 @@ pub async fn compose_cancel(
 /// (r1.s3.w3) — the drivable core, split from the `#[tauri::command]` wrapper so a
 /// test reaches it without a webview (the `library_overview_core` pattern).
 ///
-/// **The request carries only a version id.** r1's Lab runs the fixed BTCUSDT
-/// M15+H4 / default-cost configuration; those are product defaults, and a field the
-/// user cannot vary would be a control that does not exist.
+/// **The request carries only a version id.** The shared application resolver
+/// ([`resolve_default_request`], r2.s1.w3) decides what the version runs with:
+/// the version's parent's latest persisted run (then its own, then the r1
+/// BTCUSDT M15+H4 / default-cost configuration) supplies the pair, timeframes,
+/// cost model and the exact snapshot pins — the desktop and MCP surfaces run a
+/// version identically, and a field the user cannot vary would be a control
+/// that does not exist. The desktop sends no window, so the run covers the
+/// whole pinned snapshot.
 ///
 /// **A normal request/response command, not a `Channel`.** The r1 target is under
 /// five seconds, there is no meaningful progress to report, and a percentage bar
@@ -1366,13 +1369,16 @@ pub async fn run_backtest_version_core(
     let strategies = state.strategy_repo();
     let runs = state.backtest_run_repo();
     let candles = state.candles();
-    let app_request = BacktestRequest {
-        version_id: VersionId::new(request.version_id),
-        pair: Pair::new("BTCUSDT"),
-        primary_timeframe: Timeframe::M15,
-        htf_timeframe: Some(Timeframe::H4),
-        config: BacktestConfig::default(),
-    };
+    // One resolver for every surface (r2.s1.w3): parent's latest run → own
+    // latest run → app defaults. `window: None` — the desktop has no date-range
+    // surface, so a pinned snapshot runs in full.
+    let app_request = resolve_default_request(
+        &strategies,
+        &runs,
+        &VersionId::new(request.version_id),
+        None,
+    )
+    .await?;
     let outcome = run_version_backtest(
         &strategies,
         &candles,

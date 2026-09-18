@@ -463,8 +463,8 @@ pub use domain::{
 // error taxonomy onto `BusError`. The module itself stays private.
 pub use application::backtest::{
     BacktestAppError, BacktestOutcome, BacktestRequest, HISTOGRAM_BIN_COUNT,
-    HISTOGRAM_BIN_WIDTH_STR, Histogram, HistogramBin, ReadBackFailure, ReadBackStage,
-    histogram_bin_width, project_histogram, run_version_backtest,
+    HISTOGRAM_BIN_WIDTH_STR, Histogram, HistogramBin, ReadBackFailure, ReadBackStage, SnapshotPins,
+    histogram_bin_width, project_histogram, resolve_default_request, run_version_backtest,
 };
 
 // VS-1.3.1 work-1.01: the LLM domain ring (FR-23 / FR-24, README C1–C5). The

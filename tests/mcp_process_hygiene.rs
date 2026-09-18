@@ -128,8 +128,8 @@ fn stdout_carries_only_jsonrpc_frames_and_stdin_close_exits_cleanly() {
     let tools: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(
         tools["result"]["tools"].as_array().map(Vec::len),
-        Some(7),
-        "seven read tools are listed"
+        Some(9),
+        "the nine declared tools are listed (seven read + w3's two write)"
     );
 
     // 4. One export — a real store read whose response must still be a single
@@ -182,6 +182,69 @@ fn wait_with_timeout(
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// AC-5 (r2.s1.w3): the identity path validates through the w1 `AgentName`
+/// newtype, which counts CHARACTERS — `name.len()` on the old path counted
+/// bytes, so a 33-`é` name (33 chars, 66 bytes) was refused on LENGTH. Through
+/// `AgentName::parse` the same name is refused on the CHARACTER SET — the
+/// stderr reason is what distinguishes the two.
+#[test]
+fn agent_identity_counts_characters_not_bytes() {
+    let name = "é".repeat(33); // 33 chars, 66 bytes — over the byte limit, inside the char limit
+    let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "mcp",
+            "--agent-name",
+            &name,
+            "--db",
+            "/nonexistent/never.db",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn pulse mcp with a multibyte agent name");
+    assert!(
+        !output.status.success(),
+        "an out-of-charset name still refuses to serve (status {})",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ASCII"),
+        "the refusal names the character set, proving the count was in chars: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("1-64 characters"),
+        "a byte-counted validator would refuse on length instead: {stderr:?}"
+    );
+}
+
+#[test]
+fn agent_identity_too_long_name_exits_nonzero() {
+    // 65 ASCII chars: inside the byte count either way — the char-counted
+    // validator must still refuse, on length.
+    let name = "x".repeat(65);
+    let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "mcp",
+            "--agent-name",
+            &name,
+            "--db",
+            "/nonexistent/never.db",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn pulse mcp with an over-long agent name");
+    assert!(
+        !output.status.success(),
+        "an over-64-char name refuses to serve (status {})",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1-64"),
+        "the refusal names the length rule: {stderr:?}"
+    );
 }
 
 #[test]

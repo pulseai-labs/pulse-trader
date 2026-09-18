@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::store::{CandleStore, default_base_dir};
 use crate::mcp::export::Exports;
 use crate::mcp::identity::{AgentIdentity, validate_agent_name};
@@ -62,6 +63,9 @@ pub(crate) async fn run_mcp(args: &McpArgs) -> anyhow::Result<()> {
         candles: CandleStore::with_base_dir(data_dir),
         exports,
         identity: AgentIdentity::resolve(agent_name.as_deref(), None),
+        // Stateless, cloneable, no I/O at construction — the run_backtest
+        // tool's symbol-filter surface (r2.s1.w3).
+        exchange: BinanceAdapter::new(),
     };
     serve(state).await
 }

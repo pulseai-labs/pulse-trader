@@ -1,14 +1,16 @@
 //! Agent identity resolution for `pulse mcp` (r2.s1.w2).
 //!
-//! The `w1` domain `AgentName` newtype is deliberately NOT imported here — `w1`
-//! lands in parallel and this file owns the validation until `w3` re-points it.
-//! The rules are the spec's: 1–64 characters of `[A-Za-z0-9._-]`, normalized to
-//! lowercase.
+//! Validation is the `w1` domain [`AgentName`] newtype — `w3` re-pointed it so
+//! the identity path and the `agent_submission` row share ONE rule set: 1–64
+//! **characters** (not bytes — `AgentName::parse` counts `chars`) of
+//! `[A-Za-z0-9._-]`, normalized to lowercase.
 //!
 //! Precedence: the `--agent-name` flag beats the MCP `initialize` handshake's
 //! `clientInfo.name`, which beats the `unknown` fallback. A bad flag is a
 //! startup error (the CLI validates before serving); a bad handshake name
 //! degrades to `unknown` with one stderr line — it never fails the session.
+
+use crate::domain::strategy::AgentName;
 
 /// The fallback agent name when neither the flag nor the handshake yields a
 /// valid name.
@@ -81,37 +83,24 @@ impl AgentIdentity {
     }
 }
 
-/// Validate a candidate agent name against the `AgentName` rules: 1–64
-/// characters of `[A-Za-z0-9._-]`.
+/// Validate a candidate agent name — a thin wrapper over
+/// [`AgentName::parse`], the w1 domain newtype the `agent_submission` row also
+/// validates through, so the flag/handshake path and the submit path share ONE
+/// rule: 1–64 **characters** (char-counted, not bytes) of `[A-Za-z0-9._-]`,
+/// lowercased.
 ///
-/// Returns the **lowercased** name on success, or a human-readable reason on
+/// Returns the **lowercased** name on success, or the newtype's message on
 /// failure. The CLI uses this on `--agent-name` (invalid → non-zero exit
 /// before serving); [`AgentIdentity::resolve`] uses it on the handshake name.
 ///
 /// # Errors
 ///
-/// Returns `Err(reason)` when the name is empty, over 64 bytes, or contains a
-/// character outside the allowed set.
+/// Returns `Err(reason)` when the name is empty, over 64 characters, or
+/// contains a character outside the allowed set.
 pub fn validate_agent_name(raw: &str) -> Result<String, String> {
-    let name = raw.to_ascii_lowercase();
-    if name.is_empty() {
-        return Err("agent name must be 1-64 characters".to_owned());
-    }
-    if name.len() > 64 {
-        return Err(format!(
-            "agent name must be 1-64 characters, got {}",
-            name.len()
-        ));
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-    {
-        return Err(format!(
-            "agent name {raw:?} contains {bad:?}: allowed characters are A-Z, a-z, 0-9, '.', '_', '-'"
-        ));
-    }
-    Ok(name)
+    AgentName::parse(raw)
+        .map(|name| name.as_str().to_owned())
+        .map_err(|e| e.message)
 }
 
 #[cfg(test)]

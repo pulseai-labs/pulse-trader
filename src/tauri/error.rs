@@ -193,6 +193,7 @@ impl From<BacktestAppError> for BusError {
             BacktestAppError::VersionNotFound(_)
             | BacktestAppError::SnapshotMissing { .. }
             | BacktestAppError::SeriesGapped { .. }
+            | BacktestAppError::WindowEmpty { .. }
             | BacktestAppError::PreSaveRead { .. }
             | BacktestAppError::Persist(_)
             | BacktestAppError::SavedButReadBackFailed { .. } => BusErrorCode::Data,
