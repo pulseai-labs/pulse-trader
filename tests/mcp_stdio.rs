@@ -325,6 +325,10 @@ async fn candle_and_indicator_exports_match_the_snapshot() {
     .await;
     assert_eq!(exported["rows"], candle_count);
     assert_eq!(exported["data_version"], expected_version);
+    // G7: the export contract echoes pair + timeframe on every export —
+    // export_indicators used to drop both.
+    assert_eq!(exported["timeframe"], "15m");
+    assert_eq!(exported["pair"], "BTCUSDT");
     assert_eq!(exported["columns"], json!(["rsi:14"]));
     let path = PathBuf::from(exported["path"].as_str().expect("path"));
     let csv = std::fs::read_to_string(&path).expect("read indicators csv");

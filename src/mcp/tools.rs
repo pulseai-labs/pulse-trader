@@ -667,6 +667,8 @@ impl PulseMcp {
                 "path": path,
                 "rows": series.candles.len(),
                 "data_version": series.version.as_str(),
+                "timeframe": tf.binance_interval(),
+                "pair": series.pair.to_string(),
                 "columns": labels,
             }))),
             Err(e) => Ok(tool_error(e)),
