@@ -26,6 +26,7 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::regime::RegimeBreakdown;
 use super::stats::SummaryStats;
@@ -98,6 +99,56 @@ pub struct BacktestInputs {
     pub slippage_bps: Decimal,
     /// How funding rates were sourced.
     pub funding: FundingConfig,
+    /// The candle slice of the snapshots the run consumed, when it was windowed
+    /// (r2.s1.w1). `None` is the whole snapshot — every pre-`0009` row, and
+    /// every run saved before windowing existed or without one.
+    pub window: Option<CandleWindow>,
+}
+
+/// The candle slice of a snapshot a run consumed, when it was windowed
+/// (r2.s1.w1).
+///
+/// Both bounds are UTC epoch milliseconds on the candles' `open_time`, and the
+/// window is **half-open `[from_ms, to_ms)`** — the `backtest_run.window_from_ms`
+/// / `window_to_ms` `INTEGER` columns one-to-one. `NULL`/`NULL` on the columns is
+/// the whole snapshot (no `CandleWindow` at all — see
+/// [`BacktestInputs::window`]); a half-present or inverted pair is refused by
+/// the `0009` `backtest_run_window_pair` trigger, and `Eq` is derivable (two
+/// `i64`s, no `f64` anywhere).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandleWindow {
+    /// The first `open_time` the window includes (inclusive lower bound).
+    pub from_ms: i64,
+    /// The `open_time` the window stops before (exclusive upper bound —
+    /// `[from, to)`).
+    pub to_ms: i64,
+}
+
+/// Why [`CandleWindow::new`] refused: an empty or backwards window is not a
+/// window.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("a candle window requires from_ms < to_ms, got {from_ms} >= {to_ms}")]
+pub struct CandleWindowError {
+    /// The submitted lower bound.
+    pub from_ms: i64,
+    /// The submitted upper bound.
+    pub to_ms: i64,
+}
+
+impl CandleWindow {
+    /// Build a window, refusing an empty or inverted one — `from_ms` must be
+    /// strictly before `to_ms` (the `0009` pair trigger refuses the same shape
+    /// at the schema layer).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CandleWindowError`] when `from_ms >= to_ms`.
+    pub fn new(from_ms: i64, to_ms: i64) -> Result<Self, CandleWindowError> {
+        if from_ms >= to_ms {
+            return Err(CandleWindowError { from_ms, to_ms });
+        }
+        Ok(Self { from_ms, to_ms })
+    }
 }
 
 /// Identifier of a persisted [`PersistedRun`] — a `#[serde(transparent)]`

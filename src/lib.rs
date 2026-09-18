@@ -80,9 +80,15 @@ pub use domain::{AlignedBar, align};
 // curated surface like `MarketDataSource`.
 pub use domain::StrategyRepository;
 pub use domain::strategy::{
-    CreatedBy, NewVersion, Strategy, StrategyId, StrategyVersion, VersionDiff, VersionId,
+    AgentName, AgentNameError, AgentSubmission, AgentSubmissionId, CreatedBy, HypothesisError,
+    NewAgentSubmission, NewVersion, Strategy, StrategyId, StrategyVersion, VersionDiff, VersionId,
     diff_versions,
 };
+// r2.s1.w1: the strategy-level `Hypothesis` an `agent_submission` carries is a
+// DIFFERENT type from the coaching `Hypothesis` re-exported below (different
+// bounds, different audit table) — it surfaces under the `AgentHypothesis`
+// alias so neither name silently stands in for the other.
+pub use domain::strategy::Hypothesis as AgentHypothesis;
 
 // VS-1.1.2 work-2.01: the DSL grammar leaf + predicate layer. These are the
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
@@ -443,8 +449,8 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // under `deny(warnings)`), so `tests/backtest_provenance.rs` and W3's DTO can
 // name them.
 pub use domain::{
-    BacktestInputs, BacktestRunId, BacktestRunRepository, FundingConfig, PersistedRun, RunSummary,
-    SnapshotSelection,
+    BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, CandleWindowError,
+    FundingConfig, PersistedRun, RunSummary, SnapshotSelection,
 };
 
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line

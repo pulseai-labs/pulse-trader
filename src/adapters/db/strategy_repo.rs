@@ -34,7 +34,8 @@ use uuid::Uuid;
 
 use crate::adapters::clock::SystemClock;
 use crate::domain::strategy::{
-    CreatedBy, NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
+    AgentName, AgentSubmission, AgentSubmissionId, CreatedBy, Hypothesis, NewAgentSubmission,
+    NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
 };
 use crate::domain::{Clock, DataError, Migrator, SchemaVersion, StrategyRepository, validate};
 
@@ -530,6 +531,153 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
     ) -> Result<Vec<StrategyVersion>, DataError> {
         let versions = self.list_versions(strategy_id).await?;
         Ok(parent_order(versions))
+    }
+
+    async fn create_agent_version(
+        &self,
+        request: NewVersion,
+        submission: NewAgentSubmission,
+    ) -> Result<(StrategyVersion, AgentSubmission), DataError> {
+        // Refusals BEFORE touching the database (r2.s1.w1): the submission is
+        // the version's whole audit trail — it names no LlmCall rows, and a
+        // non-external-agent request is not this port's to write.
+        if request.created_by != CreatedBy::ExternalAgent {
+            return Err(DataError::Db(
+                "create_agent_version requires created_by = external_agent".to_owned(),
+            ));
+        }
+        if !request.creating_llm_call_ids.is_empty() {
+            return Err(DataError::Db(
+                "an external-agent version names no LlmCall rows".to_owned(),
+            ));
+        }
+
+        // The same load → validate → canonicalize pipeline `create_version`
+        // runs — the migrator and validator are provenance-blind.
+        let loaded = self
+            .migrator
+            .load(&request.dsl_json)
+            .map_err(|e| DataError::Db(format!("dsl load failed: {e}")))?;
+        validate(&loaded.dsl).map_err(|e| DataError::Db(format!("dsl validation failed: {e}")))?;
+
+        let id = Uuid::new_v4().to_string();
+        let submission_id = Uuid::new_v4().to_string();
+        let schema_version_str = SchemaVersion::CURRENT.to_string();
+        let strategy_id_str = request.strategy_id.as_str().to_owned();
+        let parent_str = request
+            .parent_version_id
+            .as_ref()
+            .map(|p| p.as_str().to_owned());
+        let dsl_current =
+            serde_json::to_string(&loaded.dsl).map_err(|e| DataError::Db(e.to_string()))?;
+        let hash = version_hash(
+            &strategy_id_str,
+            parent_str.as_deref(),
+            &schema_version_str,
+            &loaded.dsl_original,
+        );
+        let created_by_text =
+            serde_json::to_string(&request.created_by).map_err(|e| DataError::Db(e.to_string()))?;
+        let llm_ids_json = serde_json::to_string(&request.creating_llm_call_ids)
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        // One timestamp for the committed pair — they are minted atomically.
+        let (_, created_at) = self.now_rfc3339()?;
+
+        // ONE transaction: the version row and its submission row, or neither.
+        // `BEGIN IMMEDIATE` takes the write lock up front rather than upgrading
+        // a deferred transaction on first write — the two writes are committed
+        // as one unit and a concurrent writer fails fast instead of racing the
+        // upgrade.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        insert_version_row(
+            &mut tx,
+            &VersionInsert {
+                id: &id,
+                strategy_id: &strategy_id_str,
+                parent_version_id: parent_str.as_deref(),
+                dsl_schema_version: &schema_version_str,
+                dsl: &dsl_current,
+                dsl_original: &loaded.dsl_original,
+                version_hash: &hash,
+                created_by: &created_by_text,
+                creating_llm_call_ids: &llm_ids_json,
+                created_at: &created_at,
+            },
+        )
+        .await?;
+        let agent_name = submission.agent_name.as_str();
+        let hypothesis = submission.hypothesis.as_str();
+        sqlx::query!(
+            "INSERT INTO agent_submission (id, version_id, agent_name, hypothesis, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            submission_id,
+            id,
+            agent_name,
+            hypothesis,
+            created_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+
+        // Read both halves back through the defended paths — `get_version`
+        // re-derives the hash; `get_agent_submission` re-validates the newtypes.
+        let version = self
+            .get_version(&VersionId::new(id))
+            .await?
+            .ok_or_else(|| {
+                DataError::Db("created agent version vanished on read-back".to_owned())
+            })?;
+        let submission = self
+            .get_agent_submission(&version.id)
+            .await?
+            .ok_or_else(|| DataError::Db("created submission vanished on read-back".to_owned()))?;
+        Ok((version, submission))
+    }
+
+    async fn get_agent_submission(
+        &self,
+        version_id: &VersionId,
+    ) -> Result<Option<AgentSubmission>, DataError> {
+        let vid = version_id.as_str();
+        let row = sqlx::query!(
+            r#"SELECT
+                 id         AS "id!: String",
+                 version_id AS "version_id!: String",
+                 agent_name AS "agent_name!: String",
+                 hypothesis AS "hypothesis!: String",
+                 created_at AS "created_at!: String"
+               FROM agent_submission WHERE version_id = ?1"#,
+            vid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(AgentSubmission {
+                id: AgentSubmissionId::new(r.id),
+                version_id: VersionId::new(r.version_id),
+                // Defended read: a stored row that fails domain validation is
+                // a corrupt row (a write that bypassed the typed port), not a
+                // `None`.
+                agent_name: AgentName::parse(&r.agent_name).map_err(|e| {
+                    DataError::Db(format!("stored agent_name failed domain validation: {e}"))
+                })?,
+                hypothesis: Hypothesis::parse(&r.hypothesis).map_err(|e| {
+                    DataError::Db(format!("stored hypothesis failed domain validation: {e}"))
+                })?,
+                created_at: parse_created_at(&r.created_at)?,
+            })),
+        }
     }
 }
 

@@ -122,3 +122,43 @@ keep **deep**: re-exposing `content_version`, `snapshot_path`, `write_head` or t
 encode helpers on the port would recreate `CandleStore` as a shallow interface and
 close nothing. Those stay inherent methods on the adapter, for its own tests and
 tooling.
+
+## Amendment — 2026-09-18 (r2.s1.w1, Proposed)
+
+*(Authored `Proposed`; flips `Accepted` at `r2.s1` spine close.)*
+
+**`pulse mcp` is a second long-lived OS process on the same artifact and the
+same `pulse.db`.** An external coding agent drives the discovery loop over MCP
+by running `pulse mcp` — a process the *agent* owns (spawned by its harness,
+lived for its session), not one PulseTrader supervises. Both processes open the
+same embedded database: WAL readers never block each other, writes serialize
+through SQLite's single-writer discipline, and each composition root migrates
+forward on open under ADR-0018's backup-before-migrate and refuses a schema
+newer than itself. A second OS process sharing the file is the design WAL was
+chosen for, not a breach of it.
+
+**It is not a sidecar runtime, and it opens no listener.** The zero-sidecars
+claim was always about PulseTrader not *supervising* a second runtime — no
+spawned Python, no service mesh, no version skew to manage. `pulse mcp` is the
+same binary on the same release cadence, speaking stdio framing to its parent
+agent: there is no socket, no port, no IPC substrate PulseTrader must keep
+alive or version against. It is a second *entry point*, not a second
+*component*.
+
+**`src/mcp/` is a third composition root beside `src/cli/` and `src/tauri/`.**
+The composition-root rule — only roots choose concrete adapters — now closes
+over three roots: the CLI, the desktop shell, and the MCP surface. `src/mcp/`
+constructs the same domain ports (`SqliteStrategyRepo` et al.) the other two
+do and consumes the same application-ring use cases; it introduces no fourth
+kind of adapter and no new dependency direction. **The application ring stays
+infrastructure-free** — MCP transport types (framing, JSON-RPC envelopes) live
+in the root, never in `src/application/` or `src/domain/`.
+
+**The revisit trigger is exercised, not violated.** The Consequences entry
+names this bone's trigger: "a component that genuinely needs independent
+deployment would force a revisit". `pulse mcp` is not that component — it ships
+inside the one artifact, upgrades on the same cadence, and cannot skew against
+itself. What changed is the *process* count, which the decision never counted;
+what did not change is the *deployment* count, which is what the trigger
+measures. Recorded here so a future reader does not mistake a second `main`
+for a sidecar: the monolith gained a door, not a satellite.

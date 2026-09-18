@@ -581,6 +581,24 @@ impl StrategyRepository for InjectingStrategyRepo {
     {
         self.inner.version_tree(strategy_id)
     }
+
+    fn create_agent_version(
+        &self,
+        request: NewVersion,
+        submission: pulse::NewAgentSubmission,
+    ) -> impl std::future::Future<
+        Output = Result<(pulse::StrategyVersion, pulse::AgentSubmission), DataError>,
+    > + Send {
+        self.inner.create_agent_version(request, submission)
+    }
+
+    fn get_agent_submission(
+        &self,
+        version_id: &VersionId,
+    ) -> impl std::future::Future<Output = Result<Option<pulse::AgentSubmission>, DataError>> + Send
+    {
+        self.inner.get_agent_submission(version_id)
+    }
 }
 
 /// Drive the use case with one injected failure and return the error.

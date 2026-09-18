@@ -98,9 +98,10 @@ const BUSY_TIMEOUT_SECS: u64 = 5;
 /// 1.04 drives `MIGRATOR.run(pool)` / `MIGRATOR.undo(pool, target)` in-process;
 /// re-exported from `lib.rs` so it (and the integration boundary) can reach it.
 /// r1.s4.w4: `sqlx::migrate!` records a dependency on the migration files it saw
-/// when it last expanded, so ADDING a file (here, `0008_coaching_lifecycle`) does
-/// not by itself invalidate the cached expansion. Editing this file is what forces
-/// the re-expansion, which is why a new migration always comes with a touch here.
+/// when it last expanded, so ADDING a file (here, `0009_external_agent_window_claim`)
+/// does not by itself invalidate the cached expansion. Editing this file is what
+/// forces the re-expansion, which is why a new migration always comes with a
+/// touch here.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// A thin newtype over a `sqlx::SqlitePool` for the `PulseTrader` `SQLite` tier.

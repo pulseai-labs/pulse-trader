@@ -47,7 +47,10 @@ use crate::domain::llm_call::{AttributedCall, AttributedCallError, LlmCall, LlmC
 use crate::domain::pair::Pair;
 use crate::domain::series::{CandleSeries, StoredCandleSeries};
 use crate::domain::sizing::SymbolFilters;
-use crate::domain::strategy::{NewVersion, Strategy, StrategyId, StrategyVersion, VersionId};
+use crate::domain::strategy::{
+    AgentSubmission, NewAgentSubmission, NewVersion, Strategy, StrategyId, StrategyVersion,
+    VersionId,
+};
 use crate::domain::timeframe::Timeframe;
 use crate::domain::version::DataVersion;
 use rust_decimal::Decimal;
@@ -328,6 +331,37 @@ pub trait StrategyRepository {
         &self,
         strategy_id: &StrategyId,
     ) -> impl Future<Output = Result<Vec<StrategyVersion>, DataError>> + Send;
+
+    /// Create an external-agent version and its `agent_submission` audit row in
+    /// ONE transaction (r2.s1.w1): either both rows exist afterwards or neither
+    /// does. The submission is the audit trail an agent version carries where a
+    /// coach version carries a coaching session and an `LlmCall`.
+    ///
+    /// The implementation refuses `request.created_by !=
+    /// CreatedBy::ExternalAgent` and a non-empty `creating_llm_call_ids`
+    /// **before touching the database** — an agent version names no `LlmCall`
+    /// rows because the agent's cost is external to the app.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on a refused provenance shape, if the underlying
+    /// store fails, or if the DSL is invalid.
+    fn create_agent_version(
+        &self,
+        request: NewVersion,
+        submission: NewAgentSubmission,
+    ) -> impl Future<Output = Result<(StrategyVersion, AgentSubmission), DataError>> + Send;
+
+    /// Fetch the `agent_submission` audit row for a version (`Ok(None)` when the
+    /// version has none — e.g. a human- or coach-authored version).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] if the underlying store fails.
+    fn get_agent_submission(
+        &self,
+        version_id: &VersionId,
+    ) -> impl Future<Output = Result<Option<AgentSubmission>, DataError>> + Send;
 }
 
 /// The persisted backtest-run system-of-record port (VS-1.2.4 work-4.04, FR-6 /
@@ -952,7 +986,8 @@ mod repository_tests {
     use super::StrategyRepository;
     use crate::domain::error::DataError;
     use crate::domain::strategy::{
-        CreatedBy, NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
+        AgentSubmission, AgentSubmissionId, CreatedBy, NewAgentSubmission, NewVersion, Strategy,
+        StrategyId, StrategyVersion, VersionId,
     };
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1002,6 +1037,7 @@ mod repository_tests {
     struct FakeRepo {
         strategies: Mutex<HashMap<String, Strategy>>,
         versions: Mutex<HashMap<String, StrategyVersion>>,
+        submissions: Mutex<HashMap<String, AgentSubmission>>,
         seq: Mutex<u64>,
     }
 
@@ -1176,6 +1212,48 @@ mod repository_tests {
             strategy_id: &StrategyId,
         ) -> Result<Vec<StrategyVersion>, DataError> {
             self.list_versions(strategy_id).await
+        }
+
+        async fn create_agent_version(
+            &self,
+            request: NewVersion,
+            submission: NewAgentSubmission,
+        ) -> Result<(StrategyVersion, AgentSubmission), DataError> {
+            if request.created_by != CreatedBy::ExternalAgent {
+                return Err(DataError::Db(
+                    "create_agent_version requires created_by = external_agent".to_owned(),
+                ));
+            }
+            if !request.creating_llm_call_ids.is_empty() {
+                return Err(DataError::Db(
+                    "an external-agent version names no LlmCall rows".to_owned(),
+                ));
+            }
+            let version = self.create_version(request).await?;
+            let submission = AgentSubmission {
+                id: AgentSubmissionId::new(self.next_id("sub")),
+                version_id: version.id.clone(),
+                agent_name: submission.agent_name,
+                hypothesis: submission.hypothesis,
+                created_at: version.created_at,
+            };
+            self.submissions
+                .lock()
+                .expect("submissions lock")
+                .insert(version.id.as_str().to_owned(), submission.clone());
+            Ok((version, submission))
+        }
+
+        fn get_agent_submission(
+            &self,
+            version_id: &VersionId,
+        ) -> impl Future<Output = Result<Option<AgentSubmission>, DataError>> {
+            std::future::ready(Ok(self
+                .submissions
+                .lock()
+                .expect("submissions lock")
+                .get(version_id.as_str())
+                .cloned()))
         }
     }
 
@@ -1401,6 +1479,7 @@ mod backtest_run_repository_tests {
             taker_fee_bps: Decimal::new(4, 0),
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,
+            window: None,
         };
         let id = repo
             .save_run(

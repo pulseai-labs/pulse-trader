@@ -52,9 +52,9 @@ use uuid::Uuid;
 
 use crate::adapters::clock::SystemClock;
 use crate::domain::backtest::{
-    BacktestInputs, BacktestResult, BacktestRunId, EquityCurve, ExitReason, Fill, FundingConfig,
-    PersistedRun, Regime, RegimeBreakdown, RunSummary, SnapshotSelection, SummaryStats, Trade,
-    TradeSource,
+    BacktestInputs, BacktestResult, BacktestRunId, CandleWindow, EquityCurve, ExitReason, Fill,
+    FundingConfig, PersistedRun, Regime, RegimeBreakdown, RunSummary, SnapshotSelection,
+    SummaryStats, Trade, TradeSource,
 };
 use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
@@ -354,7 +354,9 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                  htf_data_version        AS "htf_data_version?: String",
                  taker_fee_bps           AS "taker_fee_bps?: String",
                  slippage_bps            AS "slippage_bps?: String",
-                 funding_config          AS "funding_config?: String"
+                 funding_config          AS "funding_config?: String",
+                 window_from_ms          AS "window_from_ms?: i64",
+                 window_to_ms            AS "window_to_ms?: i64"
                FROM backtest_run WHERE id = ?1"#,
             id_str,
         )
@@ -478,6 +480,8 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             r.taker_fee_bps.as_deref(),
             r.slippage_bps.as_deref(),
             r.funding_config.as_deref(),
+            r.window_from_ms,
+            r.window_to_ms,
         )?;
 
         Ok(Some(PersistedRun {
@@ -778,6 +782,8 @@ fn decode_inputs(
     taker_fee_bps: Option<&str>,
     slippage_bps: Option<&str>,
     funding_config: Option<&str>,
+    window_from_ms: Option<i64>,
+    window_to_ms: Option<i64>,
 ) -> Result<Option<BacktestInputs>, DataError> {
     let required = [
         pair,
@@ -794,8 +800,16 @@ fn decode_inputs(
         .count();
 
     // Shape 1: the legacy row. ALL eight must be NULL — a row with no required
-    // provenance but a stray HTF value is corrupt, not legacy.
+    // provenance but a stray HTF value is corrupt, not legacy. The `0009` window
+    // pair is NULL there too, and is decoded with it rather than counted among
+    // the `0006` shapes (a legacy row has no inputs at all).
     if present == 0 && htf_present == 0 {
+        if window_from_ms.is_some() || window_to_ms.is_some() {
+            return Err(DataError::Db(format!(
+                "run `{run_id}` carries window bounds but no input provenance: \
+                 a row that cannot name its snapshot cannot name a slice of it"
+            )));
+        }
         return Ok(None);
     }
     if present != required.len() {
@@ -812,6 +826,23 @@ fn decode_inputs(
              must both be present or both absent (#110)"
         )));
     }
+    // r2.s1.w1: the window is both bounds or neither, and from < to — the same
+    // shape `0009`'s pair trigger refuses on INSERT, checked again on the way
+    // out (a defended read does not trust the trigger to have seen the write).
+    let window = match (window_from_ms, window_to_ms) {
+        (None, None) => None,
+        (Some(from_ms), Some(to_ms)) => {
+            Some(CandleWindow::new(from_ms, to_ms).map_err(|e| {
+                DataError::Db(format!("run `{run_id}` stores an invalid window: {e}"))
+            })?)
+        }
+        _ => {
+            return Err(DataError::Db(format!(
+                "run `{run_id}` has a half-present window: window_from_ms and window_to_ms \
+                 must both be present or both absent (r2.s1.w1)"
+            )));
+        }
+    };
 
     let pair = require_col("backtest_run.pair", pair)?;
     let primary_timeframe = require_col("backtest_run.primary_timeframe", primary_timeframe)?;
@@ -842,6 +873,7 @@ fn decode_inputs(
         taker_fee_bps: parse_decimal("backtest_run.taker_fee_bps", taker_fee_bps)?,
         slippage_bps: parse_decimal("backtest_run.slippage_bps", slippage_bps)?,
         funding: parse_funding("backtest_run.funding_config", funding_config)?,
+        window,
     }))
 }
 
@@ -991,6 +1023,11 @@ pub(crate) async fn insert_run_row(
     let taker_fee_bps_text = decimal_text(inputs.taker_fee_bps);
     let slippage_bps_text = decimal_text(inputs.slippage_bps);
     let funding_config = enum_token(&inputs.funding)?;
+    // r2.s1.w1 — the window pair is written all-or-nothing: the domain type is
+    // `Option<CandleWindow>`, so "half a window" is unrepresentable here, and the
+    // `0009` trigger refuses it anyway. Both bounds are UTC epoch-ms INTEGERs.
+    let window_from_ms = inputs.window.as_ref().map(|w| w.from_ms);
+    let window_to_ms = inputs.window.as_ref().map(|w| w.to_ms);
     sqlx::query!(
         "INSERT INTO backtest_run \
          (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
@@ -1000,10 +1037,10 @@ pub(crate) async fn insert_run_row(
           wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
           regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
-          taker_fee_bps, slippage_bps, funding_config) \
+          taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
-                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
         run_id,
         version_id_str,
         schema_version,
@@ -1044,6 +1081,8 @@ pub(crate) async fn insert_run_row(
         taker_fee_bps_text,
         slippage_bps_text,
         funding_config,
+        window_from_ms,
+        window_to_ms,
     )
     .execute(&mut **tx)
     .await
@@ -1212,6 +1251,7 @@ mod tests {
             taker_fee_bps: d(4, 0),
             slippage_bps: d(1, 0),
             funding: FundingConfig::SnapshotRates,
+            window: None,
         }
     }
 

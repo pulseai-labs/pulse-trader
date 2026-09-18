@@ -15,9 +15,9 @@
 use std::process::Command;
 
 use pulse::{
-    Comparator, Condition, CreatedBy, DataError, Db, Direction, ExitRule, IndicatorSpec, MIGRATOR,
-    NewVersion, RiskParams, SchemaVersion, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
-    SweepableValue, ValueSource, VersionId,
+    AgentHypothesis, AgentName, Comparator, Condition, CreatedBy, DataError, Db, Direction,
+    ExitRule, IndicatorSpec, MIGRATOR, NewAgentSubmission, NewVersion, RiskParams, SchemaVersion,
+    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue, ValueSource, VersionId,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -223,6 +223,241 @@ async fn raw_delete_on_strategy_version_aborts() {
     // The row still exists (the abort rolled the DELETE back).
     let still = repo.get_version(&vid).await.unwrap();
     assert!(still.is_some(), "row still present after aborted DELETE");
+}
+
+// ---- r2.s1.w1 (AC-2): the external-agent provenance pair --------------------
+//
+// `create_agent_version` writes TWO rows in one `BEGIN IMMEDIATE` transaction —
+// the immutable `strategy_version` (created_by `external_agent`, no LLM-call
+// provenance) and its `agent_submission` audit row — or neither. A coach
+// version's audit trail is its coaching session and its `LlmCall`; the external
+// agent's cost is external to the app, so the submission is the ONLY durable
+// link between the version and the agent + hypothesis that produced it.
+
+/// A valid `NewAgentSubmission` — `AgentName`/`Hypothesis` are validated
+/// newtypes, so this is the only construction path.
+fn a_submission() -> NewAgentSubmission {
+    NewAgentSubmission {
+        agent_name: AgentName::parse("Claude-Code").expect("a valid agent name"),
+        hypothesis: AgentHypothesis::parse("RSI(21) oversold holds longer than RSI(14)")
+            .expect("a valid hypothesis"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_external_agent_version_round_trips_with_its_submission() {
+    let (repo, _pool, _tmp) = repo().await;
+    let s = repo
+        .create_strategy("AgentTree", Some("agent"), &[])
+        .await
+        .unwrap();
+    let parent = repo
+        .create_version(NewVersion {
+            strategy_id: s.id.clone(),
+            parent_version_id: None,
+            dsl_json: canonical_json(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .unwrap();
+
+    let (version, submission) = repo
+        .create_agent_version(
+            NewVersion {
+                strategy_id: s.id.clone(),
+                parent_version_id: Some(parent.id.clone()),
+                dsl_json: canonical_json(),
+                created_by: CreatedBy::ExternalAgent,
+                creating_llm_call_ids: vec![],
+            },
+            a_submission(),
+        )
+        .await
+        .expect("the version + submission pair commits");
+
+    // The version carries the sixth provenance and NO ledger ids — the agent's
+    // call is external, so there is nothing truthful to put there.
+    assert_eq!(version.created_by, CreatedBy::ExternalAgent);
+    assert!(
+        version.creating_llm_call_ids.is_empty(),
+        "an external_agent version names no LlmCall rows"
+    );
+    assert_eq!(version.parent_version_id, Some(parent.id));
+
+    // The submission is the normalized audit row, keyed to the minted version.
+    assert_eq!(submission.version_id, version.id);
+    assert_eq!(
+        submission.agent_name.as_str(),
+        "claude-code",
+        "AgentName normalizes to lowercase"
+    );
+
+    // The version round-trips through the EXISTING read path, hash defense and
+    // all — `create_agent_version` reuses `insert_version_row`, so `get_version`
+    // is the proof the stored row is a real version.
+    let fetched = repo
+        .get_version(&version.id)
+        .await
+        .unwrap()
+        .expect("the agent version reads back");
+    assert_eq!(fetched, version, "the version round-trips byte-identical");
+
+    let back = repo
+        .get_agent_submission(&version.id)
+        .await
+        .unwrap()
+        .expect("the submission reads back");
+    assert_eq!(
+        back, submission,
+        "the submission round-trips field-identical"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_agent_version_refuses_a_non_agent_provenance_and_llm_call_ids() {
+    let (repo, pool, _tmp) = repo().await;
+    let s = repo.create_strategy("Refusals", None, &[]).await.unwrap();
+    let versions_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // A coach-composed request is NOT an agent submission: refusing pre-DB keeps
+    // a misattributed version out of the audit trail.
+    assert!(
+        repo.create_agent_version(
+            NewVersion {
+                strategy_id: s.id.clone(),
+                parent_version_id: None,
+                dsl_json: canonical_json(),
+                created_by: CreatedBy::CoachLlm,
+                creating_llm_call_ids: vec![],
+            },
+            a_submission(),
+        )
+        .await
+        .is_err(),
+        "created_by != external_agent must be refused before the database"
+    );
+
+    // An agent submission writes no LlmCall — its cost is external — so a
+    // request carrying call ids claims a provenance the ledger does not hold.
+    assert!(
+        repo.create_agent_version(
+            NewVersion {
+                strategy_id: s.id.clone(),
+                parent_version_id: None,
+                dsl_json: canonical_json(),
+                created_by: CreatedBy::ExternalAgent,
+                creating_llm_call_ids: vec!["call-1".to_owned()],
+            },
+            a_submission(),
+        )
+        .await
+        .is_err(),
+        "a non-empty creating_llm_call_ids must be refused before the database"
+    );
+
+    let versions_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions_after, versions_before,
+        "a refused call writes no version"
+    );
+    let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_submission")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(submissions, 0, "a refused call writes no submission");
+}
+
+/// Atomicity: when the transaction fails, BOTH halves roll back.
+///
+/// The reachable in-transaction failure through the typed port is the
+/// VERSION-side insert (here, an `strategy_id` FK violation): a submission-side
+/// CHECK failure is *unrepresentable* through `NewAgentSubmission` — the domain
+/// newtypes are strictly tighter than the schema CHECKs (`agent_name`'s
+/// charset/length and `hypothesis`'s bounds are enforced at construction), so
+/// the schema CHECKs exist only against writes that bypass the domain. Those
+/// raw-SQL refusals are proven in `tests/migration_0009.rs`; here the property
+/// under test is that a failed insert leaves NO row on either side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_agent_version_is_atomic_when_the_version_insert_fails() {
+    let (repo, pool, _tmp) = repo().await;
+
+    assert!(
+        repo.create_agent_version(
+            NewVersion {
+                strategy_id: pulse::StrategyId::new("strat-missing"),
+                parent_version_id: None,
+                dsl_json: canonical_json(),
+                created_by: CreatedBy::ExternalAgent,
+                creating_llm_call_ids: vec![],
+            },
+            a_submission(),
+        )
+        .await
+        .is_err(),
+        "the version insert must fail on the strategy FK"
+    );
+
+    // The one transaction rolled back: no version AND no submission.
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, 0, "the failed insert left no version row");
+    let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_submission")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(submissions, 0, "the failed insert left no submission row");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_version_writes_no_agent_submission() {
+    let (repo, pool, _tmp) = repo().await;
+    let (_dsl, vid) = seed_one_version(&repo).await;
+
+    let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_submission")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        submissions, 0,
+        "the ordinary create_version path never touches the ledger"
+    );
+    assert!(
+        repo.get_agent_submission(&vid).await.unwrap().is_none(),
+        "a human-authored version has no submission to read back"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_agent_submission_returns_none_for_a_coach_version() {
+    let (repo, _pool, _tmp) = repo().await;
+    let s = repo.create_strategy("CoachTree", None, &[]).await.unwrap();
+    let coach_child = repo
+        .create_version(NewVersion {
+            strategy_id: s.id.clone(),
+            parent_version_id: None,
+            dsl_json: canonical_json(),
+            created_by: CreatedBy::CoachLlm,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        repo.get_agent_submission(&coach_child.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a coach version's audit trail is its coaching session, not this ledger"
+    );
 }
 
 // ---- binary smoke test (AC-5): clap→dispatch→repo wiring end-to-end ----------

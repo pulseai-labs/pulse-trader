@@ -532,7 +532,7 @@ where
             );
             return settle_failure(
                 sessions,
-                &session_id,
+                &session.id,
                 None,
                 CoachFailure::Interrupted { detail },
             )

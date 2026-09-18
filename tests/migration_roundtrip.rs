@@ -101,8 +101,8 @@ async fn migrate_up_then_undo_is_reversible() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        8,
-        "migrated to embedded max (8)"
+        9,
+        "migrated to embedded max (9)"
     );
     assert!(
         object_present(db.pool(), "table", "strategy").await,
@@ -130,7 +130,7 @@ async fn migrate_up_then_undo_is_reversible() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 8, "after re-run, max == 8");
+    assert_eq!(applied_max(db.pool()).await, 9, "after re-run, max == 9");
     assert!(
         index_present(db.pool()).await,
         "after re-run, 0002 index back"
@@ -162,7 +162,7 @@ async fn backup_written_before_migrate() {
     match outcome {
         pulse::MigrationOutcome::Migrated { from, to, backup } => {
             assert_eq!(from, 1, "from == the pre-migration version");
-            assert_eq!(to, 8, "to == the embedded max");
+            assert_eq!(to, 9, "to == the embedded max");
             assert!(backup.exists(), "backup file exists: {}", backup.display());
             let name = backup.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
@@ -177,7 +177,7 @@ async fn backup_written_before_migrate() {
 
     // The migration completed to the embedded max.
     let db = Db::with_path(&path).await.expect("reopen migrated db");
-    assert_eq!(applied_max(db.pool()).await, 8, "schema now at 0008");
+    assert_eq!(applied_max(db.pool()).await, 9, "schema now at 0009");
     assert!(
         index_present(db.pool()).await,
         "0002 index present post-migrate"
@@ -208,8 +208,8 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        8,
-        "migrated to embedded max (8)"
+        9,
+        "migrated to embedded max (9)"
     );
     assert!(
         schema_0003_present(db.pool()).await,
@@ -246,7 +246,7 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 8, "after re-run, max == 8");
+    assert_eq!(applied_max(db.pool()).await, 9, "after re-run, max == 9");
     assert!(
         schema_0003_present(db.pool()).await,
         "after re-run, 0003 backtest_run + trade tables and both indexes back"
@@ -278,8 +278,8 @@ async fn migration_0004_llm_call_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        8,
-        "migrated to embedded max (8)"
+        9,
+        "migrated to embedded max (9)"
     );
     assert!(
         schema_0004_present(db.pool()).await,
@@ -312,7 +312,7 @@ async fn migration_0004_llm_call_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 8, "after re-run, max == 8");
+    assert_eq!(applied_max(db.pool()).await, 9, "after re-run, max == 9");
     assert!(
         schema_0004_present(db.pool()).await,
         "after re-run, 0004 llm_call table + triggers + index back"
