@@ -138,6 +138,7 @@ fn seeded_inputs() -> BacktestInputs {
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
+        window: None,
     }
 }
 
