@@ -7,10 +7,10 @@
 # What it asserts (each a source property that decays silently without a gate):
 #
 #   1. STDOUT PURITY in the serving path. No `println!`/`print!` in
-#      src/mcp/**, src/cli/mcp.rs, or src/application/mcp_read.rs — one stray
-#      print corrupts the JSON-RPC stream on stdout and every client sees
-#      garbage. `eprintln!`/`eprint!` stay legal: stderr is the diagnostics
-#      channel, stdout is the wire.
+#      src/mcp/**, src/cli/mcp.rs, src/application/mcp_read.rs, or
+#      src/application/mcp_write.rs — one stray print corrupts the JSON-RPC
+#      stream on stdout and every client sees garbage. `eprintln!`/`eprint!`
+#      stay legal: stderr is the diagnostics channel, stdout is the wire.
 #
 #   2. LEAST PRIVILEGE in the serving path. The same files may not name
 #      `adapters::secrets`, `adapters::llm`, `agent::`, or
@@ -49,7 +49,7 @@ code_of() {
 
 serving_files() {
   find src/mcp -name '*.rs' -type f 2>/dev/null
-  for f in src/cli/mcp.rs src/application/mcp_read.rs; do
+  for f in src/cli/mcp.rs src/application/mcp_read.rs src/application/mcp_write.rs; do
     [[ -f "$f" ]] && printf '%s\n' "$f"
   done
 }
