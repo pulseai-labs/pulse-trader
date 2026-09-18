@@ -42,7 +42,9 @@
 
 use rust_decimal::Decimal;
 
-use crate::application::backtest::{PrepareError, ReadBackFailure, prepare_backtest};
+use crate::application::backtest::{
+    BacktestAppError, PrepareError, ReadBackFailure, prepare_backtest,
+};
 use crate::domain::backtest::SummaryStats;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
@@ -50,7 +52,7 @@ use crate::domain::{
     CoachAcceptFailure, CoachAcceptanceRepository, CoachingRepository, CoachingSession,
     CoachingSessionId, DataError, Disposition, DispositionKind, EngineFingerprint, ExchangeAdapter,
     Mutation, MutationError, PersistedRun, PreparedBacktest, PreparedCoachAcceptance, Proposal,
-    SessionOutcome, StrategyRepository, SymbolFilters, ValidatedDsl, apply,
+    SeriesEnd, SessionOutcome, StrategyRepository, SymbolFilters, ValidatedDsl, apply,
 };
 
 // ---------------------------------------------------------------------------
@@ -580,13 +582,13 @@ where
     E: ExchangeAdapter + Send + 'static,
 {
     let joined = tokio::task::spawn_blocking(move || -> Result<PreparedBacktest, StagedFailure> {
-        let primary = load_named_snapshot(
+        let mut primary = load_named_snapshot(
             &candles,
             &inputs.pair,
             inputs.primary.timeframe,
             &inputs.primary.data_version,
         )?;
-        let htf = match inputs.htf.as_ref() {
+        let mut htf = match inputs.htf.as_ref() {
             Some(selection) => Some(load_named_snapshot(
                 &candles,
                 &inputs.pair,
@@ -595,6 +597,36 @@ where
             )?),
             None => None,
         };
+        // r2.s1 G1: "the parent's exact persisted inputs" INCLUDES the window —
+        // a windowed parent's child must replay the same slice, or the re-run
+        // silently computes over the full snapshot while the inputs claim a
+        // window. Same rule as the standalone path: slice both series, an empty
+        // PRIMARY slice is a refusal, and a `to` cutting before the snapshot's
+        // real last candle makes the series end a window edge — not end-of-data.
+        let mut series_end = SeriesEnd::SnapshotEnd;
+        if let Some(w) = &inputs.window {
+            let snapshot_last_open = primary.candles.last().map(|c| c.open_time);
+            primary = primary.windowed(w);
+            if primary.candles.is_empty() {
+                return Err(StagedFailure {
+                    stage: AcceptFailureStage::Backtest,
+                    message: BacktestAppError::WindowEmpty {
+                        pair: inputs.pair.clone(),
+                        timeframe: inputs.primary.timeframe,
+                        from_ms: w.from_ms,
+                        to_ms: w.to_ms,
+                    }
+                    .to_string(),
+                    subject: Some(inputs.pair.as_str().to_owned()),
+                });
+            }
+            if snapshot_last_open
+                .is_some_and(|last| primary.candles.last().is_some_and(|c| c.open_time < last))
+            {
+                series_end = SeriesEnd::WindowEdge;
+            }
+            htf = htf.map(|series| series.windowed(w));
+        }
         // Symbol filters are pinned exchange METADATA, not price data — resolving
         // them is not "fetching candles from an exchange", which the accept path
         // never does.
@@ -614,6 +646,7 @@ where
             htf.as_ref(),
             &filters,
             starting_equity,
+            series_end,
         )
         .map_err(|e| match e {
             PrepareError::Compile(reason) => StagedFailure {

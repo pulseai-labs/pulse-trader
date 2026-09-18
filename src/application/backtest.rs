@@ -49,7 +49,7 @@ use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
     CandleSeriesRepository, CandleWindow, DataError, DataVersion, EngineFingerprint,
-    ExchangeAdapter, ExchangeError, FundingConfig, Pair, PersistedRun, PreparedBacktest,
+    ExchangeAdapter, ExchangeError, FundingConfig, Pair, PersistedRun, PreparedBacktest, SeriesEnd,
     SnapshotSelection, StrategyRepository, SymbolFilters, Timeframe, Trade, ValidatedDsl,
     ValidationErrors, compile, validate,
 };
@@ -517,6 +517,7 @@ pub(crate) fn prepare_backtest(
     htf: Option<&CandleSeries>,
     filters: &SymbolFilters,
     starting_equity: Decimal,
+    series_end: SeriesEnd,
 ) -> Result<PreparedBacktest, PrepareError> {
     let compiled = compile(validated).map_err(|e| PrepareError::Compile(e.to_string()))?;
     let config = BacktestConfig {
@@ -524,8 +525,8 @@ pub(crate) fn prepare_backtest(
         taker_fee_bps: inputs.taker_fee_bps,
         slippage_bps: inputs.slippage_bps,
     };
-    let result =
-        run_backtest(&compiled, primary, htf, &config, filters).map_err(PrepareError::Engine)?;
+    let result = run_backtest(&compiled, primary, htf, &config, filters, series_end)
+        .map_err(PrepareError::Engine)?;
     let summary = result.summary.clone();
     Ok(PreparedBacktest {
         inputs,
@@ -814,7 +815,14 @@ where
         // candles, so indicators warm up inside the window and nothing forces a
         // flat at `to`. An empty PRIMARY slice is a refusal — an empty HTF
         // slice is legal (every aligned HTF bar is simply `None`).
+        let mut series_end = SeriesEnd::SnapshotEnd;
         if let Some(w) = &window {
+            // The snapshot's real last candle, remembered BEFORE the slice: a
+            // window whose `to` still covers it ends at genuine end-of-data, so
+            // the engine's force-close stays correct (and an unwindowed run over
+            // the same extent agrees). A `to` cutting earlier makes the last bar
+            // a window edge — no flat is forced there (r2.s1 G1).
+            let snapshot_last_open = primary.candles.last().map(|c| c.open_time);
             primary = primary.windowed(w);
             if primary.candles.is_empty() {
                 return Err(BacktestAppError::WindowEmpty {
@@ -823,6 +831,11 @@ where
                     from_ms: w.from_ms,
                     to_ms: w.to_ms,
                 });
+            }
+            if snapshot_last_open
+                .is_some_and(|last| primary.candles.last().is_some_and(|c| c.open_time < last))
+            {
+                series_end = SeriesEnd::WindowEdge;
             }
             htf = htf.map(|series| series.windowed(w));
         }
@@ -837,6 +850,7 @@ where
             htf.as_ref(),
             &filters,
             config.starting_equity,
+            series_end,
         )
         .map_err(|e| match e {
             PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),

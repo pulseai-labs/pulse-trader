@@ -37,12 +37,12 @@ use pulse::{
     AgentHypothesis, AgentName, BacktestAppError, BacktestConfig, BacktestInputs, BacktestResult,
     BacktestRunId, BacktestRunRepository, BacktestRunRequest, BusErrorCode, Candle,
     CandleSeriesRepository, CandleStore, CandleWindow, CompareChildRunRequest, CreatedBy,
-    DataError, DataVersion, Db, DesktopState, EngineFingerprint, EquityCurve, FundingConfig,
-    HISTOGRAM_BIN_COUNT, NewAgentSubmission, NewVersion, Pair, PersistedRun, ReadBackFailure,
-    ReadBackStage, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
-    SqliteStrategyRepo, StoredCandleSeries, StrategyId, StrategyRepository, SummaryStats,
-    Timeframe, Trade, VersionId, compare_child_run_core, histogram_bin_width, project_histogram,
-    run_backtest_version_core, run_version_backtest,
+    DataError, DataVersion, Db, DesktopState, EngineFingerprint, EquityCurve, ExitReason,
+    FundingConfig, HISTOGRAM_BIN_COUNT, NewAgentSubmission, NewVersion, Pair, PersistedRun,
+    ReadBackFailure, ReadBackStage, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
+    SqliteBacktestRunRepo, SqliteStrategyRepo, StoredCandleSeries, StrategyId, StrategyRepository,
+    SummaryStats, Timeframe, Trade, VersionId, compare_child_run_core, histogram_bin_width,
+    project_histogram, run_backtest_version_core, run_version_backtest,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -980,6 +980,100 @@ async fn a_windowed_runs_read_back_is_sliced_to_the_persisted_window() {
             .iter()
             .all(|c| c.open_time >= from_ms && c.open_time < to_ms),
         "the htf read-back is sliced to the same window"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3d. a window edge is not end-of-data (r2.s1 G1)
+// ---------------------------------------------------------------------------
+
+/// G1: a `[from, to)` window that truncates the snapshot inside an open hold
+/// must not produce the fabricated `EndOfData` close the unwindowed tail would.
+/// The strategy still holds that position — the window is the caller's lens,
+/// not evidence the market ran out of bars.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_ending_mid_hold_does_not_fabricate_an_end_of_data_trade() {
+    let env = env();
+    let version_id = seed_version(&env).await;
+
+    let store = env.store();
+    let complete = store
+        .load_head(&Pair::new("BTCUSDT"), Timeframe::M15)
+        .expect("load_head")
+        .expect("15m HEAD exists")
+        .series;
+    let snapshot_last = complete.candles.last().expect("non-empty").open_time;
+
+    let db = env.db().await;
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+
+    // Baseline: the unwindowed run's trade log — find a position the strategy
+    // holds across more than one bar.
+    let baseline = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &r1_request(&version_id),
+    )
+    .await
+    .expect("the unwindowed run succeeds");
+    // The LAST multi-bar hold: every trade before it still closed inside the
+    // window, so the run's trade log is non-empty (a position still open at
+    // `to` produces no `Trade` row — closed trades only).
+    let held = baseline
+        .trades
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, t)| *i > 0 && t.entry_fill_time < t.exit_signal_time)
+        .map(|(_, t)| t)
+        .expect("the golden strategy holds a multi-bar position after earlier trades");
+
+    // Cut the window at the open_time of the bar the exit FILLED on
+    // (exclusive): every bar that kept the position open is inside; the bar
+    // that closed it is outside. `EndOfData` fills stamp a `close_time`, so
+    // for that exit mode the cut falls back to the last bar's open_time —
+    // which still excludes it.
+    let from_ms = complete.candles[0].open_time;
+    let to_ms = complete
+        .candles
+        .iter()
+        .map(|c| c.open_time)
+        .find(|t| *t >= held.exit_fill_time)
+        .unwrap_or(snapshot_last);
+    assert!(
+        to_ms <= snapshot_last,
+        "the window truncates at or before the snapshot's real last candle"
+    );
+    let mut request = r1_request(&version_id);
+    request.window = Some(CandleWindow::new(from_ms, to_ms).expect("window"));
+
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &request,
+    )
+    .await
+    .expect("the windowed run succeeds");
+
+    assert!(
+        !outcome.trades.is_empty(),
+        "earlier trades still closed inside the window — the run is non-vacuous"
+    );
+    assert!(
+        outcome
+            .trades
+            .iter()
+            .all(|t| t.exit_reason != ExitReason::EndOfData),
+        "a window edge is not end-of-data: no fabricated close at `to`"
+    );
+    assert!(
+        outcome.trades.iter().all(|t| t.exit_signal_time < to_ms),
+        "no trade may exit on a bar the window excluded"
     );
 }
 

@@ -124,6 +124,27 @@ pub struct CandleWindow {
     pub to_ms: i64,
 }
 
+/// What the LAST bar of the series the engine consumed represents (r2.s1 G1).
+///
+/// The engine cannot tell a genuine snapshot end from a caller-imposed window
+/// edge — the sliced series looks identical either way, so only the caller
+/// that performed the slice can say. The distinction decides whether an open
+/// position at the last bar is force-closed: a window bounds what the
+/// strategy may TRADE inside it, it does not mean the data ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesEnd {
+    /// The series ended because the snapshot did. A position still open on
+    /// the last bar is force-closed at its close with `ExitReason::EndOfData`
+    /// — the strategy had no more bars to act on.
+    SnapshotEnd,
+    /// The series ended because a [`CandleWindow`] truncated it before the
+    /// snapshot's real last candle. A position still open at `to` stays open
+    /// and produces no trade — the strategy never chose an exit, and an
+    /// `EndOfData` close would book a trade the window fabricated, changing
+    /// trade counts and P&L against the same run unwindowed.
+    WindowEdge,
+}
+
 /// Why [`CandleWindow::new`] refused: an empty or backwards window is not a
 /// window.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

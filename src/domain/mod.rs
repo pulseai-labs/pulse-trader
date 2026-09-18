@@ -88,7 +88,7 @@ pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 // `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{
     BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig, PersistedRun,
-    RunSummary, SnapshotSelection,
+    RunSummary, SeriesEnd, SnapshotSelection,
 };
 pub use candle::Candle;
 pub use clock::Clock;

@@ -7,9 +7,10 @@ use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
     CompiledStrategy, Direction, EngineFingerprint, EquityCurve, ExitReason, Fill, IntraBarExit,
-    Regime, RegimeBreakdown, Side, SizingOutcome, SkippedEntryCounts, SummaryStats, SymbolFilters,
-    Trade, TradeSource, align, apply_slippage, compute_position_size, funding_payment,
-    realized_pnl, realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
+    Regime, RegimeBreakdown, SeriesEnd, Side, SizingOutcome, SkippedEntryCounts, SummaryStats,
+    SymbolFilters, Trade, TradeSource, align, apply_slippage, compute_position_size,
+    funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, stop_price,
+    take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -70,6 +71,12 @@ impl BacktestConfig {
 
 /// Run one sequential, deterministic backtest.
 ///
+/// `series_end` says what `primary`'s last bar IS (r2.s1 G1): the caller that
+/// sliced the series knows whether it ends because the snapshot did or because
+/// a window truncated it. Only [`SeriesEnd::SnapshotEnd`] licenses the
+/// `EndOfData` force-close — a position open at a window edge is left open
+/// rather than booked as a trade the strategy never chose.
+///
 /// # Errors
 ///
 /// Returns [`BacktestError`] for strategy preconditions or sizing failures.
@@ -79,6 +86,7 @@ pub fn run_backtest(
     htf: Option<&CandleSeries>,
     config: &BacktestConfig,
     filters: &SymbolFilters,
+    series_end: SeriesEnd,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
@@ -154,7 +162,12 @@ pub fn run_backtest(
         }
     }
 
-    close_end_of_data(&mut state, primary, &funding_index, config)?;
+    // The force-close fires ONLY when the series genuinely ran out. A window
+    // edge is not end-of-data: a position still open at `to` is the strategy's
+    // open position, and booking it as a trade fabricates an exit (r2.s1 G1).
+    if series_end == SeriesEnd::SnapshotEnd {
+        close_end_of_data(&mut state, primary, &funding_index, config)?;
+    }
     // The leading equity point's time is the run's first primary candle open
     // (README C2 / D5). An empty primary series has no run-start bar; fall back to
     // 0 (the run produced no trades either, so the curve is just the leading point).
@@ -753,8 +766,8 @@ mod tests {
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
-        StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile, realized_pnl,
-        validate,
+        SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile,
+        realized_pnl, validate,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -906,6 +919,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -928,6 +942,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -947,6 +962,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -969,6 +985,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -990,6 +1007,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1011,6 +1029,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1159,6 +1178,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
@@ -1192,7 +1212,8 @@ mod tests {
                 &primary,
                 None,
                 &config(),
-                &SymbolFilters::unconstrained()
+                &SymbolFilters::unconstrained(),
+                SeriesEnd::SnapshotEnd,
             )
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
@@ -1203,7 +1224,8 @@ mod tests {
                 &primary,
                 None,
                 &config(),
-                &SymbolFilters::unconstrained()
+                &SymbolFilters::unconstrained(),
+                SeriesEnd::SnapshotEnd,
             )
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
@@ -1223,6 +1245,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1243,6 +1266,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1273,6 +1297,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1326,6 +1351,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1380,6 +1406,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1419,6 +1446,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1451,6 +1479,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1470,6 +1499,46 @@ mod tests {
         );
     }
 
+    /// G1: a `[from, to)` window edge is not end-of-data. The same series that
+    /// force-closes under `SnapshotEnd` must emit NO fabricated trade under
+    /// `WindowEdge` — the engine cannot know whether the real market had more
+    /// bars, so closing at the window edge would invent a trade, its P&L, and
+    /// its exit timestamp.
+    #[test]
+    fn window_edge_leaves_a_still_open_position_unclosed() {
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+            candle(2, 100, 110, 96, 105),
+        ]);
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::WindowEdge,
+        )
+        .unwrap();
+        assert!(
+            result.trades.is_empty(),
+            "window edge must not fabricate an EndOfData trade"
+        );
+
+        // Contrast on the same series: the snapshot-end interpretation still
+        // force-closes — `SeriesEnd` is the only input that differs.
+        let closed = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+        )
+        .unwrap();
+        assert_eq!(closed.trades[0].exit_reason, ExitReason::EndOfData);
+    }
+
     /// C5 invariant on a real run: every completed trade satisfies
     /// `mfe_r >= 0 ∧ mae_r <= 0` (holds by the init-0 running sample). A direct
     /// engine-level check complementing the golden-fixture assertion.
@@ -1487,6 +1556,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1605,6 +1675,7 @@ mod tests {
             None,
             &bad,
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap_err();
         assert!(matches!(err, BacktestError::InvalidConfig(_)));
@@ -1635,6 +1706,7 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap_err();
         assert!(matches!(err, BacktestError::ImpossibleTakeProfit(_)));
@@ -1655,7 +1727,8 @@ mod tests {
                 &primary,
                 None,
                 &config(),
-                &SymbolFilters::unconstrained()
+                &SymbolFilters::unconstrained(),
+                SeriesEnd::SnapshotEnd,
             )
             .is_ok()
         );
@@ -1683,6 +1756,7 @@ mod tests {
             None,
             &cfg,
             &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 

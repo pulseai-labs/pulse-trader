@@ -47,8 +47,8 @@ use crate::application::backtest::{BacktestOutcome, BacktestRequest, run_version
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestResult, CandleSeries, CandleSeriesRepository, CompiledStrategy, Direction,
-    EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime, StrategyDsl,
-    Timeframe, Trade, compile, validate,
+    EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime, SeriesEnd,
+    StrategyDsl, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -194,8 +194,18 @@ where
         .symbol_filters(&pair)
         .map_err(|e| anyhow::anyhow!("resolve exchange filters for {pair}: {e}"))?;
 
-    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config, &filters)
-        .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
+    // The --dsl path runs whole snapshots — the series ends at data end, so a
+    // still-open position force-closes as EndOfData (the windowed variant of
+    // this ruling lives in the shared use case, r2.s1 G1).
+    let result = run_backtest(
+        &compiled,
+        &primary,
+        htf_series.as_ref(),
+        &config,
+        &filters,
+        SeriesEnd::SnapshotEnd,
+    )
+    .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
 
     if args.json {
         render_json(&result)?;
