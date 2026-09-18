@@ -24,7 +24,7 @@ use super::sweepable::SweepableValue;
 ///
 /// Internally-tagged (`#[serde(tag = "type")]`) with **all struct variants** —
 /// see the module docs for why tuple/newtype variants are forbidden.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ExitRule {
     /// A fixed stop-loss a percentage distance from entry. This stop distance

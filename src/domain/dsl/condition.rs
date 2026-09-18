@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::value::ValueSource;
 
 /// A scalar comparison operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum Comparator {
     /// Greater than.
     Gt,
@@ -38,7 +38,7 @@ pub enum Comparator {
 ///
 /// Internally-tagged (`#[serde(tag = "type")]`) with **all struct variants** —
 /// see the module docs for why tuple/newtype variants are forbidden.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum Condition {
     /// Compare two values with a [`Comparator`].

@@ -113,6 +113,23 @@ impl TryFrom<String> for SchemaVersion {
     }
 }
 
+// r2.s1.w2: `pulse://dsl/schema` publishes the serde wire shape — a bare
+// `"MAJOR.MINOR.PATCH"` string — not the three-field struct layout, which is
+// what the derived impl would describe (and what no document ever contains).
+impl schemars::JsonSchema for SchemaVersion {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SchemaVersion".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        String::json_schema(generator)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

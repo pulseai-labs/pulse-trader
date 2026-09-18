@@ -20,6 +20,10 @@ mod cli;
 // `cli` on purpose -- it runs BEFORE any surface is chosen, so it cannot live
 // inside one of them.
 mod entry;
+// r2.s1.w2: the `pulse mcp` delivery ring — the ONLY module in the crate that
+// may name `rmcp` (`scripts/check-mcp-boundary.sh` enforces it). Private like
+// `adapters`; `cli::mcp` is its composition root.
+mod mcp;
 mod tauri;
 
 // The domain layer is the library's stable public API surface (the port traits

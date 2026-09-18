@@ -17,6 +17,9 @@ pub(crate) mod compose;
 pub(crate) mod fetch_data;
 pub(crate) mod indicators;
 pub(crate) mod llm;
+// r2.s1.w2: the `pulse mcp` composition root — validates `--agent-name`,
+// resolves the data dir, opens the migrated DB and hands stdout to `mcp::serve`.
+pub(crate) mod mcp;
 pub(crate) mod runs;
 pub(crate) mod strategy;
 
@@ -38,6 +41,7 @@ use compose::{ComposeArgs, run_compose};
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
 use indicators::{IndicatorsArgs, run_indicators};
 use llm::{LlmArgs, run_llm_check};
+use mcp::{McpArgs, run_mcp};
 use runs::{RunsArgs, run_runs};
 use strategy::{StrategyArgs, run_strategy};
 
@@ -77,6 +81,10 @@ pub enum Command {
     /// Run ONE coach turn against a persisted backtest run and record it
     /// (r1.s2.w3). A developer/debug surface: it claims no user journey.
     Coach(CoachArgs),
+    /// Serve MCP over stdio (r2.s1.w2): the seven read tools, the
+    /// `pulse://dsl/schema` resource and file exports under the data dir.
+    /// stdout is protocol traffic only — diagnostics go to stderr.
+    Mcp(McpArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -182,6 +190,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let db = open_db(args.db.as_deref()).await?;
             run_coach(Some(&db), &args).await
         }
+        // r2.s1.w2: the MCP server arm. `run_mcp` validates `--agent-name`
+        // FIRST (AC-10: invalid → non-zero before serving), then opens the
+        // migrated db + resolves the data dir inside.
+        Command::Mcp(args) => run_mcp(&args).await,
     }
 }
 
