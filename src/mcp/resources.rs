@@ -80,6 +80,13 @@ mod tests {
         ] {
             assert!(properties.contains_key(field), "missing property {field}");
         }
+        // F6: `schema_version` publishes the ACCEPTED value, not an
+        // unconstrained string — `Migrator::v1()` loads exactly `CURRENT`, so
+        // the schema a validating agent reads must pin the const.
+        assert_eq!(
+            properties["schema_version"]["const"], "1.0.0",
+            "schema_version property must publish the accepted const"
+        );
         let conventions = doc["conventions"].as_object().expect("conventions object");
         let window = conventions
             .get("windows")
