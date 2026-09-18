@@ -29,8 +29,9 @@ use std::sync::{Arc, Mutex};
 
 use pulse::{
     BUS_COMMANDS, BacktestAppError, BacktestError, BacktestRunId, BusError, BusErrorCode, BusEvent,
-    ComposerError, DataError, DesktopState, EventSink, ExchangeError, LlmError, ReadBackFailure,
-    ReadBackStage, RunId, StrategyRepository, demo_stream_core, shell_info_core,
+    ComposerError, DataError, DesktopState, EventSink, ExchangeError, LlmError, Pair,
+    ReadBackFailure, ReadBackStage, RunId, StrategyRepository, Timeframe, demo_stream_core,
+    shell_info_core,
 };
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tempfile::TempDir;
@@ -198,6 +199,20 @@ fn domain_error_maps_to_one_serializable_shape() {
             "ComposerError",
             ComposerError::MaxTurns.into(),
             BusErrorCode::Composer,
+        ),
+        // r2.s1 F10: a windowed run whose sliced primary is empty is a
+        // caller-correctable bad-argument refusal — the MCP surface maps the
+        // same variant to `field_error("window", …)` — not a storage failure.
+        (
+            "BacktestAppError::WindowEmpty",
+            BacktestAppError::WindowEmpty {
+                pair: Pair::parse("BTCUSDT").unwrap(),
+                timeframe: Timeframe::M15,
+                from_ms: 1_700_000_000_000,
+                to_ms: 1_700_086_400_000,
+            }
+            .into(),
+            BusErrorCode::Validation,
         ),
     ];
 

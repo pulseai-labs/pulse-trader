@@ -208,24 +208,26 @@ bus_error_from! {
 /// The application ring's backtest failures (r1.s3.w3).
 ///
 /// Hand-written rather than macro-generated because this is the one family where the
-/// mapping is not "one type, one code": the variants fan out across four existing
+/// mapping is not "one type, one code": the variants fan out across five existing
 /// codes, and exactly one of them additionally carries a run id. **No new
 /// `BusErrorCode` variant is added** — the code set is a closed discriminant every
 /// existing screen already branches on, and "saved but unreadable" is a `data`
-/// failure that happens to know something extra, not a new family.
+/// failure that happens to know something extra, not a new family. r2.s1's
+/// `WindowEmpty` maps to `validation`, not `data`: it is a caller-correctable
+/// bad-argument refusal (the MCP surface reports the same variant as
+/// `field_error("window", …)`), while `data` is storage/read-back failure.
 impl From<BacktestAppError> for BusError {
     fn from(err: BacktestAppError) -> Self {
         let code = match &err {
-            BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
-                BusErrorCode::Validation
-            }
+            BacktestAppError::DslInvalid(_)
+            | BacktestAppError::CompileFailed(_)
+            | BacktestAppError::WindowEmpty { .. } => BusErrorCode::Validation,
             BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
             BacktestAppError::Engine(_) => BusErrorCode::Backtest,
             BacktestAppError::Internal(_) => BusErrorCode::Internal,
             BacktestAppError::VersionNotFound(_)
             | BacktestAppError::SnapshotMissing { .. }
             | BacktestAppError::SeriesGapped { .. }
-            | BacktestAppError::WindowEmpty { .. }
             | BacktestAppError::PreSaveRead { .. }
             | BacktestAppError::Persist(_)
             | BacktestAppError::SavedButReadBackFailed { .. } => BusErrorCode::Data,
