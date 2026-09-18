@@ -22,7 +22,7 @@ use rmcp::model::{ReadResourceRequestParams, ResourceContents};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use support::mcp::{
-    FIXTURE_STORE, MINIMAL_DSL, call, copy_tree, manifest, migrated_db, seeded_fixture,
+    FIXTURE_STORE, MINIMAL_DSL, call, call_err, copy_tree, manifest, migrated_db, seeded_fixture,
     spawn_client,
 };
 use tempfile::TempDir;
@@ -344,6 +344,57 @@ async fn candle_and_indicator_exports_match_the_snapshot() {
     // A run-scoped export here keeps the session genuinely read-only — the
     // seeded run_id proves trades read back through the same store.
     assert!(!run_id.is_empty());
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// F4 (r2.s1): `export_trades` validates `run_id` at the boundary — a value
+/// that is not a single path component is refused, and a well-formed but
+/// UNKNOWN id is refused too (an empty `get_trades` result must never write a
+/// header-only export that impersonates a real zero-trade run). Nothing is
+/// written for either refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_trades_refuses_bad_and_unknown_run_ids_without_writing() {
+    let (fixture, client) = seeded_fixture().await;
+
+    let exports_dir = fixture.store_dir.join("exports");
+    let export_count = |dir: &std::path::Path| -> usize {
+        std::fs::read_dir(dir).map_or(0, |entries| entries.flatten().count())
+    };
+    let before = export_count(&exports_dir);
+
+    // Every shape that would escape or relocate the exports dir is refused on
+    // `run_id` — the same rule `data_version` already applies.
+    for bad in ["foo/bar", "..", "../escape", "a\\b", ""] {
+        let err = call_err(&client, "export_trades", json!({"run_id": bad})).await;
+        assert_eq!(
+            err["field"], "run_id",
+            "a path-unsafe run_id attaches to run_id: {err}"
+        );
+        assert!(
+            err["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("invalid run_id")),
+            "the refusal says the id is not a single path component: {err}"
+        );
+    }
+
+    // A well-formed id naming no run is refused BEFORE a file exists —
+    // distinguishable from a genuine zero-trade run.
+    let err = call_err(&client, "export_trades", json!({"run_id": "no-such-run"})).await;
+    assert_eq!(err["field"], "run_id");
+    assert!(
+        err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no such backtest run")),
+        "an unknown run is named, not exported empty: {err}"
+    );
+
+    assert_eq!(
+        export_count(&exports_dir),
+        before,
+        "a refused run_id writes no export"
+    );
 
     client.cancel().await.expect("cancel session");
 }

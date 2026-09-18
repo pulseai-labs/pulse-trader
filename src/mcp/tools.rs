@@ -181,6 +181,34 @@ fn parse_data_version(raw: Option<String>) -> Result<Option<DataVersion>, String
         .transpose()
 }
 
+/// The `run_id` boundary check for export tools (r2.s1 F4).
+/// [`BacktestRunId::new`] is the unchecked constructor for adapter-minted ids,
+/// and a wire-supplied id is joined verbatim into the export path by
+/// `Exports::next_path` — so the single-portable-path-component rule
+/// [`DataVersion::parse`] applies to snapshot tags applies here too: empty,
+/// `.`, `..`, a `/` or `\\` separator, or a NUL byte is refused before any
+/// file is written.
+fn parse_run_id(raw: String) -> Result<BacktestRunId, String> {
+    let unsafe_reason = if raw.is_empty() {
+        Some("it is empty")
+    } else if raw == "." || raw == ".." {
+        Some("it is a relative path component")
+    } else if raw.contains('/') || raw.contains('\\') {
+        Some("it contains a path separator")
+    } else if raw.contains('\0') {
+        Some("it contains a NUL byte")
+    } else {
+        None
+    };
+    match unsafe_reason {
+        None => Ok(BacktestRunId::new(raw)),
+        Some(reason) => Err(format!(
+            "invalid run_id {raw:?}: {reason}; a run id is joined verbatim \
+             into the export path and must be a single portable path component"
+        )),
+    }
+}
+
 /// Parse one RFC 3339 window bound to epoch millis.
 fn parse_rfc3339_ms(raw: &str) -> Result<i64, String> {
     chrono::DateTime::parse_from_rfc3339(raw)
@@ -391,8 +419,20 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<ExportTradesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let run_id = BacktestRunId::new(args.run_id);
+        // One seam for the whole input: the id must be a safe single path
+        // component AND name a real run — `get_trades` returns an empty vec
+        // for an unknown id, which would otherwise write a header-only export
+        // indistinguishable from a genuine zero-trade run.
+        let run_id = match parse_run_id(args.run_id) {
+            Ok(id) => id,
+            Err(e) => return Ok(field_error("run_id", e)),
+        };
         let repo = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        match repo.get_run(&run_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(field_error("run_id", "no such backtest run")),
+            Err(e) => return Ok(tool_error(e)),
+        }
         let trades = match repo.get_trades(&run_id).await {
             Ok(t) => t,
             Err(e) => return Ok(tool_error(e)),
