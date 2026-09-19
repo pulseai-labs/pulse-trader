@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::Timeframe;
+use crate::domain::{Pair, Timeframe};
 
 /// Errors produced by the backtester (domain layer).
 ///
@@ -94,5 +94,23 @@ pub enum BacktestError {
         primary: Timeframe,
         /// The supplied higher-timeframe series' timeframe.
         htf: Timeframe,
+    },
+
+    /// The supplied higher-timeframe series is for a different trading pair
+    /// than the primary series. `CandleSeries::pair` is public and
+    /// `run_backtest` takes the two series independently, so without this
+    /// check a direct caller could produce mixed-symbol signals with nothing
+    /// red — the engine steps `htf.candles` and routes `Series::Htf` leaves to
+    /// it regardless (r2.s2 round-2 fix G1). The application path loads both
+    /// series by the request's pair, so this arm is the whole API-seam guard.
+    #[error(
+        "higher-timeframe series is for a different pair (primary {primary}, htf {htf}) — \
+         `Series::Htf` operands must read the same symbol's bars"
+    )]
+    HtfPairMismatch {
+        /// The primary series' trading pair.
+        primary: Pair,
+        /// The supplied higher-timeframe series' trading pair.
+        htf: Pair,
     },
 }

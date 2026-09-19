@@ -34,9 +34,9 @@ use crate::application::mcp_write::{
 };
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow, CompiledValue,
-    DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun, Series,
-    StrategyRepository, Timeframe, ValidationCode,
+    BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
+    CompiledValue, DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun,
+    Series, StrategyRepository, Timeframe, ValidationCode,
 };
 
 use super::PulseMcp;
@@ -352,6 +352,12 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         // `"inputs.htf"`, so surface it verbatim.
         BacktestAppError::HtfRequired { field } | BacktestAppError::HtfNotHigher { field, .. } => {
             field_error(field, err)
+        }
+        // r2.s2 round-2 fix G1: a different-pair HTF series is refused by the
+        // engine (the request itself carries only one pair, so no app-layer
+        // variant exists) — surface it on the same `inputs.htf` field.
+        BacktestAppError::Engine(BacktestError::HtfPairMismatch { .. }) => {
+            field_error("inputs.htf", err)
         }
         _ => tool_error(err),
     }

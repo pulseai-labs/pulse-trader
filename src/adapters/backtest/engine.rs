@@ -264,12 +264,15 @@ pub fn run_backtest(
 /// The engine-side HTF input guards: a strategy carrying an `Htf` operand must
 /// never evaluate that operand against primary data (r2.s2.w2 — the
 /// application ring checks this first and reports the missing input field),
-/// and a supplied "higher" timeframe that is not strictly higher than the
+/// a supplied "higher" timeframe that is not strictly higher than the
 /// primary — compared by `Timeframe::duration_ms`, so the rule holds for any
 /// pair — would advance `Series::Htf` operands on the wrong cadence while the
-/// DSL renders them as the HTF (r2.s2 round-1 fix F1). Both refusals live at
-/// the request boundary too; these are the defence-in-depth copies for callers
-/// that construct the series directly.
+/// DSL renders them as the HTF (r2.s2 round-1 fix F1), and a supplied series
+/// for a DIFFERENT pair would feed `Series::Htf` operands another symbol's
+/// bars — mixed-symbol signals with nothing red (r2.s2 round-2 fix G1). The
+/// timeframe refusal also lives at the request boundary; the missing-HTF and
+/// pair checks are defence-in-depth (the request carries no second pair), for
+/// callers that construct the series directly.
 fn check_htf_inputs(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -278,13 +281,23 @@ fn check_htf_inputs(
     if compiled.needs_htf() && htf.is_none() {
         return Err(BacktestError::HtfRequired);
     }
-    if let Some(htf_series) = htf
-        && htf_series.timeframe.duration_ms() <= primary.timeframe.duration_ms()
-    {
-        return Err(BacktestError::HtfNotHigher {
-            primary: primary.timeframe,
-            htf: htf_series.timeframe,
-        });
+    if let Some(htf_series) = htf {
+        // r2.s2 round-2 fix G1: a different-pair "htf" series would feed
+        // `Series::Htf` operands another symbol's bars — mixed-symbol signals
+        // with nothing red. The application path loads both series by the
+        // request's pair, so this engine-side check is the whole seam.
+        if htf_series.pair != primary.pair {
+            return Err(BacktestError::HtfPairMismatch {
+                primary: primary.pair.clone(),
+                htf: htf_series.pair.clone(),
+            });
+        }
+        if htf_series.timeframe.duration_ms() <= primary.timeframe.duration_ms() {
+            return Err(BacktestError::HtfNotHigher {
+                primary: primary.timeframe,
+                htf: htf_series.timeframe,
+            });
+        }
     }
     Ok(())
 }

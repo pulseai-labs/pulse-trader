@@ -39,6 +39,10 @@
 //! - **(k)** an ATR-derived stop resolving to a non-positive price refuses with
 //!   the typed `ImpossibleStop` — not the generic `NoStopLoss`, not a silent
 //!   skip (round-1 fix F4).
+//! - **(l)** a supplied HTF series for a DIFFERENT pair is refused with the
+//!   typed `HtfPairMismatch` before alignment — `Series::Htf` operands must
+//!   never read another symbol's bars — while a matching pair still runs
+//!   (round-2 fix G1).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -745,6 +749,73 @@ fn engine_refuses_a_non_higher_htf_series() {
         ),
         "expected HtfNotHigher(H4, M15), got {err:?}"
     );
+}
+
+/// r2.s2 round-2 fix G1: a supplied HTF series for a DIFFERENT pair is refused
+/// with the typed [`BacktestError::HtfPairMismatch`] before any alignment —
+/// `CandleSeries::pair` is public and `run_backtest` takes the two series
+/// independently, so without the check a direct caller produces mixed-symbol
+/// signals with nothing red. The request path loads both series by the one
+/// request pair, so this engine check is the whole seam; a matching pair
+/// still runs.
+#[test]
+fn engine_refuses_a_mismatched_pair_htf_series() {
+    let strategy = dsl(
+        compare(htf_price(PriceField::Close), Comparator::Gt, constant(0, 0)),
+        vec![stop_loss()],
+        Direction::Long,
+    );
+    let compiled = compiled(&strategy);
+    let primary = series(Timeframe::M15, flat_m15(40));
+
+    // Same timeframe ordering (H4 > M15) but a different symbol: the pair
+    // check must fire, not the cadence check.
+    let foreign = CandleSeries {
+        pair: Pair::new("ETHUSDT"),
+        ..series(
+            Timeframe::H4,
+            vec![
+                h4(0, 100, 101, 99, 100),
+                h4(1, 100, 101, 99, 100),
+                h4(2, 100, 101, 99, 100),
+            ],
+        )
+    };
+    let err = run_backtest(
+        &compiled,
+        &primary,
+        Some(&foreign),
+        &zero_slippage(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect_err("a different-pair htf series must refuse");
+    match err {
+        BacktestError::HtfPairMismatch { primary, htf } => {
+            assert_eq!(primary, Pair::new("BTCUSDT"));
+            assert_eq!(htf, Pair::new("ETHUSDT"));
+        }
+        other => panic!("expected HtfPairMismatch, got {other:?}"),
+    }
+
+    // The same H4 candles under the matching pair still run to completion.
+    let matching = series(
+        Timeframe::H4,
+        vec![
+            h4(0, 100, 101, 99, 100),
+            h4(1, 100, 101, 99, 100),
+            h4(2, 100, 101, 99, 100),
+        ],
+    );
+    run_backtest(
+        &compiled,
+        &primary,
+        Some(&matching),
+        &zero_slippage(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect("a same-pair htf series still runs");
 }
 
 // ---------------------------------------------------------------------------

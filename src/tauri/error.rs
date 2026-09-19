@@ -227,6 +227,10 @@ impl From<BacktestAppError> for BusError {
             // surface reports the same variants as `field_error("inputs.htf", …)`).
             | BacktestAppError::HtfRequired { .. }
             | BacktestAppError::HtfNotHigher { .. }
+            // r2.s2 round-2 fix G1: a different-pair HTF series refusal is the
+            // same caller-correctable `inputs.htf` family — `validation`, not
+            // `backtest`.
+            | BacktestAppError::Engine(BacktestError::HtfPairMismatch { .. })
             | BacktestAppError::WindowEmpty { .. } => BusErrorCode::Validation,
             BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
             BacktestAppError::Engine(_) => BusErrorCode::Backtest,
@@ -252,7 +256,7 @@ impl From<BacktestAppError> for BusError {
 mod tests {
     use super::{BusError, BusErrorCode};
     use crate::application::backtest::BacktestAppError;
-    use crate::domain::{DataError, Timeframe};
+    use crate::domain::{BacktestError, DataError, Pair, Timeframe};
 
     #[test]
     fn code_serializes_as_a_string_discriminant() {
@@ -278,5 +282,21 @@ mod tests {
         });
         assert_eq!(err.code, BusErrorCode::Validation);
         assert!(err.message.contains("inputs.htf"), "{}", err.message);
+    }
+
+    /// r2.s2 round-2 fix G1: a different-pair HTF series refusal arrives as
+    /// `Engine(HtfPairMismatch)` (the request carries only one pair, so no
+    /// app-layer variant exists) but is still the caller-correctable
+    /// `inputs.htf` family — `validation`, not `backtest` — and the message
+    /// names both pairs.
+    #[test]
+    fn htf_pair_mismatch_maps_to_validation() {
+        let err = BusError::from(BacktestAppError::Engine(BacktestError::HtfPairMismatch {
+            primary: Pair::new("BTCUSDT"),
+            htf: Pair::new("ETHUSDT"),
+        }));
+        assert_eq!(err.code, BusErrorCode::Validation);
+        assert!(err.message.contains("BTCUSDT"), "{}", err.message);
+        assert!(err.message.contains("ETHUSDT"), "{}", err.message);
     }
 }
