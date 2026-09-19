@@ -36,6 +36,9 @@
 //!   paired closed H4 bar — a `Not(...)` over an absent `Htf` operand reads
 //!   `true`, so the gate must not be vacuous for a Price-leaf-only strategy
 //!   (round-1 fix F3).
+//! - **(k)** an ATR-derived stop resolving to a non-positive price refuses with
+//!   the typed `ImpossibleStop` — not the generic `NoStopLoss`, not a silent
+//!   skip (round-1 fix F4).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -1176,6 +1179,60 @@ fn not_over_htf_price_signal_exit_waits_for_the_first_closed_h4_bar() {
          firing before the pair exists means `Not` over absent HTF data read true"
     );
     assert_eq!(trade.exit_fill_time, primary.candles[17].open_time);
+}
+
+// ---------------------------------------------------------------------------
+// (k) a non-positive ATR-derived stop is a typed refusal (F4)
+// ---------------------------------------------------------------------------
+
+/// `multiple × ATR >= entry` on a long resolves to `entry − m·ATR <= 0` — a
+/// stop level the market can never reach. Before this fix a zero stop fell out
+/// as the generic `NoStopLoss` and a negative one was sized on its absolute
+/// distance while never being fillable; the fill now refuses with
+/// `BacktestError::ImpossibleStop`, mirroring the short-TP leg.
+#[test]
+fn atr_stop_resolving_non_positive_is_a_typed_refusal() {
+    // Prices at ~1.0 with TR exactly 1.0 on every bar after the first
+    // (high−low = 1.0, close = open = 1.0): ATR(5) reads 1.0 once warm, entry
+    // fills at the open 1.0, and multiple 2.0 ⇒ stop = 1 − 2·1.0 = −1.
+    let candles: Vec<Candle> = (0..10)
+        .map(|i| {
+            let open_time = i * Timeframe::M15.duration_ms();
+            Candle {
+                open_time,
+                close_time: open_time + Timeframe::M15.duration_ms() - 1,
+                open: dec(1, 0),
+                high: dec(15, 1), // 1.5
+                low: dec(5, 1),   // 0.5
+                close: dec(1, 0),
+                volume: dec(1, 0),
+                funding_rate: None,
+            }
+        })
+        .collect();
+    let primary = series(Timeframe::M15, candles);
+    let strategy = dsl(
+        compare(
+            primary_price(PriceField::Close),
+            Comparator::Gt,
+            constant(0, 0),
+        ),
+        vec![atr_stop(5, 2, 0)],
+        Direction::Long,
+    );
+    let err = run_backtest(
+        &compiled(&strategy),
+        &primary,
+        None,
+        &zero_slippage(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect_err("a non-positive ATR stop must refuse");
+    assert!(
+        matches!(err, BacktestError::ImpossibleStop(_)),
+        "expected ImpossibleStop, got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

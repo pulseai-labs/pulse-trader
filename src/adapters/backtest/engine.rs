@@ -566,7 +566,19 @@ fn fill_pending_entry(
             let Some(atr) = pending.atr_at_signal else {
                 return Ok(());
             };
-            atr_stop_price(entry_price, atr, multiple, direction)
+            let stop = atr_stop_price(entry_price, atr, multiple, direction);
+            // r2.s2 round-1 fix F4: `multiple × ATR >= entry` on a long
+            // resolves to a non-positive stop — a level that can never fill.
+            // Zero would surface as the generic `NoStopLoss` and a negative
+            // would size on its absolute distance, both silently wrong, so the
+            // fill refuses with the typed error the short-TP leg already has.
+            if stop <= Decimal::ZERO {
+                return Err(BacktestError::ImpossibleStop(format!(
+                    "ATR stop {multiple} × ATR {atr} from entry {entry_price} \
+                     resolves to a non-positive price {stop}"
+                )));
+            }
+            stop
         }
     };
     // The shared exchange-constrained sizer (NFR-3, C8): one sizing path for sim

@@ -54,6 +54,15 @@ pub enum BacktestError {
     #[error("impossible take-profit geometry: {0}")]
     ImpossibleTakeProfit(String),
 
+    /// An ATR-derived stop resolved to a non-positive price (`multiple × ATR ≥
+    /// entry` on a long, so `entry − multiple × ATR ≤ 0`). A zero stop would
+    /// collapse into the generic `NoStopLoss` and a negative one would size off
+    /// its absolute distance while never being fillable — both silently wrong —
+    /// so the loop refuses at the seam where the stop is derived, mirroring
+    /// [`BacktestError::ImpossibleTakeProfit`] (r2.s2 round-1 fix F4).
+    #[error("impossible ATR stop: {0}")]
+    ImpossibleStop(String),
+
     /// The cost/equity configuration is out of range — non-positive starting
     /// equity (the sizing denominator) or a fee/slippage rate outside `[0, 100%)`.
     /// Enforced at the engine boundary so a non-CLI caller cannot feed the
