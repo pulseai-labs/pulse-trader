@@ -37,12 +37,12 @@ use pulse::{
     AgentHypothesis, AgentName, BacktestAppError, BacktestConfig, BacktestInputs, BacktestResult,
     BacktestRunId, BacktestRunRepository, BacktestRunRequest, BusErrorCode, Candle,
     CandleSeriesRepository, CandleStore, CandleWindow, CompareChildRunRequest, CreatedBy,
-    DataError, DataVersion, Db, DesktopState, EngineFingerprint, EquityCurve, FundingConfig,
-    HISTOGRAM_BIN_COUNT, NewAgentSubmission, NewVersion, Pair, PersistedRun, ReadBackFailure,
-    ReadBackStage, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
-    SqliteStrategyRepo, StoredCandleSeries, StrategyId, StrategyRepository, SummaryStats,
-    Timeframe, Trade, VersionId, compare_child_run_core, histogram_bin_width, project_histogram,
-    run_backtest_version_core, run_version_backtest,
+    DataError, DataVersion, Db, DesktopState, EngineFingerprint, EquityCurve, ExitReason,
+    FundingConfig, HISTOGRAM_BIN_COUNT, NewAgentSubmission, NewVersion, Pair, PersistedRun,
+    ReadBackFailure, ReadBackStage, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
+    SqliteBacktestRunRepo, SqliteStrategyRepo, StoredCandleSeries, StrategyId, StrategyRepository,
+    SummaryStats, Timeframe, Trade, VersionId, compare_child_run_core, histogram_bin_width,
+    project_histogram, run_backtest_version_core, run_version_backtest,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -983,6 +983,128 @@ async fn a_windowed_runs_read_back_is_sliced_to_the_persisted_window() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 3d. a window edge is not end-of-data (r2.s1 G1)
+// ---------------------------------------------------------------------------
+
+/// G1: a `[from, to)` window that truncates the snapshot inside an open hold
+/// must not produce the fabricated `EndOfData` close the unwindowed tail would.
+/// The strategy still holds that position — the window is the caller's lens,
+/// not evidence the market ran out of bars.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_ending_mid_hold_does_not_fabricate_an_end_of_data_trade() {
+    let env = env();
+    let version_id = seed_version(&env).await;
+
+    let store = env.store();
+    let complete = store
+        .load_head(&Pair::new("BTCUSDT"), Timeframe::M15)
+        .expect("load_head")
+        .expect("15m HEAD exists")
+        .series;
+    let snapshot_last = complete.candles.last().expect("non-empty").open_time;
+
+    let db = env.db().await;
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+
+    // Baseline: the unwindowed run's trade log — find a position the strategy
+    // holds across more than one bar.
+    let baseline = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &r1_request(&version_id),
+    )
+    .await
+    .expect("the unwindowed run succeeds");
+    // The LAST multi-bar hold: every trade before it still closed inside the
+    // window, so the run's trade log is non-empty (a position still open at
+    // `to` produces no `Trade` row — closed trades only).
+    let held = baseline
+        .trades
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, t)| *i > 0 && t.entry_fill_time < t.exit_signal_time)
+        .map(|(_, t)| t)
+        .expect("the golden strategy holds a multi-bar position after earlier trades");
+
+    // Cut the window at the open_time of the bar the exit FILLED on
+    // (exclusive): every bar that kept the position open is inside; the bar
+    // that closed it is outside. `EndOfData` fills stamp a `close_time`, so
+    // for that exit mode the cut falls back to the last bar's open_time —
+    // which still excludes it.
+    let from_ms = complete.candles[0].open_time;
+    let to_ms = complete
+        .candles
+        .iter()
+        .map(|c| c.open_time)
+        .find(|t| *t >= held.exit_fill_time)
+        .unwrap_or(snapshot_last);
+    assert!(
+        to_ms <= snapshot_last,
+        "the window truncates at or before the snapshot's real last candle"
+    );
+    let mut request = r1_request(&version_id);
+    request.window = Some(CandleWindow::new(from_ms, to_ms).expect("window"));
+
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &request,
+    )
+    .await
+    .expect("the windowed run succeeds");
+
+    assert!(
+        !outcome.trades.is_empty(),
+        "earlier trades still closed inside the window — the run is non-vacuous"
+    );
+    assert!(
+        outcome
+            .trades
+            .iter()
+            .all(|t| t.exit_reason != ExitReason::EndOfData),
+        "a window edge is not end-of-data: no fabricated close at `to`"
+    );
+    assert!(
+        outcome.trades.iter().all(|t| t.exit_signal_time < to_ms),
+        "no trade may exit on a bar the window excluded"
+    );
+
+    // G1 ruling (b): the still-open position is on the PERSISTED run record —
+    // `outcome.run` is the save→get_run read-back, so this proves the column
+    // round-trips, not just that the engine emitted it. It is the bisected
+    // `held` position, marked at the last in-window candle's close — never a
+    // trade row, never inside the closed-trade statistics.
+    let last_in_window = complete
+        .candles
+        .iter()
+        .rfind(|c| c.open_time < to_ms)
+        .expect("the window holds at least one candle");
+    let mark = outcome
+        .run
+        .open_position
+        .expect("a run that ends mid-hold at a window edge records the mark");
+    assert_eq!(mark.direction, held.direction);
+    assert_eq!(mark.qty, held.qty);
+    assert_eq!(mark.entry_price, held.entry_price);
+    assert_eq!(mark.entry_signal_time, held.entry_signal_time);
+    assert_eq!(mark.entry_fill_time, held.entry_fill_time);
+    assert_eq!(mark.mark_time, last_in_window.close_time);
+    assert_eq!(mark.mark_price, last_in_window.close);
+    // And the mark is not folded into the closed-trade statistics.
+    assert_eq!(
+        outcome.run.summary.trade_count,
+        outcome.trades.len(),
+        "the summary counts only closed trades — the mark is excluded visibly"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enum_tokens_match_the_stored_column_text_exactly() {
     let env = env();
@@ -1460,6 +1582,7 @@ fn trade_free_result() -> BacktestResult {
         slippage_total: Decimal::ZERO,
         regime_breakdown: RegimeBreakdown::new(),
         skipped_entries: SkippedEntryCounts::new(),
+        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary: SummaryStats::default(),
         equity_curve: EquityCurve::default(),

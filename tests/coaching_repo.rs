@@ -1294,6 +1294,7 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
                 slippage_total: Decimal::ZERO,
                 regime_breakdown: pulse::RegimeBreakdown::default(),
                 skipped_entries: pulse::SkippedEntryCounts::default(),
+                open_position: None,
                 engine_fingerprint: pulse::EngineFingerprint::current(),
                 summary: summary.clone(),
                 equity_curve,

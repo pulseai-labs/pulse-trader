@@ -556,6 +556,107 @@ async fn windowed_run_repeats_byte_identical() {
     client.cancel().await.expect("cancel session");
 }
 
+/// G1 ruling (b): a windowed run that ends holding a position reports it on
+/// `get_run` — direction, entry fill and size as opened, marked at the last
+/// in-window candle's close. Never a trade, never in the closed-trade stats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_run_ending_mid_hold_reports_its_open_position() {
+    let (fixture, client) = write_fixture().await;
+    let (_parent, child, parent_run) = &fixture.seed;
+
+    let runs_repo = SqliteBacktestRunRepo::new(fixture.db.pool().clone());
+    let store = fixture_store(&fixture);
+    let series = store
+        .load_head(&Pair::new("BTCUSDT"), Timeframe::M15)
+        .expect("load_head")
+        .expect("15m HEAD exists")
+        .series;
+
+    // The parent's full-snapshot run is the baseline — bisect its last
+    // multi-bar hold: `to` falls at the open_time of the bar the exit FILLED
+    // on, so the position is still open when the window ends.
+    let baseline = runs_repo
+        .get_trades(parent_run)
+        .await
+        .expect("parent trades");
+    let held = baseline
+        .iter()
+        .rev()
+        .find(|t| {
+            t.entry_fill_time < t.exit_signal_time && t.exit_reason != pulse::ExitReason::EndOfData
+        })
+        .expect("the golden strategy holds a multi-bar position that exits on a bar");
+    let to_ms = series
+        .candles
+        .iter()
+        .map(|c| c.open_time)
+        .find(|t| *t >= held.exit_fill_time)
+        .expect("the exit-fill bar exists in the snapshot");
+    let from_ms = series.candles[0].open_time;
+
+    let result = call(
+        &client,
+        "run_backtest",
+        json!({
+            "version_id": child.as_str(),
+            "from": rfc3339(from_ms),
+            "to": rfc3339(to_ms),
+        }),
+    )
+    .await;
+    let run_id = result["run_id"].as_str().expect("run_id").to_owned();
+
+    // The mark reaches the wire on `get_run`.
+    let detail = call(&client, "get_run", json!({ "run_id": run_id })).await;
+    let mark = &detail["open_position"];
+    assert!(mark.is_object(), "open_position carries the mark: {detail}");
+    assert_eq!(
+        mark["direction"],
+        serde_json::to_value(held.direction).unwrap()
+    );
+    let entry_price: rust_decimal::Decimal = mark["entry_price"]
+        .as_str()
+        .expect("entry_price")
+        .parse()
+        .unwrap();
+    assert_eq!(entry_price, held.entry_price, "the entry fill as opened");
+    let qty: rust_decimal::Decimal = mark["qty"].as_str().expect("qty").parse().unwrap();
+    assert_eq!(qty, held.qty);
+    assert_eq!(mark["entry_signal_time"], held.entry_signal_time);
+    assert_eq!(mark["entry_fill_time"], held.entry_fill_time);
+    let last_in_window = series
+        .candles
+        .iter()
+        .rfind(|c| c.open_time < to_ms)
+        .expect("non-empty window");
+    assert_eq!(mark["mark_time"], last_in_window.close_time);
+    let mark_price: rust_decimal::Decimal = mark["mark_price"]
+        .as_str()
+        .expect("mark_price")
+        .parse()
+        .unwrap();
+    assert_eq!(mark_price, last_in_window.close);
+
+    // And it is not a trade: no fabricated EndOfData row, and the closed-trade
+    // count is the trade log's length — the mark excluded visibly.
+    let trades = runs_repo
+        .get_trades(&pulse::BacktestRunId::new(run_id))
+        .await
+        .expect("trades");
+    assert!(
+        trades
+            .iter()
+            .all(|t| t.exit_reason != pulse::ExitReason::EndOfData),
+        "no fabricated close at the window edge"
+    );
+    assert_eq!(
+        detail["summary"]["trade_count"].as_u64().unwrap(),
+        trades.len() as u64
+    );
+
+    client.cancel().await.expect("cancel session");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn windowed_run_empty_slice_is_refused_and_writes_nothing() {
     let (fixture, client) = write_fixture().await;

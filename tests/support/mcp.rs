@@ -203,6 +203,7 @@ pub async fn seed(db: &Db) -> Seed {
         slippage_total: trade.slippage_total,
         regime_breakdown: RegimeBreakdown::new(),
         skipped_entries: SkippedEntryCounts::new(),
+        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary,
         equity_curve: EquityCurve::default(),

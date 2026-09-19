@@ -1,0 +1,27 @@
+-- r2.s1 G1(b) — 0010: the window-edge open-position mark on `backtest_run`.
+--
+-- Since the engine's end-of-data force-close no longer fires at a window edge
+-- (G1: a window bounds what the strategy may TRADE, it is not end-of-data), a
+-- windowed run can end with a position still open — and that position must be
+-- a recorded fact, not a silent omission from the trade log. The column holds
+-- the mark as one JSON object:
+--
+--   {"direction": ..., "qty": ..., "entry_price": ...,
+--    "entry_signal_time": ..., "entry_fill_time": ...,
+--    "mark_time": ..., "mark_price": ...}
+--
+-- direction/entry fill/size exactly as the strategy opened them; mark_time and
+-- mark_price are the last in-window candle's close_time and close. It is NOT a
+-- trade — no `trade` row is written and the closed-trade statistics exclude
+-- it; the column's presence is the record saying so. A single JSON column
+-- rides the `regime_breakdown`/`fills` precedent rather than seven scalar
+-- columns, and the read path parses it fail-closed the same way.
+--
+-- NULL means there is nothing to report — a run that ended flat, an
+-- unwindowed run (whose open position closed as an ordinary EndOfData trade),
+-- or any pre-0010 row, none of which can carry a mark back. No backfill is
+-- attempted: the bound a legacy run's window edge left open is not
+-- recoverable from anything stored (0006's argument again — ADR-0018 forbids
+-- rewriting immutable records with invented facts).
+
+ALTER TABLE backtest_run ADD COLUMN open_position TEXT;

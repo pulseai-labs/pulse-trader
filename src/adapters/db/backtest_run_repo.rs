@@ -53,8 +53,8 @@ use uuid::Uuid;
 use crate::adapters::clock::SystemClock;
 use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, CandleWindow, EquityCurve, ExitReason, Fill,
-    FundingConfig, PersistedRun, Regime, RegimeBreakdown, RunSummary, SnapshotSelection,
-    SummaryStats, Trade, TradeSource,
+    FundingConfig, OpenPositionMark, PersistedRun, Regime, RegimeBreakdown, RunSummary,
+    SnapshotSelection, SummaryStats, Trade, TradeSource,
 };
 use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
@@ -356,7 +356,8 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                  slippage_bps            AS "slippage_bps?: String",
                  funding_config          AS "funding_config?: String",
                  window_from_ms          AS "window_from_ms?: i64",
-                 window_to_ms            AS "window_to_ms?: i64"
+                 window_to_ms            AS "window_to_ms?: i64",
+                 open_position           AS "open_position?: String"
                FROM backtest_run WHERE id = ?1"#,
             id_str,
         )
@@ -395,6 +396,13 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             sub_notional: usize_from("skipped_sub_notional", r.skipped_sub_notional)?,
             leverage_capped: usize_from("skipped_leverage_capped", r.skipped_leverage_capped)?,
         };
+        // r2.s1 G1(b): the window-edge mark parses BEFORE the hash rebuild — the
+        // feed covers it when present, so a tampered column fails the #39 guard
+        // below; a malformed one fails-closed on the parse (D5).
+        let open_position: Option<OpenPositionMark> = match r.open_position.as_deref() {
+            Some(json) => Some(parse_json("backtest_run.open_position", json)?),
+            None => None,
+        };
 
         // #39 re-validate-on-read (D4): reconstruct the FULL hash input — run totals
         // + regime_breakdown + skipped_entries + the seq-ordered trades — by
@@ -410,6 +418,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             slippage_total,
             regime_breakdown,
             skipped_entries,
+            open_position: open_position.clone(),
             engine_fingerprint: EngineFingerprint::default(),
             summary: SummaryStats::default(),
             equity_curve: EquityCurve::default(),
@@ -506,6 +515,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             // recomputing anything (ADR-0021 decision 8).
             regime_breakdown,
             skipped_entries,
+            open_position,
         }))
     }
 
@@ -1028,6 +1038,16 @@ pub(crate) async fn insert_run_row(
     // `0009` trigger refuses it anyway. Both bounds are UTC epoch-ms INTEGERs.
     let window_from_ms = inputs.window.as_ref().map(|w| w.from_ms);
     let window_to_ms = inputs.window.as_ref().map(|w| w.to_ms);
+    // r2.s1 G1(b): the window-edge open-position mark is one JSON column (the
+    // `regime_breakdown`/`fills` precedent) — NULL for a run that ended flat
+    // or at the snapshot's real last bar. Never a trade row, so the
+    // closed-trade statistics stay closed-trade statistics.
+    let open_position_json = result
+        .open_position
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| DataError::Db(e.to_string()))?;
     sqlx::query!(
         "INSERT INTO backtest_run \
          (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
@@ -1037,10 +1057,11 @@ pub(crate) async fn insert_run_row(
           wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
           regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
-          taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms) \
+          taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms, \
+          open_position) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
-                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
         run_id,
         version_id_str,
         schema_version,
@@ -1083,6 +1104,7 @@ pub(crate) async fn insert_run_row(
         funding_config,
         window_from_ms,
         window_to_ms,
+        open_position_json,
     )
     .execute(&mut **tx)
     .await
@@ -1177,8 +1199,8 @@ mod tests {
     use crate::adapters::db::{Db, MIGRATOR};
     use crate::domain::backtest::{
         BacktestInputs, BacktestResult, BacktestRunId, EquityCurve, ExitReason, Fill,
-        FundingConfig, Regime, RegimeBreakdown, SnapshotSelection, SummaryStats, Trade,
-        TradeSource,
+        FundingConfig, OpenPositionMark, Regime, RegimeBreakdown, SnapshotSelection, SummaryStats,
+        Trade, TradeSource,
     };
     use crate::domain::sizing::SkippedEntryCounts;
     use crate::domain::strategy::VersionId;
@@ -1312,6 +1334,7 @@ mod tests {
             slippage_total,
             regime_breakdown,
             skipped_entries: skipped,
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: summary.clone(),
             equity_curve,
@@ -1499,6 +1522,121 @@ mod tests {
         // The trades read back in seq order, trade-for-trade equal.
         let trades = repo.get_trades(&id).await.expect("get_trades");
         assert_eq!(trades, result.trades, "trades round-trip identically");
+    }
+
+    // ---- G1(b): the window-edge open-position mark persists + is hash-covered --
+
+    /// A [`OpenPositionMark`] fixture: the shape `run_backtest` writes when a
+    /// `SeriesEnd::WindowEdge` run ends holding a position.
+    fn a_mark() -> OpenPositionMark {
+        OpenPositionMark {
+            direction: Direction::Long,
+            qty: d(20, 0),
+            entry_price: d(100, 0),
+            entry_signal_time: 119_999,
+            entry_fill_time: 120_000,
+            mark_time: 179_999,
+            mark_price: d(103, 0),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_window_edge_open_position_mark_round_trips() {
+        let (repo, _pool, _tmp) = repo_at(1_700_000_000_000).await;
+        let mut breakdown = RegimeBreakdown::new();
+        let trade = simple_trade();
+        breakdown.record(trade.regime, trade.realized_pnl);
+        let (mut result, summary) = result_from(vec![trade], breakdown, SkippedEntryCounts::new());
+        result.open_position = Some(a_mark());
+
+        let id = repo
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
+            .await
+            .expect("save_run");
+
+        let run = repo.get_run(&id).await.expect("get_run").expect("present");
+        assert_eq!(
+            run.open_position.as_ref(),
+            Some(&a_mark()),
+            "the persisted mark reads back field-for-field"
+        );
+        assert_eq!(
+            run.summary.trade_count, 1,
+            "the mark is not a trade — closed-trade statistics exclude it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_run_rejects_a_mark_the_stored_hash_does_not_cover() {
+        let (repo, pool, _tmp) = repo_at(1_700_000_000_000).await;
+        // Empty trade log so every other column can be written honestly by
+        // hand: the ONLY difference between what the stored hash covers and
+        // what the row carries is the mark.
+        let (mut result, _summary) = result_from(
+            Vec::new(),
+            RegimeBreakdown::default(),
+            SkippedEntryCounts::new(),
+        );
+        result.open_position = Some(a_mark());
+        let hash_of_mark_a = result.result_content_hash();
+
+        // A second result identical but for the mark — its hash is what a
+        // tamperer would store if the mark column were swapped.
+        let mut marked_b = result_from(
+            Vec::new(),
+            RegimeBreakdown::default(),
+            SkippedEntryCounts::new(),
+        );
+        marked_b.0.open_position = Some(OpenPositionMark {
+            mark_price: d(999, 0),
+            ..a_mark()
+        });
+        let hash_of_mark_b = marked_b.0.result_content_hash();
+        assert_ne!(
+            hash_of_mark_a, hash_of_mark_b,
+            "the mark feeds the content hash — different marks hash differently"
+        );
+
+        // The immutability trigger blocks UPDATE, so the tamper is seeded as a
+        // row honest in every column EXCEPT the pair (stored hash for mark-B,
+        // column carrying mark-A): the #39 re-derive must catch exactly that.
+        sqlx::query(
+            "INSERT INTO backtest_run \
+             (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+              engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+              funding_total, slippage_total, trade_count, wins, losses, breakeven, \
+              max_win_streak, max_loss_streak, win_rate, expectancy, gross_profit, \
+              gross_loss, avg_win, avg_loss, max_drawdown, regime_breakdown, \
+              skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+              pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+              funding_config, open_position) \
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, '10000', '0', '0', '0', '0', 0, 0, 0, 0, 0, 0, \
+                     '0', '0', '0', '0', '0', '0', '0', ?7, 0, 0, 0, \
+                     'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates', ?8)",
+        )
+        .bind("run-lying-mark")
+        .bind("ver-1")
+        .bind("2026-06-30T00:00:00.000Z")
+        .bind(EngineFingerprint::current().as_str())
+        .bind(EngineFingerprint::target())
+        .bind(&hash_of_mark_b)
+        .bind(serde_json::to_string(&RegimeBreakdown::default()).unwrap())
+        .bind(serde_json::to_string(&a_mark()).unwrap())
+        .execute(&pool)
+        .await
+        .expect("seed mark-mismatched run");
+
+        let err = repo.get_run(&BacktestRunId::new("run-lying-mark")).await;
+        assert!(
+            err.is_err(),
+            "a mark the stored hash does not cover must fail the #39 re-derive"
+        );
     }
 
     // ---- AC-2: get_run rejects a tampered content hash (#39 re-validate) ------
@@ -1915,6 +2053,7 @@ mod tests {
             slippage_total: result.slippage_total,
             regime_breakdown: result.regime_breakdown,
             skipped_entries: result.skipped_entries,
+            open_position: result.open_position.clone(),
             engine_fingerprint: EngineFingerprint::current(),
             summary: SummaryStats::default(),
             equity_curve: EquityCurve::default(),

@@ -207,6 +207,18 @@ async fn run_tools_return_the_seeded_run() {
     );
     assert!(detail["regime_breakdown"].is_object());
     assert!(detail["skipped_entries"].is_object());
+    // r2.s1 G1(b): the window-edge mark is a first-class RunDetail field —
+    // `null` for this unwindowed seed, an object when a windowed run ends
+    // holding a position.
+    assert!(
+        detail.get("open_position").is_some(),
+        "get_run carries the open_position key"
+    );
+    assert_eq!(
+        detail["open_position"],
+        Value::Null,
+        "an unwindowed run reports no mark"
+    );
     assert!(
         detail.get("trades").is_none(),
         "no inline trades in get_run"

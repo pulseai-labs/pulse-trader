@@ -47,8 +47,8 @@ use crate::application::backtest::{BacktestOutcome, BacktestRequest, run_version
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestResult, CandleSeries, CandleSeriesRepository, CompiledStrategy, Direction,
-    EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime, StrategyDsl,
-    Timeframe, Trade, compile, validate,
+    EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime, SeriesEnd,
+    StrategyDsl, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -194,8 +194,18 @@ where
         .symbol_filters(&pair)
         .map_err(|e| anyhow::anyhow!("resolve exchange filters for {pair}: {e}"))?;
 
-    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config, &filters)
-        .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
+    // The --dsl path runs whole snapshots — the series ends at data end, so a
+    // still-open position force-closes as EndOfData (the windowed variant of
+    // this ruling lives in the shared use case, r2.s1 G1).
+    let result = run_backtest(
+        &compiled,
+        &primary,
+        htf_series.as_ref(),
+        &config,
+        &filters,
+        SeriesEnd::SnapshotEnd,
+    )
+    .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
 
     if args.json {
         render_json(&result)?;
@@ -273,6 +283,7 @@ fn persisted_result(outcome: &BacktestOutcome) -> BacktestResult {
         slippage_total: run.slippage_total,
         regime_breakdown: run.regime_breakdown,
         skipped_entries: run.skipped_entries,
+        open_position: run.open_position.clone(),
         engine_fingerprint: EngineFingerprint::from_stored(run.engine_fingerprint.clone()),
         summary: run.summary.clone(),
         equity_curve: outcome.equity_curve(),
@@ -728,6 +739,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: crate::domain::SummaryStats::default(),
             equity_curve: crate::domain::EquityCurve::default(),
@@ -762,6 +774,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: crate::domain::SummaryStats::default(),
             equity_curve: crate::domain::EquityCurve::default(),
@@ -783,6 +796,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: crate::domain::SummaryStats::default(),
             equity_curve: crate::domain::EquityCurve::default(),
@@ -806,6 +820,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: counts,
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: crate::domain::SummaryStats::default(),
             equity_curve: crate::domain::EquityCurve::default(),
@@ -827,6 +842,7 @@ mod tests {
             slippage_total: Decimal::new(3, 0),
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: crate::domain::SummaryStats::default(),
             equity_curve: crate::domain::EquityCurve::default(),
@@ -882,6 +898,7 @@ mod tests {
             slippage_total: Decimal::new(3, 0),
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: populated_summary(),
             equity_curve: EquityCurve::default(),
@@ -959,6 +976,7 @@ mod tests {
             slippage_total: Decimal::new(3, 0),
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: SummaryStats::default(),
             equity_curve: EquityCurve::default(),
@@ -1014,6 +1032,7 @@ mod tests {
             slippage_total: Decimal::new(3, 0),
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: crate::domain::SummaryStats::default(),
             equity_curve: crate::domain::EquityCurve::default(),
