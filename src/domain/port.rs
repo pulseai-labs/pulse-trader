@@ -1453,6 +1453,7 @@ mod backtest_run_repository_tests {
                 summary: summary.clone(),
                 regime_breakdown: result.regime_breakdown,
                 skipped_entries: result.skipped_entries,
+                open_position: result.open_position.clone(),
             };
             self.runs
                 .lock()
@@ -1541,6 +1542,7 @@ mod backtest_run_repository_tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: crate::domain::backtest::RegimeBreakdown::default(),
             skipped_entries: crate::domain::sizing::SkippedEntryCounts::default(),
+            open_position: None,
             engine_fingerprint: crate::domain::EngineFingerprint::current(),
             summary: SummaryStats::default(),
             equity_curve: crate::domain::backtest::EquityCurve::default(),

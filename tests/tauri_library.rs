@@ -76,6 +76,7 @@ fn trade_free_result() -> BacktestResult {
         slippage_total: Decimal::ZERO,
         regime_breakdown: RegimeBreakdown::new(),
         skipped_entries: SkippedEntryCounts::new(),
+        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary: SummaryStats::default(),
         equity_curve: EquityCurve::default(),

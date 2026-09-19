@@ -1075,6 +1075,34 @@ async fn a_window_ending_mid_hold_does_not_fabricate_an_end_of_data_trade() {
         outcome.trades.iter().all(|t| t.exit_signal_time < to_ms),
         "no trade may exit on a bar the window excluded"
     );
+
+    // G1 ruling (b): the still-open position is on the PERSISTED run record —
+    // `outcome.run` is the save→get_run read-back, so this proves the column
+    // round-trips, not just that the engine emitted it. It is the bisected
+    // `held` position, marked at the last in-window candle's close — never a
+    // trade row, never inside the closed-trade statistics.
+    let last_in_window = complete
+        .candles
+        .iter()
+        .rfind(|c| c.open_time < to_ms)
+        .expect("the window holds at least one candle");
+    let mark = outcome
+        .run
+        .open_position
+        .expect("a run that ends mid-hold at a window edge records the mark");
+    assert_eq!(mark.direction, held.direction);
+    assert_eq!(mark.qty, held.qty);
+    assert_eq!(mark.entry_price, held.entry_price);
+    assert_eq!(mark.entry_signal_time, held.entry_signal_time);
+    assert_eq!(mark.entry_fill_time, held.entry_fill_time);
+    assert_eq!(mark.mark_time, last_in_window.close_time);
+    assert_eq!(mark.mark_price, last_in_window.close);
+    // And the mark is not folded into the closed-trade statistics.
+    assert_eq!(
+        outcome.run.summary.trade_count,
+        outcome.trades.len(),
+        "the summary counts only closed trades — the mark is excluded visibly"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1554,6 +1582,7 @@ fn trade_free_result() -> BacktestResult {
         slippage_total: Decimal::ZERO,
         regime_breakdown: RegimeBreakdown::new(),
         skipped_entries: SkippedEntryCounts::new(),
+        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary: SummaryStats::default(),
         equity_curve: EquityCurve::default(),

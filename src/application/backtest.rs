@@ -1399,6 +1399,7 @@ mod tests {
             summary: SummaryStats::default(),
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            open_position: None,
         }
     }
 

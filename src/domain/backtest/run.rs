@@ -30,6 +30,7 @@ use thiserror::Error;
 
 use super::regime::RegimeBreakdown;
 use super::stats::SummaryStats;
+use crate::domain::Direction;
 use crate::domain::pair::Pair;
 use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
@@ -143,6 +144,39 @@ pub enum SeriesEnd {
     /// `EndOfData` close would book a trade the window fabricated, changing
     /// trade counts and P&L against the same run unwindowed.
     WindowEdge,
+}
+
+/// The strategy's still-open position at a window edge (r2.s1 G1, ruling
+/// condition b).
+///
+/// A [`SeriesEnd::WindowEdge`] run does not force-close a position still open
+/// at `to` — booking it would fabricate an exit the strategy never chose. But
+/// a position that never closed must not vanish from the run record either:
+/// this mark IS that record — the direction, entry fill and size exactly as
+/// the strategy opened them, and the last in-window candle's `close_time` /
+/// `close` as the mark price. It is deliberately NOT a [`Trade`]: it produces
+/// no trade row and no closed-trade statistics count it — the record says so
+/// explicitly rather than by omission.
+///
+/// `None` on the carrying `Option` means the run ended flat — or ended at the
+/// snapshot's real last bar, where `close_end_of_data` already books the
+/// position as an `EndOfData` trade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenPositionMark {
+    /// The position's side.
+    pub direction: Direction,
+    /// Position size in base units.
+    pub qty: Decimal,
+    /// The price the entry filled at.
+    pub entry_price: Decimal,
+    /// The signal bar's `close_time` that produced the entry (epoch ms).
+    pub entry_signal_time: i64,
+    /// The bar the entry filled on (`open_time`, epoch ms).
+    pub entry_fill_time: i64,
+    /// The mark timestamp — the last in-window candle's `close_time`.
+    pub mark_time: i64,
+    /// The mark price — the last in-window candle's `close`.
+    pub mark_price: Decimal,
 }
 
 /// Why [`CandleWindow::new`] refused: an empty or backwards window is not a
@@ -263,6 +297,13 @@ pub struct PersistedRun {
     /// regime split, these are **not** derivable from the trade log at all: they
     /// count entries that never became trades.
     pub skipped_entries: SkippedEntryCounts,
+    /// The still-open position the window edge left behind, as persisted
+    /// (r2.s1 G1, `0010` `backtest_run.open_position`). `None` for every run
+    /// that ended flat, every unwindowed run, and every pre-`0010` row — the
+    /// column cannot say which, and the distinction does not matter: none of
+    /// them have a position to report. The mark is never a [`Trade`] and never
+    /// enters the summary's closed-trade statistics.
+    pub open_position: Option<OpenPositionMark>,
 }
 
 /// The typed list projection of one run for the catalog
