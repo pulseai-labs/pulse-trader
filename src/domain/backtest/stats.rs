@@ -417,6 +417,7 @@ mod tests {
             exit_reason: ExitReason::Signal,
             source: TradeSource::Backtest,
             regime: Regime::Unknown,
+            stop_price: None,
         }
     }
 

@@ -654,6 +654,17 @@ where
                 message: reason,
                 subject: None,
             },
+            // r2.s2.w2: the child carries an `Htf` operand but the parent run's
+            // persisted inputs name no HTF snapshot — the same typed refusal the
+            // standalone path raises as `BacktestAppError::HtfRequired`.
+            PrepareError::HtfRequired => StagedFailure {
+                stage: AcceptFailureStage::Backtest,
+                message: BacktestAppError::HtfRequired {
+                    field: "inputs.htf",
+                }
+                .to_string(),
+                subject: None,
+            },
             PrepareError::Engine(source) => StagedFailure {
                 stage: AcceptFailureStage::Backtest,
                 message: source.to_string(),

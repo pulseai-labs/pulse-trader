@@ -61,7 +61,8 @@ pub enum ExitRule {
     /// An ATR-multiple stop (schema 1.1.0): the stop sits `multiple` × ATR of
     /// the **primary** series away from entry (`atr_stop_price` in 2.04's
     /// compiler). Shares the [`StopLoss`](ExitRule::StopLoss) exclusive family
-    /// for the semantic rules (2.03); its fill behaviour is w2's.
+    /// for the semantic rules (2.03); the ATR is read at the signal bar and
+    /// frozen through the fill (r2.s2.w2).
     AtrStop {
         /// ATR lookback period (the primary series' ATR).
         period: SweepableValue<u32>,

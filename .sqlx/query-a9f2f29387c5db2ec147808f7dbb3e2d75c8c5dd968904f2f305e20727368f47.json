@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                 direction         AS \"direction?: String\",\n                 qty               AS \"qty?: String\",\n                 entry_price       AS \"entry_price?: String\",\n                 exit_price        AS \"exit_price?: String\",\n                 entry_signal_time AS \"entry_signal_time?: i64\",\n                 entry_fill_time   AS \"entry_fill_time?: i64\",\n                 exit_signal_time  AS \"exit_signal_time?: i64\",\n                 exit_fill_time    AS \"exit_fill_time?: i64\",\n                 fees_total        AS \"fees_total?: String\",\n                 funding_total     AS \"funding_total?: String\",\n                 slippage_total    AS \"slippage_total?: String\",\n                 realized_pnl      AS \"realized_pnl?: String\",\n                 realized_r        AS \"realized_r?: String\",\n                 mfe_r             AS \"mfe_r?: String\",\n                 mae_r             AS \"mae_r?: String\",\n                 exit_reason       AS \"exit_reason?: String\",\n                 source            AS \"source?: String\",\n                 regime            AS \"regime?: String\",\n                 fills             AS \"fills?: String\"\n               FROM trade WHERE backtest_run_id = ?1 ORDER BY seq",
+  "query": "SELECT\n                 direction         AS \"direction?: String\",\n                 qty               AS \"qty?: String\",\n                 entry_price       AS \"entry_price?: String\",\n                 exit_price        AS \"exit_price?: String\",\n                 entry_signal_time AS \"entry_signal_time?: i64\",\n                 entry_fill_time   AS \"entry_fill_time?: i64\",\n                 exit_signal_time  AS \"exit_signal_time?: i64\",\n                 exit_fill_time    AS \"exit_fill_time?: i64\",\n                 fees_total        AS \"fees_total?: String\",\n                 funding_total     AS \"funding_total?: String\",\n                 slippage_total    AS \"slippage_total?: String\",\n                 realized_pnl      AS \"realized_pnl?: String\",\n                 realized_r        AS \"realized_r?: String\",\n                 mfe_r             AS \"mfe_r?: String\",\n                 mae_r             AS \"mae_r?: String\",\n                 exit_reason       AS \"exit_reason?: String\",\n                 source            AS \"source?: String\",\n                 regime            AS \"regime?: String\",\n                 fills             AS \"fills?: String\",\n                 stop_price        AS \"stop_price?: String\"\n               FROM trade WHERE backtest_run_id = ?1 ORDER BY seq",
   "describe": {
     "columns": [
       {
@@ -97,6 +97,11 @@
         "name": "fills?: String",
         "ordinal": 18,
         "type_info": "Text"
+      },
+      {
+        "name": "stop_price?: String",
+        "ordinal": 19,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -121,8 +126,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "200f78b86d0f1ee672bc0285ade2ed06db6f4239f712265e197c390fcbaad3e6"
+  "hash": "a9f2f29387c5db2ec147808f7dbb3e2d75c8c5dd968904f2f305e20727368f47"
 }

@@ -274,6 +274,16 @@ pub enum BacktestAppError {
     #[error("backtest failed: {0}")]
     Engine(#[from] BacktestError),
 
+    /// The strategy needs a higher-timeframe series the request did not supply
+    /// (schema 1.1.0, r2.s2.w2). `field` names the missing input —
+    /// `"inputs.htf"` — so MCP/Tauri callers can point at the exact request
+    /// member instead of parsing the message.
+    #[error("strategy requires a higher-timeframe series but {field} was not supplied")]
+    HtfRequired {
+        /// The request/input field that was missing — always `"inputs.htf"`.
+        field: &'static str,
+    },
+
     /// A READ failed before anything was saved.
     ///
     /// Distinct from [`Persist`](Self::Persist) because that one says "persist
@@ -492,6 +502,11 @@ impl BacktestOutcome {
 pub(crate) enum PrepareError {
     /// The validated document did not compile.
     Compile(String),
+    /// The compiled strategy carries an `Htf` operand but no higher-timeframe
+    /// series was supplied (schema 1.1.0, r2.s2.w2) — refused before any candle
+    /// work rather than silently evaluating the operand against primary data.
+    /// Surfaces as [`BacktestAppError::HtfRequired`] on the standalone path.
+    HtfRequired,
     /// The engine refused the run.
     Engine(BacktestError),
 }
@@ -520,6 +535,13 @@ pub(crate) fn prepare_backtest(
     series_end: SeriesEnd,
 ) -> Result<PreparedBacktest, PrepareError> {
     let compiled = compile(validated).map_err(|e| PrepareError::Compile(e.to_string()))?;
+    // The typed application-ring guard (r2.s2.w2 / ADR-0015): a strategy with an
+    // `Htf` operand and no HTF series refuses here — after compile, before any
+    // candle work — rather than reaching the engine, which would raise its own
+    // `BacktestError::HtfRequired` as the last line of defense.
+    if compiled.needs_htf() && htf.is_none() {
+        return Err(PrepareError::HtfRequired);
+    }
     let config = BacktestConfig {
         starting_equity,
         taker_fee_bps: inputs.taker_fee_bps,
@@ -854,6 +876,9 @@ where
         )
         .map_err(|e| match e {
             PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
+            PrepareError::HtfRequired => BacktestAppError::HtfRequired {
+                field: "inputs.htf",
+            },
             PrepareError::Engine(source) => BacktestAppError::Engine(source),
         })?;
         Ok(EngineOutput { prepared })

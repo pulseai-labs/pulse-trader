@@ -649,7 +649,8 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                  exit_reason       AS "exit_reason?: String",
                  source            AS "source?: String",
                  regime            AS "regime?: String",
-                 fills             AS "fills?: String"
+                 fills             AS "fills?: String",
+                 stop_price        AS "stop_price?: String"
                FROM trade WHERE backtest_run_id = ?1 ORDER BY seq"#,
             id_str,
         )
@@ -708,6 +709,12 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                 exit_reason: parse_exit_reason(&require_col("trade.exit_reason", r.exit_reason)?)?,
                 source: parse_trade_source(&require_col("trade.source", r.source)?)?,
                 regime: parse_regime(&require_col("trade.regime", r.regime)?)?,
+                // Migration 0011: NULL (every pre-0011 row) reads back as `None`;
+                // a stored value parses fail-closed like every other column.
+                stop_price: r
+                    .stop_price
+                    .map(|s| parse_decimal("trade.stop_price", &s))
+                    .transpose()?,
             });
         }
         Ok(out)
@@ -1152,15 +1159,18 @@ pub(crate) async fn insert_trade_rows(
         let entry_fill_time = trade.entry_fill_time;
         let exit_signal_time = trade.exit_signal_time;
         let exit_fill_time = trade.exit_fill_time;
+        // r2.s2.w2 / migration 0011: the recorded per-trade stop. `None` binds
+        // NULL — the only value a pre-0011-shaped row can carry.
+        let stop_price = trade.stop_price.map(decimal_text);
 
         sqlx::query!(
             "INSERT INTO trade \
              (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, \
               entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, \
               fees_total, funding_total, slippage_total, realized_pnl, realized_r, \
-              mfe_r, mae_r, exit_reason, source, regime, fills) \
+              mfe_r, mae_r, exit_reason, source, regime, fills, stop_price) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             trade_id,
             run_id,
             seq_i64,
@@ -1183,6 +1193,7 @@ pub(crate) async fn insert_trade_rows(
             source,
             regime,
             fills_json,
+            stop_price,
         )
         .execute(&mut **tx)
         .await
@@ -1308,6 +1319,7 @@ mod tests {
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
+            stop_price: Some(d(28_500, 0)),
         }
     }
 
@@ -1389,6 +1401,7 @@ mod tests {
             exit_reason: ExitReason::StopLoss,
             source: TradeSource::Backtest,
             regime: Regime::TrendingDown,
+            stop_price: Some(Decimal::from_str_exact("19500.00").unwrap()),
         };
         // Trade B — single fill, regime Ranging, positive.
         let trade_b = Trade {
@@ -1416,6 +1429,7 @@ mod tests {
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
             regime: Regime::Ranging,
+            stop_price: Some(d(110, 0)),
         };
         // Trade C — regime Unknown (opened while warming), break-even.
         let trade_c = Trade {
@@ -1443,6 +1457,7 @@ mod tests {
             exit_reason: ExitReason::Signal,
             source: TradeSource::Backtest,
             regime: Regime::Unknown,
+            stop_price: Some(d(45, 0)),
         };
         // Trade D — regime TrendingUp, positive (so all four variants appear).
         let trade_d = Trade {
@@ -1470,6 +1485,7 @@ mod tests {
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
+            stop_price: Some(Decimal::from_str_exact("6.66666667").unwrap()),
         };
         let trades = vec![trade_a, trade_b, trade_c, trade_d];
         // All four regime cells populated.

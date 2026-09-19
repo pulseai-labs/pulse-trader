@@ -5,20 +5,20 @@
 //! grammar's serde round-trips (a `series`-scoped operand, `IndicatorSpec::Atr`,
 //! `ExitRule::AtrStop`), the validation arms and their exact `FieldError` paths,
 //! the mutation leaves in lockstep, the series-tagged compilation shapes
-//! (`CompileError::HtfUnsupported`, `CompiledExit::AtrStop`,
-//! `required_htf_indicators`/`needs_htf`), the pure `atr_stop_price` helper, and
-//! the repository round-trip of a persisted `1.0.0` document. Behaviour (ATR
-//! math, `bar.htf` reads, HTF stepping) is w2's and is NOT exercised here.
+//! (`CompiledValue::{Price,Indicator}` carrying `Series::Htf`,
+//! `CompiledExit::AtrStop`, `required_htf_indicators`/`needs_htf`), the pure
+//! `atr_stop_price` helper, and the repository round-trip of a persisted
+//! `1.0.0` document. Behaviour (ATR math, `bar.htf` reads, HTF stepping) is
+//! covered by `tests/htf_atr_engine.rs`; this file pins the compile shapes.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 
 use pulse::{
-    CandidateDsl, Comparator, CompileError, CompiledExit, Condition, CreatedBy, Db, Direction,
-    ExitRule, IndicatorSpec, MIGRATOR, Migrator, Mutation, NewVersion, ParamValue, PriceField,
-    RiskParams, SchemaVersion, Series, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
-    SweepableValue, ValidationCode, ValueSource, apply, atr_stop_price, compile, sweepable_paths,
-    validate,
+    CandidateDsl, Comparator, CompiledExit, Condition, CreatedBy, Db, Direction, ExitRule,
+    IndicatorSpec, MIGRATOR, Migrator, Mutation, NewVersion, ParamValue, PriceField, RiskParams,
+    SchemaVersion, Series, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue,
+    ValidationCode, ValueSource, apply, atr_stop_price, compile, sweepable_paths, validate,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -493,7 +493,11 @@ fn atr_and_atr_stop_leaves_are_sweepable_and_retunable() {
 // ---- (f) compilation shapes -------------------------------------------------
 
 #[test]
-fn htf_operand_fails_compile_with_htf_unsupported() {
+fn htf_operand_compiles_with_its_series() {
+    // w2 lifts the compile gate: an `Htf` operand is a `CompiledValue` carrying
+    // `Series::Htf`, collected into `required_htf_indicators`, and flips
+    // `needs_htf()`. Evaluation routes it to the HTF engine (covered by
+    // `tests/htf_atr_engine.rs`).
     let dsl = dsl_with(
         compare(
             ValueSource::Indicator {
@@ -507,18 +511,87 @@ fn htf_operand_fails_compile_with_htf_unsupported() {
         ),
         vec![stop_loss()],
     );
-    // `series` carries no validation rule — the document validates, then the
-    // compiler refuses to evaluate it on the primary series.
+    // `series` carries no validation rule — the document validates AND compiles.
     let validated = validate(&dsl).expect("htf operand has no validation rule");
-    let err = compile(&validated).expect_err("htf operand must not compile");
-    match err {
-        CompileError::HtfUnsupported { field } => {
-            assert_eq!(field, "entry.lhs");
+    let compiled = compile(&validated).expect("htf operand must compile");
+
+    let htf_leaf = pulse::CompiledValue::Indicator {
+        series: Series::Htf,
+        spec: IndicatorSpec::Ema {
+            period: SweepableValue::Fixed(200),
+        },
+    };
+    assert!(
+        matches!(
+            compiled.entry(),
+            pulse::CompiledCondition::Compare { lhs, .. } if *lhs == htf_leaf
+        ),
+        "entry.lhs must be the Htf-series indicator leaf, was {:?}",
+        compiled.entry()
+    );
+    assert!(
+        compiled
+            .required_htf_indicators()
+            .contains(&IndicatorSpec::Ema {
+                period: SweepableValue::Fixed(200),
+            }),
+        "required_htf_indicators must contain Ema(200), got {:?}",
+        compiled.required_htf_indicators()
+    );
+    assert!(
+        compiled.required_indicators().is_empty(),
+        "an htf operand registers no primary indicator, got {:?}",
+        compiled.required_indicators()
+    );
+    assert!(compiled.needs_htf(), "an htf operand flips needs_htf");
+}
+
+#[test]
+fn htf_price_operand_compiles_and_needs_htf() {
+    // An `Htf` Price leaf compiles too — the gate is gone for both operand
+    // kinds. (The engine reads the aligned closed H4 candle for it.)
+    let dsl = dsl_with(
+        compare(
+            ValueSource::Price {
+                series: Series::Htf,
+                field: PriceField::Close,
+            },
+            Comparator::Gt,
+            constant(100, 0),
+        ),
+        vec![stop_loss()],
+    );
+    let compiled = compile(&validate(&dsl).expect("valid")).expect("must compile");
+    assert!(matches!(
+        compiled.entry(),
+        pulse::CompiledCondition::Compare {
+            lhs: pulse::CompiledValue::Price {
+                series: Series::Htf,
+                field: PriceField::Close,
+            },
+            ..
         }
-        other @ CompileError::UnexpectedSweep { .. } => {
-            panic!("expected HtfUnsupported, got {other:?}")
-        }
-    }
+    ));
+    assert!(compiled.needs_htf());
+    assert!(compiled.required_htf_indicators().is_empty());
+}
+
+#[test]
+fn primary_only_strategy_needs_no_htf() {
+    let dsl = dsl_with(
+        compare(
+            ValueSource::Price {
+                series: Series::Primary,
+                field: PriceField::Close,
+            },
+            Comparator::Gt,
+            constant(100, 0),
+        ),
+        vec![stop_loss()],
+    );
+    let compiled = compile(&validate(&dsl).expect("valid")).expect("must compile");
+    assert!(!compiled.needs_htf());
+    assert!(compiled.required_htf_indicators().is_empty());
 }
 
 #[test]

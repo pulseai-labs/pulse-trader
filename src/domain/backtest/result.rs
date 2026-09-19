@@ -251,6 +251,13 @@ fn feed_trade(hasher: &mut Sha256, trade: &Trade) {
     hasher.update([exit_reason_tag(trade.exit_reason)]);
     hasher.update([trade_source_tag(trade.source)]);
     hasher.update([regime_tag(trade.regime)]);
+    // r2.s2.w2 (G1(b) precedent): the recorded per-trade stop feeds the hash
+    // CONDITIONALLY — `None` writes nothing, so a pre-`0011` row (`stop_price`
+    // NULL → `None`) re-derives the identical byte stream it hashed under
+    // before the column existed.
+    if let Some(stop_price) = trade.stop_price {
+        feed_decimal(hasher, stop_price);
+    }
 }
 
 /// Feed one [`RegimeCell`] (`{ trade_count: usize, net_pnl: Decimal }`).
@@ -383,6 +390,7 @@ mod tests {
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
+            stop_price: Some(Decimal::new(28_500, 0)),
         };
         let mut regime_breakdown = RegimeBreakdown::new();
         regime_breakdown.record(Regime::TrendingUp, trade.realized_pnl);

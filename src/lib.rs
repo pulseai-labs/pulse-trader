@@ -305,6 +305,12 @@ pub use adapters::indicators::rsi::Rsi;
 // module is a `dead_code` build error, not a warning); the 3.03 factory that
 // consumes it is next round.
 pub use adapters::indicators::adx::Adx;
+// r2.s2.w2: the `Atr` adapter (Wilder true-range smoothing over the shared
+// `wilder.rs` core, schema 1.1.0's `IndicatorSpec::Atr`). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod adapters` (a new public adapter struct
+// unused outside its module is a `dead_code` build error, not a warning); the
+// indicator engine's factory consumes it.
+pub use adapters::indicators::atr::Atr;
 // VS-1.1.3 work-3.03: the multi-indicator engine that implements the frozen
 // `EvalContext` seam over real candles and streaming adapter values. Its
 // readiness gate is load-bearing for warmup safety under the current boolean DSL

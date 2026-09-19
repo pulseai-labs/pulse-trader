@@ -74,6 +74,31 @@ const MINIMAL_DSL: &str = r#"{
   "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
 }"#;
 
+/// A schema-1.1.0 variant whose RSI leaf rides the H4 series — the child keeps
+/// needing the higher timeframe after `proposed_mutation` retunes its period,
+/// which is what reaches the accept path's `HtfRequired` mapping (r2.s2.w2).
+const HTF_RSI_DSL: &str = r#"{
+  "schema_version": "1.1.0",
+  "name": "HTF RSI Oversold (decision)",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": {
+      "type": "Indicator",
+      "series": "htf",
+      "spec": { "indicator": "Rsi", "period": 14 }
+    },
+    "op": "Lt",
+    "rhs": { "type": "Constant", "value": "30" }
+  },
+  "filters": [],
+  "exits": [
+    { "type": "StopLoss", "distance_pct": "0.05" },
+    { "type": "TakeProfit", "target_r": "2.0" }
+  ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+
 fn manifest(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
@@ -1134,6 +1159,45 @@ async fn a_compute_failure_records_backtest_and_leaves_the_proposal_actionable()
     );
 }
 
+/// r2.s2.w2 — the child's DSL carries an `htf` operand but the parent run's
+/// persisted inputs name no HTF snapshot, so the replay has nothing to feed the
+/// HTF engine. The accept must record a `Backtest` failure naming `inputs.htf`
+/// — the same typed refusal the standalone path raises as
+/// `BacktestAppError::HtfRequired` — and mint nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_htf_child_replayed_without_a_parent_htf_snapshot_records_backtest() {
+    // The parent DSL already carries the `htf` operand, so the mutation-retuned
+    // child still needs the higher timeframe. The parent run itself ran WITH
+    // H4; repointing its persisted inputs to the M15-only shape reproduces the
+    // lineage state the refusal exists for.
+    let world = world_with_dsl(HTF_RSI_DSL).await;
+    repoint_parent_htf_inputs(world.pool(), &world.parent_run_id).await;
+
+    let outcome = decide(&world, CoachAction::Accept)
+        .await
+        .expect("a recorded failure is an outcome, not an error");
+
+    assert_accept_failed(&outcome, AcceptFailureStage::Backtest);
+    let CoachDecisionOutcome::AcceptFailed(proposal) = &outcome else {
+        panic!("expected AcceptFailed, got {outcome:?}");
+    };
+    let failure = proposal
+        .accept_failure
+        .as_ref()
+        .expect("the refusal is recorded on the proposal");
+    assert!(
+        failure.message.contains("inputs.htf"),
+        "the recorded refusal names the missing input: {}",
+        failure.message
+    );
+    assert_eq!(world.version_count().await, 1, "no child was minted");
+    assert_eq!(
+        world.settled_proposal_count().await,
+        0,
+        "no settled row exists"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_persist_failure_records_persist_in_a_new_transaction_with_no_child() {
     let world = world().await;
@@ -1390,6 +1454,20 @@ async fn make_parent_legacy(pool: &SqlitePool, run_id: &BacktestRunId) {
             "UPDATE backtest_run SET pair = NULL, primary_timeframe = NULL, \
              primary_data_version = NULL, htf_timeframe = NULL, htf_data_version = NULL, \
              taker_fee_bps = NULL, slippage_bps = NULL, funding_config = NULL \
+             WHERE id = '{}'",
+            run_id.as_str()
+        )],
+    )
+    .await;
+}
+
+/// Null the parent run's persisted HTF selection — the M15-only inputs shape a
+/// schema-1.0.0 lineage records honestly (r2.s2.w2's `HtfRequired` trigger).
+async fn repoint_parent_htf_inputs(pool: &SqlitePool, run_id: &BacktestRunId) {
+    coach_support::with_run_immutability_lifted(
+        pool,
+        &[&format!(
+            "UPDATE backtest_run SET htf_timeframe = NULL, htf_data_version = NULL \
              WHERE id = '{}'",
             run_id.as_str()
         )],

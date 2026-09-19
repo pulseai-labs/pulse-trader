@@ -1,6 +1,6 @@
 //! Streaming indicator engine over the VS-1.1.3 indicator adapters.
 
-use super::{adx::Adx, ema::Ema, macd::Macd, rsi::Rsi};
+use super::{adx::Adx, atr::Atr, ema::Ema, macd::Macd, rsi::Rsi};
 use crate::{
     Candle, CompiledStrategy, CompiledValue, EvalContext, Indicator, IndicatorSpec, PriceField,
     SweepableValue,
@@ -24,8 +24,7 @@ pub enum EngineError {
         /// Adapter/factory detail explaining the invalid parameter tuple.
         detail: String,
     },
-    /// A grammatically-valid spec whose computation lands in a later work item
-    /// (r2.s2.w1 compile-only arm — removed by the owning item).
+    /// A grammatically-valid spec whose computation lands in a later work item.
     #[error("{0}")]
     Unsupported(String),
 }
@@ -196,10 +195,11 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
                     )
                 })
         }
-        // r2.s2.w1 compile-only arm: the grammar carries `Atr`; its computation
-        // is w2's. A typed refusal, never a silent default.
-        IndicatorSpec::Atr { .. } => {
-            Err(EngineError::Unsupported("atr lands in r2.s2.w2".to_owned()))
+        IndicatorSpec::Atr { period } => {
+            let period = fixed_u32(period, "atr.period")?;
+            Atr::new(period)
+                .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+                .ok_or_else(|| invalid_period(spec, format!("ATR period {period} is invalid")))
         }
     }
 }
@@ -545,20 +545,15 @@ mod tests {
         assert!(matches!(err, EngineError::InvalidPeriod { .. }));
     }
 
-    /// r2.s2.w1 compile-only arm: `Atr` is grammar — the factory refuses it
-    /// with a typed `Unsupported` until w2 lands the computation.
+    /// r2.s2.w2: the factory builds `Atr` — the Wilder true-range adapter —
+    /// like every other fixed-period spec.
     #[test]
-    fn factory_rejects_atr_with_typed_unsupported() {
-        let result = IndicatorEngine::from_specs(&[IndicatorSpec::Atr {
+    fn factory_builds_atr() {
+        let engine = IndicatorEngine::from_specs(&[IndicatorSpec::Atr {
             period: SweepableValue::Fixed(14),
-        }]);
-        let Err(err) = result else {
-            panic!("atr must be rejected until r2.s2.w2");
-        };
+        }])
+        .expect("atr builds in r2.s2.w2");
 
-        assert_eq!(
-            err,
-            EngineError::Unsupported("atr lands in r2.s2.w2".to_owned())
-        );
+        assert_eq!(engine.indicator_count(), 1);
     }
 }

@@ -73,6 +73,10 @@ const BANNED_SHARED_STATE: &[&str] = &[
 /// as a loud failure rather than a silently-skipped (false-green) scan.
 const SCAN_TARGETS: &[&str] = &[
     "src/adapters/indicators/adx.rs",
+    // r2.s2.w2: the ATR adapter + the Wilder smoothing core it shares with ADX
+    // are f64 math paths — scanned like every other indicator surface.
+    "src/adapters/indicators/atr.rs",
+    "src/adapters/indicators/wilder.rs",
     "src/adapters/indicators/convert.rs",
     "src/adapters/indicators/ema.rs",
     "src/adapters/indicators/engine.rs",
