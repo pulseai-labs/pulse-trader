@@ -454,7 +454,7 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // name them.
 pub use domain::{
     BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, CandleWindowError,
-    FundingConfig, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    FundingConfig, PersistedRun, RunSummary, SnapshotSelection,
 };
 
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line

@@ -24,8 +24,8 @@ use serde::Serialize;
 
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
-    BacktestInputs, IndicatorSpec, MfeMaeAggregates, OpenPositionMark, PersistedRun,
-    RegimeBreakdown, SkippedEntryCounts, SummaryStats, SweepableValue,
+    BacktestInputs, IndicatorSpec, MfeMaeAggregates, PersistedRun, RegimeBreakdown,
+    SkippedEntryCounts, SummaryStats, SweepableValue,
 };
 
 /// One column of indicator output: the label a client sees (`<kind>:<period>`,
@@ -285,13 +285,6 @@ pub struct RunDetail {
     pub mfe_mae: MfeMaeWire,
     /// The persisted inputs, or `null` for a pre-0006 row.
     pub inputs: Option<BacktestInputs>,
-    /// The still-open position a windowed run ended holding (r2.s1 G1): the
-    /// direction, entry fill and size the strategy opened, marked at the last
-    /// in-window candle's close. `null` for a run that ended flat or at the
-    /// snapshot's real last bar. Never counted in `summary`'s closed-trade
-    /// statistics — it is reported explicitly precisely because it is not a
-    /// trade.
-    pub open_position: Option<OpenPositionMark>,
     /// The recording engine's build-time fingerprint.
     pub engine_fingerprint: String,
     /// The recording engine's compiled target triple.
@@ -315,7 +308,6 @@ pub fn run_detail(run: &PersistedRun, mfe_mae: &MfeMaeAggregates) -> RunDetail {
             count: mfe_mae.trade_count,
         },
         inputs: run.inputs.clone(),
-        open_position: run.open_position.clone(),
         engine_fingerprint: run.engine_fingerprint.clone(),
         engine_target: run.engine_target.clone(),
         result_content_hash: run.result_content_hash.clone(),

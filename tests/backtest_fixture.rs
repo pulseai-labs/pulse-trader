@@ -60,7 +60,7 @@ use std::path::PathBuf;
 
 use pulse::{
     BacktestConfig, BacktestResult, BinanceAdapter, CandleSeries, CandleStore, ExchangeAdapter,
-    Migrator, Pair, Regime, SeriesEnd, Timeframe, Trade, compile, run_backtest, validate,
+    Migrator, Pair, Regime, Timeframe, Trade, compile, run_backtest, validate,
 };
 use rust_decimal::Decimal;
 
@@ -138,7 +138,6 @@ fn run_golden(primary: &CandleSeries) -> BacktestResult {
         None,
         &BacktestConfig::default(),
         &filters,
-        SeriesEnd::SnapshotEnd,
     )
     .expect("backtest runs over the fixture")
 }

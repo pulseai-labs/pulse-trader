@@ -115,36 +115,35 @@ const PROVENANCE_COLUMNS: [&str; 8] = [
     "funding_config",
 ];
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0006_*` and
-/// everything from `0008` on — the "older binary" that shipped `0007` while
-/// `0006` was still a reserved gap.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0006_*`, `0008_*` and
+/// `0009_*` — the "older binary" that shipped `0007` while `0006` was still a
+/// reserved gap.
 ///
 /// r1.s4.w4 added `0008` to the skip list. A binary that predates `0006` predates
 /// `0008` by two spines, and including it would also move the fixture's maximum
 /// applied version to 8 — which would silently destroy the property the next
 /// assertion states: that `0006` arrives BELOW the maximum already in the database.
-/// r2.s1.w1 adds `0009`, and G1 adds `0010`, for the same reason, one release
-/// further along each.
+/// r2.s1.w1 adds `0009` for the same reason, one release further along.
 fn shipped_set_without_0006(dir: &Path) {
     let shipped = manifest("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("0006_") || name.as_str() >= "0008" {
+        if name.starts_with("0006_") || name.starts_with("0008_") || name.starts_with("0009_") {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
     }
 }
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0009_*` and later
-/// — the `0008` binary this item's pre-0009 compatibility is measured against.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING only `0009_*` — the
+/// `0008` binary this item's pre-0009 compatibility is measured against.
 fn shipped_set_without_0009(dir: &Path) {
     let shipped = manifest("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.as_str() >= "0009" {
+        if name.starts_with("0009_") {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
@@ -264,7 +263,6 @@ fn empty_result() -> BacktestResult {
         slippage_total: Decimal::ZERO,
         regime_breakdown: RegimeBreakdown::new(),
         skipped_entries: SkippedEntryCounts::new(),
-        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary: SummaryStats::default(),
         equity_curve: EquityCurve::default(),
@@ -416,15 +414,13 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     // already held; the isolated "filling a gap moves no maximum" case lives in
     // `migrate.rs`'s `a_later_lower_numbered_migration_applies_through_the_startup_path`,
     // which withholds `0008` precisely so it can still state it.
-    // r2.s1.w1: `0009` rides along too, and G1's `0010` as well, moving the
-    // maximum to 10.
+    // r2.s1.w1: `0009` rides along too, moving the maximum to 9.
     assert!(applied.contains(&8), "0008 rides along: {applied:?}");
     assert!(applied.contains(&9), "0009 rides along: {applied:?}");
-    assert!(applied.contains(&10), "0010 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(10),
-        "0006 is recorded at its own version, below the maximum 0010 sets"
+        Some(9),
+        "0006 is recorded at its own version, below the maximum 0009 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;

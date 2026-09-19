@@ -7,10 +7,9 @@ use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
     CompiledStrategy, Direction, EngineFingerprint, EquityCurve, ExitReason, Fill, IntraBarExit,
-    OpenPositionMark, Regime, RegimeBreakdown, SeriesEnd, Side, SizingOutcome, SkippedEntryCounts,
-    SummaryStats, SymbolFilters, Trade, TradeSource, align, apply_slippage, compute_position_size,
-    funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, stop_price,
-    take_profit_price, taker_fee,
+    Regime, RegimeBreakdown, Side, SizingOutcome, SkippedEntryCounts, SummaryStats, SymbolFilters,
+    Trade, TradeSource, align, apply_slippage, compute_position_size, funding_payment,
+    realized_pnl, realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -71,12 +70,6 @@ impl BacktestConfig {
 
 /// Run one sequential, deterministic backtest.
 ///
-/// `series_end` says what `primary`'s last bar IS (r2.s1 G1): the caller that
-/// sliced the series knows whether it ends because the snapshot did or because
-/// a window truncated it. Only [`SeriesEnd::SnapshotEnd`] licenses the
-/// `EndOfData` force-close — a position open at a window edge is left open
-/// rather than booked as a trade the strategy never chose.
-///
 /// # Errors
 ///
 /// Returns [`BacktestError`] for strategy preconditions or sizing failures.
@@ -86,7 +79,6 @@ pub fn run_backtest(
     htf: Option<&CandleSeries>,
     config: &BacktestConfig,
     filters: &SymbolFilters,
-    series_end: SeriesEnd,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
@@ -162,34 +154,12 @@ pub fn run_backtest(
         }
     }
 
-    // The force-close fires ONLY when the series genuinely ran out. A window
-    // edge is not end-of-data: a position still open at `to` is the strategy's
-    // open position, and booking it as a trade fabricates an exit (r2.s1 G1).
-    // It must not silently vanish either — the run record carries it as an
-    // explicit mark (direction, entry fill, size, last in-window close), never
-    // as a trade and never inside the closed-trade statistics.
-    let open_position = if series_end == SeriesEnd::SnapshotEnd {
-        close_end_of_data(&mut state, primary, &funding_index, config)?;
-        None
-    } else {
-        match (state.position.as_ref(), primary.candles.last()) {
-            (Some(position), Some(last)) => Some(OpenPositionMark {
-                direction: position.direction,
-                qty: position.qty,
-                entry_price: position.entry_price,
-                entry_signal_time: position.entry_signal_time,
-                entry_fill_time: position.entry_fill_time,
-                mark_time: last.close_time,
-                mark_price: last.close,
-            }),
-            _ => None,
-        }
-    };
+    close_end_of_data(&mut state, primary, &funding_index, config)?;
     // The leading equity point's time is the run's first primary candle open
     // (README C2 / D5). An empty primary series has no run-start bar; fall back to
     // 0 (the run produced no trades either, so the curve is just the leading point).
     let run_start_time_ms = primary.candles.first().map_or(0, |candle| candle.open_time);
-    Ok(state.into_result(config, run_start_time_ms, open_position))
+    Ok(state.into_result(config, run_start_time_ms))
 }
 
 #[derive(Debug, Clone)]
@@ -249,16 +219,7 @@ impl LoopState {
     /// are computed as pure folds **after** the existing totals loop (D1) — they
     /// read the already-final trade log + totals, never mutate them, and (the HARD
     /// slice invariant, README C3/C8) are EXCLUDED from both content hashes.
-    /// `open_position` is the still-open position a `SeriesEnd::WindowEdge` run
-    /// left behind (built by the caller, which owns the last candle), or `None`
-    /// — it lands on the result verbatim, outside the trade log and every
-    /// closed-trade statistic.
-    fn into_result(
-        self,
-        config: &BacktestConfig,
-        run_start_time_ms: i64,
-        open_position: Option<OpenPositionMark>,
-    ) -> BacktestResult {
+    fn into_result(self, config: &BacktestConfig, run_start_time_ms: i64) -> BacktestResult {
         let mut regime_breakdown = RegimeBreakdown::new();
         for trade in &self.trades {
             // Aggregate each closed trade into its entry-bar regime cell (FR-5).
@@ -272,7 +233,6 @@ impl LoopState {
             slippage_total: Decimal::ZERO,
             regime_breakdown,
             skipped_entries: self.skipped_entries,
-            open_position,
             // FR-7 / NFR-2 (3.03): stamp every run with the build-time engine
             // identity. EXCLUDED from the content hash (D4) — it is the cross-run
             // comparison key, not part of the determinism oracle.
@@ -793,8 +753,8 @@ mod tests {
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
-        SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile,
-        realized_pnl, validate,
+        StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile, realized_pnl,
+        validate,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -946,7 +906,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -969,7 +928,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -989,7 +947,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1012,7 +969,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1034,7 +990,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1056,7 +1011,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1205,7 +1159,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
@@ -1239,8 +1192,7 @@ mod tests {
                 &primary,
                 None,
                 &config(),
-                &SymbolFilters::unconstrained(),
-                SeriesEnd::SnapshotEnd,
+                &SymbolFilters::unconstrained()
             )
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
@@ -1251,8 +1203,7 @@ mod tests {
                 &primary,
                 None,
                 &config(),
-                &SymbolFilters::unconstrained(),
-                SeriesEnd::SnapshotEnd,
+                &SymbolFilters::unconstrained()
             )
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
@@ -1272,77 +1223,12 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::EndOfData);
         assert_eq!(result.trades[0].exit_price, d(103));
-        assert_eq!(
-            result.open_position, None,
-            "a SnapshotEnd run books the close as a trade — no mark"
-        );
-    }
-
-    /// G1 ruling (b): the SAME still-open position under `WindowEdge` is not a
-    /// trade — but it is not silently dropped either. The run record carries it
-    /// as an explicit [`OpenPositionMark`]: direction, entry fill and size as
-    /// opened, marked at the last in-window candle's close.
-    #[test]
-    fn a_position_open_at_a_window_edge_is_marked_not_closed() {
-        let primary = series(vec![
-            candle(0, 100, 101, 99, 100),
-            candle(1, 100, 101, 99, 100),
-            candle(2, 100, 101, 99, 103),
-        ]);
-        let result = run_backtest(
-            &base_strategy(),
-            &primary,
-            None,
-            &config(),
-            &SymbolFilters::unconstrained(),
-            SeriesEnd::WindowEdge,
-        )
-        .unwrap();
-
-        // No fabricated exit: the position never became a trade.
-        assert!(result.trades.is_empty(), "trades were: {:?}", result.trades);
-        assert_eq!(result.net_pnl, Decimal::ZERO);
-        assert_eq!(result.summary.trade_count, 0);
-
-        // The mark says exactly what the strategy is holding at the edge.
-        let mark = result
-            .open_position
-            .expect("a window-edge run that ends holding carries the mark");
-        assert_eq!(mark.direction, Direction::Long);
-        assert_eq!(mark.qty, d(20), "1% of 10_000 at a 5% stop on 100");
-        assert_eq!(mark.entry_price, d(100), "filled at bar 2's open");
-        assert_eq!(mark.entry_signal_time, 119_999, "bar 1's close_time");
-        assert_eq!(mark.entry_fill_time, 120_000, "bar 2's open_time");
-        assert_eq!(mark.mark_time, 179_999, "bar 2's close_time");
-        assert_eq!(mark.mark_price, d(103), "bar 2's close");
-    }
-
-    /// A `WindowEdge` run that ends FLAT carries no mark — `None` is the honest
-    /// "nothing left open", distinguishable from a mark by construction.
-    #[test]
-    fn a_window_edge_run_ending_flat_carries_no_mark() {
-        let primary = series(vec![
-            candle(0, 100, 101, 99, 100),
-            candle(1, 100, 101, 99, 100),
-        ]);
-        let result = run_backtest(
-            &compiled(never_signal(), vec![stop()]),
-            &primary,
-            None,
-            &config(),
-            &SymbolFilters::unconstrained(),
-            SeriesEnd::WindowEdge,
-        )
-        .unwrap();
-        assert!(result.trades.is_empty());
-        assert_eq!(result.open_position, None);
     }
 
     #[test]
@@ -1357,7 +1243,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1388,7 +1273,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1442,7 +1326,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1497,7 +1380,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1537,7 +1419,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1570,7 +1451,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1590,46 +1470,6 @@ mod tests {
         );
     }
 
-    /// G1: a `[from, to)` window edge is not end-of-data. The same series that
-    /// force-closes under `SnapshotEnd` must emit NO fabricated trade under
-    /// `WindowEdge` — the engine cannot know whether the real market had more
-    /// bars, so closing at the window edge would invent a trade, its P&L, and
-    /// its exit timestamp.
-    #[test]
-    fn window_edge_leaves_a_still_open_position_unclosed() {
-        let primary = series(vec![
-            candle(0, 100, 101, 99, 100),
-            candle(1, 100, 101, 99, 100),
-            candle(2, 100, 110, 96, 105),
-        ]);
-        let result = run_backtest(
-            &base_strategy(),
-            &primary,
-            None,
-            &config(),
-            &SymbolFilters::unconstrained(),
-            SeriesEnd::WindowEdge,
-        )
-        .unwrap();
-        assert!(
-            result.trades.is_empty(),
-            "window edge must not fabricate an EndOfData trade"
-        );
-
-        // Contrast on the same series: the snapshot-end interpretation still
-        // force-closes — `SeriesEnd` is the only input that differs.
-        let closed = run_backtest(
-            &base_strategy(),
-            &primary,
-            None,
-            &config(),
-            &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
-        )
-        .unwrap();
-        assert_eq!(closed.trades[0].exit_reason, ExitReason::EndOfData);
-    }
-
     /// C5 invariant on a real run: every completed trade satisfies
     /// `mfe_r >= 0 ∧ mae_r <= 0` (holds by the init-0 running sample). A direct
     /// engine-level check complementing the golden-fixture assertion.
@@ -1647,7 +1487,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 
@@ -1766,7 +1605,6 @@ mod tests {
             None,
             &bad,
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap_err();
         assert!(matches!(err, BacktestError::InvalidConfig(_)));
@@ -1797,7 +1635,6 @@ mod tests {
             None,
             &config(),
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap_err();
         assert!(matches!(err, BacktestError::ImpossibleTakeProfit(_)));
@@ -1818,8 +1655,7 @@ mod tests {
                 &primary,
                 None,
                 &config(),
-                &SymbolFilters::unconstrained(),
-                SeriesEnd::SnapshotEnd,
+                &SymbolFilters::unconstrained()
             )
             .is_ok()
         );
@@ -1847,7 +1683,6 @@ mod tests {
             None,
             &cfg,
             &SymbolFilters::unconstrained(),
-            SeriesEnd::SnapshotEnd,
         )
         .unwrap();
 

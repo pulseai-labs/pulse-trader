@@ -227,7 +227,6 @@ async fn seeded() -> (TempDir, Db, BacktestRunId) {
         slippage_total: Decimal::ZERO,
         regime_breakdown: RegimeBreakdown::default(),
         skipped_entries: SkippedEntryCounts::default(),
-        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary: SummaryStats::default(),
         equity_curve: pulse::EquityCurve::default(),

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO backtest_run (id, strategy_version_id, schema_version, created_at, engine_fingerprint, engine_target, result_content_hash, starting_equity, net_pnl, fees_total, funding_total, slippage_total, expectancy, win_rate, profit_factor, gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 42
+    },
+    "nullable": []
+  },
+  "hash": "954dc0be7c340da3db763d874eff7c92608edba77ba87d1bbcd9d5d493a18a0f"
+}

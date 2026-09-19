@@ -63,15 +63,14 @@ async fn columns_of(pool: &SqlitePool, table: &str) -> Vec<String> {
         .unwrap()
 }
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0009_*` and
-/// everything after — the binary that shipped `0008` while this item's
-/// contract was still being planned.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0009_*` — the binary
+/// that shipped `0008` while this item's contract was still being planned.
 fn shipped_set_without_0009(dir: &Path) {
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.as_str() >= "0009" {
+        if name.starts_with("0009_") {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
