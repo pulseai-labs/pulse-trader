@@ -96,7 +96,8 @@ pub use clock::Clock;
 // concrete indicator adapter implements and the backtester reads through.
 pub use dsl::{
     Comparator, Condition, DSL_SCHEMA_VERSION, Direction, ExitRule, IndicatorSpec, PriceField,
-    RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl, SweepableValue, ValueSource,
+    RiskParams, SchemaVersion, SchemaVersionParseError, Series, StrategyDsl, SweepableValue,
+    ValueSource,
 };
 pub use indicator::Indicator;
 // VS-1.1.2 work-2.03: the semantic-validation surface (FR-3 correctable rejection).
@@ -129,7 +130,7 @@ pub use ids::IdSource;
 // surface.
 pub use dsl::{
     CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, compile, stop_price, take_profit_price,
+    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
 };
 pub use error::{DataError, ValidationError};
 // VS-1.2.3 work-3.01: the build-time engine identity (FR-7 / NFR-2). Re-exported

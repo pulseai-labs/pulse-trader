@@ -337,7 +337,9 @@ mod tests {
                 SweepableValue::Fixed(period) => *period,
                 SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
             },
-            IndicatorSpec::Macd { .. } => panic!("MACD is not part of kind:period parsing"),
+            IndicatorSpec::Macd { .. } | IndicatorSpec::Atr { .. } => {
+                panic!("MACD/ATR are not part of kind:period parsing")
+            }
         }
     }
 

@@ -12,7 +12,7 @@ expected_inputs: >
 expected_outputs: >
   A sequence of builder-tool calls (one visible step each) that compose and
   finalize a schema-valid strategy; never raw DSL JSON.
-dsl_schema_version: "1.0.0"
+dsl_schema_version: "1.1.0"
 ---
 
 # Composer system prompt

@@ -595,8 +595,8 @@ mod tests {
     use crate::domain::{
         BacktestResult, Candle, CandleSeries, Comparator, Condition, DataVersion, Direction,
         EquityCurve, ExitReason, ExitRule, Fill, Pair, PriceField, Regime, RegimeBreakdown,
-        RiskParams, SchemaVersion, SkipReason, SkippedEntryCounts, StrategyDsl, SummaryStats,
-        SweepableValue, Timeframe, Trade, TradeSource, ValueSource,
+        RiskParams, SchemaVersion, Series, SkipReason, SkippedEntryCounts, StrategyDsl,
+        SummaryStats, SweepableValue, Timeframe, Trade, TradeSource, ValueSource,
     };
     use rust_decimal::Decimal;
 
@@ -608,6 +608,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Price {
+                    series: Series::Primary,
                     field: PriceField::Close,
                 },
                 op: Comparator::Gt,

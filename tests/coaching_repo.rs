@@ -30,7 +30,7 @@ use pulse::{
     ExitRule, FakeClock, Hypothesis, InMemoryCoachAcceptanceRepo, IndicatorSpec,
     InitialCoachOutcome, LlmCallId, MIGRATOR, MemoryCoachTurn, Mutation, MutationError, ParamValue,
     PreparedBacktest, PreparedCoachAcceptance, Proposal, RiskParams, SchemaVersion, SeqIdSource,
-    SessionOutcome, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, StrategyDsl, StrategyId,
+    Series, SessionOutcome, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, StrategyDsl, StrategyId,
     SweepableValue, ValueSource, VersionId, apply,
 };
 use rust_decimal::Decimal;
@@ -179,6 +179,7 @@ fn rsi_oversold_strategy() -> StrategyDsl {
         direction: Direction::Long,
         entry: Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(14),
                 },

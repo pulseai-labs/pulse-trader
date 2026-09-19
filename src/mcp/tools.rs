@@ -35,8 +35,8 @@ use crate::application::mcp_write::{
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow, CompiledValue,
-    DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun, StrategyRepository,
-    Timeframe, ValidationCode,
+    DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun, Series,
+    StrategyRepository, Timeframe, ValidationCode,
 };
 
 use super::PulseMcp;
@@ -643,7 +643,12 @@ impl PulseMcp {
                 rows.push(
                     specs
                         .iter()
-                        .map(|spec| engine.current(&CompiledValue::Indicator(spec.clone())))
+                        .map(|spec| {
+                            engine.current(&CompiledValue::Indicator {
+                                series: Series::Primary,
+                                spec: spec.clone(),
+                            })
+                        })
                         .collect::<Vec<_>>(),
                 );
             }

@@ -203,10 +203,13 @@ struct ExitPlan<'a> {
 
 impl<'a> ExitPlan<'a> {
     fn from_strategy(compiled: &'a CompiledStrategy) -> Result<Self, BacktestError> {
+        // Unsupported kinds gate FIRST (r2.s2.w1): an `AtrStop`-only strategy
+        // is a stop-family member under validation but unmodelled here, so it
+        // must surface the typed `UnsupportedExit` — not `NoStopLoss`.
+        reject_unsupported(compiled.exits())?;
         let Some(stop_distance_pct) = stop_distance(compiled.exits()) else {
             return Err(BacktestError::NoStopLoss);
         };
-        reject_unsupported(compiled.exits())?;
         let take_profit_target_r = take_profit_target(compiled.exits());
         reject_impossible_short_tp(
             compiled.direction(),
@@ -777,6 +780,13 @@ fn reject_unsupported(exits: &[CompiledExit]) -> Result<(), BacktestError> {
             CompiledExit::TimeStop { .. } => {
                 return Err(BacktestError::UnsupportedExit("TimeStop".to_owned()));
             }
+            // r2.s2.w1 compile-only arm: `CompiledExit::AtrStop` is pure data;
+            // its fill is w2's. A typed refusal, never a silent no-stop run.
+            CompiledExit::AtrStop { .. } => {
+                return Err(BacktestError::UnsupportedExit(
+                    "atr stop lands in r2.s2.w2".to_owned(),
+                ));
+            }
             _ => {}
         }
     }
@@ -793,8 +803,8 @@ mod tests {
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
-        SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile,
-        realized_pnl, validate,
+        Series, SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource,
+        compile, realized_pnl, validate,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -862,6 +872,7 @@ mod tests {
     fn price_entry() -> Condition {
         Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: PriceField::Close,
             },
             op: Comparator::Gt,
@@ -874,6 +885,7 @@ mod tests {
     fn never_signal() -> Condition {
         Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: PriceField::Close,
             },
             op: Comparator::Lt,
@@ -886,6 +898,7 @@ mod tests {
     fn signal_on_high_close() -> Condition {
         Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: PriceField::Close,
             },
             op: Comparator::Gt,
@@ -1257,6 +1270,35 @@ mod tests {
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
         ));
+    }
+
+    /// r2.s2.w1 compile-only arm: an `AtrStop` is a valid stop-family member
+    /// under validation but unmodelled here — the run refuses it with the
+    /// typed `UnsupportedExit`, never a silent no-stop backtest.
+    #[test]
+    fn atr_stop_is_rejected_with_typed_unsupported() {
+        let primary = series(vec![candle(0, 100, 101, 99, 100)]);
+        let strategy = compiled(
+            price_entry(),
+            vec![ExitRule::AtrStop {
+                period: SweepableValue::Fixed(14),
+                multiple: SweepableValue::Fixed(d(2)),
+            }],
+        );
+
+        let err = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BacktestError::UnsupportedExit("atr stop lands in r2.s2.w2".to_owned())
+        );
     }
 
     #[test]

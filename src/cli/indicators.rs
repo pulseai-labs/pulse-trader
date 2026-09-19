@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::{CandleSeriesRepository, CompiledValue, EvalContext, IndicatorEngine, Pair};
+use crate::{CandleSeriesRepository, CompiledValue, EvalContext, IndicatorEngine, Pair, Series};
 use rust_decimal::Decimal;
 
 // r2.s1.w2: the `<kind>:<period>` parser moved to `crate::application::mcp_read`
@@ -105,7 +105,12 @@ pub(crate) fn render_row(open_time: i64, values: &[Option<Decimal>]) -> String {
 fn current_values(engine: &IndicatorEngine, columns: &[IndicatorColumn]) -> Vec<Option<Decimal>> {
     columns
         .iter()
-        .map(|column| engine.current(&CompiledValue::Indicator(column.spec.clone())))
+        .map(|column| {
+            engine.current(&CompiledValue::Indicator {
+                series: Series::Primary,
+                spec: column.spec.clone(),
+            })
+        })
         .collect()
 }
 

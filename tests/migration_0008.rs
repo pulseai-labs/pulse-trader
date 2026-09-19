@@ -30,7 +30,7 @@ use pulse::{
     Condition, DataVersion, Db, Direction, Disposition, EquityCurve, ExitReason, ExitRule,
     FakeClock, Fill, FundingConfig, Hypothesis, IndicatorSpec, InitialCoachOutcome, LlmCallId,
     MIGRATOR, Mutation, Pair, ParamValue, PreparedBacktest, PreparedCoachAcceptance, Proposal,
-    Regime, RegimeBreakdown, RiskParams, SchemaVersion, SeqIdSource, SessionOutcome,
+    Regime, RegimeBreakdown, RiskParams, SchemaVersion, SeqIdSource, Series, SessionOutcome,
     SkippedEntryCounts, SnapshotSelection, SqliteCoachAcceptanceRepo, SqliteCoachingRepo,
     StrategyDsl, SummaryStats, SweepableValue, Timeframe, Trade, TradeSource, ValueSource,
     VersionId, undo_to,
@@ -1836,6 +1836,7 @@ fn child_dsl() -> StrategyDsl {
         direction: Direction::Long,
         entry: Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(21),
                 },

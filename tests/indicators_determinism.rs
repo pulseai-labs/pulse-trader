@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use pulse::{
-    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair,
+    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair, Series,
     SweepableValue, Timeframe,
 };
 use rust_decimal::Decimal;
@@ -57,7 +57,10 @@ fn load_candles() -> Vec<Candle> {
 }
 
 fn current(engine: &IndicatorEngine, spec: &IndicatorSpec) -> Option<Decimal> {
-    engine.current(&CompiledValue::Indicator(spec.clone()))
+    engine.current(&CompiledValue::Indicator {
+        series: Series::Primary,
+        spec: spec.clone(),
+    })
 }
 
 fn run_once(candles: &[Candle]) -> Vec<IndicatorSnapshot> {

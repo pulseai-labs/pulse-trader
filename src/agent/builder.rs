@@ -159,13 +159,14 @@ mod tests {
     use super::StrategyBuilder;
     use crate::domain::{
         Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, RiskParams,
-        SchemaVersion, SweepableValue, ValidationCode, ValueSource,
+        SchemaVersion, Series, SweepableValue, ValidationCode, ValueSource,
     };
     use rust_decimal::Decimal;
 
     fn valid_entry() -> Condition {
         Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(14),
                 },
@@ -180,10 +181,12 @@ mod tests {
     fn ema_filter(period: u32) -> Condition {
         Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: PriceField::Close,
             },
             op: Comparator::Gt,
             rhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Ema {
                     period: SweepableValue::Fixed(period),
                 },
@@ -237,6 +240,7 @@ mod tests {
         // violation (`entry.indicator.macd.fast`, code FieldRange).
         builder.set_entry(Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Macd {
                     fast: SweepableValue::Fixed(26),
                     slow: SweepableValue::Fixed(12),

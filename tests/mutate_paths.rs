@@ -2,8 +2,10 @@
 //! in `validate.rs`'s locator grammar (r1.s2.w1, ADR-0021 decision 4 / audit C6).
 //!
 //! Two claims, both asserted here against ONE representative strategy that
-//! exercises every leaf-bearing shape the DSL has — all four indicators, nested
-//! `And`/`Or`/`Not`, a filter, all five exit kinds, and the risk params:
+//! exercises every leaf-bearing shape the DSL has — all five indicators, nested
+//! `And`/`Or`/`Not`, a primary + an `htf` filter, every exit kind validation
+//! permits at once (`StopLoss` and `AtrStop` are one exclusive family — the
+//! fixture carries `AtrStop`, the schema-1.1.0 member), and the risk params:
 //!
 //!   1. **Totality.** Every sweepable numeric leaf is addressable, and the set of
 //!      addressable paths is exactly the set of leaves — no leaf is unreachable
@@ -23,7 +25,7 @@
 
 use pulse::{
     Comparator, Condition, Direction, ExitRule, IndicatorSpec, Mutation, MutationError, ParamValue,
-    PriceField, RiskParams, SchemaVersion, StrategyDsl, SweepableValue, ValueSource, apply,
+    PriceField, RiskParams, SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource, apply,
     sweepable_paths, validate,
 };
 use rust_decimal::Decimal;
@@ -39,6 +41,7 @@ fn representative_strategy() -> StrategyDsl {
             conditions: vec![
                 Condition::Compare {
                     lhs: ValueSource::Indicator {
+                        series: Series::Primary,
                         spec: IndicatorSpec::Rsi {
                             period: SweepableValue::Fixed(14),
                         },
@@ -51,6 +54,7 @@ fn representative_strategy() -> StrategyDsl {
                 Condition::Not {
                     condition: Box::new(Condition::Compare {
                         lhs: ValueSource::Indicator {
+                            series: Series::Primary,
                             spec: IndicatorSpec::Adx {
                                 period: SweepableValue::Fixed(20),
                             },
@@ -65,16 +69,19 @@ fn representative_strategy() -> StrategyDsl {
                     conditions: vec![
                         Condition::CrossesAbove {
                             lhs: ValueSource::Indicator {
+                                series: Series::Primary,
                                 spec: IndicatorSpec::Ema {
                                     period: SweepableValue::Fixed(9),
                                 },
                             },
                             rhs: ValueSource::Price {
+                                series: Series::Primary,
                                 field: PriceField::Close,
                             },
                         },
                         Condition::Compare {
                             lhs: ValueSource::Indicator {
+                                series: Series::Primary,
                                 spec: IndicatorSpec::Macd {
                                     fast: SweepableValue::Fixed(12),
                                     slow: SweepableValue::Fixed(26),
@@ -88,22 +95,56 @@ fn representative_strategy() -> StrategyDsl {
                         },
                     ],
                 },
+                // schema 1.1.0: an `Atr` operand (a new indicator leaf).
+                Condition::Compare {
+                    lhs: ValueSource::Indicator {
+                        series: Series::Primary,
+                        spec: IndicatorSpec::Atr {
+                            period: SweepableValue::Fixed(14),
+                        },
+                    },
+                    op: Comparator::Gt,
+                    rhs: ValueSource::Constant {
+                        value: Decimal::ZERO,
+                    },
+                },
             ],
         },
-        filters: vec![Condition::Compare {
-            lhs: ValueSource::Indicator {
-                spec: IndicatorSpec::Ema {
-                    period: SweepableValue::Fixed(50),
+        filters: vec![
+            Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec: IndicatorSpec::Ema {
+                        period: SweepableValue::Fixed(50),
+                    },
+                },
+                op: Comparator::Gt,
+                rhs: ValueSource::Price {
+                    series: Series::Primary,
+                    field: PriceField::Close,
                 },
             },
-            op: Comparator::Gt,
-            rhs: ValueSource::Price {
-                field: PriceField::Close,
+            // schema 1.1.0: an `htf`-tagged `Ema` filter — `series` is grammar,
+            // not a leaf; the Ema's period is.
+            Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Htf,
+                    spec: IndicatorSpec::Ema {
+                        period: SweepableValue::Fixed(200),
+                    },
+                },
+                op: Comparator::Gt,
+                rhs: ValueSource::Constant {
+                    value: Decimal::new(100, 0),
+                },
             },
-        }],
+        ],
         exits: vec![
-            ExitRule::StopLoss {
-                distance_pct: SweepableValue::Fixed(Decimal::new(5, 2)),
+            // schema 1.1.0: `AtrStop` occupies the stop family (`StopLoss` and
+            // `AtrStop` are exclusive — only one may appear).
+            ExitRule::AtrStop {
+                period: SweepableValue::Fixed(14),
+                multiple: SweepableValue::Fixed(Decimal::new(2, 0)),
             },
             ExitRule::TakeProfit {
                 target_r: SweepableValue::Fixed(Decimal::new(2, 0)),
@@ -117,6 +158,7 @@ fn representative_strategy() -> StrategyDsl {
             ExitRule::SignalExit {
                 condition: Condition::Compare {
                     lhs: ValueSource::Indicator {
+                        series: Series::Primary,
                         spec: IndicatorSpec::Rsi {
                             period: SweepableValue::Fixed(14),
                         },
@@ -135,6 +177,19 @@ fn representative_strategy() -> StrategyDsl {
     }
 }
 
+/// The same representative strategy minus the `htf` filter.
+///
+/// `apply()` compiles its candidate, and `series: "htf"` is the schema-1.1.0
+/// compile gate ([`CompileError::HtfUnsupported`]) — so every apply-driven
+/// claim below runs against this all-primary variant; the `htf` filter still
+/// proves its addressing claim (a `series` tag is not a leaf, the indicator's
+/// period is) through `sweepable_paths` on the full fixture.
+fn representative_strategy_primary_only() -> StrategyDsl {
+    let mut dsl = representative_strategy();
+    dsl.filters.truncate(1);
+    dsl
+}
+
 /// Every sweepable leaf of [`representative_strategy`], in traversal order.
 /// Hand-derived from the fixture: if a leaf is added to the fixture and the
 /// traversal does not reach it (or reaches it by another name), this list is what
@@ -146,8 +201,11 @@ const EXPECTED_PATHS: &[&str] = &[
     "entry.and[2].or[1].lhs.indicator.macd.fast",
     "entry.and[2].or[1].lhs.indicator.macd.slow",
     "entry.and[2].or[1].lhs.indicator.macd.signal",
+    "entry.and[3].lhs.indicator.atr.period",
     "filters[0].lhs.indicator.ema.period",
-    "exits[0].distance_pct",
+    "filters[1].lhs.indicator.ema.period",
+    "exits[0].period",
+    "exits[0].multiple",
     "exits[1].target_r",
     "exits[2].trail_pct",
     "exits[3].max_bars",
@@ -245,7 +303,9 @@ fn every_addressable_path_has_exactly_one_leaf_kind() {
 
 #[test]
 fn a_type_correct_mutation_on_every_period_leaf_applies() {
-    let dsl = representative_strategy();
+    // `representative_strategy_primary_only`: `apply` compiles its candidate,
+    // and the full fixture's `htf` filter hits the schema-1.1.0 compile gate.
+    let dsl = representative_strategy_primary_only();
 
     // Every period leaf except MACD's, which is cross-field constrained
     // (`fast < slow`) and therefore not independently settable to one value.
@@ -253,7 +313,9 @@ fn a_type_correct_mutation_on_every_period_leaf_applies() {
         "entry.and[0].lhs.indicator.rsi.period",
         "entry.and[1].not.lhs.indicator.adx.period",
         "entry.and[2].or[0].lhs.indicator.ema.period",
+        "entry.and[3].lhs.indicator.atr.period",
         "filters[0].lhs.indicator.ema.period",
+        "exits[0].period",
         "exits[3].max_bars",
         "exits[4].condition.lhs.indicator.rsi.period",
     ];
@@ -274,14 +336,17 @@ fn a_type_correct_mutation_on_every_period_leaf_applies() {
 
 #[test]
 fn a_validate_field_error_path_is_an_addressable_mutation_path() {
+    // `representative_strategy_primary_only`: `apply` compiles its candidate —
+    // the full fixture's `htf` filter hits the compile gate.
     // Break one leaf so `validate` has something to point at, and take the path
     // from ITS mouth rather than writing it out again here.
-    let mut broken = representative_strategy();
+    let mut broken = representative_strategy_primary_only();
     broken.entry = Condition::And {
         conditions: match broken.entry {
             Condition::And { mut conditions } => {
                 conditions[0] = Condition::Compare {
                     lhs: ValueSource::Indicator {
+                        series: Series::Primary,
                         spec: IndicatorSpec::Rsi {
                             period: SweepableValue::Fixed(0),
                         },
@@ -305,7 +370,7 @@ fn a_validate_field_error_path_is_an_addressable_mutation_path() {
         .expect("validate must report the zero RSI period");
 
     // The grammar claim: validate's locator IS a mutation path.
-    let healthy = representative_strategy();
+    let healthy = representative_strategy_primary_only();
     assert!(
         sweepable_paths(&healthy).contains(&field_error.path),
         "validate reported `{}`, which mutation paths must also address: {:?}",
@@ -341,6 +406,9 @@ fn unknown_and_non_parameter_paths_are_typed_inapplicability() {
         "entry.and[0].lhs.indicator.rsi",
         "exits",
         "exits[0]",
+        // `exits[0]` is an AtrStop — the old stop family's leaf name is a
+        // near-miss, not an address.
+        "exits[0].distance_pct",
         "risk",
         // A leaf of the wrong indicator at a real address.
         "entry.and[0].lhs.indicator.ema.period",
@@ -348,7 +416,7 @@ fn unknown_and_non_parameter_paths_are_typed_inapplicability() {
         "entry.and[0].rhs.indicator.rsi.period",
         "entry.and[2].or[0].rhs.indicator.ema.period",
         // Indices past the end.
-        "filters[1].lhs.indicator.ema.period",
+        "filters[2].lhs.indicator.ema.period",
         "exits[5].distance_pct",
         "entry.and[3].lhs.indicator.rsi.period",
         "entry.and[2].or[2].lhs.indicator.ema.period",

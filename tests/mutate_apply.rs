@@ -21,8 +21,8 @@
 
 use pulse::{
     CandidateDsl, Comparator, Condition, Direction, ExitRule, IndicatorSpec, Mutation,
-    MutationError, ParamKind, ParamValue, RiskParams, SchemaVersion, StrategyDsl, SweepableValue,
-    ValueSource, apply, compile,
+    MutationError, ParamKind, ParamValue, RiskParams, SchemaVersion, Series, StrategyDsl,
+    SweepableValue, ValueSource, apply, compile,
 };
 use rust_decimal::Decimal;
 
@@ -36,6 +36,7 @@ fn rsi_oversold_strategy() -> StrategyDsl {
         direction: Direction::Long,
         entry: Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(14),
                 },
@@ -81,6 +82,7 @@ fn entry_rsi_period(dsl: &StrategyDsl) -> &SweepableValue<u32> {
         Condition::Compare {
             lhs:
                 ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi { period },
                 },
             ..
@@ -110,6 +112,7 @@ fn set_param_yields_a_candidate_that_validated_and_compiles() {
     let mut expected = rsi_oversold_strategy();
     expected.entry = Condition::Compare {
         lhs: ValueSource::Indicator {
+            series: Series::Primary,
             spec: IndicatorSpec::Rsi {
                 period: SweepableValue::Fixed(21),
             },
@@ -311,6 +314,7 @@ fn validation_failure_carries_the_field_errors() {
     let mut macd = rsi_oversold_strategy();
     macd.entry = Condition::Compare {
         lhs: ValueSource::Indicator {
+            series: Series::Primary,
             spec: IndicatorSpec::Macd {
                 fast: SweepableValue::Fixed(12),
                 slow: SweepableValue::Fixed(26),
@@ -408,6 +412,7 @@ fn fixing_a_swept_leaf_at_its_current_value_is_a_real_change() {
     let mut dsl = rsi_oversold_strategy();
     dsl.entry = Condition::Compare {
         lhs: ValueSource::Indicator {
+            series: Series::Primary,
             spec: IndicatorSpec::Rsi {
                 period: SweepableValue::Sweep {
                     start: 10,

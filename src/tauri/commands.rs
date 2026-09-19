@@ -89,7 +89,7 @@ use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
     BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, Clock, Comparator,
     Condition, CredentialStatus, DataError, Direction, EngineFingerprint, ExitRule, IndicatorSpec,
-    LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse, Message, PriceField,
+    LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse, Message, PriceField, Series,
     SnapshotSelection, StrategyDsl, StrategyRepository, SweepableValue, ToolDefinition,
     ValueSource,
 };
@@ -873,15 +873,29 @@ fn render_comparator(op: Comparator) -> &'static str {
 fn render_value_source(source: &ValueSource) -> String {
     match source {
         ValueSource::Constant { value } => value.normalize().to_string(),
-        ValueSource::Price { field } => match field {
-            PriceField::Open => "open",
-            PriceField::High => "high",
-            PriceField::Low => "low",
-            PriceField::Close => "close",
-            PriceField::Volume => "volume",
+        ValueSource::Price { series, field } => render_series_tag(
+            *series,
+            match field {
+                PriceField::Open => "open",
+                PriceField::High => "high",
+                PriceField::Low => "low",
+                PriceField::Close => "close",
+                PriceField::Volume => "volume",
+            }
+            .to_owned(),
+        ),
+        ValueSource::Indicator { series, spec } => {
+            render_series_tag(*series, render_indicator(spec))
         }
-        .to_owned(),
-        ValueSource::Indicator { spec } => render_indicator(spec),
+    }
+}
+
+/// The `series` tag as a text prefix — schema 1.1.0's only higher timeframe is
+/// H4, so an `htf` operand reads `h4:…`; `primary` renders bare.
+fn render_series_tag(series: Series, text: String) -> String {
+    match series {
+        Series::Primary => text,
+        Series::Htf => format!("h4:{text}"),
     }
 }
 
@@ -897,6 +911,7 @@ fn render_indicator(spec: &IndicatorSpec) -> String {
             render_sweepable(slow),
             render_sweepable(signal)
         ),
+        IndicatorSpec::Atr { period } => format!("atr({})", render_sweepable(period)),
     }
 }
 
@@ -914,6 +929,11 @@ fn render_exit(rule: &ExitRule) -> String {
         ExitRule::SignalExit { condition } => {
             format!("signal_exit {}", render_condition(condition))
         }
+        ExitRule::AtrStop { period, multiple } => format!(
+            "atr_stop {} x{}",
+            render_sweepable(period),
+            render_sweepable(multiple)
+        ),
     }
 }
 

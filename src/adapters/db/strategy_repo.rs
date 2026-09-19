@@ -1101,8 +1101,8 @@ mod tests {
     use crate::domain::strategy::{CreatedBy, NewVersion, StrategyId, VersionId};
     use crate::domain::{
         Comparator, Condition, Direction, ExitRule, IndicatorSpec, Migration, MigrationError,
-        MigrationKind, Migrator, RiskParams, SchemaVersion, StrategyDsl, StrategyRepository,
-        SweepableValue, ValueSource,
+        MigrationKind, Migrator, RiskParams, SchemaVersion, Series, StrategyDsl,
+        StrategyRepository, SweepableValue, ValueSource,
     };
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
@@ -1134,6 +1134,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },
@@ -1486,10 +1487,10 @@ mod tests {
 
     // ---- AC-19 (gate-2 Q1): migrate-on-write via an injected migrator -------
 
-    /// A synthetic minor migration `0.9.0 → 1.0.0` renaming `strat_name → name`
-    /// and stamping the current `schema_version`. A NON-CAPTURING named `fn`
-    /// (Migration.apply is a bare fn pointer, §4a-5) — mirrors migrate.rs's own
-    /// `synthetic_minor_0_9_to_1_0`.
+    /// A synthetic minor migration `0.9.0 → CURRENT` renaming `strat_name →
+    /// name` and stamping the current `schema_version`. A NON-CAPTURING named
+    /// `fn` (Migration.apply is a bare fn pointer, §4a-5) — mirrors migrate.rs's
+    /// own `synthetic_minor_0_9_to_1_0`.
     fn synthetic_minor_0_9_to_1_0() -> Migration {
         fn apply(mut value: Value) -> Result<Value, MigrationError> {
             let obj = value
@@ -1499,7 +1500,10 @@ mod tests {
                 .remove("strat_name")
                 .ok_or_else(|| MigrationError("old doc missing `strat_name`".to_owned()))?;
             obj.insert("name".to_owned(), name);
-            obj.insert("schema_version".to_owned(), json!("1.0.0"));
+            obj.insert(
+                "schema_version".to_owned(),
+                json!(SchemaVersion::CURRENT.to_string()),
+            );
             Ok(value)
         }
         Migration {

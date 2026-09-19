@@ -247,9 +247,12 @@ fn is_constant(v: &ValueSource) -> bool {
 }
 
 /// Validate a `ValueSource` — only `Indicator` carries sweepable period fields
-/// (rules 1/6); `Constant`/`Price` carry no validatable numeric leaf.
+/// (rules 1/6); `Constant`/`Price` carry no validatable numeric leaf. `series`
+/// is total over its two values at deserialization and carries **no** rule —
+/// which series a run loads is an engine concern (w2's typed `HtfRequired`), a
+/// document is valid independent of it.
 fn check_value_source(v: &ValueSource, path: &str, errors: &mut Vec<FieldError>) {
-    if let ValueSource::Indicator { spec } = v {
+    if let ValueSource::Indicator { spec, .. } = v {
         check_indicator(spec, &format!("{path}.indicator"), errors);
     }
 }
@@ -288,6 +291,9 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
                     ),
                 });
             }
+        }
+        IndicatorSpec::Atr { period } => {
+            check_u32_positive(period, &format!("{path}.atr.period"), "ATR period", errors);
         }
     }
 }
@@ -379,22 +385,38 @@ fn check_exits(exits: &[ExitRule], errors: &mut Vec<FieldError>) {
             ExitRule::SignalExit { condition } => {
                 check_condition(condition, &format!("{base}.condition"), errors);
             }
+            ExitRule::AtrStop { period, multiple } => {
+                // The ATR-multiple stop shares StopLoss's exclusive family
+                // (rule 5) and satisfies rule 3's stop requirement.
+                has_stop = true;
+                count_stop += 1;
+                // Rule 6: period > 0; multiple in (0, 10].
+                check_u32_positive(period, &format!("{base}.period"), "ATR period", errors);
+                check_decimal_atr_multiple(
+                    multiple,
+                    &format!("{base}.multiple"),
+                    "atr-stop multiple",
+                    errors,
+                );
+            }
         }
     }
 
-    // Rule 3: TakeProfit requires a StopLoss in the same strategy.
+    // Rule 3: TakeProfit requires a stop (StopLoss or AtrStop) in the same
+    // strategy.
     if has_take_profit && !has_stop {
         errors.push(FieldError {
             path: "exits".to_owned(),
             code: ValidationCode::TakeProfitWithoutStop,
-            message: "a TakeProfit exit requires a StopLoss in the same strategy (R is undefined \
-                      without a stop)"
+            message: "a TakeProfit exit requires a StopLoss or AtrStop in the same strategy (R is \
+                      undefined without a stop)"
                 .to_owned(),
         });
     }
 
-    // Rule 5: no duplicate exclusive exits (multiple SignalExit allowed).
-    push_dup(count_stop, "StopLoss", errors);
+    // Rule 5: no duplicate exclusive exits (StopLoss and AtrStop are ONE
+    // exclusive family; multiple SignalExit allowed).
+    push_dup(count_stop, "stop (StopLoss or AtrStop)", errors);
     push_dup(count_take_profit, "TakeProfit", errors);
     push_dup(count_trailing, "TrailingStop", errors);
     push_dup(count_time, "TimeStop", errors);
@@ -488,6 +510,29 @@ fn check_decimal_positive(
     }
 }
 
+/// Rule 6 for a `SweepableValue<Decimal>` that must lie in `(0, 10]` — the
+/// `AtrStop` `multiple` bound (schema 1.1.0). A `Sweep` short-circuits to
+/// [`ValidationCode::SweepUnsupported`] exactly as the other decimal checks do.
+fn check_decimal_atr_multiple(
+    v: &SweepableValue<Decimal>,
+    path: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    match v {
+        SweepableValue::Sweep { .. } => push_sweep(path, errors),
+        SweepableValue::Fixed(d) => {
+            if *d <= Decimal::ZERO || *d > Decimal::TEN {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::FieldRange,
+                    message: format!("{label} must be an ATR multiple in the range (0, 10]"),
+                });
+            }
+        }
+    }
+}
+
 /// Push a [`ValidationCode::SweepUnsupported`] for a `Sweep` value at `path`
 /// (rule 1). A `Sweep` short-circuits the field's range check (no spurious
 /// `FieldRange` for the same field).
@@ -509,7 +554,7 @@ mod tests {
     use crate::domain::dsl::schema_version::SchemaVersion;
     use crate::domain::dsl::strategy::StrategyDsl;
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, Series, ValueSource};
     use rust_decimal::Decimal;
 
     /// The canonical demo-1 RSI-oversold strategy (the 2.02 fixture): long when
@@ -521,6 +566,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },
@@ -576,6 +622,7 @@ mod tests {
         let mut s = valid_base();
         s.entry = Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Sweep {
                         start: 5,
@@ -680,6 +727,7 @@ mod tests {
         let mut s = valid_base();
         s.entry = Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(0),
                 },
@@ -701,6 +749,7 @@ mod tests {
         let mut s = valid_base();
         s.entry = Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Macd {
                     fast: SweepableValue::Fixed(26),
                     slow: SweepableValue::Fixed(12),
@@ -770,6 +819,7 @@ mod tests {
             conditions: vec![Condition::Not {
                 condition: Box::new(Condition::Compare {
                     lhs: ValueSource::Indicator {
+                        series: Series::Primary,
                         spec: IndicatorSpec::Rsi {
                             period: SweepableValue::Fixed(0),
                         },
