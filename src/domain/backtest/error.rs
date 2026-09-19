@@ -58,4 +58,12 @@ pub enum BacktestError {
     /// sizing/fill math nonsensical inputs.
     #[error("invalid backtest configuration: {0}")]
     InvalidConfig(String),
+
+    /// The compiled strategy references a `series: "htf"` operand but no
+    /// higher-timeframe candle series was supplied (schema 1.1.0, r2.s2.w2).
+    /// The engine raises this rather than silently evaluating an `Htf` leaf
+    /// against primary data; the application ring checks it first and reports
+    /// the missing input field.
+    #[error("strategy requires a higher-timeframe candle series (series: \"htf\" operand present)")]
+    HtfRequired,
 }

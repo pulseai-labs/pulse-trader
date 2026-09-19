@@ -260,11 +260,12 @@ const REGIME_LABELS: Record<string, string> = {
   unknown: "Unknown",
 };
 
-/** The 18 trade columns in the DTO's own field order. */
+/** The 19 trade columns in the DTO's own field order. */
 const TRADE_FIELDS = [
   "direction", "qty", "entryPrice", "exitPrice", "entrySignalTime", "entryFillTime",
   "exitSignalTime", "exitFillTime", "feesTotal", "fundingTotal", "slippageTotal",
   "realizedPnl", "realizedR", "mfeR", "maeR", "exitReason", "source", "regime",
+  "stopPrice",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -904,7 +905,8 @@ function TradeTable({ trades }: { trades: TradeRowDto[] }) {
               <tr key={i}>
                 {TRADE_FIELDS.map((field) => (
                   <td key={field} className="mono">
-                    {trade[field]}
+                    {/* `stopPrice` is `string | null` — a pre-0011 row renders `—` (r2.s2.w2). */}
+                    {trade[field] ?? "—"}
                   </td>
                 ))}
               </tr>

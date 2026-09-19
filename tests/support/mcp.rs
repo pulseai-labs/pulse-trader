@@ -123,6 +123,7 @@ pub fn seeded_trade() -> Trade {
         exit_reason: ExitReason::TakeProfit,
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
+        stop_price: Some(Decimal::new(89_450, 0)),
     }
 }
 
@@ -248,6 +249,38 @@ pub async fn seed_real_run(db: &Db, store_dir: &Path, version_id: &VersionId) ->
     )
     .await
     .expect("the seeded real run completes over the fixture")
+    .run
+    .id
+}
+
+/// [`seed_real_run`] without the HTF snapshot: the persisted run records
+/// `inputs.htf = None`, which is what leaves a child's resolved request without
+/// an HTF timeframe — the `HtfRequired` trigger (r2.s2.w2).
+pub async fn seed_real_run_primary_only(
+    db: &Db,
+    store_dir: &Path,
+    version_id: &VersionId,
+) -> BacktestRunId {
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let store = CandleStore::with_base_dir(store_dir.to_path_buf());
+    run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &BacktestRequest {
+            version_id: version_id.clone(),
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: None,
+            config: BacktestConfig::default(),
+            snapshots: None,
+            window: None,
+        },
+    )
+    .await
+    .expect("the seeded M15-only run completes over the fixture")
     .run
     .id
 }

@@ -177,19 +177,6 @@ fn representative_strategy() -> StrategyDsl {
     }
 }
 
-/// The same representative strategy minus the `htf` filter.
-///
-/// `apply()` compiles its candidate, and `series: "htf"` is the schema-1.1.0
-/// compile gate ([`CompileError::HtfUnsupported`]) — so every apply-driven
-/// claim below runs against this all-primary variant; the `htf` filter still
-/// proves its addressing claim (a `series` tag is not a leaf, the indicator's
-/// period is) through `sweepable_paths` on the full fixture.
-fn representative_strategy_primary_only() -> StrategyDsl {
-    let mut dsl = representative_strategy();
-    dsl.filters.truncate(1);
-    dsl
-}
-
 /// Every sweepable leaf of [`representative_strategy`], in traversal order.
 /// Hand-derived from the fixture: if a leaf is added to the fixture and the
 /// traversal does not reach it (or reaches it by another name), this list is what
@@ -303,9 +290,10 @@ fn every_addressable_path_has_exactly_one_leaf_kind() {
 
 #[test]
 fn a_type_correct_mutation_on_every_period_leaf_applies() {
-    // `representative_strategy_primary_only`: `apply` compiles its candidate,
-    // and the full fixture's `htf` filter hits the schema-1.1.0 compile gate.
-    let dsl = representative_strategy_primary_only();
+    // The full fixture compiles end to end now — `series: "htf"` is evaluated
+    // by w2's dual-series engine, so the `htf` filter's own period leaf is
+    // addressable too.
+    let dsl = representative_strategy();
 
     // Every period leaf except MACD's, which is cross-field constrained
     // (`fast < slow`) and therefore not independently settable to one value.
@@ -315,6 +303,7 @@ fn a_type_correct_mutation_on_every_period_leaf_applies() {
         "entry.and[2].or[0].lhs.indicator.ema.period",
         "entry.and[3].lhs.indicator.atr.period",
         "filters[0].lhs.indicator.ema.period",
+        "filters[1].lhs.indicator.ema.period",
         "exits[0].period",
         "exits[3].max_bars",
         "exits[4].condition.lhs.indicator.rsi.period",
@@ -336,11 +325,9 @@ fn a_type_correct_mutation_on_every_period_leaf_applies() {
 
 #[test]
 fn a_validate_field_error_path_is_an_addressable_mutation_path() {
-    // `representative_strategy_primary_only`: `apply` compiles its candidate —
-    // the full fixture's `htf` filter hits the compile gate.
     // Break one leaf so `validate` has something to point at, and take the path
     // from ITS mouth rather than writing it out again here.
-    let mut broken = representative_strategy_primary_only();
+    let mut broken = representative_strategy();
     broken.entry = Condition::And {
         conditions: match broken.entry {
             Condition::And { mut conditions } => {
@@ -370,7 +357,7 @@ fn a_validate_field_error_path_is_an_addressable_mutation_path() {
         .expect("validate must report the zero RSI period");
 
     // The grammar claim: validate's locator IS a mutation path.
-    let healthy = representative_strategy_primary_only();
+    let healthy = representative_strategy();
     assert!(
         sweepable_paths(&healthy).contains(&field_error.path),
         "validate reported `{}`, which mutation paths must also address: {:?}",

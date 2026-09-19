@@ -1023,6 +1023,11 @@ export type TradeRowDto = {
 	source: string,
 	/**  The regime at entry. */
 	regime: string,
+	/**
+	 *  The recorded per-trade stop, exact decimal string (r2.s2.w2 / migration
+	 *  0011). `null` on a row written before the column existed.
+	 */
+	stopPrice: string | null,
 };
 
 /**

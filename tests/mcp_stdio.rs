@@ -249,11 +249,23 @@ async fn run_tools_return_the_seeded_run() {
     assert_eq!(lines.len(), 2, "header + one trade row");
     assert!(lines[0].contains("realized_pnl"));
     assert!(lines[0].contains("mfe_r"));
+    // r2.s2.w2: the recorded per-trade stop is the 20th column — the seeded
+    // trade's 89450 stop must appear in the row, not just the header.
+    assert!(lines[0].contains("stop_price"));
     assert!(lines[1].contains("take_profit"));
+    assert!(
+        lines[1].split('\t').next_back() == Some("89450"),
+        "the stop cell carries the persisted stop_price: {}",
+        lines[1]
+    );
     let columns = exported["columns"].as_array().expect("columns array");
     assert!(
         columns.iter().any(|c| c == "regime"),
         "columns names the trade fields"
+    );
+    assert!(
+        columns.iter().any(|c| c == "stop_price"),
+        "columns names the recorded stop"
     );
 
     client.cancel().await.expect("cancel session");

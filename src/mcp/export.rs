@@ -106,9 +106,10 @@ impl Exports {
 }
 
 /// Render the trades CSV: one header naming every [`Trade`] field, one row per
-/// trade in `seq` order. `fills` (the only non-scalar field) is a JSON cell.
+/// trade in `seq` order. `fills` (the only non-scalar field) is a JSON cell;
+/// `stop_price` (the only nullable one) is an empty cell for pre-0011 rows.
 pub(crate) fn trades_csv(trades: &[Trade]) -> String {
-    const HEADER: &str = "direction\tqty\tentry_price\texit_price\tentry_signal_time\tentry_fill_time\texit_signal_time\texit_fill_time\tfills\tfees_total\tfunding_total\tslippage_total\trealized_pnl\trealized_r\tmfe_r\tmae_r\texit_reason\tsource\tregime";
+    const HEADER: &str = "direction\tqty\tentry_price\texit_price\tentry_signal_time\tentry_fill_time\texit_signal_time\texit_fill_time\tfills\tfees_total\tfunding_total\tslippage_total\trealized_pnl\trealized_r\tmfe_r\tmae_r\texit_reason\tsource\tregime\tstop_price";
     let mut out = String::with_capacity(trades.len() * 192 + HEADER.len() + 1);
     out.push_str(HEADER);
     out.push('\n');
@@ -117,7 +118,7 @@ pub(crate) fn trades_csv(trades: &[Trade]) -> String {
         // A String's fmt::Write impl cannot fail.
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             json_scalar(&t.direction),
             t.qty.normalize(),
             t.entry_price.normalize(),
@@ -137,6 +138,8 @@ pub(crate) fn trades_csv(trades: &[Trade]) -> String {
             json_scalar(&t.exit_reason),
             json_scalar(&t.source),
             json_scalar(&t.regime),
+            t.stop_price
+                .map_or_else(String::new, |s| s.normalize().to_string()),
         );
     }
     out

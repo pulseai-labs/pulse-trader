@@ -152,6 +152,9 @@ pub struct TradeRowDto {
     pub source: String,
     /// The regime at entry.
     pub regime: String,
+    /// The recorded per-trade stop, exact decimal string (r2.s2.w2 / migration
+    /// 0011). `null` on a row written before the column existed.
+    pub stop_price: Option<String>,
 }
 
 /// The complete Backtest Lab response.
@@ -455,6 +458,7 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
         exit_reason: exit_reason_label(trade.exit_reason).to_owned(),
         source: trade_source_label(trade.source).to_owned(),
         regime: regime_label(trade.regime).to_owned(),
+        stop_price: trade.stop_price.map(dec),
     }
 }
 

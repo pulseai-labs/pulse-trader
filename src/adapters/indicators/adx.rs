@@ -21,57 +21,9 @@
 //! port.
 
 use crate::adapters::indicators::convert::{decimal_to_f64, f64_to_decimal_rounded};
+use crate::adapters::indicators::wilder::{WilderRma, true_range};
 use crate::domain::{Candle, Indicator};
 use rust_decimal::Decimal;
-
-/// A hand-rolled **Wilder RMA** (`α = 1/period`), seeded by the simple average of
-/// the first `period` values, then `S_t = S_{t−1} + (x_t − S_{t−1})/period`.
-///
-/// Returns `None` until it has accumulated `period` real values; from the
-/// `period`-th value onward it returns `Some(smoothed)`. This is the Wilder
-/// smoothing constant (NOT the EMA `α = 2/(period+1)` ta-rs uses), shared by
-/// `ATR`, `S+DM`, `S−DM`, and the `DX → ADX` step.
-struct WilderRma {
-    period: u32,
-    /// Running smoothed value once seeded.
-    smoothed: Option<f64>,
-    /// Sum of the first `period` values while still seeding.
-    seed_sum: f64,
-    /// Count of real values fed so far.
-    seen: u32,
-}
-
-impl WilderRma {
-    fn new(period: u32) -> Self {
-        Self {
-            period,
-            smoothed: None,
-            seed_sum: 0.0,
-            seen: 0,
-        }
-    }
-
-    /// Feed one real value; returns the current smoothed value, or `None` while
-    /// still seeding (before `period` values have accrued).
-    fn next(&mut self, value: f64) -> Option<f64> {
-        self.seen = self.seen.saturating_add(1);
-        if let Some(prev) = self.smoothed {
-            let updated = prev + (value - prev) / f64::from(self.period);
-            self.smoothed = Some(updated);
-            Some(updated)
-        } else {
-            self.seed_sum += value;
-            if self.seen < self.period {
-                None
-            } else {
-                // `period`-th value: seed with the simple average.
-                let seed = self.seed_sum / f64::from(self.period);
-                self.smoothed = Some(seed);
-                Some(seed)
-            }
-        }
-    }
-}
 
 /// One-bar carry of the previous candle's high/low/close, in `f64`.
 struct PrevBar {
@@ -138,14 +90,6 @@ impl Adx {
         let ndm = if down > up && down > 0.0 { down } else { 0.0 };
         (pdm, ndm)
     }
-
-    /// Per-bar true range against the previous close.
-    fn true_range(prev: &PrevBar, high: f64, low: f64) -> f64 {
-        let hl = high - low;
-        let hc = (high - prev.close).abs();
-        let lc = (low - prev.close).abs();
-        hl.max(hc).max(lc)
-    }
 }
 
 impl Indicator for Adx {
@@ -168,7 +112,7 @@ impl Indicator for Adx {
         };
 
         let (pdm, ndm) = Self::directional_movement(prev, high, low);
-        let tr = Self::true_range(prev, high, low);
+        let tr = true_range(high, low, prev.close);
         self.prev = Some(PrevBar { high, low, close });
 
         // Wilder-smooth TR, +DM, −DM. All three seed together (same period), so

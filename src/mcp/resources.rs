@@ -36,6 +36,10 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "windows",
         "a windowed backtest slices the series to `[from, to)` and indicators warm up inside the window",
     ),
+    (
+        "series_htf",
+        "an `htf` operand is evaluated on the last closed H4 bar; an ATR stop uses the signal bar's ATR",
+    ),
 ];
 
 /// Build the `pulse://dsl/schema` document body (a compact JSON string).
@@ -98,6 +102,15 @@ mod tests {
         assert_eq!(
             window,
             "a windowed backtest slices the series to `[from, to)` and indicators warm up inside the window"
+        );
+        // r2.s2.w2 (b13): the schema-1.1.0 semantics the grammar cannot express.
+        let htf = conventions
+            .get("series_htf")
+            .and_then(serde_json::Value::as_str)
+            .expect("conventions.series_htf is a string");
+        assert_eq!(
+            htf,
+            "an `htf` operand is evaluated on the last closed H4 bar; an ATR stop uses the signal bar's ATR"
         );
     }
 }

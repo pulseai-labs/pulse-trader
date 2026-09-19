@@ -346,6 +346,9 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
             field_error("dsl", err)
         }
+        // r2.s2.w2: the strategy needs an HTF series the request lacked — the
+        // error's `field` already carries `"inputs.htf"`, so surface it verbatim.
+        BacktestAppError::HtfRequired { field } => field_error(field, err),
         _ => tool_error(err),
     }
 }
@@ -499,7 +502,7 @@ impl PulseMcp {
                     "exit_signal_time", "exit_fill_time",
                     "fills", "fees_total", "funding_total", "slippage_total",
                     "realized_pnl", "realized_r", "mfe_r", "mae_r",
-                    "exit_reason", "source", "regime",
+                    "exit_reason", "source", "regime", "stop_price",
                 ],
             }))),
             Err(e) => Ok(tool_error(e)),

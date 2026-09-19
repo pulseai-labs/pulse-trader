@@ -221,6 +221,11 @@ impl From<BacktestAppError> for BusError {
         let code = match &err {
             BacktestAppError::DslInvalid(_)
             | BacktestAppError::CompileFailed(_)
+            // r2.s2.w2: a missing HTF series is a caller-correctable
+            // missing-input refusal like `WindowEmpty` — `validation`, and the
+            // message names `inputs.htf` (the MCP surface reports the same
+            // variant as `field_error("inputs.htf", …)`).
+            | BacktestAppError::HtfRequired { .. }
             | BacktestAppError::WindowEmpty { .. } => BusErrorCode::Validation,
             BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
             BacktestAppError::Engine(_) => BusErrorCode::Backtest,

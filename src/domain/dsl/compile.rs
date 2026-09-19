@@ -71,15 +71,16 @@ use super::value::{IndicatorSpec, PriceField, Series, ValueSource};
 /// validation (2.03) already rejects every [`SweepableValue::Sweep`], so a
 /// validated document only ever carries `Fixed` leaves. The variant exists so
 /// Fixed extraction stays panic-free under the crate's `unwrap_used`/
-/// `expect_used` lints. [`CompileError::HtfUnsupported`] is the schema-1.1.0
-/// gate: the `series` tag is grammar, but evaluating a higher-timeframe
-/// operand is r2.s2.w2's — until then the compiler refuses rather than
-/// silently reading the primary series (w2 removes the variant).
+/// `expect_used` lints.
 ///
 /// Serde-serializable (r1.s2.w2): it rides inside
 /// [`MutationError::CompileFailed`](super::mutate::MutationError::CompileFailed),
 /// which a coaching session persists verbatim as a recorded failure reason.
 /// Internally tagged with a struct variant — the DSL-wide serde invariant.
+///
+/// r2.s2.w2 removed the schema-1.1.0 compile gate: an `Htf`-tagged operand now
+/// compiles with its [`Series`] intact and evaluates against the aligned
+/// higher-timeframe engine.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CompileError {
@@ -91,15 +92,6 @@ pub enum CompileError {
     )]
     UnexpectedSweep {
         /// A human-readable field hint for where the stray sweep was found.
-        field: String,
-    },
-    /// An operand tagged `series: "htf"` reached the compiler. Schema 1.1.0
-    /// carries the tag only; r2.s2.w2 lands the aligned closed-bar evaluation
-    /// and removes this variant.
-    #[error("higher-timeframe operand at {field}: `series: htf` evaluation lands in r2.s2.w2")]
-    HtfUnsupported {
-        /// The operand's `validate.rs`-style locator (e.g. `entry.lhs`,
-        /// `filters[0].rhs`).
         field: String,
     },
 }
@@ -115,16 +107,16 @@ pub enum CompiledValue {
     Const(Decimal),
     /// A field of the current candle (available once the candle exists).
     Price {
-        /// Which series the field reads (`Htf` is unreachable until w2 lifts
-        /// the compile-time gate — the tag is carried for it).
+        /// Which series the field reads — the eval context routes on it
+        /// (r2.s2.w2: `Htf` reads the aligned closed higher-timeframe bar).
         series: Series,
         /// Which OHLCV field to read.
         field: PriceField,
     },
     /// A technical-indicator output (unavailable during warmup → `None`).
     Indicator {
-        /// Which series the indicator runs on (`Htf` is unreachable until
-        /// w2 lifts the compile-time gate).
+        /// Which series the indicator runs on — the eval context routes on it
+        /// (r2.s2.w2: `Htf` reads the higher-timeframe indicator engine).
         series: Series,
         /// The indicator and its parameters.
         spec: IndicatorSpec,
@@ -277,10 +269,9 @@ pub enum CompiledExit {
         /// The condition that, when true, closes the position.
         condition: CompiledCondition,
     },
-    /// An ATR-multiple stop (schema 1.1.0): pure data — `period` selects the
-    /// primary-series ATR, `multiple` scales it via [`atr_stop_price`]. The
-    /// fill behaviour is w2's; the backtester rejects it with a typed
-    /// `UnsupportedExit` until then.
+    /// An ATR-multiple stop (schema 1.1.0): `period` selects the primary-series
+    /// ATR read at the signal bar, `multiple` scales it via [`atr_stop_price`]
+    /// at fill time (r2.s2.w2).
     AtrStop {
         /// ATR lookback period.
         period: u32,
@@ -348,18 +339,16 @@ impl CompiledStrategy {
     }
 
     /// The de-duplicated **higher-timeframe** indicators this strategy
-    /// references (schema 1.1.0). Always empty while the compile-time
-    /// [`CompileError::HtfUnsupported`] gate rejects `Htf` operands; w2 fills
-    /// and consumes it.
+    /// references (schema 1.1.0) — what the backtester steps on the aligned
+    /// closed H4 bar and routes `Htf` operands to.
     #[must_use]
     pub fn required_htf_indicators(&self) -> &[IndicatorSpec] {
         &self.required_htf_indicators
     }
 
-    /// Whether any operand is tagged `series: "htf"` (schema 1.1.0). Always
-    /// `false` while the compile-time gate rejects them; kept honest by walking
-    /// the compiled tree rather than a stored flag, so w2's ungate flips it
-    /// with no further edit here.
+    /// Whether any operand is tagged `series: "htf"` (schema 1.1.0) — computed
+    /// by walking the compiled tree rather than a stored flag, so it cannot
+    /// drift from the actual leaves.
     #[must_use]
     pub fn needs_htf(&self) -> bool {
         fn value_is_htf(value: &CompiledValue) -> bool {
@@ -439,8 +428,9 @@ pub fn take_profit_price(
 ///
 /// `Long`: `entry − multiple × atr` (the stop sits *below* entry).
 /// `Short`: `entry + multiple × atr` (the stop sits *above* entry).
-/// `atr` is the **primary** series' ATR (the stop always reads primary). w2
-/// calls this at fill time; this item only lands the pure helper.
+/// `atr` is the **primary** series' ATR (the stop always reads primary); the
+/// backtester calls this at fill time with the value frozen at the signal bar
+/// (r2.s2.w2).
 #[must_use]
 pub fn atr_stop_price(
     entry: Decimal,
@@ -466,31 +456,19 @@ fn fixed<T>(value: &SweepableValue<T>) -> Option<&T> {
     }
 }
 
-/// Resolve a [`ValueSource`] into a [`CompiledValue`], extracting any `Fixed`
-/// indicator periods. Pure — no eval-context dependency. `path` is the
-/// operand's `validate.rs`-style locator, carried into
-/// [`CompileError::HtfUnsupported`]: schema 1.1.0's `series` tag is grammar
-/// only — compiling an `Htf` operand is a typed error until w2 evaluates it.
-fn compile_value(source: &ValueSource, path: &str) -> Result<CompiledValue, CompileError> {
+/// Resolve a [`ValueSource`] into a [`CompiledValue`], carrying its [`Series`]
+/// tag verbatim — evaluation routes on it (r2.s2.w2: an `Htf` leaf reads the
+/// aligned higher-timeframe engine, not the primary one). Infallible.
+fn compile_value(source: &ValueSource) -> CompiledValue {
     match source {
-        ValueSource::Constant { value } => Ok(CompiledValue::Const(*value)),
-        ValueSource::Price { series, field } => match series {
-            Series::Primary => Ok(CompiledValue::Price {
-                series: *series,
-                field: *field,
-            }),
-            Series::Htf => Err(CompileError::HtfUnsupported {
-                field: path.to_owned(),
-            }),
+        ValueSource::Constant { value } => CompiledValue::Const(*value),
+        ValueSource::Price { series, field } => CompiledValue::Price {
+            series: *series,
+            field: *field,
         },
-        ValueSource::Indicator { series, spec } => match series {
-            Series::Primary => Ok(CompiledValue::Indicator {
-                series: *series,
-                spec: spec.clone(),
-            }),
-            Series::Htf => Err(CompileError::HtfUnsupported {
-                field: path.to_owned(),
-            }),
+        ValueSource::Indicator { series, spec } => CompiledValue::Indicator {
+            series: *series,
+            spec: spec.clone(),
         },
     }
 }
@@ -539,50 +517,38 @@ fn collect_indicators(
     }
 }
 
-/// Compile a [`Condition`] into a [`CompiledCondition`] (recursive, pure apart
-/// from the `Htf` gate). `path` threads the `validate.rs` locator grammar so an
-/// `Htf` operand reports where it sits.
-fn compile_condition(condition: &Condition, path: &str) -> Result<CompiledCondition, CompileError> {
-    Ok(match condition {
+/// Compile a [`Condition`] into a [`CompiledCondition`] (recursive, pure and
+/// infallible — every grammar shape has a compiled counterpart).
+fn compile_condition(condition: &Condition) -> CompiledCondition {
+    match condition {
         Condition::Compare { lhs, op, rhs } => CompiledCondition::Compare {
-            lhs: compile_value(lhs, &format!("{path}.lhs"))?,
+            lhs: compile_value(lhs),
             op: *op,
-            rhs: compile_value(rhs, &format!("{path}.rhs"))?,
+            rhs: compile_value(rhs),
         },
         Condition::CrossesAbove { lhs, rhs } => CompiledCondition::CrossesAbove {
-            lhs: compile_value(lhs, &format!("{path}.lhs"))?,
-            rhs: compile_value(rhs, &format!("{path}.rhs"))?,
+            lhs: compile_value(lhs),
+            rhs: compile_value(rhs),
         },
         Condition::CrossesBelow { lhs, rhs } => CompiledCondition::CrossesBelow {
-            lhs: compile_value(lhs, &format!("{path}.lhs"))?,
-            rhs: compile_value(rhs, &format!("{path}.rhs"))?,
+            lhs: compile_value(lhs),
+            rhs: compile_value(rhs),
         },
-        Condition::And { conditions } => CompiledCondition::And(
-            conditions
-                .iter()
-                .enumerate()
-                .map(|(i, c)| compile_condition(c, &format!("{path}.and[{i}]")))
-                .collect::<Result<_, _>>()?,
-        ),
-        Condition::Or { conditions } => CompiledCondition::Or(
-            conditions
-                .iter()
-                .enumerate()
-                .map(|(i, c)| compile_condition(c, &format!("{path}.or[{i}]")))
-                .collect::<Result<_, _>>()?,
-        ),
-        Condition::Not { condition } => CompiledCondition::Not(Box::new(compile_condition(
-            condition,
-            &format!("{path}.not"),
-        )?)),
-    })
+        Condition::And { conditions } => {
+            CompiledCondition::And(conditions.iter().map(compile_condition).collect())
+        }
+        Condition::Or { conditions } => {
+            CompiledCondition::Or(conditions.iter().map(compile_condition).collect())
+        }
+        Condition::Not { condition } => {
+            CompiledCondition::Not(Box::new(compile_condition(condition)))
+        }
+    }
 }
 
 /// Compile a single [`ExitRule`] into a [`CompiledExit`], extracting `Fixed`
-/// payloads (defensive `Err` on the unreachable `Sweep`). `base` is the exit's
-/// locator root (`exits[i]`), threaded into a nested [`SignalExit`] condition's
-/// operand paths.
-fn compile_exit(rule: &ExitRule, base: &str) -> Result<CompiledExit, CompileError> {
+/// payloads (defensive `Err` on the unreachable `Sweep`).
+fn compile_exit(rule: &ExitRule) -> Result<CompiledExit, CompileError> {
     match rule {
         ExitRule::StopLoss { distance_pct } => {
             let distance_pct =
@@ -610,7 +576,7 @@ fn compile_exit(rule: &ExitRule, base: &str) -> Result<CompiledExit, CompileErro
             Ok(CompiledExit::TimeStop { max_bars })
         }
         ExitRule::SignalExit { condition } => Ok(CompiledExit::SignalExit {
-            condition: compile_condition(condition, &format!("{base}.condition"))?,
+            condition: compile_condition(condition),
         }),
         ExitRule::AtrStop { period, multiple } => {
             let period = *fixed(period).ok_or_else(|| CompileError::UnexpectedSweep {
@@ -650,20 +616,19 @@ fn compile_risk(risk: &RiskParams) -> Result<CompiledRisk, CompileError> {
 /// Returns [`CompileError::UnexpectedSweep`] if a numeric leaf is a
 /// [`SweepableValue::Sweep`]. This is **defensive / should-be-unreachable**:
 /// validation (2.03) already rejects every sweep, so a `ValidatedDsl` never
-/// carries one. Returns [`CompileError::HtfUnsupported`] for any
-/// `series: "htf"` operand — the schema-1.1.0 gate w2 lifts.
+/// carries one.
 pub fn compile(validated: &ValidatedDsl) -> Result<CompiledStrategy, CompileError> {
     let dsl = validated.dsl();
 
     // Effective entry = entry ∧ all filters. Fold into a single And (or the bare
     // entry condition when there are no filters).
     let entry = if dsl.filters.is_empty() {
-        compile_condition(&dsl.entry, "entry")?
+        compile_condition(&dsl.entry)
     } else {
         let mut parts = Vec::with_capacity(1 + dsl.filters.len());
-        parts.push(compile_condition(&dsl.entry, "entry")?);
-        for (i, filter) in dsl.filters.iter().enumerate() {
-            parts.push(compile_condition(filter, &format!("filters[{i}]"))?);
+        parts.push(compile_condition(&dsl.entry));
+        for filter in &dsl.filters {
+            parts.push(compile_condition(filter));
         }
         CompiledCondition::And(parts)
     };
@@ -671,8 +636,7 @@ pub fn compile(validated: &ValidatedDsl) -> Result<CompiledStrategy, CompileErro
     let exits = dsl
         .exits
         .iter()
-        .enumerate()
-        .map(|(i, rule)| compile_exit(rule, &format!("exits[{i}]")))
+        .map(compile_exit)
         .collect::<Result<Vec<_>, _>>()?;
 
     let risk = compile_risk(&dsl.risk)?;

@@ -19,10 +19,9 @@ use super::sweepable::SweepableValue;
 /// Which candle series a [`ValueSource`] operand reads (r2.s2.w1, schema 1.1.0).
 ///
 /// `Primary` is the run's own series; `Htf` is the aligned higher-timeframe
-/// series (its evaluation is w2's — schema 1.1.0 carries the tag only, and
-/// `compile()` rejects an `Htf` operand with
-/// [`CompileError::HtfUnsupported`](super::compile::CompileError::HtfUnsupported)
-/// until then). Serializes lowercase (`"primary"`/`"htf"`); deserialization
+/// series — r2.s2.w2 evaluates it against the higher-timeframe indicator
+/// engine stepped on the aligned closed bar (never the primary one).
+/// Serializes lowercase (`"primary"`/`"htf"`); deserialization
 /// defaults a missing `series` to `primary` via the `#[serde(default)]` on each
 /// operand field, while writes always emit the tag explicitly.
 #[derive(
@@ -33,7 +32,7 @@ pub enum Series {
     /// The run's own candle series.
     #[default]
     Primary,
-    /// The aligned higher-timeframe series (evaluated by w2).
+    /// The aligned higher-timeframe series.
     Htf,
 }
 
@@ -91,9 +90,8 @@ pub enum IndicatorSpec {
         /// Signal-line EMA period.
         signal: SweepableValue<u32>,
     },
-    /// Average True Range over `period` bars (schema 1.1.0; its computation is
-    /// w2's — the indicator factory rejects it with a typed `Unsupported` until
-    /// then).
+    /// Average True Range over `period` bars (schema 1.1.0; r2.s2.w2 computes
+    /// it — Wilder smoothing of the true range).
     Atr {
         /// Lookback period.
         period: SweepableValue<u32>,

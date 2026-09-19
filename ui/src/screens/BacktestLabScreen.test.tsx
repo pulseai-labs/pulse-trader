@@ -10,7 +10,7 @@
 // zero `runBacktestVersion` invocations from mount (StrictMode included),
 // the indeterminate running label, `BusError` rendering incl. the structured
 // `run_id`, selector-change clearing, the fresh-DTO render (provenance, KPIs,
-// equity, regimes, both histograms, all 18 trade columns), table twins,
+// equity, regimes, both histograms, all 19 trade columns), table twins,
 // pointer/keyboard tooltip parity with Left/Right/Home/End traversal, the
 // focusable trade-table scroll region, and the ≥24px inline hit targets.
 
@@ -184,6 +184,7 @@ const SEEDED_RUN: BacktestRunDto = {
       exitReason: "stop_loss",
       source: "signal",
       regime: "trending_down",
+      stopPrice: "61500.00",
     },
     {
       direction: "short",
@@ -204,6 +205,8 @@ const SEEDED_RUN: BacktestRunDto = {
       exitReason: "take_profit",
       source: "signal",
       regime: "ranging",
+      // A pre-0011-shaped row carries no recorded stop — the cell renders `—`.
+      stopPrice: null,
     },
   ],
 };
@@ -600,7 +603,7 @@ describe("BacktestLabScreen (fresh result render)", () => {
     expect(container.querySelectorAll(".bt-histogram")).toHaveLength(2);
   });
 
-  it("renders the trade table: one row per trade in seq order with all 18 DTO columns, exact strings", async () => {
+  it("renders the trade table: one row per trade in seq order with all 19 DTO columns, exact strings", async () => {
     const container = await renderRun(SEEDED_RUN);
     const region = container.querySelector(".bt-table-scroll");
     expect(region).not.toBeNull();
@@ -614,6 +617,7 @@ describe("BacktestLabScreen (fresh result render)", () => {
       "direction", "qty", "entryPrice", "exitPrice", "entrySignalTime", "entryFillTime",
       "exitSignalTime", "exitFillTime", "feesTotal", "fundingTotal", "slippageTotal",
       "realizedPnl", "realizedR", "mfeR", "maeR", "exitReason", "source", "regime",
+      "stopPrice",
     ]);
 
     const rows = Array.from((table as HTMLElement).querySelectorAll("tbody tr"));
@@ -622,8 +626,12 @@ describe("BacktestLabScreen (fresh result render)", () => {
     expect(within(rows[0] as HTMLElement).getAllByText("stop_loss").length).toBeGreaterThan(0);
     expect(within(rows[0] as HTMLElement).getByText("-166.396250")).toBeTruthy();
     expect(within(rows[0] as HTMLElement).getByText("0.01500000")).toBeTruthy();
+    // The recorded stop renders its exact decimal string…
+    expect(within(rows[0] as HTMLElement).getByText("61500.00")).toBeTruthy();
     expect(within(rows[1] as HTMLElement).getByText("take_profit")).toBeTruthy();
     expect(within(rows[1] as HTMLElement).getByText("129.545000")).toBeTruthy();
+    // …while a null stop (the pre-0011 row shape) renders the em dash.
+    expect(within(rows[1] as HTMLElement).getByText("—")).toBeTruthy();
   });
 
   it("renders an em dash for a null HTF pair and visibly flags a non-null fingerprintWarning", async () => {
