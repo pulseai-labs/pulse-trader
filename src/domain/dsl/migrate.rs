@@ -192,6 +192,11 @@ fn identity_1_0_0_to_1_1_0(mut value: Value) -> Result<Value, MigrationError> {
 
 impl Migrator {
     /// The production registry: the one real step, `1.0.0 → 1.1.0` (identity).
+    ///
+    /// `to` is pinned to the literal `1.1.0` the step's `apply` stamps —
+    /// NOT `SchemaVersion::CURRENT` (r2.s2 round-1 fix F8): a future `CURRENT`
+    /// bump must not silently desync the registration from the version the
+    /// step actually produces. A test below pins the two to the same literal.
     #[must_use]
     pub fn v1() -> Self {
         Migrator {
@@ -201,7 +206,11 @@ impl Migrator {
                     minor: 0,
                     patch: 0,
                 },
-                to: SchemaVersion::CURRENT,
+                to: SchemaVersion {
+                    major: 1,
+                    minor: 1,
+                    patch: 0,
+                },
                 kind: MigrationKind::Minor,
                 apply: identity_1_0_0_to_1_1_0,
             }],
@@ -612,6 +621,38 @@ mod tests {
         assert!(
             matches!(err, LoadError::MigrationFailed { .. }),
             "expected MigrationFailed for a stalled registry, got {err:?}"
+        );
+    }
+
+    /// r2.s2 round-1 fix F8: the identity step's registered `to` is the literal
+    /// `1.1.0` its `apply` stamps — pinned, not `SchemaVersion::CURRENT` — so a
+    /// future `CURRENT` bump cannot silently desync the chain: this test fails
+    /// if the registration and the stamped literal ever diverge.
+    #[test]
+    fn v1_terminal_version_matches_the_literal_its_apply_stamps() {
+        let migrator = Migrator::v1();
+        let step = migrator
+            .migrations
+            .iter()
+            .find(|m| m.from == v(1, 0, 0))
+            .expect("v1 registers the 1.0.0 -> 1.1.0 step");
+
+        // The registration pins the literal, not CURRENT.
+        assert_eq!(step.to, v(1, 1, 0));
+
+        // And the literal equals what `apply` stamps on a real 1.0.0 document.
+        let mut doc: Value =
+            serde_json::from_str(&canonical_current_json()).expect("canonical parses");
+        doc["schema_version"] = json!("1.0.0");
+        let migrated = (step.apply)(doc).expect("identity step applies");
+        let stamped: SchemaVersion = migrated["schema_version"]
+            .as_str()
+            .expect("schema_version stays a string")
+            .parse()
+            .expect("the stamped version parses");
+        assert_eq!(
+            stamped, step.to,
+            "the registry's terminal `to` must equal the literal `apply` stamps"
         );
     }
 }
