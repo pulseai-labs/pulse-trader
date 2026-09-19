@@ -57,8 +57,8 @@ function version(
       direction: "long",
       entry: ["rsi(14) < 30"],
       filters: [],
-      exits: ["stop loss 5%", "take profit 2R"],
-      risk: ["risk per trade 1%", "max leverage 3x"],
+      exits: ["stop 5%", "take profit 2R"],
+      risk: ["risk 1% per trade", "max leverage 3x"],
     },
     stats: versionStats,
     deltaVsParent: delta,
@@ -175,7 +175,7 @@ describe("LibraryScreen (seeded payload)", () => {
     expect(await inPane.findByText("Alpha Wave")).toBeTruthy();
     expect(inPane.getByText("v2")).toBeTruthy();
     expect(inPane.getByText("rsi(14) < 30")).toBeTruthy();
-    expect(inPane.getByText("stop loss 5%")).toBeTruthy();
+    expect(inPane.getByText("stop 5%")).toBeTruthy();
     // The KPI block and the recent-run row both carry the run's expectancy —
     // at least one occurrence, scoped to the pane.
     expect(inPane.getAllByText("+0.42R").length).toBeGreaterThan(0);

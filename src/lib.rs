@@ -113,6 +113,14 @@ pub use domain::{
     Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl,
 };
 
+// r2.s2.w4 (b10, ADR-0024): the one ring-owned DSL display formatter —
+// `render::strategy(&StrategyDsl) -> Rendered` plus the per-token functions the
+// vocabulary test pins (`render::condition`, `render::exit`, …). The two Tauri
+// DTO adapters delegate to it; `tests/dsl_render.rs` proves they can no longer
+// disagree. REQUIRED under `deny(warnings)` — a `pub` module reachable only
+// in-crate is a `dead_code` build error otherwise.
+pub use domain::dsl::render;
+
 // VS-1.1.2 work-2.03: the semantic-validation engine (FR-3 correctable rejection).
 // `validate` is the entry point; `ValidatedDsl` is the newtype 2.04's compiler
 // accepts (constructible ONLY via `validate`); `FieldError`/`ValidationCode`/
@@ -595,9 +603,9 @@ pub use crate::tauri::{
     ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EquityPointDto, EventSink,
     HistogramBinDto, HistogramDto, LibraryOverview, LibraryRunSummary, LibraryStrategy,
     LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
-    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core,
+    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core, dsl_summary,
     export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
-    shell_info_core,
+    shell_info_core, summarize_dsl,
 };
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the

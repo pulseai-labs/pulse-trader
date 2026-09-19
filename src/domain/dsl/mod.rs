@@ -35,6 +35,7 @@ mod condition;
 mod exit;
 mod migrate;
 mod mutate;
+pub mod render;
 mod risk;
 mod schema_version;
 mod strategy;

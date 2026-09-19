@@ -51,8 +51,8 @@ function finalizeResult() {
         direction: "long",
         entry: "rsi(14) < 30",
         filters: ["close > ema(200)"],
-        exits: ["stop_loss 5%", "take_profit 2R"],
-        risk: ["risk_per_trade 1%", "max_leverage 3x"],
+        exits: ["stop 5%", "take profit 2R"],
+        risk: ["risk 1% per trade", "max leverage 3x"],
       },
     },
   };
@@ -169,7 +169,7 @@ describe("<DesignerScreen /> streaming compose", () => {
     // The compact DSL summary renders the version's own lines. The filter line
     // legitimately appears TWICE now — as the step's preview and in the summary
     // card's Filters block — so assert presence, not uniqueness.
-    expect(screen.getByText(/stop_loss 5%/)).toBeTruthy();
+    expect(screen.getByText(/stop 5%/)).toBeTruthy();
     expect(screen.getAllByText(/close > ema\(200\)/).length).toBeGreaterThan(0);
     // The run is marked complete once its outcome is in.
     expect(screen.getByText(/completed/i)).toBeTruthy();

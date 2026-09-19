@@ -16,7 +16,12 @@ mod clock;
 // typed failure taxonomy, and the disposition state machine. Pure + zero-I/O; the
 // `CoachingRepository` port lives in `port` beside the other ports.
 mod coaching;
-mod dsl;
+// r2.s2.w4 (ADR-0024, b10): `pub(crate)` (matching the `strategy`/`backtest`
+// nested-module precedent) so the two Tauri DTO adapters can import
+// `domain::dsl::render` and `lib.rs` can re-export the formatter for the
+// `tests/dsl_render.rs` agreement suite; the DSL types themselves still leave
+// the crate only through the curated `pub use dsl::{...}` lists below.
+pub(crate) mod dsl;
 mod error;
 // VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
 // NFR-2). Pure accessor over `build.rs`-baked env (`PULSE_ENGINE_FINGERPRINT` /

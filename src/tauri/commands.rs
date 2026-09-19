@@ -85,13 +85,12 @@ use crate::application::coach::CoachTurnRegistry;
 use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, compose_config, run_compose_with};
 use crate::domain::CoachingSessionId;
 use crate::domain::Redactor;
+use crate::domain::dsl::render;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
-    BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, Clock, Comparator,
-    Condition, CredentialStatus, DataError, Direction, EngineFingerprint, ExitRule, IndicatorSpec,
-    LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse, Message, PriceField, Series,
-    SnapshotSelection, StrategyDsl, StrategyRepository, SweepableValue, ToolDefinition,
-    ValueSource,
+    BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, Clock, CredentialStatus,
+    DataError, EngineFingerprint, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse,
+    Message, SnapshotSelection, StrategyDsl, StrategyRepository, ToolDefinition,
 };
 
 // ---------------------------------------------------------------------------
@@ -786,22 +785,20 @@ where
 /// Render a [`StrategyDsl`] into the summary card's line vocabulary — the DSL's
 /// own values, compactly, with no field invented and none echoed beyond what
 /// the document carries.
-fn summarize_dsl(dsl: &StrategyDsl) -> ComposeDslSummary {
+///
+/// `pub` so `tests/dsl_render.rs` (a separate crate) can prove this adapter and
+/// [`crate::tauri::library::dsl_summary`] emit identical lines — the b10
+/// consolidation claim. The vocabulary lives in the domain ring's
+/// [`render`](crate::domain::dsl::render); this is the thin DTO adapter over it.
+#[must_use]
+pub fn summarize_dsl(dsl: &StrategyDsl) -> ComposeDslSummary {
+    let rendered = render::strategy(dsl);
     ComposeDslSummary {
-        direction: match dsl.direction {
-            Direction::Long => "long".to_owned(),
-            Direction::Short => "short".to_owned(),
-        },
-        entry: render_condition(&dsl.entry),
-        filters: dsl.filters.iter().map(render_condition).collect(),
-        exits: dsl.exits.iter().map(render_exit).collect(),
-        risk: vec![
-            format!(
-                "risk_per_trade {}",
-                render_percent(&dsl.risk.risk_per_trade_pct)
-            ),
-            format!("max_leverage {}x", render_sweepable(&dsl.risk.max_leverage)),
-        ],
+        direction: rendered.direction,
+        entry: rendered.entry,
+        filters: rendered.filters,
+        exits: rendered.exits,
+        risk: rendered.risk,
     }
 }
 
@@ -818,143 +815,6 @@ fn created_by_label(created_by: CreatedBy) -> String {
         CreatedBy::ExternalAgent => "external_agent",
     }
     .to_owned()
-}
-
-/// Render one condition, e.g. `rsi(14) < 30` / `close crosses above ema(200)`.
-fn render_condition(condition: &Condition) -> String {
-    match condition {
-        Condition::Compare { lhs, op, rhs } => format!(
-            "{} {} {}",
-            render_value_source(lhs),
-            render_comparator(*op),
-            render_value_source(rhs)
-        ),
-        Condition::CrossesAbove { lhs, rhs } => {
-            format!(
-                "{} crosses above {}",
-                render_value_source(lhs),
-                render_value_source(rhs)
-            )
-        }
-        Condition::CrossesBelow { lhs, rhs } => {
-            format!(
-                "{} crosses below {}",
-                render_value_source(lhs),
-                render_value_source(rhs)
-            )
-        }
-        Condition::And { conditions } => render_joined(conditions, "and"),
-        Condition::Or { conditions } => render_joined(conditions, "or"),
-        Condition::Not { condition } => format!("not ({})", render_condition(condition)),
-    }
-}
-
-/// Render a conjoined/disjoined condition list, parenthesized per term.
-fn render_joined(conditions: &[Condition], joiner: &str) -> String {
-    conditions
-        .iter()
-        .map(|c| format!("({})", render_condition(c)))
-        .collect::<Vec<_>>()
-        .join(&format!(" {joiner} "))
-}
-
-/// The comparator's source rendering (not its `Debug`).
-fn render_comparator(op: Comparator) -> &'static str {
-    match op {
-        Comparator::Gt => ">",
-        Comparator::Gte => ">=",
-        Comparator::Lt => "<",
-        Comparator::Lte => "<=",
-        Comparator::Eq => "=",
-    }
-}
-
-/// Render one operand, e.g. `rsi(14)`, `close`, `30`.
-fn render_value_source(source: &ValueSource) -> String {
-    match source {
-        ValueSource::Constant { value } => value.normalize().to_string(),
-        ValueSource::Price { series, field } => render_series_tag(
-            *series,
-            match field {
-                PriceField::Open => "open",
-                PriceField::High => "high",
-                PriceField::Low => "low",
-                PriceField::Close => "close",
-                PriceField::Volume => "volume",
-            }
-            .to_owned(),
-        ),
-        ValueSource::Indicator { series, spec } => {
-            render_series_tag(*series, render_indicator(spec))
-        }
-    }
-}
-
-/// The `series` tag as a text prefix — schema 1.1.0's only higher timeframe is
-/// H4, so an `htf` operand reads `h4:…`; `primary` renders bare.
-fn render_series_tag(series: Series, text: String) -> String {
-    match series {
-        Series::Primary => text,
-        Series::Htf => format!("h4:{text}"),
-    }
-}
-
-/// Render an indicator with its parameters, e.g. `ema(200)`.
-fn render_indicator(spec: &IndicatorSpec) -> String {
-    match spec {
-        IndicatorSpec::Rsi { period } => format!("rsi({})", render_sweepable(period)),
-        IndicatorSpec::Ema { period } => format!("ema({})", render_sweepable(period)),
-        IndicatorSpec::Adx { period } => format!("adx({})", render_sweepable(period)),
-        IndicatorSpec::Macd { fast, slow, signal } => format!(
-            "macd({},{},{})",
-            render_sweepable(fast),
-            render_sweepable(slow),
-            render_sweepable(signal)
-        ),
-        IndicatorSpec::Atr { period } => format!("atr({})", render_sweepable(period)),
-    }
-}
-
-/// Render one exit rule, e.g. `stop_loss 5%` / `take_profit 2R`.
-fn render_exit(rule: &ExitRule) -> String {
-    match rule {
-        ExitRule::StopLoss { distance_pct } => {
-            format!("stop_loss {}", render_percent(distance_pct))
-        }
-        ExitRule::TakeProfit { target_r } => format!("take_profit {}R", render_sweepable(target_r)),
-        ExitRule::TrailingStop { trail_pct } => {
-            format!("trailing_stop {}", render_percent(trail_pct))
-        }
-        ExitRule::TimeStop { max_bars } => format!("time_stop {} bars", render_sweepable(max_bars)),
-        ExitRule::SignalExit { condition } => {
-            format!("signal_exit {}", render_condition(condition))
-        }
-        ExitRule::AtrStop { period, multiple } => format!(
-            "atr_stop {} x{}",
-            render_sweepable(period),
-            render_sweepable(multiple)
-        ),
-    }
-}
-
-/// Render a `Decimal`-fraction sweepable as a percentage (`0.05` → `5%`) — the
-/// DSL stores decimal fractions; the summary speaks the human unit.
-fn render_percent(value: &SweepableValue<Decimal>) -> String {
-    match value {
-        SweepableValue::Fixed(fraction) => {
-            format!("{}%", (*fraction * Decimal::from(100)).normalize())
-        }
-        SweepableValue::Sweep { .. } => "sweep".to_owned(),
-    }
-}
-
-/// Render a sweepable's fixed value, or name the sweep (v1 validation rejects
-/// sweeps before persist; the label keeps rendering total).
-fn render_sweepable<T: std::fmt::Display>(value: &SweepableValue<T>) -> String {
-    match value {
-        SweepableValue::Fixed(v) => v.to_string(),
-        SweepableValue::Sweep { .. } => "sweep".to_owned(),
-    }
 }
 
 /// A cancelled run's outcome: nothing persisted, so no summary.
