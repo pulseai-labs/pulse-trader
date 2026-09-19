@@ -186,6 +186,12 @@ pub fn run_backtest(
 
         if state.position.is_some()
             && state.pending_exit.is_none()
+            // r2.s2 round-1 fix F3: when the strategy needs the higher
+            // timeframe a signal exit must not evaluate before a closed HTF
+            // bar is actually paired — a `Not(...)` over an absent `Htf`
+            // operand otherwise reads `true` and exits against a bar that
+            // does not exist yet.
+            && (htf_engine.is_none() || bar.htf.is_some())
             && exit_plan.signal_triggered(&ctx)
         {
             state.pending_exit = Some(PendingExit {
@@ -202,6 +208,12 @@ pub fn run_backtest(
             // HTF engine must be warm too — an `Htf` EMA still seeding must not
             // fire an entry (the same warmup discipline the primary gate has).
             && htf_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
+            // r2.s2 round-1 fix F3: `is_warm` is vacuous when the strategy's
+            // only `Htf` operand is a Price leaf (no HTF indicator exists to
+            // warm), so a paired closed HTF bar must exist before the entry
+            // may evaluate — a `Not(...)` over an absent `Htf` operand
+            // otherwise reads `true` and fires before any H4 bar exists.
+            && (htf_engine.is_none() || bar.htf.is_some())
             && compiled.entry().eval(&ctx)
         {
             // ATR-stop entries additionally require the primary ATR(period)

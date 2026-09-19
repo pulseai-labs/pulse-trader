@@ -32,6 +32,10 @@
 //! - **(i)** the HTF engine steps EVERY closed H4 candle exactly once — H4
 //!   lead-in history closed before the first primary bar warms the indicator,
 //!   and no closed H4 bar is ever fed twice (round-1 fix F2).
+//! - **(j)** when the strategy needs HTF, entries and signal exits wait for a
+//!   paired closed H4 bar — a `Not(...)` over an absent `Htf` operand reads
+//!   `true`, so the gate must not be vacuous for a Price-leaf-only strategy
+//!   (round-1 fix F3).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -1065,6 +1069,113 @@ fn htf_engine_never_steps_a_closed_candle_twice() {
         result.trades[0].entry_fill_time,
         primary.candles[32].open_time
     );
+}
+
+// ---------------------------------------------------------------------------
+// (j) entries and signal exits wait for a paired closed H4 bar (F3)
+// ---------------------------------------------------------------------------
+
+/// `Not(htf.close < 100)` — true whenever an H4 bar IS paired (the fixture's
+/// closes are 150), but ALSO `true` before any H4 bar exists: the absent `Htf`
+/// leaf evaluates to `false` and `Not` flips it. Only the paired-bar gate
+/// keeps this from firing in the void.
+fn not_over_absent_htf_price() -> Condition {
+    Condition::Not {
+        condition: Box::new(compare(
+            htf_price(PriceField::Close),
+            Comparator::Lt,
+            constant(100, 0),
+        )),
+    }
+}
+
+/// The two-H4 fixture for F3: `h4[0]` (close 150) closes at 14_399_999 and
+/// first pairs at primary[15]; `h4[1]` closes inside the run.
+fn two_h4_closing_150() -> CandleSeries {
+    series(
+        Timeframe::H4,
+        vec![h4(0, 100, 160, 90, 150), h4(1, 100, 160, 90, 150)],
+    )
+}
+
+/// Entry `Not(htf.close < 100)` on a Price-leaf-only HTF strategy: the HTF
+/// engine registers NO indicators, so `is_warm` is vacuous and the bug fired
+/// the entry at bar 1 — before the first H4 close pairs at bar 15. With the
+/// gate the signal must land exactly on `primary[15].close_time`.
+#[test]
+fn not_over_htf_price_entry_waits_for_the_first_closed_h4_bar() {
+    let primary = series(Timeframe::M15, flat_m15(40));
+    let htf = two_h4_closing_150();
+    let strategy = dsl(
+        not_over_absent_htf_price(),
+        vec![stop_loss()],
+        Direction::Long,
+    );
+    let result = run(
+        &compiled(&strategy),
+        &primary,
+        Some(&htf),
+        SeriesEnd::SnapshotEnd,
+    );
+
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "one entry, gated until the first pair"
+    );
+    let trade = &result.trades[0];
+    assert_eq!(
+        trade.entry_signal_time, primary.candles[15].close_time,
+        "the entry must wait for the bar paired with the closed h4[0] — \
+         firing before 15 means `Not` over absent HTF data read true"
+    );
+    assert_eq!(trade.entry_fill_time, primary.candles[16].open_time);
+}
+
+/// The signal-exit mirror: the strategy `needs_htf()` through the EXIT's `htf`
+/// operand, so even the primary-only `close > 0` entry waits for the first
+/// paired bar (signals at 15, fills at 16), and the always-true
+/// `SignalExit(Not(htf.close < 100))` then fires at 16 and fills at 17.
+/// Ungated, the exit would signal at bar 2 (fill at bar 3) and the still-true
+/// conditions would spawn a re-entry train — the trade count alone catches it.
+/// The series ends at bar 18 so the re-signal at 17 dies unfilled.
+#[test]
+fn not_over_htf_price_signal_exit_waits_for_the_first_closed_h4_bar() {
+    let primary = series(Timeframe::M15, flat_m15(18));
+    let htf = two_h4_closing_150();
+    let strategy = dsl(
+        compare(
+            primary_price(PriceField::Close),
+            Comparator::Gt,
+            constant(0, 0),
+        ),
+        vec![
+            stop_loss(),
+            ExitRule::SignalExit {
+                condition: not_over_absent_htf_price(),
+            },
+        ],
+        Direction::Long,
+    );
+    let result = run(
+        &compiled(&strategy),
+        &primary,
+        Some(&htf),
+        SeriesEnd::SnapshotEnd,
+    );
+
+    assert_eq!(result.trades.len(), 1);
+    let trade = &result.trades[0];
+    // The gated entry fires at the first paired bar (15) and fills at 16.
+    assert_eq!(trade.entry_signal_time, primary.candles[15].close_time);
+    assert_eq!(trade.entry_fill_time, primary.candles[16].open_time);
+    assert_eq!(trade.exit_reason, ExitReason::Signal);
+    assert_eq!(
+        trade.exit_signal_time, primary.candles[16].close_time,
+        "the signal exit evaluates from the first paired bar onward — \
+         firing before the pair exists means `Not` over absent HTF data read true"
+    );
+    assert_eq!(trade.exit_fill_time, primary.candles[17].open_time);
 }
 
 // ---------------------------------------------------------------------------
