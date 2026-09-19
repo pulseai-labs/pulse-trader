@@ -170,25 +170,45 @@ pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutc
     }
 }
 
-/// `set_exit_rules { stop_loss_pct?, take_profit_r?, trailing_pct?, time_bars? }`
-/// — build a `Vec<ExitRule>` (replacing); `stop_loss_pct` is required (defines
-/// 1R). No duplicate exclusive kinds are possible (each field appears at most
-/// once).
+/// `set_exit_rules { stop_loss_pct?, atr_stop_period?, atr_stop_multiple?,
+/// take_profit_r?, trailing_pct?, time_bars? }` — build a `Vec<ExitRule>`
+/// (replacing). Exactly ONE stop family: `stop_loss_pct` alone (a percent
+/// [`ExitRule::StopLoss`], defines 1R) or `atr_stop_period` +
+/// `atr_stop_multiple` together (an [`ExitRule::AtrStop`], defines 1R). Both
+/// families, one ATR half without the other, or neither are a correctable
+/// `FieldError` localized at `stop_loss_pct` — the tool refuses FIRST rather
+/// than letting a duplicated `StopLoss` + `AtrStop` pair reach
+/// `finalize_strategy`'s `DuplicateExit` rule (whose error would not name the
+/// field to fix). The ATR bounds (`period ≥ 1`, `multiple ∈ (0, 10]`) stay
+/// `validate()`'s at finalize — not re-implemented here. No duplicate exclusive
+/// kinds are possible (each field appears at most once).
 pub(crate) fn set_exit_rules(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
     let args: ExitArgs = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(error) => return err(error),
     };
-    let Some(stop_loss_pct) = args.stop_loss_pct else {
-        return err(field_error(
-            "stop_loss_pct",
-            ValidationCode::FieldRange,
-            "stop_loss_pct is required; it defines 1R (a decimal fraction string like \"0.05\")",
-        ));
+    let stop = match (
+        args.stop_loss_pct,
+        args.atr_stop_period,
+        args.atr_stop_multiple,
+    ) {
+        (Some(stop_loss_pct), None, None) => ExitRule::StopLoss {
+            distance_pct: SweepableValue::Fixed(stop_loss_pct),
+        },
+        (None, Some(period), Some(multiple)) => ExitRule::AtrStop {
+            period: SweepableValue::Fixed(period),
+            multiple: SweepableValue::Fixed(multiple),
+        },
+        _ => {
+            return err(field_error(
+                "stop_loss_pct",
+                ValidationCode::FieldRange,
+                "exactly one stop family is required: give stop_loss_pct, or \
+                 atr_stop_period with atr_stop_multiple",
+            ));
+        }
     };
-    let mut exits = vec![ExitRule::StopLoss {
-        distance_pct: SweepableValue::Fixed(stop_loss_pct),
-    }];
+    let mut exits = vec![stop];
     if let Some(target_r) = args.take_profit_r {
         exits.push(ExitRule::TakeProfit {
             target_r: SweepableValue::Fixed(target_r),
@@ -299,6 +319,12 @@ struct SignalArgs {
 struct ExitArgs {
     #[serde(default, with = "rust_decimal::serde::str_option")]
     stop_loss_pct: Option<Decimal>,
+    // The ATR stop family (schema 1.1.0): `atr_stop_period` is a JSON integer,
+    // `atr_stop_multiple` a decimal STRING like every other Decimal arg.
+    #[serde(default)]
+    atr_stop_period: Option<u32>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    atr_stop_multiple: Option<Decimal>,
     #[serde(default, with = "rust_decimal::serde::str_option")]
     take_profit_r: Option<Decimal>,
     #[serde(default, with = "rust_decimal::serde::str_option")]
@@ -368,6 +394,13 @@ mod mapping {
         // via `parse_args` (slice-close FIX E).
         #[serde(default, with = "rust_decimal::serde::str_option")]
         value: Option<Decimal>,
+        // The TOOL boundary names it `timeframe`; the DSL names it `series`
+        // (SPINE.md grill ruling 1) — this field is the only translation point.
+        // `"h4"` selects the run's higher-timeframe series (`Series::Htf`);
+        // `"primary"` or absent is the primary series. No `timeframe` word ever
+        // reaches a DSL type.
+        #[serde(default)]
+        timeframe: Option<String>,
     }
 
     /// The comparator/cross the flat `op` string selects.
@@ -452,6 +485,15 @@ mod mapping {
     fn operand_to_value_source(operand: &Operand, path: &str) -> Result<ValueSource, FieldError> {
         match operand.source.as_str() {
             "constant" => {
+                // A constant has no series — a `timeframe` token on one is a
+                // correctable error, never a silent drop (#160's class).
+                if operand.timeframe.is_some() {
+                    return Err(field_error(
+                        format!("{path}.timeframe"),
+                        ValidationCode::FieldRange,
+                        "a constant operand has no series — drop `timeframe`",
+                    ));
+                }
                 let value = operand.value.ok_or_else(|| {
                     field_error(
                         format!("{path}.value"),
@@ -462,19 +504,34 @@ mod mapping {
                 Ok(ValueSource::Constant { value })
             }
             "price" => Ok(ValueSource::Price {
-                // w3 owns the builder vocabulary — tool args carry no `series`
-                // token yet, so every composed operand is primary-series.
-                series: Series::Primary,
+                series: series_from(operand.timeframe.as_deref(), path)?,
                 field: price_field(operand.price_field.as_deref(), path)?,
             }),
             "indicator" => Ok(ValueSource::Indicator {
-                series: Series::Primary,
+                series: series_from(operand.timeframe.as_deref(), path)?,
                 spec: indicator_spec(operand, path)?,
             }),
             other => Err(field_error(
                 format!("{path}.source"),
                 ValidationCode::FieldRange,
                 format!("unknown operand source {other:?}; expected indicator|price|constant"),
+            )),
+        }
+    }
+
+    /// Map the flat `timeframe` token to a tagged [`Series`] — the ONLY place
+    /// the tool boundary's `timeframe` becomes the DSL's `series` (SPINE.md
+    /// grill ruling 1). `"h4"` is the sole higher-timeframe token (the run pairs
+    /// exactly one HTF series); an unknown token is a correctable
+    /// `FieldError` localized at `{left|right}.timeframe`.
+    fn series_from(timeframe: Option<&str>, path: &str) -> Result<Series, FieldError> {
+        match timeframe {
+            None | Some("primary") => Ok(Series::Primary),
+            Some("h4") => Ok(Series::Htf),
+            Some(other) => Err(field_error(
+                format!("{path}.timeframe"),
+                ValidationCode::FieldRange,
+                format!("unknown timeframe {other:?}; expected primary|h4"),
             )),
         }
     }
@@ -527,10 +584,13 @@ mod mapping {
                 slow: fixed_u32(operand.slow, &format!("{path}.slow"))?,
                 signal: fixed_u32(operand.signal, &format!("{path}.signal"))?,
             }),
+            "atr" => Ok(IndicatorSpec::Atr {
+                period: fixed_period(operand, path)?,
+            }),
             other => Err(field_error(
                 format!("{path}.indicator"),
                 ValidationCode::FieldRange,
-                format!("unknown indicator {other:?}; expected rsi|ema|adx|macd"),
+                format!("unknown indicator {other:?}; expected rsi|ema|adx|macd|atr"),
             )),
         }
     }
@@ -591,7 +651,12 @@ fn operand_schema() -> Value {
         "type": "object",
         "properties": {
             "source": { "type": "string", "enum": ["indicator", "price", "constant"] },
-            "indicator": { "type": "string", "enum": ["rsi", "ema", "adx", "macd"] },
+            "indicator": { "type": "string", "enum": ["rsi", "ema", "adx", "macd", "atr"] },
+            "timeframe": {
+                "type": "string",
+                "enum": ["primary", "h4"],
+                "description": "series the operand is evaluated on; \"h4\" uses the last closed H4 bar, omit for the primary series"
+            },
             "period": { "type": "integer", "minimum": 1 },
             "fast": { "type": "integer", "minimum": 1 },
             "slow": { "type": "integer", "minimum": 1 },
@@ -662,19 +727,22 @@ fn def_add_filter() -> ToolDefinition {
 fn def_set_exit_rules() -> ToolDefinition {
     ToolDefinition {
         name: "set_exit_rules".to_owned(),
-        description: "Set the exit rules (replacing). `stop_loss_pct` is required and defines \
-                      1R. Decimal fields are JSON strings (e.g. \"0.05\"); `take_profit_r` is a \
-                      plain R-multiple string; `time_bars` is an integer."
+        description: "Set the exit rules (replacing). Exactly one stop family is required: \
+                      `stop_loss_pct`, or `atr_stop_period` with `atr_stop_multiple` — either \
+                      defines 1R. Decimal fields are JSON strings (e.g. \"0.05\"); \
+                      `take_profit_r` is a plain R-multiple string; `time_bars` and \
+                      `atr_stop_period` are integers."
             .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "stop_loss_pct": { "type": "string", "description": "stop distance fraction, e.g. \"0.05\"" },
+                "atr_stop_period": { "type": "integer", "minimum": 1, "description": "ATR lookback period, e.g. 14" },
+                "atr_stop_multiple": { "type": "string", "description": "ATR multiple as a decimal string, e.g. \"2\"" },
                 "take_profit_r": { "type": "string", "description": "take-profit R-multiple, e.g. \"2\"" },
                 "trailing_pct": { "type": "string", "description": "trailing distance fraction" },
                 "time_bars": { "type": "integer", "minimum": 1 }
-            },
-            "required": ["stop_loss_pct"]
+            }
         }),
     }
 }
