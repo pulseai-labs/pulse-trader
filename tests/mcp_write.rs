@@ -16,13 +16,15 @@
 mod support;
 
 use pulse::{
-    BacktestRunRepository, CandleSeriesRepository, CandleStore, CreatedBy, NewVersion, Pair,
-    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyRepository, Timeframe, VersionId,
+    BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleStore,
+    CreatedBy, DataVersion, NewVersion, Pair, SnapshotSelection, SqliteBacktestRunRepo,
+    SqliteStrategyRepo, StrategyRepository, Timeframe, VersionId,
 };
 use serde_json::{Value, json};
 use support::mcp::{
     FIXTURE_STORE, Fixture, MINIMAL_DSL, call, call_err, copy_tree, manifest, migrated_db,
-    seed_real_run, seed_real_run_primary_only, seed_versions, spawn_client,
+    seed_real_run, seed_real_run_primary_only, seed_run_with_inputs, seed_versions, seeded_inputs,
+    spawn_client,
 };
 use tempfile::TempDir;
 
@@ -843,6 +845,91 @@ async fn run_backtest_refused_when_an_htf_child_inherits_an_m15_only_run() {
             .as_str()
             .is_some_and(|m| m.contains("higher-timeframe")),
         "the refusal explains the missing input: {err}"
+    );
+    assert_eq!(
+        row_count(&fixture, "backtest_run").await,
+        runs_before,
+        "a refused run writes no row"
+    );
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// r2.s2 round-1 fix F1 — a parent run whose recorded inputs name an `htf`
+/// timeframe that is NOT higher than its primary (`"15m"` on `"15m"` — a row a
+/// pre-fix binary or an out-of-band writer could have left). The child's
+/// resolved request inherits `htf_timeframe: Some(M15)`, so `run_backtest`
+/// must refuse with `{ field: "inputs.htf" }` — the MCP mapping of
+/// `BacktestAppError::HtfNotHigher` — and write no run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_backtest_refused_when_the_inherited_htf_is_not_higher() {
+    let tmp_db = TempDir::new().unwrap();
+    let (db_path, db) = migrated_db(&tmp_db).await;
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let strategy = strategies
+        .create_strategy("mcp htf order", None, &[])
+        .await
+        .expect("create strategy");
+    let parent = strategies
+        .create_version(NewVersion {
+            strategy_id: strategy.id.clone(),
+            parent_version_id: None,
+            dsl_json: MINIMAL_DSL.to_owned(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create parent version");
+    let child = strategies
+        .create_version(NewVersion {
+            strategy_id: strategy.id.clone(),
+            parent_version_id: Some(parent.id.clone()),
+            dsl_json: serde_json::to_string(&variant_dsl("RSI Oversold (mcp htf-order child)"))
+                .expect("child doc serializes"),
+            created_by: CreatedBy::ComposerLlm,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create child version");
+
+    // The equal-timeframe `inputs.htf` — a provenance state no current code
+    // path can write, seeded directly so the refusal has something to catch.
+    let corrupt_inputs = BacktestInputs {
+        htf: Some(SnapshotSelection {
+            timeframe: Timeframe::M15, // not higher than the M15 primary
+            data_version: DataVersion::new("v-htf"),
+        }),
+        ..seeded_inputs()
+    };
+    seed_run_with_inputs(&db, &parent.id, &corrupt_inputs).await;
+
+    let tmp_store = TempDir::new().unwrap();
+    let store_dir = tmp_store.path().join("store");
+    copy_tree(&manifest(FIXTURE_STORE), &store_dir);
+    let fixture = Fixture {
+        _tmp_db: tmp_db,
+        _tmp_store: tmp_store,
+        db,
+        db_path,
+        store_dir,
+        seed: (parent.id, child.id.clone(), BacktestRunId::new("seeded")),
+    };
+    let client = spawn_client(&fixture.db_path, &fixture.store_dir).await;
+
+    let runs_before = row_count(&fixture, "backtest_run").await;
+    let err = call_err(
+        &client,
+        "run_backtest",
+        json!({"version_id": child.id.as_str()}),
+    )
+    .await;
+
+    assert_eq!(err["field"], "inputs.htf");
+    assert!(
+        err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("higher")),
+        "the refusal names the higher-timeframe rule: {err}"
     );
     assert_eq!(
         row_count(&fixture, "backtest_run").await,

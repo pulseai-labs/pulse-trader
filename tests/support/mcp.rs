@@ -182,13 +182,17 @@ pub async fn seed_versions(db: &Db) -> (VersionId, VersionId) {
     (parent.id, child.id)
 }
 
-/// Seed one strategy with a parent→child version pair, and one run (one trade)
-/// against the child, all through the repository layer the server reads.
-pub async fn seed(db: &Db) -> Seed {
-    let (parent_id, child_id) = seed_versions(db).await;
-
+/// Seed one run carrying CALLER-SUPPLIED `inputs` — for states a real run can
+/// no longer produce (e.g. round-1 fix F1's equal-timeframe `inputs.htf`, a
+/// row only a pre-fix binary or an out-of-band writer could leave). The row's
+/// trade and result are the ordinary seeded ones; only the provenance block
+/// differs.
+pub async fn seed_run_with_inputs(
+    db: &Db,
+    version_id: &VersionId,
+    inputs: &BacktestInputs,
+) -> BacktestRunId {
     let trade = seeded_trade();
-    let inputs = seeded_inputs();
     let summary = SummaryStats::from_trades(
         std::slice::from_ref(&trade),
         trade.realized_pnl,
@@ -210,16 +214,22 @@ pub async fn seed(db: &Db) -> Seed {
         equity_curve: EquityCurve::default(),
     };
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
-    let run_id = runs
-        .save_run(
-            &child_id,
-            &inputs,
-            &result,
-            &result.summary,
-            Decimal::new(10_000, 0),
-        )
-        .await
-        .expect("save seeded run");
+    runs.save_run(
+        version_id,
+        inputs,
+        &result,
+        &result.summary,
+        Decimal::new(10_000, 0),
+    )
+    .await
+    .expect("save seeded run")
+}
+
+/// Seed one strategy with a parent→child version pair, and one run (one trade)
+/// against the child, all through the repository layer the server reads.
+pub async fn seed(db: &Db) -> Seed {
+    let (parent_id, child_id) = seed_versions(db).await;
+    let run_id = seed_run_with_inputs(db, &child_id, &seeded_inputs()).await;
     (parent_id, child_id, run_id)
 }
 

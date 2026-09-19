@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::domain::Timeframe;
+
 /// Errors produced by the backtester (domain layer).
 ///
 /// `#[non_exhaustive]` so 1.03/1.04 can add variants additively (the shared file
@@ -66,4 +68,22 @@ pub enum BacktestError {
     /// the missing input field.
     #[error("strategy requires a higher-timeframe candle series (series: \"htf\" operand present)")]
     HtfRequired,
+
+    /// The supplied higher-timeframe series is not strictly higher than the
+    /// primary series (`htf.duration_ms() <= primary.duration_ms()`). An equal
+    /// or lower interval would advance `Series::Htf` operands on the wrong
+    /// cadence while the DSL renders them as the HTF — silently wrong signals.
+    /// The request boundary refuses this before any candle I/O (r2.s2 round-1
+    /// fix F1); this arm is the engine-level defence for callers that
+    /// construct the series directly.
+    #[error(
+        "higher-timeframe series {htf:?} is not higher than the primary series {primary:?} — \
+         `Series::Htf` operands need a strictly longer timeframe"
+    )]
+    HtfNotHigher {
+        /// The primary series' timeframe.
+        primary: Timeframe,
+        /// The supplied higher-timeframe series' timeframe.
+        htf: Timeframe,
+    },
 }

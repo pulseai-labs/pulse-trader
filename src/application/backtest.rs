@@ -284,6 +284,27 @@ pub enum BacktestAppError {
         field: &'static str,
     },
 
+    /// The request's `inputs.htf` selection is not strictly higher than the
+    /// primary timeframe — compared by [`Timeframe::duration_ms`], so the rule
+    /// holds for any future timeframe pair rather than hardcoding M15→H4.
+    /// An equal or lower interval would advance `Series::Htf` operands on the
+    /// wrong cadence while the DSL renders them as the HTF — silently wrong
+    /// signals — so the request is refused before any candle I/O (r2.s2
+    /// round-1 fix F1).
+    #[error(
+        "{field} must be a strictly higher timeframe than the primary {} — got {}",
+        primary.binance_interval(),
+        htf.binance_interval()
+    )]
+    HtfNotHigher {
+        /// The request/input field at fault — always `"inputs.htf"`.
+        field: &'static str,
+        /// The request's primary timeframe.
+        primary: Timeframe,
+        /// The request's higher-timeframe selection.
+        htf: Timeframe,
+    },
+
     /// A READ failed before anything was saved.
     ///
     /// Distinct from [`Persist`](Self::Persist) because that one says "persist
@@ -630,6 +651,31 @@ where
         })?
         .ok_or_else(|| BacktestAppError::VersionNotFound(request.version_id.clone()))?;
     let validated = validate(&version.dsl)?;
+
+    // r2.s2 round-1 fixes F1/F6: the request-level guards run BEFORE any
+    // candle I/O. `compile` is pure, so an `htf`-operand strategy missing
+    // `inputs.htf` — or an `inputs.htf` selection that is not strictly higher
+    // than the primary timeframe — is refused here rather than surfacing as a
+    // `PreSaveRead`/`SnapshotMissing` after loading (and possibly failing on)
+    // candle data the run can never use. `prepare_backtest` keeps the same
+    // `needs_htf` guard and `run_backtest` the same pair check as the last
+    // line of defence for callers that skip this ring.
+    let compiled =
+        compile(&validated).map_err(|e| BacktestAppError::CompileFailed(e.to_string()))?;
+    if compiled.needs_htf() && request.htf_timeframe.is_none() {
+        return Err(BacktestAppError::HtfRequired {
+            field: "inputs.htf",
+        });
+    }
+    if let Some(htf_tf) = request.htf_timeframe
+        && htf_tf.duration_ms() <= request.primary_timeframe.duration_ms()
+    {
+        return Err(BacktestAppError::HtfNotHigher {
+            field: "inputs.htf",
+            primary: request.primary_timeframe,
+            htf: htf_tf,
+        });
+    }
 
     // 3. Everything synchronous — Parquet decode and the CPU engine — happens on a
     //    blocking thread. Both are hundreds of milliseconds on the real fixture, and

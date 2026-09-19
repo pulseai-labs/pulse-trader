@@ -91,13 +91,7 @@ pub fn run_backtest(
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
-    // Engine-side typed guard (r2.s2.w2): a strategy carrying an `Htf` operand
-    // must never evaluate that operand against primary data. The application
-    // ring checks this first and reports the missing input field; this is the
-    // defense-in-depth the spec requires of the engine itself.
-    if compiled.needs_htf() && htf.is_none() {
-        return Err(BacktestError::HtfRequired);
-    }
+    check_htf_inputs(compiled, primary, htf)?;
     let mut engine =
         IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
     // The higher-timeframe engine is built only when the strategy carries an
@@ -254,6 +248,34 @@ pub fn run_backtest(
     // 0 (the run produced no trades either, so the curve is just the leading point).
     let run_start_time_ms = primary.candles.first().map_or(0, |candle| candle.open_time);
     Ok(state.into_result(config, run_start_time_ms, open_position))
+}
+
+/// The engine-side HTF input guards: a strategy carrying an `Htf` operand must
+/// never evaluate that operand against primary data (r2.s2.w2 — the
+/// application ring checks this first and reports the missing input field),
+/// and a supplied "higher" timeframe that is not strictly higher than the
+/// primary — compared by `Timeframe::duration_ms`, so the rule holds for any
+/// pair — would advance `Series::Htf` operands on the wrong cadence while the
+/// DSL renders them as the HTF (r2.s2 round-1 fix F1). Both refusals live at
+/// the request boundary too; these are the defence-in-depth copies for callers
+/// that construct the series directly.
+fn check_htf_inputs(
+    compiled: &CompiledStrategy,
+    primary: &CandleSeries,
+    htf: Option<&CandleSeries>,
+) -> Result<(), BacktestError> {
+    if compiled.needs_htf() && htf.is_none() {
+        return Err(BacktestError::HtfRequired);
+    }
+    if let Some(htf_series) = htf
+        && htf_series.timeframe.duration_ms() <= primary.timeframe.duration_ms()
+    {
+        return Err(BacktestError::HtfNotHigher {
+            primary: primary.timeframe,
+            htf: htf_series.timeframe,
+        });
+    }
+    Ok(())
 }
 
 /// How a position's stop is derived (r2.s2.w2): either the fixed-fraction

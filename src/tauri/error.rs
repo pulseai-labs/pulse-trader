@@ -221,11 +221,12 @@ impl From<BacktestAppError> for BusError {
         let code = match &err {
             BacktestAppError::DslInvalid(_)
             | BacktestAppError::CompileFailed(_)
-            // r2.s2.w2: a missing HTF series is a caller-correctable
-            // missing-input refusal like `WindowEmpty` — `validation`, and the
-            // message names `inputs.htf` (the MCP surface reports the same
-            // variant as `field_error("inputs.htf", …)`).
+            // r2.s2.w2 + round-1 fix F1: a missing or non-higher HTF selection
+            // is a caller-correctable input refusal like `WindowEmpty` —
+            // `validation`, and the message names `inputs.htf` (the MCP
+            // surface reports the same variants as `field_error("inputs.htf", …)`).
             | BacktestAppError::HtfRequired { .. }
+            | BacktestAppError::HtfNotHigher { .. }
             | BacktestAppError::WindowEmpty { .. } => BusErrorCode::Validation,
             BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
             BacktestAppError::Engine(_) => BusErrorCode::Backtest,
@@ -250,7 +251,8 @@ impl From<BacktestAppError> for BusError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{BusError, BusErrorCode};
-    use crate::domain::DataError;
+    use crate::application::backtest::BacktestAppError;
+    use crate::domain::{DataError, Timeframe};
 
     #[test]
     fn code_serializes_as_a_string_discriminant() {
@@ -262,5 +264,19 @@ mod tests {
     fn display_is_the_message_so_anyhow_context_reads_cleanly() {
         let err = BusError::from(DataError::Parse("nope".to_owned()));
         assert_eq!(err.to_string(), "parse error: nope");
+    }
+
+    /// r2.s2 round-1 fix F1: a non-higher `inputs.htf` refusal maps to the
+    /// caller-correctable `validation` family, exactly like `HtfRequired`, and
+    /// its message names the field.
+    #[test]
+    fn htf_not_higher_maps_to_validation_and_names_the_field() {
+        let err = BusError::from(BacktestAppError::HtfNotHigher {
+            field: "inputs.htf",
+            primary: Timeframe::H4,
+            htf: Timeframe::M15,
+        });
+        assert_eq!(err.code, BusErrorCode::Validation);
+        assert!(err.message.contains("inputs.htf"), "{}", err.message);
     }
 }

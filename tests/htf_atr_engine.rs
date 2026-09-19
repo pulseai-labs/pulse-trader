@@ -26,17 +26,20 @@
 //!   identical `result_content_hash` (the repeat-twice oracle).
 //! - **(g)** every trade's `stop_price` equals the geometric stop, and a
 //!   windowed run's open-position mark is unaffected.
+//! - **(h)** a non-higher `inputs.htf` selection is refused with the typed
+//!   field-pathed error — at the request boundary before any candle I/O, and
+//!   again inside `run_backtest` as engine-level defence (round-1 fix F1/F6).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
 
 use pulse::{
-    BacktestAppError, BacktestConfig, BacktestRequest, BacktestResult, BinanceAdapter, Candle,
-    CandleSeries, CandleStore, Comparator, CompiledStrategy, Condition, CreatedBy, DataVersion, Db,
-    Direction, ExitReason, ExitRule, MIGRATOR, NewVersion, Pair, PriceField, RiskParams,
-    SchemaVersion, Series, SeriesEnd, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyDsl,
-    StrategyRepository, SweepableValue, SymbolFilters, Timeframe, ValueSource, atr_stop_price,
-    compile, run_backtest, run_version_backtest, stop_price, validate,
+    BacktestAppError, BacktestConfig, BacktestError, BacktestRequest, BacktestResult,
+    BinanceAdapter, Candle, CandleSeries, CandleStore, Comparator, CompiledStrategy, Condition,
+    CreatedBy, DataVersion, Db, Direction, ExitReason, ExitRule, MIGRATOR, NewVersion, Pair,
+    PriceField, RiskParams, SchemaVersion, Series, SeriesEnd, SqliteBacktestRunRepo,
+    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue, SymbolFilters, Timeframe,
+    ValueSource, atr_stop_price, compile, run_backtest, run_version_backtest, stop_price, validate,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -523,6 +526,199 @@ async fn htf_strategy_without_htf_snapshot_is_refused_with_htf_required() {
         }
         other => panic!("expected BacktestAppError::HtfRequired, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// (h) a non-higher `inputs.htf` selection is refused before any candle I/O
+// ---------------------------------------------------------------------------
+
+/// Round-1 fixes F1+F6: `--tf M15 --htf M15` and `--tf H4 --htf M15` are
+/// refused with `BacktestAppError::HtfNotHigher` naming `inputs.htf`, compared
+/// by `Timeframe::duration_ms` — not an M15/H4 special case.
+///
+/// Both refused requests run against a pair with NO snapshot (`NOPEUSDT`), so
+/// landing on `HtfNotHigher` rather than `SnapshotMissing`/`PreSaveRead`
+/// proves the guard fires before any candle I/O — a missing/corrupt primary
+/// snapshot can no longer mask the field error. The valid M15→H4 pair still
+/// runs end-to-end over the fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_higher_htf_selection_is_refused_at_the_request_boundary() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open db");
+    MIGRATOR.run(db.pool()).await.expect("run migrations");
+
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let strategy = strategies
+        .create_strategy("htf-need", None, &[])
+        .await
+        .expect("create strategy");
+    let htf_dsl = r#"{
+      "schema_version": "1.1.0",
+      "name": "htf filter",
+      "direction": "long",
+      "entry": {
+        "type": "Compare",
+        "lhs": { "type": "Price", "series": "htf", "field": "Close" },
+        "op": "Gt",
+        "rhs": { "type": "Constant", "value": "0" }
+      },
+      "filters": [],
+      "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+      "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+    }"#;
+    let version = strategies
+        .create_version(NewVersion {
+            strategy_id: strategy.id.clone(),
+            parent_version_id: None,
+            dsl_json: htf_dsl.to_owned(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create version");
+
+    let store = CandleStore::with_base_dir(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/btcusdt-1m-store"),
+    );
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+
+    let request = |pair: &str, primary: Timeframe, htf: Option<Timeframe>| BacktestRequest {
+        version_id: version.id.clone(),
+        pair: Pair::new(pair),
+        primary_timeframe: primary,
+        htf_timeframe: htf,
+        config: BacktestConfig::default(),
+        snapshots: None,
+        window: None,
+    };
+
+    // Equal timeframe: `M15 --htf M15`.
+    let err = run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &request("NOPEUSDT", Timeframe::M15, Some(Timeframe::M15)),
+    )
+    .await
+    .expect_err("an equal-timeframe htf selection must refuse");
+    match err {
+        BacktestAppError::HtfNotHigher {
+            field,
+            primary,
+            htf,
+        } => {
+            assert_eq!(field, "inputs.htf");
+            assert_eq!((primary, htf), (Timeframe::M15, Timeframe::M15));
+        }
+        other => panic!("expected BacktestAppError::HtfNotHigher, got {other:?}"),
+    }
+
+    // Lower timeframe: `H4 --htf M15`.
+    let err = run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &request("NOPEUSDT", Timeframe::H4, Some(Timeframe::M15)),
+    )
+    .await
+    .expect_err("a lower-timeframe htf selection must refuse");
+    match err {
+        BacktestAppError::HtfNotHigher {
+            field,
+            primary,
+            htf,
+        } => {
+            assert_eq!(field, "inputs.htf");
+            assert_eq!((primary, htf), (Timeframe::H4, Timeframe::M15));
+        }
+        other => panic!("expected BacktestAppError::HtfNotHigher, got {other:?}"),
+    }
+
+    // The valid M15→H4 pair still runs end-to-end.
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &request("BTCUSDT", Timeframe::M15, Some(Timeframe::H4)),
+    )
+    .await
+    .expect("a strictly-higher htf selection runs");
+    assert!(
+        !outcome.trades.is_empty(),
+        "the valid pair must still produce a real run, not just a non-error"
+    );
+}
+
+/// Engine-level defence for the same rule: callers that skip the request ring
+/// (the coach accept path replays persisted inputs through `prepare_backtest`)
+/// get the typed [`BacktestError::HtfNotHigher`] from `run_backtest` itself.
+#[test]
+fn engine_refuses_a_non_higher_htf_series() {
+    let strategy = dsl(
+        compare(htf_price(PriceField::Close), Comparator::Gt, constant(0, 0)),
+        vec![stop_loss()],
+        Direction::Long,
+    );
+    let compiled = compiled(&strategy);
+
+    // Equal timeframe: an "htf" series built from M15 bars.
+    let primary = series(Timeframe::M15, flat_m15(40));
+    let equal = series(Timeframe::M15, flat_m15(40));
+    let err = run_backtest(
+        &compiled,
+        &primary,
+        Some(&equal),
+        &zero_slippage(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect_err("an equal-timeframe htf series must refuse");
+    assert!(
+        matches!(
+            err,
+            BacktestError::HtfNotHigher {
+                primary: Timeframe::M15,
+                htf: Timeframe::M15
+            }
+        ),
+        "expected HtfNotHigher(M15, M15), got {err:?}"
+    );
+
+    // Lower timeframe: M15 bars supplied as the "higher" series for an H4
+    // primary.
+    let h4_primary = series(
+        Timeframe::H4,
+        vec![
+            h4(0, 100, 101, 99, 100),
+            h4(1, 100, 101, 99, 100),
+            h4(2, 100, 101, 99, 100),
+        ],
+    );
+    let lower = series(Timeframe::M15, flat_m15(48));
+    let err = run_backtest(
+        &compiled,
+        &h4_primary,
+        Some(&lower),
+        &zero_slippage(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect_err("a lower-timeframe htf series must refuse");
+    assert!(
+        matches!(
+            err,
+            BacktestError::HtfNotHigher {
+                primary: Timeframe::H4,
+                htf: Timeframe::M15
+            }
+        ),
+        "expected HtfNotHigher(H4, M15), got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

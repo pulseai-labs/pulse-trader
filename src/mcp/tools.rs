@@ -346,9 +346,13 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
             field_error("dsl", err)
         }
-        // r2.s2.w2: the strategy needs an HTF series the request lacked — the
-        // error's `field` already carries `"inputs.htf"`, so surface it verbatim.
-        BacktestAppError::HtfRequired { field } => field_error(field, err),
+        // r2.s2.w2 + round-1 fix F1: the strategy needs an HTF series the
+        // request lacked, or the `inputs.htf` selection is not strictly higher
+        // than the primary timeframe — the error's `field` already carries
+        // `"inputs.htf"`, so surface it verbatim.
+        BacktestAppError::HtfRequired { field } | BacktestAppError::HtfNotHigher { field, .. } => {
+            field_error(field, err)
+        }
         _ => tool_error(err),
     }
 }
