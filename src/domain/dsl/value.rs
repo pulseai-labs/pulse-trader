@@ -16,6 +16,27 @@ use serde::{Deserialize, Serialize};
 
 use super::sweepable::SweepableValue;
 
+/// Which candle series a [`ValueSource`] operand reads (r2.s2.w1, schema 1.1.0).
+///
+/// `Primary` is the run's own series; `Htf` is the aligned higher-timeframe
+/// series (its evaluation is w2's — schema 1.1.0 carries the tag only, and
+/// `compile()` rejects an `Htf` operand with
+/// [`CompileError::HtfUnsupported`](super::compile::CompileError::HtfUnsupported)
+/// until then). Serializes lowercase (`"primary"`/`"htf"`); deserialization
+/// defaults a missing `series` to `primary` via the `#[serde(default)]` on each
+/// operand field, while writes always emit the tag explicitly.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Series {
+    /// The run's own candle series.
+    #[default]
+    Primary,
+    /// The aligned higher-timeframe series (evaluated by w2).
+    Htf,
+}
+
 /// A field of the current candle (OHLCV). Serialized via its variant name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PriceField {
@@ -70,6 +91,13 @@ pub enum IndicatorSpec {
         /// Signal-line EMA period.
         signal: SweepableValue<u32>,
     },
+    /// Average True Range over `period` bars (schema 1.1.0; its computation is
+    /// w2's — the indicator factory rejects it with a typed `Unsupported` until
+    /// then).
+    Atr {
+        /// Lookback period.
+        period: SweepableValue<u32>,
+    },
 }
 
 /// Where a scalar value in a [`Condition`](super::Condition) comes from.
@@ -86,11 +114,19 @@ pub enum ValueSource {
     },
     /// A field of the current candle.
     Price {
+        /// Which series the field reads (absent ⇒ `primary`; writes always
+        /// emit it).
+        #[serde(default)]
+        series: Series,
         /// Which OHLCV field to read.
         field: PriceField,
     },
     /// The output of a technical indicator.
     Indicator {
+        /// Which series the indicator runs on (absent ⇒ `primary`; writes
+        /// always emit it).
+        #[serde(default)]
+        series: Series,
         /// The indicator and its parameters.
         spec: IndicatorSpec,
     },
@@ -99,7 +135,7 @@ pub enum ValueSource {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{IndicatorSpec, PriceField, SweepableValue, ValueSource};
+    use super::{IndicatorSpec, PriceField, Series, SweepableValue, ValueSource};
     use rust_decimal::Decimal;
 
     fn round_trip(v: &ValueSource) -> ValueSource {
@@ -118,6 +154,7 @@ mod tests {
     #[test]
     fn price_round_trips() {
         let v = ValueSource::Price {
+            series: Series::Primary,
             field: PriceField::Close,
         };
         assert_eq!(round_trip(&v), v);
@@ -126,6 +163,7 @@ mod tests {
     #[test]
     fn indicator_rsi_round_trips() {
         let v = ValueSource::Indicator {
+            series: Series::Primary,
             spec: IndicatorSpec::Rsi {
                 period: SweepableValue::Fixed(14),
             },
@@ -136,6 +174,7 @@ mod tests {
     #[test]
     fn indicator_macd_round_trips() {
         let v = ValueSource::Indicator {
+            series: Series::Primary,
             spec: IndicatorSpec::Macd {
                 fast: SweepableValue::Fixed(12),
                 slow: SweepableValue::Fixed(26),
@@ -143,6 +182,54 @@ mod tests {
             },
         };
         assert_eq!(round_trip(&v), v);
+    }
+
+    /// schema 1.1.0: an `htf`-tagged operand round-trips, an absent `series`
+    /// reads `primary`, and writes always emit the field explicitly.
+    #[test]
+    fn series_round_trips_and_defaults_primary() {
+        let htf = ValueSource::Indicator {
+            series: Series::Htf,
+            spec: IndicatorSpec::Ema {
+                period: SweepableValue::Fixed(200),
+            },
+        };
+        assert_eq!(round_trip(&htf), htf);
+
+        // Absent on the wire ⇒ Primary.
+        let read: ValueSource = serde_json::from_str(r#"{"type":"Price","field":"Close"}"#)
+            .expect("series-less Price deserializes");
+        assert_eq!(
+            read,
+            ValueSource::Price {
+                series: Series::Primary,
+                field: PriceField::Close,
+            }
+        );
+
+        // Writes always emit `series` explicitly.
+        let json = serde_json::to_string(&read).expect("serialize Price");
+        assert!(json.contains("\"series\":\"primary\""), "json was: {json}");
+    }
+
+    /// schema 1.1.0: `IndicatorSpec::Atr` round-trips under its `atr` tag.
+    #[test]
+    fn indicator_atr_round_trips() {
+        let v = ValueSource::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Atr {
+                period: SweepableValue::Fixed(14),
+            },
+        };
+        assert_eq!(round_trip(&v), v);
+        let wire: IndicatorSpec =
+            serde_json::from_str(r#"{"indicator":"Atr","period":14}"#).expect("Atr tag parses");
+        assert_eq!(
+            wire,
+            IndicatorSpec::Atr {
+                period: SweepableValue::Fixed(14),
+            }
+        );
     }
 
     #[test]

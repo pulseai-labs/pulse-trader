@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::backtest::{RunSummary, SummaryStats};
 use crate::domain::{
-    Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, StrategyDsl,
+    Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, Series, StrategyDsl,
     SweepableValue, ValueSource,
 };
 
@@ -254,6 +254,16 @@ fn indicator_text(spec: &IndicatorSpec) -> String {
             u32_sweep_text(slow),
             u32_sweep_text(signal)
         ),
+        IndicatorSpec::Atr { period } => format!("atr({})", u32_sweep_text(period)),
+    }
+}
+
+/// The `series` tag as a text prefix — schema 1.1.0's only higher timeframe is
+/// H4, so an `htf` operand reads `h4:…`; `primary` renders bare.
+fn series_tag(series: Series, text: String) -> String {
+    match series {
+        Series::Primary => text,
+        Series::Htf => format!("h4:{text}"),
     }
 }
 
@@ -261,14 +271,17 @@ fn indicator_text(spec: &IndicatorSpec) -> String {
 fn value_text(source: &ValueSource) -> String {
     match source {
         ValueSource::Constant { value } => value.normalize().to_string(),
-        ValueSource::Price { field } => match field {
-            PriceField::Open => "open".to_owned(),
-            PriceField::High => "high".to_owned(),
-            PriceField::Low => "low".to_owned(),
-            PriceField::Close => "close".to_owned(),
-            PriceField::Volume => "volume".to_owned(),
-        },
-        ValueSource::Indicator { spec } => indicator_text(spec),
+        ValueSource::Price { series, field } => series_tag(
+            *series,
+            match field {
+                PriceField::Open => "open".to_owned(),
+                PriceField::High => "high".to_owned(),
+                PriceField::Low => "low".to_owned(),
+                PriceField::Close => "close".to_owned(),
+                PriceField::Volume => "volume".to_owned(),
+            },
+        ),
+        ValueSource::Indicator { series, spec } => series_tag(*series, indicator_text(spec)),
     }
 }
 
@@ -330,6 +343,13 @@ fn format_exit(exit: &ExitRule) -> String {
         ExitRule::SignalExit { condition } => {
             format!("signal exit: {}", format_condition(condition))
         }
+        ExitRule::AtrStop { period, multiple } => {
+            format!(
+                "atr stop {} x{}",
+                u32_sweep_text(period),
+                decimal_sweep_text(multiple)
+            )
+        }
     }
 }
 
@@ -342,7 +362,7 @@ mod tests {
     use crate::domain::backtest::SummaryStats;
     use crate::domain::{
         Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, RiskParams,
-        SchemaVersion, StrategyDsl, SweepableValue, ValueSource,
+        SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource,
     };
     use rust_decimal::Decimal;
 
@@ -355,6 +375,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },
@@ -366,10 +387,12 @@ mod tests {
             },
             filters: vec![Condition::Compare {
                 lhs: ValueSource::Price {
+                    series: Series::Primary,
                     field: PriceField::Close,
                 },
                 op: Comparator::Gt,
                 rhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Ema {
                         period: SweepableValue::Fixed(200),
                     },
@@ -424,6 +447,7 @@ mod tests {
                 conditions: vec![
                     Condition::Compare {
                         lhs: ValueSource::Indicator {
+                            series: Series::Primary,
                             spec: IndicatorSpec::Adx {
                                 period: SweepableValue::Fixed(14),
                             },
@@ -435,6 +459,7 @@ mod tests {
                     },
                     Condition::CrossesAbove {
                         lhs: ValueSource::Indicator {
+                            series: Series::Primary,
                             spec: IndicatorSpec::Macd {
                                 fast: SweepableValue::Fixed(12),
                                 slow: SweepableValue::Fixed(26),

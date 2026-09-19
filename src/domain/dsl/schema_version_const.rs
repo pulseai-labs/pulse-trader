@@ -18,4 +18,4 @@
 /// The DSL schema version this build writes, as the canonical
 /// `"MAJOR.MINOR.PATCH"` string. Kept byte-for-byte in lock-step with
 /// `SchemaVersion::CURRENT` via the non-drift test in `schema_version.rs`.
-pub const DSL_SCHEMA_VERSION: &str = "1.0.0";
+pub const DSL_SCHEMA_VERSION: &str = "1.1.0";

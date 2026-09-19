@@ -98,7 +98,9 @@ pub use domain::strategy::Hypothesis as AgentHypothesis;
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
 // (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
 // same curated-surface pattern as the domain types above.
-pub use domain::{Comparator, Condition, IndicatorSpec, PriceField, SweepableValue, ValueSource};
+pub use domain::{
+    Comparator, Condition, IndicatorSpec, PriceField, Series, SweepableValue, ValueSource,
+};
 
 // VS-1.1.2 work-2.02: the whole-strategy document layer. `StrategyDsl` is the
 // top-level document the LLM composes (FR-3) and the backtester executes;
@@ -139,7 +141,7 @@ pub use domain::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Mi
 // `deny(warnings)` + `pub(crate) mod domain`.
 pub use domain::{
     CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, compile, stop_price, take_profit_price,
+    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
 };
 
 // r1.s2.w1 (ADR-0021): the one-mutation framework. `apply(&StrategyDsl,

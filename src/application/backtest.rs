@@ -1084,8 +1084,8 @@ mod tests {
         BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CandleWindow,
         Comparator, Condition, DataError, DataVersion, Direction, ExitRule, FundingConfig,
         IndicatorSpec, Pair, PersistedRun, RegimeBreakdown, RiskParams, RunSummary, SchemaVersion,
-        SkippedEntryCounts, SnapshotSelection, StrategyDsl, StrategyRepository, SummaryStats,
-        SweepableValue, Timeframe, Trade, ValueSource,
+        Series, SkippedEntryCounts, SnapshotSelection, StrategyDsl, StrategyRepository,
+        SummaryStats, SweepableValue, Timeframe, Trade, ValueSource,
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
@@ -1346,6 +1346,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },

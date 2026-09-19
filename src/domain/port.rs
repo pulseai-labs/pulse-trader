@@ -1027,7 +1027,7 @@ mod repository_tests {
 
     use crate::domain::dsl::{
         Comparator, Condition, Direction, ExitRule, IndicatorSpec, RiskParams, SchemaVersion,
-        StrategyDsl, SweepableValue, ValueSource,
+        Series, StrategyDsl, SweepableValue, ValueSource,
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
@@ -1041,6 +1041,7 @@ mod repository_tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },

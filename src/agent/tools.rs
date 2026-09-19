@@ -332,7 +332,7 @@ mod mapping {
     use serde::Deserialize;
 
     use crate::domain::{
-        Comparator, Condition, FieldError, IndicatorSpec, PriceField, SweepableValue,
+        Comparator, Condition, FieldError, IndicatorSpec, PriceField, Series, SweepableValue,
         ValidationCode, ValueSource,
     };
 
@@ -462,9 +462,13 @@ mod mapping {
                 Ok(ValueSource::Constant { value })
             }
             "price" => Ok(ValueSource::Price {
+                // w3 owns the builder vocabulary — tool args carry no `series`
+                // token yet, so every composed operand is primary-series.
+                series: Series::Primary,
                 field: price_field(operand.price_field.as_deref(), path)?,
             }),
             "indicator" => Ok(ValueSource::Indicator {
+                series: Series::Primary,
                 spec: indicator_spec(operand, path)?,
             }),
             other => Err(field_error(

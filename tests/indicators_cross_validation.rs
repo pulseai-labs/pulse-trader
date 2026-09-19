@@ -10,7 +10,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use pulse::{
-    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair,
+    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair, Series,
     SweepableValue, Timeframe,
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -144,7 +144,10 @@ fn all_specs() -> Vec<IndicatorSpec> {
 }
 
 fn current_value(engine: &IndicatorEngine, indicator: IndicatorName) -> Option<Decimal> {
-    engine.current(&CompiledValue::Indicator(indicator.spec()))
+    engine.current(&CompiledValue::Indicator {
+        series: Series::Primary,
+        spec: indicator.spec(),
+    })
 }
 
 fn decimal_to_f64(value: Decimal) -> f64 {

@@ -60,12 +60,13 @@ pub(crate) fn dsl_schema_json() -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::dsl_schema_json;
+    use crate::domain::DSL_SCHEMA_VERSION;
 
     #[test]
     fn dsl_schema_document_shape() {
         let doc: serde_json::Value =
             serde_json::from_str(&dsl_schema_json()).expect("resource body parses as JSON");
-        assert_eq!(doc["schema_version"], "1.0.0");
+        assert_eq!(doc["schema_version"], DSL_SCHEMA_VERSION);
         let properties = doc["json_schema"]["properties"]
             .as_object()
             .expect("json_schema has properties");
@@ -80,12 +81,14 @@ mod tests {
         ] {
             assert!(properties.contains_key(field), "missing property {field}");
         }
-        // F6: `schema_version` publishes the ACCEPTED value, not an
-        // unconstrained string — `Migrator::v1()` loads exactly `CURRENT`, so
-        // the schema a validating agent reads must pin the const.
+        // F6: `schema_version` publishes the ACCEPTED values, not an
+        // unconstrained string — `Migrator::v1()` loads `1.0.0` (identity-
+        // migrated) and `CURRENT`, so the schema a validating agent reads must
+        // pin exactly that enum.
         assert_eq!(
-            properties["schema_version"]["const"], "1.0.0",
-            "schema_version property must publish the accepted const"
+            properties["schema_version"]["enum"],
+            serde_json::json!(["1.0.0", DSL_SCHEMA_VERSION]),
+            "schema_version property must publish the accepted enum"
         );
         let conventions = doc["conventions"].as_object().expect("conventions object");
         let window = conventions
