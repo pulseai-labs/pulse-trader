@@ -87,14 +87,17 @@ async fn columns_of(pool: &SqlitePool, table: &str) -> Vec<String> {
         .unwrap()
 }
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0008_*` — the binary
-/// that shipped `0007` while the coach rail was still being planned.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0008_*` and later
+/// — the binary that shipped `0007` while the coach rail was still being
+/// planned. (`0009`'s pending-claim index only has meaning once `0008` makes
+/// `pending` a legal outcome; unskipped it would also lift the fixture's
+/// maximum off the `0007` pin.)
 fn shipped_set_without_0008(dir: &Path) {
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("0008_") {
+        if name.as_str() >= "0008" {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
@@ -1901,6 +1904,7 @@ fn prepared_backtest() -> PreparedBacktest {
         slippage_total,
         regime_breakdown: RegimeBreakdown::default(),
         skipped_entries: SkippedEntryCounts::default(),
+        open_position: None,
         engine_fingerprint: pulse::EngineFingerprint::current(),
         summary: summary.clone(),
         equity_curve,
@@ -1916,6 +1920,7 @@ fn prepared_backtest() -> PreparedBacktest {
             taker_fee_bps: Decimal::new(4, 0),
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,
+            window: None,
         },
         result,
         summary,

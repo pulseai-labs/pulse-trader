@@ -38,7 +38,7 @@ use super::schema_version::SchemaVersion;
 /// Plain (untagged) struct — it's the root object. `entry` is required; the
 /// other collections carry their own emptiness semantics (see module docs and
 /// 2.03 for validation).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StrategyDsl {
     /// The DSL document's schema version (a `"MAJOR.MINOR.PATCH"` string in
     /// JSON). Deserialize is migration-unaware — see module docs.

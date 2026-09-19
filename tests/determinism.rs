@@ -52,7 +52,8 @@ use std::path::PathBuf;
 
 use pulse::{
     BacktestConfig, BacktestResult, BinanceAdapter, CandleSeries, CandleStore, CompiledStrategy,
-    ExchangeAdapter, Migrator, Pair, SymbolFilters, Timeframe, compile, run_backtest, validate,
+    ExchangeAdapter, Migrator, Pair, SeriesEnd, SymbolFilters, Timeframe, compile, run_backtest,
+    validate,
 };
 use rayon::prelude::*;
 
@@ -111,8 +112,15 @@ fn run_once(
     primary: &CandleSeries,
     filters: &SymbolFilters,
 ) -> BacktestResult {
-    run_backtest(compiled, primary, None, &BacktestConfig::default(), filters)
-        .expect("backtest runs over the fixture")
+    run_backtest(
+        compiled,
+        primary,
+        None,
+        &BacktestConfig::default(),
+        filters,
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect("backtest runs over the fixture")
 }
 
 /// NFR-2 / BACKLOG-12 in-process determinism: the SAME backtest run 100x

@@ -53,6 +53,7 @@ fn seed_inputs() -> BacktestInputs {
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
+        window: None,
     }
 }
 use rust_decimal::Decimal;
@@ -174,6 +175,7 @@ async fn seeded() -> (TempDir, Db, StrategyVersion, BacktestRunId) {
         slippage_total: Decimal::ZERO,
         regime_breakdown: RegimeBreakdown::default(),
         skipped_entries: SkippedEntryCounts::default(),
+        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary: SummaryStats::default(),
         equity_curve: pulse::EquityCurve::default(),

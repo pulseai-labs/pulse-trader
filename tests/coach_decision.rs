@@ -27,14 +27,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use pulse::{
     AcceptFailureStage, BacktestConfig, BacktestInputs, BacktestRequest, BacktestResult,
     BacktestRunId, BacktestRunRepository, BinanceAdapter, CandleSeriesRepository, CandleStore,
-    CoachAction, CoachDecisionError, CoachDecisionOutcome, CoachDecisionRequest,
+    CandleWindow, CoachAction, CoachDecisionError, CoachDecisionOutcome, CoachDecisionRequest,
     CoachRequestFingerprint, CoachSessionClaim, CoachingRepository, CoachingSessionId, CreatedBy,
-    DataError, Db, Disposition, ExchangeAdapter, ExchangeError, FakeClock, Hypothesis,
-    InitialCoachOutcome, LlmCallId, MIGRATOR, Mutation, NewVersion, Pair, ParamValue, PersistedRun,
-    Proposal, ReadBackFailure, RunSummary, SeqIdSource, SessionOutcome, SqliteBacktestRunRepo,
-    SqliteCoachAcceptanceRepo, SqliteCoachingRepo, SqliteStrategyRepo, StrategyDsl,
-    StrategyRepository, SummaryStats, SymbolFilters, Timeframe, VersionId, run_coach_decision,
-    run_version_backtest,
+    DataError, Db, Disposition, ExchangeAdapter, ExchangeError, ExitReason, FakeClock, Hypothesis,
+    InitialCoachOutcome, LlmCallId, MIGRATOR, Migrator, Mutation, NewVersion, Pair, ParamValue,
+    PersistedRun, Proposal, ReadBackFailure, RunSummary, SeqIdSource, SeriesEnd, SessionOutcome,
+    SqliteBacktestRunRepo, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, SqliteStrategyRepo,
+    StrategyDsl, StrategyRepository, SummaryStats, SymbolFilters, Timeframe, VersionId, apply,
+    compile, run_backtest, run_coach_decision, run_version_backtest,
 };
 mod coach_support;
 
@@ -306,6 +306,12 @@ async fn world() -> World {
 }
 
 async fn world_with_dsl(dsl_json: &str) -> World {
+    world_with_dsl_windowed(dsl_json, None).await
+}
+
+/// `window` bounds the PARENT run's `[from_ms, to_ms)` slice — the accept must
+/// replay that same slice for the child (r2.s1 G1).
+async fn world_with_dsl_windowed(dsl_json: &str, window: Option<CandleWindow>) -> World {
     let tmp = TempDir::new().unwrap();
     let db = Db::with_path(&tmp.path().join("pulse.db")).await.unwrap();
     MIGRATOR.run(db.pool()).await.expect("run the shipped set");
@@ -349,6 +355,8 @@ async fn world_with_dsl(dsl_json: &str) -> World {
             primary_timeframe: Timeframe::M15,
             htf_timeframe: Some(Timeframe::H4),
             config: BacktestConfig::default(),
+            snapshots: None,
+            window,
         },
     )
     .await
@@ -769,6 +777,100 @@ async fn the_child_is_re_backtested_on_the_parents_exact_persisted_inputs() {
         child_inputs, world.parent_inputs,
         "the child ran on the PARENT run's exact persisted inputs — same pair, same \
          snapshot identities, same costs"
+    );
+}
+
+/// r2.s1 G1: the parent run was WINDOWED and its `to` cuts inside a hold the
+/// child's (mutated) strategy keeps open. The accept must replay the parent's
+/// persisted slice — every child trade confined to `[from, to)` — and the
+/// window's last bar is a window edge, not end-of-data: no fabricated
+/// `EndOfData` close may appear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_of_a_windowed_parent_replays_the_parents_slice() {
+    // Probe the CHILD's document (the session's mutation, rsi period 21)
+    // unwindowed against the committed fixture, and cut the window inside one
+    // of its multi-bar holds — so the window edge provably bisects a position
+    // the child strategy holds.
+    let store = CandleStore::with_base_dir(manifest(FIXTURE_STORE));
+    let pair = Pair::new("BTCUSDT");
+    let primary = store
+        .load_head(&pair, Timeframe::M15)
+        .expect("load_head")
+        .expect("15m HEAD exists")
+        .series;
+    let loaded = Migrator::v1().load(MINIMAL_DSL).expect("load");
+    let candidate = apply(&loaded.dsl, &proposed_mutation(21)).expect("apply");
+    let compiled = compile(candidate.validated()).expect("compile");
+    let filters = BinanceAdapter::new()
+        .symbol_filters(&pair)
+        .expect("the fixture pair's filters");
+    let probe = run_backtest(
+        &compiled,
+        &primary,
+        None,
+        &BacktestConfig::default(),
+        &filters,
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect("the probe runs");
+    // The LAST multi-bar hold: every trade before it closed inside the window,
+    // so the child's trade log is non-empty (a position still open at `to`
+    // produces no `Trade` row — closed trades only).
+    let held = probe
+        .trades
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, t)| *i > 0 && t.entry_fill_time < t.exit_signal_time)
+        .map(|(_, t)| t)
+        .expect("the mutated strategy holds a multi-bar position after earlier trades");
+    // Cut the window at the open_time of the bar the exit FILLED on
+    // (exclusive): the bar that closed the position is outside, so it is still
+    // open at the edge. `EndOfData` fills stamp a `close_time`, so for that
+    // exit mode the cut falls back to the last bar's open_time.
+    let snapshot_last = primary.candles.last().expect("non-empty").open_time;
+    let to_ms = primary
+        .candles
+        .iter()
+        .map(|c| c.open_time)
+        .find(|t| *t >= held.exit_fill_time)
+        .unwrap_or(snapshot_last);
+    let window = CandleWindow::new(primary.candles[0].open_time, to_ms).expect("from < to");
+
+    let world = world_with_dsl_windowed(MINIMAL_DSL, Some(window.clone())).await;
+    assert_eq!(
+        world.parent_inputs.window,
+        Some(window.clone()),
+        "the parent run persisted the window"
+    );
+
+    let outcome = decide(&world, CoachAction::Accept)
+        .await
+        .expect("the accept commits");
+    let CoachDecisionOutcome::Accepted(accepted) = outcome else {
+        panic!("expected Accepted, got {outcome:?}");
+    };
+    let child_trades = world
+        .runs()
+        .get_trades(&accepted.accepted_run_id)
+        .await
+        .expect("the child's trades read back");
+
+    assert!(
+        !child_trades.is_empty(),
+        "the mutated strategy trades inside the window"
+    );
+    assert!(
+        child_trades
+            .iter()
+            .all(|t| t.exit_reason != ExitReason::EndOfData),
+        "a window edge is not end-of-data: no fabricated close at `to`"
+    );
+    assert!(
+        child_trades
+            .iter()
+            .all(|t| t.exit_signal_time < window.to_ms),
+        "the child ran the parent's slice — nothing exits on a bar `to` excluded"
     );
 }
 

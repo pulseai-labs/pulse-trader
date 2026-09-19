@@ -42,3 +42,17 @@ pub(crate) mod coach;
 // parent run's exact persisted inputs through `backtest::prepare_backtest`, and
 // commits child version + run + trades + links in W4's one transaction.
 pub(crate) mod coach_decision;
+
+// r2.s1.w2: the MCP read projections — the pure parser moved out of
+// `cli::indicators` plus the typed wire shapes the `src/mcp/` delivery ring
+// returns, so the CLI viewer and `pulse mcp` share one parse/dedup path and one
+// projection seam.
+pub(crate) mod mcp_read;
+
+// r2.s1.w3: the external-agent submit use case. One typed request in
+// (`SubmitRequest`: target + DSL + hypothesis + agent name), one persisted
+// outcome out (version + `agent_submission` row). Validates in the spec's
+// fixed order — hypothesis, agent name, target, load, validate, compile — so a
+// field failure and a compile failure are distinguishable, and the `dsl` path
+// collects EVERY validation error rather than stopping at the first.
+pub(crate) mod mcp_write;

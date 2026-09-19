@@ -26,9 +26,11 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::regime::RegimeBreakdown;
 use super::stats::SummaryStats;
+use crate::domain::Direction;
 use crate::domain::pair::Pair;
 use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
@@ -98,6 +100,110 @@ pub struct BacktestInputs {
     pub slippage_bps: Decimal,
     /// How funding rates were sourced.
     pub funding: FundingConfig,
+    /// The candle slice of the snapshots the run consumed, when it was windowed
+    /// (r2.s1.w1). `None` is the whole snapshot — every pre-`0009` row, and
+    /// every run saved before windowing existed or without one.
+    pub window: Option<CandleWindow>,
+}
+
+/// The candle slice of a snapshot a run consumed, when it was windowed
+/// (r2.s1.w1).
+///
+/// Both bounds are UTC epoch milliseconds on the candles' `open_time`, and the
+/// window is **half-open `[from_ms, to_ms)`** — the `backtest_run.window_from_ms`
+/// / `window_to_ms` `INTEGER` columns one-to-one. `NULL`/`NULL` on the columns is
+/// the whole snapshot (no `CandleWindow` at all — see
+/// [`BacktestInputs::window`]); a half-present or inverted pair is refused by
+/// the `0009` `backtest_run_window_pair` trigger, and `Eq` is derivable (two
+/// `i64`s, no `f64` anywhere).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandleWindow {
+    /// The first `open_time` the window includes (inclusive lower bound).
+    pub from_ms: i64,
+    /// The `open_time` the window stops before (exclusive upper bound —
+    /// `[from, to)`).
+    pub to_ms: i64,
+}
+
+/// What the LAST bar of the series the engine consumed represents (r2.s1 G1).
+///
+/// The engine cannot tell a genuine snapshot end from a caller-imposed window
+/// edge — the sliced series looks identical either way, so only the caller
+/// that performed the slice can say. The distinction decides whether an open
+/// position at the last bar is force-closed: a window bounds what the
+/// strategy may TRADE inside it, it does not mean the data ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesEnd {
+    /// The series ended because the snapshot did. A position still open on
+    /// the last bar is force-closed at its close with `ExitReason::EndOfData`
+    /// — the strategy had no more bars to act on.
+    SnapshotEnd,
+    /// The series ended because a [`CandleWindow`] truncated it before the
+    /// snapshot's real last candle. A position still open at `to` stays open
+    /// and produces no trade — the strategy never chose an exit, and an
+    /// `EndOfData` close would book a trade the window fabricated, changing
+    /// trade counts and P&L against the same run unwindowed.
+    WindowEdge,
+}
+
+/// The strategy's still-open position at a window edge (r2.s1 G1, ruling
+/// condition b).
+///
+/// A [`SeriesEnd::WindowEdge`] run does not force-close a position still open
+/// at `to` — booking it would fabricate an exit the strategy never chose. But
+/// a position that never closed must not vanish from the run record either:
+/// this mark IS that record — the direction, entry fill and size exactly as
+/// the strategy opened them, and the last in-window candle's `close_time` /
+/// `close` as the mark price. It is deliberately NOT a [`Trade`]: it produces
+/// no trade row and no closed-trade statistics count it — the record says so
+/// explicitly rather than by omission.
+///
+/// `None` on the carrying `Option` means the run ended flat — or ended at the
+/// snapshot's real last bar, where `close_end_of_data` already books the
+/// position as an `EndOfData` trade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenPositionMark {
+    /// The position's side.
+    pub direction: Direction,
+    /// Position size in base units.
+    pub qty: Decimal,
+    /// The price the entry filled at.
+    pub entry_price: Decimal,
+    /// The signal bar's `close_time` that produced the entry (epoch ms).
+    pub entry_signal_time: i64,
+    /// The bar the entry filled on (`open_time`, epoch ms).
+    pub entry_fill_time: i64,
+    /// The mark timestamp — the last in-window candle's `close_time`.
+    pub mark_time: i64,
+    /// The mark price — the last in-window candle's `close`.
+    pub mark_price: Decimal,
+}
+
+/// Why [`CandleWindow::new`] refused: an empty or backwards window is not a
+/// window.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("a candle window requires from_ms < to_ms, got {from_ms} >= {to_ms}")]
+pub struct CandleWindowError {
+    /// The submitted lower bound.
+    pub from_ms: i64,
+    /// The submitted upper bound.
+    pub to_ms: i64,
+}
+
+impl CandleWindow {
+    /// Build a window, refusing an empty or inverted one — `from_ms` must be
+    /// strictly before `to_ms` (the `0009` pair trigger refuses the same shape
+    /// at the schema layer).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CandleWindowError`] when `from_ms >= to_ms`.
+    pub fn new(from_ms: i64, to_ms: i64) -> Result<Self, CandleWindowError> {
+        if from_ms >= to_ms {
+            return Err(CandleWindowError { from_ms, to_ms });
+        }
+        Ok(Self { from_ms, to_ms })
+    }
 }
 
 /// Identifier of a persisted [`PersistedRun`] — a `#[serde(transparent)]`
@@ -191,6 +297,13 @@ pub struct PersistedRun {
     /// regime split, these are **not** derivable from the trade log at all: they
     /// count entries that never became trades.
     pub skipped_entries: SkippedEntryCounts,
+    /// The still-open position the window edge left behind, as persisted
+    /// (r2.s1 G1, `0010` `backtest_run.open_position`). `None` for every run
+    /// that ended flat, every unwindowed run, and every pre-`0010` row — the
+    /// column cannot say which, and the distinction does not matter: none of
+    /// them have a position to report. The mark is never a [`Trade`] and never
+    /// enters the summary's closed-trade statistics.
+    pub open_position: Option<OpenPositionMark>,
 }
 
 /// The typed list projection of one run for the catalog

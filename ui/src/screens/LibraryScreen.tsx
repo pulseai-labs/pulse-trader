@@ -19,12 +19,13 @@
 // it. The host is looked up in an effect, not during render, because it is
 // committed in the same tree this screen mounts in.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 
 import { commands } from "../bindings";
 import type { LibraryOverview, LibraryStrategy, LibraryVersion, VersionStats } from "../bindings";
+import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 
 /** The em dash a version with no persisted run renders (grill A1) — a statement
  * that no run exists, never a zero dressed up as data. */
@@ -41,7 +42,14 @@ const NODE_PAD = 8;
 const COL_W = 158;
 const ROW_H = 78;
 
-/** Which version the details pane is showing. */
+/** Which version the details pane is showing — the ids, not a payload object,
+ * so a focus refetch re-renders the pane from the fresher `overview` (F5). */
+interface SelectionId {
+  strategyId: string;
+  versionId: string;
+}
+
+/** The resolved selection the details pane renders. */
 interface Selection {
   strategyName: string;
   label: string;
@@ -52,35 +60,69 @@ export default function LibraryScreen() {
   const [overview, setOverview] = useState<LibraryOverview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [selection, setSelection] = useState<Selection | null>(null);
+  const [selected, setSelected] = useState<SelectionId | null>(null);
   const [paneHost, setPaneHost] = useState<HTMLElement | null>(null);
+
+  /**
+   * Read the library overview — the mount fetch AND the refetch-on-focus read
+   * (r2.s1.w4 C2), one code path.
+   *
+   * `alive` is the caller's: the mount effect passes its own cleanup flag so a
+   * response arriving after unmount sets no state. A refetch never clears the
+   * selection — a version selected from the previous payload stays selected,
+   * and the details pane re-renders from the fresher object. A successful read
+   * also clears a stale error — a recovered backend must not leave the
+   * library hidden behind a dead read (F5).
+   */
+  const load = useCallback(async (alive: () => boolean = () => true): Promise<void> => {
+    try {
+      const result = await commands.libraryOverview();
+      if (!alive()) return;
+      if (result.status === "ok") {
+        setOverview(result.data);
+        setError(null);
+      } else {
+        setError(result.error.message);
+      }
+    } catch {
+      // A rejection here is the IPC call itself failing (no app handle under
+      // a non-Tauri preview) — rendered as the honest error line, never as
+      // fabricated content.
+      if (alive()) setError("The library read failed.");
+    }
+  }, []);
 
   useEffect(() => {
     let alive = true;
-    commands
-      .libraryOverview()
-      .then((result) => {
-        if (!alive) return;
-        if (result.status === "ok") {
-          setOverview(result.data);
-        } else {
-          setError(result.error.message);
-        }
-      })
-      .catch(() => {
-        // A rejection here is the IPC call itself failing (no app handle under
-        // a non-Tauri preview) — rendered as the honest error line, never as
-        // fabricated content.
-        if (alive) setError("The library read failed.");
-      });
+    void load(() => alive);
     return () => {
       alive = false;
     };
-  }, []);
+  }, [load]);
+
+  // C2: versions and runs written by `pulse mcp` appear on their own when the
+  // window regains focus — DOM events only, throttled inside the hook.
+  useRefetchOnFocus(load);
 
   useEffect(() => {
     setPaneHost(document.getElementById(DETAILS_PANE_ID));
   }, []);
+
+  // F5: the selection is resolved against the FRESHEST overview — a refetch
+  // swaps `overview` and this memo re-derives the version object, so the
+  // details pane never renders a stale payload. A version absent from the
+  // fresh payload resolves to null (the hint), not a phantom.
+  const selection = useMemo<Selection | null>(() => {
+    if (selected === null || overview === null) return null;
+    const strategy = overview.strategies.find((s) => s.id === selected.strategyId);
+    const version = strategy?.versions.find((v) => v.id === selected.versionId);
+    if (strategy === undefined || version === undefined) return null;
+    return {
+      strategyName: strategy.name,
+      label: versionLabels(strategy.versions).get(version.id) ?? "?",
+      version,
+    };
+  }, [selected, overview]);
 
   if (error !== null) {
     return (
@@ -129,8 +171,10 @@ export default function LibraryScreen() {
               onToggle={() =>
                 setExpanded((current) => ({ ...current, [strategy.id]: !(current[strategy.id] === true) }))
               }
-              onSelect={(label, version) => setSelection({ strategyName: strategy.name, label, version })}
-              selectedId={selection?.version.id ?? null}
+              onSelect={(version) =>
+                setSelected({ strategyId: strategy.id, versionId: version.id })
+              }
+              selectedId={selected?.versionId ?? null}
             />
           ))}
         </div>
@@ -155,7 +199,7 @@ function StrategyCard({
   strategy: LibraryStrategy;
   expanded: boolean;
   onToggle: () => void;
-  onSelect: (label: string, version: LibraryVersion) => void;
+  onSelect: (version: LibraryVersion) => void;
   selectedId: string | null;
 }) {
   const labels = versionLabels(strategy.versions);
@@ -294,7 +338,7 @@ function VersionTree({
 }: {
   strategy: LibraryStrategy;
   labels: Map<string, string>;
-  onSelect: (label: string, version: LibraryVersion) => void;
+  onSelect: (version: LibraryVersion) => void;
   selectedId: string | null;
 }) {
   const placed = useMemo(() => layoutTree(strategy.versions), [strategy]);
@@ -360,7 +404,7 @@ function VersionTree({
               width: NODE_W,
               height: NODE_H,
             }}
-            onClick={() => onSelect(labels.get(v.id) ?? "?", v)}
+            onClick={() => onSelect(v)}
           />
         );
       })}
@@ -407,6 +451,17 @@ function VersionNode({
           </span>
         )}
       </div>
+      {/* C1 (r2.s1.w4): who authored the version — `external_agent · <agent
+          name>` for an agent-written version, the bare label otherwise. The
+          hypothesis rides a clamped subline only when the version carries one. */}
+      <div
+        className={`vnode-provenance${version.createdBy === "external_agent" ? " agent" : ""}`}
+      >
+        {provenanceLine(version)}
+      </div>
+      {version.hypothesis !== null && (
+        <div className="vnode-hypothesis">{version.hypothesis}</div>
+      )}
       <div className="vnode-summary">{summaryLine(version)}</div>
       <div className="vnode-kpis mono">
         <Kpis stats={version.stats} />
@@ -466,6 +521,16 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
         {/* The mock's `pair` / `timeframes` lines are deliberately absent:
             `StrategyDsl` carries neither field. */}
       </section>
+
+      {/* C1 (r2.s1.w4): the agent's stated hypothesis in full — the node's
+          subline is CSS-clamped to two lines, this is the unclamped text. A
+          human version has none, so the block is absent rather than empty. */}
+      {version.hypothesis !== null && (
+        <section className="d-section">
+          <h4 className="dsl-h">Hypothesis</h4>
+          <p className="d-hypothesis">{version.hypothesis}</p>
+        </section>
+      )}
 
       <section className="d-section">
         <h4 className="dsl-h">Recent backtests</h4>
@@ -549,6 +614,16 @@ function latestVersion(strategy: LibraryStrategy): LibraryVersion | undefined {
     (latest, v) => (latest === undefined || v.createdAt > latest.createdAt ? v : latest),
     undefined,
   );
+}
+
+/** A version's provenance label (r2.s1.w4 C1): `external_agent · <agent name>`
+ * for an agent-written version, the bare `created_by` label for everything
+ * else. An agent version whose submission row is absent still reads
+ * `external_agent` — the label, never a guessed name. */
+function provenanceLine(version: LibraryVersion): string {
+  return version.agentName !== null
+    ? `${version.createdBy} · ${version.agentName}`
+    : version.createdBy;
 }
 
 /** A version's one-line summary from its own DSL fields. */

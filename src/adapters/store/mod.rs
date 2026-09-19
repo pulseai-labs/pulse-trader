@@ -13,6 +13,9 @@ mod paths;
 mod version;
 
 pub use parquet::SnapshotProvenance;
+// r2.s1.w2: `pulse mcp --data-dir` falls back to the same platform default the
+// store uses, so the CLI arm resolves it from here.
+pub(crate) use paths::default_base_dir;
 
 use std::fs::{self, File};
 use std::io::Write;

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::sweepable::SweepableValue;
 
 /// A field of the current candle (OHLCV). Serialized via its variant name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PriceField {
     /// Opening price of the candle.
     Open,
@@ -43,7 +43,7 @@ pub enum PriceField {
 /// indicator variant is a serde-backward-compatible change (old strategies still
 /// deserialize) → a **minor** `schema_version` bump. Only renaming, removing, or
 /// reshaping a shipped variant is breaking.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "indicator")]
 pub enum IndicatorSpec {
     /// Relative Strength Index over `period` bars.
@@ -76,7 +76,7 @@ pub enum IndicatorSpec {
 ///
 /// Internally-tagged (`#[serde(tag = "type")]`) with **all struct variants** —
 /// see the module docs for why tuple/newtype variants are forbidden.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ValueSource {
     /// A literal constant in value-space.

@@ -32,10 +32,10 @@ use std::process::Command;
 
 use pulse::{
     BacktestInputs, BacktestResult, BacktestRunRepository, Candle, CandleSeriesRepository,
-    CandleStore, CreatedBy, DataVersion, Db, EngineFingerprint, EquityCurve, FundingConfig,
-    MIGRATOR, NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
-    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId, StrategyRepository, SummaryStats,
-    Timeframe, VersionId, run_migrations_with_backup, undo_to,
+    CandleStore, CandleWindow, CreatedBy, DataVersion, Db, EngineFingerprint, EquityCurve,
+    FundingConfig, MIGRATOR, NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts,
+    SnapshotSelection, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId, StrategyRepository,
+    SummaryStats, Timeframe, VersionId, run_migrations_with_backup, undo_to,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -115,23 +115,65 @@ const PROVENANCE_COLUMNS: [&str; 8] = [
     "funding_config",
 ];
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0006_*` and `0008_*` —
-/// the "older binary" that shipped `0007` while `0006` was still a reserved gap.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0006_*` and
+/// everything from `0008` on — the "older binary" that shipped `0007` while
+/// `0006` was still a reserved gap.
 ///
 /// r1.s4.w4 added `0008` to the skip list. A binary that predates `0006` predates
 /// `0008` by two spines, and including it would also move the fixture's maximum
 /// applied version to 8 — which would silently destroy the property the next
 /// assertion states: that `0006` arrives BELOW the maximum already in the database.
+/// r2.s1.w1 adds `0009`, and G1 adds `0010`, for the same reason, one release
+/// further along each.
 fn shipped_set_without_0006(dir: &Path) {
     let shipped = manifest("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("0006_") || name.starts_with("0008_") {
+        if name.starts_with("0006_") || name.as_str() >= "0008" {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
     }
+}
+
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0009_*` and later
+/// — the `0008` binary this item's pre-0009 compatibility is measured against.
+fn shipped_set_without_0009(dir: &Path) {
+    let shipped = manifest("migrations");
+    for entry in std::fs::read_dir(&shipped).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.as_str() >= "0009" {
+            continue;
+        }
+        std::fs::copy(&path, dir.join(&name)).unwrap();
+    }
+}
+
+/// A temp database migrated by the `0008` set (everything but `0009`).
+async fn db_at_0008() -> (TempDir, PathBuf, Db) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("migrations");
+    std::fs::create_dir_all(&dir).unwrap();
+    shipped_set_without_0009(&dir);
+
+    let db_path = tmp.path().join("pulse.db");
+    let older = Migrator::new(dir.as_path()).await.unwrap();
+    let db = Db::with_path(&db_path).await.unwrap();
+    older.run(db.pool()).await.expect("the 0008 set applies");
+
+    let applied = applied_versions(db.pool()).await;
+    assert!(
+        !applied.contains(&9),
+        "the fixture must NOT have 0009 applied: {applied:?}"
+    );
+    assert_eq!(
+        applied.iter().copied().max(),
+        Some(8),
+        "the fixture sits at the pre-0009 maximum"
+    );
+    (tmp, db_path, db)
 }
 
 /// A temp database migrated by the "older" set (everything but `0006`).
@@ -222,6 +264,7 @@ fn empty_result() -> BacktestResult {
         slippage_total: Decimal::ZERO,
         regime_breakdown: RegimeBreakdown::new(),
         skipped_entries: SkippedEntryCounts::new(),
+        open_position: None,
         engine_fingerprint: EngineFingerprint::current(),
         summary: SummaryStats::default(),
         equity_curve: EquityCurve::default(),
@@ -242,6 +285,7 @@ fn inputs_with_htf() -> BacktestInputs {
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
+        window: None,
     }
 }
 
@@ -372,11 +416,15 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     // already held; the isolated "filling a gap moves no maximum" case lives in
     // `migrate.rs`'s `a_later_lower_numbered_migration_applies_through_the_startup_path`,
     // which withholds `0008` precisely so it can still state it.
+    // r2.s1.w1: `0009` rides along too, and G1's `0010` as well, moving the
+    // maximum to 10.
     assert!(applied.contains(&8), "0008 rides along: {applied:?}");
+    assert!(applied.contains(&9), "0009 rides along: {applied:?}");
+    assert!(applied.contains(&10), "0010 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(8),
-        "0006 is recorded at its own version, below the maximum 0008 sets"
+        Some(10),
+        "0006 is recorded at its own version, below the maximum 0010 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;
@@ -1087,4 +1135,161 @@ async fn run_and_trade_immutability_survives_a_0006_up_down_up_cycle() {
             "{trigger} survived the 0006 up/down/up cycle"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 8. r2.s1.w1 (AC-3): the candle window a run consumed
+// ---------------------------------------------------------------------------
+//
+// A run may now record WHICH slice of its snapshots it consumed:
+// `window_from_ms` / `window_to_ms`, UTC epoch milliseconds, half-open
+// `[from, to)`. `NULL`/`NULL` is the whole snapshot — every pre-0009 row, and
+// every run saved without a window. The schema-side pair/inversion refusals
+// live in `tests/migration_0009.rs`; these are the ADAPTER round-trips.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_saved_with_a_window_round_trips_its_bounds() {
+    let (_tmp, _db_path, db) = migrated_db().await;
+    seed_strategy_and_version(db.pool()).await;
+    let repo = SqliteBacktestRunRepo::new(db.pool().clone());
+    let result = empty_result();
+    let version = VersionId::new("ver-1");
+    let window = CandleWindow::new(1_700_000_000_000, 1_700_086_400_000).expect("a real window");
+    let inputs = BacktestInputs {
+        window: Some(window.clone()),
+        ..inputs_with_htf()
+    };
+
+    let id = repo
+        .save_run(
+            &version,
+            &inputs,
+            &result,
+            &result.summary,
+            Decimal::new(10_000, 0),
+        )
+        .await
+        .expect("save a windowed run");
+    let run = repo
+        .get_run(&id)
+        .await
+        .expect("read it back")
+        .expect("the saved run exists");
+    let got = run.inputs.expect("a fresh save always carries inputs");
+    assert_eq!(
+        got.window,
+        Some(window),
+        "the window round-trips bound-for-bound"
+    );
+
+    // The columns hold UTC epoch milliseconds — two INTEGERs, not a blob.
+    let bounds: (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT window_from_ms, window_to_ms FROM backtest_run WHERE id = ?1")
+            .bind(id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        bounds,
+        (Some(1_700_000_000_000_i64), Some(1_700_086_400_000_i64)),
+        "the bounds persist as UTC epoch-ms integers"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_saved_without_a_window_round_trips_none() {
+    let (_tmp, _db_path, db) = migrated_db().await;
+    seed_strategy_and_version(db.pool()).await;
+    let repo = SqliteBacktestRunRepo::new(db.pool().clone());
+    let result = empty_result();
+    let version = VersionId::new("ver-1");
+
+    let id = repo
+        .save_run(
+            &version,
+            &inputs_with_htf(),
+            &result,
+            &result.summary,
+            Decimal::new(10_000, 0),
+        )
+        .await
+        .expect("save an unwindowed run");
+    let run = repo
+        .get_run(&id)
+        .await
+        .expect("read it back")
+        .expect("the saved run exists");
+    let got = run.inputs.expect("a fresh save always carries inputs");
+    assert_eq!(
+        got.window, None,
+        "an unwindowed run reads back as window: None — the whole snapshot"
+    );
+
+    let bounds: (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT window_from_ms, window_to_ms FROM backtest_run WHERE id = ?1")
+            .bind(id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(bounds, (None, None), "NULL/NULL is the whole snapshot");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_0009_row_reloads_with_window_none() {
+    // Written by the `0008` binary: the window columns do not exist yet, so the
+    // row CANNOT carry them. It is a complete `0008`-shape row — every summary
+    // column AND the full `0006` provenance tuple — missing only the field
+    // `0009` introduces.
+    let (_tmp, db_path, db) = db_at_0008().await;
+    seed_strategy_and_version(db.pool()).await;
+    let p = Provenance::complete();
+    sqlx::query(
+        "INSERT INTO backtest_run \
+         (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+          engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+          funding_total, slippage_total, expectancy, win_rate, gross_profit, gross_loss, \
+          avg_win, avg_loss, max_drawdown, trade_count, wins, losses, breakeven, \
+          max_win_streak, max_loss_streak, regime_breakdown, skipped_sub_lot, \
+          skipped_sub_notional, skipped_leverage_capped, \
+          pair, primary_timeframe, primary_data_version, htf_timeframe, \
+          htf_data_version, taker_fee_bps, slippage_bps, funding_config) \
+         VALUES ('run-pre-0009', 'ver-1', 1, '2026-09-01T00:00:00.000Z', ?1, ?2, \
+                 ?3, '10000', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', \
+                 '0', 0, 0, 0, 0, 0, 0, ?4, 0, 0, 0, \
+                 ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )
+    .bind(EngineFingerprint::current().as_str())
+    .bind(EngineFingerprint::target())
+    .bind(empty_result().result_content_hash())
+    .bind(serde_json::to_string(&RegimeBreakdown::new()).unwrap())
+    .bind(p.pair)
+    .bind(p.primary_timeframe)
+    .bind(p.primary_data_version)
+    .bind(p.htf_timeframe)
+    .bind(p.htf_data_version)
+    .bind(p.taker_fee_bps)
+    .bind(p.slippage_bps)
+    .bind(p.funding_config)
+    .execute(db.pool())
+    .await
+    .expect("a complete row at 0008");
+    drop(db);
+
+    run_migrations_with_backup(&db_path)
+        .await
+        .expect("0009 applies over it");
+
+    let db = Db::with_path(&db_path).await.unwrap();
+    let repo = SqliteBacktestRunRepo::new(db.pool().clone());
+    let run = repo
+        .get_run(&pulse::BacktestRunId::new("run-pre-0009"))
+        .await
+        .expect("a pre-0009 row still reads")
+        .expect("the row is present");
+
+    // The row keeps its full 0006 provenance AND gains `window: None` — the
+    // whole snapshot, not a guess at bounds it never recorded.
+    let inputs = run.inputs.expect("the 0006 provenance still decodes");
+    assert_eq!(inputs.window, None, "a pre-0009 row is unwindowed");
+    assert_eq!(inputs.pair, Pair::new("BTCUSDT"));
 }

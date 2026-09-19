@@ -91,6 +91,7 @@ gates:
     bash scripts/check-adr-0021.sh
     bash scripts/check-no-specta-workaround.sh
     bash scripts/check-coach-boundary.sh
+    bash scripts/check-mcp-boundary.sh
 
 # VS-1.1.4 work-1.01 — regenerate the committed .sqlx offline query cache
 # (NFR-12). Needs sqlx-cli (a developer-local tool, NOT installed in this slice's

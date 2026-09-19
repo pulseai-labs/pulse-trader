@@ -34,7 +34,8 @@ use uuid::Uuid;
 
 use crate::adapters::clock::SystemClock;
 use crate::domain::strategy::{
-    CreatedBy, NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
+    AgentName, AgentSubmission, AgentSubmissionId, CreatedBy, Hypothesis, NewAgentSubmission,
+    NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
 };
 use crate::domain::{Clock, DataError, Migrator, SchemaVersion, StrategyRepository, validate};
 
@@ -86,6 +87,22 @@ impl<C: Clock> SqliteStrategyRepo<C> {
             DataError::Db(format!("clock.now_ms() {now_ms} is out of DateTime range"))
         })?;
         Ok((dt, dt.to_rfc3339_opts(SecondsFormat::Millis, true)))
+    }
+
+    /// The load → validate → canonicalize prelude every agent version write
+    /// runs before its transaction — the same pipeline `create_version` runs
+    /// (the migrator and validator are provenance-blind). Returns the verbatim
+    /// `dsl_original` (hash + column input) and the canonical `dsl` column
+    /// text.
+    fn load_agent_document(&self, dsl_json: &str) -> Result<(String, String), DataError> {
+        let loaded = self
+            .migrator
+            .load(dsl_json)
+            .map_err(|e| DataError::Db(format!("dsl load failed: {e}")))?;
+        validate(&loaded.dsl).map_err(|e| DataError::Db(format!("dsl validation failed: {e}")))?;
+        let dsl_current =
+            serde_json::to_string(&loaded.dsl).map_err(|e| DataError::Db(e.to_string()))?;
+        Ok((loaded.dsl_original, dsl_current))
     }
 }
 
@@ -172,6 +189,14 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
         let (_, created_at) = self.now_rfc3339()?;
         let tags_json = serde_json::to_string(tags).map_err(|e| DataError::Db(e.to_string()))?;
 
+        // INSERT + read-back in one transaction (G8): the defended read runs
+        // BEFORE commit, so a read failure rolls the insert back rather than
+        // reporting a committed write as failed.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
         sqlx::query!(
             "INSERT INTO strategy (id, name, tags, owner, pinned_version_id, archived, created_at) \
              VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
@@ -181,45 +206,21 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             owner,
             created_at,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| DataError::Db(e.to_string()))?;
-
-        self.get_strategy(&StrategyId::new(id))
+        let strategy = self
+            .fetch_strategy(&mut *tx, &StrategyId::new(&id))
             .await?
-            .ok_or_else(|| DataError::Db("created strategy vanished on read-back".to_owned()))
+            .ok_or_else(|| DataError::Db("created strategy vanished on read-back".to_owned()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        Ok(strategy)
     }
 
     async fn get_strategy(&self, id: &StrategyId) -> Result<Option<Strategy>, DataError> {
-        let id_str = id.as_str();
-        let row = sqlx::query!(
-            r#"SELECT
-                 id                AS "id!: String",
-                 name              AS "name!: String",
-                 tags              AS "tags!: String",
-                 owner             AS "owner?: String",
-                 pinned_version_id AS "pinned_version_id?: String",
-                 archived          AS "archived!: i64",
-                 created_at        AS "created_at!: String"
-               FROM strategy WHERE id = ?1"#,
-            id_str,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        match row {
-            None => Ok(None),
-            Some(r) => Ok(Some(Strategy {
-                id: StrategyId::new(r.id),
-                name: r.name,
-                tags: parse_json_str_array(&r.tags)?,
-                owner: r.owner,
-                pinned_version_id: r.pinned_version_id.map(VersionId::new),
-                archived: r.archived != 0,
-                created_at: parse_created_at(&r.created_at)?,
-            })),
-        }
+        self.fetch_strategy(&self.pool, id).await
     }
 
     async fn list_strategies(&self, include_archived: bool) -> Result<Vec<Strategy>, DataError> {
@@ -417,7 +418,10 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             .map_err(|e| DataError::Db(e.to_string()))?;
         let (_, created_at) = self.now_rfc3339()?;
 
-        // 3. INSERT + read-back in one transaction (gate-7 C5).
+        // 3. INSERT + read-back in one transaction (gate-7 C5). The defended
+        //    read runs on the transaction BEFORE commit (G8): a read failure
+        //    rolls the insert back — a reported error always means nothing was
+        //    persisted, never a committed write misreported as failed.
         let mut tx = self
             .pool
             .begin()
@@ -439,49 +443,18 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             },
         )
         .await?;
+        let version = self
+            .fetch_version(&mut *tx, &VersionId::new(&id))
+            .await?
+            .ok_or_else(|| DataError::Db("created version vanished on read-back".to_owned()))?;
         tx.commit()
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
-
-        self.get_version(&VersionId::new(id))
-            .await?
-            .ok_or_else(|| DataError::Db("created version vanished on read-back".to_owned()))
+        Ok(version)
     }
 
     async fn get_version(&self, id: &VersionId) -> Result<Option<StrategyVersion>, DataError> {
-        let id_str = id.as_str();
-        let row = sqlx::query!(
-            r#"SELECT
-                 id                    AS "id!: String",
-                 strategy_id           AS "strategy_id!: String",
-                 parent_version_id     AS "parent_version_id?: String",
-                 dsl_schema_version    AS "dsl_schema_version!: String",
-                 dsl_original          AS "dsl_original!: String",
-                 version_hash          AS "version_hash!: String",
-                 created_by            AS "created_by!: String",
-                 creating_llm_call_ids AS "creating_llm_call_ids!: String",
-                 created_at            AS "created_at!: String"
-               FROM strategy_version WHERE id = ?1"#,
-            id_str,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        match row {
-            None => Ok(None),
-            Some(r) => Ok(Some(self.row_to_version(VersionRow {
-                id: r.id,
-                strategy_id: r.strategy_id,
-                parent_version_id: r.parent_version_id,
-                dsl_schema_version: r.dsl_schema_version,
-                dsl_original: r.dsl_original,
-                version_hash: r.version_hash,
-                created_by: r.created_by,
-                creating_llm_call_ids: r.creating_llm_call_ids,
-                created_at: r.created_at,
-            })?)),
-        }
+        self.fetch_version(&self.pool, id).await
     }
 
     async fn list_versions(
@@ -531,6 +504,233 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
         let versions = self.list_versions(strategy_id).await?;
         Ok(parent_order(versions))
     }
+
+    async fn create_agent_version(
+        &self,
+        request: NewVersion,
+        submission: NewAgentSubmission,
+    ) -> Result<(StrategyVersion, AgentSubmission), DataError> {
+        // Refusals BEFORE touching the database (r2.s1.w1): the submission is
+        // the version's whole audit trail — it names no LlmCall rows, and a
+        // non-external-agent request is not this port's to write.
+        if request.created_by != CreatedBy::ExternalAgent {
+            return Err(DataError::Db(
+                "create_agent_version requires created_by = external_agent".to_owned(),
+            ));
+        }
+        if !request.creating_llm_call_ids.is_empty() {
+            return Err(DataError::Db(
+                "an external-agent version names no LlmCall rows".to_owned(),
+            ));
+        }
+
+        // The same load → validate → canonicalize pipeline `create_version`
+        // runs — the migrator and validator are provenance-blind.
+        let (dsl_original, dsl_current) = self.load_agent_document(&request.dsl_json)?;
+
+        let id = Uuid::new_v4().to_string();
+        let submission_id = Uuid::new_v4().to_string();
+        let schema_version_str = SchemaVersion::CURRENT.to_string();
+        let strategy_id_str = request.strategy_id.as_str().to_owned();
+        let parent_str = request
+            .parent_version_id
+            .as_ref()
+            .map(|p| p.as_str().to_owned());
+        let hash = version_hash(
+            &strategy_id_str,
+            parent_str.as_deref(),
+            &schema_version_str,
+            &dsl_original,
+        );
+        let created_by_text =
+            serde_json::to_string(&request.created_by).map_err(|e| DataError::Db(e.to_string()))?;
+        let llm_ids_json = serde_json::to_string(&request.creating_llm_call_ids)
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        // One timestamp for the committed pair — they are minted atomically.
+        let (_, created_at) = self.now_rfc3339()?;
+
+        // ONE transaction: the version row and its submission row, or neither.
+        // `BEGIN IMMEDIATE` takes the write lock up front rather than upgrading
+        // a deferred transaction on first write — the two writes are committed
+        // as one unit and a concurrent writer fails fast instead of racing the
+        // upgrade.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        insert_version_row(
+            &mut tx,
+            &VersionInsert {
+                id: &id,
+                strategy_id: &strategy_id_str,
+                parent_version_id: parent_str.as_deref(),
+                dsl_schema_version: &schema_version_str,
+                dsl: &dsl_current,
+                dsl_original: &dsl_original,
+                version_hash: &hash,
+                created_by: &created_by_text,
+                creating_llm_call_ids: &llm_ids_json,
+                created_at: &created_at,
+            },
+        )
+        .await?;
+        insert_submission_row(
+            &mut tx,
+            &SubmissionInsert {
+                id: &submission_id,
+                version_id: &id,
+                agent_name: submission.agent_name.as_str(),
+                hypothesis: submission.hypothesis.as_str(),
+                created_at: &created_at,
+            },
+        )
+        .await?;
+
+        // Read both halves back through the defended paths ON THE TRANSACTION
+        // (G8/T23): `fetch_version` re-derives the hash; `fetch_submission`
+        // re-validates the newtypes. A read that fails here rolls the pair
+        // back — post-commit, a read error would have misreported a committed
+        // write as failed and made a retry double-write.
+        let version = self
+            .fetch_version(&mut *tx, &VersionId::new(&id))
+            .await?
+            .ok_or_else(|| {
+                DataError::Db("created agent version vanished on read-back".to_owned())
+            })?;
+        let submission = self
+            .fetch_submission(&mut *tx, &version.id)
+            .await?
+            .ok_or_else(|| DataError::Db("created submission vanished on read-back".to_owned()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        Ok((version, submission))
+    }
+
+    async fn create_agent_strategy_version(
+        &self,
+        strategy_name: &str,
+        dsl_json: String,
+        submission: NewAgentSubmission,
+    ) -> Result<(Strategy, StrategyVersion, AgentSubmission), DataError> {
+        // The provenance-blind load → validate → canonicalize pipeline runs
+        // BEFORE the transaction: a refused document never touches the store.
+        let (dsl_original, dsl_current) = self.load_agent_document(&dsl_json)?;
+
+        // Mint every id and column value up front — inside the transaction the
+        // only step that can still refuse is the name check, so the rollback
+        // path is a single early return.
+        let strategy_id = Uuid::new_v4().to_string();
+        let id = Uuid::new_v4().to_string();
+        let submission_id = Uuid::new_v4().to_string();
+        let schema_version_str = SchemaVersion::CURRENT.to_string();
+        let hash = version_hash(&strategy_id, None, &schema_version_str, &dsl_original);
+        let created_by_text = serde_json::to_string(&CreatedBy::ExternalAgent)
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        // A root version names no parent and no LlmCall rows (the agent's cost
+        // is external); agent roots are bare strategies — `tags` is `[]`,
+        // `owner` is NULL.
+        let llm_ids_json = "[]";
+        let tags_json = "[]";
+        // One timestamp for the committed triple — they are minted atomically.
+        let (_, created_at) = self.now_rfc3339()?;
+
+        // ONE `BEGIN IMMEDIATE` transaction: the name check, the strategy row,
+        // its root version and the submission commit or roll back as a unit.
+        // Holding the write lock across check+insert is what makes the
+        // uniqueness decision atomic — two concurrent root submits serialize
+        // here (the loser waits out the winner's commit, then sees the name),
+        // where the old `list_strategies` + `create_strategy` +
+        // `create_agent_version` sequence let both writers pass the pre-read
+        // and left an orphaned strategy when the version write failed.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        let taken = sqlx::query!(
+            r#"SELECT 1 AS "one!: i64" FROM strategy WHERE name = ?1 LIMIT 1"#,
+            strategy_name,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+        if taken.is_some() {
+            // The tx drops uncommitted — nothing was written.
+            return Err(DataError::StrategyNameTaken {
+                name: strategy_name.to_owned(),
+            });
+        }
+        sqlx::query!(
+            "INSERT INTO strategy (id, name, tags, owner, pinned_version_id, archived, created_at) \
+             VALUES (?1, ?2, ?3, NULL, NULL, 0, ?4)",
+            strategy_id,
+            strategy_name,
+            tags_json,
+            created_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+        insert_version_row(
+            &mut tx,
+            &VersionInsert {
+                id: &id,
+                strategy_id: &strategy_id,
+                parent_version_id: None,
+                dsl_schema_version: &schema_version_str,
+                dsl: &dsl_current,
+                dsl_original: &dsl_original,
+                version_hash: &hash,
+                created_by: &created_by_text,
+                creating_llm_call_ids: llm_ids_json,
+                created_at: &created_at,
+            },
+        )
+        .await?;
+        insert_submission_row(
+            &mut tx,
+            &SubmissionInsert {
+                id: &submission_id,
+                version_id: &id,
+                agent_name: submission.agent_name.as_str(),
+                hypothesis: submission.hypothesis.as_str(),
+                created_at: &created_at,
+            },
+        )
+        .await?;
+        // Read all three rows back through the defended paths ON THE
+        // TRANSACTION (G8/T23) — before commit, so a read failure rolls the
+        // triple back rather than misreporting a committed write.
+        let strategy = self
+            .fetch_strategy(&mut *tx, &StrategyId::new(&strategy_id))
+            .await?
+            .ok_or_else(|| {
+                DataError::Db("created agent strategy vanished on read-back".to_owned())
+            })?;
+        let version = self
+            .fetch_version(&mut *tx, &VersionId::new(&id))
+            .await?
+            .ok_or_else(|| {
+                DataError::Db("created agent version vanished on read-back".to_owned())
+            })?;
+        let submission = self
+            .fetch_submission(&mut *tx, &version.id)
+            .await?
+            .ok_or_else(|| DataError::Db("created submission vanished on read-back".to_owned()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        Ok((strategy, version, submission))
+    }
+
+    async fn get_agent_submission(
+        &self,
+        version_id: &VersionId,
+    ) -> Result<Option<AgentSubmission>, DataError> {
+        self.fetch_submission(&self.pool, version_id).await
+    }
 }
 
 /// The raw `strategy_version` column values as read from the DB — the input to
@@ -549,6 +749,138 @@ struct VersionRow {
 }
 
 impl<C: Clock> SqliteStrategyRepo<C> {
+    /// `get_strategy`'s SELECT + decode, run on `executor` — a pool for plain
+    /// reads, the transaction handle for the in-transaction write verification
+    /// (G8: the create paths verify BEFORE commit so a read failure rolls the
+    /// write back rather than reporting a committed write as failed).
+    async fn fetch_strategy<'e, E>(
+        &self,
+        executor: E,
+        id: &StrategyId,
+    ) -> Result<Option<Strategy>, DataError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let id_str = id.as_str();
+        let row = sqlx::query!(
+            r#"SELECT
+                 id                AS "id!: String",
+                 name              AS "name!: String",
+                 tags              AS "tags!: String",
+                 owner             AS "owner?: String",
+                 pinned_version_id AS "pinned_version_id?: String",
+                 archived          AS "archived!: i64",
+                 created_at        AS "created_at!: String"
+               FROM strategy WHERE id = ?1"#,
+            id_str,
+        )
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(Strategy {
+                id: StrategyId::new(r.id),
+                name: r.name,
+                tags: parse_json_str_array(&r.tags)?,
+                owner: r.owner,
+                pinned_version_id: r.pinned_version_id.map(VersionId::new),
+                archived: r.archived != 0,
+                created_at: parse_created_at(&r.created_at)?,
+            })),
+        }
+    }
+
+    /// `get_version`'s SELECT + defended decode on `executor` — see
+    /// [`fetch_strategy`](Self::fetch_strategy) for the executor split.
+    async fn fetch_version<'e, E>(
+        &self,
+        executor: E,
+        id: &VersionId,
+    ) -> Result<Option<StrategyVersion>, DataError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let id_str = id.as_str();
+        let row = sqlx::query!(
+            r#"SELECT
+                 id                    AS "id!: String",
+                 strategy_id           AS "strategy_id!: String",
+                 parent_version_id     AS "parent_version_id?: String",
+                 dsl_schema_version    AS "dsl_schema_version!: String",
+                 dsl_original          AS "dsl_original!: String",
+                 version_hash          AS "version_hash!: String",
+                 created_by            AS "created_by!: String",
+                 creating_llm_call_ids AS "creating_llm_call_ids!: String",
+                 created_at            AS "created_at!: String"
+               FROM strategy_version WHERE id = ?1"#,
+            id_str,
+        )
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(self.row_to_version(VersionRow {
+                id: r.id,
+                strategy_id: r.strategy_id,
+                parent_version_id: r.parent_version_id,
+                dsl_schema_version: r.dsl_schema_version,
+                dsl_original: r.dsl_original,
+                version_hash: r.version_hash,
+                created_by: r.created_by,
+                creating_llm_call_ids: r.creating_llm_call_ids,
+                created_at: r.created_at,
+            })?)),
+        }
+    }
+
+    /// `get_agent_submission`'s SELECT + defended decode on `executor` — see
+    /// [`fetch_strategy`](Self::fetch_strategy) for the executor split.
+    async fn fetch_submission<'e, E>(
+        &self,
+        executor: E,
+        version_id: &VersionId,
+    ) -> Result<Option<AgentSubmission>, DataError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let vid = version_id.as_str();
+        let row = sqlx::query!(
+            r#"SELECT
+                 id         AS "id!: String",
+                 version_id AS "version_id!: String",
+                 agent_name AS "agent_name!: String",
+                 hypothesis AS "hypothesis!: String",
+                 created_at AS "created_at!: String"
+               FROM agent_submission WHERE version_id = ?1"#,
+            vid,
+        )
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(AgentSubmission {
+                id: AgentSubmissionId::new(r.id),
+                version_id: VersionId::new(r.version_id),
+                // Defended read: a stored row that fails domain validation is
+                // a corrupt row (a write that bypassed the typed port), not a
+                // `None`.
+                agent_name: AgentName::parse(&r.agent_name).map_err(|e| {
+                    DataError::Db(format!("stored agent_name failed domain validation: {e}"))
+                })?,
+                hypothesis: Hypothesis::parse(&r.hypothesis).map_err(|e| {
+                    DataError::Db(format!("stored hypothesis failed domain validation: {e}"))
+                })?,
+                created_at: parse_created_at(&r.created_at)?,
+            })),
+        }
+    }
+
     /// Build a [`StrategyVersion`] from its raw column values, re-deriving `.dsl`
     /// from the verbatim `dsl_original` (#19) and rejecting a `version_hash`
     /// mismatch (audit-C5). All `get_version`/`list_versions`/`version_tree`
@@ -709,6 +1041,49 @@ pub(crate) async fn insert_version_row(
         row.version_hash,
         row.created_by,
         row.creating_llm_call_ids,
+        row.created_at,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// The `agent_submission` column tuple, minted by the caller — mirrors
+/// [`VersionInsert`] for the audit half of every agent version write.
+struct SubmissionInsert<'a> {
+    /// The minted row id.
+    id: &'a str,
+    /// The version this submission produced.
+    version_id: &'a str,
+    /// The normalized agent name.
+    agent_name: &'a str,
+    /// The agent's stated hypothesis.
+    hypothesis: &'a str,
+    /// RFC3339 UTC creation timestamp (shared with the version row).
+    created_at: &'a str,
+}
+
+/// Insert one `agent_submission` row on the caller's transaction — shared by
+/// `create_agent_version` and `create_agent_strategy_version` so the audit
+/// column mapping lives in one place.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] when the store rejects the write — including the
+/// `agent_submission` CHECKs and the `agent_submission_version_kind` trigger
+/// (migration `0009`).
+async fn insert_submission_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    row: &SubmissionInsert<'_>,
+) -> Result<(), DataError> {
+    sqlx::query!(
+        "INSERT INTO agent_submission (id, version_id, agent_name, hypothesis, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        row.id,
+        row.version_id,
+        row.agent_name,
+        row.hypothesis,
         row.created_at,
     )
     .execute(&mut **tx)

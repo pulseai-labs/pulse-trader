@@ -56,7 +56,7 @@ pub use mutate::{
     CandidateDsl, Mutation, MutationError, ParamKind, ParamValue, apply, sweepable_paths,
 };
 pub use risk::{Direction, RiskParams};
-pub use schema_version::{SchemaVersion, SchemaVersionParseError};
+pub use schema_version::{DSL_SCHEMA_VERSION, SchemaVersion, SchemaVersionParseError};
 pub use strategy::StrategyDsl;
 pub use sweepable::SweepableValue;
 pub use validate::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};

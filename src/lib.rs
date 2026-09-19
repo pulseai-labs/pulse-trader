@@ -20,6 +20,10 @@ mod cli;
 // `cli` on purpose -- it runs BEFORE any surface is chosen, so it cannot live
 // inside one of them.
 mod entry;
+// r2.s1.w2: the `pulse mcp` delivery ring — the ONLY module in the crate that
+// may name `rmcp` (`scripts/check-mcp-boundary.sh` enforces it). Private like
+// `adapters`; `cli::mcp` is its composition root.
+mod mcp;
 mod tauri;
 
 // The domain layer is the library's stable public API surface (the port traits
@@ -80,9 +84,15 @@ pub use domain::{AlignedBar, align};
 // curated surface like `MarketDataSource`.
 pub use domain::StrategyRepository;
 pub use domain::strategy::{
-    CreatedBy, NewVersion, Strategy, StrategyId, StrategyVersion, VersionDiff, VersionId,
+    AgentName, AgentNameError, AgentSubmission, AgentSubmissionId, CreatedBy, HypothesisError,
+    NewAgentSubmission, NewVersion, Strategy, StrategyId, StrategyVersion, VersionDiff, VersionId,
     diff_versions,
 };
+// r2.s1.w1: the strategy-level `Hypothesis` an `agent_submission` carries is a
+// DIFFERENT type from the coaching `Hypothesis` re-exported below (different
+// bounds, different audit table) — it surfaces under the `AgentHypothesis`
+// alias so neither name silently stands in for the other.
+pub use domain::strategy::Hypothesis as AgentHypothesis;
 
 // VS-1.1.2 work-2.01: the DSL grammar leaf + predicate layer. These are the
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
@@ -443,8 +453,8 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // under `deny(warnings)`), so `tests/backtest_provenance.rs` and W3's DTO can
 // name them.
 pub use domain::{
-    BacktestInputs, BacktestRunId, BacktestRunRepository, FundingConfig, PersistedRun, RunSummary,
-    SnapshotSelection,
+    BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, CandleWindowError,
+    FundingConfig, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
 };
 
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
@@ -453,8 +463,8 @@ pub use domain::{
 // error taxonomy onto `BusError`. The module itself stays private.
 pub use application::backtest::{
     BacktestAppError, BacktestOutcome, BacktestRequest, HISTOGRAM_BIN_COUNT,
-    HISTOGRAM_BIN_WIDTH_STR, Histogram, HistogramBin, ReadBackFailure, ReadBackStage,
-    histogram_bin_width, project_histogram, run_version_backtest,
+    HISTOGRAM_BIN_WIDTH_STR, Histogram, HistogramBin, ReadBackFailure, ReadBackStage, SnapshotPins,
+    histogram_bin_width, project_histogram, resolve_default_request, run_version_backtest,
 };
 
 // VS-1.3.1 work-1.01: the LLM domain ring (FR-23 / FR-24, README C1–C5). The
@@ -573,12 +583,13 @@ pub use entry::{LaunchMode, launch_mode, launch_mode_from_env};
 // error, not a warning (the harvested gotcha).
 pub use crate::tauri::{
     BUS_COMMANDS, BacktestRunDto, BacktestRunRequest, BusError, BusErrorCode, BusEvent,
-    BusEventPayload, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
-    DesktopState, DslSummary, EquityPointDto, EventSink, HistogramBinDto, HistogramDto,
-    LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, RegimeCellDto, RunId,
-    ShellInfo, StreamOutcome, TradeRowDto, VersionStats, backtest_run_dto, compose_strategy_core,
-    demo_stream_core, export_bindings, library_overview_core, run_backtest_version_core,
-    run_desktop, shell_info_core,
+    BusEventPayload, CompareChildRunDto, CompareChildRunRequest, ComposeDeps, ComposeDslSummary,
+    ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EquityPointDto, EventSink,
+    HistogramBinDto, HistogramDto, LibraryOverview, LibraryRunSummary, LibraryStrategy,
+    LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
+    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core,
+    export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
+    shell_info_core,
 };
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the

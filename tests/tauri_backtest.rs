@@ -34,11 +34,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use pulse::{
-    BacktestAppError, BacktestConfig, BacktestRunId, BacktestRunRepository, BacktestRunRequest,
-    Candle, CandleSeriesRepository, CandleStore, CreatedBy, DataError, DataVersion, Db,
-    DesktopState, HISTOGRAM_BIN_COUNT, NewVersion, Pair, PersistedRun, ReadBackFailure,
-    ReadBackStage, SqliteBacktestRunRepo, SqliteStrategyRepo, StoredCandleSeries, StrategyId,
-    StrategyRepository, SummaryStats, Timeframe, Trade, VersionId, histogram_bin_width,
+    AgentHypothesis, AgentName, BacktestAppError, BacktestConfig, BacktestInputs, BacktestResult,
+    BacktestRunId, BacktestRunRepository, BacktestRunRequest, BusErrorCode, Candle,
+    CandleSeriesRepository, CandleStore, CandleWindow, CompareChildRunRequest, CreatedBy,
+    DataError, DataVersion, Db, DesktopState, EngineFingerprint, EquityCurve, ExitReason,
+    FundingConfig, HISTOGRAM_BIN_COUNT, NewAgentSubmission, NewVersion, Pair, PersistedRun,
+    ReadBackFailure, ReadBackStage, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
+    SqliteBacktestRunRepo, SqliteStrategyRepo, StoredCandleSeries, StrategyId, StrategyRepository,
+    SummaryStats, Timeframe, Trade, VersionId, compare_child_run_core, histogram_bin_width,
     project_histogram, run_backtest_version_core, run_version_backtest,
 };
 use rust_decimal::Decimal;
@@ -477,6 +480,8 @@ fn r1_request(version_id: &VersionId) -> pulse::BacktestRequest {
         primary_timeframe: Timeframe::M15,
         htf_timeframe: Some(Timeframe::H4),
         config: BacktestConfig::default(),
+        snapshots: None,
+        window: None,
     }
 }
 
@@ -580,6 +585,43 @@ impl StrategyRepository for InjectingStrategyRepo {
     ) -> impl std::future::Future<Output = Result<Vec<pulse::StrategyVersion>, DataError>> + Send
     {
         self.inner.version_tree(strategy_id)
+    }
+
+    fn create_agent_version(
+        &self,
+        request: NewVersion,
+        submission: pulse::NewAgentSubmission,
+    ) -> impl std::future::Future<
+        Output = Result<(pulse::StrategyVersion, pulse::AgentSubmission), DataError>,
+    > + Send {
+        self.inner.create_agent_version(request, submission)
+    }
+
+    fn create_agent_strategy_version(
+        &self,
+        strategy_name: &str,
+        dsl_json: String,
+        submission: pulse::NewAgentSubmission,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (
+                pulse::Strategy,
+                pulse::StrategyVersion,
+                pulse::AgentSubmission,
+            ),
+            DataError,
+        >,
+    > + Send {
+        self.inner
+            .create_agent_strategy_version(strategy_name, dsl_json, submission)
+    }
+
+    fn get_agent_submission(
+        &self,
+        version_id: &VersionId,
+    ) -> impl std::future::Future<Output = Result<Option<pulse::AgentSubmission>, DataError>> + Send
+    {
+        self.inner.get_agent_submission(version_id)
     }
 }
 
@@ -852,6 +894,214 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
     assert!(
         pulse::backtest_run_dto(&good).is_ok(),
         "positive control: an uncorrupted outcome projects"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3c. a windowed run's read-back returns only the candles it consumed
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_runs_read_back_is_sliced_to_the_persisted_window() {
+    let env = env();
+    let version_id = seed_version(&env).await;
+
+    // Candle-aligned bounds that trim the head of BOTH snapshots — the same
+    // shape `run_backtest`'s from/to produce over the MCP wire
+    // (tests/mcp_write.rs's windowed_call).
+    let store = env.store();
+    let complete = store
+        .load_head(&Pair::new("BTCUSDT"), Timeframe::M15)
+        .expect("load_head")
+        .expect("15m HEAD exists")
+        .series;
+    let from_ms = complete.candles[400].open_time;
+    let to_ms = complete.candles.last().expect("non-empty series").open_time;
+    let window = CandleWindow::new(from_ms, to_ms).expect("window");
+
+    let db = env.db().await;
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let mut request = r1_request(&version_id);
+    request.window = Some(window.clone());
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &request,
+    )
+    .await
+    .expect("the windowed run succeeds");
+
+    // The row records the window — and the outcome answers from exactly that
+    // slice, never the complete snapshot the pinned data_version loads.
+    assert_eq!(
+        outcome.inputs.window,
+        Some(window),
+        "the persisted inputs carry the requested window"
+    );
+    let expected_len = complete
+        .candles
+        .iter()
+        .filter(|c| c.open_time >= from_ms && c.open_time < to_ms)
+        .count();
+    assert!(
+        expected_len < complete.candles.len(),
+        "the window genuinely trims the snapshot (the test is not vacuous)"
+    );
+    assert_eq!(
+        outcome.primary.candles.len(),
+        expected_len,
+        "primary read back the windowed slice, not the complete snapshot"
+    );
+    assert!(
+        outcome
+            .primary
+            .candles
+            .iter()
+            .all(|c| c.open_time >= from_ms && c.open_time < to_ms),
+        "every read-back candle lies inside [from_ms, to_ms)"
+    );
+    assert_eq!(
+        outcome.primary.candles.first().map(|c| c.open_time),
+        Some(from_ms),
+        "equity_curve() opens at the window's first candle, not the snapshot's"
+    );
+    assert_eq!(
+        outcome.equity_curve().0.first().map(|p| p.time_ms),
+        Some(from_ms),
+        "the equity curve's leading point is the window start"
+    );
+
+    let htf = outcome.htf.expect("the r1 request records an htf");
+    assert!(
+        htf.candles
+            .iter()
+            .all(|c| c.open_time >= from_ms && c.open_time < to_ms),
+        "the htf read-back is sliced to the same window"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3d. a window edge is not end-of-data (r2.s1 G1)
+// ---------------------------------------------------------------------------
+
+/// G1: a `[from, to)` window that truncates the snapshot inside an open hold
+/// must not produce the fabricated `EndOfData` close the unwindowed tail would.
+/// The strategy still holds that position — the window is the caller's lens,
+/// not evidence the market ran out of bars.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_ending_mid_hold_does_not_fabricate_an_end_of_data_trade() {
+    let env = env();
+    let version_id = seed_version(&env).await;
+
+    let store = env.store();
+    let complete = store
+        .load_head(&Pair::new("BTCUSDT"), Timeframe::M15)
+        .expect("load_head")
+        .expect("15m HEAD exists")
+        .series;
+    let snapshot_last = complete.candles.last().expect("non-empty").open_time;
+
+    let db = env.db().await;
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+
+    // Baseline: the unwindowed run's trade log — find a position the strategy
+    // holds across more than one bar.
+    let baseline = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &r1_request(&version_id),
+    )
+    .await
+    .expect("the unwindowed run succeeds");
+    // The LAST multi-bar hold: every trade before it still closed inside the
+    // window, so the run's trade log is non-empty (a position still open at
+    // `to` produces no `Trade` row — closed trades only).
+    let held = baseline
+        .trades
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, t)| *i > 0 && t.entry_fill_time < t.exit_signal_time)
+        .map(|(_, t)| t)
+        .expect("the golden strategy holds a multi-bar position after earlier trades");
+
+    // Cut the window at the open_time of the bar the exit FILLED on
+    // (exclusive): every bar that kept the position open is inside; the bar
+    // that closed it is outside. `EndOfData` fills stamp a `close_time`, so
+    // for that exit mode the cut falls back to the last bar's open_time —
+    // which still excludes it.
+    let from_ms = complete.candles[0].open_time;
+    let to_ms = complete
+        .candles
+        .iter()
+        .map(|c| c.open_time)
+        .find(|t| *t >= held.exit_fill_time)
+        .unwrap_or(snapshot_last);
+    assert!(
+        to_ms <= snapshot_last,
+        "the window truncates at or before the snapshot's real last candle"
+    );
+    let mut request = r1_request(&version_id);
+    request.window = Some(CandleWindow::new(from_ms, to_ms).expect("window"));
+
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &pulse::BinanceAdapter::new(),
+        &runs,
+        &request,
+    )
+    .await
+    .expect("the windowed run succeeds");
+
+    assert!(
+        !outcome.trades.is_empty(),
+        "earlier trades still closed inside the window — the run is non-vacuous"
+    );
+    assert!(
+        outcome
+            .trades
+            .iter()
+            .all(|t| t.exit_reason != ExitReason::EndOfData),
+        "a window edge is not end-of-data: no fabricated close at `to`"
+    );
+    assert!(
+        outcome.trades.iter().all(|t| t.exit_signal_time < to_ms),
+        "no trade may exit on a bar the window excluded"
+    );
+
+    // G1 ruling (b): the still-open position is on the PERSISTED run record —
+    // `outcome.run` is the save→get_run read-back, so this proves the column
+    // round-trips, not just that the engine emitted it. It is the bisected
+    // `held` position, marked at the last in-window candle's close — never a
+    // trade row, never inside the closed-trade statistics.
+    let last_in_window = complete
+        .candles
+        .iter()
+        .rfind(|c| c.open_time < to_ms)
+        .expect("the window holds at least one candle");
+    let mark = outcome
+        .run
+        .open_position
+        .expect("a run that ends mid-hold at a window edge records the mark");
+    assert_eq!(mark.direction, held.direction);
+    assert_eq!(mark.qty, held.qty);
+    assert_eq!(mark.entry_price, held.entry_price);
+    assert_eq!(mark.entry_signal_time, held.entry_signal_time);
+    assert_eq!(mark.entry_fill_time, held.entry_fill_time);
+    assert_eq!(mark.mark_time, last_in_window.close_time);
+    assert_eq!(mark.mark_price, last_in_window.close);
+    // And the mark is not folded into the closed-trade statistics.
+    assert_eq!(
+        outcome.run.summary.trade_count,
+        outcome.trades.len(),
+        "the summary counts only closed trades — the mark is excluded visibly"
     );
 }
 
@@ -1293,6 +1543,370 @@ fn the_command_is_registered_once_in_the_append_only_list() {
         pulse::BUS_COMMANDS
             .iter()
             .filter(|c| **c == "run_backtest_version")
+            .count(),
+        1,
+        "registered exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. compare_child_run — a child's run beside its parent's latest (r2.s1.w4 C3)
+// ---------------------------------------------------------------------------
+
+/// A complete single-timeframe `BacktestInputs` — the shape every freshly saved
+/// run carries. The comparison's `inputs_differ` verdict comes off this tuple.
+fn seed_inputs() -> BacktestInputs {
+    BacktestInputs {
+        pair: Pair::new("BTCUSDT"),
+        primary: SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: DataVersion::new("v-primary"),
+        },
+        htf: None,
+        taker_fee_bps: Decimal::new(4, 0),
+        slippage_bps: Decimal::new(1, 0),
+        funding: FundingConfig::SnapshotRates,
+        window: None,
+    }
+}
+
+/// A persisted result with no trades — `save_run` re-derives the content hash
+/// from trades + totals and this persists cleanly, and the comparison reads
+/// headline stats off the run row, not the trades.
+fn trade_free_result() -> BacktestResult {
+    BacktestResult {
+        trades: vec![],
+        net_pnl: Decimal::ZERO,
+        fees_total: Decimal::ZERO,
+        funding_total: Decimal::ZERO,
+        slippage_total: Decimal::ZERO,
+        regime_breakdown: RegimeBreakdown::new(),
+        skipped_entries: SkippedEntryCounts::new(),
+        open_position: None,
+        engine_fingerprint: EngineFingerprint::current(),
+        summary: SummaryStats::default(),
+        equity_curve: EquityCurve::default(),
+    }
+}
+
+/// Persist a run for `version_id` over `inputs`, reporting `expectancy_milli`
+/// so the before/after cells are distinguishable.
+async fn save_run(
+    env: &Env,
+    version_id: &VersionId,
+    inputs: &BacktestInputs,
+    expectancy_milli: i64,
+) -> BacktestRunId {
+    let db = env.db().await;
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    runs.save_run(
+        version_id,
+        inputs,
+        &trade_free_result(),
+        &SummaryStats {
+            expectancy: Decimal::new(expectancy_milli, 3),
+            win_rate: Decimal::new(500, 3),
+            trade_count: 12,
+            ..SummaryStats::default()
+        },
+        Decimal::new(10_000, 0),
+    )
+    .await
+    .expect("save run")
+}
+
+/// Seed a strategy with a Human ROOT version and an external-agent CHILD
+/// version written through the real submission path — the shape `pulse mcp`
+/// produces.
+async fn seed_parent_and_agent_child(env: &Env) -> (VersionId, VersionId) {
+    let state = env.cold_state().await;
+    let repo = state.strategy_repo();
+    let strat = repo
+        .create_strategy("Compare demo", Some("alice"), &["btc".to_owned()])
+        .await
+        .expect("create strategy");
+    let dsl = std::fs::read_to_string(manifest(GOLDEN_STRATEGY)).expect("read golden strategy");
+    let parent = repo
+        .create_version(NewVersion {
+            strategy_id: strat.id.clone(),
+            parent_version_id: None,
+            dsl_json: dsl.clone(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create parent version");
+    let (child, _submission) = repo
+        .create_agent_version(
+            NewVersion {
+                strategy_id: strat.id,
+                parent_version_id: Some(parent.id.clone()),
+                dsl_json: dsl,
+                created_by: CreatedBy::ExternalAgent,
+                creating_llm_call_ids: vec![],
+            },
+            NewAgentSubmission {
+                agent_name: AgentName::parse("claude-code").expect("valid agent name"),
+                hypothesis: AgentHypothesis::parse("a structural variant")
+                    .expect("valid hypothesis"),
+            },
+        )
+        .await
+        .expect("create agent child");
+    (parent.id, child.id)
+}
+
+/// The comparison reads the CHILD's asked-for run and the PARENT's LATEST run
+/// (not the asked-for one — the parent side is always "latest"), with headline
+/// stats projected from the persisted rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_run_compares_with_its_parents_latest_run() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+
+    // Two parent runs: the comparison must pick the LATEST, not the first.
+    let _stale_parent_run = save_run(&env, &parent, &seed_inputs(), 100).await;
+    let latest_parent_run = save_run(&env, &parent, &seed_inputs(), 300).await;
+    let child_run = save_run(&env, &child, &seed_inputs(), 420).await;
+
+    let state = env.cold_state().await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("the comparison succeeds");
+
+    assert_eq!(dto.child_run_id, child_run.as_str());
+    assert_eq!(dto.child_version_id, child.as_str());
+    assert_eq!(dto.parent_run_id, latest_parent_run.as_str());
+    assert_eq!(dto.parent_version_id, parent.as_str());
+    assert_eq!(dto.before.expectancy, "0.3");
+    assert_eq!(dto.after.expectancy, "0.42");
+    assert_eq!(dto.before.trade_count, 12);
+    assert_eq!(dto.after.trade_count, 12);
+    assert!(
+        !dto.inputs_differ,
+        "identical persisted inputs do not differ"
+    );
+    assert_eq!(dto.inputs_note, None);
+}
+
+/// `inputs_differ` is the `BacktestInputs` equality verdict: a recorded window
+/// (the `run_backtest` shape) or a recosted run each differs from the parent's
+/// baseline. When both sides carry inputs that differ, `inputs_note` names the
+/// differing fields — the badge's hover text (G6/T22).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inputs_differ_flags_a_windowed_or_recosted_child_run() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+    save_run(&env, &parent, &seed_inputs(), 300).await;
+
+    // A windowed child run (the MCP `run_backtest` shape) — the headline case:
+    // child windowed, parent whole-snapshot.
+    let mut windowed = seed_inputs();
+    windowed.window =
+        Some(CandleWindow::new(1_735_689_600_000, 1_756_684_800_000).expect("valid window"));
+    let child_run = save_run(&env, &child, &windowed, 420).await;
+    let state = env.cold_state().await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("comparison succeeds");
+    assert!(
+        dto.inputs_differ,
+        "a recorded window the parent lacks is an inputs difference"
+    );
+    let note = dto
+        .inputs_note
+        .expect("both runs carry inputs that differ — the note names the fields");
+    assert!(
+        note.contains("window"),
+        "the note names the differing field: {note}"
+    );
+    assert!(
+        note.contains("2025-01-01T00:00:00Z"),
+        "the child's window bound renders readably: {note}"
+    );
+    assert!(
+        note.contains("whole snapshot"),
+        "the parent's unwindowed side is named: {note}"
+    );
+
+    // A recosted child run differs the same way — the note names the cost field.
+    let mut recosted = seed_inputs();
+    recosted.taker_fee_bps = Decimal::new(8, 0);
+    let child_run = save_run(&env, &child, &recosted, 420).await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("comparison succeeds");
+    assert!(
+        dto.inputs_differ,
+        "a different taker_fee_bps is an inputs difference"
+    );
+    let note = dto.inputs_note.expect("the note names the differing field");
+    assert!(
+        note.contains("taker fee bps") && note.contains('8') && note.contains('4'),
+        "the note names the differing cost with both values: {note}"
+    );
+}
+
+/// A run saved WITHOUT inputs (the legacy/migration shape) is reported
+/// honestly: the inputs cannot be proven equal, so `inputs_differ` reads
+/// `true` and `inputs_note` names which side lacks the provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_without_recorded_inputs_reports_no_verdict() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+    let child_run = save_run(&env, &child, &seed_inputs(), 420).await;
+    save_run(&env, &parent, &seed_inputs(), 300).await;
+
+    // Write a second child run in the pre-0006 row shape: `backtest_run` is
+    // UPDATE/DELETE-immutable (0003) and `backtest_run_inputs_complete` refuses
+    // an all-NULL provenance INSERT (0006), so the row is cloned with the ten
+    // provenance columns NULL — exactly what a migration-era row stores and
+    // what `decode_inputs` reads as `inputs: None`. The completeness trigger is
+    // dropped for the insert on this throwaway database; `result_content_hash`
+    // does not cover inputs, so the clone stays hash-consistent.
+    let db = env.db().await;
+    sqlx::query("DROP TRIGGER backtest_run_inputs_complete")
+        .execute(db.pool())
+        .await
+        .expect("drop the insert-only provenance guard");
+    sqlx::query(
+        "INSERT INTO backtest_run (\
+         id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+         engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+         funding_total, slippage_total, expectancy, win_rate, profit_factor, \
+         gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
+         wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
+         regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+         pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
+         taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms) \
+         SELECT 'run-legacy-child', strategy_version_id, schema_version, created_at, \
+         engine_fingerprint, engine_target, result_content_hash, starting_equity, net_pnl, \
+         fees_total, funding_total, slippage_total, expectancy, win_rate, profit_factor, \
+         gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
+         wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
+         regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+         NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL \
+         FROM backtest_run WHERE id = ?1",
+    )
+    .bind(child_run.as_str())
+    .execute(db.pool())
+    .await
+    .expect("clone the run in the pre-provenance row shape");
+
+    let state = env.cold_state().await;
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: "run-legacy-child".to_owned(),
+        },
+    )
+    .await
+    .expect("comparison still succeeds");
+    assert!(
+        dto.inputs_differ,
+        "inputs that cannot be proven equal read as differing"
+    );
+    assert!(
+        dto.inputs_note.is_some(),
+        "the note explains the missing provenance"
+    );
+}
+
+/// The typed refusals name exactly what is missing, in `not_found`: an unknown
+/// run id carries the asked-for id in `child_run_id`; a ROOT version's run has
+/// no parent to compare with; a child whose parent has no run names the absent
+/// partner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_typed_refusals_name_what_is_missing() {
+    let env = env();
+    let (parent, child) = seed_parent_and_agent_child(&env).await;
+    let state = env.cold_state().await;
+
+    // Unknown run id → not_found carrying the asked-for id.
+    let err = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: "run-nonexistent".to_owned(),
+        },
+    )
+    .await
+    .expect_err("an unknown run id is a typed refusal");
+    assert_eq!(err.code, BusErrorCode::NotFound);
+    assert_eq!(err.child_run_id.as_deref(), Some("run-nonexistent"));
+
+    // A child run whose PARENT has no run → not_found.
+    let child_run = save_run(&env, &child, &seed_inputs(), 420).await;
+    let err = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect_err("a child with no parent run is a typed refusal");
+    assert_eq!(err.code, BusErrorCode::NotFound);
+    assert_eq!(err.child_run_id, None);
+    assert!(
+        err.message.contains("parent"),
+        "the reason names the missing side: {}",
+        err.message
+    );
+
+    // A ROOT version's run → not_found (there is no parent to compare with).
+    let root_run = save_run(&env, &parent, &seed_inputs(), 300).await;
+    let err = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: root_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect_err("a root version's run has no parent");
+    assert_eq!(err.code, BusErrorCode::NotFound);
+    assert!(
+        err.message.contains("no parent"),
+        "the reason names the absent parent: {}",
+        err.message
+    );
+
+    // Now the parent has a run — the same child run compares cleanly.
+    let dto = compare_child_run_core(
+        &state,
+        CompareChildRunRequest {
+            child_run_id: child_run.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("with a parent run present the comparison succeeds");
+    assert_eq!(dto.parent_version_id, parent.as_str());
+}
+
+#[test]
+fn the_compare_command_is_registered_once_in_the_append_only_list() {
+    assert!(
+        pulse::BUS_COMMANDS.contains(&"compare_child_run"),
+        "the command joins the single append-only registry: {:?}",
+        pulse::BUS_COMMANDS
+    );
+    assert_eq!(
+        pulse::BUS_COMMANDS
+            .iter()
+            .filter(|c| **c == "compare_child_run")
             .count(),
         1,
         "registered exactly once"

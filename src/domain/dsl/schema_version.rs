@@ -113,6 +113,31 @@ impl TryFrom<String> for SchemaVersion {
     }
 }
 
+// r2.s1.w2: `pulse://dsl/schema` publishes the serde wire shape — a bare
+// `"MAJOR.MINOR.PATCH"` string — not the three-field struct layout, which is
+// what the derived impl would describe (and what no document ever contains).
+// The string is further pinned to a `const`: `Migrator::v1()`'s registry is
+// empty, so the only version the loader can accept is exactly `CURRENT`. A bare
+// `type: string` would tell a validating agent that `"garbage"` or `"2.0.0"`
+// is legal — both are rejected at submission. If a migration ever registers a
+// non-CURRENT `from` version, widen this to the accepted set.
+impl schemars::JsonSchema for SchemaVersion {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SchemaVersion".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "const": DSL_SCHEMA_VERSION,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -176,6 +201,20 @@ mod tests {
         assert!(v100 < v101);
         assert!(v101 < v110);
         assert!(v110 < v200);
+    }
+
+    /// r2.s1 F6: the published JSON Schema pins `schema_version` to the
+    /// accepted const so a validating agent rejects `"garbage"`/`"2.0.0"`
+    /// before calling the tool, the same way `Migrator::load` does at
+    /// submission.
+    #[test]
+    fn published_schema_is_the_current_const() {
+        let schema = <SchemaVersion as schemars::JsonSchema>::json_schema(
+            &mut schemars::SchemaGenerator::default(),
+        );
+        let json = serde_json::to_value(&schema).expect("schema serializes");
+        assert_eq!(json["const"], DSL_SCHEMA_VERSION);
+        assert_eq!(json["type"], "string");
     }
 
     #[test]

@@ -413,6 +413,7 @@ fn created_by_label(created_by: CreatedBy) -> &'static str {
         CreatedBy::CoachLlm => "coach_llm",
         CreatedBy::AutoOptimizer => "auto_optimizer",
         CreatedBy::Migration => "migration",
+        CreatedBy::ExternalAgent => "external_agent",
     }
 }
 
@@ -570,6 +571,10 @@ mod tests {
         assert_eq!(
             parse_created_by("composer_llm").unwrap(),
             CreatedBy::ComposerLlm
+        );
+        assert_eq!(
+            parse_created_by("external_agent").unwrap(),
+            CreatedBy::ExternalAgent
         );
         assert!(parse_created_by("bogus").is_err(), "unknown token rejects");
     }

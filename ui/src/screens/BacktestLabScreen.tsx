@@ -27,6 +27,7 @@ import type {
   CoachActionDto,
   CoachDecisionDto,
   CoachSessionDto,
+  CompareChildRunDto,
   HistogramDto,
   LibraryOverview,
   LibraryVersion,
@@ -36,6 +37,7 @@ import type {
 } from "../bindings";
 import { backtestKey, coachKey, useActiveOperations } from "../hooks/useActiveOperations";
 import type { BusResult, OperationRecord } from "../hooks/useActiveOperations";
+import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 
 /** The em dash every null renders — a statement that no value exists, never
  * a zero dressed up as data (the Library's grill A1 rule, applied here). */
@@ -64,7 +66,10 @@ type CatalogState =
   | { kind: "loading" }
   | { kind: "error"; code: string; message: string }
   | { kind: "empty" }
-  | { kind: "ready"; options: Option[] };
+  // The overview rides along (r2.s1.w4 C3): the compare section needs the
+  // selected version's `parentId` and `recentRuns`, which the flattened
+  // options do not carry.
+  | { kind: "ready"; options: Option[]; overview: LibraryOverview };
 
 /** Flatten the catalog's strategies into the selector's options — the real
  * versions only; a version not in the payload cannot appear here. */
@@ -291,8 +296,19 @@ export default function BacktestLabScreen() {
         if (!alive()) return new Set();
         if (result.status === "ok") {
           const options = catalogOptions(result.data);
-          setCatalog(options.length === 0 ? { kind: "empty" } : { kind: "ready", options });
-          return new Set(options.map((option) => option.value));
+          setCatalog(
+            options.length === 0
+              ? { kind: "empty" }
+              : { kind: "ready", options, overview: result.data },
+          );
+          const known = new Set(options.map((option) => option.value));
+          // C2 (r2.s1.w4): a refetch keeps the selection ONLY while the
+          // refreshed catalog still carries it — a vanished version falls back
+          // to the first option rather than rendering a blank select.
+          setSelectedId((current) =>
+            current !== null && !known.has(current) ? null : current,
+          );
+          return known;
         }
         setCatalog({
           kind: "error",
@@ -319,6 +335,16 @@ export default function BacktestLabScreen() {
     };
   }, [loadCatalog]);
 
+  // C2 (r2.s1.w4): versions and runs written by `pulse mcp` surface on window
+  // focus — DOM events only, throttled inside the hook. The refetch is the
+  // same `loadCatalog` the mount and the accept paths use, so the selection
+  // repair above applies to it too.
+  useRefetchOnFocus(
+    useCallback(() => {
+      void loadCatalog();
+    }, [loadCatalog]),
+  );
+
   const options = catalog.kind === "ready" ? catalog.options : [];
   const currentId = selectedId ?? options[0]?.value ?? null;
   /** This version's operation, whoever started it and whenever. Keyed by version,
@@ -327,6 +353,15 @@ export default function BacktestLabScreen() {
   const run = runStateOf(
     currentId === null ? undefined : operations.lookup(backtestKey(currentId)),
   );
+
+  /** The selected version's own record — the compare section needs its
+   * `parentId` and `recentRuns`, which the selector's flattened options drop. */
+  const selectedVersion =
+    catalog.kind === "ready"
+      ? (catalog.overview.strategies
+          .flatMap((strategy) => strategy.versions)
+          .find((version) => version.id === currentId) ?? null)
+      : null;
 
   /** Selecting a version shows THAT version's operation. Nothing is cleared and
    * nothing is cancelled: each version's record is its own, so a run still going
@@ -497,6 +532,15 @@ export default function BacktestLabScreen() {
           {/* No percentage, no cancel — the run is request/response. */}
         </div>
       )}
+
+      {/* C3 (r2.s1.w4): a child version's latest run beside its parent's — for
+          ANY child, not only a coach accept. Shown only when there is a parent
+          to compare with and at least one run to compare. */}
+      {selectedVersion !== null &&
+        selectedVersion.parentId !== null &&
+        (run.kind === "done" || selectedVersion.recentRuns.length > 0) && (
+          <CompareWithParent version={selectedVersion} run={run} />
+        )}
 
       {run.kind === "running" && (
         <div className="bt-state dim" role="status">
@@ -1268,6 +1312,143 @@ function cell(summary: SummaryDto, key: keyof SummaryDto) {
   return value === null ? EM_DASH : String(value);
 }
 
+/**
+ * The before/after summary table — extracted from `AcceptedPanel` (r2.s1.w4
+ * C3) so the coach accept and the standalone child-vs-parent compare share ONE
+ * cell shape. `badge` is optional and rides the table's caption: the accept
+ * never passes one, so its table renders exactly as it did inline.
+ */
+function CompareTable({
+  before,
+  after,
+  badge,
+}: {
+  before: SummaryDto;
+  after: SummaryDto;
+  badge?: React.ReactNode;
+}) {
+  return (
+    <table className="coach-compare" aria-label="Before and after">
+      {badge !== undefined && <caption className="compare-caption">{badge}</caption>}
+      <thead>
+        <tr>
+          <th scope="col">metric</th>
+          <th scope="col">before (parent)</th>
+          <th scope="col">after (child)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {SUMMARY_ROWS.map((row) => (
+          <tr key={row.key}>
+            <th scope="row">{row.label}</th>
+            <td className="mono">{cell(before, row.key)}</td>
+            <td className="mono">{cell(after, row.key)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/** What `CompareWithParent` resolves to — the same explicit-state discipline
+ * as the catalog's own union. */
+type CompareState =
+  | { kind: "loading" }
+  | { kind: "error"; error: BusError }
+  | { kind: "ready"; dto: CompareChildRunDto };
+
+/**
+ * The selected version's latest run beside its parent's latest — for ANY child
+ * version, not only a coach accept (r2.s1.w4 C3). The child run named is the
+ * freshest one the screen can prove: the run this screen just finished when it
+ * is newer than the catalog's, else the catalog's latest (`recentRuns` arrives
+ * `created_at DESC`). A typed refusal renders its reason line instead of the
+ * table — a child whose parent has no run is a state to report, not an error
+ * to raise.
+ */
+function CompareWithParent({ version, run }: { version: LibraryVersion; run: RunState }) {
+  const [outcome, setOutcome] = useState<CompareState>({ kind: "loading" });
+
+  const persistedRunId = version.recentRuns[0]?.id ?? null;
+  const freshRunId =
+    run.kind === "done" &&
+    run.dto.strategyVersionId === version.id &&
+    (version.recentRuns[0] === undefined ||
+      run.dto.createdAt >= version.recentRuns[0].createdAt)
+      ? run.dto.runId
+      : null;
+  const latestRunId = freshRunId ?? persistedRunId;
+
+  useEffect(() => {
+    if (latestRunId === null) return;
+    let alive = true;
+    setOutcome({ kind: "loading" });
+    commands
+      .compareChildRun({ childRunId: latestRunId })
+      .then((result) => {
+        if (!alive) return;
+        setOutcome(
+          result.status === "ok"
+            ? { kind: "ready", dto: result.data }
+            : { kind: "error", error: result.error },
+        );
+      })
+      .catch(() => {
+        // The IPC call itself failing — the honest reason line, never a
+        // fabricated table.
+        if (alive) {
+          setOutcome({
+            kind: "error",
+            error: {
+              code: "internal",
+              message: "The comparison read failed.",
+              run_id: null,
+              session_id: null,
+              child_run_id: null,
+            },
+          });
+        }
+      });
+    return () => {
+      alive = false;
+    };
+    // `version` (not `version.id`) is a dep on purpose: a C2 refetch hands the
+    // section a FRESH object, and re-comparing picks up a parent-side run that
+    // arrived while the app was unfocused. `latestRunId` covers the post-Run
+    // case the object identity cannot.
+  }, [version, latestRunId]);
+
+  return (
+    <section className="bt-section compare-parent" aria-label="Compare with parent">
+      <h3 className="compare-title">Compare with parent</h3>
+      {outcome.kind === "loading" && (
+        <p className="compare-reason dim">Comparing with the parent…</p>
+      )}
+      {outcome.kind === "error" && (
+        <p className="compare-reason" role="alert">
+          <span className="mono">{outcome.error.code}</span> {outcome.error.message}
+        </p>
+      )}
+      {outcome.kind === "ready" && (
+        <CompareTable
+          before={outcome.dto.before}
+          after={outcome.dto.after}
+          badge={
+            outcome.dto.inputsDiffer ? (
+              <span
+                className="badge-inputs-differ"
+                title={outcome.dto.inputsNote ?? undefined}
+              >
+                inputs differ
+              </span>
+            ) : undefined
+          }
+        />
+      )}
+    </section>
+  );
+}
+
 /** The committed accept: the child beside its parent, and both links. */
 function AcceptedPanel({
   session,
@@ -1304,24 +1485,7 @@ function AcceptedPanel({
         </p>
       )}
       {accepted.after !== null && (
-        <table className="coach-compare" aria-label="Before and after">
-          <thead>
-            <tr>
-              <th scope="col">metric</th>
-              <th scope="col">before (parent)</th>
-              <th scope="col">after (child)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {SUMMARY_ROWS.map((row) => (
-              <tr key={row.key}>
-                <th scope="row">{row.label}</th>
-                <td className="mono">{cell(accepted.before, row.key)}</td>
-                <td className="mono">{cell(accepted.after as SummaryDto, row.key)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <CompareTable before={accepted.before} after={accepted.after} />
       )}
       <p className="coach-session-line mono">session {session.sessionId}</p>
     </div>

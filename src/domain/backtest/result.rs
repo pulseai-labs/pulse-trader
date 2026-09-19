@@ -64,6 +64,26 @@ pub struct BacktestResult {
     #[serde(default)]
     pub skipped_entries: SkippedEntryCounts,
 
+    /// The position still open when a [`SeriesEnd::WindowEdge`](super::run::SeriesEnd)
+    /// run stopped at `to` (r2.s1 G1, ruling condition b): the direction, entry fill and size
+    /// the strategy opened, marked at the last in-window candle's close. `None`
+    /// for a run that ended flat and for every `SnapshotEnd` run — there the
+    /// engine's ordinary `EndOfData` close already books the position as a
+    /// trade. The mark is **never a [`Trade`]**: it produces no trade row, adds
+    /// nothing to `net_pnl`, and the summary's closed-trade statistics exclude
+    /// it — the record says so explicitly rather than by omission.
+    ///
+    /// `#[serde(default)]` (#68 / README C5): an old-shape result missing this
+    /// field deserializes as `None`.
+    ///
+    /// Hash feeding is CONDITIONAL: [`feed_money_math`](Self::feed_money_math)
+    /// appends the mark's byte-exact fields only when it is `Some`, so a
+    /// pre-`0010` persisted row (always `None`) re-derives the identical byte
+    /// stream and its stored `result_content_hash` still verifies — while a
+    /// marked run's hash covers the mark.
+    #[serde(default)]
+    pub open_position: Option<super::run::OpenPositionMark>,
+
     /// The build-time identity of the engine that produced this run (FR-7 /
     /// NFR-2, VS-1.2.3 work-3.03). Populated from [`EngineFingerprint::current`]
     /// at construction in `LoopState::into_result`; surfaced in the human footer
@@ -170,6 +190,20 @@ impl BacktestResult {
         feed_usize(hasher, result.skipped_entries.sub_lot);
         feed_usize(hasher, result.skipped_entries.sub_notional);
         feed_usize(hasher, result.skipped_entries.leverage_capped);
+        // r2.s1 G1(b): the window-edge open-position mark is run output, so a
+        // `Some` mark feeds into the hash — a tampered `open_position` column
+        // then fails the #39 re-derive-on-read guard. The feed is CONDITIONAL:
+        // `None` writes nothing, so a pre-`0010` row re-derives the identical
+        // byte stream it hashed under before the field existed.
+        if let Some(mark) = &result.open_position {
+            hasher.update([direction_tag(mark.direction)]);
+            feed_decimal(hasher, mark.qty);
+            feed_decimal(hasher, mark.entry_price);
+            hasher.update(mark.entry_signal_time.to_be_bytes());
+            hasher.update(mark.entry_fill_time.to_be_bytes());
+            hasher.update(mark.mark_time.to_be_bytes());
+            feed_decimal(hasher, mark.mark_price);
+        }
     }
 
     /// Feed the f64-derived regime breakdown into `hasher`: the four fixed
@@ -308,6 +342,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: crate::domain::backtest::RegimeBreakdown::new(),
             skipped_entries: crate::domain::sizing::SkippedEntryCounts::new(),
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary: SummaryStats::default(),
             equity_curve: EquityCurve::default(),
@@ -374,6 +409,7 @@ mod tests {
             slippage_total: trade.slippage_total,
             regime_breakdown,
             skipped_entries,
+            open_position: None,
             engine_fingerprint: EngineFingerprint::current(),
             summary,
             equity_curve,

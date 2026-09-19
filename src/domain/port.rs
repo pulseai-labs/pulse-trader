@@ -47,7 +47,10 @@ use crate::domain::llm_call::{AttributedCall, AttributedCallError, LlmCall, LlmC
 use crate::domain::pair::Pair;
 use crate::domain::series::{CandleSeries, StoredCandleSeries};
 use crate::domain::sizing::SymbolFilters;
-use crate::domain::strategy::{NewVersion, Strategy, StrategyId, StrategyVersion, VersionId};
+use crate::domain::strategy::{
+    AgentSubmission, NewAgentSubmission, NewVersion, Strategy, StrategyId, StrategyVersion,
+    VersionId,
+};
 use crate::domain::timeframe::Timeframe;
 use crate::domain::version::DataVersion;
 use rust_decimal::Decimal;
@@ -328,6 +331,70 @@ pub trait StrategyRepository {
         &self,
         strategy_id: &StrategyId,
     ) -> impl Future<Output = Result<Vec<StrategyVersion>, DataError>> + Send;
+
+    /// Create an external-agent version and its `agent_submission` audit row in
+    /// ONE transaction (r2.s1.w1): either both rows exist afterwards or neither
+    /// does. The submission is the audit trail an agent version carries where a
+    /// coach version carries a coaching session and an `LlmCall`.
+    ///
+    /// The implementation refuses `request.created_by !=
+    /// CreatedBy::ExternalAgent` and a non-empty `creating_llm_call_ids`
+    /// **before touching the database** — an agent version names no `LlmCall`
+    /// rows because the agent's cost is external to the app.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on a refused provenance shape, if the underlying
+    /// store fails, or if the DSL is invalid.
+    fn create_agent_version(
+        &self,
+        request: NewVersion,
+        submission: NewAgentSubmission,
+    ) -> impl Future<Output = Result<(StrategyVersion, AgentSubmission), DataError>> + Send;
+
+    /// Create a NEW `strategy` row, its root `external_agent` version, and the
+    /// `agent_submission` audit row in ONE `BEGIN IMMEDIATE` transaction
+    /// (r2.s1.w3): either all three rows exist afterwards or none does.
+    ///
+    /// The name-uniqueness refusal is part of the atomic write — the `strategy`
+    /// name is re-read under the `BEGIN IMMEDIATE` write lock — so two
+    /// concurrent root submits can never both pass the way the `list_strategies`
+    /// pre-read followed by `create_strategy` + `create_agent_version` let them
+    /// (two writers both pass the pre-read; a failed version write orphans the
+    /// strategy). `strategy.name` carries no schema-level UNIQUE — same-named
+    /// human strategies are legal and may already exist — so the constraint is
+    /// enforced here, at the only write boundary that promises it.
+    ///
+    /// `parent_version_id` / `created_by` / `creating_llm_call_ids` are absent
+    /// by construction: a root version has no parent, writes as
+    /// [`CreatedBy::ExternalAgent`], and names no `LlmCall` rows — the same
+    /// refusals [`create_agent_version`](Self::create_agent_version) validates,
+    /// made structural. Agent roots are bare strategies: `owner` is `NULL` and
+    /// `tags` is `[]` (they are human-library metadata).
+    ///
+    /// # Errors
+    ///
+    /// - [`DataError::StrategyNameTaken`] when a `strategy` row already carries
+    ///   `strategy_name` — decided under the write lock.
+    /// - [`DataError`] on a store failure or an invalid DSL (the same
+    ///   load → validate → canonicalize pipeline `create_agent_version` runs).
+    fn create_agent_strategy_version(
+        &self,
+        strategy_name: &str,
+        dsl_json: String,
+        submission: NewAgentSubmission,
+    ) -> impl Future<Output = Result<(Strategy, StrategyVersion, AgentSubmission), DataError>> + Send;
+
+    /// Fetch the `agent_submission` audit row for a version (`Ok(None)` when the
+    /// version has none — e.g. a human- or coach-authored version).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] if the underlying store fails.
+    fn get_agent_submission(
+        &self,
+        version_id: &VersionId,
+    ) -> impl Future<Output = Result<Option<AgentSubmission>, DataError>> + Send;
 }
 
 /// The persisted backtest-run system-of-record port (VS-1.2.4 work-4.04, FR-6 /
@@ -952,7 +1019,8 @@ mod repository_tests {
     use super::StrategyRepository;
     use crate::domain::error::DataError;
     use crate::domain::strategy::{
-        CreatedBy, NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
+        AgentSubmission, AgentSubmissionId, CreatedBy, NewAgentSubmission, NewVersion, Strategy,
+        StrategyId, StrategyVersion, VersionId,
     };
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1002,6 +1070,7 @@ mod repository_tests {
     struct FakeRepo {
         strategies: Mutex<HashMap<String, Strategy>>,
         versions: Mutex<HashMap<String, StrategyVersion>>,
+        submissions: Mutex<HashMap<String, AgentSubmission>>,
         seq: Mutex<u64>,
     }
 
@@ -1177,6 +1246,91 @@ mod repository_tests {
         ) -> Result<Vec<StrategyVersion>, DataError> {
             self.list_versions(strategy_id).await
         }
+
+        async fn create_agent_version(
+            &self,
+            request: NewVersion,
+            submission: NewAgentSubmission,
+        ) -> Result<(StrategyVersion, AgentSubmission), DataError> {
+            if request.created_by != CreatedBy::ExternalAgent {
+                return Err(DataError::Db(
+                    "create_agent_version requires created_by = external_agent".to_owned(),
+                ));
+            }
+            if !request.creating_llm_call_ids.is_empty() {
+                return Err(DataError::Db(
+                    "an external-agent version names no LlmCall rows".to_owned(),
+                ));
+            }
+            let version = self.create_version(request).await?;
+            let submission = AgentSubmission {
+                id: AgentSubmissionId::new(self.next_id("sub")),
+                version_id: version.id.clone(),
+                agent_name: submission.agent_name,
+                hypothesis: submission.hypothesis,
+                created_at: version.created_at,
+            };
+            self.submissions
+                .lock()
+                .expect("submissions lock")
+                .insert(version.id.as_str().to_owned(), submission.clone());
+            Ok((version, submission))
+        }
+
+        async fn create_agent_strategy_version(
+            &self,
+            strategy_name: &str,
+            dsl_json: String,
+            submission: NewAgentSubmission,
+        ) -> Result<(Strategy, StrategyVersion, AgentSubmission), DataError> {
+            // The fake's `Mutex` plays the adapter's `BEGIN IMMEDIATE` write
+            // lock: the name check and the strategy insert happen under one
+            // hold, so the fake honours the same collision-free contract.
+            let strat = {
+                let mut strategies = self.strategies.lock().expect("strategies lock");
+                if strategies.values().any(|s| s.name == strategy_name) {
+                    return Err(DataError::StrategyNameTaken {
+                        name: strategy_name.to_owned(),
+                    });
+                }
+                let strat = Strategy {
+                    id: StrategyId::new(self.next_id("strat")),
+                    name: strategy_name.to_owned(),
+                    tags: vec![],
+                    owner: None,
+                    pinned_version_id: None,
+                    archived: false,
+                    created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                };
+                strategies.insert(strat.id.as_str().to_owned(), strat.clone());
+                strat
+            };
+            let (version, submission) = self
+                .create_agent_version(
+                    NewVersion {
+                        strategy_id: strat.id.clone(),
+                        parent_version_id: None,
+                        dsl_json,
+                        created_by: CreatedBy::ExternalAgent,
+                        creating_llm_call_ids: vec![],
+                    },
+                    submission,
+                )
+                .await?;
+            Ok((strat, version, submission))
+        }
+
+        fn get_agent_submission(
+            &self,
+            version_id: &VersionId,
+        ) -> impl Future<Output = Result<Option<AgentSubmission>, DataError>> {
+            std::future::ready(Ok(self
+                .submissions
+                .lock()
+                .expect("submissions lock")
+                .get(version_id.as_str())
+                .cloned()))
+        }
     }
 
     /// Generic consumption (`<R: StrategyRepository>`) proves the port is used by
@@ -1299,6 +1453,7 @@ mod backtest_run_repository_tests {
                 summary: summary.clone(),
                 regime_breakdown: result.regime_breakdown,
                 skipped_entries: result.skipped_entries,
+                open_position: result.open_position.clone(),
             };
             self.runs
                 .lock()
@@ -1387,6 +1542,7 @@ mod backtest_run_repository_tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: crate::domain::backtest::RegimeBreakdown::default(),
             skipped_entries: crate::domain::sizing::SkippedEntryCounts::default(),
+            open_position: None,
             engine_fingerprint: crate::domain::EngineFingerprint::current(),
             summary: SummaryStats::default(),
             equity_curve: crate::domain::backtest::EquityCurve::default(),
@@ -1401,6 +1557,7 @@ mod backtest_run_repository_tests {
             taker_fee_bps: Decimal::new(4, 0),
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,
+            window: None,
         };
         let id = repo
             .save_run(

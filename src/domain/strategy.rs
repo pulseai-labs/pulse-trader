@@ -29,6 +29,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::dsl::{SchemaVersion, StrategyDsl};
 
@@ -82,10 +83,12 @@ impl VersionId {
 /// The provenance of a [`StrategyVersion`] — who/what authored it.
 ///
 /// Serializes to exactly `"human"`, `"composer_llm"`, `"coach_llm"`,
-/// `"auto_optimizer"`, `"migration"` — these strings ARE the
+/// `"auto_optimizer"`, `"migration"`, `"external_agent"` — these strings ARE the
 /// `strategy_version.created_by` column text (pinned by test, not prose).
 /// `Copy` is safe (a fieldless enum). `Migration` covers a version minted by a
-/// future DSL migration.
+/// future DSL migration. `ExternalAgent` (r2.s1.w1) covers a version submitted
+/// through `pulse mcp` by an external coding agent — its audit trail is an
+/// [`AgentSubmission`] row, not a coaching session or an `LlmCall`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CreatedBy {
@@ -99,6 +102,8 @@ pub enum CreatedBy {
     AutoOptimizer,
     /// Minted by a forward DSL migration (FR-4 read-path).
     Migration,
+    /// Submitted by an external coding agent over `pulse mcp` (r2.s1).
+    ExternalAgent,
 }
 
 /// The mutable strategy meta record — one-to-one with the `strategy` table
@@ -196,6 +201,216 @@ pub struct NewVersion {
     pub created_by: CreatedBy,
     /// The LLM-call ids that produced this version.
     pub creating_llm_call_ids: Vec<String>,
+}
+
+/// Identifier of an [`AgentSubmission`] — a `#[serde(transparent)]` `String`
+/// newtype.
+///
+/// Same discipline as [`VersionId`]: a UUID-hyphenated value minted by the
+/// adapter, serialized as a bare JSON string matching the `TEXT` column.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentSubmissionId(String);
+
+impl AgentSubmissionId {
+    /// Wrap a raw (adapter-generated) id string.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Borrow the underlying id string (for SQL binding / map keys).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A field-pathed rejection of [`AgentName::parse`] (r2.s1.w1).
+///
+/// Carries `path` (`"agent_name"`) and `message` — the same shape `w3` surfaces
+/// as a [`FieldError`](crate::domain::dsl::FieldError), so the MCP layer can
+/// relay it without re-validating. No `code` field: the typed classification is
+/// `w3`'s to supply at that boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{path}: {message}")]
+pub struct AgentNameError {
+    /// The field path the error attaches to.
+    pub path: String,
+    /// Human/agent-correctable description.
+    pub message: String,
+}
+
+/// A field-pathed rejection of [`Hypothesis::parse`] (r2.s1.w1).
+///
+/// Same contract as [`AgentNameError`], for the `"hypothesis"` field.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{path}: {message}")]
+pub struct HypothesisError {
+    /// The field path the error attaches to.
+    pub path: String,
+    /// Human/agent-correctable description.
+    pub message: String,
+}
+
+/// The submitting agent's name — validated: 1–64 chars, `^[A-Za-z0-9._-]+$`,
+/// stored **lowercased** (r2.s1.w1).
+///
+/// Constructible only through [`AgentName::parse`], and
+/// `#[serde(try_from)]` so the invariant survives the read path too — the
+/// `agent_submission.agent_name` column's `CHECK` mirrors the bounds, and a
+/// hand-edited row cannot smuggle an invalid name past the constructor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AgentName(String);
+
+impl AgentName {
+    /// Parse and normalize an agent name (lowercased).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentNameError`] when the name is not 1–64 characters or
+    /// contains characters outside `A–Z a–z 0–9 . _ -`.
+    pub fn parse(raw: &str) -> Result<Self, AgentNameError> {
+        let name = raw.to_lowercase();
+        let len = name.chars().count();
+        if !(1..=64).contains(&len) {
+            return Err(AgentNameError {
+                path: "agent_name".to_owned(),
+                message: format!("agent_name must be 1-64 characters, got {len}"),
+            });
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(AgentNameError {
+                path: "agent_name".to_owned(),
+                message: "agent_name may contain only ASCII letters, digits, '.', '_' and '-'"
+                    .to_owned(),
+            });
+        }
+        Ok(Self(name))
+    }
+
+    /// Borrow the normalized name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AgentName {
+    type Error = AgentNameError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(&text)
+    }
+}
+
+impl From<AgentName> for String {
+    fn from(name: AgentName) -> Self {
+        name.0
+    }
+}
+
+/// An external agent's stated hypothesis for a strategy version — validated:
+/// trimmed, 1–2000 chars, no control characters but `'\n'` (r2.s1.w1).
+///
+/// This is the **strategy-level** hypothesis an `agent_submission` carries —
+/// deliberately a separate type from
+/// [`coaching::Hypothesis`](crate::domain::coaching::Hypothesis) (the coach's
+/// proposal text): different bounds, a different owner, and a different audit
+/// table, and neither may silently stand in for the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Hypothesis(String);
+
+impl Hypothesis {
+    /// Parse a hypothesis, trimming surrounding whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HypothesisError`] when the text is not 1–2000 characters after
+    /// trimming, or contains a control character other than `'\n'`.
+    pub fn parse(raw: &str) -> Result<Self, HypothesisError> {
+        let text = raw.trim();
+        let len = text.chars().count();
+        if !(1..=2000).contains(&len) {
+            return Err(HypothesisError {
+                path: "hypothesis".to_owned(),
+                message: format!("hypothesis must be 1-2000 characters after trimming, got {len}"),
+            });
+        }
+        if text.chars().any(|c| c.is_control() && c != '\n') {
+            return Err(HypothesisError {
+                path: "hypothesis".to_owned(),
+                message: "hypothesis may not contain control characters other than '\\n'"
+                    .to_owned(),
+            });
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// Borrow the hypothesis text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Hypothesis {
+    type Error = HypothesisError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(&text)
+    }
+}
+
+impl From<Hypothesis> for String {
+    fn from(hypothesis: Hypothesis) -> Self {
+        hypothesis.0
+    }
+}
+
+/// The immutable audit row an `external_agent` version carries (r2.s1.w1) —
+/// one-to-one with the `agent_submission` table.
+///
+/// Where a coach-authored version's audit trail is its coaching session,
+/// proposal and `LlmCall`, an external agent's cost is **external to the app**:
+/// no `LlmCall` row exists, and this normalized row is the only durable link
+/// between the version and the agent + hypothesis that produced it. Immutability
+/// is structural — the port has no update/delete for submissions, and the
+/// `0009` triggers are the second guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSubmission {
+    /// Primary key (adapter-generated UUID string).
+    pub id: AgentSubmissionId,
+    /// The version this submission produced (unique — one submission per
+    /// version).
+    pub version_id: VersionId,
+    /// The submitting agent's normalized name.
+    pub agent_name: AgentName,
+    /// The agent's stated hypothesis for this version.
+    pub hypothesis: Hypothesis,
+    /// Creation timestamp (adapter-supplied; the RFC3339 `TEXT` column).
+    pub created_at: DateTime<Utc>,
+}
+
+/// The submission payload [`StrategyRepository::create_agent_version`]
+/// consumes alongside the [`NewVersion`] request (r2.s1.w1).
+///
+/// Both fields are validated newtypes, so an invalid submission is
+/// unconstructible by the time it reaches the port.
+/// `#[serde(deny_unknown_fields)]`: the MCP layer deserializes this (#17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewAgentSubmission {
+    /// The submitting agent's name.
+    pub agent_name: AgentName,
+    /// The agent's stated hypothesis.
+    pub hypothesis: Hypothesis,
 }
 
 /// The result of [`diff_versions`] — a field-level "what changed" report (FR-11
@@ -318,6 +533,7 @@ mod tests {
             (CreatedBy::CoachLlm, "\"coach_llm\""),
             (CreatedBy::AutoOptimizer, "\"auto_optimizer\""),
             (CreatedBy::Migration, "\"migration\""),
+            (CreatedBy::ExternalAgent, "\"external_agent\""),
         ];
         for (variant, expected_json) in cases {
             let json = serde_json::to_string(&variant).expect("serialize CreatedBy");

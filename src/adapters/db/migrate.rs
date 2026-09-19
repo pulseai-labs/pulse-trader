@@ -61,13 +61,19 @@ pub enum MigrationOutcome {
 /// mismatch restores the original db from the backup and returns an error — the
 /// caller MUST treat that as fatal (REFUSE TO START, MASTER-SPEC §7.4).
 ///
-/// # Single-process v1 assumption (#38)
-/// This protocol assumes a **single process** brings the schema forward — v1 opens
-/// the db from exactly one CLI/app instance. There is intentionally NO cross-process
-/// advisory lock: two concurrent migrators racing the same `pulse.db` is out of
-/// scope (track-forward). The single-writer `SQLite` WAL + the ahead-state refusal
-/// below cover the v1 surface; a multi-process deployment would need the advisory
-/// lock added before this assumption is relaxed.
+/// # Cross-process serialization (r2.s1)
+/// `pulse mcp` (r2.s1.w2) is a second long-lived process that reaches this
+/// protocol — it can start against a behind-schema db *while the desktop is
+/// starting against the same one*. The whole body below therefore runs under a
+/// `flock(2)` on `pulse.db.migrate.lock` (co-located with the db, so it is on
+/// the same filesystem): the second migrator parks until the first releases,
+/// then re-derives `applied` and reports `AlreadyCurrent`. Without it, two
+/// concurrent migrators collide on the `VACUUM INTO` name probe, and a losing
+/// migrator's restore-on-failure renames the pre-migration backup over a db the
+/// winner already migrated — a torn schema under live pools. Unix-only; on
+/// `not(unix)` [`acquire_migration_lock`] is a no-op (matching
+/// `mcp/export.rs`'s `set_owner_only` posture — desktop parity is a separate
+/// work item).
 ///
 /// # Errors
 /// Returns [`DataError::Migration`] if the backup, migrate, or post-verify step
@@ -89,6 +95,13 @@ async fn run_migrations_with_backup_using(
     db_path: &Path,
     migrator: &Migrator,
 ) -> Result<MigrationOutcome, DataError> {
+    // Serialize the whole protocol — detect → backup → migrate → verify →
+    // restore-on-failure — across processes. The second migrator parks here
+    // until the first drops its lock, then derives `applied` from the
+    // FINISHED schema (a loser's mid-protocol read could otherwise observe a
+    // restored file it must not trust).
+    let _migration_lock = acquire_migration_lock(db_path).await?;
+
     let db = Db::with_path(db_path).await?;
     let pool = db.pool();
 
@@ -376,6 +389,72 @@ fn embedded_max_version(migrator: &Migrator) -> i64 {
         .unwrap_or(0)
 }
 
+/// `pulse.db.migrate.lock` co-located beside `db_path` — the `flock` target for
+/// [`acquire_migration_lock`]. The lock file is never written to or deleted;
+/// its inode is the rendezvous point for every process that migrates this db.
+fn migration_lock_path(db_path: &Path) -> Result<PathBuf, DataError> {
+    let file_name = db_path
+        .file_name()
+        .ok_or_else(|| {
+            DataError::Migration(format!("db path has no file name: {}", db_path.display()))
+        })?
+        .to_string_lossy();
+    let dir = db_path.parent().ok_or_else(|| {
+        DataError::Migration(format!("db path has no parent: {}", db_path.display()))
+    })?;
+    Ok(dir.join(format!("{file_name}.migrate.lock")))
+}
+
+/// Take an exclusive `flock(2)` on the migration lock file and return the open
+/// [`std::fs::File`] that holds it — drop releases the lock (flock is per
+/// open-file-description, so closing the fd frees a parked migrator even on a
+/// panicking path).
+///
+/// `flock` blocks until the holder releases, so the wait runs on the blocking
+/// pool rather than parking a runtime worker. The lock is deliberately NOT
+/// released between backup and migrate: the restore-on-failure path is part of
+/// the critical section, since it is the step that renames over a live db.
+#[cfg(unix)]
+async fn acquire_migration_lock(db_path: &Path) -> Result<std::fs::File, DataError> {
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = migration_lock_path(db_path)?;
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| DataError::Migration(format!("open {}: {e}", lock_path.display())))?;
+        // SAFETY: `file` is a live open fd for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(DataError::Migration(format!(
+                "flock {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(|e| DataError::Migration(format!("migration lock task failed: {e}")))?
+}
+
+/// No-op on platforms without `flock` (matching `mcp/export.rs`'s
+/// `set_owner_only` posture). Returns a file that holds no lock so the call
+/// site is identical — the guard's only job is to stay alive to end of scope.
+#[cfg(not(unix))]
+async fn acquire_migration_lock(db_path: &Path) -> Result<std::fs::File, DataError> {
+    let lock_path = migration_lock_path(db_path)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| DataError::Migration(format!("open {}: {e}", lock_path.display())))
+}
+
 /// `pulse.db.bak-<from_version>-<timestamp>` co-located beside `db_path` (NFR-12).
 /// Same directory ⇒ the restore-rename is atomic on the same filesystem. The
 /// timestamp is a filesystem-safe UTC stamp (`%Y%m%dT%H%M%SZ`, no colons).
@@ -523,8 +602,8 @@ fn sidecar_path(db_path: &Path, ext: &str) -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        MigrationOutcome, applied_max_version, embedded_max_version, run_migrations_with_backup,
-        run_migrations_with_backup_using, undo_to,
+        MigrationOutcome, applied_max_version, embedded_max_version, migration_lock_path,
+        run_migrations_with_backup, run_migrations_with_backup_using, undo_to,
     };
     use crate::adapters::db::{Db, MIGRATOR};
     use crate::domain::DataError;
@@ -610,7 +689,7 @@ mod tests {
         match outcome {
             MigrationOutcome::Migrated { from, to, backup } => {
                 assert_eq!(from, 1, "from must be the pre-migration version");
-                assert_eq!(to, 8, "to must be the embedded max");
+                assert_eq!(to, 10, "to must be the embedded max");
                 assert!(
                     backup.exists(),
                     "backup file must exist: {}",
@@ -628,7 +707,7 @@ mod tests {
         }
 
         let db = Db::with_path(&path).await.expect("reopen db");
-        assert_eq!(applied_max(&db).await, 8, "schema must now be at 0008");
+        assert_eq!(applied_max(&db).await, 10, "schema must now be at 0010");
         assert!(
             index_present(&db).await,
             "idx_strategy_name must exist after migrate"
@@ -654,7 +733,7 @@ mod tests {
 
         match outcome {
             MigrationOutcome::AlreadyCurrent { version } => {
-                assert_eq!(version, 8, "version must be the embedded max");
+                assert_eq!(version, 10, "version must be the embedded max");
             }
             other @ MigrationOutcome::Migrated { .. } => {
                 panic!("expected AlreadyCurrent, got {other:?}")
@@ -789,33 +868,90 @@ mod tests {
         );
     }
 
+    /// G4 / T24: `pulse mcp` is a second long-lived process that can reach the
+    /// protocol while the desktop is mid-migrate on the same db. The flock on
+    /// `pulse.db.migrate.lock` must park the loser until the winner's whole
+    /// critical section — backup + migrate + any restore — is done.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_migrator_parks_until_the_lock_holder_releases() {
+        use std::os::unix::io::AsRawFd;
+
+        let (_tmp, path) = db_at_0001().await;
+
+        // Stand in for the concurrently-starting process: flock conflicts across
+        // open-file-descriptions, so holding LOCK_EX here parks a second
+        // migrator exactly as an out-of-process holder would.
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(migration_lock_path(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) },
+            0,
+            "the test must hold the migration lock"
+        );
+
+        let migrator_path = path.clone();
+        let mut migrating =
+            tokio::spawn(async move { run_migrations_with_backup(&migrator_path).await });
+
+        // While the lock is held the loser cannot even reach detect-behind:
+        // the acquire sits before the first pool open.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut migrating)
+                .await
+                .is_err(),
+            "a concurrent migrator must park on the lock, not race the protocol"
+        );
+
+        // Releasing frees the parked migrator, which then does the full job.
+        drop(holder);
+        let outcome = migrating
+            .await
+            .expect("migrator task panicked")
+            .expect("the parked migrator must complete once the lock frees");
+        assert!(
+            matches!(outcome, MigrationOutcome::Migrated { from: 1, .. }),
+            "the released migrator runs the real protocol, got {outcome:?}"
+        );
+        let db = Db::with_path(&path).await.expect("reopen");
+        assert_eq!(
+            applied_max(&db).await,
+            10,
+            "schema reached the embedded max"
+        );
+    }
+
     #[tokio::test]
     async fn migration_up_down_round_run_undo_rerun() {
-        // run → undo_to(1) → re-run. Index gone then back; max 7→1→7.
-        // The embedded max is 8, not 5: `0005`/`0006` were reserved for `r1.s2`
+        // run → undo_to(1) → re-run. Index gone then back; max 10→1→10.
+        // The embedded max is 10, not 5: `0005`/`0006` were reserved for `r1.s2`
         // and `r1.s3`, allocated at release planning so parallel spines cannot
         // collide on a migration number. sqlx applies versions in numeric order
         // and does not require them to be contiguous.
         let (_tmp, path) = db_at_0001().await;
 
-        // Up: 1 → 8 (the embedded max, now that r1.s4.w4's 0008 ships).
-        run_migrations_with_backup(&path).await.expect("up to 0008");
+        // Up: 1 → 10 (the embedded max, now that r2.s1.w1's 0010 ships).
+        run_migrations_with_backup(&path).await.expect("up to 0010");
         let db = Db::with_path(&path).await.expect("reopen after up");
-        assert_eq!(applied_max(&db).await, 8, "after run, max == 8");
+        assert_eq!(applied_max(&db).await, 10, "after run, max == 10");
         assert!(index_present(&db).await, "after run, index present");
 
-        // Down: 8 → 1.
+        // Down: 10 → 1.
         undo_to(db.pool(), 1).await.expect("undo to 1");
         assert_eq!(applied_max(&db).await, 1, "after undo, max == 1");
         assert!(!index_present(&db).await, "after undo, index gone");
         drop(db);
 
-        // Re-run: 1 → 7.
+        // Re-run: 1 → 10.
         run_migrations_with_backup(&path)
             .await
-            .expect("re-run to 0008");
+            .expect("re-run to 0010");
         let db = Db::with_path(&path).await.expect("reopen after re-run");
-        assert_eq!(applied_max(&db).await, 8, "after re-run, max == 8");
+        assert_eq!(applied_max(&db).await, 10, "after re-run, max == 10");
         assert!(index_present(&db).await, "after re-run, index back");
     }
 
@@ -1015,15 +1151,20 @@ mod reserved_number_tests {
 
         // The "older binary": the shipped set as it stood while `0005` was still a
         // reserved gap and `0007` had already shipped. Withhold the real 0005 —
-        // and, since r1.s4.w4, the real 0008 as well.
+        // and, since r1.s4.w4 the real 0008 and since r2.s1.w1 the real 0009 as
+        // well.
         //
         // `0008` REBUILDS the two tables `0005` creates, so a set holding `0008`
         // without `0005` is not an older binary, it is an impossible one ("no such
-        // table: coaching_proposals"). Withholding both is also what keeps this
-        // test testing what it says: the property under test is that filling a
-        // reserved gap runs a migration WITHOUT moving the maximum, and letting
-        // `0008` ride along in the same run would move it to 8 and make the
-        // `from: 7, to: 7` assertion below meaningless.
+        // table: coaching_proposals"). `0009` indexes `coaching_sessions` and
+        // `0010` alters `backtest_run` for the same reason. Withholding all four
+        // is also what keeps this test testing what it says: the property under
+        // test is that filling a reserved gap runs a migration WITHOUT moving
+        // the maximum, and letting `0008`/`0009`/`0010` ride along in the same
+        // run would move it past 7 and make the `from: 7, to: 7` assertion
+        // below meaningless.
+        let withheld_0010 = withhold(&dir, "0010_");
+        let withheld_0009 = withhold(&dir, "0009_");
         let withheld_0008 = withhold(&dir, "0008_");
         let withheld = withhold(&dir, "0005_");
 
@@ -1072,8 +1213,10 @@ mod reserved_number_tests {
             "0005 is recorded at its own version, not appended after 0007"
         );
 
-        // Put 0008 back so the scratch directory is the shipped set again.
+        // Put 0008-0010 back so the scratch directory is the shipped set again.
         restore(&dir, &withheld_0008);
+        restore(&dir, &withheld_0009);
+        restore(&dir, &withheld_0010);
     }
 
     /// A database carrying a migration this binary does not ship is refused as
@@ -1117,7 +1260,7 @@ mod reserved_number_tests {
         }
 
         // Now the OLDER binary — the same set with the real 0006 withheld — opens
-        // the same db. 0006 sorts BELOW the embedded max of 8, so a max comparison
+        // the same db. 0006 sorts BELOW the embedded max of 9, so a max comparison
         // would walk straight past it.
         let withheld = withhold(&dir, "0006_");
         let older = Migrator::new(dir.as_path()).await.unwrap();

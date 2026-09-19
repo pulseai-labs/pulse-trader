@@ -50,6 +50,8 @@ use crate::application::backtest::{
 use crate::domain::backtest::{EquityCurve, ExitReason, Regime, RegimeCell, TradeSource};
 use crate::domain::{BacktestInputs, BacktestRunId, Direction, FundingConfig, PersistedRun, Trade};
 
+use super::coach::SummaryDto;
+
 /// What the desktop asks for: one persisted strategy version.
 ///
 /// Pair, timeframes and costs are **not** here. r1's Backtest Lab runs the fixed
@@ -265,6 +267,46 @@ pub struct BacktestRunDto {
     pub mae: HistogramDto,
     /// Every persisted trade, in `seq` order, with exact values.
     pub trades: Vec<TradeRowDto>,
+}
+
+/// What `compare_child_run` is asked for: one persisted run id (r2.s1.w4 C3).
+///
+/// Everything else — the run's version, that version's parent, the parent's
+/// latest run — is resolved server-side so the screen never reconstructs a
+/// lineage it was already shown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareChildRunRequest {
+    /// The child run to compare against its parent's latest run.
+    pub child_run_id: String,
+}
+
+/// A child run beside its parent's latest run — the Backtest Lab's
+/// before/after for ANY child version, not only a coach accept (r2.s1.w4 C3).
+///
+/// `before` is always the parent's LATEST persisted run; `after` is the run
+/// named in the request. `inputs_differ` is `BacktestInputs` equality over the
+/// two persisted tuples — window included — and reads `true` when either side
+/// predates recorded inputs, with `inputs_note` saying which.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareChildRunDto {
+    /// The version the child run belongs to.
+    pub child_version_id: String,
+    /// The parent version the `before` run belongs to.
+    pub parent_version_id: String,
+    /// The run named in the request — the `after` half.
+    pub child_run_id: String,
+    /// The parent's latest persisted run — the `before` half.
+    pub parent_run_id: String,
+    /// The parent's latest run, in the coach DTO's cell shape.
+    pub before: SummaryDto,
+    /// The child run, in the same shape.
+    pub after: SummaryDto,
+    /// `parent.inputs != child.inputs`; `true` when either side is `None`.
+    pub inputs_differ: bool,
+    /// Why the inputs cannot be proven equal, when a side predates them.
+    pub inputs_note: Option<String>,
 }
 
 /// Exact decimal text — the same `.normalize()`d form the database stores.

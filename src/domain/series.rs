@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::backtest::CandleWindow;
 use crate::domain::candle::Candle;
 use crate::domain::error::{DataError, ValidationError};
 use crate::domain::pair::Pair;
@@ -101,12 +102,39 @@ impl CandleSeries {
 
         Ok(gaps)
     }
+
+    /// Slice the series to a half-open candle window `[from_ms, to_ms)` on
+    /// `open_time` (r2.s1.w3, ruling 1: the backtester's date-window semantics).
+    ///
+    /// The slice keeps `pair`, `timeframe` and `version` — the version names
+    /// the snapshot the candles were sliced FROM, which is the identity a run's
+    /// `inputs` must record; the slice itself is not a stored snapshot. A
+    /// window containing no candle yields an empty `candles` — whether that is
+    /// a refusal is the caller's choice (a windowed backtest refuses an empty
+    /// primary slice; an empty HTF slice is a legal all-`None` alignment).
+    /// Indicators warm up *inside* the window because the engine only ever sees
+    /// the sliced candles.
+    #[must_use]
+    pub fn windowed(&self, window: &CandleWindow) -> CandleSeries {
+        CandleSeries {
+            pair: self.pair.clone(),
+            timeframe: self.timeframe,
+            version: self.version.clone(),
+            candles: self
+                .candles
+                .iter()
+                .filter(|c| c.open_time >= window.from_ms && c.open_time < window.to_ms)
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{CandleSeries, Gap};
+    use crate::domain::backtest::CandleWindow;
     use crate::domain::candle::Candle;
     use crate::domain::error::{DataError, ValidationError};
     use crate::domain::pair::Pair;
@@ -197,5 +225,48 @@ mod tests {
         let json = serde_json::to_string(&s).expect("serialize series");
         let back: CandleSeries = serde_json::from_str(&json).expect("deserialize series");
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn windowed_keeps_only_open_times_inside_the_half_open_bounds() {
+        // `from` is inclusive, `to` is exclusive: the candle AT `to` drops.
+        let s = series(&[0, 900_000, 1_800_000, 2_700_000, 3_600_000]);
+        let window = CandleWindow::new(900_000, 2_700_000).expect("window");
+        let sliced = s.windowed(&window);
+        let times: Vec<i64> = sliced.candles.iter().map(|c| c.open_time).collect();
+        assert_eq!(times, vec![900_000, 1_800_000]);
+    }
+
+    #[test]
+    fn windowed_boundary_candles_follow_from_inclusive_to_exclusive() {
+        let s = series(&[0, 900_000, 1_800_000]);
+        let window = CandleWindow::new(0, 1_800_000).expect("window");
+        let times: Vec<i64> = s
+            .windowed(&window)
+            .candles
+            .iter()
+            .map(|c| c.open_time)
+            .collect();
+        assert_eq!(times, vec![0, 900_000], "candle at `to` is excluded");
+    }
+
+    #[test]
+    fn windowed_empty_result_preserves_the_source_identity() {
+        // An empty slice still names the snapshot it was sliced from — the
+        // run's `inputs` record THAT version, not a slice id.
+        let s = series(&[0, 900_000]);
+        let window = CandleWindow::new(3_600_000, 4_500_000).expect("window");
+        let sliced = s.windowed(&window);
+        assert!(sliced.candles.is_empty());
+        assert_eq!(sliced.pair, s.pair);
+        assert_eq!(sliced.timeframe, s.timeframe);
+        assert_eq!(sliced.version, s.version, "version tag names the source");
+    }
+
+    #[test]
+    fn windowed_covering_everything_returns_the_whole_series() {
+        let s = series(&[0, 900_000, 1_800_000]);
+        let window = CandleWindow::new(-1, 10_000_000).expect("window");
+        assert_eq!(s.windowed(&window).candles.len(), 3);
     }
 }
