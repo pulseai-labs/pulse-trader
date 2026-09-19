@@ -19,11 +19,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::domain::StrategyDsl;
 use crate::domain::backtest::{RunSummary, SummaryStats};
-use crate::domain::{
-    Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, StrategyDsl,
-    SweepableValue, ValueSource,
-};
+use crate::domain::dsl::render;
 
 // ---------------------------------------------------------------------------
 // Wire DTOs (one per shape the Library screen renders)
@@ -138,25 +136,20 @@ pub struct DslSummary {
 // Projections (pure: domain values in, wire values out)
 // ---------------------------------------------------------------------------
 
-/// Render a [`StrategyDsl`] to its summary lines.
+/// Render a [`StrategyDsl`] to its summary lines. The vocabulary lives in the
+/// domain ring's [`render`] — this is the thin DTO adapter over it, so this
+/// summary and the Designer's card can never drift apart again (the `atr stop
+/// 14 x2` / `atr_stop 14 x2` split r2.s2.w4 deletes).
 #[must_use]
 pub fn dsl_summary(dsl: &StrategyDsl) -> DslSummary {
+    let rendered = render::strategy(dsl);
     DslSummary {
         name: dsl.name.clone(),
-        direction: direction_text(dsl.direction).to_owned(),
-        entry: vec![format_condition(&dsl.entry)],
-        filters: dsl.filters.iter().map(format_condition).collect(),
-        exits: dsl.exits.iter().map(format_exit).collect(),
-        risk: vec![
-            format!(
-                "risk per trade {}",
-                pct_sweep_text(&dsl.risk.risk_per_trade_pct)
-            ),
-            format!(
-                "max leverage {}x",
-                decimal_sweep_text(&dsl.risk.max_leverage)
-            ),
-        ],
+        direction: rendered.direction,
+        entry: vec![rendered.entry],
+        filters: rendered.filters,
+        exits: rendered.exits,
+        risk: rendered.risk,
     }
 }
 
@@ -199,150 +192,15 @@ pub fn format_win_rate(rate: Decimal) -> String {
     format!("{}%", (rate * Decimal::from(100)).round_dp(1).normalize())
 }
 
-/// Format a decimal fraction as a percentage, e.g. `0.05` -> `"5%"`.
-fn pct_text(fraction: Decimal) -> String {
-    format!("{}%", (fraction * Decimal::from(100)).normalize())
-}
-
-/// `Direction` as its display word.
-fn direction_text(direction: Direction) -> &'static str {
-    match direction {
-        Direction::Long => "long",
-        Direction::Short => "short",
-    }
-}
-
-/// A fixed-or-sweepable decimal leaf as text. `Sweep` values cannot be persisted
-/// (validation rejects them), so the sweep arm is a faithful rendering of a
-/// shape the screen will not see from a stored version.
-fn decimal_sweep_text(value: &SweepableValue<Decimal>) -> String {
-    match value {
-        SweepableValue::Fixed(v) => v.normalize().to_string(),
-        SweepableValue::Sweep { start, end, step } => {
-            format!("sweep({start}..{end} step {step})")
-        }
-    }
-}
-
-/// A fixed-or-sweepable `u32` leaf as text.
-fn u32_sweep_text(value: &SweepableValue<u32>) -> String {
-    match value {
-        SweepableValue::Fixed(v) => v.to_string(),
-        SweepableValue::Sweep { start, end, step } => {
-            format!("sweep({start}..{end} step {step})")
-        }
-    }
-}
-
-/// A percent-typed sweepable leaf as percentage text.
-fn pct_sweep_text(value: &SweepableValue<Decimal>) -> String {
-    match value {
-        SweepableValue::Fixed(v) => pct_text(*v),
-        SweepableValue::Sweep { .. } => decimal_sweep_text(value),
-    }
-}
-
-/// An indicator reference as call text, e.g. `rsi(14)`, `macd(12, 26, 9)`.
-fn indicator_text(spec: &IndicatorSpec) -> String {
-    match spec {
-        IndicatorSpec::Rsi { period } => format!("rsi({})", u32_sweep_text(period)),
-        IndicatorSpec::Ema { period } => format!("ema({})", u32_sweep_text(period)),
-        IndicatorSpec::Adx { period } => format!("adx({})", u32_sweep_text(period)),
-        IndicatorSpec::Macd { fast, slow, signal } => format!(
-            "macd({}, {}, {})",
-            u32_sweep_text(fast),
-            u32_sweep_text(slow),
-            u32_sweep_text(signal)
-        ),
-    }
-}
-
-/// Where a compared scalar comes from, as text.
-fn value_text(source: &ValueSource) -> String {
-    match source {
-        ValueSource::Constant { value } => value.normalize().to_string(),
-        ValueSource::Price { field } => match field {
-            PriceField::Open => "open".to_owned(),
-            PriceField::High => "high".to_owned(),
-            PriceField::Low => "low".to_owned(),
-            PriceField::Close => "close".to_owned(),
-            PriceField::Volume => "volume".to_owned(),
-        },
-        ValueSource::Indicator { spec } => indicator_text(spec),
-    }
-}
-
-/// A comparator as its symbol.
-fn comparator_text(op: Comparator) -> &'static str {
-    match op {
-        Comparator::Gt => ">",
-        Comparator::Gte => ">=",
-        Comparator::Lt => "<",
-        Comparator::Lte => "<=",
-        Comparator::Eq => "=",
-    }
-}
-
-/// A condition as one line of text, e.g. `rsi(14) < 30`. Compound conditions
-/// parenthesize so a nested tree reads unambiguously.
-fn format_condition(condition: &Condition) -> String {
-    match condition {
-        Condition::Compare { lhs, op, rhs } => {
-            format!(
-                "{} {} {}",
-                value_text(lhs),
-                comparator_text(*op),
-                value_text(rhs)
-            )
-        }
-        Condition::CrossesAbove { lhs, rhs } => {
-            format!("{} crosses above {}", value_text(lhs), value_text(rhs))
-        }
-        Condition::CrossesBelow { lhs, rhs } => {
-            format!("{} crosses below {}", value_text(lhs), value_text(rhs))
-        }
-        Condition::And { conditions } => join_conditions(conditions, " AND "),
-        Condition::Or { conditions } => join_conditions(conditions, " OR "),
-        Condition::Not { condition } => format!("not ({})", format_condition(condition)),
-    }
-}
-
-fn join_conditions(conditions: &[Condition], separator: &str) -> String {
-    let parts: Vec<String> = conditions.iter().map(format_condition).collect();
-    format!("({})", parts.join(separator))
-}
-
-/// An exit rule as one line of text.
-fn format_exit(exit: &ExitRule) -> String {
-    match exit {
-        ExitRule::StopLoss { distance_pct } => {
-            format!("stop loss {}", pct_sweep_text(distance_pct))
-        }
-        ExitRule::TakeProfit { target_r } => {
-            format!("take profit {}R", decimal_sweep_text(target_r))
-        }
-        ExitRule::TrailingStop { trail_pct } => {
-            format!("trailing stop {}", pct_sweep_text(trail_pct))
-        }
-        ExitRule::TimeStop { max_bars } => {
-            format!("time stop {} bars", u32_sweep_text(max_bars))
-        }
-        ExitRule::SignalExit { condition } => {
-            format!("signal exit: {}", format_condition(condition))
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{
-        DslSummary, comparator_text, dsl_summary, format_expectancy, format_win_rate, version_stats,
-    };
+    use super::{DslSummary, dsl_summary, format_expectancy, format_win_rate, version_stats};
     use crate::domain::backtest::SummaryStats;
+    use crate::domain::dsl::render;
     use crate::domain::{
         Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, RiskParams,
-        SchemaVersion, StrategyDsl, SweepableValue, ValueSource,
+        SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource,
     };
     use rust_decimal::Decimal;
 
@@ -355,6 +213,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },
@@ -366,10 +225,12 @@ mod tests {
             },
             filters: vec![Condition::Compare {
                 lhs: ValueSource::Price {
+                    series: Series::Primary,
                     field: PriceField::Close,
                 },
                 op: Comparator::Gt,
                 rhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Ema {
                         period: SweepableValue::Fixed(200),
                     },
@@ -407,11 +268,11 @@ mod tests {
         assert_eq!(filters, vec!["close > ema(200)".to_owned()]);
         assert_eq!(
             exits,
-            vec!["stop loss 5%".to_owned(), "take profit 2R".to_owned()]
+            vec!["stop 5%".to_owned(), "take profit 2R".to_owned()]
         );
         assert_eq!(
             risk,
-            vec!["risk per trade 1%".to_owned(), "max leverage 3x".to_owned()]
+            vec!["risk 1% per trade".to_owned(), "max leverage 3x".to_owned()]
         );
         // The mock's `pair`/`timeframes` lines have no field to come from — the
         // summary struct cannot even carry them.
@@ -424,6 +285,7 @@ mod tests {
                 conditions: vec![
                     Condition::Compare {
                         lhs: ValueSource::Indicator {
+                            series: Series::Primary,
                             spec: IndicatorSpec::Adx {
                                 period: SweepableValue::Fixed(14),
                             },
@@ -435,6 +297,7 @@ mod tests {
                     },
                     Condition::CrossesAbove {
                         lhs: ValueSource::Indicator {
+                            series: Series::Primary,
                             spec: IndicatorSpec::Macd {
                                 fast: SweepableValue::Fixed(12),
                                 slow: SweepableValue::Fixed(26),
@@ -448,20 +311,20 @@ mod tests {
                 ],
             }),
         };
-        let text = super::format_condition(&compound);
+        let text = render::condition(&compound);
         assert_eq!(
             text,
-            "not ((adx(14) > 25 OR macd(12, 26, 9) crosses above 0))"
+            "not ((adx(14) > 25) or (macd(12,26,9) crosses above 0))"
         );
     }
 
     #[test]
     fn every_comparator_renders_a_symbol() {
-        assert_eq!(comparator_text(Comparator::Gt), ">");
-        assert_eq!(comparator_text(Comparator::Gte), ">=");
-        assert_eq!(comparator_text(Comparator::Lt), "<");
-        assert_eq!(comparator_text(Comparator::Lte), "<=");
-        assert_eq!(comparator_text(Comparator::Eq), "=");
+        assert_eq!(render::comparator(Comparator::Gt), ">");
+        assert_eq!(render::comparator(Comparator::Gte), ">=");
+        assert_eq!(render::comparator(Comparator::Lt), "<");
+        assert_eq!(render::comparator(Comparator::Lte), "<=");
+        assert_eq!(render::comparator(Comparator::Eq), "=");
     }
 
     #[test]

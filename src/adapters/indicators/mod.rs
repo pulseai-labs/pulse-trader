@@ -7,11 +7,13 @@
 //! multi-indicator engine / `EvalContext` impl in 3.03.
 
 pub mod adx;
+pub mod atr;
 pub mod convert;
 pub mod ema;
 pub mod engine;
 pub mod macd;
 pub mod rsi;
+pub mod wilder;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use pulse::{
-    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair,
+    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair, Series,
     SweepableValue, Timeframe,
 };
 use rust_decimal::Decimal;
@@ -17,13 +17,14 @@ struct IndicatorSnapshot {
     ema_50: Option<Decimal>,
     adx_14: Option<Decimal>,
     macd_12_26_9: Option<Decimal>,
+    atr_14: Option<Decimal>,
 }
 
 fn fixed(value: u32) -> SweepableValue<u32> {
     SweepableValue::Fixed(value)
 }
 
-fn specs() -> [IndicatorSpec; 4] {
+fn specs() -> [IndicatorSpec; 5] {
     [
         IndicatorSpec::Rsi { period: fixed(14) },
         IndicatorSpec::Ema { period: fixed(50) },
@@ -33,6 +34,7 @@ fn specs() -> [IndicatorSpec; 4] {
             slow: fixed(26),
             signal: fixed(9),
         },
+        IndicatorSpec::Atr { period: fixed(14) },
     ]
 }
 
@@ -57,7 +59,10 @@ fn load_candles() -> Vec<Candle> {
 }
 
 fn current(engine: &IndicatorEngine, spec: &IndicatorSpec) -> Option<Decimal> {
-    engine.current(&CompiledValue::Indicator(spec.clone()))
+    engine.current(&CompiledValue::Indicator {
+        series: Series::Primary,
+        spec: spec.clone(),
+    })
 }
 
 fn run_once(candles: &[Candle]) -> Vec<IndicatorSnapshot> {
@@ -72,6 +77,7 @@ fn run_once(candles: &[Candle]) -> Vec<IndicatorSnapshot> {
                 ema_50: current(&engine, &specs[1]),
                 adx_14: current(&engine, &specs[2]),
                 macd_12_26_9: current(&engine, &specs[3]),
+                atr_14: current(&engine, &specs[4]),
             }
         })
         .collect()

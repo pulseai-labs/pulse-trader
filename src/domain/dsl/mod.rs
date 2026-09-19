@@ -35,6 +35,7 @@ mod condition;
 mod exit;
 mod migrate;
 mod mutate;
+pub mod render;
 mod risk;
 mod schema_version;
 mod strategy;
@@ -45,7 +46,7 @@ mod value;
 // VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3).
 pub use compile::{
     CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, compile, stop_price, take_profit_price,
+    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
 };
 pub use condition::{Comparator, Condition};
 pub use exit::ExitRule;
@@ -60,4 +61,4 @@ pub use schema_version::{DSL_SCHEMA_VERSION, SchemaVersion, SchemaVersionParseEr
 pub use strategy::StrategyDsl;
 pub use sweepable::SweepableValue;
 pub use validate::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
-pub use value::{IndicatorSpec, PriceField, ValueSource};
+pub use value::{IndicatorSpec, PriceField, Series, ValueSource};

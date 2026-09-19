@@ -299,6 +299,96 @@ async fn htf_provenance_is_recorded_and_reloads_after_both_heads_move() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. r2.s2.w2 — an `htf` operand with no resolvable HTF snapshot refuses
+// ---------------------------------------------------------------------------
+
+/// A schema-1.1.0 document whose entry reads the H4 close — the operand shape
+/// this work item makes executable.
+const HTF_OPERAND_DSL: &str = r#"{
+  "schema_version": "1.1.0",
+  "name": "htf close (tauri)",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Price", "series": "htf", "field": "Close" },
+    "op": "Gt",
+    "rhs": { "type": "Constant", "value": "0" }
+  },
+  "filters": [],
+  "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+
+/// The only honest way a version reaches the desktop command needing an HTF
+/// snapshot its resolved request does not carry: the parent's recorded inputs
+/// are M15-only, so `resolve_default_request` inherits `htf_timeframe: None`
+/// for the child that adds the `htf` operand. The command must refuse with a
+/// `validation` `BusError` naming `inputs.htf` — never a silent evaluation of
+/// the operand against primary candles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_htf_strategy_with_no_resolvable_htf_snapshot_is_refused_with_inputs_htf() {
+    let env = env();
+    let state = env.cold_state().await;
+    let strategies = state.strategy_repo();
+    let strat = strategies
+        .create_strategy("htf lab", Some("alice"), &[])
+        .await
+        .expect("create strategy");
+    let parent = strategies
+        .create_version(NewVersion {
+            strategy_id: StrategyId::new(strat.id.as_str().to_owned()),
+            parent_version_id: None,
+            dsl_json: std::fs::read_to_string(manifest(GOLDEN_STRATEGY))
+                .expect("read golden strategy"),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create parent version");
+
+    // The parent's one run is M15-only — through the real use case with an
+    // explicit request, so its persisted `inputs.htf` is `None`.
+    let mut parent_request = r1_request(&parent.id);
+    parent_request.htf_timeframe = None;
+    run_version_backtest(
+        &strategies,
+        &env.store(),
+        &pulse::BinanceAdapter::new(),
+        &state.backtest_run_repo(),
+        &parent_request,
+    )
+    .await
+    .expect("the M15-only parent run succeeds");
+
+    let child = strategies
+        .create_version(NewVersion {
+            strategy_id: StrategyId::new(strat.id.as_str().to_owned()),
+            parent_version_id: Some(parent.id.clone()),
+            dsl_json: HTF_OPERAND_DSL.to_owned(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create htf child version");
+
+    let err = run_backtest_version_core(&state, request(&child.id))
+        .await
+        .expect_err("an htf operand with no resolvable H4 snapshot must refuse");
+
+    assert_eq!(
+        err.code,
+        BusErrorCode::Validation,
+        "a missing input is caller-correctable — validation, not data: {err}"
+    );
+    assert!(
+        err.message.contains("inputs.htf"),
+        "the refusal names the missing input field: {}",
+        err.message
+    );
+    assert_eq!(err.run_id, None, "nothing was persisted for a refusal");
+}
+
+// ---------------------------------------------------------------------------
 // 3. post-save read-back failures carry the persisted run id
 // ---------------------------------------------------------------------------
 

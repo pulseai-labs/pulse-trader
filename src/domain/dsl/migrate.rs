@@ -17,13 +17,15 @@
 //! `StrategyDsl`; validation is 2.03's and compilation is 2.04's. The caller
 //! (VS-1.1.4 / agent layer) composes `load → validate → compile`.
 //!
-//! **Empty production registry.** v1 has exactly one version (`1.0.0`), so
-//! [`Migrator::v1`] registers **no** real migrations — the framework (registry +
-//! chaining + error paths) is proven by **synthetic test migrations** only (see
-//! the test module). A real prior version can be added additively in v2.
+//! **The production registry.** [`Migrator::v1`] registers the real steps —
+//! currently one: the `1.0.0 → 1.1.0` identity step (schema 1.1.0 is additive —
+//! a new defaulted field and new enum variants — so the step rewrites only the
+//! `schema_version` string; every `1.0.0` document deserializes identically at
+//! `1.1.0`). Chaining + error paths are additionally proven by synthetic test
+//! migrations (see the test module).
 //!
 //! **No forward-compatibility** (architect-critic): every `schema_version >
-//! CURRENT` — including a same-major future minor like `1.1.0` vs `1.0.0` — is
+//! CURRENT` — including a same-major future minor like `1.2.0` vs `1.1.0` — is
 //! rejected as [`LoadError::FutureVersion`]. A newer minor may carry semantics
 //! this engine cannot honor, and silently ignoring unknown fields could
 //! mis-execute a real-money strategy.
@@ -164,21 +166,54 @@ impl SchemaVersion {
 /// An ordered registry of [`Migration`]s that drives the version-safe read-path.
 ///
 /// A **value** (not a global) so tests can build a custom registry with
-/// synthetic migrations. [`Migrator::v1`] is the production registry — currently
-/// empty, since `1.0.0` is the first version.
+/// synthetic migrations. [`Migrator::v1`] is the production registry — it
+/// carries the real `1.0.0 → 1.1.0` identity step.
 #[derive(Clone, Default)]
 pub struct Migrator {
     migrations: Vec<Migration>,
 }
 
+/// The `1.0.0 → 1.1.0` step: **identity**. Schema 1.1.0 is purely additive
+/// (ADR-0024 — the `series` field defaults to `primary`, `IndicatorSpec::Atr`
+/// and `ExitRule::AtrStop` are new variants), so the document's meaning is
+/// unchanged; `apply` rewrites only the `schema_version` string and leaves
+/// every other byte alone. `dsl_original` is preserved verbatim by [`Loaded`]
+/// regardless — the migration never touches it.
+fn identity_1_0_0_to_1_1_0(mut value: Value) -> Result<Value, MigrationError> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| MigrationError("document is not a JSON object".to_owned()))?;
+    obj.insert(
+        "schema_version".to_owned(),
+        serde_json::Value::String("1.1.0".to_owned()),
+    );
+    Ok(value)
+}
+
 impl Migrator {
-    /// The production registry. **Empty** — `1.0.0` is the first version, so no
-    /// real migration exists yet. The framework is exercised by synthetic test
-    /// migrations.
+    /// The production registry: the one real step, `1.0.0 → 1.1.0` (identity).
+    ///
+    /// `to` is pinned to the literal `1.1.0` the step's `apply` stamps —
+    /// NOT `SchemaVersion::CURRENT` (r2.s2 round-1 fix F8): a future `CURRENT`
+    /// bump must not silently desync the registration from the version the
+    /// step actually produces. A test below pins the two to the same literal.
     #[must_use]
     pub fn v1() -> Self {
         Migrator {
-            migrations: Vec::new(),
+            migrations: vec![Migration {
+                from: SchemaVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                },
+                to: SchemaVersion {
+                    major: 1,
+                    minor: 1,
+                    patch: 0,
+                },
+                kind: MigrationKind::Minor,
+                apply: identity_1_0_0_to_1_1_0,
+            }],
         }
     }
 
@@ -322,7 +357,7 @@ mod tests {
     use crate::domain::dsl::schema_version::SchemaVersion;
     use crate::domain::dsl::strategy::StrategyDsl;
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, Series, ValueSource};
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
 
@@ -334,7 +369,7 @@ mod tests {
         }
     }
 
-    /// The canonical `1.0.0` RSI-oversold strategy (the demo-1/demo-2 shape from
+    /// The canonical `1.1.0` RSI-oversold strategy (the demo-1/demo-2 shape from
     /// 2.02's `rsi_oversold_strategy`). Used to derive the canonical JSON via
     /// serialization, so the test JSON is guaranteed to match the real serde
     /// shapes (struct-tagged enums, string-encoded decimals) rather than a
@@ -346,6 +381,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },
@@ -371,13 +407,13 @@ mod tests {
         }
     }
 
-    /// The canonical `1.0.0` strategy as a JSON string (serialized from the typed
+    /// The canonical `1.1.0` strategy as a JSON string (serialized from the typed
     /// value, so the shape is exactly the current grammar's).
     fn canonical_current_json() -> String {
         serde_json::to_string(&canonical_strategy()).expect("serialize canonical strategy")
     }
 
-    /// AC-5: the canonical `1.0.0` strategy loads via `Migrator::v1().load(json)`
+    /// AC-5: the canonical `1.1.0` strategy loads via `Migrator::v1().load(json)`
     /// → `Ok(Loaded { migrated: false, .. })`, `dsl_original == json`, and `dsl`
     /// equals the directly-deserialized value.
     #[test]
@@ -421,7 +457,7 @@ mod tests {
     #[test]
     fn rejects_same_major_future_minor() {
         let mut value: Value = serde_json::from_str(&canonical_current_json()).unwrap();
-        value["schema_version"] = json!("1.1.0");
+        value["schema_version"] = json!("1.2.0");
         let json = value.to_string();
 
         let err = Migrator::v1()
@@ -429,11 +465,11 @@ mod tests {
             .expect_err("same-major future minor must reject");
         assert!(
             matches!(err, LoadError::FutureVersion { .. }),
-            "expected FutureVersion for 1.1.0 vs 1.0.0, got {err:?}"
+            "expected FutureVersion for 1.2.0 vs 1.1.0, got {err:?}"
         );
     }
 
-    /// AC-7: an older version not covered by `v1()`'s (empty) registry →
+    /// AC-7: an older version not covered by `v1()`'s registry →
     /// `NoMigrationPath`.
     #[test]
     fn rejects_unknown_old_version_with_no_path() {
@@ -450,10 +486,11 @@ mod tests {
         }
     }
 
-    /// A synthetic minor migration `0.9.0 → 1.0.0` that renames an old field
+    /// A synthetic minor migration `0.9.0 → CURRENT` that renames an old field
     /// (`strat_name` → `name`) and stamps the current `schema_version`. Proves
-    /// the framework end-to-end without a real prior version.
-    fn synthetic_minor_0_9_to_1_0() -> Migration {
+    /// the framework end-to-end against a `from` the real registry does not
+    /// cover.
+    fn synthetic_minor_0_9_to_current() -> Migration {
         fn apply(mut value: Value) -> Result<Value, MigrationError> {
             let obj = value
                 .as_object_mut()
@@ -463,12 +500,15 @@ mod tests {
                 .remove("strat_name")
                 .ok_or_else(|| MigrationError("old doc missing `strat_name`".to_owned()))?;
             obj.insert("name".to_owned(), name);
-            obj.insert("schema_version".to_owned(), json!("1.0.0"));
+            obj.insert(
+                "schema_version".to_owned(),
+                json!(SchemaVersion::CURRENT.to_string()),
+            );
             Ok(value)
         }
         Migration {
             from: v(0, 9, 0),
-            to: v(1, 0, 0),
+            to: SchemaVersion::CURRENT,
             kind: MigrationKind::Minor,
             apply,
         }
@@ -494,7 +534,7 @@ mod tests {
     #[test]
     fn applies_synthetic_minor_migration_and_preserves_original() {
         let old = old_0_9_json();
-        let migrator = Migrator::with_migrations(vec![synthetic_minor_0_9_to_1_0()]);
+        let migrator = Migrator::with_migrations(vec![synthetic_minor_0_9_to_current()]);
 
         let loaded = migrator.load(&old).expect("synthetic migration must load");
 
@@ -540,7 +580,7 @@ mod tests {
             Ok(value)
         }
 
-        // A cycle: 0.8.0 -> 0.9.0 -> 0.8.0, never reaching CURRENT (1.0.0).
+        // A cycle: 0.8.0 -> 0.9.0 -> 0.8.0, never reaching CURRENT (1.1.0).
         let cyclic = Migrator::with_migrations(vec![
             Migration {
                 from: v(0, 8, 0),
@@ -581,6 +621,38 @@ mod tests {
         assert!(
             matches!(err, LoadError::MigrationFailed { .. }),
             "expected MigrationFailed for a stalled registry, got {err:?}"
+        );
+    }
+
+    /// r2.s2 round-1 fix F8: the identity step's registered `to` is the literal
+    /// `1.1.0` its `apply` stamps — pinned, not `SchemaVersion::CURRENT` — so a
+    /// future `CURRENT` bump cannot silently desync the chain: this test fails
+    /// if the registration and the stamped literal ever diverge.
+    #[test]
+    fn v1_terminal_version_matches_the_literal_its_apply_stamps() {
+        let migrator = Migrator::v1();
+        let step = migrator
+            .migrations
+            .iter()
+            .find(|m| m.from == v(1, 0, 0))
+            .expect("v1 registers the 1.0.0 -> 1.1.0 step");
+
+        // The registration pins the literal, not CURRENT.
+        assert_eq!(step.to, v(1, 1, 0));
+
+        // And the literal equals what `apply` stamps on a real 1.0.0 document.
+        let mut doc: Value =
+            serde_json::from_str(&canonical_current_json()).expect("canonical parses");
+        doc["schema_version"] = json!("1.0.0");
+        let migrated = (step.apply)(doc).expect("identity step applies");
+        let stamped: SchemaVersion = migrated["schema_version"]
+            .as_str()
+            .expect("schema_version stays a string")
+            .parse()
+            .expect("the stamped version parses");
+        assert_eq!(
+            stamped, step.to,
+            "the registry's terminal `to` must equal the literal `apply` stamps"
         );
     }
 }

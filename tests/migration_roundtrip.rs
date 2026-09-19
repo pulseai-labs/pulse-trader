@@ -11,7 +11,7 @@
 //! `llm_call.key_source` provenance column, r1.s1.w2) and `0008` (the coach
 //! lifecycle rebuild of the two coaching tables, r1.s4.w4), `0009` (the
 //! external-agent provenance + run-window contract, r2.s1.w1) and `0010` (the
-//! window-edge open-position mark, r2.s1 G1); the embedded max is therefore 10.
+//! window-edge open-position mark, r2.s1 G1); the embedded max is therefore 11 (r2.s2.w2 `0011` records the per-trade stop).
 //!
 //! The set is now CONTIGUOUS, and the way it got there is the point. `0005` and
 //! `0006` were reserved at release planning for `r1.s2` and `r1.s3` while `r1.s1`
@@ -26,7 +26,10 @@
 //! migrator, which has no `undo`). Offline + `TempDir`-isolated.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pulse::{Db, MIGRATOR, run_migrations_with_backup, undo_to};
+use pulse::{
+    BacktestRunId, BacktestRunRepository, Db, MIGRATOR, SqliteBacktestRunRepo,
+    run_migrations_with_backup, undo_to,
+};
 use sqlx::SqlitePool;
 use std::path::Path;
 use tempfile::TempDir;
@@ -102,8 +105,8 @@ async fn migrate_up_then_undo_is_reversible() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        10,
-        "migrated to embedded max (10)"
+        11,
+        "migrated to embedded max (11)"
     );
     assert!(
         object_present(db.pool(), "table", "strategy").await,
@@ -131,7 +134,7 @@ async fn migrate_up_then_undo_is_reversible() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 10, "after re-run, max == 10");
+    assert_eq!(applied_max(db.pool()).await, 11, "after re-run, max == 11");
     assert!(
         index_present(db.pool()).await,
         "after re-run, 0002 index back"
@@ -163,7 +166,7 @@ async fn backup_written_before_migrate() {
     match outcome {
         pulse::MigrationOutcome::Migrated { from, to, backup } => {
             assert_eq!(from, 1, "from == the pre-migration version");
-            assert_eq!(to, 10, "to == the embedded max");
+            assert_eq!(to, 11, "to == the embedded max");
             assert!(backup.exists(), "backup file exists: {}", backup.display());
             let name = backup.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
@@ -178,7 +181,7 @@ async fn backup_written_before_migrate() {
 
     // The migration completed to the embedded max.
     let db = Db::with_path(&path).await.expect("reopen migrated db");
-    assert_eq!(applied_max(db.pool()).await, 10, "schema now at 0010");
+    assert_eq!(applied_max(db.pool()).await, 11, "schema now at 0011");
     assert!(
         index_present(db.pool()).await,
         "0002 index present post-migrate"
@@ -209,8 +212,8 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        10,
-        "migrated to embedded max (10)"
+        11,
+        "migrated to embedded max (11)"
     );
     assert!(
         schema_0003_present(db.pool()).await,
@@ -247,7 +250,7 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 10, "after re-run, max == 10");
+    assert_eq!(applied_max(db.pool()).await, 11, "after re-run, max == 11");
     assert!(
         schema_0003_present(db.pool()).await,
         "after re-run, 0003 backtest_run + trade tables and both indexes back"
@@ -279,8 +282,8 @@ async fn migration_0004_llm_call_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        10,
-        "migrated to embedded max (10)"
+        11,
+        "migrated to embedded max (11)"
     );
     assert!(
         schema_0004_present(db.pool()).await,
@@ -313,10 +316,213 @@ async fn migration_0004_llm_call_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 10, "after re-run, max == 10");
+    assert_eq!(applied_max(db.pool()).await, 11, "after re-run, max == 11");
     assert!(
         schema_0004_present(db.pool()).await,
         "after re-run, 0004 llm_call table + triggers + index back"
+    );
+}
+
+// ---- r2.s2.w2: the 0011 trade.stop_price up/down -----------------------------
+
+/// Whether `trade.stop_price` exists (a `PRAGMA table_info` probe — a column is
+/// not a `sqlite_master` object, so `object_present` cannot see it).
+async fn stop_price_column_present(pool: &SqlitePool) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('trade') WHERE name = 'stop_price'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    n == 1
+}
+
+/// Seed the FK chain (strategy → `strategy_version` → `backtest_run`) a `trade` row
+/// needs — raw sqlx, the repo tests' `seed_version` shape. `stop` is bound into
+/// `trade.stop_price`; pass `None` for the pre-0011-shaped NULL row.
+/// `stored_hash` is bound into `backtest_run.result_content_hash` — pass the
+/// placeholder `"hash"` for the schema-shape tests, or a real content hash for
+/// the read-side re-derivation test.
+async fn seed_run_with_trade(pool: &SqlitePool, stop: Option<&str>, stored_hash: &str) {
+    sqlx::query("INSERT INTO strategy (id, name, created_at) VALUES (?1, ?2, ?3)")
+        .bind("strat-1")
+        .bind("Test Strategy")
+        .bind("2026-06-14T00:00:00.000Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO strategy_version \
+         (id, strategy_id, dsl_schema_version, dsl, dsl_original, version_hash, created_by, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind("ver-1")
+    .bind("strat-1")
+    .bind("1.0.0")
+    .bind("{}")
+    .bind("{}")
+    .bind("deadbeef")
+    .bind("\"human\"")
+    .bind("2026-06-14T00:00:00.000Z")
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO backtest_run \
+         (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+          engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+          funding_total, slippage_total, expectancy, trade_count, wins, losses, \
+          breakeven, max_win_streak, max_loss_streak, skipped_sub_lot, \
+          skipped_sub_notional, skipped_leverage_capped, \
+          pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+          funding_config) \
+         VALUES ('run-1', 'ver-1', 1, '2026-06-30T00:00:00.000Z', 'fp', 'tgt', \
+                 ?1, '10000', '0', '0', '0', '0', '0', 1, 0, 0, 0, 0, 0, 0, 0, 0, \
+                 'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
+    )
+    .bind(stored_hash)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO trade \
+         (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, \
+          entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, \
+          fees_total, funding_total, slippage_total, realized_pnl, realized_r, \
+          mfe_r, mae_r, exit_reason, source, regime, fills, stop_price) \
+         VALUES ('trade-1', 'run-1', 0, 'long', '1', '100', '105', 0,0,0,0, \
+                 '0','0','0', '5', '1', '1', '0', 'take_profit', 'backtest', 'ranging', '[]', ?1)",
+    )
+    .bind(stop)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// r2.s2.w2 / AC (persistence): `0011` adds the recorded per-trade stop column;
+/// undoing it over NULL-only history (the only shape pre-0011 rows can have) is
+/// lossless and restores the exact 0010 shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0011_trade_stop_price_roundtrip() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+
+    // (a) At 11 the column exists.
+    assert_eq!(applied_max(db.pool()).await, 11, "embedded max is 11");
+    assert!(
+        stop_price_column_present(db.pool()).await,
+        "trade.stop_price exists after up"
+    );
+
+    // (b) A NULL-stop trade (the pre-0011 shape) survives the down: undo to 10
+    //     succeeds and drops the column.
+    seed_run_with_trade(db.pool(), None, "hash").await;
+    undo_to(db.pool(), 10).await.expect("undo to 10");
+    assert_eq!(applied_max(db.pool()).await, 10, "after undo, max == 10");
+    assert!(
+        !stop_price_column_present(db.pool()).await,
+        "after undo to 10, trade.stop_price is gone"
+    );
+
+    // (c) Re-running brings 0011 back (reversible round): 10 → 11.
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("re-run to embedded max");
+    assert_eq!(applied_max(db.pool()).await, 11, "after re-run, max == 11");
+    assert!(
+        stop_price_column_present(db.pool()).await,
+        "after re-run, trade.stop_price is back"
+    );
+}
+
+/// r2.s2.w2 / AC (persistence): the down REFUSES over a trade carrying a
+/// recorded stop — 0010 has no column for it, and dropping it would falsify the
+/// trade record (ADR-0018; the scratch-table + trigger pattern 0010 set).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0011_down_refuses_a_recorded_stop() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+    seed_run_with_trade(db.pool(), Some("95"), "hash").await;
+
+    let err = undo_to(db.pool(), 10)
+        .await
+        .expect_err("a recorded stop must refuse the 0011 down");
+    assert!(
+        err.to_string().contains("0011"),
+        "the refusal names the migration: {err}"
+    );
+    // The abort was transactional: still at 11, column intact.
+    assert_eq!(applied_max(db.pool()).await, 11, "refusal leaves max at 11");
+    assert!(stop_price_column_present(db.pool()).await);
+}
+
+/// r2.s2.w2: the spec's Interface contract requires that "the read-side hash
+/// re-derivation verifies unchanged for old rows (a test seeds a
+/// pre-`0011`-shaped row)". This pins the CONDITIONAL `stop_price` append in
+/// `feed_trade`: `PRE_0011_CONTENT_HASH` is the sha256 a pre-`0011` binary
+/// computed for this exact row — the frozen byte stream wrote NOTHING for a
+/// stop field that did not exist — so the stored literal is independent of the
+/// current feed. `get_run`'s #39 re-derive must match it byte-for-byte; a feed
+/// that emits bytes for a `None` stop (e.g. made unconditional) derives a
+/// different hash, the guard rejects the read, and this test goes RED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_0011_row_re_derives_its_stored_hash_with_no_stop_bytes() {
+    // sha256 of the pre-`0011` byte stream for `run-1`'s contents: one
+    // `stop_price`-absent trade, zeroed run totals, empty regime breakdown,
+    // zero skipped counts, no open-position mark. Frozen by this literal —
+    // recomputing it through `BacktestResult::result_content_hash` would route
+    // through the same `feed_trade` being pinned and prove nothing.
+    const PRE_0011_CONTENT_HASH: &str =
+        "afa00259af222c33181e98085a61487d960fa3185e8de989042f1f8272ea882e";
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+
+    // The pre-0011 shape: `stop_price` NULL (the only value the column can
+    // hold for a row written before it existed), stored hash = the literal a
+    // pre-0011 binary wrote.
+    seed_run_with_trade(db.pool(), None, PRE_0011_CONTENT_HASH).await;
+    let stored_stop: Option<String> =
+        sqlx::query_scalar("SELECT stop_price FROM trade WHERE id = 'trade-1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_stop, None,
+        "the seeded row must carry no recorded stop"
+    );
+
+    // `get_run` rebuilds the BacktestResult and re-derives the hash — NULL
+    // stop → no stop bytes → identical stream → the guard passes and the
+    // stored pre-0011 hash round-trips.
+    let repo = SqliteBacktestRunRepo::new(db.pool().clone());
+    let run = repo
+        .get_run(&BacktestRunId::new("run-1"))
+        .await
+        .expect("a pre-0011 row must re-derive its stored hash unchanged (#39)")
+        .expect("run-1 exists");
+    assert_eq!(
+        run.result_content_hash, PRE_0011_CONTENT_HASH,
+        "the stored pre-0011 hash round-trips through the read path"
     );
 }
 

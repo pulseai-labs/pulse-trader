@@ -274,6 +274,37 @@ pub enum BacktestAppError {
     #[error("backtest failed: {0}")]
     Engine(#[from] BacktestError),
 
+    /// The strategy needs a higher-timeframe series the request did not supply
+    /// (schema 1.1.0, r2.s2.w2). `field` names the missing input —
+    /// `"inputs.htf"` — so MCP/Tauri callers can point at the exact request
+    /// member instead of parsing the message.
+    #[error("strategy requires a higher-timeframe series but {field} was not supplied")]
+    HtfRequired {
+        /// The request/input field that was missing — always `"inputs.htf"`.
+        field: &'static str,
+    },
+
+    /// The request's `inputs.htf` selection is not strictly higher than the
+    /// primary timeframe — compared by [`Timeframe::duration_ms`], so the rule
+    /// holds for any future timeframe pair rather than hardcoding M15→H4.
+    /// An equal or lower interval would advance `Series::Htf` operands on the
+    /// wrong cadence while the DSL renders them as the HTF — silently wrong
+    /// signals — so the request is refused before any candle I/O (r2.s2
+    /// round-1 fix F1).
+    #[error(
+        "{field} must be a strictly higher timeframe than the primary {} — got {}",
+        primary.binance_interval(),
+        htf.binance_interval()
+    )]
+    HtfNotHigher {
+        /// The request/input field at fault — always `"inputs.htf"`.
+        field: &'static str,
+        /// The request's primary timeframe.
+        primary: Timeframe,
+        /// The request's higher-timeframe selection.
+        htf: Timeframe,
+    },
+
     /// A READ failed before anything was saved.
     ///
     /// Distinct from [`Persist`](Self::Persist) because that one says "persist
@@ -492,6 +523,11 @@ impl BacktestOutcome {
 pub(crate) enum PrepareError {
     /// The validated document did not compile.
     Compile(String),
+    /// The compiled strategy carries an `Htf` operand but no higher-timeframe
+    /// series was supplied (schema 1.1.0, r2.s2.w2) — refused before any candle
+    /// work rather than silently evaluating the operand against primary data.
+    /// Surfaces as [`BacktestAppError::HtfRequired`] on the standalone path.
+    HtfRequired,
     /// The engine refused the run.
     Engine(BacktestError),
 }
@@ -520,6 +556,13 @@ pub(crate) fn prepare_backtest(
     series_end: SeriesEnd,
 ) -> Result<PreparedBacktest, PrepareError> {
     let compiled = compile(validated).map_err(|e| PrepareError::Compile(e.to_string()))?;
+    // The typed application-ring guard (r2.s2.w2 / ADR-0015): a strategy with an
+    // `Htf` operand and no HTF series refuses here — after compile, before any
+    // candle work — rather than reaching the engine, which would raise its own
+    // `BacktestError::HtfRequired` as the last line of defense.
+    if compiled.needs_htf() && htf.is_none() {
+        return Err(PrepareError::HtfRequired);
+    }
     let config = BacktestConfig {
         starting_equity,
         taker_fee_bps: inputs.taker_fee_bps,
@@ -608,6 +651,31 @@ where
         })?
         .ok_or_else(|| BacktestAppError::VersionNotFound(request.version_id.clone()))?;
     let validated = validate(&version.dsl)?;
+
+    // r2.s2 round-1 fixes F1/F6: the request-level guards run BEFORE any
+    // candle I/O. `compile` is pure, so an `htf`-operand strategy missing
+    // `inputs.htf` — or an `inputs.htf` selection that is not strictly higher
+    // than the primary timeframe — is refused here rather than surfacing as a
+    // `PreSaveRead`/`SnapshotMissing` after loading (and possibly failing on)
+    // candle data the run can never use. `prepare_backtest` keeps the same
+    // `needs_htf` guard and `run_backtest` the same pair check as the last
+    // line of defence for callers that skip this ring.
+    let compiled =
+        compile(&validated).map_err(|e| BacktestAppError::CompileFailed(e.to_string()))?;
+    if compiled.needs_htf() && request.htf_timeframe.is_none() {
+        return Err(BacktestAppError::HtfRequired {
+            field: "inputs.htf",
+        });
+    }
+    if let Some(htf_tf) = request.htf_timeframe
+        && htf_tf.duration_ms() <= request.primary_timeframe.duration_ms()
+    {
+        return Err(BacktestAppError::HtfNotHigher {
+            field: "inputs.htf",
+            primary: request.primary_timeframe,
+            htf: htf_tf,
+        });
+    }
 
     // 3. Everything synchronous — Parquet decode and the CPU engine — happens on a
     //    blocking thread. Both are hundreds of milliseconds on the real fixture, and
@@ -854,6 +922,9 @@ where
         )
         .map_err(|e| match e {
             PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
+            PrepareError::HtfRequired => BacktestAppError::HtfRequired {
+                field: "inputs.htf",
+            },
             PrepareError::Engine(source) => BacktestAppError::Engine(source),
         })?;
         Ok(EngineOutput { prepared })
@@ -1084,8 +1155,8 @@ mod tests {
         BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CandleWindow,
         Comparator, Condition, DataError, DataVersion, Direction, ExitRule, FundingConfig,
         IndicatorSpec, Pair, PersistedRun, RegimeBreakdown, RiskParams, RunSummary, SchemaVersion,
-        SkippedEntryCounts, SnapshotSelection, StrategyDsl, StrategyRepository, SummaryStats,
-        SweepableValue, Timeframe, Trade, ValueSource,
+        Series, SkippedEntryCounts, SnapshotSelection, StrategyDsl, StrategyRepository,
+        SummaryStats, SweepableValue, Timeframe, Trade, ValueSource,
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
@@ -1346,6 +1417,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },

@@ -150,6 +150,7 @@ fn marker_trade() -> Trade {
         exit_reason: ExitReason::TakeProfit,
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
+        stop_price: None,
     }
 }
 

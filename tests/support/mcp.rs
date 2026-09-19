@@ -123,6 +123,7 @@ pub fn seeded_trade() -> Trade {
         exit_reason: ExitReason::TakeProfit,
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
+        stop_price: Some(Decimal::new(89_450, 0)),
     }
 }
 
@@ -181,13 +182,17 @@ pub async fn seed_versions(db: &Db) -> (VersionId, VersionId) {
     (parent.id, child.id)
 }
 
-/// Seed one strategy with a parent→child version pair, and one run (one trade)
-/// against the child, all through the repository layer the server reads.
-pub async fn seed(db: &Db) -> Seed {
-    let (parent_id, child_id) = seed_versions(db).await;
-
+/// Seed one run carrying CALLER-SUPPLIED `inputs` — for states a real run can
+/// no longer produce (e.g. round-1 fix F1's equal-timeframe `inputs.htf`, a
+/// row only a pre-fix binary or an out-of-band writer could leave). The row's
+/// trade and result are the ordinary seeded ones; only the provenance block
+/// differs.
+pub async fn seed_run_with_inputs(
+    db: &Db,
+    version_id: &VersionId,
+    inputs: &BacktestInputs,
+) -> BacktestRunId {
     let trade = seeded_trade();
-    let inputs = seeded_inputs();
     let summary = SummaryStats::from_trades(
         std::slice::from_ref(&trade),
         trade.realized_pnl,
@@ -209,16 +214,22 @@ pub async fn seed(db: &Db) -> Seed {
         equity_curve: EquityCurve::default(),
     };
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
-    let run_id = runs
-        .save_run(
-            &child_id,
-            &inputs,
-            &result,
-            &result.summary,
-            Decimal::new(10_000, 0),
-        )
-        .await
-        .expect("save seeded run");
+    runs.save_run(
+        version_id,
+        inputs,
+        &result,
+        &result.summary,
+        Decimal::new(10_000, 0),
+    )
+    .await
+    .expect("save seeded run")
+}
+
+/// Seed one strategy with a parent→child version pair, and one run (one trade)
+/// against the child, all through the repository layer the server reads.
+pub async fn seed(db: &Db) -> Seed {
+    let (parent_id, child_id) = seed_versions(db).await;
+    let run_id = seed_run_with_inputs(db, &child_id, &seeded_inputs()).await;
     (parent_id, child_id, run_id)
 }
 
@@ -248,6 +259,38 @@ pub async fn seed_real_run(db: &Db, store_dir: &Path, version_id: &VersionId) ->
     )
     .await
     .expect("the seeded real run completes over the fixture")
+    .run
+    .id
+}
+
+/// [`seed_real_run`] without the HTF snapshot: the persisted run records
+/// `inputs.htf = None`, which is what leaves a child's resolved request without
+/// an HTF timeframe — the `HtfRequired` trigger (r2.s2.w2).
+pub async fn seed_real_run_primary_only(
+    db: &Db,
+    store_dir: &Path,
+    version_id: &VersionId,
+) -> BacktestRunId {
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let store = CandleStore::with_base_dir(store_dir.to_path_buf());
+    run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &BacktestRequest {
+            version_id: version_id.clone(),
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: None,
+            config: BacktestConfig::default(),
+            snapshots: None,
+            window: None,
+        },
+    )
+    .await
+    .expect("the seeded M15-only run completes over the fixture")
     .run
     .id
 }

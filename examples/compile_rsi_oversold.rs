@@ -10,7 +10,7 @@
 
 use pulse::{
     Comparator, Condition, Direction, ExitRule, IndicatorSpec, Migrator, RiskParams, SchemaVersion,
-    StrategyDsl, SweepableValue, ValueSource, compile, validate,
+    Series, StrategyDsl, SweepableValue, ValueSource, compile, validate,
 };
 use rust_decimal::Decimal;
 
@@ -22,6 +22,7 @@ fn rsi_oversold_strategy() -> StrategyDsl {
         direction: Direction::Long,
         entry: Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(14),
                 },

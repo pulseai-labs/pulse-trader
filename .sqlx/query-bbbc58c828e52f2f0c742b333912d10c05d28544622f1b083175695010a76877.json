@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO trade (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, fees_total, funding_total, slippage_total, realized_pnl, realized_r, mfe_r, mae_r, exit_reason, source, regime, fills, stop_price) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 23
+    },
+    "nullable": []
+  },
+  "hash": "bbbc58c828e52f2f0c742b333912d10c05d28544622f1b083175695010a76877"
+}

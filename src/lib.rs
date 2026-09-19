@@ -98,7 +98,9 @@ pub use domain::strategy::Hypothesis as AgentHypothesis;
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
 // (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
 // same curated-surface pattern as the domain types above.
-pub use domain::{Comparator, Condition, IndicatorSpec, PriceField, SweepableValue, ValueSource};
+pub use domain::{
+    Comparator, Condition, IndicatorSpec, PriceField, Series, SweepableValue, ValueSource,
+};
 
 // VS-1.1.2 work-2.02: the whole-strategy document layer. `StrategyDsl` is the
 // top-level document the LLM composes (FR-3) and the backtester executes;
@@ -110,6 +112,14 @@ pub use domain::{Comparator, Condition, IndicatorSpec, PriceField, SweepableValu
 pub use domain::{
     Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl,
 };
+
+// r2.s2.w4 (b10, ADR-0024): the one ring-owned DSL display formatter —
+// `render::strategy(&StrategyDsl) -> Rendered` plus the per-token functions the
+// vocabulary test pins (`render::condition`, `render::exit`, …). The two Tauri
+// DTO adapters delegate to it; `tests/dsl_render.rs` proves they can no longer
+// disagree. REQUIRED under `deny(warnings)` — a `pub` module reachable only
+// in-crate is a `dead_code` build error otherwise.
+pub use domain::dsl::render;
 
 // VS-1.1.2 work-2.03: the semantic-validation engine (FR-3 correctable rejection).
 // `validate` is the entry point; `ValidatedDsl` is the newtype 2.04's compiler
@@ -139,7 +149,7 @@ pub use domain::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Mi
 // `deny(warnings)` + `pub(crate) mod domain`.
 pub use domain::{
     CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, compile, stop_price, take_profit_price,
+    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
 };
 
 // r1.s2.w1 (ADR-0021): the one-mutation framework. `apply(&StrategyDsl,
@@ -303,6 +313,12 @@ pub use adapters::indicators::rsi::Rsi;
 // module is a `dead_code` build error, not a warning); the 3.03 factory that
 // consumes it is next round.
 pub use adapters::indicators::adx::Adx;
+// r2.s2.w2: the `Atr` adapter (Wilder true-range smoothing over the shared
+// `wilder.rs` core, schema 1.1.0's `IndicatorSpec::Atr`). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod adapters` (a new public adapter struct
+// unused outside its module is a `dead_code` build error, not a warning); the
+// indicator engine's factory consumes it.
+pub use adapters::indicators::atr::Atr;
 // VS-1.1.3 work-3.03: the multi-indicator engine that implements the frozen
 // `EvalContext` seam over real candles and streaming adapter values. Its
 // readiness gate is load-bearing for warmup safety under the current boolean DSL
@@ -587,9 +603,9 @@ pub use crate::tauri::{
     ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EquityPointDto, EventSink,
     HistogramBinDto, HistogramDto, LibraryOverview, LibraryRunSummary, LibraryStrategy,
     LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
-    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core,
+    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core, dsl_summary,
     export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
-    shell_info_core,
+    shell_info_core, summarize_dsl,
 };
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the

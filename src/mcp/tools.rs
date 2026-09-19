@@ -34,9 +34,9 @@ use crate::application::mcp_write::{
 };
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow, CompiledValue,
-    DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun, StrategyRepository,
-    Timeframe, ValidationCode,
+    BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
+    CompiledValue, DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun,
+    Series, StrategyRepository, Timeframe, ValidationCode,
 };
 
 use super::PulseMcp;
@@ -346,6 +346,19 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
             field_error("dsl", err)
         }
+        // r2.s2.w2 + round-1 fix F1: the strategy needs an HTF series the
+        // request lacked, or the `inputs.htf` selection is not strictly higher
+        // than the primary timeframe — the error's `field` already carries
+        // `"inputs.htf"`, so surface it verbatim.
+        BacktestAppError::HtfRequired { field } | BacktestAppError::HtfNotHigher { field, .. } => {
+            field_error(field, err)
+        }
+        // r2.s2 round-2 fix G1: a different-pair HTF series is refused by the
+        // engine (the request itself carries only one pair, so no app-layer
+        // variant exists) — surface it on the same `inputs.htf` field.
+        BacktestAppError::Engine(BacktestError::HtfPairMismatch { .. }) => {
+            field_error("inputs.htf", err)
+        }
         _ => tool_error(err),
     }
 }
@@ -499,7 +512,7 @@ impl PulseMcp {
                     "exit_signal_time", "exit_fill_time",
                     "fills", "fees_total", "funding_total", "slippage_total",
                     "realized_pnl", "realized_r", "mfe_r", "mae_r",
-                    "exit_reason", "source", "regime",
+                    "exit_reason", "source", "regime", "stop_price",
                 ],
             }))),
             Err(e) => Ok(tool_error(e)),
@@ -600,7 +613,7 @@ impl PulseMcp {
 
     /// Export one row per candle of the requested indicator specs.
     #[tool(
-        description = "Export per-candle indicator values (e.g. rsi:14, ema:50) as CSV under the server exports dir: open_time plus one column per spec, blank while the engine warms."
+        description = "Export per-candle indicator values (e.g. rsi:14, ema:50, atr:14) as CSV under the server exports dir: open_time plus one column per spec, blank while the engine warms."
     )]
     async fn export_indicators(
         &self,
@@ -643,7 +656,12 @@ impl PulseMcp {
                 rows.push(
                     specs
                         .iter()
-                        .map(|spec| engine.current(&CompiledValue::Indicator(spec.clone())))
+                        .map(|spec| {
+                            engine.current(&CompiledValue::Indicator {
+                                series: Series::Primary,
+                                spec: spec.clone(),
+                            })
+                        })
                         .collect::<Vec<_>>(),
                 );
             }
