@@ -88,6 +88,32 @@ fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, FieldError> {
     })
 }
 
+/// Deserialize one flat operand arg, pathed at the operand itself so a
+/// misspelled key (e.g. `timefrom` for `timeframe`) names WHICH operand to fix
+/// (r2.s2 round-1 fix F7).
+fn parse_operand(path: &'static str, value: Value) -> Result<mapping::Operand, FieldError> {
+    serde_json::from_value(value).map_err(|source| {
+        field_error(
+            path,
+            ValidationCode::FieldRange,
+            format!("could not parse operand: {source}"),
+        )
+    })
+}
+
+/// Parse the `{ left, right }` operand pair, collecting every parse failure so
+/// a call with two malformed operands reports both at once (the same
+/// collect-all-errors convention [`mapping::build_condition`] follows).
+fn parse_operand_pair(
+    left: Value,
+    right: Value,
+) -> Result<(mapping::Operand, mapping::Operand), Vec<FieldError>> {
+    match (parse_operand("left", left), parse_operand("right", right)) {
+        (Ok(left), Ok(right)) => Ok((left, right)),
+        (left, right) => Err([left, right].into_iter().filter_map(Result::err).collect()),
+    }
+}
+
 /// Map the flat `"long"`/`"short"` string to a tagged [`Direction`].
 fn direction_from_str(raw: &str) -> Result<Direction, FieldError> {
     match raw {
@@ -141,7 +167,11 @@ pub(crate) fn add_entry_signal(builder: &mut StrategyBuilder, args: Value) -> To
         Ok(parsed) => parsed,
         Err(error) => return err(error),
     };
-    match mapping::build_condition(&args.left, &args.op, &args.right) {
+    let (left, right) = match parse_operand_pair(args.left, args.right) {
+        Ok(pair) => pair,
+        Err(errors) => return ToolOutcome::Err { errors },
+    };
+    match mapping::build_condition(&left, &args.op, &right) {
         Ok(condition) => {
             builder.set_entry(condition);
             ToolOutcome::Ok {
@@ -159,7 +189,11 @@ pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutc
         Ok(parsed) => parsed,
         Err(error) => return err(error),
     };
-    match mapping::build_condition(&args.left, &args.op, &args.right) {
+    let (left, right) = match parse_operand_pair(args.left, args.right) {
+        Ok(pair) => pair,
+        Err(errors) => return ToolOutcome::Err { errors },
+    };
+    match mapping::build_condition(&left, &args.op, &right) {
         Ok(condition) => {
             builder.push_filter(condition);
             ToolOutcome::Ok {
@@ -294,12 +328,17 @@ struct CreateStrategyArgs {
 }
 
 /// `add_entry_signal` / `add_filter` args (flat `{ left, op, right }`).
+///
+/// `left`/`right` stay raw [`Value`]s so each operand parses on its own: a
+/// `deny_unknown_fields` failure inside an operand is then pathed at `left` /
+/// `right` instead of collapsing into the unlocalized whole-struct
+/// `arguments` error (r2.s2 round-1 fix F7).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignalArgs {
-    left: mapping::Operand,
+    left: Value,
     op: String,
-    right: mapping::Operand,
+    right: Value,
 }
 
 /// `set_exit_rules` args — flat scalar fields; `Decimal`s are carried as JSON
@@ -367,7 +406,15 @@ mod mapping {
     /// A flat, untagged operand — the LLM-facing scalar shape (README C5). It is
     /// assembled **server-side** into a tagged [`ValueSource`]; the LLM never
     /// emits the serde tag.
+    ///
+    /// `deny_unknown_fields` (r2.s2 round-1 fix F7): every field is optional,
+    /// so without it a misspelled `timefrom` deserializes fine, silently drops
+    /// the requested series, and degrades the operand to primary — a different
+    /// operand than the caller sent, with no error anywhere (pulse-trader#160's
+    /// silent-substitution class). Rejecting the unknown key makes it a
+    /// correctable `FieldError` naming the operand path.
     #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub(super) struct Operand {
         // Defaulted so a MISSING `source` still deserializes and the mapping
         // layer reports a LOCALIZED `{left|right}.source` error (e.g. a constant
@@ -1030,6 +1077,69 @@ mod tests {
                 })
             ),
             ToolOutcome::Err { .. }
+        ));
+    }
+
+    /// r2.s2 round-1 fix F7: a MISSPELLED key inside an operand (`timefrom`
+    /// for `timeframe`) is a correctable `FieldError` pathed at that operand —
+    /// never a silent drop. Before `deny_unknown_fields` on `Operand` the key
+    /// deserializes fine, `series_from(None)` degrades the operand to the
+    /// primary series, and the composed strategy silently differs from the
+    /// request (pulse-trader#160's silent-substitution class).
+    #[test]
+    fn misspelled_operand_key_is_correctable_and_names_the_operand() {
+        let mut builder = StrategyBuilder::new();
+        let outcome = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close", "timefrom": "h4" },
+                "op": "gt",
+                "right": { "source": "constant", "value": "100" }
+            }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.path == "left"),
+                    "the misspelled operand must be pathed at `left`, got {errors:?}"
+                );
+                assert!(
+                    errors.iter().all(|e| e.path != "arguments"),
+                    "the error must NOT be the unlocalized whole-struct `arguments` parse error"
+                );
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!("a misspelled operand key must be a correctable Err, not a silent drop")
+            }
+        }
+        // The same misspelling inside `right` names `right`.
+        let outcome = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": { "source": "constant", "value": "100", "timefrom": "h4" }
+            }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.path == "right"),
+                    "the misspelled operand must be pathed at `right`, got {errors:?}"
+                );
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!("a misspelled operand key must be a correctable Err, not a silent drop")
+            }
+        }
+        // The correctly-spelled `timeframe` still composes the htf operand.
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close", "timeframe": "h4" },
+                "op": "gt",
+                "right": { "source": "constant", "value": "100" }
+            }),
         ));
     }
 
