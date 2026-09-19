@@ -111,9 +111,13 @@ pub fn run_backtest(
     let mut detector = RegimeDetector::new();
     let mut state = LoopState::default();
     let direction = compiled.direction();
-    // The open_time of the last H4 bar the HTF engine was stepped with — the
-    // dedup key that turns "the aligned pairing changed" into "step once".
-    let mut last_htf_open_time: Option<i64> = None;
+    // Index into `htf.candles` of the next HTF bar not yet stepped through the
+    // HTF engine (r2.s2 round-1 fix F2). A cursor over the source series — not
+    // the aligned pairing — is what guarantees every closed HTF candle is
+    // stepped exactly once, including the lead-in history `align` jumps past
+    // when several H4 closes precede the first primary bar.
+    let mut htf_cursor = 0_usize;
+    let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
 
     // D6 (NFR-1): build the funding-event index ONCE, before the trade loop, so
     // funding accrual is O(trades × (log E + k)) over the ~1095 funding events
@@ -150,16 +154,20 @@ pub fn run_backtest(
         close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
 
         engine.step(bar.primary);
-        // Step the HTF engine exactly once per NEWLY aligned closed H4 bar
-        // (r2.s2.w2): the feed pairs each primary bar with the most-recent
-        // closed H4 candle, and the same H4 stays paired for a run of primary
-        // bars — stepping on `open_time` change (not on presence) keeps
-        // `previous()` H4-relative and never feeds one bar twice.
-        if let (Some(engine_htf), Some(htf_bar)) = (htf_engine.as_mut(), bar.htf)
-            && Some(htf_bar.open_time) != last_htf_open_time
-        {
-            engine_htf.step(htf_bar);
-            last_htf_open_time = Some(htf_bar.open_time);
+        // Step the HTF engine with EVERY HTF candle that has closed at or
+        // before this primary bar's close (r2.s2 round-1 fix F2), in
+        // chronological order, each exactly once. The aligned `bar.htf` stays
+        // the last of them, so `current()`/`previous()` remain H4-relative —
+        // but the warmup history a `close_time`-jumped pairing would skip
+        // (lead-in H4 bars already closed when the run's first primary bar
+        // lands) now feeds the engine instead of vanishing.
+        if let Some(engine_htf) = htf_engine.as_mut() {
+            while let Some(candle) = htf_candles.get(htf_cursor)
+                && candle.close_time <= bar.primary.close_time
+            {
+                engine_htf.step(candle);
+                htf_cursor += 1;
+            }
         }
         // Advance the regime detector in lock-step with the indicator engine, once
         // per primary bar (README C7). The order vs. `engine.step` is irrelevant

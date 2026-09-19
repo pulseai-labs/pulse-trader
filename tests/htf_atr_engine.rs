@@ -29,6 +29,9 @@
 //! - **(h)** a non-higher `inputs.htf` selection is refused with the typed
 //!   field-pathed error — at the request boundary before any candle I/O, and
 //!   again inside `run_backtest` as engine-level defence (round-1 fix F1/F6).
+//! - **(i)** the HTF engine steps EVERY closed H4 candle exactly once — H4
+//!   lead-in history closed before the first primary bar warms the indicator,
+//!   and no closed H4 bar is ever fed twice (round-1 fix F2).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -36,10 +39,11 @@ use std::path::PathBuf;
 use pulse::{
     BacktestAppError, BacktestConfig, BacktestError, BacktestRequest, BacktestResult,
     BinanceAdapter, Candle, CandleSeries, CandleStore, Comparator, CompiledStrategy, Condition,
-    CreatedBy, DataVersion, Db, Direction, ExitReason, ExitRule, MIGRATOR, NewVersion, Pair,
-    PriceField, RiskParams, SchemaVersion, Series, SeriesEnd, SqliteBacktestRunRepo,
-    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue, SymbolFilters, Timeframe,
-    ValueSource, atr_stop_price, compile, run_backtest, run_version_backtest, stop_price, validate,
+    CreatedBy, DataVersion, Db, Direction, ExitReason, ExitRule, IndicatorSpec, MIGRATOR,
+    NewVersion, Pair, PriceField, RiskParams, SchemaVersion, Series, SeriesEnd,
+    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue,
+    SymbolFilters, Timeframe, ValueSource, atr_stop_price, compile, run_backtest,
+    run_version_backtest, stop_price, validate,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -81,7 +85,13 @@ fn series(timeframe: Timeframe, candles: Vec<Candle>) -> CandleSeries {
 /// exactly `1.0` once warm (TR = max(1.0, |0.5|, |−0.5|) = 1.0 on every bar
 /// after the first). `n` bars.
 fn flat_m15(n: i64) -> Vec<Candle> {
-    (0..n)
+    flat_m15_from(0, n)
+}
+
+/// [`flat_m15`] whose first bar is absolute M15 index `start` — so the series
+/// can begin mid-stream while the H4 fixture keeps its own `h4(j)` indexing.
+fn flat_m15_from(start: i64, n: i64) -> Vec<Candle> {
+    (start..start + n)
         .map(|i| {
             let open_time = i * Timeframe::M15.duration_ms();
             Candle {
@@ -120,6 +130,15 @@ fn htf_price(field: PriceField) -> ValueSource {
     ValueSource::Price {
         series: Series::Htf,
         field,
+    }
+}
+
+fn htf_ema(period: u32) -> ValueSource {
+    ValueSource::Indicator {
+        series: Series::Htf,
+        spec: IndicatorSpec::Ema {
+            period: fixed_u32(period),
+        },
     }
 }
 
@@ -923,6 +942,129 @@ fn windowed_run_open_position_mark_is_unaffected_by_the_stop_column() {
     let mark = result.open_position.expect("mark present");
     assert_eq!(mark.direction, Direction::Long);
     assert_eq!(mark.entry_price, dec(100, 0));
+}
+
+// ---------------------------------------------------------------------------
+// (i) the HTF engine steps EVERY closed H4 candle exactly once (F2)
+// ---------------------------------------------------------------------------
+
+/// The six-H4 fixture shared by both F2 pins: `h4[0..=3]` all close before the
+/// shifted primary series' first bar (`close_time <= primary[0].close_time`),
+/// `h4[4]` pairs at primary index 15 and `h4[5]` at index 31.
+fn htf_lead_in_series() -> CandleSeries {
+    series(
+        Timeframe::H4,
+        vec![
+            h4(0, 100, 105, 95, 100),
+            h4(1, 100, 115, 95, 110),
+            h4(2, 100, 125, 95, 120),
+            h4(3, 100, 135, 95, 130),
+            h4(4, 100, 145, 95, 140),
+            h4(5, 100, 155, 95, 150),
+        ],
+    )
+}
+
+/// Independent seeded-EMA oracle — `ema[0] = close[0]`, then
+/// `ema[t] = k·close[t] + (1−k)·ema[t−1]` with `k = 2/(period+1)`, matching the
+/// adapter's ta-rs recursion (NOT the engine under test).
+fn oracle_ema(closes: &[f64], period: u32) -> Decimal {
+    use pulse::f64_to_decimal_rounded;
+    let k = 2.0 / (f64::from(period) + 1.0);
+    let mut ema = closes[0];
+    for &close in &closes[1..] {
+        ema = k * close + (1.0 - k) * ema;
+    }
+    f64_to_decimal_rounded(ema).expect("oracle ema to Decimal")
+}
+
+/// An H4 snapshot normally carries lead-in history: bars already closed when
+/// the run's first primary bar lands. `align` pairs that first bar with the
+/// LAST closed H4 — so an engine stepped only on the pairing would see a
+/// single H4 candle where four had closed, and an H4 indicator would still be
+/// in warmup when the data says it should be warm. This entry is true exactly
+/// when the H4 EMA(3) equals the value full-history stepping produces —
+/// `121.25` after `h4[0..=3]` — so the trade exists only if the lead-in bars
+/// were actually fed.
+#[test]
+fn htf_lead_in_history_warms_the_indicator_at_the_first_paired_bar() {
+    // 40 M15 bars starting at absolute M15 index 64 (open_time = 4 × 4h): H4
+    // bars 0..=3 closed before primary[0], h4[4] pairs at index 15, h4[5] at 31.
+    let primary = series(Timeframe::M15, flat_m15_from(64, 40));
+    let htf = htf_lead_in_series();
+    let expected = oracle_ema(&[100.0, 110.0, 120.0, 130.0], 3);
+    assert_eq!(expected, dec(12125, 2), "hand-check: EMA(3) = 121.25");
+    let strategy = dsl(
+        compare(
+            htf_ema(3),
+            Comparator::Eq,
+            ValueSource::Constant { value: expected },
+        ),
+        vec![stop_loss()],
+        Direction::Long,
+    );
+    let result = run(
+        &compiled(&strategy),
+        &primary,
+        Some(&htf),
+        SeriesEnd::SnapshotEnd,
+    );
+
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "an H4 EMA warm at the first paired bar fires one entry"
+    );
+    // The earliest lawful signal bar is index 1 (`bar.index > 0`).
+    assert_eq!(
+        result.trades[0].entry_signal_time,
+        primary.candles[1].close_time
+    );
+    assert_eq!(
+        result.trades[0].entry_fill_time,
+        primary.candles[2].open_time
+    );
+}
+
+/// The no-double-step half of F2: the H4 EMA(3) after `h4[5]` closes is
+/// `140.3125` ONLY when every one of `h4[0..=5]` was fed exactly once — a
+/// re-stepped or skipped candle anywhere in the prefix perturbs the recursive
+/// state and the equality never fires. `h4[5]` first pairs at primary[31].
+#[test]
+fn htf_engine_never_steps_a_closed_candle_twice() {
+    let primary = series(Timeframe::M15, flat_m15_from(64, 40));
+    let htf = htf_lead_in_series();
+    let expected = oracle_ema(&[100.0, 110.0, 120.0, 130.0, 140.0, 150.0], 3);
+    assert_eq!(expected, dec(1403125, 4), "hand-check: EMA(3) = 140.3125");
+    let strategy = dsl(
+        compare(
+            htf_ema(3),
+            Comparator::Eq,
+            ValueSource::Constant { value: expected },
+        ),
+        vec![stop_loss()],
+        Direction::Long,
+    );
+    let result = run(
+        &compiled(&strategy),
+        &primary,
+        Some(&htf),
+        SeriesEnd::SnapshotEnd,
+    );
+
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "the EMA equals 140.3125 only while h4[5] is the paired bar"
+    );
+    assert_eq!(
+        result.trades[0].entry_signal_time, primary.candles[31].close_time,
+        "h4[5] (close_time 86_399_999) first pairs at the M15 bar closing then"
+    );
+    assert_eq!(
+        result.trades[0].entry_fill_time,
+        primary.candles[32].open_time
+    );
 }
 
 // ---------------------------------------------------------------------------
