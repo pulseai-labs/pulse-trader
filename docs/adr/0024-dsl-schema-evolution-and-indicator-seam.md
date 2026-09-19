@@ -4,7 +4,7 @@ Date: 2026-09-19T00:00:00Z
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -45,13 +45,17 @@ revisit trigger, not a licence to widen the seam mid-item.
 
 **Operands are series-scoped.** `ValueSource::Price` and
 `ValueSource::Indicator` carry a `series` tag (`primary` | `htf`, defaulting
-to `primary` so every `1.0.0` document reads as primary-series). Schema 1.1.0
-makes the tag grammar only: `compile()` rejects an `htf` operand with
-`CompileError::HtfUnsupported`. The engine-side semantics — evaluating the
-operand against the aligned, closed HTF bar — belong to the follow-on item
-that removes the gate; likewise `IndicatorSpec::Atr` and `ExitRule::AtrStop`
-are grammar here, with the indicator engine and backtester holding typed
-`Unsupported` placeholders until their owning item lands the computation.
+to `primary` so every `1.0.0` document reads as primary-series). An `htf`
+operand is evaluated against the aligned, already-closed higher-timeframe bar
+— the most recent HTF candle whose `close_time` is at or before the primary
+bar's, and no pairing at all before the first HTF close — so a run never
+reads an HTF bar that has not finished. `IndicatorSpec::Atr` is computed by
+the indicator engine (the streaming Wilder adapter), and `ExitRule::AtrStop`
+derives its stop from `multiple × ATR(period)` **frozen at the signal bar**.
+`compile()` is pure and never refuses a strategy merely because an `htf`
+operand is present: a run that needs the higher timeframe but is invoked
+without an HTF input fails as the typed backtest input error `HtfRequired`,
+not as a compile-time rejection.
 
 **Touch surface:** `src/domain/dsl/**`, `src/adapters/indicators/**`.
 
@@ -69,12 +73,12 @@ re-serialization, no backfill — so the version store keeps ADR-0018's
 correction-is-a-new-version guarantee without a rewrite path. The next
 indicator is a one-item flesh job: the seam enumerates its entire touch
 surface, and the schema-1.1.0 item demonstrates it end to end (`Atr` landed
-with exactly the arms the seam declares). The schema/engine boundary is
-explicit: grammar may precede behaviour, and the gap is carried as typed
-errors (`HtfUnsupported`, `Unsupported`, `UnsupportedExit`) with asserting
-tests, never as `todo!`/`unimplemented!` or a silent fallback — a document the
-grammar accepts but the engine cannot yet run fails loudly at the boundary
-instead of producing plausible-but-wrong results. The cost is a transitional
-state in which valid documents exist that do not compile, which is exactly
-what `CompileError::HtfUnsupported` is for; the revisit triggers bound how far
-the grammar may drift from the engine before this decision must be re-opened.
+with exactly the arms the seam declares). The schema/engine boundary stays
+explicit: every construct the 1.1.0 grammar admits is computable, and the
+boundary errors that remain are typed and asserted — `HtfRequired` for a run
+missing its HTF input, `HtfNotHigher` for a timeframe selection that is not
+strictly higher, `UnsupportedExit` for an exit kind the backtester does not
+model — never `todo!`/`unimplemented!` or a silent fallback. The transitional
+state in which valid documents did not compile is closed: the grammar and the
+engine agree, and the revisit triggers bound how far the grammar may drift
+before this decision must be re-opened.
