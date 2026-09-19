@@ -1042,7 +1042,7 @@ fn htf_engine_never_steps_a_closed_candle_twice() {
     let primary = series(Timeframe::M15, flat_m15_from(64, 40));
     let htf = htf_lead_in_series();
     let expected = oracle_ema(&[100.0, 110.0, 120.0, 130.0, 140.0, 150.0], 3);
-    assert_eq!(expected, dec(1403125, 4), "hand-check: EMA(3) = 140.3125");
+    assert_eq!(expected, dec(1_403_125, 4), "hand-check: EMA(3) = 140.3125");
     let strategy = dsl(
         compare(
             htf_ema(3),
@@ -1092,7 +1092,7 @@ fn not_over_absent_htf_price() -> Condition {
     }
 }
 
-/// The two-H4 fixture for F3: `h4[0]` (close 150) closes at 14_399_999 and
+/// The two-H4 fixture for F3: `h4[0]` (close 150) closes at `14_399_999` and
 /// first pairs at primary[15]; `h4[1]` closes inside the run.
 fn two_h4_closing_150() -> CandleSeries {
     series(

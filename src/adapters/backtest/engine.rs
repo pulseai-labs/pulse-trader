@@ -155,19 +155,18 @@ pub fn run_backtest(
 
         engine.step(bar.primary);
         // Step the HTF engine with EVERY HTF candle that has closed at or
-        // before this primary bar's close (r2.s2 round-1 fix F2), in
-        // chronological order, each exactly once. The aligned `bar.htf` stays
-        // the last of them, so `current()`/`previous()` remain H4-relative —
-        // but the warmup history a `close_time`-jumped pairing would skip
-        // (lead-in H4 bars already closed when the run's first primary bar
-        // lands) now feeds the engine instead of vanishing.
+        // before this primary bar's close (r2.s2 round-1 fix F2). The aligned
+        // `bar.htf` stays the last of them, so `current()`/`previous()` remain
+        // H4-relative — but the warmup history a `close_time`-jumped pairing
+        // would skip (lead-in H4 bars already closed when the run's first
+        // primary bar lands) now feeds the engine instead of vanishing.
         if let Some(engine_htf) = htf_engine.as_mut() {
-            while let Some(candle) = htf_candles.get(htf_cursor)
-                && candle.close_time <= bar.primary.close_time
-            {
-                engine_htf.step(candle);
-                htf_cursor += 1;
-            }
+            step_closed_htf_candles(
+                engine_htf,
+                htf_candles,
+                &mut htf_cursor,
+                bar.primary.close_time,
+            );
         }
         // Advance the regime detector in lock-step with the indicator engine, once
         // per primary bar (README C7). The order vs. `engine.step` is irrelevant
@@ -222,15 +221,7 @@ pub fn run_backtest(
             // never recomputed there. `is_warm` already covers it when the
             // `AtrStop` registers its ATR, but the explicit `Some` read keeps
             // the gate honest if that registration ever changes.
-            let atr_at_signal = match exit_plan.stop {
-                StopRule::Atr { period, .. } => ctx.current(&CompiledValue::Indicator {
-                    series: Series::Primary,
-                    spec: IndicatorSpec::Atr {
-                        period: SweepableValue::Fixed(period),
-                    },
-                }),
-                StopRule::Pct(_) => None,
-            };
+            let atr_at_signal = atr_at_signal(&exit_plan, &ctx);
             if !matches!(exit_plan.stop, StopRule::Atr { .. }) || atr_at_signal.is_some() {
                 state.pending_entry = Some(PendingEntry {
                     signal_time: bar.primary.close_time,
@@ -296,6 +287,41 @@ fn check_htf_inputs(
         });
     }
     Ok(())
+}
+
+/// Advance the HTF indicator engine over every HTF candle that has closed at
+/// or before `primary_close` (r2.s2 round-1 fix F2), in chronological order,
+/// each exactly once. `cursor` indexes `htf_candles` at the next bar not yet
+/// stepped — a cursor over the source series, not the aligned pairing, is what
+/// guarantees lead-in history `align` jumps past still feeds the engine.
+fn step_closed_htf_candles(
+    htf_engine: &mut IndicatorEngine,
+    htf_candles: &[Candle],
+    cursor: &mut usize,
+    primary_close: i64,
+) {
+    while let Some(candle) = htf_candles.get(*cursor)
+        && candle.close_time <= primary_close
+    {
+        htf_engine.step(candle);
+        *cursor += 1;
+    }
+}
+
+/// The primary-series ATR(period) value at the signal bar, for an `AtrStop`
+/// exit — frozen into the pending entry so the stop derives from the signal
+/// bar's ATR, never recomputed at fill (r2.s2.w2). `None` for a `StopLoss`
+/// exit and while the ATR is still unwarm.
+fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -> Option<Decimal> {
+    match exit_plan.stop {
+        StopRule::Atr { period, .. } => ctx.current(&CompiledValue::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Atr {
+                period: SweepableValue::Fixed(period),
+            },
+        }),
+        StopRule::Pct(_) => None,
+    }
 }
 
 /// How a position's stop is derived (r2.s2.w2): either the fixed-fraction
