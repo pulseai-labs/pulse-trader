@@ -21,7 +21,12 @@ vi.mock("../bindings", () => ({
 }));
 
 import { commands } from "../bindings";
-import type { LibraryOverview, LibraryVersion, VersionStats } from "../bindings";
+import type {
+  BusError,
+  LibraryOverview,
+  LibraryVersion,
+  VersionStats,
+} from "../bindings";
 import { App, RouteContent } from "../App";
 import { resolveRoute } from "../routes";
 
@@ -371,9 +376,9 @@ describe("LibraryScreen (C2 — refetch on focus, r2.s1.w4)", () => {
 // F5 (r2.s1 review) — the two stale-state defects in `load`
 // ---------------------------------------------------------------------------
 
-function busError(message: string) {
+function busError(message: string): { status: "error"; error: BusError } {
   return {
-    status: "error" as const,
+    status: "error",
     error: { code: "data", message, run_id: null, session_id: null, child_run_id: null },
   };
 }
