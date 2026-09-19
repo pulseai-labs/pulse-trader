@@ -62,7 +62,7 @@ pub fn parse_indicator_specs(raw: &[String]) -> anyhow::Result<Vec<IndicatorColu
     // The engine dedups specs, but the viewer renders one column per flag — so
     // repeated `--indicator` flags would print duplicate columns. Dedup here,
     // order-preserving, keyed on the case-normalized `kind:period` label (which
-    // is 1:1 with the parsed spec for rsi/ema/adx).
+    // is 1:1 with the parsed spec for rsi/ema/adx/atr).
     let mut seen = HashSet::new();
     let mut columns = Vec::with_capacity(tokens.len());
     for token in &tokens {
@@ -85,11 +85,12 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
         "rsi" => IndicatorSpec::Rsi { period: fixed },
         "ema" => IndicatorSpec::Ema { period: fixed },
         "adx" => IndicatorSpec::Adx { period: fixed },
+        "atr" => IndicatorSpec::Atr { period: fixed },
         "macd" => anyhow::bail!(
             "invalid --indicator {token:?}: MACD needs fast/slow/signal and is not supported by <kind>:<period>"
         ),
         _ => anyhow::bail!(
-            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, or adx)"
+            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, adx, or atr)"
         ),
     };
     Ok(IndicatorColumn {
@@ -333,12 +334,13 @@ mod tests {
         match spec {
             IndicatorSpec::Rsi { period }
             | IndicatorSpec::Ema { period }
-            | IndicatorSpec::Adx { period } => match period {
+            | IndicatorSpec::Adx { period }
+            | IndicatorSpec::Atr { period } => match period {
                 SweepableValue::Fixed(period) => *period,
                 SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
             },
-            IndicatorSpec::Macd { .. } | IndicatorSpec::Atr { .. } => {
-                panic!("MACD/ATR are not part of kind:period parsing")
+            IndicatorSpec::Macd { .. } => {
+                panic!("MACD is not part of kind:period parsing")
             }
         }
     }
@@ -360,6 +362,15 @@ mod tests {
         assert_eq!(repeated[1].label, "adx:14");
         assert!(matches!(repeated[1].spec, IndicatorSpec::Adx { .. }));
         assert_eq!(fixed_period(&repeated[1].spec), 14);
+
+        // `atr:<period>` parses too (r2.s2 round-1 fix F5): the engine builds
+        // `IndicatorSpec::Atr`, so `pulse indicators` / MCP `export_indicators`
+        // can inspect the ATR an `AtrStop` sizes against.
+        let atr = parse_indicator_specs(&["atr:14".to_owned()]).expect("atr:14 parses");
+        assert_eq!(atr.len(), 1);
+        assert_eq!(atr[0].label, "atr:14");
+        assert!(matches!(atr[0].spec, IndicatorSpec::Atr { .. }));
+        assert_eq!(fixed_period(&atr[0].spec), 14);
 
         let defaults = parse_indicator_specs(&[]).expect("defaults parse");
         assert_eq!(

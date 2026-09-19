@@ -607,7 +607,7 @@ impl PulseMcp {
 
     /// Export one row per candle of the requested indicator specs.
     #[tool(
-        description = "Export per-candle indicator values (e.g. rsi:14, ema:50) as CSV under the server exports dir: open_time plus one column per spec, blank while the engine warms."
+        description = "Export per-candle indicator values (e.g. rsi:14, ema:50, atr:14) as CSV under the server exports dir: open_time plus one column per spec, blank while the engine warms."
     )]
     async fn export_indicators(
         &self,
