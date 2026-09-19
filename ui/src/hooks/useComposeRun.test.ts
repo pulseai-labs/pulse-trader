@@ -62,8 +62,8 @@ function finalizeResult() {
         direction: "long",
         entry: "rsi(14) < 30",
         filters: ["close > ema(200)"],
-        exits: ["stop_loss 5%"],
-        risk: ["risk_per_trade 1%"],
+        exits: ["stop 5%"],
+        risk: ["risk 1% per trade"],
       },
     },
   };

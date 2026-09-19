@@ -270,11 +270,11 @@ async fn overview_lists_every_strategy_and_version_with_stats_iff_a_run_exists()
         assert_eq!(version.dsl.entry, vec!["rsi(14) < 30".to_owned()]);
         assert_eq!(
             version.dsl.exits,
-            vec!["stop loss 5%".to_owned(), "take profit 2R".to_owned()]
+            vec!["stop 5%".to_owned(), "take profit 2R".to_owned()]
         );
         assert_eq!(
             version.dsl.risk,
-            vec!["risk per trade 1%".to_owned(), "max leverage 3x".to_owned()]
+            vec!["risk 1% per trade".to_owned(), "max leverage 3x".to_owned()]
         );
         assert!(
             version.dsl.filters.is_empty(),

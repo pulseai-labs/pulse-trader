@@ -52,12 +52,13 @@ pub use commands::{
     BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
     DesktopState, OperationGuard, OperationKey, ShellInfo, StreamOutcome, compare_child_run_core,
     compose_strategy_core, demo_stream_core, library_overview_core, run_backtest_version_core,
-    shell_info_core,
+    shell_info_core, summarize_dsl,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
 pub use library::{
     DslSummary, LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, VersionStats,
+    dsl_summary,
 };
 
 /// Build the `tauri-specta` builder that owns the command registry.
