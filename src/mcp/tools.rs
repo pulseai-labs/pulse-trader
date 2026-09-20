@@ -389,7 +389,7 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
 impl PulseMcp {
     /// List strategies with their version trees (parent-first order).
     #[tool(
-        description = "List strategies with their version trees in parent-first order. Pass include_archived to include archived strategies."
+        description = "List strategies with their version trees in parent-first order. The result is an object carrying the tree under `strategies`. Pass include_archived to include archived strategies."
     )]
     async fn list_strategies(
         &self,
@@ -436,7 +436,7 @@ impl PulseMcp {
     /// report §10; a dedicated repository method is a future seam, not this
     /// work item).
     #[tool(
-        description = "List the backtest runs recorded against a strategy version: headline stats plus persisted input provenance."
+        description = "List the backtest runs recorded against a strategy version: headline stats plus persisted input provenance. The result is an object carrying the rows under `runs`."
     )]
     async fn list_runs(
         &self,
