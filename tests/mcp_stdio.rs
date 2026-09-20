@@ -164,10 +164,12 @@ async fn strategy_and_version_tools_return_the_seed() {
 
 /// #183: the MCP spec types `structuredContent` as a JSON OBJECT — Claude
 /// Code's tools/call validator refuses anything else (`expected: record`,
-/// the failure the r2.s1 walk hit). Asserted over the wire for ALL nine
-/// tools, with `list_strategies`'s `{"strategies": [...]}` envelope and the
-/// content text block's parity checked explicitly — a bare array must never
-/// come back.
+/// the failure the r2.s1 walk hit). The object invariant itself is carried
+/// by `support::mcp::call`, which asserts it on every happy-path tools/call
+/// in the suite; this test adds what the choke point cannot see —
+/// `list_strategies`'s `{"strategies": [...]}` envelope with the content
+/// text block's parity checked explicitly, and each list tool's envelope
+/// key read back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_tools_structured_content_is_an_object() {
     let (fixture, client) = seeded_fixture().await;
@@ -210,22 +212,29 @@ async fn every_tools_structured_content_is_an_object() {
         "the content text block echoes structuredContent"
     );
 
-    // Table-driven over the other eight tools: every success result's
-    // structuredContent is an object — a future list tool cannot regress to
-    // a bare array without failing here.
+    // Table-driven over the other eight tools: `call` asserts the object
+    // shape on each, and each row names its list tool's envelope key so a
+    // typo'd or copy-pasted key fails here — `is_object()` alone cannot
+    // catch one.
     let dsl: Value = serde_json::from_str(MINIMAL_DSL).expect("MINIMAL_DSL parses");
-    for (tool, args) in [
-        ("get_version", json!({ "version_id": child.as_str() })),
-        ("list_runs", json!({ "version_id": child.as_str() })),
-        ("get_run", json!({ "run_id": run.as_str() })),
-        ("export_trades", json!({ "run_id": run.as_str() })),
+    for (tool, args, list_key) in [
+        ("get_version", json!({ "version_id": child.as_str() }), None),
+        (
+            "list_runs",
+            json!({ "version_id": child.as_str() }),
+            Some("runs"),
+        ),
+        ("get_run", json!({ "run_id": run.as_str() }), None),
+        ("export_trades", json!({ "run_id": run.as_str() }), None),
         (
             "export_candles",
             json!({ "pair": "BTCUSDT", "timeframe": "15m" }),
+            None,
         ),
         (
             "export_indicators",
             json!({ "pair": "BTCUSDT", "timeframe": "15m", "indicators": ["rsi:14"] }),
+            None,
         ),
         (
             "submit_strategy_version",
@@ -234,16 +243,22 @@ async fn every_tools_structured_content_is_an_object() {
                 "dsl": dsl,
                 "hypothesis": "object-shape probe",
             }),
+            None,
         ),
         // The parent has no runs — the call resolves the app defaults and
         // backtests over the copied fixture.
-        ("run_backtest", json!({ "version_id": parent.as_str() })),
+        (
+            "run_backtest",
+            json!({ "version_id": parent.as_str() }),
+            None,
+        ),
     ] {
         let structured = call(&client, tool, args).await;
-        assert!(
-            structured.is_object(),
-            "{tool} structuredContent must be a JSON object: {structured}"
-        );
+        if let Some(key) = list_key {
+            structured[key].as_array().unwrap_or_else(|| {
+                panic!("{tool} carries its entries under `{key}`: {structured}")
+            });
+        }
     }
 
     client.cancel().await.expect("cancel session");

@@ -326,6 +326,11 @@ pub fn arguments(value: &Value) -> serde_json::Map<String, Value> {
 /// Call a tool and return its `structuredContent`; fails the test on a wire or
 /// tool-level error instead of letting a `None` slide through. Negative paths
 /// must call `client.call_tool` DIRECTLY (this helper asserts success).
+///
+/// The returned content is asserted a JSON OBJECT — the #183 invariant: the
+/// spec types `structuredContent` as an object and Claude Code's validator
+/// refuses a bare array. Every happy-path call in the suite funnels through
+/// here, so the rule is enforced at the choke point, not per test.
 pub async fn call(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &str,
@@ -340,9 +345,14 @@ pub async fn call(
         "tools/call {name} returned is_error: {:?}",
         result.content
     );
-    result
+    let structured = result
         .structured_content
-        .unwrap_or_else(|| panic!("tools/call {name} carried no structuredContent"))
+        .unwrap_or_else(|| panic!("tools/call {name} carried no structuredContent"));
+    assert!(
+        structured.is_object(),
+        "tools/call {name} structuredContent must be a JSON object: {structured}"
+    );
+    structured
 }
 
 /// Call a tool EXPECTING a tool-level error and return its structured error
@@ -363,9 +373,14 @@ pub async fn call_err(
         "tools/call {name} should have failed, got: {:?}",
         result.content
     );
-    result
+    let structured = result
         .structured_content
-        .unwrap_or_else(|| panic!("tools/call {name} error carried no structuredContent"))
+        .unwrap_or_else(|| panic!("tools/call {name} error carried no structuredContent"));
+    assert!(
+        structured.is_object(),
+        "tools/call {name} structured error content must be a JSON object: {structured}"
+    );
+    structured
 }
 
 /// The whole seeded fixture: db, copied store, and their tempdir guards.
