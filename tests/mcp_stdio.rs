@@ -267,7 +267,7 @@ async fn every_tools_structured_content_is_an_object() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_tools_return_the_seeded_run() {
     let (fixture, client) = seeded_fixture().await;
-    let (_parent, child, run) = &fixture.seed;
+    let (parent, child, run) = &fixture.seed;
     let child_id = child.as_str().to_owned();
     let run_id = run.as_str().to_owned();
 
@@ -283,6 +283,16 @@ async fn run_tools_return_the_seeded_run() {
     assert_eq!(row["inputs"]["primary"]["timeframe"], "15m");
     assert_eq!(row["inputs"]["primary"]["data_version"], "v-primary");
     assert_eq!(row["inputs"]["htf"]["data_version"], "v-htf");
+
+    // --- list_runs on the parent: the empty-list envelope (#183's
+    // fresh-install case, and the only place a fallback can land). The
+    // seeded run is on the child, so the result must still be an object
+    // carrying `runs` as an EMPTY array — never a missing key, never `{}`.
+    let empty = call(&client, "list_runs", json!({"version_id": parent.as_str()})).await;
+    let empty_runs = empty["runs"]
+        .as_array()
+        .expect("an empty list still carries the `runs` key");
+    assert!(empty_runs.is_empty(), "the parent has no runs: {empty}");
 
     // --- get_run: summary + aggregates + integrity fields, no inline trades.
     let detail = call(&client, "get_run", json!({"run_id": run_id})).await;
