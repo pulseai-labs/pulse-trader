@@ -608,7 +608,7 @@ fn fill_pending_entry(
             atr_stop_price(entry_price, atr, multiple, direction)
         }
     };
-    // r2.s2 review fix: the F4 geometry guard hoisted out of the `Atr` arm — it
+    // r2.s2 round-3 fix: the F4 geometry guard hoisted out of the `Atr` arm — it
     // must reject a zero stop DISTANCE too, not only a non-positive price. A
     // flat series (`high == low == prev_close` on every bar) drives the frozen
     // ATR to exactly 0, so `atr_stop_price` resolves `stop == entry`: positive,

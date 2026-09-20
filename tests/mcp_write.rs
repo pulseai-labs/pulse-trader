@@ -769,7 +769,7 @@ async fn run_backtest_unknown_version_is_refused() {
     client.cancel().await.expect("cancel session");
 }
 
-/// r2.s2 review fix — a schema-1.1.0 child whose entry reads the H4 close, run
+/// r2.s2 round-3 fix — a schema-1.1.0 child whose entry reads the H4 close, run
 /// against a parent whose recorded inputs name no HTF snapshot. The resolver
 /// inherits `htf_timeframe: None` and falls back to the application default
 /// `Some(H4)` at HEAD, so `run_backtest` RUNS the child over the store's real

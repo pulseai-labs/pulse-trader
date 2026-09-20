@@ -46,7 +46,7 @@
 //! - **(m)** a flat series drives the frozen ATR to exactly `0`, so the stop
 //!   resolves to `stop == entry` — positive, which the arm-local check missed
 //!   — and the hoisted geometry guard refuses `ImpossibleStop`, never the
-//!   generic `NoStopLoss` (review fix, same class as F4).
+//!   generic `NoStopLoss` (round-3 fix, same class as F4).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -1311,7 +1311,7 @@ fn atr_stop_resolving_non_positive_is_a_typed_refusal() {
 }
 
 // ---------------------------------------------------------------------------
-// (m) a ZERO-distance ATR stop is the same typed refusal (review fix)
+// (m) a ZERO-distance ATR stop is the same typed refusal (round-3 fix)
 // ---------------------------------------------------------------------------
 
 /// The boundary F4's arm-local `stop <= 0` check missed: a flat series where

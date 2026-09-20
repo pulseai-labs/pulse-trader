@@ -266,7 +266,7 @@ pub async fn seed_real_run(db: &Db, store_dir: &Path, version_id: &VersionId) ->
 /// [`seed_real_run`] without the HTF snapshot: the persisted run records
 /// `inputs.htf = None`, which is what leaves a child's resolved request without
 /// an inherited HTF timeframe — the resolver's `Some(H4)` fallback trigger for
-/// an htf-needing child (r2.s2 review fix).
+/// an htf-needing child (r2.s2 round-3 fix).
 pub async fn seed_real_run_primary_only(
     db: &Db,
     store_dir: &Path,

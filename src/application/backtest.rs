@@ -1037,7 +1037,7 @@ fn inputs_from_run(
 /// run's exact `data_version`s — an agent run is then comparable with the run
 /// it iterates on. `window` is NEVER inherited: it is always the caller's.
 ///
-/// One correction sits on top of the inherit (r2.s2 review fix): when the prior
+/// One correction sits on top of the inherit (r2.s2 round-3 fix): when the prior
 /// run recorded **no** HTF selection and the version's compiled strategy needs
 /// one (`needs_htf()`), `htf_timeframe` falls back to the application default
 /// `H4` at `HEAD` — identical to the no-run path, pin included. Neither
@@ -1080,7 +1080,7 @@ where
     Ok(match inherited {
         Some(inputs) => {
             let mut request = request_from_inputs(version_id, inputs, window);
-            // r2.s2 review fix: an htf-needing version inheriting a run that
+            // r2.s2 round-3 fix: an htf-needing version inheriting a run that
             // recorded NO HTF selection must not mint `htf_timeframe: None` —
             // `run_version_backtest` would refuse it as `HtfRequired`, a field
             // no surface can set, dead-ending the iterate path. Fall back to
@@ -1706,7 +1706,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_default_request_defaults_htf_when_an_htf_version_inherits_none() {
-        // r2.s2 review fix: the parent's run is M15-only (`inputs.htf` None)
+        // r2.s2 round-3 fix: the parent's run is M15-only (`inputs.htf` None)
         // and the child's compiled strategy needs HTF. An unconditional `None`
         // inherit would mint a request `run_version_backtest` refuses as
         // `HtfRequired` — a field neither surface can set — so the resolver

@@ -299,7 +299,7 @@ async fn htf_provenance_is_recorded_and_reloads_after_both_heads_move() {
 }
 
 // ---------------------------------------------------------------------------
-// 2b. r2.s2 review fix — an `htf` child inheriting an M15-only run runs on H4
+// 2b. r2.s2 round-3 fix — an `htf` child inheriting an M15-only run runs on H4
 // ---------------------------------------------------------------------------
 
 /// A schema-1.1.0 document whose entry reads the H4 close — the operand shape
@@ -323,7 +323,7 @@ const HTF_OPERAND_DSL: &str = r#"{
 /// snapshot its inherited request does not name: the parent's recorded inputs
 /// are M15-only, so `resolve_default_request` inherits `htf_timeframe: None`
 /// for the child that adds the `htf` operand — then falls back to the
-/// application default `Some(H4)` at HEAD (r2.s2 review fix), the same default
+/// application default `Some(H4)` at HEAD (r2.s2 round-3 fix), the same default
 /// the no-run path mints. The child RUNS over the fixture's real H4 snapshot,
 /// and the persisted `inputs.htf` records the selection the operand was
 /// evaluated against — never a silent evaluation against primary candles.
