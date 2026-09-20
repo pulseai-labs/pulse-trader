@@ -43,6 +43,10 @@
 //!   typed `HtfPairMismatch` before alignment — `Series::Htf` operands must
 //!   never read another symbol's bars — while a matching pair still runs
 //!   (round-2 fix G1).
+//! - **(m)** a flat series drives the frozen ATR to exactly `0`, so the stop
+//!   resolves to `stop == entry` — positive, which the arm-local check missed
+//!   — and the hoisted geometry guard refuses `ImpossibleStop`, never the
+//!   generic `NoStopLoss` (review fix, same class as F4).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -1303,6 +1307,62 @@ fn atr_stop_resolving_non_positive_is_a_typed_refusal() {
     assert!(
         matches!(err, BacktestError::ImpossibleStop(_)),
         "expected ImpossibleStop, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (m) a ZERO-distance ATR stop is the same typed refusal (review fix)
+// ---------------------------------------------------------------------------
+
+/// The boundary F4's arm-local `stop <= 0` check missed: a flat series where
+/// every bar has `high == low == prev_close` drives ATR to exactly `0`, so
+/// `atr_stop_price` resolves `stop == entry` — a positive price that passed
+/// the old check — and the sizer's zero-distance branch then failed the run
+/// as the generic `NoStopLoss` ("the strategy has no stop loss") for a
+/// strategy that DID declare an `AtrStop`. The hoisted guard in
+/// `fill_pending_entry` refuses it as `ImpossibleStop`.
+#[test]
+fn atr_stop_resolving_to_zero_distance_is_a_typed_refusal() {
+    // Every bar identical (`open = high = low = close = 100`): TR = 0 on every
+    // bar, so ATR(5) reads exactly 0 once warm, and the stop resolves to
+    // `entry − 2·0 = entry` — zero distance, positive price.
+    let candles: Vec<Candle> = (0..10)
+        .map(|i| {
+            let open_time = i * Timeframe::M15.duration_ms();
+            Candle {
+                open_time,
+                close_time: open_time + Timeframe::M15.duration_ms() - 1,
+                open: dec(100, 0),
+                high: dec(100, 0),
+                low: dec(100, 0),
+                close: dec(100, 0),
+                volume: dec(1, 0),
+                funding_rate: None,
+            }
+        })
+        .collect();
+    let primary = series(Timeframe::M15, candles);
+    let strategy = dsl(
+        compare(
+            primary_price(PriceField::Close),
+            Comparator::Gt,
+            constant(0, 0),
+        ),
+        vec![atr_stop(5, 2, 0)],
+        Direction::Long,
+    );
+    let err = run_backtest(
+        &compiled(&strategy),
+        &primary,
+        None,
+        &zero_slippage(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+    )
+    .expect_err("a zero-distance ATR stop must refuse");
+    assert!(
+        matches!(err, BacktestError::ImpossibleStop(_)),
+        "expected ImpossibleStop — not the generic NoStopLoss — got {err:?}"
     );
 }
 

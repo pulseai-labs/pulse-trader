@@ -605,21 +605,27 @@ fn fill_pending_entry(
             let Some(atr) = pending.atr_at_signal else {
                 return Ok(());
             };
-            let stop = atr_stop_price(entry_price, atr, multiple, direction);
-            // r2.s2 round-1 fix F4: `multiple × ATR >= entry` on a long
-            // resolves to a non-positive stop — a level that can never fill.
-            // Zero would surface as the generic `NoStopLoss` and a negative
-            // would size on its absolute distance, both silently wrong, so the
-            // fill refuses with the typed error the short-TP leg already has.
-            if stop <= Decimal::ZERO {
-                return Err(BacktestError::ImpossibleStop(format!(
-                    "ATR stop {multiple} × ATR {atr} from entry {entry_price} \
-                     resolves to a non-positive price {stop}"
-                )));
-            }
-            stop
+            atr_stop_price(entry_price, atr, multiple, direction)
         }
     };
+    // r2.s2 review fix: the F4 geometry guard hoisted out of the `Atr` arm — it
+    // must reject a zero stop DISTANCE too, not only a non-positive price. A
+    // flat series (`high == low == prev_close` on every bar) drives the frozen
+    // ATR to exactly 0, so `atr_stop_price` resolves `stop == entry`: positive,
+    // it passed the arm-local check, and `risk_capped_qty` then failed the
+    // whole run as the generic `NoStopLoss` for a strategy that DID declare an
+    // `AtrStop`. The typed `ImpossibleStop` fires here for both shapes.
+    // Hoisting is behaviour-preserving for `Pct`: validate rule 6 pins
+    // `distance_pct` to the open interval (0, 1), so a Pct stop can be neither
+    // non-positive nor zero-distance.
+    let stop_distance = (entry_price - stop).abs();
+    if stop <= Decimal::ZERO || stop_distance.is_zero() {
+        return Err(BacktestError::ImpossibleStop(format!(
+            "{:?} stop from entry {entry_price} resolves to stop {stop} — \
+             non-positive or zero stop distance",
+            plan.stop
+        )));
+    }
     // The shared exchange-constrained sizer (NFR-3, C8): one sizing path for sim
     // and (future v3) live. `NoStopLoss` (zero stop distance) still propagates
     // fail-fast (G5/#20). A `Skipped` outcome consumes the pending entry (it is
