@@ -175,6 +175,16 @@ fn tool_error(message: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::structured_error(json!({ "message": message.to_string() }))
 }
 
+/// The list-tool result seam (#183): the MCP spec types `structuredContent`
+/// as a JSON object — Claude Code's tools/call validator refuses a bare
+/// array — so the entries go under a named key. `CallToolResult::structured`
+/// renders the same object into the content text block, keeping the two
+/// consistent.
+fn structured_list(key: &'static str, entries: impl serde::Serialize) -> CallToolResult {
+    let entries = serde_json::to_value(entries).unwrap_or_else(|_| json!([]));
+    CallToolResult::structured(json!({ key: entries }))
+}
+
 /// Parse a timeframe token the way the wire names it (`15m`/`4h`), accepting
 /// the CLI spellings (`M15`/`H4`) as aliases.
 fn parse_timeframe(raw: &str) -> Result<Timeframe, String> {
@@ -387,9 +397,7 @@ impl PulseMcp {
             };
             entries.push(strategy_entry(strategy, versions));
         }
-        Ok(CallToolResult::structured(
-            serde_json::to_value(entries).unwrap_or_else(|_| json!([])),
-        ))
+        Ok(structured_list("strategies", entries))
     }
 
     /// Fetch one immutable strategy version by id.
@@ -448,9 +456,7 @@ impl PulseMcp {
                 Err(e) => return Ok(tool_error(e)),
             }
         }
-        Ok(CallToolResult::structured(
-            serde_json::to_value(entries).unwrap_or_else(|_| json!([])),
-        ))
+        Ok(structured_list("runs", entries))
     }
 
     /// Fetch one persisted run: summary, regime breakdown, skipped entries,
