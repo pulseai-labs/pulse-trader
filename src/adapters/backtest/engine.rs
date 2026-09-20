@@ -627,7 +627,10 @@ fn fill_pending_entry(
         )));
     }
     // The shared exchange-constrained sizer (NFR-3, C8): one sizing path for sim
-    // and (future v3) live. `NoStopLoss` (zero stop distance) still propagates
+    // and (future v3) live. From this path it only ever sees a positive stop
+    // with positive distance — the geometry guard above refuses anything else
+    // as `ImpossibleStop`, so its `NoStopLoss` (zero distance) branch is
+    // unreachable here; any error the sizer does return still propagates
     // fail-fast (G5/#20). A `Skipped` outcome consumes the pending entry (it is
     // NOT retried) and increments the matching `SkippedEntryCounts` cell.
     let qty = match compute_position_size(

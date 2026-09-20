@@ -36,9 +36,11 @@
 //!   paired closed H4 bar — a `Not(...)` over an absent `Htf` operand reads
 //!   `true`, so the gate must not be vacuous for a Price-leaf-only strategy
 //!   (round-1 fix F3).
-//! - **(k)** an ATR-derived stop resolving to a non-positive price refuses with
-//!   the typed `ImpossibleStop` — not the generic `NoStopLoss`, not a silent
-//!   skip (round-1 fix F4).
+//! - **(k)** an ATR-derived stop resolving to an untradeable level — a
+//!   non-positive price, or `stop == entry` on a flat series (zero distance;
+//!   case (m)) — refuses with the typed `ImpossibleStop`, not the generic
+//!   `NoStopLoss`, not a silent skip (round-1 fix F4; the zero-distance leg
+//!   is r2.s2 round-3).
 //! - **(l)** a supplied HTF series for a DIFFERENT pair is refused with the
 //!   typed `HtfPairMismatch` before alignment — `Series::Htf` operands must
 //!   never read another symbol's bars — while a matching pair still runs

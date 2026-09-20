@@ -54,12 +54,16 @@ pub enum BacktestError {
     #[error("impossible take-profit geometry: {0}")]
     ImpossibleTakeProfit(String),
 
-    /// An ATR-derived stop resolved to a non-positive price (`multiple × ATR ≥
-    /// entry` on a long, so `entry − multiple × ATR ≤ 0`). A zero stop would
-    /// collapse into the generic `NoStopLoss` and a negative one would size off
-    /// its absolute distance while never being fillable — both silently wrong —
-    /// so the loop refuses at the seam where the stop is derived, mirroring
-    /// [`BacktestError::ImpossibleTakeProfit`] (r2.s2 round-1 fix F4).
+    /// The resolved stop leaves untradeable geometry: a non-positive price
+    /// (`multiple × ATR ≥ entry` on a long, so `entry − multiple × ATR ≤ 0`)
+    /// or a zero stop distance (`stop == entry`, a flat series driving the
+    /// frozen ATR to exactly 0). A zero distance would collapse into the
+    /// generic `NoStopLoss` and a negative one would size off its absolute
+    /// distance while never being fillable — both silently wrong — so the
+    /// fill refuses at the seam where the stop is derived, for every stop
+    /// kind, mirroring [`BacktestError::ImpossibleTakeProfit`] (r2.s2 round-1
+    /// fix F4; the zero-distance leg and the hoist out of the `Atr` arm are
+    /// r2.s2 round-3).
     #[error("impossible ATR stop: {0}")]
     ImpossibleStop(String),
 
