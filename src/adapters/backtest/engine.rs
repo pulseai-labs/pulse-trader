@@ -267,12 +267,14 @@ pub fn run_backtest(
 /// a supplied "higher" timeframe that is not strictly higher than the
 /// primary — compared by `Timeframe::duration_ms`, so the rule holds for any
 /// pair — would advance `Series::Htf` operands on the wrong cadence while the
-/// DSL renders them as the HTF (r2.s2 round-1 fix F1), and a supplied series
+/// DSL renders them as the HTF (r2.s2 round-1 fix F1), a supplied series
 /// for a DIFFERENT pair would feed `Series::Htf` operands another symbol's
-/// bars — mixed-symbol signals with nothing red (r2.s2 round-2 fix G1). The
-/// timeframe refusal also lives at the request boundary; the missing-HTF and
-/// pair checks are defence-in-depth (the request carries no second pair), for
-/// callers that construct the series directly.
+/// bars — mixed-symbol signals with nothing red (r2.s2 round-2 fix G1), and an
+/// HTF series ending more than one HTF interval before the primary's end would
+/// leave `Series::Htf` operands reading the frozen FINAL HTF bar for the rest
+/// of the run (r2.s2 round-5). The timeframe refusal also lives at the request
+/// boundary; the missing-HTF and pair checks are defence-in-depth (the request
+/// carries no second pair), for callers that construct the series directly.
 fn check_htf_inputs(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -295,6 +297,27 @@ fn check_htf_inputs(
         if htf_series.timeframe.duration_ms() <= primary.timeframe.duration_ms() {
             return Err(BacktestError::HtfNotHigher {
                 primary: primary.timeframe,
+                htf: htf_series.timeframe,
+            });
+        }
+        // r2.s2 round-5: `align` advances its HTF pointer forward-only and
+        // never clears it, so once the HTF candles run out every later primary
+        // bar still pairs with the FINAL one — `Series::Htf` operands would
+        // read a frozen, stale bar for the rest of the run (silent wrong
+        // trades, not a loud failure). The primary and HTF snapshots load
+        // independently with no coverage invariant between them, and an M15
+        // HEAD routinely extends past an H4 HEAD, so this is reachable. One
+        // interval of slack is allowed: at most one not-yet-closed HTF bar may
+        // be pending, the normal live shape. An empty HTF series is legal
+        // (r2.s1.w3) and skipped — `align` then yields `htf: None` per bar and
+        // the paired-bar gate closes entries outright.
+        if let (Some(primary_last), Some(htf_last)) =
+            (primary.candles.last(), htf_series.candles.last())
+            && primary_last.close_time - htf_last.close_time > htf_series.timeframe.duration_ms()
+        {
+            return Err(BacktestError::HtfCoverageShort {
+                primary_end: primary_last.close_time,
+                htf_end: htf_last.close_time,
                 htf: htf_series.timeframe,
             });
         }

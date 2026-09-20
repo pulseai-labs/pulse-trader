@@ -49,17 +49,23 @@
 //!   resolves to `stop == entry` — positive, which the arm-local check missed
 //!   — and the hoisted geometry guard refuses `ImpossibleStop`, never the
 //!   generic `NoStopLoss` (round-3 fix, same class as F4).
+//! - **(n)** an HTF series whose coverage ends more than one HTF interval
+//!   before the primary's end is the typed `HtfCoverageShort` refusal — on the
+//!   versioned/application path AND the `pulse backtest --dsl` CLI path —
+//!   because `align` pairs forward-only and would otherwise read the frozen
+//!   final HTF bar for the rest of the run; the one-interval-short live shape
+//!   and the empty (windowed) HTF slice still run (r2.s2 round-5).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
 
 use pulse::{
     BacktestAppError, BacktestConfig, BacktestError, BacktestRequest, BacktestResult,
-    BinanceAdapter, Candle, CandleSeries, CandleStore, Comparator, CompiledStrategy, Condition,
-    CreatedBy, DataVersion, Db, Direction, ExitReason, ExitRule, IndicatorSpec, MIGRATOR,
-    NewVersion, Pair, PriceField, RiskParams, SchemaVersion, Series, SeriesEnd,
-    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue,
-    SymbolFilters, Timeframe, ValueSource, atr_stop_price, compile, run_backtest,
+    BinanceAdapter, Candle, CandleSeries, CandleSeriesRepository, CandleStore, Comparator,
+    CompiledStrategy, Condition, CreatedBy, DataVersion, Db, Direction, ExitReason, ExitRule,
+    IndicatorSpec, MIGRATOR, NewVersion, Pair, PriceField, RiskParams, SchemaVersion, Series,
+    SeriesEnd, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
+    SweepableValue, SymbolFilters, Timeframe, ValueSource, atr_stop_price, compile, run_backtest,
     run_version_backtest, stop_price, validate,
 };
 use rust_decimal::Decimal;
@@ -1365,6 +1371,202 @@ fn atr_stop_resolving_to_zero_distance_is_a_typed_refusal() {
     assert!(
         matches!(err, BacktestError::ImpossibleStop(_)),
         "expected ImpossibleStop — not the generic NoStopLoss — got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (n) a stale HTF series is a typed refusal (r2.s2 round-5)
+// ---------------------------------------------------------------------------
+
+/// The htf-operand DSL both stale-coverage proofs run (schema 1.1.0 JSON —
+/// `htf.close > 0` is the `Series::Htf` leaf that forces `needs_htf()`).
+const HTF_OPERAND_DSL: &str = r#"{
+  "schema_version": "1.1.0",
+  "name": "htf filter",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Price", "series": "htf", "field": "Close" },
+    "op": "Gt",
+    "rhs": { "type": "Constant", "value": "0" }
+  },
+  "filters": [],
+  "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+
+/// Seed `store_dir` with a LONG M15 series and an H4 series that ends well
+/// more than one H4 interval before it — 400 M15 bars span 25 H4 intervals,
+/// so 10 H4 bars leave coverage ~15 intervals short.
+fn seed_stale_htf_store(store_dir: PathBuf) {
+    let store = CandleStore::with_base_dir(store_dir);
+    let pair = Pair::new("BTCUSDT");
+    store
+        .commit(&pair, Timeframe::M15, flat_m15(400))
+        .expect("commit m15 snapshot");
+    store
+        .commit(
+            &pair,
+            Timeframe::H4,
+            (0..10).map(|j| h4(j, 100, 101, 99, 100)).collect(),
+        )
+        .expect("commit short h4 snapshot");
+}
+
+/// The versioned/application path: `run_version_backtest` loads both series
+/// independently (no coverage invariant between snapshots), so the engine
+/// seam is what refuses — `BacktestError::HtfCoverageShort` naming both ends
+/// and the HTF interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn htf_coverage_ending_early_is_a_typed_refusal_on_the_versioned_path() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open db");
+    MIGRATOR.run(db.pool()).await.expect("run migrations");
+
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let strategy = strategies
+        .create_strategy("htf-stale", None, &[])
+        .await
+        .expect("create strategy");
+    let version = strategies
+        .create_version(NewVersion {
+            strategy_id: strategy.id.clone(),
+            parent_version_id: None,
+            dsl_json: HTF_OPERAND_DSL.to_owned(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create version");
+
+    let store_dir = tmp.path().join("store");
+    seed_stale_htf_store(store_dir.clone());
+    let store = CandleStore::with_base_dir(store_dir);
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let err = run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &BacktestRequest {
+            version_id: version.id.clone(),
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: Some(Timeframe::H4),
+            config: BacktestConfig::default(),
+            snapshots: None,
+            window: None,
+        },
+    )
+    .await
+    .expect_err("an HTF series ending more than one interval early must refuse");
+
+    match err {
+        BacktestAppError::Engine(BacktestError::HtfCoverageShort {
+            primary_end,
+            htf_end,
+            htf,
+        }) => {
+            assert_eq!(htf, Timeframe::H4);
+            assert_eq!(primary_end, 400 * Timeframe::M15.duration_ms() - 1);
+            assert_eq!(htf_end, 10 * Timeframe::H4.duration_ms() - 1);
+        }
+        other => panic!("expected Engine(HtfCoverageShort), got {other:?}"),
+    }
+}
+
+/// The direct `pulse backtest --dsl` CLI path: `src/cli/backtest.rs` loads
+/// both series then calls `run_backtest`, so the same engine seam refuses —
+/// the run exits non-zero and the typed error's text reaches stderr.
+#[test]
+fn cli_backtest_refuses_a_stale_htf_series() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store_dir = tmp.path().join("store");
+    seed_stale_htf_store(store_dir.clone());
+    let dsl_path = tmp.path().join("strategy.json");
+    std::fs::write(&dsl_path, HTF_OPERAND_DSL).expect("write htf DSL");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "backtest",
+            "--dsl",
+            dsl_path.to_str().expect("dsl path is utf8"),
+            "--pair",
+            "BTCUSDT",
+            "--tf",
+            "M15",
+            "--htf",
+            "H4",
+            "--store",
+            store_dir.to_str().expect("store path is utf8"),
+        ])
+        .output()
+        .expect("run pulse backtest");
+
+    assert!(
+        !output.status.success(),
+        "a stale H4 series must exit non-zero; stdout was:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("higher-timeframe coverage ends") && stderr.contains("stale final bar"),
+        "stderr must carry the HtfCoverageShort refusal; stderr was:\n{stderr}"
+    );
+}
+
+/// One interval of slack is allowed — at most one not-yet-closed HTF bar may
+/// be pending, the normal live shape. 400 M15 bars span exactly 25 H4
+/// intervals, so a 24-bar H4 series ends exactly one interval before the
+/// primary's end and still runs.
+#[test]
+fn htf_coverage_within_one_interval_still_runs() {
+    let primary = series(Timeframe::M15, flat_m15(400));
+    let htf = series(
+        Timeframe::H4,
+        (0..24).map(|j| h4(j, 100, 101, 99, 100)).collect(),
+    );
+    let strategy = dsl(
+        compare(htf_price(PriceField::Close), Comparator::Gt, constant(0, 0)),
+        vec![stop_loss()],
+        Direction::Long,
+    );
+    let result = run(
+        &compiled(&strategy),
+        &primary,
+        Some(&htf),
+        SeriesEnd::SnapshotEnd,
+    );
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "the run must complete — htf.close > 0 fires once a closed H4 bar pairs"
+    );
+}
+
+/// An empty HTF series is legal (r2.s1.w3): `align` yields `htf: None` for
+/// every bar and the paired-bar gate closes entries outright — no refusal,
+/// no trades.
+#[test]
+fn empty_htf_series_is_legal_and_runs() {
+    let primary = series(Timeframe::M15, flat_m15(64));
+    let htf = series(Timeframe::H4, vec![]);
+    let strategy = dsl(
+        compare(htf_price(PriceField::Close), Comparator::Gt, constant(0, 0)),
+        vec![stop_loss()],
+        Direction::Long,
+    );
+    let result = run(
+        &compiled(&strategy),
+        &primary,
+        Some(&htf),
+        SeriesEnd::SnapshotEnd,
+    );
+    assert!(
+        result.trades.is_empty(),
+        "every aligned bar has `htf: None`, so no entry may fire"
     );
 }
 

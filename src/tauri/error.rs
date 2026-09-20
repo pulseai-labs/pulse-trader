@@ -227,10 +227,12 @@ impl From<BacktestAppError> for BusError {
             // surface reports the same variants as `field_error("inputs.htf", …)`).
             | BacktestAppError::HtfRequired { .. }
             | BacktestAppError::HtfNotHigher { .. }
-            // r2.s2 round-2 fix G1: a different-pair HTF series refusal is the
-            // same caller-correctable `inputs.htf` family — `validation`, not
-            // `backtest`.
-            | BacktestAppError::Engine(BacktestError::HtfPairMismatch { .. })
+            // r2.s2 round-2 fix G1 + round-5: a different-pair or stale
+            // (too-short) HTF series refusal is the same caller-correctable
+            // `inputs.htf` family — `validation`, not `backtest`.
+            | BacktestAppError::Engine(
+                BacktestError::HtfPairMismatch { .. } | BacktestError::HtfCoverageShort { .. },
+            )
             | BacktestAppError::WindowEmpty { .. } => BusErrorCode::Validation,
             BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
             BacktestAppError::Engine(_) => BusErrorCode::Backtest,

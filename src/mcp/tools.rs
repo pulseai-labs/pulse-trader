@@ -353,12 +353,13 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         BacktestAppError::HtfRequired { field } | BacktestAppError::HtfNotHigher { field, .. } => {
             field_error(field, err)
         }
-        // r2.s2 round-2 fix G1: a different-pair HTF series is refused by the
-        // engine (the request itself carries only one pair, so no app-layer
-        // variant exists) — surface it on the same `inputs.htf` field.
-        BacktestAppError::Engine(BacktestError::HtfPairMismatch { .. }) => {
-            field_error("inputs.htf", err)
-        }
+        // r2.s2 round-2 fix G1 + round-5: a different-pair or stale
+        // (too-short) HTF series is refused by the engine (the request itself
+        // carries only one pair, so no app-layer variant exists) — surface
+        // both on the same `inputs.htf` field.
+        BacktestAppError::Engine(
+            BacktestError::HtfPairMismatch { .. } | BacktestError::HtfCoverageShort { .. },
+        ) => field_error("inputs.htf", err),
         _ => tool_error(err),
     }
 }

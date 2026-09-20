@@ -117,4 +117,30 @@ pub enum BacktestError {
         /// The supplied higher-timeframe series' trading pair.
         htf: Pair,
     },
+
+    /// The supplied higher-timeframe series ends more than one HTF interval
+    /// before the primary series ends. `align` advances its HTF pointer
+    /// forward-only and never clears it, so once the HTF candles are exhausted
+    /// every later primary bar would still pair with the FINAL one — `Series::Htf`
+    /// operands reading a frozen, stale bar for the rest of the run: silent
+    /// wrong trades, not a loud failure. One interval of slack is allowed —
+    /// at most one not-yet-closed HTF bar may be pending, the normal live
+    /// shape — and an empty HTF series is skipped (legal per r2.s1.w3: `align`
+    /// then yields `htf: None` per bar and the paired-bar gate closes entries
+    /// outright). The refusal lives in `check_htf_inputs`, the seam that owns
+    /// the other HTF input invariants (r2.s2 round-5).
+    #[error(
+        "higher-timeframe coverage ends at close_time {htf_end}, more than one {htf:?} interval \
+         before the primary series ends at {primary_end} — `Series::Htf` operands would read \
+         a stale final bar"
+    )]
+    HtfCoverageShort {
+        /// The primary series' last candle `close_time` (epoch ms).
+        primary_end: i64,
+        /// The supplied higher-timeframe series' last candle `close_time` (epoch ms).
+        htf_end: i64,
+        /// The supplied higher-timeframe series' timeframe — the interval the
+        /// slack is measured in.
+        htf: Timeframe,
+    },
 }
