@@ -184,7 +184,14 @@ async fn every_tools_structured_content_is_an_object() {
         )
         .await
         .expect("list_strategies transport");
-    assert_eq!(result.is_error, Some(false));
+    // `!= Some(true)`, not `== Some(false)`: an ABSENT isError is spec-legal
+    // success — the same guard `call()` uses, so the suite carries one
+    // definition of success.
+    assert!(
+        result.is_error != Some(true),
+        "list_strategies returned is_error: {:?}",
+        result.content
+    );
     let structured = result
         .structured_content
         .as_ref()
@@ -201,7 +208,10 @@ async fn every_tools_structured_content_is_an_object() {
         "the seeded strategy is listed: {strategies:?}"
     );
     let echoed: Value = serde_json::from_str(
-        &result.content[0]
+        &result
+            .content
+            .first()
+            .expect("a text content block")
             .as_text()
             .expect("a text content block")
             .text,
