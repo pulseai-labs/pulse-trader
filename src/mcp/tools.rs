@@ -175,6 +175,27 @@ fn tool_error(message: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::structured_error(json!({ "message": message.to_string() }))
 }
 
+/// The list-tool result seam (#183): the MCP spec types `structuredContent`
+/// as a JSON object — Claude Code's tools/call validator refuses a bare
+/// array — so the entries go under a named key. `CallToolResult::structured`
+/// renders the same object into the content text block, keeping the two
+/// consistent.
+///
+/// A serialization failure refuses with `{"message"}` — it never degrades
+/// into a successful `{key: []}`: an empty list is a real answer, not a
+/// fallback (the same refuse-don't-return-empty rule [`resolve_version`]
+/// carries for unknown identifiers). The envelope is built by insertion, not
+/// `json!` — the macro would re-serialize the `Value` just produced.
+fn structured_list(key: &'static str, entries: impl serde::Serialize) -> CallToolResult {
+    let entries = match serde_json::to_value(entries) {
+        Ok(entries) => entries,
+        Err(e) => return tool_error(e),
+    };
+    let mut envelope = serde_json::Map::new();
+    envelope.insert(key.to_owned(), entries);
+    CallToolResult::structured(serde_json::Value::Object(envelope))
+}
+
 /// Parse a timeframe token the way the wire names it (`15m`/`4h`), accepting
 /// the CLI spellings (`M15`/`H4`) as aliases.
 fn parse_timeframe(raw: &str) -> Result<Timeframe, String> {
@@ -368,7 +389,7 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
 impl PulseMcp {
     /// List strategies with their version trees (parent-first order).
     #[tool(
-        description = "List strategies with their version trees in parent-first order. Pass include_archived to include archived strategies."
+        description = "List strategies with their version trees in parent-first order. The result is an object carrying the tree under `strategies`. Pass include_archived to include archived strategies."
     )]
     async fn list_strategies(
         &self,
@@ -387,9 +408,7 @@ impl PulseMcp {
             };
             entries.push(strategy_entry(strategy, versions));
         }
-        Ok(CallToolResult::structured(
-            serde_json::to_value(entries).unwrap_or_else(|_| json!([])),
-        ))
+        Ok(structured_list("strategies", entries))
     }
 
     /// Fetch one immutable strategy version by id.
@@ -417,7 +436,7 @@ impl PulseMcp {
     /// report §10; a dedicated repository method is a future seam, not this
     /// work item).
     #[tool(
-        description = "List the backtest runs recorded against a strategy version: headline stats plus persisted input provenance."
+        description = "List the backtest runs recorded against a strategy version: headline stats plus persisted input provenance. The result is an object carrying the rows under `runs`."
     )]
     async fn list_runs(
         &self,
@@ -448,9 +467,7 @@ impl PulseMcp {
                 Err(e) => return Ok(tool_error(e)),
             }
         }
-        Ok(CallToolResult::structured(
-            serde_json::to_value(entries).unwrap_or_else(|_| json!([])),
-        ))
+        Ok(structured_list("runs", entries))
     }
 
     /// Fetch one persisted run: summary, regime breakdown, skipped entries,

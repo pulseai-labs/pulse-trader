@@ -110,7 +110,7 @@ async fn strategy_and_version_tools_return_the_seed() {
 
     // --- list_strategies: the seeded tree, parent-first, created_by strings.
     let strategies = call(&client, "list_strategies", json!({})).await;
-    let strategies = strategies.as_array().expect("strategy array");
+    let strategies = strategies["strategies"].as_array().expect("strategy array");
     let demo = strategies
         .iter()
         .find(|s| s["name"] == "MCP demo")
@@ -132,7 +132,7 @@ async fn strategy_and_version_tools_return_the_seed() {
         json!({"include_archived": true}),
     )
     .await;
-    assert!(with_flag.as_array().expect("array").len() >= strategies.len());
+    assert!(with_flag["strategies"].as_array().expect("array").len() >= strategies.len());
 
     // --- get_version: migrated object + verbatim original + provenance.
     let version = call(&client, "get_version", json!({"version_id": child_id})).await;
@@ -162,16 +162,128 @@ async fn strategy_and_version_tools_return_the_seed() {
     client.cancel().await.expect("cancel session");
 }
 
+/// #183: the MCP spec types `structuredContent` as a JSON OBJECT — Claude
+/// Code's tools/call validator refuses anything else (`expected: record`,
+/// the failure the r2.s1 walk hit). The object invariant itself is carried
+/// by `support::mcp::call`, which asserts it on every happy-path tools/call
+/// in the suite; this test adds what the choke point cannot see —
+/// `list_strategies`'s `{"strategies": [...]}` envelope with the content
+/// text block's parity checked explicitly, and each list tool's envelope
+/// key read back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_tools_structured_content_is_an_object() {
+    let (fixture, client) = seeded_fixture().await;
+    let (parent, child, run) = &fixture.seed;
+
+    // The cited failure: an object carrying the tree under `strategies`, and
+    // the content text block renders the SAME object.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("list_strategies".to_owned())
+                .with_arguments(arguments(&json!({}))),
+        )
+        .await
+        .expect("list_strategies transport");
+    // `!= Some(true)`, not `== Some(false)`: an ABSENT isError is spec-legal
+    // success — the same guard `call()` uses, so the suite carries one
+    // definition of success.
+    assert!(
+        result.is_error != Some(true),
+        "list_strategies returned is_error: {:?}",
+        result.content
+    );
+    let structured = result
+        .structured_content
+        .as_ref()
+        .expect("list_strategies carries structuredContent");
+    assert!(
+        structured.is_object(),
+        "structuredContent must be a JSON object, not a bare array: {structured}"
+    );
+    let strategies = structured["strategies"]
+        .as_array()
+        .expect("the strategy tree lives under `strategies`");
+    assert!(
+        strategies.iter().any(|s| s["name"] == "MCP demo"),
+        "the seeded strategy is listed: {strategies:?}"
+    );
+    let echoed: Value = serde_json::from_str(
+        &result
+            .content
+            .first()
+            .expect("a text content block")
+            .as_text()
+            .expect("a text content block")
+            .text,
+    )
+    .expect("the content text block parses as JSON");
+    assert_eq!(
+        &echoed, structured,
+        "the content text block echoes structuredContent"
+    );
+
+    // Table-driven over the other eight tools: `call` asserts the object
+    // shape on each, and each row names its list tool's envelope key so a
+    // typo'd or copy-pasted key fails here — `is_object()` alone cannot
+    // catch one.
+    let dsl: Value = serde_json::from_str(MINIMAL_DSL).expect("MINIMAL_DSL parses");
+    for (tool, args, list_key) in [
+        ("get_version", json!({ "version_id": child.as_str() }), None),
+        (
+            "list_runs",
+            json!({ "version_id": child.as_str() }),
+            Some("runs"),
+        ),
+        ("get_run", json!({ "run_id": run.as_str() }), None),
+        ("export_trades", json!({ "run_id": run.as_str() }), None),
+        (
+            "export_candles",
+            json!({ "pair": "BTCUSDT", "timeframe": "15m" }),
+            None,
+        ),
+        (
+            "export_indicators",
+            json!({ "pair": "BTCUSDT", "timeframe": "15m", "indicators": ["rsi:14"] }),
+            None,
+        ),
+        (
+            "submit_strategy_version",
+            json!({
+                "strategy_name": "Schema Probe",
+                "dsl": dsl,
+                "hypothesis": "object-shape probe",
+            }),
+            None,
+        ),
+        // The parent has no runs — the call resolves the app defaults and
+        // backtests over the copied fixture.
+        (
+            "run_backtest",
+            json!({ "version_id": parent.as_str() }),
+            None,
+        ),
+    ] {
+        let structured = call(&client, tool, args).await;
+        if let Some(key) = list_key {
+            structured[key].as_array().unwrap_or_else(|| {
+                panic!("{tool} carries its entries under `{key}`: {structured}")
+            });
+        }
+    }
+
+    client.cancel().await.expect("cancel session");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_tools_return_the_seeded_run() {
     let (fixture, client) = seeded_fixture().await;
-    let (_parent, child, run) = &fixture.seed;
+    let (parent, child, run) = &fixture.seed;
     let child_id = child.as_str().to_owned();
     let run_id = run.as_str().to_owned();
 
     // --- list_runs: the one seeded run, with inputs provenance.
     let runs = call(&client, "list_runs", json!({"version_id": child_id})).await;
-    let runs = runs.as_array().expect("runs array");
+    let runs = runs["runs"].as_array().expect("runs array");
     assert_eq!(runs.len(), 1);
     let row = &runs[0];
     assert_eq!(row["run_id"], run_id);
@@ -181,6 +293,16 @@ async fn run_tools_return_the_seeded_run() {
     assert_eq!(row["inputs"]["primary"]["timeframe"], "15m");
     assert_eq!(row["inputs"]["primary"]["data_version"], "v-primary");
     assert_eq!(row["inputs"]["htf"]["data_version"], "v-htf");
+
+    // --- list_runs on the parent: the empty-list envelope (#183's
+    // fresh-install case, and the only place a fallback can land). The
+    // seeded run is on the child, so the result must still be an object
+    // carrying `runs` as an EMPTY array — never a missing key, never `{}`.
+    let empty = call(&client, "list_runs", json!({"version_id": parent.as_str()})).await;
+    let empty_runs = empty["runs"]
+        .as_array()
+        .expect("an empty list still carries the `runs` key");
+    assert!(empty_runs.is_empty(), "the parent has no runs: {empty}");
 
     // --- get_run: summary + aggregates + integrity fields, no inline trades.
     let detail = call(&client, "get_run", json!({"run_id": run_id})).await;
