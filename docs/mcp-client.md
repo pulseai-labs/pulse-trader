@@ -84,7 +84,7 @@ commit before they return.
 |---|---|---|
 | `list_strategies` | `{ include_archived?: bool }` | `{ strategies: [...] }` — strategy/version tree, parent-first |
 | `get_version` | `{ version_id }` | migrated DSL document, verbatim original, hash, provenance |
-| `list_runs` | `{ version_id }` | `{ runs: [...] }` — headline stats + input provenance |
+| `list_runs` | `{ version_id }` | `{ runs: [...] }` — runs against the version, headline stats + input provenance |
 | `get_run` | `{ run_id }` | summary stats, regime breakdown, skipped entries, MFE/MAE, persisted inputs, `open_position` (the window-edge mark, or `null`) |
 | `export_trades` | `{ run_id }` | absolute CSV path, row count, column names |
 | `export_candles` | `{ pair, timeframe, data_version?, format? }` | absolute path under exports dir, row count, resolved `data_version` |
