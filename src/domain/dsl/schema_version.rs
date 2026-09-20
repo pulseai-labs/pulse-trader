@@ -58,10 +58,10 @@ pub struct SchemaVersion {
 }
 
 impl SchemaVersion {
-    /// The schema version this build of the DSL writes (`1.0.0`).
+    /// The schema version this build of the DSL writes (`1.1.0`).
     pub const CURRENT: SchemaVersion = SchemaVersion {
         major: 1,
-        minor: 0,
+        minor: 1,
         patch: 0,
     };
 }
@@ -116,11 +116,11 @@ impl TryFrom<String> for SchemaVersion {
 // r2.s1.w2: `pulse://dsl/schema` publishes the serde wire shape — a bare
 // `"MAJOR.MINOR.PATCH"` string — not the three-field struct layout, which is
 // what the derived impl would describe (and what no document ever contains).
-// The string is further pinned to a `const`: `Migrator::v1()`'s registry is
-// empty, so the only version the loader can accept is exactly `CURRENT`. A bare
-// `type: string` would tell a validating agent that `"garbage"` or `"2.0.0"`
-// is legal — both are rejected at submission. If a migration ever registers a
-// non-CURRENT `from` version, widen this to the accepted set.
+// The string is pinned to the loader's ACCEPTED set: `Migrator::v1()` registers
+// `1.0.0 → 1.1.0`, so the loadable spellings are `"1.0.0"` (migrated forward)
+// and `CURRENT`. A bare `type: string` would tell a validating agent that
+// `"garbage"` or `"2.0.0"` is legal — both are rejected at submission. When the
+// registry gains another `from` version, widen this enum again.
 impl schemars::JsonSchema for SchemaVersion {
     fn inline_schema() -> bool {
         true
@@ -133,7 +133,7 @@ impl schemars::JsonSchema for SchemaVersion {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "const": DSL_SCHEMA_VERSION,
+            "enum": ["1.0.0", DSL_SCHEMA_VERSION],
         })
     }
 }
@@ -160,20 +160,24 @@ mod tests {
     }
 
     /// AC-7: `CURRENT` serializes to a `"MAJOR.MINOR.PATCH"` string and
-    /// round-trips; deserializing `"1.0.0"` equals `CURRENT`.
+    /// round-trips; deserializing `"1.1.0"` equals `CURRENT`.
     #[test]
     fn schema_version_current_serializes_semver() {
         let json = serde_json::to_string(&SchemaVersion::CURRENT).expect("serialize CURRENT");
         // A bare JSON string, not an object.
-        assert_eq!(json, "\"1.0.0\"");
+        assert_eq!(json, "\"1.1.0\"");
 
         let back: SchemaVersion = serde_json::from_str(&json).expect("deserialize CURRENT");
         assert_eq!(back, SchemaVersion::CURRENT);
 
-        // Deserializing the literal "1.0.0" yields CURRENT.
+        // Deserializing the literal "1.1.0" yields CURRENT; "1.0.0" still
+        // parses (it is a registered `from`, not CURRENT).
         let from_literal: SchemaVersion =
-            serde_json::from_str("\"1.0.0\"").expect("deserialize \"1.0.0\"");
+            serde_json::from_str("\"1.1.0\"").expect("deserialize \"1.1.0\"");
         assert_eq!(from_literal, SchemaVersion::CURRENT);
+        let old_literal: SchemaVersion =
+            serde_json::from_str("\"1.0.0\"").expect("deserialize \"1.0.0\"");
+        assert_ne!(old_literal, SchemaVersion::CURRENT);
     }
 
     #[test]
@@ -203,17 +207,20 @@ mod tests {
         assert!(v110 < v200);
     }
 
-    /// r2.s1 F6: the published JSON Schema pins `schema_version` to the
-    /// accepted const so a validating agent rejects `"garbage"`/`"2.0.0"`
-    /// before calling the tool, the same way `Migrator::load` does at
-    /// submission.
+    /// r2.s1 F6 / r2.s2.w1: the published JSON Schema pins `schema_version` to
+    /// the loader's accepted set — `CURRENT` plus every registered `from` — so
+    /// a validating agent rejects `"garbage"`/`"2.0.0"` before calling the
+    /// tool, the same way `Migrator::load` does at submission.
     #[test]
-    fn published_schema_is_the_current_const() {
+    fn published_schema_is_the_accepted_set() {
         let schema = <SchemaVersion as schemars::JsonSchema>::json_schema(
             &mut schemars::SchemaGenerator::default(),
         );
         let json = serde_json::to_value(&schema).expect("schema serializes");
-        assert_eq!(json["const"], DSL_SCHEMA_VERSION);
+        assert_eq!(
+            json["enum"],
+            serde_json::json!(["1.0.0", DSL_SCHEMA_VERSION])
+        );
         assert_eq!(json["type"], "string");
     }
 

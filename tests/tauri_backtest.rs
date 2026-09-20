@@ -299,6 +299,113 @@ async fn htf_provenance_is_recorded_and_reloads_after_both_heads_move() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. r2.s2 round-3 fix — an `htf` child inheriting an M15-only run runs on H4
+// ---------------------------------------------------------------------------
+
+/// A schema-1.1.0 document whose entry reads the H4 close — the operand shape
+/// this work item makes executable.
+const HTF_OPERAND_DSL: &str = r#"{
+  "schema_version": "1.1.0",
+  "name": "htf close (tauri)",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Price", "series": "htf", "field": "Close" },
+    "op": "Gt",
+    "rhs": { "type": "Constant", "value": "0" }
+  },
+  "filters": [],
+  "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+
+/// The only honest way a version reaches the desktop command needing an HTF
+/// snapshot its inherited request does not name: the parent's recorded inputs
+/// are M15-only, so `resolve_default_request` inherits `htf_timeframe: None`
+/// for the child that adds the `htf` operand — then falls back to the
+/// application default `Some(H4)` at HEAD (r2.s2 round-3 fix), the same default
+/// the no-run path mints. The child RUNS over the fixture's real H4 snapshot,
+/// and the persisted `inputs.htf` records the selection the operand was
+/// evaluated against — never a silent evaluation against primary candles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_htf_child_inheriting_an_m15_only_run_runs_on_the_default_h4() {
+    let env = env();
+    let state = env.cold_state().await;
+    let strategies = state.strategy_repo();
+    let strat = strategies
+        .create_strategy("htf lab", Some("alice"), &[])
+        .await
+        .expect("create strategy");
+    let parent = strategies
+        .create_version(NewVersion {
+            strategy_id: StrategyId::new(strat.id.as_str().to_owned()),
+            parent_version_id: None,
+            dsl_json: std::fs::read_to_string(manifest(GOLDEN_STRATEGY))
+                .expect("read golden strategy"),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create parent version");
+
+    // The parent's one run is M15-only — through the real use case with an
+    // explicit request, so its persisted `inputs.htf` is `None`.
+    let mut parent_request = r1_request(&parent.id);
+    parent_request.htf_timeframe = None;
+    run_version_backtest(
+        &strategies,
+        &env.store(),
+        &pulse::BinanceAdapter::new(),
+        &state.backtest_run_repo(),
+        &parent_request,
+    )
+    .await
+    .expect("the M15-only parent run succeeds");
+
+    let child = strategies
+        .create_version(NewVersion {
+            strategy_id: StrategyId::new(strat.id.as_str().to_owned()),
+            parent_version_id: Some(parent.id.clone()),
+            dsl_json: HTF_OPERAND_DSL.to_owned(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create htf child version");
+
+    let dto = run_backtest_version_core(&state, request(&child.id))
+        .await
+        .expect("the htf child runs on the resolver's H4 fallback");
+
+    // The DTO and the persisted row both carry the HTF selection the `htf`
+    // operand was evaluated against — the resolver's default H4 at HEAD.
+    assert_eq!(dto.primary_timeframe, "15m");
+    assert_eq!(
+        dto.htf_timeframe.as_deref(),
+        Some("4h"),
+        "the resolved request carried the default H4 timeframe"
+    );
+    assert!(
+        dto.htf_data_version.as_ref().is_some_and(|v| !v.is_empty()),
+        "a real H4 data_version is recorded, not a silent primary evaluation"
+    );
+
+    let db = env.db().await;
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let inputs = runs
+        .get_run(&BacktestRunId::new(dto.run_id.clone()))
+        .await
+        .expect("read run")
+        .expect("run exists")
+        .inputs
+        .expect("a fresh run carries inputs");
+    let recorded_htf = inputs
+        .htf
+        .expect("inputs.htf records the resolved H4 selection");
+    assert_eq!(recorded_htf.timeframe, Timeframe::H4);
+}
+
+// ---------------------------------------------------------------------------
 // 3. post-save read-back failures carry the persisted run id
 // ---------------------------------------------------------------------------
 

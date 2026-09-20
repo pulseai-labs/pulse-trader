@@ -17,7 +17,8 @@ use std::process::Command;
 use pulse::{
     AgentHypothesis, AgentName, Comparator, Condition, CreatedBy, DataError, Db, Direction,
     ExitRule, IndicatorSpec, MIGRATOR, NewAgentSubmission, NewVersion, RiskParams, SchemaVersion,
-    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue, ValueSource, VersionId,
+    Series, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SweepableValue, ValueSource,
+    VersionId,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -49,6 +50,7 @@ fn canonical_dsl() -> StrategyDsl {
         direction: Direction::Long,
         entry: Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(14),
                 },

@@ -88,6 +88,32 @@ fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, FieldError> {
     })
 }
 
+/// Deserialize one flat operand arg, pathed at the operand itself so a
+/// misspelled key (e.g. `timefrom` for `timeframe`) names WHICH operand to fix
+/// (r2.s2 round-1 fix F7).
+fn parse_operand(path: &'static str, value: Value) -> Result<mapping::Operand, FieldError> {
+    serde_json::from_value(value).map_err(|source| {
+        field_error(
+            path,
+            ValidationCode::FieldRange,
+            format!("could not parse operand: {source}"),
+        )
+    })
+}
+
+/// Parse the `{ left, right }` operand pair, collecting every parse failure so
+/// a call with two malformed operands reports both at once (the same
+/// collect-all-errors convention [`mapping::build_condition`] follows).
+fn parse_operand_pair(
+    left: Value,
+    right: Value,
+) -> Result<(mapping::Operand, mapping::Operand), Vec<FieldError>> {
+    match (parse_operand("left", left), parse_operand("right", right)) {
+        (Ok(left), Ok(right)) => Ok((left, right)),
+        (left, right) => Err([left, right].into_iter().filter_map(Result::err).collect()),
+    }
+}
+
 /// Map the flat `"long"`/`"short"` string to a tagged [`Direction`].
 fn direction_from_str(raw: &str) -> Result<Direction, FieldError> {
     match raw {
@@ -141,7 +167,11 @@ pub(crate) fn add_entry_signal(builder: &mut StrategyBuilder, args: Value) -> To
         Ok(parsed) => parsed,
         Err(error) => return err(error),
     };
-    match mapping::build_condition(&args.left, &args.op, &args.right) {
+    let (left, right) = match parse_operand_pair(args.left, args.right) {
+        Ok(pair) => pair,
+        Err(errors) => return ToolOutcome::Err { errors },
+    };
+    match mapping::build_condition(&left, &args.op, &right) {
         Ok(condition) => {
             builder.set_entry(condition);
             ToolOutcome::Ok {
@@ -159,7 +189,11 @@ pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutc
         Ok(parsed) => parsed,
         Err(error) => return err(error),
     };
-    match mapping::build_condition(&args.left, &args.op, &args.right) {
+    let (left, right) = match parse_operand_pair(args.left, args.right) {
+        Ok(pair) => pair,
+        Err(errors) => return ToolOutcome::Err { errors },
+    };
+    match mapping::build_condition(&left, &args.op, &right) {
         Ok(condition) => {
             builder.push_filter(condition);
             ToolOutcome::Ok {
@@ -170,25 +204,45 @@ pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutc
     }
 }
 
-/// `set_exit_rules { stop_loss_pct?, take_profit_r?, trailing_pct?, time_bars? }`
-/// — build a `Vec<ExitRule>` (replacing); `stop_loss_pct` is required (defines
-/// 1R). No duplicate exclusive kinds are possible (each field appears at most
-/// once).
+/// `set_exit_rules { stop_loss_pct?, atr_stop_period?, atr_stop_multiple?,
+/// take_profit_r?, trailing_pct?, time_bars? }` — build a `Vec<ExitRule>`
+/// (replacing). Exactly ONE stop family: `stop_loss_pct` alone (a percent
+/// [`ExitRule::StopLoss`], defines 1R) or `atr_stop_period` +
+/// `atr_stop_multiple` together (an [`ExitRule::AtrStop`], defines 1R). Both
+/// families, one ATR half without the other, or neither are a correctable
+/// `FieldError` localized at `stop_loss_pct` — the tool refuses FIRST rather
+/// than letting a duplicated `StopLoss` + `AtrStop` pair reach
+/// `finalize_strategy`'s `DuplicateExit` rule (whose error would not name the
+/// field to fix). The ATR bounds (`period ≥ 1`, `multiple ∈ (0, 10]`) stay
+/// `validate()`'s at finalize — not re-implemented here. No duplicate exclusive
+/// kinds are possible (each field appears at most once).
 pub(crate) fn set_exit_rules(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
     let args: ExitArgs = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(error) => return err(error),
     };
-    let Some(stop_loss_pct) = args.stop_loss_pct else {
-        return err(field_error(
-            "stop_loss_pct",
-            ValidationCode::FieldRange,
-            "stop_loss_pct is required; it defines 1R (a decimal fraction string like \"0.05\")",
-        ));
+    let stop = match (
+        args.stop_loss_pct,
+        args.atr_stop_period,
+        args.atr_stop_multiple,
+    ) {
+        (Some(stop_loss_pct), None, None) => ExitRule::StopLoss {
+            distance_pct: SweepableValue::Fixed(stop_loss_pct),
+        },
+        (None, Some(period), Some(multiple)) => ExitRule::AtrStop {
+            period: SweepableValue::Fixed(period),
+            multiple: SweepableValue::Fixed(multiple),
+        },
+        _ => {
+            return err(field_error(
+                "stop_loss_pct",
+                ValidationCode::FieldRange,
+                "exactly one stop family is required: give stop_loss_pct, or \
+                 atr_stop_period with atr_stop_multiple",
+            ));
+        }
     };
-    let mut exits = vec![ExitRule::StopLoss {
-        distance_pct: SweepableValue::Fixed(stop_loss_pct),
-    }];
+    let mut exits = vec![stop];
     if let Some(target_r) = args.take_profit_r {
         exits.push(ExitRule::TakeProfit {
             target_r: SweepableValue::Fixed(target_r),
@@ -274,12 +328,17 @@ struct CreateStrategyArgs {
 }
 
 /// `add_entry_signal` / `add_filter` args (flat `{ left, op, right }`).
+///
+/// `left`/`right` stay raw [`Value`]s so each operand parses on its own: a
+/// `deny_unknown_fields` failure inside an operand is then pathed at `left` /
+/// `right` instead of collapsing into the unlocalized whole-struct
+/// `arguments` error (r2.s2 round-1 fix F7).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignalArgs {
-    left: mapping::Operand,
+    left: Value,
     op: String,
-    right: mapping::Operand,
+    right: Value,
 }
 
 /// `set_exit_rules` args — flat scalar fields; `Decimal`s are carried as JSON
@@ -299,6 +358,12 @@ struct SignalArgs {
 struct ExitArgs {
     #[serde(default, with = "rust_decimal::serde::str_option")]
     stop_loss_pct: Option<Decimal>,
+    // The ATR stop family (schema 1.1.0): `atr_stop_period` is a JSON integer,
+    // `atr_stop_multiple` a decimal STRING like every other Decimal arg.
+    #[serde(default)]
+    atr_stop_period: Option<u32>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    atr_stop_multiple: Option<Decimal>,
     #[serde(default, with = "rust_decimal::serde::str_option")]
     take_profit_r: Option<Decimal>,
     #[serde(default, with = "rust_decimal::serde::str_option")]
@@ -332,7 +397,7 @@ mod mapping {
     use serde::Deserialize;
 
     use crate::domain::{
-        Comparator, Condition, FieldError, IndicatorSpec, PriceField, SweepableValue,
+        Comparator, Condition, FieldError, IndicatorSpec, PriceField, Series, SweepableValue,
         ValidationCode, ValueSource,
     };
 
@@ -341,7 +406,15 @@ mod mapping {
     /// A flat, untagged operand — the LLM-facing scalar shape (README C5). It is
     /// assembled **server-side** into a tagged [`ValueSource`]; the LLM never
     /// emits the serde tag.
+    ///
+    /// `deny_unknown_fields` (r2.s2 round-1 fix F7): every field is optional,
+    /// so without it a misspelled `timefrom` deserializes fine, silently drops
+    /// the requested series, and degrades the operand to primary — a different
+    /// operand than the caller sent, with no error anywhere (pulse-trader#160's
+    /// silent-substitution class). Rejecting the unknown key makes it a
+    /// correctable `FieldError` naming the operand path.
     #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub(super) struct Operand {
         // Defaulted so a MISSING `source` still deserializes and the mapping
         // layer reports a LOCALIZED `{left|right}.source` error (e.g. a constant
@@ -368,6 +441,13 @@ mod mapping {
         // via `parse_args` (slice-close FIX E).
         #[serde(default, with = "rust_decimal::serde::str_option")]
         value: Option<Decimal>,
+        // The TOOL boundary names it `timeframe`; the DSL names it `series`
+        // (SPINE.md grill ruling 1) — this field is the only translation point.
+        // `"h4"` selects the run's higher-timeframe series (`Series::Htf`);
+        // `"primary"` or absent is the primary series. No `timeframe` word ever
+        // reaches a DSL type.
+        #[serde(default)]
+        timeframe: Option<String>,
     }
 
     /// The comparator/cross the flat `op` string selects.
@@ -452,6 +532,15 @@ mod mapping {
     fn operand_to_value_source(operand: &Operand, path: &str) -> Result<ValueSource, FieldError> {
         match operand.source.as_str() {
             "constant" => {
+                // A constant has no series — a `timeframe` token on one is a
+                // correctable error, never a silent drop (#160's class).
+                if operand.timeframe.is_some() {
+                    return Err(field_error(
+                        format!("{path}.timeframe"),
+                        ValidationCode::FieldRange,
+                        "a constant operand has no series — drop `timeframe`",
+                    ));
+                }
                 let value = operand.value.ok_or_else(|| {
                     field_error(
                         format!("{path}.value"),
@@ -462,15 +551,34 @@ mod mapping {
                 Ok(ValueSource::Constant { value })
             }
             "price" => Ok(ValueSource::Price {
+                series: series_from(operand.timeframe.as_deref(), path)?,
                 field: price_field(operand.price_field.as_deref(), path)?,
             }),
             "indicator" => Ok(ValueSource::Indicator {
+                series: series_from(operand.timeframe.as_deref(), path)?,
                 spec: indicator_spec(operand, path)?,
             }),
             other => Err(field_error(
                 format!("{path}.source"),
                 ValidationCode::FieldRange,
                 format!("unknown operand source {other:?}; expected indicator|price|constant"),
+            )),
+        }
+    }
+
+    /// Map the flat `timeframe` token to a tagged [`Series`] — the ONLY place
+    /// the tool boundary's `timeframe` becomes the DSL's `series` (SPINE.md
+    /// grill ruling 1). `"h4"` is the sole higher-timeframe token (the run pairs
+    /// exactly one HTF series); an unknown token is a correctable
+    /// `FieldError` localized at `{left|right}.timeframe`.
+    fn series_from(timeframe: Option<&str>, path: &str) -> Result<Series, FieldError> {
+        match timeframe {
+            None | Some("primary") => Ok(Series::Primary),
+            Some("h4") => Ok(Series::Htf),
+            Some(other) => Err(field_error(
+                format!("{path}.timeframe"),
+                ValidationCode::FieldRange,
+                format!("unknown timeframe {other:?}; expected primary|h4"),
             )),
         }
     }
@@ -523,10 +631,13 @@ mod mapping {
                 slow: fixed_u32(operand.slow, &format!("{path}.slow"))?,
                 signal: fixed_u32(operand.signal, &format!("{path}.signal"))?,
             }),
+            "atr" => Ok(IndicatorSpec::Atr {
+                period: fixed_period(operand, path)?,
+            }),
             other => Err(field_error(
                 format!("{path}.indicator"),
                 ValidationCode::FieldRange,
-                format!("unknown indicator {other:?}; expected rsi|ema|adx|macd"),
+                format!("unknown indicator {other:?}; expected rsi|ema|adx|macd|atr"),
             )),
         }
     }
@@ -587,7 +698,12 @@ fn operand_schema() -> Value {
         "type": "object",
         "properties": {
             "source": { "type": "string", "enum": ["indicator", "price", "constant"] },
-            "indicator": { "type": "string", "enum": ["rsi", "ema", "adx", "macd"] },
+            "indicator": { "type": "string", "enum": ["rsi", "ema", "adx", "macd", "atr"] },
+            "timeframe": {
+                "type": "string",
+                "enum": ["primary", "h4"],
+                "description": "series the operand is evaluated on; \"h4\" uses the last closed H4 bar, omit for the primary series"
+            },
             "period": { "type": "integer", "minimum": 1 },
             "fast": { "type": "integer", "minimum": 1 },
             "slow": { "type": "integer", "minimum": 1 },
@@ -658,19 +774,22 @@ fn def_add_filter() -> ToolDefinition {
 fn def_set_exit_rules() -> ToolDefinition {
     ToolDefinition {
         name: "set_exit_rules".to_owned(),
-        description: "Set the exit rules (replacing). `stop_loss_pct` is required and defines \
-                      1R. Decimal fields are JSON strings (e.g. \"0.05\"); `take_profit_r` is a \
-                      plain R-multiple string; `time_bars` is an integer."
+        description: "Set the exit rules (replacing). Exactly one stop family is required: \
+                      `stop_loss_pct`, or `atr_stop_period` with `atr_stop_multiple` — either \
+                      defines 1R. Decimal fields are JSON strings (e.g. \"0.05\"); \
+                      `take_profit_r` is a plain R-multiple string; `time_bars` and \
+                      `atr_stop_period` are integers."
             .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "stop_loss_pct": { "type": "string", "description": "stop distance fraction, e.g. \"0.05\"" },
+                "atr_stop_period": { "type": "integer", "minimum": 1, "description": "ATR lookback period, e.g. 14" },
+                "atr_stop_multiple": { "type": "string", "description": "ATR multiple as a decimal string, e.g. \"2\"" },
                 "take_profit_r": { "type": "string", "description": "take-profit R-multiple, e.g. \"2\"" },
                 "trailing_pct": { "type": "string", "description": "trailing distance fraction" },
                 "time_bars": { "type": "integer", "minimum": 1 }
-            },
-            "required": ["stop_loss_pct"]
+            }
         }),
     }
 }
@@ -958,6 +1077,69 @@ mod tests {
                 })
             ),
             ToolOutcome::Err { .. }
+        ));
+    }
+
+    /// r2.s2 round-1 fix F7: a MISSPELLED key inside an operand (`timefrom`
+    /// for `timeframe`) is a correctable `FieldError` pathed at that operand —
+    /// never a silent drop. Before `deny_unknown_fields` on `Operand` the key
+    /// deserializes fine, `series_from(None)` degrades the operand to the
+    /// primary series, and the composed strategy silently differs from the
+    /// request (pulse-trader#160's silent-substitution class).
+    #[test]
+    fn misspelled_operand_key_is_correctable_and_names_the_operand() {
+        let mut builder = StrategyBuilder::new();
+        let outcome = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close", "timefrom": "h4" },
+                "op": "gt",
+                "right": { "source": "constant", "value": "100" }
+            }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.path == "left"),
+                    "the misspelled operand must be pathed at `left`, got {errors:?}"
+                );
+                assert!(
+                    errors.iter().all(|e| e.path != "arguments"),
+                    "the error must NOT be the unlocalized whole-struct `arguments` parse error"
+                );
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!("a misspelled operand key must be a correctable Err, not a silent drop")
+            }
+        }
+        // The same misspelling inside `right` names `right`.
+        let outcome = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": { "source": "constant", "value": "100", "timefrom": "h4" }
+            }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.path == "right"),
+                    "the misspelled operand must be pathed at `right`, got {errors:?}"
+                );
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!("a misspelled operand key must be a correctable Err, not a silent drop")
+            }
+        }
+        // The correctly-spelled `timeframe` still composes the htf operand.
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close", "timeframe": "h4" },
+                "op": "gt",
+                "right": { "source": "constant", "value": "100" }
+            }),
         ));
     }
 

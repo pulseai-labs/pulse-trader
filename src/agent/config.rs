@@ -566,6 +566,22 @@ mod tests {
         );
     }
 
+    /// r2.s2.w3 (#160/#163): the shipped composer prompt must TEACH the
+    /// schema-1.1.0 vocabulary — the `"timeframe"` operand token and `"atr"` as
+    /// an indicator — or a described H4 filter / ATR stop is silently
+    /// substituted instead of composed. Same machine-guard shape as the
+    /// frontmatter pin above: a prompt edit that drops the vocabulary fails here.
+    #[test]
+    fn composer_prompt_teaches_the_1_1_0_vocabulary() {
+        let prompt = load_composer_prompt_from(None).expect("compiled-in default");
+        for needle in ["\"timeframe\"", "\"atr\""] {
+            assert!(
+                prompt.contains(needle),
+                "composer prompt must carry {needle} — the 1.1.0 operand vocabulary"
+            );
+        }
+    }
+
     /// The `$PULSE_PROMPT_DIR/composer.md` override wins over the compiled-in
     /// default (the private-workspace override path).
     #[test]
@@ -638,6 +654,20 @@ mod tests {
         assert!(
             prompt.contains("rsi(14) < 30"),
             "the exclusion needs the concrete case a model will meet in the fixture"
+        );
+    }
+
+    /// r2.s2.w3 (ADR-0021 decision 1, SPINE b7): the shipped coach prompt must
+    /// NAME the ATR stop's `multiple` leaf it may retune — `exits[0].multiple` —
+    /// so the prompt and the mutate grammar can never silently desync (w1
+    /// already registered the leaf; this guard pins the prompt to it). Same
+    /// whitespace-flattened shape as the other coach-prompt contracts.
+    #[test]
+    fn coach_prompt_names_the_atr_numeric_leaves() {
+        let prompt = coach_prompt_flattened();
+        assert!(
+            prompt.contains("exits[0].multiple"),
+            "the coach prompt must name exits[0].multiple — an ATR stop's multiple leaf"
         );
     }
 

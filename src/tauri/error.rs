@@ -221,6 +221,18 @@ impl From<BacktestAppError> for BusError {
         let code = match &err {
             BacktestAppError::DslInvalid(_)
             | BacktestAppError::CompileFailed(_)
+            // r2.s2.w2 + round-1 fix F1: a missing or non-higher HTF selection
+            // is a caller-correctable input refusal like `WindowEmpty` —
+            // `validation`, and the message names `inputs.htf` (the MCP
+            // surface reports the same variants as `field_error("inputs.htf", …)`).
+            | BacktestAppError::HtfRequired { .. }
+            | BacktestAppError::HtfNotHigher { .. }
+            // r2.s2 round-2 fix G1 + round-5: a different-pair or stale
+            // (too-short) HTF series refusal is the same caller-correctable
+            // `inputs.htf` family — `validation`, not `backtest`.
+            | BacktestAppError::Engine(
+                BacktestError::HtfPairMismatch { .. } | BacktestError::HtfCoverageShort { .. },
+            )
             | BacktestAppError::WindowEmpty { .. } => BusErrorCode::Validation,
             BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
             BacktestAppError::Engine(_) => BusErrorCode::Backtest,
@@ -245,7 +257,8 @@ impl From<BacktestAppError> for BusError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{BusError, BusErrorCode};
-    use crate::domain::DataError;
+    use crate::application::backtest::BacktestAppError;
+    use crate::domain::{BacktestError, DataError, Pair, Timeframe};
 
     #[test]
     fn code_serializes_as_a_string_discriminant() {
@@ -257,5 +270,35 @@ mod tests {
     fn display_is_the_message_so_anyhow_context_reads_cleanly() {
         let err = BusError::from(DataError::Parse("nope".to_owned()));
         assert_eq!(err.to_string(), "parse error: nope");
+    }
+
+    /// r2.s2 round-1 fix F1: a non-higher `inputs.htf` refusal maps to the
+    /// caller-correctable `validation` family, exactly like `HtfRequired`, and
+    /// its message names the field.
+    #[test]
+    fn htf_not_higher_maps_to_validation_and_names_the_field() {
+        let err = BusError::from(BacktestAppError::HtfNotHigher {
+            field: "inputs.htf",
+            primary: Timeframe::H4,
+            htf: Timeframe::M15,
+        });
+        assert_eq!(err.code, BusErrorCode::Validation);
+        assert!(err.message.contains("inputs.htf"), "{}", err.message);
+    }
+
+    /// r2.s2 round-2 fix G1: a different-pair HTF series refusal arrives as
+    /// `Engine(HtfPairMismatch)` (the request carries only one pair, so no
+    /// app-layer variant exists) but is still the caller-correctable
+    /// `inputs.htf` family — `validation`, not `backtest` — and the message
+    /// names both pairs.
+    #[test]
+    fn htf_pair_mismatch_maps_to_validation() {
+        let err = BusError::from(BacktestAppError::Engine(BacktestError::HtfPairMismatch {
+            primary: Pair::new("BTCUSDT"),
+            htf: Pair::new("ETHUSDT"),
+        }));
+        assert_eq!(err.code, BusErrorCode::Validation);
+        assert!(err.message.contains("BTCUSDT"), "{}", err.message);
+        assert!(err.message.contains("ETHUSDT"), "{}", err.message);
     }
 }

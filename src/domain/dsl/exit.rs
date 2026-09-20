@@ -7,11 +7,12 @@
 //! is an **R-multiple** of the stop distance (grill branch 1 — R:R is the
 //! project's native risk vocabulary).
 //!
-//! No ATR-based stops in v1 (ATR isn't in the 2.01 indicator catalog). No
-//! evaluation or money math here — these are declarative grammar only; the
-//! backtester computes `1R = entry_price × distance_pct` (Sprint 1.2). Semantic
-//! rules (≥1 exit; no duplicate exclusive exits; a `TakeProfit` requires a
-//! `StopLoss`) are **2.03's**, recorded in the slice README contract.
+//! `AtrStop` (schema 1.1.0) declares an ATR-multiple stop — `period` feeds the
+//! primary-series ATR and `multiple` scales it. No evaluation or money math
+//! here — these are declarative grammar only; the backtester computes `1R =
+//! entry_price × distance_pct` (Sprint 1.2). Semantic rules (≥1 exit; no
+//! duplicate exclusive exits; a `TakeProfit` requires a `StopLoss`/`AtrStop`)
+//! are **2.03's**, recorded in the slice README contract.
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,17 @@ pub enum ExitRule {
         /// The condition that, when true, closes the position.
         condition: Condition,
     },
+    /// An ATR-multiple stop (schema 1.1.0): the stop sits `multiple` × ATR of
+    /// the **primary** series away from entry (`atr_stop_price` in 2.04's
+    /// compiler). Shares the [`StopLoss`](ExitRule::StopLoss) exclusive family
+    /// for the semantic rules (2.03); the ATR is read at the signal bar and
+    /// frozen through the fill (r2.s2.w2).
+    AtrStop {
+        /// ATR lookback period (the primary series' ATR).
+        period: SweepableValue<u32>,
+        /// ATR multiple — a plain multiplier in `(0, 10]` (bounded in 2.03).
+        multiple: SweepableValue<Decimal>,
+    },
 }
 
 #[cfg(test)]
@@ -65,7 +77,7 @@ mod tests {
     use super::ExitRule;
     use crate::domain::dsl::condition::{Comparator, Condition};
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, Series, ValueSource};
     use rust_decimal::Decimal;
 
     fn round_trip(e: &ExitRule) -> ExitRule {
@@ -112,6 +124,7 @@ mod tests {
         let e = ExitRule::SignalExit {
             condition: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },
@@ -122,6 +135,19 @@ mod tests {
                 },
             },
         };
+        assert_eq!(round_trip(&e), e);
+    }
+
+    /// schema 1.1.0: `AtrStop` round-trips — `period`/`multiple` are ordinary
+    /// sweepable leaves (`multiple` a decimal string on the wire).
+    #[test]
+    fn atr_stop_round_trips() {
+        let e = ExitRule::AtrStop {
+            period: SweepableValue::Fixed(14),
+            multiple: SweepableValue::Fixed(Decimal::new(2, 0)),
+        };
+        let json = serde_json::to_string(&e).expect("serialize AtrStop");
+        assert!(json.contains("\"type\":\"AtrStop\""), "json was: {json}");
         assert_eq!(round_trip(&e), e);
     }
 

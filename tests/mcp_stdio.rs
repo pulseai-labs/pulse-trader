@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use pulse::{
     CandleSeriesRepository, CandleStore, CompiledValue, EvalContext, IndicatorEngine,
-    IndicatorSpec, Pair, SweepableValue, Timeframe,
+    IndicatorSpec, Pair, Series, SweepableValue, Timeframe,
 };
 use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use rust_decimal::Decimal;
@@ -78,7 +78,7 @@ async fn tools_and_dsl_schema_resource_are_served() {
         other => panic!("dsl_schema must be text contents, got {other:?}"),
     };
     let doc: Value = serde_json::from_str(&text).expect("dsl_schema body parses as JSON");
-    assert_eq!(doc["schema_version"], "1.0.0");
+    assert_eq!(doc["schema_version"], "1.1.0");
     let properties = doc["json_schema"]["properties"]
         .as_object()
         .expect("json_schema has properties");
@@ -139,7 +139,9 @@ async fn strategy_and_version_tools_return_the_seed() {
     assert_eq!(version["id"], child_id);
     assert_eq!(version["parent_version_id"], parent_id);
     assert_eq!(version["created_by"], "composer_llm");
-    assert_eq!(version["dsl_schema_version"], "1.0.0");
+    // The seeded `1.0.0` document was identity-migrated on write — the stored
+    // column and the migrated `.dsl` read back at CURRENT.
+    assert_eq!(version["dsl_schema_version"], "1.1.0");
     assert_eq!(version["dsl"]["name"], "RSI Oversold (mcp child)");
     assert_eq!(
         version["dsl_original"],
@@ -247,11 +249,23 @@ async fn run_tools_return_the_seeded_run() {
     assert_eq!(lines.len(), 2, "header + one trade row");
     assert!(lines[0].contains("realized_pnl"));
     assert!(lines[0].contains("mfe_r"));
+    // r2.s2.w2: the recorded per-trade stop is the 20th column — the seeded
+    // trade's 89450 stop must appear in the row, not just the header.
+    assert!(lines[0].contains("stop_price"));
     assert!(lines[1].contains("take_profit"));
+    assert!(
+        lines[1].split('\t').next_back() == Some("89450"),
+        "the stop cell carries the persisted stop_price: {}",
+        lines[1]
+    );
     let columns = exported["columns"].as_array().expect("columns array");
     assert!(
         columns.iter().any(|c| c == "regime"),
         "columns names the trade fields"
+    );
+    assert!(
+        columns.iter().any(|c| c == "stop_price"),
+        "columns names the recorded stop"
     );
 
     client.cancel().await.expect("cancel session");
@@ -326,7 +340,10 @@ async fn candle_and_indicator_exports_match_the_snapshot() {
     let mut expected: Vec<Option<Decimal>> = Vec::with_capacity(candle_count);
     for candle in &stored.series.candles {
         engine.step(candle);
-        expected.push(engine.current(&CompiledValue::Indicator(spec.clone())));
+        expected.push(engine.current(&CompiledValue::Indicator {
+            series: Series::Primary,
+            spec: spec.clone(),
+        }));
     }
 
     let exported = call(

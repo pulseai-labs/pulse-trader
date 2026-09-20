@@ -86,7 +86,7 @@ pub enum Condition {
 mod tests {
     use super::{Comparator, Condition};
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, Series, ValueSource};
     use rust_decimal::Decimal;
 
     fn round_trip(c: &Condition) -> Condition {
@@ -100,6 +100,7 @@ mod tests {
     fn rsi_oversold_condition_round_trips() {
         let cond = Condition::Compare {
             lhs: ValueSource::Indicator {
+                series: Series::Primary,
                 spec: IndicatorSpec::Rsi {
                     period: SweepableValue::Fixed(14),
                 },
@@ -122,6 +123,7 @@ mod tests {
             conditions: vec![
                 Condition::Compare {
                     lhs: ValueSource::Indicator {
+                        series: Series::Primary,
                         spec: IndicatorSpec::Rsi {
                             period: SweepableValue::Fixed(14),
                         },
@@ -133,6 +135,7 @@ mod tests {
                 },
                 Condition::Compare {
                     lhs: ValueSource::Indicator {
+                        series: Series::Primary,
                         spec: IndicatorSpec::Ema {
                             period: SweepableValue::Fixed(50),
                         },
@@ -159,6 +162,7 @@ mod tests {
         assert_eq!(scaled.scale(), 2, "fixture must carry a non-zero scale");
         let cond = Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: crate::domain::dsl::value::PriceField::Close,
             },
             op: Comparator::Gte,
@@ -200,7 +204,7 @@ mod tests {
 mod prop_tests {
     use super::{Comparator, Condition};
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, PriceField, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, PriceField, Series, ValueSource};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
 
@@ -223,6 +227,7 @@ mod prop_tests {
             arb_sweepable_u32().prop_map(|period| IndicatorSpec::Rsi { period }),
             arb_sweepable_u32().prop_map(|period| IndicatorSpec::Ema { period }),
             arb_sweepable_u32().prop_map(|period| IndicatorSpec::Adx { period }),
+            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Atr { period }),
             (
                 arb_sweepable_u32(),
                 arb_sweepable_u32(),
@@ -246,11 +251,19 @@ mod prop_tests {
         ]
     }
 
+    /// schema 1.1.0: the `series` tag covers both values so the round-trip
+    /// property exercises `htf` operands too (compile gating is not grammar).
+    fn arb_series() -> impl Strategy<Value = Series> {
+        prop_oneof![Just(Series::Primary), Just(Series::Htf)]
+    }
+
     fn arb_value_source() -> impl Strategy<Value = ValueSource> {
         prop_oneof![
             arb_decimal().prop_map(|value| ValueSource::Constant { value }),
-            arb_price_field().prop_map(|field| ValueSource::Price { field }),
-            arb_indicator_spec().prop_map(|spec| ValueSource::Indicator { spec }),
+            (arb_series(), arb_price_field())
+                .prop_map(|(series, field)| ValueSource::Price { series, field }),
+            (arb_series(), arb_indicator_spec())
+                .prop_map(|(series, spec)| ValueSource::Indicator { series, spec }),
         ]
     }
 

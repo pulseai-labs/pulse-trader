@@ -406,6 +406,10 @@ fn visit_leaves(dsl: &mut StrategyDsl, f: Visit<'_>) -> ControlFlow<()> {
             ExitRule::SignalExit { condition } => {
                 visit_condition(condition, &format!("{base}.condition"), f)?;
             }
+            ExitRule::AtrStop { period, multiple } => {
+                f(&format!("{base}.period"), LeafMut::Period(period))?;
+                f(&format!("{base}.multiple"), LeafMut::Threshold(multiple))?;
+            }
         }
     }
 
@@ -449,9 +453,10 @@ fn visit_condition(cond: &mut Condition, path: &str, f: Visit<'_>) -> ControlFlo
 }
 
 /// Only `Indicator` carries sweepable leaves; `Constant`/`Price` carry none —
-/// the same asymmetry `validate.rs`'s `check_value_source` encodes.
+/// the same asymmetry `validate.rs`'s `check_value_source` encodes. `series` is
+/// not a leaf (it is a series tag, not a numeric parameter).
 fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlFlow<()> {
-    if let ValueSource::Indicator { spec } = v {
+    if let ValueSource::Indicator { spec, .. } = v {
         let base = format!("{path}.indicator");
         match spec {
             IndicatorSpec::Rsi { period } => {
@@ -467,6 +472,9 @@ fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlF
                 f(&format!("{base}.macd.fast"), LeafMut::Period(fast))?;
                 f(&format!("{base}.macd.slow"), LeafMut::Period(slow))?;
                 f(&format!("{base}.macd.signal"), LeafMut::Period(signal))?;
+            }
+            IndicatorSpec::Atr { period } => {
+                f(&format!("{base}.atr.period"), LeafMut::Period(period))?;
             }
         }
     }

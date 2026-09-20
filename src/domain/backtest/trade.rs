@@ -146,6 +146,20 @@ pub struct Trade {
     /// then-current regime at open; it is `Unknown` while the EMA200/ADX warm.
     /// `RegimeBreakdown` aggregates `(regime, realized_pnl)` over the trade log.
     pub regime: Regime,
+
+    /// The recorded per-trade stop price (r2.s2.w2) — the level the position's
+    /// stop order sat at, frozen at the fill. For a `StopLoss` it is
+    /// `entry × (1 ± distance_pct)`; for an `AtrStop` it is `entry ∓ multiple ×
+    /// ATR(period)` evaluated at the **signal** bar. `Option` because a pre-`0011`
+    /// persisted row carries no such column and reads back `NULL`; a fresh trade
+    /// always records `Some`.
+    ///
+    /// `#[serde(default)]` (#68 / README C5): an old-shape trade missing this
+    /// field deserializes as `None`. The content hash feeds it CONDITIONALLY —
+    /// only when `Some` — so a pre-`0011` row re-derives the identical byte
+    /// stream it hashed under (the r2.s1 G1(b) precedent).
+    #[serde(default)]
+    pub stop_price: Option<Decimal>,
 }
 
 #[cfg(test)]
@@ -189,6 +203,7 @@ mod tests {
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
+            stop_price: Some(Decimal::new(99, 0)),
         }
     }
 

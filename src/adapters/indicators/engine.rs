@@ -1,6 +1,6 @@
 //! Streaming indicator engine over the VS-1.1.3 indicator adapters.
 
-use super::{adx::Adx, ema::Ema, macd::Macd, rsi::Rsi};
+use super::{adx::Adx, atr::Atr, ema::Ema, macd::Macd, rsi::Rsi};
 use crate::{
     Candle, CompiledStrategy, CompiledValue, EvalContext, Indicator, IndicatorSpec, PriceField,
     SweepableValue,
@@ -24,6 +24,9 @@ pub enum EngineError {
         /// Adapter/factory detail explaining the invalid parameter tuple.
         detail: String,
     },
+    /// A grammatically-valid spec whose computation lands in a later work item.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Composes the concrete indicator adapters needed by one compiled strategy.
@@ -133,16 +136,20 @@ impl EvalContext for IndicatorEngine {
     fn current(&self, value: &CompiledValue) -> Option<Decimal> {
         match value {
             CompiledValue::Const(value) => Some(*value),
-            CompiledValue::Price(field) => self.current_candle.as_ref().map(|c| price(c, *field)),
-            CompiledValue::Indicator(spec) => self.current_indicator(spec),
+            CompiledValue::Price { field, .. } => {
+                self.current_candle.as_ref().map(|c| price(c, *field))
+            }
+            CompiledValue::Indicator { spec, .. } => self.current_indicator(spec),
         }
     }
 
     fn previous(&self, value: &CompiledValue) -> Option<Decimal> {
         match value {
             CompiledValue::Const(value) => Some(*value),
-            CompiledValue::Price(field) => self.previous_candle.as_ref().map(|c| price(c, *field)),
-            CompiledValue::Indicator(spec) => self.previous_indicator(spec),
+            CompiledValue::Price { field, .. } => {
+                self.previous_candle.as_ref().map(|c| price(c, *field))
+            }
+            CompiledValue::Indicator { spec, .. } => self.previous_indicator(spec),
         }
     }
 }
@@ -188,6 +195,12 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
                     )
                 })
         }
+        IndicatorSpec::Atr { period } => {
+            let period = fixed_u32(period, "atr.period")?;
+            Atr::new(period)
+                .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+                .ok_or_else(|| invalid_period(spec, format!("ATR period {period} is invalid")))
+        }
     }
 }
 
@@ -223,7 +236,8 @@ mod tests {
     use super::{EngineError, IndicatorEngine};
     use crate::{
         Candle, Comparator, Condition, Direction, EvalContext, ExitRule, IndicatorSpec, PriceField,
-        RiskParams, SchemaVersion, StrategyDsl, SweepableValue, ValueSource, compile, validate,
+        RiskParams, SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource, compile,
+        validate,
     };
     use rust_decimal::Decimal;
     use std::str::FromStr;
@@ -273,7 +287,10 @@ mod tests {
     }
 
     fn indicator_value(spec: IndicatorSpec) -> ValueSource {
-        ValueSource::Indicator { spec }
+        ValueSource::Indicator {
+            series: Series::Primary,
+            spec,
+        }
     }
 
     fn constant(value: &str) -> ValueSource {
@@ -281,7 +298,10 @@ mod tests {
     }
 
     fn price(field: PriceField) -> ValueSource {
-        ValueSource::Price { field }
+        ValueSource::Price {
+            series: Series::Primary,
+            field,
+        }
     }
 
     fn compare(lhs: ValueSource, op: Comparator, rhs: ValueSource) -> Condition {
@@ -322,12 +342,21 @@ mod tests {
         for (idx, close) in (0_i64..).zip(["100", "99", "98"]) {
             engine.step(&candle(idx, close));
         }
-        let first = engine.current(&crate::CompiledValue::Indicator(rsi.clone()));
-        let second = engine.current(&crate::CompiledValue::Indicator(rsi));
+        let first = engine.current(&crate::CompiledValue::Indicator {
+            series: Series::Primary,
+            spec: rsi.clone(),
+        });
+        let second = engine.current(&crate::CompiledValue::Indicator {
+            series: Series::Primary,
+            spec: rsi,
+        });
         assert_eq!(first, second);
         assert!(
             engine
-                .current(&crate::CompiledValue::Indicator(ema))
+                .current(&crate::CompiledValue::Indicator {
+                    series: Series::Primary,
+                    spec: ema,
+                })
                 .is_some()
         );
     }
@@ -349,8 +378,14 @@ mod tests {
         }
 
         let const_value = crate::CompiledValue::Const(d("7"));
-        let close_value = crate::CompiledValue::Price(PriceField::Close);
-        let indicator = crate::CompiledValue::Indicator(spec);
+        let close_value = crate::CompiledValue::Price {
+            series: Series::Primary,
+            field: PriceField::Close,
+        };
+        let indicator = crate::CompiledValue::Indicator {
+            series: Series::Primary,
+            spec,
+        };
 
         assert_eq!(engine.current(&const_value), Some(d("7")));
         assert_eq!(engine.previous(&const_value), Some(d("7")));
@@ -374,8 +409,14 @@ mod tests {
         let mut engine = IndicatorEngine::new(&strategy).expect("engine builds");
         engine.step(&candle(0, "100"));
 
-        let close_value = crate::CompiledValue::Price(PriceField::Close);
-        let indicator = crate::CompiledValue::Indicator(spec);
+        let close_value = crate::CompiledValue::Price {
+            series: Series::Primary,
+            field: PriceField::Close,
+        };
+        let indicator = crate::CompiledValue::Indicator {
+            series: Series::Primary,
+            spec,
+        };
         assert_eq!(engine.current(&close_value), Some(d("100")));
         assert_eq!(engine.previous(&close_value), None);
         assert_eq!(engine.previous(&indicator), None);
@@ -393,7 +434,10 @@ mod tests {
             vec![],
         );
         let mut engine = IndicatorEngine::new(&strategy).expect("engine builds");
-        let value = crate::CompiledValue::Indicator(spec);
+        let value = crate::CompiledValue::Indicator {
+            series: Series::Primary,
+            spec,
+        };
 
         for (idx, close) in (0_i64..).zip(["100", "99", "98"]) {
             engine.step(&candle(idx, close));
@@ -464,8 +508,14 @@ mod tests {
         let candles = ["100.5", "99.25", "98.75", "97.5", "99.0"];
         let run = || {
             let mut engine = IndicatorEngine::new(&strategy).expect("engine builds");
-            let rsi_value = crate::CompiledValue::Indicator(rsi.clone());
-            let ema_value = crate::CompiledValue::Indicator(ema.clone());
+            let rsi_value = crate::CompiledValue::Indicator {
+                series: Series::Primary,
+                spec: rsi.clone(),
+            };
+            let ema_value = crate::CompiledValue::Indicator {
+                series: Series::Primary,
+                spec: ema.clone(),
+            };
             (0_i64..)
                 .zip(candles)
                 .map(|(idx, close)| {
@@ -493,5 +543,17 @@ mod tests {
         };
 
         assert!(matches!(err, EngineError::InvalidPeriod { .. }));
+    }
+
+    /// r2.s2.w2: the factory builds `Atr` — the Wilder true-range adapter —
+    /// like every other fixed-period spec.
+    #[test]
+    fn factory_builds_atr() {
+        let engine = IndicatorEngine::from_specs(&[IndicatorSpec::Atr {
+            period: SweepableValue::Fixed(14),
+        }])
+        .expect("atr builds in r2.s2.w2");
+
+        assert_eq!(engine.indicator_count(), 1);
     }
 }

@@ -45,7 +45,7 @@
 use rust_decimal::Decimal;
 
 use crate::domain::backtest::EquityCurve;
-use crate::domain::strategy::VersionId;
+use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
     CandleSeriesRepository, CandleWindow, DataError, DataVersion, EngineFingerprint,
@@ -274,6 +274,37 @@ pub enum BacktestAppError {
     #[error("backtest failed: {0}")]
     Engine(#[from] BacktestError),
 
+    /// The strategy needs a higher-timeframe series the request did not supply
+    /// (schema 1.1.0, r2.s2.w2). `field` names the missing input —
+    /// `"inputs.htf"` — so MCP/Tauri callers can point at the exact request
+    /// member instead of parsing the message.
+    #[error("strategy requires a higher-timeframe series but {field} was not supplied")]
+    HtfRequired {
+        /// The request/input field that was missing — always `"inputs.htf"`.
+        field: &'static str,
+    },
+
+    /// The request's `inputs.htf` selection is not strictly higher than the
+    /// primary timeframe — compared by [`Timeframe::duration_ms`], so the rule
+    /// holds for any future timeframe pair rather than hardcoding M15→H4.
+    /// An equal or lower interval would advance `Series::Htf` operands on the
+    /// wrong cadence while the DSL renders them as the HTF — silently wrong
+    /// signals — so the request is refused before any candle I/O (r2.s2
+    /// round-1 fix F1).
+    #[error(
+        "{field} must be a strictly higher timeframe than the primary {} — got {}",
+        primary.binance_interval(),
+        htf.binance_interval()
+    )]
+    HtfNotHigher {
+        /// The request/input field at fault — always `"inputs.htf"`.
+        field: &'static str,
+        /// The request's primary timeframe.
+        primary: Timeframe,
+        /// The request's higher-timeframe selection.
+        htf: Timeframe,
+    },
+
     /// A READ failed before anything was saved.
     ///
     /// Distinct from [`Persist`](Self::Persist) because that one says "persist
@@ -492,6 +523,11 @@ impl BacktestOutcome {
 pub(crate) enum PrepareError {
     /// The validated document did not compile.
     Compile(String),
+    /// The compiled strategy carries an `Htf` operand but no higher-timeframe
+    /// series was supplied (schema 1.1.0, r2.s2.w2) — refused before any candle
+    /// work rather than silently evaluating the operand against primary data.
+    /// Surfaces as [`BacktestAppError::HtfRequired`] on the standalone path.
+    HtfRequired,
     /// The engine refused the run.
     Engine(BacktestError),
 }
@@ -520,6 +556,13 @@ pub(crate) fn prepare_backtest(
     series_end: SeriesEnd,
 ) -> Result<PreparedBacktest, PrepareError> {
     let compiled = compile(validated).map_err(|e| PrepareError::Compile(e.to_string()))?;
+    // The typed application-ring guard (r2.s2.w2 / ADR-0015): a strategy with an
+    // `Htf` operand and no HTF series refuses here — after compile, before any
+    // candle work — rather than reaching the engine, which would raise its own
+    // `BacktestError::HtfRequired` as the last line of defense.
+    if compiled.needs_htf() && htf.is_none() {
+        return Err(PrepareError::HtfRequired);
+    }
     let config = BacktestConfig {
         starting_equity,
         taker_fee_bps: inputs.taker_fee_bps,
@@ -608,6 +651,31 @@ where
         })?
         .ok_or_else(|| BacktestAppError::VersionNotFound(request.version_id.clone()))?;
     let validated = validate(&version.dsl)?;
+
+    // r2.s2 round-1 fixes F1/F6: the request-level guards run BEFORE any
+    // candle I/O. `compile` is pure, so an `htf`-operand strategy missing
+    // `inputs.htf` — or an `inputs.htf` selection that is not strictly higher
+    // than the primary timeframe — is refused here rather than surfacing as a
+    // `PreSaveRead`/`SnapshotMissing` after loading (and possibly failing on)
+    // candle data the run can never use. `prepare_backtest` keeps the same
+    // `needs_htf` guard and `run_backtest` the same pair check as the last
+    // line of defence for callers that skip this ring.
+    let compiled =
+        compile(&validated).map_err(|e| BacktestAppError::CompileFailed(e.to_string()))?;
+    if compiled.needs_htf() && request.htf_timeframe.is_none() {
+        return Err(BacktestAppError::HtfRequired {
+            field: "inputs.htf",
+        });
+    }
+    if let Some(htf_tf) = request.htf_timeframe
+        && htf_tf.duration_ms() <= request.primary_timeframe.duration_ms()
+    {
+        return Err(BacktestAppError::HtfNotHigher {
+            field: "inputs.htf",
+            primary: request.primary_timeframe,
+            htf: htf_tf,
+        });
+    }
 
     // 3. Everything synchronous — Parquet decode and the CPU engine — happens on a
     //    blocking thread. Both are hundreds of milliseconds on the real fixture, and
@@ -854,6 +922,9 @@ where
         )
         .map_err(|e| match e {
             PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
+            PrepareError::HtfRequired => BacktestAppError::HtfRequired {
+                field: "inputs.htf",
+            },
             PrepareError::Engine(source) => BacktestAppError::Engine(source),
         })?;
         Ok(EngineOutput { prepared })
@@ -966,6 +1037,15 @@ fn inputs_from_run(
 /// run's exact `data_version`s — an agent run is then comparable with the run
 /// it iterates on. `window` is NEVER inherited: it is always the caller's.
 ///
+/// One correction sits on top of the inherit (r2.s2 round-3 fix): when the prior
+/// run recorded **no** HTF selection and the version's compiled strategy needs
+/// one (`needs_htf()`), `htf_timeframe` falls back to the application default
+/// `H4` at `HEAD` — identical to the no-run path, pin included. Neither
+/// surface DTO can name `inputs.htf`, so an unconditional `None` inherit would
+/// mint a request `run_version_backtest` refuses as `HtfRequired` forever.
+/// The fallback is gated on `needs_htf()` so a non-HTF version never loads an
+/// H4 snapshot it cannot use.
+///
 /// # Errors
 ///
 /// [`BacktestAppError::VersionNotFound`] when the version does not exist, and
@@ -998,7 +1078,20 @@ where
     };
 
     Ok(match inherited {
-        Some(inputs) => request_from_inputs(version_id, inputs, window),
+        Some(inputs) => {
+            let mut request = request_from_inputs(version_id, inputs, window);
+            // r2.s2 round-3 fix: an htf-needing version inheriting a run that
+            // recorded NO HTF selection must not mint `htf_timeframe: None` —
+            // `run_version_backtest` would refuse it as `HtfRequired`, a field
+            // no surface can set, dead-ending the iterate path. Fall back to
+            // the app default `H4` at HEAD (the pin stays `None`), the same
+            // shape the no-run arm below produces. Gated on `needs_htf()`: a
+            // non-HTF version must not load an H4 snapshot it does not need.
+            if request.htf_timeframe.is_none() && version_needs_htf(&version) {
+                request.htf_timeframe = Some(Timeframe::H4);
+            }
+            request
+        }
         None => BacktestRequest {
             version_id: version_id.clone(),
             pair: Pair::new("BTCUSDT"),
@@ -1009,6 +1102,18 @@ where
             window,
         },
     })
+}
+
+/// Whether the version's stored DSL compiles to a strategy that consumes an
+/// HTF series. Best-effort for the resolver's fallback only: a document that
+/// fails `validate`/`compile` answers `false`, so the resolver never mints a
+/// new error and `run_version_backtest` reports the real compile failure
+/// exactly as it does on the fresh-default path.
+fn version_needs_htf(version: &StrategyVersion) -> bool {
+    validate(&version.dsl)
+        .ok()
+        .and_then(|validated| compile(&validated).ok())
+        .is_some_and(|compiled| compiled.needs_htf())
 }
 
 /// The version's latest persisted run's `inputs`, when it has a usable row.
@@ -1083,9 +1188,9 @@ mod tests {
     use crate::domain::{
         BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CandleWindow,
         Comparator, Condition, DataError, DataVersion, Direction, ExitRule, FundingConfig,
-        IndicatorSpec, Pair, PersistedRun, RegimeBreakdown, RiskParams, RunSummary, SchemaVersion,
-        SkippedEntryCounts, SnapshotSelection, StrategyDsl, StrategyRepository, SummaryStats,
-        SweepableValue, Timeframe, Trade, ValueSource,
+        IndicatorSpec, Pair, PersistedRun, PriceField, RegimeBreakdown, RiskParams, RunSummary,
+        SchemaVersion, Series, SkippedEntryCounts, SnapshotSelection, StrategyDsl,
+        StrategyRepository, SummaryStats, SweepableValue, Timeframe, Trade, ValueSource,
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
@@ -1346,6 +1451,7 @@ mod tests {
             direction: Direction::Long,
             entry: Condition::Compare {
                 lhs: ValueSource::Indicator {
+                    series: Series::Primary,
                     spec: IndicatorSpec::Rsi {
                         period: SweepableValue::Fixed(14),
                     },
@@ -1378,6 +1484,42 @@ mod tests {
             created_by: CreatedBy::Human,
             creating_llm_call_ids: vec![],
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    /// `canonical_dsl` re-exited so `validate` passes (rule 3 refuses a
+    /// `TakeProfit` with no stop in the same strategy). The resolver's
+    /// `needs_htf` gate only sees a DSL that validates AND compiles, so a
+    /// fixture for it must carry a stop.
+    fn compilable_dsl(entry: Condition) -> StrategyDsl {
+        StrategyDsl {
+            entry,
+            exits: vec![ExitRule::StopLoss {
+                distance_pct: SweepableValue::Fixed(Decimal::new(5, 2)),
+            }],
+            ..canonical_dsl()
+        }
+    }
+
+    /// An entry reading the H4 close — the operand that makes the compiled
+    /// strategy report `needs_htf()`.
+    fn htf_entry() -> Condition {
+        Condition::Compare {
+            lhs: ValueSource::Price {
+                series: Series::Htf,
+                field: PriceField::Close,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::ZERO,
+            },
+        }
+    }
+
+    fn version_with_dsl(id: &str, parent: Option<&str>, dsl: StrategyDsl) -> StrategyVersion {
+        StrategyVersion {
+            dsl,
+            ..version(id, parent)
         }
     }
 
@@ -1559,6 +1701,77 @@ mod tests {
         assert_eq!(
             request.window, None,
             "a prior run's window is never inherited — it is always the caller's"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_defaults_htf_when_an_htf_version_inherits_none() {
+        // r2.s2 round-3 fix: the parent's run is M15-only (`inputs.htf` None)
+        // and the child's compiled strategy needs HTF. An unconditional `None`
+        // inherit would mint a request `run_version_backtest` refuses as
+        // `HtfRequired` — a field neither surface can set — so the resolver
+        // falls back to the app default `H4` at HEAD.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version_with_dsl(
+            "child-1",
+            Some("parent-1"),
+            compilable_dsl(htf_entry()),
+        ));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("parent-1"),
+            Some(recorded_inputs("v-parent", None, 7, 2)),
+        ));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(
+            request.htf_timeframe,
+            Some(Timeframe::H4),
+            "an htf-needing version inheriting no HTF selection resolves the app default H4"
+        );
+        assert_eq!(
+            request.snapshots,
+            Some(SnapshotPins {
+                primary: DataVersion::new("v-parent"),
+                htf: None,
+            }),
+            "the primary pin is inherited; the HTF pin stays HEAD, the fresh-default shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_keeps_htf_none_for_a_non_htf_version() {
+        // The same inherited M15-only run for a version whose strategy does
+        // NOT need HTF: `htf_timeframe` stays `None`. The fallback is gated on
+        // `needs_htf()`, so no run is made to load an H4 snapshot it cannot
+        // use — and a machine without an H4 snapshot for the pair never fails.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version_with_dsl(
+            "child-1",
+            Some("parent-1"),
+            compilable_dsl(canonical_dsl().entry),
+        ));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("parent-1"),
+            Some(recorded_inputs("v-parent", None, 7, 2)),
+        ));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(request.htf_timeframe, None);
+        assert_eq!(
+            request.snapshots,
+            Some(SnapshotPins {
+                primary: DataVersion::new("v-parent"),
+                htf: None,
+            }),
+            "a non-HTF version inherits the run's inputs untouched"
         );
     }
 

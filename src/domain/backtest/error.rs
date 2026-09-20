@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::domain::{Pair, Timeframe};
+
 /// Errors produced by the backtester (domain layer).
 ///
 /// `#[non_exhaustive]` so 1.03/1.04 can add variants additively (the shared file
@@ -52,10 +54,97 @@ pub enum BacktestError {
     #[error("impossible take-profit geometry: {0}")]
     ImpossibleTakeProfit(String),
 
+    /// The resolved stop leaves untradeable geometry: a non-positive price
+    /// (`multiple × ATR ≥ entry` on a long, so `entry − multiple × ATR ≤ 0`)
+    /// or a zero stop distance (`stop == entry`, a flat series driving the
+    /// frozen ATR to exactly 0). A zero distance would collapse into the
+    /// generic `NoStopLoss` and a negative one would size off its absolute
+    /// distance while never being fillable — both silently wrong — so the
+    /// fill refuses at the seam where the stop is derived, for every stop
+    /// kind, mirroring [`BacktestError::ImpossibleTakeProfit`] (r2.s2 round-1
+    /// fix F4; the zero-distance leg and the hoist out of the `Atr` arm are
+    /// r2.s2 round-3).
+    #[error("impossible ATR stop: {0}")]
+    ImpossibleStop(String),
+
     /// The cost/equity configuration is out of range — non-positive starting
     /// equity (the sizing denominator) or a fee/slippage rate outside `[0, 100%)`.
     /// Enforced at the engine boundary so a non-CLI caller cannot feed the
     /// sizing/fill math nonsensical inputs.
     #[error("invalid backtest configuration: {0}")]
     InvalidConfig(String),
+
+    /// The compiled strategy references a `series: "htf"` operand but no
+    /// higher-timeframe candle series was supplied (schema 1.1.0, r2.s2.w2).
+    /// The engine raises this rather than silently evaluating an `Htf` leaf
+    /// against primary data; the application ring checks it first and reports
+    /// the missing input field.
+    #[error("strategy requires a higher-timeframe candle series (series: \"htf\" operand present)")]
+    HtfRequired,
+
+    /// The supplied higher-timeframe series is not strictly higher than the
+    /// primary series (`htf.duration_ms() <= primary.duration_ms()`). An equal
+    /// or lower interval would advance `Series::Htf` operands on the wrong
+    /// cadence while the DSL renders them as the HTF — silently wrong signals.
+    /// The request boundary refuses this before any candle I/O (r2.s2 round-1
+    /// fix F1); this arm is the engine-level defence for callers that
+    /// construct the series directly.
+    #[error(
+        "higher-timeframe series {htf:?} is not higher than the primary series {primary:?} — \
+         `Series::Htf` operands need a strictly longer timeframe"
+    )]
+    HtfNotHigher {
+        /// The primary series' timeframe.
+        primary: Timeframe,
+        /// The supplied higher-timeframe series' timeframe.
+        htf: Timeframe,
+    },
+
+    /// The supplied higher-timeframe series is for a different trading pair
+    /// than the primary series. `CandleSeries::pair` is public and
+    /// `run_backtest` takes the two series independently, so without this
+    /// check a direct caller could produce mixed-symbol signals with nothing
+    /// red — the engine steps `htf.candles` and routes `Series::Htf` leaves to
+    /// it regardless (r2.s2 round-2 fix G1). The application path loads both
+    /// series by the request's pair, so this arm is the whole API-seam guard.
+    #[error(
+        "higher-timeframe series is for a different pair (primary {primary}, htf {htf}) — \
+         `Series::Htf` operands must read the same symbol's bars"
+    )]
+    HtfPairMismatch {
+        /// The primary series' trading pair.
+        primary: Pair,
+        /// The supplied higher-timeframe series' trading pair.
+        htf: Pair,
+    },
+
+    /// The supplied higher-timeframe series ends more than one HTF interval
+    /// before the primary series ends. `align` advances its HTF pointer
+    /// forward-only and never clears it, so once the HTF candles are exhausted
+    /// every later primary bar would still pair with the FINAL one — `Series::Htf`
+    /// operands reading a frozen, stale bar for the rest of the run: silent
+    /// wrong trades, not a loud failure. One interval of slack is allowed —
+    /// at most one not-yet-closed HTF bar may be pending, the normal live
+    /// shape — and an empty HTF series is skipped (legal per r2.s1.w3: `align`
+    /// then yields `htf: None` per bar and the paired-bar gate closes entries
+    /// outright). The refusal lives in `check_htf_inputs`, the seam that owns
+    /// the other HTF input invariants, and applies only when the compiled
+    /// strategy consumes the HTF series (`needs_htf`) — a primary-only
+    /// strategy is handed the default-resolved H4 snapshot but never reads it,
+    /// so a lagging H4 HEAD must not refuse its run (r2.s2 round-5; the
+    /// `needs_htf` gate is round-6).
+    #[error(
+        "higher-timeframe coverage ends at close_time {htf_end}, more than one {htf:?} interval \
+         before the primary series ends at {primary_end} — `Series::Htf` operands would read \
+         a stale final bar"
+    )]
+    HtfCoverageShort {
+        /// The primary series' last candle `close_time` (epoch ms).
+        primary_end: i64,
+        /// The supplied higher-timeframe series' last candle `close_time` (epoch ms).
+        htf_end: i64,
+        /// The supplied higher-timeframe series' timeframe — the interval the
+        /// slack is measured in.
+        htf: Timeframe,
+    },
 }

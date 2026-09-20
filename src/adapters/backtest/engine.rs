@@ -6,11 +6,12 @@ use crate::adapters::backtest::regime::RegimeDetector;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, Direction, EngineFingerprint, EquityCurve, ExitReason, Fill, IntraBarExit,
-    OpenPositionMark, Regime, RegimeBreakdown, SeriesEnd, Side, SizingOutcome, SkippedEntryCounts,
-    SummaryStats, SymbolFilters, Trade, TradeSource, align, apply_slippage, compute_position_size,
-    funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, stop_price,
-    take_profit_price, taker_fee,
+    CompiledStrategy, CompiledValue, Direction, EngineFingerprint, EquityCurve, EvalContext,
+    ExitReason, Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime, RegimeBreakdown,
+    Series, SeriesEnd, Side, SizingOutcome, SkippedEntryCounts, SummaryStats, SweepableValue,
+    SymbolFilters, Trade, TradeSource, align, apply_slippage, atr_stop_price,
+    compute_position_size, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
+    stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -90,14 +91,33 @@ pub fn run_backtest(
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
+    check_htf_inputs(compiled, primary, htf)?;
     let mut engine =
         IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
+    // The higher-timeframe engine is built only when the strategy carries an
+    // `Htf` operand (the guard above guarantees `htf` is `Some` then). It is
+    // stepped on each NEWLY aligned closed H4 bar — never once per primary bar.
+    let mut htf_engine = if compiled.needs_htf() {
+        Some(
+            IndicatorEngine::from_specs(compiled.required_htf_indicators())
+                .map_err(|err| BacktestError::EngineInit(err.to_string()))?,
+        )
+    } else {
+        None
+    };
     // The regime detector is stepped over the PRIMARY M15 series (v1, README C7),
     // independently of the strategy's indicators — so a trade is tagged with the
     // market regime regardless of which indicators the strategy declares.
     let mut detector = RegimeDetector::new();
     let mut state = LoopState::default();
     let direction = compiled.direction();
+    // Index into `htf.candles` of the next HTF bar not yet stepped through the
+    // HTF engine (r2.s2 round-1 fix F2). A cursor over the source series — not
+    // the aligned pairing — is what guarantees every closed HTF candle is
+    // stepped exactly once, including the lead-in history `align` jumps past
+    // when several H4 closes precede the first primary bar.
+    let mut htf_cursor = 0_usize;
+    let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
 
     // D6 (NFR-1): build the funding-event index ONCE, before the trade loop, so
     // funding accrual is O(trades × (log E + k)) over the ~1095 funding events
@@ -134,15 +154,44 @@ pub fn run_backtest(
         close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
 
         engine.step(bar.primary);
+        // Step the HTF engine with EVERY HTF candle that has closed at or
+        // before this primary bar's close (r2.s2 round-1 fix F2). The aligned
+        // `bar.htf` stays the last of them, so `current()`/`previous()` remain
+        // H4-relative — but the warmup history a `close_time`-jumped pairing
+        // would skip (lead-in H4 bars already closed when the run's first
+        // primary bar lands) now feeds the engine instead of vanishing.
+        if let Some(engine_htf) = htf_engine.as_mut() {
+            step_closed_htf_candles(
+                engine_htf,
+                htf_candles,
+                &mut htf_cursor,
+                bar.primary.close_time,
+            );
+        }
         // Advance the regime detector in lock-step with the indicator engine, once
         // per primary bar (README C7). The order vs. `engine.step` is irrelevant
         // (independent state); both step after fill/close so the next bar reads
         // only already-closed information.
         detector.step(bar.primary);
 
+        // The series-routed evaluation context (r2.s2.w2): `Primary` leaves
+        // read the primary engine, `Htf` leaves read the HTF engine — a missing
+        // HTF engine can only pair with an `Htf`-free strategy (the guard above
+        // enforced that), so a `None` here is unreachable for an `Htf` leaf.
+        let ctx = DualSeriesContext {
+            primary: &engine,
+            htf: htf_engine.as_ref(),
+        };
+
         if state.position.is_some()
             && state.pending_exit.is_none()
-            && exit_plan.signal_triggered(&engine)
+            // r2.s2 round-1 fix F3: when the strategy needs the higher
+            // timeframe a signal exit must not evaluate before a closed HTF
+            // bar is actually paired — a `Not(...)` over an absent `Htf`
+            // operand otherwise reads `true` and exits against a bar that
+            // does not exist yet.
+            && (htf_engine.is_none() || bar.htf.is_some())
+            && exit_plan.signal_triggered(&ctx)
         {
             state.pending_exit = Some(PendingExit {
                 signal_time: bar.primary.close_time,
@@ -154,11 +203,31 @@ pub fn run_backtest(
             && state.pending_entry.is_none()
             && bar.index > 0
             && engine.is_warm()
-            && compiled.entry().eval(&engine)
+            // Warm gate (r2.s2.w2): when the strategy uses `Htf` operands the
+            // HTF engine must be warm too — an `Htf` EMA still seeding must not
+            // fire an entry (the same warmup discipline the primary gate has).
+            && htf_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
+            // r2.s2 round-1 fix F3: `is_warm` is vacuous when the strategy's
+            // only `Htf` operand is a Price leaf (no HTF indicator exists to
+            // warm), so a paired closed HTF bar must exist before the entry
+            // may evaluate — a `Not(...)` over an absent `Htf` operand
+            // otherwise reads `true` and fires before any H4 bar exists.
+            && (htf_engine.is_none() || bar.htf.is_some())
+            && compiled.entry().eval(&ctx)
         {
-            state.pending_entry = Some(PendingEntry {
-                signal_time: bar.primary.close_time,
-            });
+            // ATR-stop entries additionally require the primary ATR(period)
+            // available AT THE SIGNAL BAR (r2.s2.w2): the value is frozen into
+            // the pending entry now and turned into the absolute stop at fill —
+            // never recomputed there. `is_warm` already covers it when the
+            // `AtrStop` registers its ATR, but the explicit `Some` read keeps
+            // the gate honest if that registration ever changes.
+            let atr_at_signal = atr_at_signal(&exit_plan, &ctx);
+            if !matches!(exit_plan.stop, StopRule::Atr { .. }) || atr_at_signal.is_some() {
+                state.pending_entry = Some(PendingEntry {
+                    signal_time: bar.primary.close_time,
+                    atr_at_signal,
+                });
+            }
         }
     }
 
@@ -192,9 +261,196 @@ pub fn run_backtest(
     Ok(state.into_result(config, run_start_time_ms, open_position))
 }
 
+/// The engine-side HTF input guards: a strategy carrying an `Htf` operand must
+/// never evaluate that operand against primary data (r2.s2.w2 — the
+/// application ring checks this first and reports the missing input field),
+/// a supplied "higher" timeframe that is not strictly higher than the
+/// primary — compared by `Timeframe::duration_ms`, so the rule holds for any
+/// pair — would advance `Series::Htf` operands on the wrong cadence while the
+/// DSL renders them as the HTF (r2.s2 round-1 fix F1), a supplied series
+/// for a DIFFERENT pair would feed `Series::Htf` operands another symbol's
+/// bars — mixed-symbol signals with nothing red (r2.s2 round-2 fix G1), and —
+/// only when the strategy actually consumes the series — an HTF series ending
+/// more than one HTF interval before the primary's end would leave
+/// `Series::Htf` operands reading the frozen FINAL HTF bar for the rest of
+/// the run (r2.s2 round-5, gated on `needs_htf` in round-6). The timeframe
+/// refusal also lives at the request boundary; the missing-HTF and pair checks
+/// are defence-in-depth (the request carries no second pair), for callers that
+/// construct the series directly.
+fn check_htf_inputs(
+    compiled: &CompiledStrategy,
+    primary: &CandleSeries,
+    htf: Option<&CandleSeries>,
+) -> Result<(), BacktestError> {
+    if compiled.needs_htf() && htf.is_none() {
+        return Err(BacktestError::HtfRequired);
+    }
+    if let Some(htf_series) = htf {
+        // r2.s2 round-2 fix G1: a different-pair "htf" series would feed
+        // `Series::Htf` operands another symbol's bars — mixed-symbol signals
+        // with nothing red. The application path loads both series by the
+        // request's pair, so this engine-side check is the whole seam.
+        if htf_series.pair != primary.pair {
+            return Err(BacktestError::HtfPairMismatch {
+                primary: primary.pair.clone(),
+                htf: htf_series.pair.clone(),
+            });
+        }
+        if htf_series.timeframe.duration_ms() <= primary.timeframe.duration_ms() {
+            return Err(BacktestError::HtfNotHigher {
+                primary: primary.timeframe,
+                htf: htf_series.timeframe,
+            });
+        }
+        // r2.s2 round-5: `align` advances its HTF pointer forward-only and
+        // never clears it, so once the HTF candles run out every later primary
+        // bar still pairs with the FINAL one — `Series::Htf` operands would
+        // read a frozen, stale bar for the rest of the run (silent wrong
+        // trades, not a loud failure). The primary and HTF snapshots load
+        // independently with no coverage invariant between them, and an M15
+        // HEAD routinely extends past an H4 HEAD, so this is reachable. One
+        // interval of slack is allowed: at most one not-yet-closed HTF bar may
+        // be pending, the normal live shape. An empty HTF series is legal
+        // (r2.s1.w3) and skipped — `align` then yields `htf: None` per bar and
+        // the paired-bar gate closes entries outright.
+        //
+        // r2.s2 round-6: this arm ALONE is gated on `needs_htf` — coverage
+        // freshness only matters when the strategy actually reads the series.
+        // The default resolver supplies `Some(H4)` unconditionally, so a
+        // primary-only strategy arrives here holding an H4 snapshot it never
+        // consumes, and a lagging H4 HEAD must not refuse its run. The other
+        // arms deliberately stay ungated: pair and cadence are structural
+        // invariants of a SUPPLIED series that can never spuriously fail here
+        // (the request carries one pair; H4 is always longer than M15), while
+        // this arm is the only one whose outcome depends on snapshot freshness.
+        if compiled.needs_htf()
+            && let (Some(primary_last), Some(htf_last)) =
+                (primary.candles.last(), htf_series.candles.last())
+            && primary_last.close_time - htf_last.close_time > htf_series.timeframe.duration_ms()
+        {
+            return Err(BacktestError::HtfCoverageShort {
+                primary_end: primary_last.close_time,
+                htf_end: htf_last.close_time,
+                htf: htf_series.timeframe,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Advance the HTF indicator engine over every HTF candle that has closed at
+/// or before `primary_close` (r2.s2 round-1 fix F2), in chronological order,
+/// each exactly once. `cursor` indexes `htf_candles` at the next bar not yet
+/// stepped — a cursor over the source series, not the aligned pairing, is what
+/// guarantees lead-in history `align` jumps past still feeds the engine.
+fn step_closed_htf_candles(
+    htf_engine: &mut IndicatorEngine,
+    htf_candles: &[Candle],
+    cursor: &mut usize,
+    primary_close: i64,
+) {
+    while let Some(candle) = htf_candles.get(*cursor)
+        && candle.close_time <= primary_close
+    {
+        htf_engine.step(candle);
+        *cursor += 1;
+    }
+}
+
+/// The primary-series ATR(period) value at the signal bar, for an `AtrStop`
+/// exit — frozen into the pending entry so the stop derives from the signal
+/// bar's ATR, never recomputed at fill (r2.s2.w2). `None` for a `StopLoss`
+/// exit and while the ATR is still unwarm.
+fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -> Option<Decimal> {
+    match exit_plan.stop {
+        StopRule::Atr { period, .. } => ctx.current(&CompiledValue::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Atr {
+                period: SweepableValue::Fixed(period),
+            },
+        }),
+        StopRule::Pct(_) => None,
+    }
+}
+
+/// How a position's stop is derived (r2.s2.w2): either the fixed-fraction
+/// `StopLoss` distance or the `AtrStop`'s `multiple × ATR(period)` frozen at
+/// the signal bar.
+#[derive(Debug, Clone, Copy)]
+enum StopRule {
+    /// `entry × (1 ∓ distance_pct)` — the stop distance in price units is
+    /// `entry × distance_pct` (defines 1R).
+    Pct(Decimal),
+    /// `entry ∓ multiple × ATR(period)` — the ATR is read on the primary series
+    /// at the signal bar and frozen into the pending entry.
+    Atr {
+        /// The primary-series ATR lookback.
+        period: u32,
+        /// The ATR multiple.
+        multiple: Decimal,
+    },
+}
+
+/// The series-routed evaluation context (r2.s2.w2): every [`CompiledValue`]
+/// leaf carries its [`Series`] tag, so `current`/`previous` forward `Primary`
+/// leaves to the primary engine and `Htf` leaves to the higher-timeframe one.
+/// `htf` is `None` only for a strategy with no `Htf` operand — the
+/// [`BacktestError::HtfRequired`] guard in [`run_backtest`] makes the
+/// alternative unreachable.
+struct DualSeriesContext<'a> {
+    primary: &'a IndicatorEngine,
+    htf: Option<&'a IndicatorEngine>,
+}
+
+impl EvalContext for DualSeriesContext<'_> {
+    fn current(&self, value: &CompiledValue) -> Option<Decimal> {
+        match value {
+            CompiledValue::Const(..)
+            | CompiledValue::Price {
+                series: Series::Primary,
+                ..
+            }
+            | CompiledValue::Indicator {
+                series: Series::Primary,
+                ..
+            } => self.primary.current(value),
+            CompiledValue::Price {
+                series: Series::Htf,
+                ..
+            }
+            | CompiledValue::Indicator {
+                series: Series::Htf,
+                ..
+            } => self.htf.and_then(|engine| engine.current(value)),
+        }
+    }
+
+    fn previous(&self, value: &CompiledValue) -> Option<Decimal> {
+        match value {
+            CompiledValue::Const(..)
+            | CompiledValue::Price {
+                series: Series::Primary,
+                ..
+            }
+            | CompiledValue::Indicator {
+                series: Series::Primary,
+                ..
+            } => self.primary.previous(value),
+            CompiledValue::Price {
+                series: Series::Htf,
+                ..
+            }
+            | CompiledValue::Indicator {
+                series: Series::Htf,
+                ..
+            } => self.htf.and_then(|engine| engine.previous(value)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExitPlan<'a> {
-    stop_distance_pct: Decimal,
+    stop: StopRule,
     take_profit_target_r: Option<Decimal>,
     signal_exits: Vec<&'a CompiledCondition>,
     risk_per_trade_pct: Decimal,
@@ -203,18 +459,27 @@ struct ExitPlan<'a> {
 
 impl<'a> ExitPlan<'a> {
     fn from_strategy(compiled: &'a CompiledStrategy) -> Result<Self, BacktestError> {
-        let Some(stop_distance_pct) = stop_distance(compiled.exits()) else {
+        // Unsupported kinds gate FIRST: a `TrailingStop`/`TimeStop` is
+        // structurally valid but unmodelled here, so it must surface the typed
+        // `UnsupportedExit` — not `NoStopLoss`.
+        reject_unsupported(compiled.exits())?;
+        let Some(stop) = stop_rule(compiled.exits()) else {
             return Err(BacktestError::NoStopLoss);
         };
-        reject_unsupported(compiled.exits())?;
         let take_profit_target_r = take_profit_target(compiled.exits());
-        reject_impossible_short_tp(
-            compiled.direction(),
-            take_profit_target_r,
-            stop_distance_pct,
-        )?;
+        // The short-TP impossibility check is plan-time only for the
+        // fixed-fraction stop (its distance is known before any bar). For an
+        // `AtrStop` the distance is `multiple × ATR` — unknowable until the
+        // signal bar — so the same typed check moves to the fill (r2.s2.w2).
+        if let StopRule::Pct(stop_distance_pct) = stop {
+            reject_impossible_short_tp(
+                compiled.direction(),
+                take_profit_target_r,
+                stop_distance_pct,
+            )?;
+        }
         Ok(Self {
-            stop_distance_pct,
+            stop,
             take_profit_target_r,
             signal_exits: signal_exits(compiled.exits()),
             risk_per_trade_pct: compiled.risk().risk_per_trade_pct,
@@ -222,10 +487,10 @@ impl<'a> ExitPlan<'a> {
         })
     }
 
-    fn signal_triggered(&self, engine: &IndicatorEngine) -> bool {
+    fn signal_triggered(&self, ctx: &dyn EvalContext) -> bool {
         self.signal_exits
             .iter()
-            .any(|condition| condition.eval(engine))
+            .any(|condition| condition.eval(ctx))
     }
 }
 
@@ -310,6 +575,11 @@ impl LoopState {
 #[derive(Debug, Clone, Copy)]
 struct PendingEntry {
     signal_time: i64,
+    /// The primary-series ATR(period) read AT THE SIGNAL BAR (r2.s2.w2) —
+    /// `Some` iff the exit plan is an `AtrStop`. Frozen here so the fill turns
+    /// it into the absolute stop without recomputing (the ATR may have moved
+    /// between signal and fill bars).
+    atr_at_signal: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -358,9 +628,45 @@ fn fill_pending_entry(
 
     let raw_entry = candle.open;
     let entry_price = apply_slippage(raw_entry, config.slippage_bps, direction, Side::Entry);
-    let stop = stop_price(entry_price, plan.stop_distance_pct, direction);
+    // The stop is derived once at the fill and FROZEN on the position — neither
+    // stop kind ever recomputes or trails afterwards (r2.s2.w2). For `AtrStop`
+    // the distance is `multiple × ATR` where the ATR was frozen into the
+    // pending entry at the signal bar.
+    let stop = match plan.stop {
+        StopRule::Pct(distance_pct) => stop_price(entry_price, distance_pct, direction),
+        // `atr_at_signal` is guaranteed `Some` by the entry gate; a `None`
+        // reaching the fill means a signal was recorded without its ATR —
+        // impossible, so skip rather than invent a stop.
+        StopRule::Atr { multiple, .. } => {
+            let Some(atr) = pending.atr_at_signal else {
+                return Ok(());
+            };
+            atr_stop_price(entry_price, atr, multiple, direction)
+        }
+    };
+    // r2.s2 round-3 fix: the F4 geometry guard hoisted out of the `Atr` arm — it
+    // must reject a zero stop DISTANCE too, not only a non-positive price. A
+    // flat series (`high == low == prev_close` on every bar) drives the frozen
+    // ATR to exactly 0, so `atr_stop_price` resolves `stop == entry`: positive,
+    // it passed the arm-local check, and `risk_capped_qty` then failed the
+    // whole run as the generic `NoStopLoss` for a strategy that DID declare an
+    // `AtrStop`. The typed `ImpossibleStop` fires here for both shapes.
+    // Hoisting is behaviour-preserving for `Pct`: validate rule 6 pins
+    // `distance_pct` to the open interval (0, 1), so a Pct stop can be neither
+    // non-positive nor zero-distance.
+    let stop_distance = (entry_price - stop).abs();
+    if stop <= Decimal::ZERO || stop_distance.is_zero() {
+        return Err(BacktestError::ImpossibleStop(format!(
+            "{:?} stop from entry {entry_price} resolves to stop {stop} — \
+             non-positive or zero stop distance",
+            plan.stop
+        )));
+    }
     // The shared exchange-constrained sizer (NFR-3, C8): one sizing path for sim
-    // and (future v3) live. `NoStopLoss` (zero stop distance) still propagates
+    // and (future v3) live. From this path it only ever sees a positive stop
+    // with positive distance — the geometry guard above refuses anything else
+    // as `ImpossibleStop`, so its `NoStopLoss` (zero distance) branch is
+    // unreachable here; any error the sizer does return still propagates
     // fail-fast (G5/#20). A `Skipped` outcome consumes the pending entry (it is
     // NOT retried) and increments the matching `SkippedEntryCounts` cell.
     let qty = match compute_position_size(
@@ -378,14 +684,28 @@ fn fill_pending_entry(
         }
     };
     let entry_fee = taker_fee(qty * entry_price, config.taker_fee_bps);
+    // Take-profit uses the same 1R distance (`|entry − stop|`) for BOTH stop
+    // kinds (r2.s2.w2): fixed-fraction keeps its closed form, `AtrStop` takes
+    // `entry ± target_r × |entry − stop|` — with the short-TP impossibility
+    // check moved here from plan time, where the ATR distance was unknowable.
+    let take_profit_price = plan
+        .take_profit_target_r
+        .map(|target| match plan.stop {
+            StopRule::Pct(distance_pct) => Ok(take_profit_price(
+                entry_price,
+                distance_pct,
+                target,
+                direction,
+            )),
+            StopRule::Atr { .. } => atr_take_profit_price(entry_price, stop, target, direction),
+        })
+        .transpose()?;
     state.position = Some(OpenPosition {
         direction,
         qty,
         entry_price,
         stop_price: stop,
-        take_profit_price: plan.take_profit_target_r.map(|target| {
-            take_profit_price(entry_price, plan.stop_distance_pct, target, direction)
-        }),
+        take_profit_price,
         entry_signal_time: pending.signal_time,
         entry_fill_time: candle.open_time,
         entry_fee,
@@ -660,6 +980,9 @@ fn close_position(
         // The market regime captured at the entry-fill bar (FR-6), carried
         // through to the trade record for `RegimeBreakdown` aggregation.
         regime: position.regime,
+        // The frozen stop level the position carried (r2.s2.w2) — recorded
+        // verbatim so the trade log shows the risk the entry was sized against.
+        stop_price: Some(position.stop_price),
     });
     Ok(())
 }
@@ -717,9 +1040,13 @@ fn funding_between(
         .sum()
 }
 
-fn stop_distance(exits: &[CompiledExit]) -> Option<Decimal> {
+fn stop_rule(exits: &[CompiledExit]) -> Option<StopRule> {
     exits.iter().find_map(|exit| match exit {
-        CompiledExit::StopLoss { distance_pct } => Some(*distance_pct),
+        CompiledExit::StopLoss { distance_pct } => Some(StopRule::Pct(*distance_pct)),
+        CompiledExit::AtrStop { period, multiple } => Some(StopRule::Atr {
+            period: *period,
+            multiple: *multiple,
+        }),
         _ => None,
     })
 }
@@ -783,6 +1110,31 @@ fn reject_unsupported(exits: &[CompiledExit]) -> Result<(), BacktestError> {
     Ok(())
 }
 
+/// ATR-stop take-profit: `entry ± target_r × |entry − stop|` — the same 1R
+/// distance a fixed-fraction stop uses, measured against the frozen ATR stop.
+/// The short variant can resolve to a non-positive price (the plan-time
+/// `reject_impossible_short_tp` cannot see the ATR distance), so the typed
+/// check lives here at fill time (r2.s2.w2).
+fn atr_take_profit_price(
+    entry_price: Decimal,
+    stop: Decimal,
+    target_r: Decimal,
+    direction: Direction,
+) -> Result<Decimal, BacktestError> {
+    let distance = (entry_price - stop).abs();
+    let tp = match direction {
+        Direction::Long => entry_price + target_r * distance,
+        Direction::Short => entry_price - target_r * distance,
+    };
+    if tp <= Decimal::ZERO {
+        return Err(BacktestError::ImpossibleTakeProfit(format!(
+            "short take-profit at {target_r}R × ATR stop distance {distance} \
+             resolves to a non-positive price"
+        )));
+    }
+    Ok(tp)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -793,8 +1145,8 @@ mod tests {
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
-        SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile,
-        realized_pnl, validate,
+        Series, SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource,
+        compile, realized_pnl, validate,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -862,6 +1214,7 @@ mod tests {
     fn price_entry() -> Condition {
         Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: PriceField::Close,
             },
             op: Comparator::Gt,
@@ -874,6 +1227,7 @@ mod tests {
     fn never_signal() -> Condition {
         Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: PriceField::Close,
             },
             op: Comparator::Lt,
@@ -886,6 +1240,7 @@ mod tests {
     fn signal_on_high_close() -> Condition {
         Condition::Compare {
             lhs: ValueSource::Price {
+                series: Series::Primary,
                 field: PriceField::Close,
             },
             op: Comparator::Gt,
@@ -1257,6 +1612,32 @@ mod tests {
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
         ));
+    }
+
+    /// r2.s2.w2: an `AtrStop` strategy is modelled — the run no longer refuses
+    /// it. A single candle can't warm the ATR (period 14 seeds at index 14), so
+    /// the run produces no trades but no error.
+    #[test]
+    fn atr_stop_runs_without_typed_refusal() {
+        let primary = series(vec![candle(0, 100, 101, 99, 100)]);
+        let strategy = compiled(
+            price_entry(),
+            vec![ExitRule::AtrStop {
+                period: SweepableValue::Fixed(14),
+                multiple: SweepableValue::Fixed(d(2)),
+            }],
+        );
+
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+        )
+        .expect("atr stop is modelled since r2.s2.w2");
+        assert!(result.trades.is_empty());
     }
 
     #[test]

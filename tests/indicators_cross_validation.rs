@@ -10,7 +10,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use pulse::{
-    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair,
+    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair, Series,
     SweepableValue, Timeframe,
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -26,6 +26,7 @@ enum IndicatorName {
     Ema,
     Adx,
     Macd,
+    Atr,
 }
 
 impl IndicatorName {
@@ -35,6 +36,7 @@ impl IndicatorName {
             Self::Ema => "EMA(50)",
             Self::Adx => "ADX(14)",
             Self::Macd => "MACD(12,26,9)",
+            Self::Atr => "ATR(14)",
         }
     }
 
@@ -48,14 +50,20 @@ impl IndicatorName {
                 slow: fixed(26),
                 signal: fixed(9),
             },
+            Self::Atr => IndicatorSpec::Atr { period: fixed(14) },
         }
     }
 
     fn settle_bars(self) -> usize {
         match self {
             // The generator pins recursive EMA with sma=false for these three,
-            // so they should agree immediately once warm.
-            Self::Rsi | Self::Ema | Self::Macd => 0,
+            // so they should agree immediately once warm. ATR shares the
+            // SMA-seeded Wilder RMA with ADX (same `wilder.rs` core), and
+            // pandas-ta-classic's `atr(mamode="rma")` turns out to SMA-seed
+            // identically — measured at regen (r2.s2.w2): the worst relative
+            // delta over post-warmup rows is ≈2.7e-12, already below REL_EPS,
+            // so no settling window is needed at all.
+            Self::Rsi | Self::Ema | Self::Macd | Self::Atr => 0,
             // ADX uses the same Wilder alpha, but the adapter is SMA-seeded
             // while pandas-ta's RMA is recursively seeded. The first 280
             // post-warmup rows let the seed delta decay below REL_EPS.
@@ -71,6 +79,7 @@ struct ReferenceRow {
     ema_50: String,
     adx_14: String,
     macd_12_26_9: String,
+    atr_14: String,
 }
 
 impl ReferenceRow {
@@ -80,6 +89,7 @@ impl ReferenceRow {
             IndicatorName::Ema => &self.ema_50,
             IndicatorName::Adx => &self.adx_14,
             IndicatorName::Macd => &self.macd_12_26_9,
+            IndicatorName::Atr => &self.atr_14,
         };
         if raw.is_empty() {
             None
@@ -127,12 +137,13 @@ fn load_reference() -> Vec<ReferenceRow> {
         .collect()
 }
 
-fn indicator_names() -> [IndicatorName; 4] {
+fn indicator_names() -> [IndicatorName; 5] {
     [
         IndicatorName::Rsi,
         IndicatorName::Ema,
         IndicatorName::Adx,
         IndicatorName::Macd,
+        IndicatorName::Atr,
     ]
 }
 
@@ -144,7 +155,10 @@ fn all_specs() -> Vec<IndicatorSpec> {
 }
 
 fn current_value(engine: &IndicatorEngine, indicator: IndicatorName) -> Option<Decimal> {
-    engine.current(&CompiledValue::Indicator(indicator.spec()))
+    engine.current(&CompiledValue::Indicator {
+        series: Series::Primary,
+        spec: indicator.spec(),
+    })
 }
 
 fn decimal_to_f64(value: Decimal) -> f64 {

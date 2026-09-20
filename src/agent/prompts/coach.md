@@ -21,7 +21,8 @@ call ends the turn, and any other number makes the whole turn a recorded failure
 - `path` — the locator of the numeric leaf you want to retune, written in the same
   dotted/indexed form the strategy document uses. Examples:
   `entry.lhs.indicator.rsi.period`, `entry.and[0].not.lhs.indicator.macd.fast`,
-  `exits[0].distance_pct`, `risk.risk_per_trade_pct`.
+  `exits[0].distance_pct`, `exits[0].multiple`,
+  `filters[0].rhs.indicator.atr.period`, `risk.risk_per_trade_pct`.
 - `new_value` — an object naming the kind and the value:
   - `{"type": "Period", "value": 21}` for an indicator period or a bar count (a
     whole number),
@@ -35,10 +36,12 @@ call ends the turn, and any other number makes the whole turn a recorded failure
 
 Three families of numeric leaf, and nothing else:
 
-- **indicator periods** and bar counts — an RSI, EMA or ADX period, MACD's `fast`,
-  `slow` or `signal`, a time stop's `max_bars`;
+- **indicator periods** and bar counts — an RSI, EMA, ADX or ATR period
+  (`…indicator.atr.period`), MACD's `fast`, `slow` or `signal`, a time stop's
+  `max_bars`;
 - **exit parameters** — a stop's `distance_pct`, a take-profit's `target_r`, a
-  trailing stop's `trail_pct`;
+  trailing stop's `trail_pct`, an ATR stop's `period` and `multiple` (an ATR
+  multiple, e.g. `exits[0].multiple`);
 - **risk parameters** — `risk.risk_per_trade_pct` and `risk.max_leverage`.
 
 You cannot change a constant a condition compares against. The `30` in
@@ -48,7 +51,8 @@ inside a signal exit's condition. A mutation aimed at one is recorded as a faile
 turn, so do not aim at one.
 
 You also cannot add or remove conditions, swap indicators, or change an exit's kind
-— this release's vocabulary is parameter retuning only. That limit is not something
+(swapping a percent stop for an ATR stop, or back, is an exit-kind change — not a
+retune) — this release's vocabulary is parameter retuning only. That limit is not something
 to work around: do NOT approximate a structural change with whichever parameter sits
 nearest to it. A parameter move offered as a stand-in for a structural one records a
 proposal nobody made and hides the limitation instead of putting it on the record.
