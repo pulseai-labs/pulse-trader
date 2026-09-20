@@ -269,12 +269,14 @@ pub fn run_backtest(
 /// pair — would advance `Series::Htf` operands on the wrong cadence while the
 /// DSL renders them as the HTF (r2.s2 round-1 fix F1), a supplied series
 /// for a DIFFERENT pair would feed `Series::Htf` operands another symbol's
-/// bars — mixed-symbol signals with nothing red (r2.s2 round-2 fix G1), and an
-/// HTF series ending more than one HTF interval before the primary's end would
-/// leave `Series::Htf` operands reading the frozen FINAL HTF bar for the rest
-/// of the run (r2.s2 round-5). The timeframe refusal also lives at the request
-/// boundary; the missing-HTF and pair checks are defence-in-depth (the request
-/// carries no second pair), for callers that construct the series directly.
+/// bars — mixed-symbol signals with nothing red (r2.s2 round-2 fix G1), and —
+/// only when the strategy actually consumes the series — an HTF series ending
+/// more than one HTF interval before the primary's end would leave
+/// `Series::Htf` operands reading the frozen FINAL HTF bar for the rest of
+/// the run (r2.s2 round-5, gated on `needs_htf` in round-6). The timeframe
+/// refusal also lives at the request boundary; the missing-HTF and pair checks
+/// are defence-in-depth (the request carries no second pair), for callers that
+/// construct the series directly.
 fn check_htf_inputs(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -311,8 +313,19 @@ fn check_htf_inputs(
         // be pending, the normal live shape. An empty HTF series is legal
         // (r2.s1.w3) and skipped — `align` then yields `htf: None` per bar and
         // the paired-bar gate closes entries outright.
-        if let (Some(primary_last), Some(htf_last)) =
-            (primary.candles.last(), htf_series.candles.last())
+        //
+        // r2.s2 round-6: this arm ALONE is gated on `needs_htf` — coverage
+        // freshness only matters when the strategy actually reads the series.
+        // The default resolver supplies `Some(H4)` unconditionally, so a
+        // primary-only strategy arrives here holding an H4 snapshot it never
+        // consumes, and a lagging H4 HEAD must not refuse its run. The other
+        // arms deliberately stay ungated: pair and cadence are structural
+        // invariants of a SUPPLIED series that can never spuriously fail here
+        // (the request carries one pair; H4 is always longer than M15), while
+        // this arm is the only one whose outcome depends on snapshot freshness.
+        if compiled.needs_htf()
+            && let (Some(primary_last), Some(htf_last)) =
+                (primary.candles.last(), htf_series.candles.last())
             && primary_last.close_time - htf_last.close_time > htf_series.timeframe.duration_ms()
         {
             return Err(BacktestError::HtfCoverageShort {

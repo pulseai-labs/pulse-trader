@@ -54,7 +54,10 @@
 //!   versioned/application path AND the `pulse backtest --dsl` CLI path —
 //!   because `align` pairs forward-only and would otherwise read the frozen
 //!   final HTF bar for the rest of the run; the one-interval-short live shape
-//!   and the empty (windowed) HTF slice still run (r2.s2 round-5).
+//!   and the empty (windowed) HTF slice still run (r2.s2 round-5). The check
+//!   applies only when the strategy consumes the HTF series — a primary-only
+//!   strategy handed the default-resolved, stale-but-unused H4 snapshot still
+//!   runs (r2.s2 round-6 gate).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -1567,6 +1570,79 @@ fn empty_htf_series_is_legal_and_runs() {
     assert!(
         result.trades.is_empty(),
         "every aligned bar has `htf: None`, so no entry may fire"
+    );
+}
+
+/// A primary-only DSL — no `series` field anywhere (it defaults to
+/// `"primary"`), so `needs_htf()` is false.
+const PRIMARY_ONLY_DSL: &str = r#"{
+  "schema_version": "1.1.0",
+  "name": "primary only",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Price", "field": "Close" },
+    "op": "Gt",
+    "rhs": { "type": "Constant", "value": "0" }
+  },
+  "filters": [],
+  "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+
+/// r2.s2 round-6: a PRIMARY-ONLY strategy handed a stale, unused H4 series
+/// still runs — the coverage check is gated on `needs_htf`, so the lagging
+/// H4 HEAD the default resolver supplies cannot refuse it (the regression the
+/// ungated round-5 arm introduced). `htf_timeframe: Some(H4)` is what
+/// `resolve_default_request`'s no-prior-run arm mints unconditionally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn primary_only_strategy_with_a_stale_unused_htf_series_still_runs() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open db");
+    MIGRATOR.run(db.pool()).await.expect("run migrations");
+
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let strategy = strategies
+        .create_strategy("primary-only", None, &[])
+        .await
+        .expect("create strategy");
+    let version = strategies
+        .create_version(NewVersion {
+            strategy_id: strategy.id.clone(),
+            parent_version_id: None,
+            dsl_json: PRIMARY_ONLY_DSL.to_owned(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create version");
+
+    let store_dir = tmp.path().join("store");
+    seed_stale_htf_store(store_dir.clone());
+    let store = CandleStore::with_base_dir(store_dir);
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &BacktestRequest {
+            version_id: version.id.clone(),
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: Some(Timeframe::H4),
+            config: BacktestConfig::default(),
+            snapshots: None,
+            window: None,
+        },
+    )
+    .await
+    .expect("a primary-only strategy must run over a stale, unused H4 series");
+    assert!(
+        !outcome.trades.is_empty(),
+        "the run must complete — close > 0 on flat 100 prices fires an entry"
     );
 }
 

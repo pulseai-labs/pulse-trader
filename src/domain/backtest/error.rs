@@ -128,7 +128,11 @@ pub enum BacktestError {
     /// shape — and an empty HTF series is skipped (legal per r2.s1.w3: `align`
     /// then yields `htf: None` per bar and the paired-bar gate closes entries
     /// outright). The refusal lives in `check_htf_inputs`, the seam that owns
-    /// the other HTF input invariants (r2.s2 round-5).
+    /// the other HTF input invariants, and applies only when the compiled
+    /// strategy consumes the HTF series (`needs_htf`) — a primary-only
+    /// strategy is handed the default-resolved H4 snapshot but never reads it,
+    /// so a lagging H4 HEAD must not refuse its run (r2.s2 round-5; the
+    /// `needs_htf` gate is round-6).
     #[error(
         "higher-timeframe coverage ends at close_time {htf_end}, more than one {htf:?} interval \
          before the primary series ends at {primary_end} — `Series::Htf` operands would read \
