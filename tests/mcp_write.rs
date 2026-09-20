@@ -769,13 +769,15 @@ async fn run_backtest_unknown_version_is_refused() {
     client.cancel().await.expect("cancel session");
 }
 
-/// r2.s2.w2 — a schema-1.1.0 child whose entry reads the H4 close, run against a
-/// parent whose recorded inputs name no HTF snapshot. The resolver inherits
-/// `htf_timeframe: None`, so `run_backtest` must refuse with
-/// `{ field: "inputs.htf" }` — never a silent evaluation of the operand against
-/// primary candles — and write no run.
+/// r2.s2 review fix — a schema-1.1.0 child whose entry reads the H4 close, run
+/// against a parent whose recorded inputs name no HTF snapshot. The resolver
+/// inherits `htf_timeframe: None` and falls back to the application default
+/// `Some(H4)` at HEAD, so `run_backtest` RUNS the child over the store's real
+/// H4 snapshot — and the persisted run's `inputs.htf` records the selection
+/// the operand was evaluated against, never a silent evaluation against
+/// primary candles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_backtest_refused_when_an_htf_child_inherits_an_m15_only_run() {
+async fn run_backtest_runs_an_htf_child_inheriting_an_m15_only_run() {
     let tmp_db = TempDir::new().unwrap();
     let (db_path, db) = migrated_db(&tmp_db).await;
     let strategies = SqliteStrategyRepo::new(db.pool().clone());
@@ -818,7 +820,8 @@ async fn run_backtest_refused_when_an_htf_child_inherits_an_m15_only_run() {
     let store_dir = tmp_store.path().join("store");
     copy_tree(&manifest(FIXTURE_STORE), &store_dir);
     // The parent's only run is M15-only, so `inputs.htf` reads `None` and the
-    // child's resolved request carries `htf_timeframe: None`.
+    // child's resolved request inherits no HTF timeframe — the case the
+    // resolver's `Some(H4)` fallback exists for.
     let parent_run = seed_real_run_primary_only(&db, &store_dir, &parent.id).await;
 
     let fixture = Fixture {
@@ -832,25 +835,34 @@ async fn run_backtest_refused_when_an_htf_child_inherits_an_m15_only_run() {
     let client = spawn_client(&fixture.db_path, &fixture.store_dir).await;
 
     let runs_before = row_count(&fixture, "backtest_run").await;
-    let err = call_err(
+    let result = call(
         &client,
         "run_backtest",
         json!({"version_id": child.id.as_str()}),
     )
     .await;
+    let run_id = result["run_id"].as_str().expect("run_id").to_owned();
 
-    assert_eq!(err["field"], "inputs.htf");
-    assert!(
-        err["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("higher-timeframe")),
-        "the refusal explains the missing input: {err}"
-    );
     assert_eq!(
         row_count(&fixture, "backtest_run").await,
-        runs_before,
-        "a refused run writes no row"
+        runs_before + 1,
+        "the htf child runs and persists a row"
     );
+
+    // The persisted inputs carry the HTF selection the operand was evaluated
+    // against — the resolver's default H4 over the store's real 4h snapshot.
+    let runs_repo = SqliteBacktestRunRepo::new(fixture.db.pool().clone());
+    let inputs = runs_repo
+        .get_run(&BacktestRunId::new(run_id))
+        .await
+        .expect("read run")
+        .expect("run exists")
+        .inputs
+        .expect("a fresh run carries inputs");
+    let recorded_htf = inputs
+        .htf
+        .expect("inputs.htf records the resolved H4 selection");
+    assert_eq!(recorded_htf.timeframe, Timeframe::H4);
 
     client.cancel().await.expect("cancel session");
 }

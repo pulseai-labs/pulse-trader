@@ -299,7 +299,7 @@ async fn htf_provenance_is_recorded_and_reloads_after_both_heads_move() {
 }
 
 // ---------------------------------------------------------------------------
-// 2b. r2.s2.w2 — an `htf` operand with no resolvable HTF snapshot refuses
+// 2b. r2.s2 review fix — an `htf` child inheriting an M15-only run runs on H4
 // ---------------------------------------------------------------------------
 
 /// A schema-1.1.0 document whose entry reads the H4 close — the operand shape
@@ -320,13 +320,15 @@ const HTF_OPERAND_DSL: &str = r#"{
 }"#;
 
 /// The only honest way a version reaches the desktop command needing an HTF
-/// snapshot its resolved request does not carry: the parent's recorded inputs
+/// snapshot its inherited request does not name: the parent's recorded inputs
 /// are M15-only, so `resolve_default_request` inherits `htf_timeframe: None`
-/// for the child that adds the `htf` operand. The command must refuse with a
-/// `validation` `BusError` naming `inputs.htf` — never a silent evaluation of
-/// the operand against primary candles.
+/// for the child that adds the `htf` operand — then falls back to the
+/// application default `Some(H4)` at HEAD (r2.s2 review fix), the same default
+/// the no-run path mints. The child RUNS over the fixture's real H4 snapshot,
+/// and the persisted `inputs.htf` records the selection the operand was
+/// evaluated against — never a silent evaluation against primary candles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_htf_strategy_with_no_resolvable_htf_snapshot_is_refused_with_inputs_htf() {
+async fn an_htf_child_inheriting_an_m15_only_run_runs_on_the_default_h4() {
     let env = env();
     let state = env.cold_state().await;
     let strategies = state.strategy_repo();
@@ -371,21 +373,36 @@ async fn an_htf_strategy_with_no_resolvable_htf_snapshot_is_refused_with_inputs_
         .await
         .expect("create htf child version");
 
-    let err = run_backtest_version_core(&state, request(&child.id))
+    let dto = run_backtest_version_core(&state, request(&child.id))
         .await
-        .expect_err("an htf operand with no resolvable H4 snapshot must refuse");
+        .expect("the htf child runs on the resolver's H4 fallback");
 
+    // The DTO and the persisted row both carry the HTF selection the `htf`
+    // operand was evaluated against — the resolver's default H4 at HEAD.
+    assert_eq!(dto.primary_timeframe, "15m");
     assert_eq!(
-        err.code,
-        BusErrorCode::Validation,
-        "a missing input is caller-correctable — validation, not data: {err}"
+        dto.htf_timeframe.as_deref(),
+        Some("4h"),
+        "the resolved request carried the default H4 timeframe"
     );
     assert!(
-        err.message.contains("inputs.htf"),
-        "the refusal names the missing input field: {}",
-        err.message
+        dto.htf_data_version.as_ref().is_some_and(|v| !v.is_empty()),
+        "a real H4 data_version is recorded, not a silent primary evaluation"
     );
-    assert_eq!(err.run_id, None, "nothing was persisted for a refusal");
+
+    let db = env.db().await;
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let inputs = runs
+        .get_run(&BacktestRunId::new(dto.run_id.clone()))
+        .await
+        .expect("read run")
+        .expect("run exists")
+        .inputs
+        .expect("a fresh run carries inputs");
+    let recorded_htf = inputs
+        .htf
+        .expect("inputs.htf records the resolved H4 selection");
+    assert_eq!(recorded_htf.timeframe, Timeframe::H4);
 }
 
 // ---------------------------------------------------------------------------

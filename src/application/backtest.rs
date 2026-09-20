@@ -45,7 +45,7 @@
 use rust_decimal::Decimal;
 
 use crate::domain::backtest::EquityCurve;
-use crate::domain::strategy::VersionId;
+use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
     CandleSeriesRepository, CandleWindow, DataError, DataVersion, EngineFingerprint,
@@ -1037,6 +1037,15 @@ fn inputs_from_run(
 /// run's exact `data_version`s — an agent run is then comparable with the run
 /// it iterates on. `window` is NEVER inherited: it is always the caller's.
 ///
+/// One correction sits on top of the inherit (r2.s2 review fix): when the prior
+/// run recorded **no** HTF selection and the version's compiled strategy needs
+/// one (`needs_htf()`), `htf_timeframe` falls back to the application default
+/// `H4` at `HEAD` — identical to the no-run path, pin included. Neither
+/// surface DTO can name `inputs.htf`, so an unconditional `None` inherit would
+/// mint a request `run_version_backtest` refuses as `HtfRequired` forever.
+/// The fallback is gated on `needs_htf()` so a non-HTF version never loads an
+/// H4 snapshot it cannot use.
+///
 /// # Errors
 ///
 /// [`BacktestAppError::VersionNotFound`] when the version does not exist, and
@@ -1069,7 +1078,20 @@ where
     };
 
     Ok(match inherited {
-        Some(inputs) => request_from_inputs(version_id, inputs, window),
+        Some(inputs) => {
+            let mut request = request_from_inputs(version_id, inputs, window);
+            // r2.s2 review fix: an htf-needing version inheriting a run that
+            // recorded NO HTF selection must not mint `htf_timeframe: None` —
+            // `run_version_backtest` would refuse it as `HtfRequired`, a field
+            // no surface can set, dead-ending the iterate path. Fall back to
+            // the app default `H4` at HEAD (the pin stays `None`), the same
+            // shape the no-run arm below produces. Gated on `needs_htf()`: a
+            // non-HTF version must not load an H4 snapshot it does not need.
+            if request.htf_timeframe.is_none() && version_needs_htf(&version) {
+                request.htf_timeframe = Some(Timeframe::H4);
+            }
+            request
+        }
         None => BacktestRequest {
             version_id: version_id.clone(),
             pair: Pair::new("BTCUSDT"),
@@ -1080,6 +1102,18 @@ where
             window,
         },
     })
+}
+
+/// Whether the version's stored DSL compiles to a strategy that consumes an
+/// HTF series. Best-effort for the resolver's fallback only: a document that
+/// fails `validate`/`compile` answers `false`, so the resolver never mints a
+/// new error and `run_version_backtest` reports the real compile failure
+/// exactly as it does on the fresh-default path.
+fn version_needs_htf(version: &StrategyVersion) -> bool {
+    validate(&version.dsl)
+        .ok()
+        .and_then(|validated| compile(&validated).ok())
+        .is_some_and(|compiled| compiled.needs_htf())
 }
 
 /// The version's latest persisted run's `inputs`, when it has a usable row.
@@ -1154,9 +1188,9 @@ mod tests {
     use crate::domain::{
         BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CandleWindow,
         Comparator, Condition, DataError, DataVersion, Direction, ExitRule, FundingConfig,
-        IndicatorSpec, Pair, PersistedRun, RegimeBreakdown, RiskParams, RunSummary, SchemaVersion,
-        Series, SkippedEntryCounts, SnapshotSelection, StrategyDsl, StrategyRepository,
-        SummaryStats, SweepableValue, Timeframe, Trade, ValueSource,
+        IndicatorSpec, Pair, PersistedRun, PriceField, RegimeBreakdown, RiskParams, RunSummary,
+        SchemaVersion, Series, SkippedEntryCounts, SnapshotSelection, StrategyDsl,
+        StrategyRepository, SummaryStats, SweepableValue, Timeframe, Trade, ValueSource,
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
@@ -1453,6 +1487,42 @@ mod tests {
         }
     }
 
+    /// `canonical_dsl` re-exited so `validate` passes (rule 3 refuses a
+    /// `TakeProfit` with no stop in the same strategy). The resolver's
+    /// `needs_htf` gate only sees a DSL that validates AND compiles, so a
+    /// fixture for it must carry a stop.
+    fn compilable_dsl(entry: Condition) -> StrategyDsl {
+        StrategyDsl {
+            entry,
+            exits: vec![ExitRule::StopLoss {
+                distance_pct: SweepableValue::Fixed(Decimal::new(5, 2)),
+            }],
+            ..canonical_dsl()
+        }
+    }
+
+    /// An entry reading the H4 close — the operand that makes the compiled
+    /// strategy report `needs_htf()`.
+    fn htf_entry() -> Condition {
+        Condition::Compare {
+            lhs: ValueSource::Price {
+                series: Series::Htf,
+                field: PriceField::Close,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::ZERO,
+            },
+        }
+    }
+
+    fn version_with_dsl(id: &str, parent: Option<&str>, dsl: StrategyDsl) -> StrategyVersion {
+        StrategyVersion {
+            dsl,
+            ..version(id, parent)
+        }
+    }
+
     fn persisted_run(version_id: &VersionId, inputs: Option<BacktestInputs>) -> PersistedRun {
         PersistedRun {
             id: BacktestRunId::new(format!("run-{}", version_id.as_str())),
@@ -1631,6 +1701,77 @@ mod tests {
         assert_eq!(
             request.window, None,
             "a prior run's window is never inherited — it is always the caller's"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_defaults_htf_when_an_htf_version_inherits_none() {
+        // r2.s2 review fix: the parent's run is M15-only (`inputs.htf` None)
+        // and the child's compiled strategy needs HTF. An unconditional `None`
+        // inherit would mint a request `run_version_backtest` refuses as
+        // `HtfRequired` — a field neither surface can set — so the resolver
+        // falls back to the app default `H4` at HEAD.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version_with_dsl(
+            "child-1",
+            Some("parent-1"),
+            compilable_dsl(htf_entry()),
+        ));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("parent-1"),
+            Some(recorded_inputs("v-parent", None, 7, 2)),
+        ));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(
+            request.htf_timeframe,
+            Some(Timeframe::H4),
+            "an htf-needing version inheriting no HTF selection resolves the app default H4"
+        );
+        assert_eq!(
+            request.snapshots,
+            Some(SnapshotPins {
+                primary: DataVersion::new("v-parent"),
+                htf: None,
+            }),
+            "the primary pin is inherited; the HTF pin stays HEAD, the fresh-default shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_default_request_keeps_htf_none_for_a_non_htf_version() {
+        // The same inherited M15-only run for a version whose strategy does
+        // NOT need HTF: `htf_timeframe` stays `None`. The fallback is gated on
+        // `needs_htf()`, so no run is made to load an H4 snapshot it cannot
+        // use — and a machine without an H4 snapshot for the pair never fails.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version_with_dsl(
+            "child-1",
+            Some("parent-1"),
+            compilable_dsl(canonical_dsl().entry),
+        ));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("parent-1"),
+            Some(recorded_inputs("v-parent", None, 7, 2)),
+        ));
+
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(request.htf_timeframe, None);
+        assert_eq!(
+            request.snapshots,
+            Some(SnapshotPins {
+                primary: DataVersion::new("v-parent"),
+                htf: None,
+            }),
+            "a non-HTF version inherits the run's inputs untouched"
         );
     }
 
