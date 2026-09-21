@@ -245,6 +245,10 @@ pub struct RunListEntry {
     pub trade_count: usize,
     /// The persisted inputs, or `null` for a pre-0006 row with no provenance.
     pub inputs: Option<BacktestInputs>,
+    /// The walk-forward membership this run carries (r2.s3.w3): the parent run
+    /// id + fold index for a `rolling-oos/v1` fold, `null` for a standalone
+    /// run and for every row persisted before migration `0013`.
+    pub walk_forward: Option<crate::domain::WalkForwardMembership>,
 }
 
 /// Project a full [`PersistedRun`] onto its [`RunListEntry`] wire row.
@@ -257,6 +261,7 @@ pub fn run_list_entry(run: &PersistedRun) -> RunListEntry {
         net_pnl: run.net_pnl,
         trade_count: run.summary.trade_count,
         inputs: run.inputs.clone(),
+        walk_forward: run.walk_forward.clone(),
     }
 }
 
@@ -301,6 +306,9 @@ pub struct RunDetail {
     pub result_content_hash: String,
     /// The equity-curve base the run started from.
     pub starting_equity: Decimal,
+    /// The walk-forward membership this run carries (r2.s3.w3), or `null` for a
+    /// standalone run.
+    pub walk_forward: Option<crate::domain::WalkForwardMembership>,
 }
 
 /// Project a [`PersistedRun`] + its [`MfeMaeAggregates`] onto [`RunDetail`].
@@ -321,6 +329,7 @@ pub fn run_detail(run: &PersistedRun, mfe_mae: &MfeMaeAggregates) -> RunDetail {
         engine_target: run.engine_target.clone(),
         result_content_hash: run.result_content_hash.clone(),
         starting_equity: run.starting_equity,
+        walk_forward: run.walk_forward.clone(),
     }
 }
 

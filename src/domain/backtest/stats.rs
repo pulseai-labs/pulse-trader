@@ -277,7 +277,9 @@ fn finite_ratio(numerator: f64, denominator: f64) -> Option<f64> {
 /// representable as a finite `f64`; `to_f64` is documented infallible for an
 /// in-range `Decimal`, but a defensive `unwrap_or(0.0)` keeps the path total
 /// (a `0.0` here only ever yields a `None` ratio downstream, never `NaN`/`Inf`).
-fn decimal_to_f64(value: Decimal) -> f64 {
+/// `pub(crate)` so `walk_forward`'s `FoldVerdict` reuses the same quarantined
+/// conversion (r2.s3.w3) rather than owning a second one.
+pub(crate) fn decimal_to_f64(value: Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
     value.to_f64().unwrap_or(0.0)
 }

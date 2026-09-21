@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 fold_index       AS \"fold_index!: i64\",\n                 window_from_ms   AS \"window_from_ms!: i64\",\n                 window_to_ms     AS \"window_to_ms!: i64\",\n                 backtest_run_id  AS \"backtest_run_id!: String\",\n                 n                AS \"n!: i64\",\n                 mean_r           AS \"mean_r!: String\",\n                 lower_bound      AS \"lower_bound!: f64\",\n                 holds            AS \"holds!: i64\"\n               FROM walk_forward_fold WHERE walk_forward_run_id = ?1\n               ORDER BY fold_index",
+  "describe": {
+    "columns": [
+      {
+        "name": "fold_index!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "window_from_ms!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "window_to_ms!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "backtest_run_id!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "n!: i64",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "mean_r!: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "lower_bound!: f64",
+        "ordinal": 6,
+        "type_info": "Float"
+      },
+      {
+        "name": "holds!: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "201eac22e54df57ad732e8b44f867c6b1973e8662801e602e92dc59d2a17ceb8"
+}

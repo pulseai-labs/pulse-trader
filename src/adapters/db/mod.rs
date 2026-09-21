@@ -71,6 +71,13 @@ pub use coach_turn_source::SqliteCoachTurnSource;
 pub mod coach_acceptance_repo;
 pub use coach_acceptance_repo::SqliteCoachAcceptanceRepo;
 
+// r2.s3.w3 (ADR-0025): the `WalkForwardRunRepository` impl on
+// `SqliteBacktestRunRepo` — the `walk_forward_run`/`walk_forward_fold` surface.
+// The fold runs themselves are ordinary `backtest_run` rows written by
+// `backtest_run_repo`'s `insert_run_row`/`insert_trade_rows`, so `query!` stays
+// confined to this module tree (the `.sqlx` cache covers this file too).
+pub mod walk_forward_run_repo;
+
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
 // item — under `#![deny(warnings)]` a `pub` item unused outside its module is a
 // `dead_code` BUILD ERROR, not a warning (VS-1.1.2 harvested gotcha). All three

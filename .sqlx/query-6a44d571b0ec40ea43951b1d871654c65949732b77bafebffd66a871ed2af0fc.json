@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO walk_forward_fold (walk_forward_run_id, fold_index, window_from_ms, window_to_ms, backtest_run_id, n, mean_r, lower_bound, holds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "6a44d571b0ec40ea43951b1d871654c65949732b77bafebffd66a871ed2af0fc"
+}

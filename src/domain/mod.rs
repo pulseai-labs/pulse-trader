@@ -95,6 +95,14 @@ pub use backtest::{
     BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig,
     OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
 };
+// r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025).
+// Re-exported so `lib.rs` can curate the crate surface — an un-re-exported
+// public domain type is a `dead_code` BUILD error under `deny(warnings)`.
+pub use backtest::{
+    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
+    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
+    WalkForwardRunDraft, WalkForwardRunId, Z, fold_windows, folds_required,
+};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
@@ -150,6 +158,7 @@ pub use pair::Pair;
 pub use port::{
     BacktestRunRepository, CandleSeriesRepository, CoachAcceptanceRepository, CoachingRepository,
     ExchangeAdapter, LlmCallRepository, LlmProvider, MarketDataSource, StrategyRepository,
+    WalkForwardRunRepository,
 };
 // r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
 // live in `port` like every other port and are re-exported `pub(crate)` rather than

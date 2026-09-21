@@ -383,6 +383,54 @@ fn step_closed_htf_candles(
     }
 }
 
+/// The first primary bar at which the entry warm gate holds (r2.s3.w3, L3 —
+/// "computed by stepping", never estimated from a period count): builds the
+/// same indicator engines [`run_backtest`] builds, steps every primary candle
+/// (and the HTF engine on each closed HTF bar exactly as `run_backtest` does,
+/// cursor semantics included), and returns the `open_time` of the first bar
+/// whose entry warm gate is satisfied: `engine.is_warm()`, the HTF engine warm
+/// when the strategy uses `Htf` indicators, and a paired closed HTF bar when an
+/// `Htf` price leaf needs one (the F3 clause — `is_warm` is vacuous when no HTF
+/// indicator exists). `None` when no bar is ever warm — or when the engines
+/// cannot be built (a compiled strategy that fails `IndicatorEngine::new` can
+/// never warm; the actual run still refuses honestly at `prepare_backtest`).
+/// Trading state is never constructed: no fills, no pending entries, no
+/// positions.
+#[must_use]
+pub fn first_fully_warm_bar_ms(
+    compiled: &CompiledStrategy,
+    primary: &CandleSeries,
+    htf: Option<&CandleSeries>,
+) -> Option<i64> {
+    let mut engine = IndicatorEngine::new(compiled).ok()?;
+    let mut htf_engine = if compiled.needs_htf() {
+        Some(IndicatorEngine::from_specs(compiled.required_htf_indicators()).ok()?)
+    } else {
+        None
+    };
+    let mut htf_cursor = 0_usize;
+    let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
+
+    for bar in align(primary, htf) {
+        engine.step(bar.primary);
+        if let Some(engine_htf) = htf_engine.as_mut() {
+            step_closed_htf_candles(
+                engine_htf,
+                htf_candles,
+                &mut htf_cursor,
+                bar.primary.close_time,
+            );
+        }
+        if engine.is_warm()
+            && htf_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
+            && (htf_engine.is_none() || bar.htf.is_some())
+        {
+            return Some(bar.primary.open_time);
+        }
+    }
+    None
+}
+
 /// The primary-series ATR(period) value at the signal bar, for an `AtrStop`
 /// exit — frozen into the pending entry so the stop derives from the signal
 /// bar's ATR, never recomputed at fill (r2.s2.w2). `None` for a `StopLoss`

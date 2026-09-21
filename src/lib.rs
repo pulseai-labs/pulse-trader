@@ -328,7 +328,7 @@ pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 // VS-1.2.1 work-1.03: deterministic, sequential backtest engine. The adapter
 // owns the concrete indicator engine while composing the pure domain backtest
 // types and money-math primitives.
-pub use adapters::backtest::{BacktestConfig, run_backtest};
+pub use adapters::backtest::{BacktestConfig, first_fully_warm_bar_ms, run_backtest};
 
 // VS-1.1.4 work-1.01: the SQLite persistence foundation. `Db` is the WAL pool
 // wrapper (`with_path`/`open_default`/`pool`); `MIGRATOR` is the embedded
@@ -471,6 +471,19 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 pub use domain::{
     BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, CandleWindowError,
     FundingConfig, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+};
+
+// r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025) —
+// the domain types, the `WalkForwardRunRepository` port (one-transaction save +
+// fail-closed read), and the use case. No MCP tool / Tauri command (w5's).
+pub use application::walk_forward::{
+    WalkForwardAppError, WalkForwardOutcome, WalkForwardRequest, run_walk_forward,
+};
+pub use domain::{
+    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
+    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
+    WalkForwardRunDraft, WalkForwardRunId, WalkForwardRunRepository, Z, fold_windows,
+    folds_required,
 };
 
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
