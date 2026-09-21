@@ -57,6 +57,28 @@ CLI verb reaches it, so the exception is library-surface only; but "forward-only
 describes the startup path, **not the crate's public API**. Restricting or gating
 `undo_to` is open work, not a decided part of this bone.
 
+## Fingerprint inputs
+
+The `engine_fingerprint` baked into a build (D5) is a sha2-256 over, in fold
+order: **(a)** the raw bytes of `Cargo.lock` (the full resolved dependency
+graph); **(b)** the resolved `rustc -vV` filtered to its `release:` +
+`commit-hash:` lines; **(c)** the DSL schema-version string via the
+`schema_version_const.rs` seam; **(d)** a sha2-256 over the engine source set —
+the `.rs` files under `src/domain/backtest/`, `src/adapters/backtest/`,
+`src/adapters/indicators/` and `src/domain/dsl/`, plus `src/domain/indicator.rs`,
+`src/domain/series.rs` and `src/domain/candle.rs`, sorted by path bytes and
+folded behind the `b"engine-source-v1\0"` domain prefix (r2.s3.w1, #155);
+**(e)** the full target triple. `build.rs` emits `cargo:rerun-if-changed` for
+every hashed file and every root directory, so an added or removed source file
+rebuilds just as an edited one does.
+
+Input (d) is the amendment this section exists for: before it, two builds that
+differed in engine code produced the same fingerprint while claiming to differ.
+Stored `backtest_run.engine_fingerprint` values are never rewritten — every run
+recorded before (d) existed mismatches builds that carry it exactly once, and
+both comparison sites treat a mismatch as they did before: the standalone path
+warns, the coach's accept path refuses.
+
 ## Consequences
 
 Reproducibility holds by construction **on the normal startup path**, and there the
