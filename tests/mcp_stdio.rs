@@ -95,7 +95,7 @@ async fn tools_and_dsl_schema_resource_are_served() {
     }
     assert_eq!(
         doc["conventions"]["windows"],
-        "a windowed backtest slices the series to `[from, to)` and indicators warm up inside the window"
+        "a windowed backtest warms indicators on the full snapshot history before `from` and counts only `[from, to)` — the run's `inputs.lead_in_from` records where the warm-up began"
     );
 
     client.cancel().await.expect("cancel session");

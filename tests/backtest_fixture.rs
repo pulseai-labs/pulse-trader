@@ -139,6 +139,7 @@ fn run_golden(primary: &CandleSeries) -> BacktestResult {
         &BacktestConfig::default(),
         &filters,
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect("backtest runs over the fixture")
 }

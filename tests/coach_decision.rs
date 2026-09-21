@@ -836,6 +836,7 @@ async fn a_child_of_a_windowed_parent_replays_the_parents_slice() {
         &BacktestConfig::default(),
         &filters,
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect("the probe runs");
     // The LAST multi-bar hold: every trade before it closed inside the window,

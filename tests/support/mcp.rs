@@ -144,6 +144,7 @@ pub fn seeded_inputs() -> BacktestInputs {
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
         window: None,
+        lead_in_from_ms: None,
     }
 }
 

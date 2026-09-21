@@ -1384,6 +1384,17 @@ fn describe_input_differences(child: &BacktestInputs, parent: &BacktestInputs) -
             window(&parent.window)
         ));
     }
+    // r2.s3.w2: a lead-in difference is a real provenance difference — two runs
+    // over the same counted window warmed on different history. A legacy
+    // (pre-0012) parent reports `none`, which is honest, not "same".
+    if child.lead_in_from_ms != parent.lead_in_from_ms {
+        let lead_in = |v: Option<i64>| v.map_or_else(|| "none".to_owned(), ms_rfc3339);
+        diffs.push(format!(
+            "lead-in from (child {}, parent {})",
+            lead_in(child.lead_in_from_ms),
+            lead_in(parent.lead_in_from_ms)
+        ));
+    }
     format!("recorded inputs differ: {}", diffs.join(", "))
 }
 
@@ -1682,5 +1693,53 @@ mod tests {
     #[test]
     fn internal_errors_carry_the_internal_code() {
         assert_eq!(BusError::internal("x").code, BusErrorCode::Internal);
+    }
+
+    /// r2.s3.w2: a lead-in difference is provenance the badge must name —
+    /// a windowed child replaying a legacy (pre-0012) parent has `Some`/`None`
+    /// lead-ins, and the hover says so rather than reading "inputs equal".
+    #[test]
+    fn describe_input_differences_names_a_lead_in_difference() {
+        use crate::domain::{
+            BacktestInputs, CandleWindow, DataVersion, FundingConfig, Pair, SnapshotSelection,
+            Timeframe,
+        };
+        use rust_decimal::Decimal;
+
+        let base = BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new("v-primary"),
+            },
+            htf: None,
+            taker_fee_bps: Decimal::new(4, 0),
+            slippage_bps: Decimal::new(1, 0),
+            funding: FundingConfig::SnapshotRates,
+            window: Some(CandleWindow::new(1_700_000_000_000, 1_700_086_400_000).unwrap()),
+            lead_in_from_ms: Some(1_699_999_000_000),
+        };
+        // Same tuple, but the parent predates 0012 — no recorded lead-in.
+        let legacy_parent = BacktestInputs {
+            lead_in_from_ms: None,
+            ..base.clone()
+        };
+
+        let text = super::describe_input_differences(&base, &legacy_parent);
+        assert!(
+            text.contains("lead-in from"),
+            "the diff must name the lead-in field: {text}"
+        );
+        assert!(
+            text.contains("none"),
+            "a legacy parent's absent lead-in renders as `none`: {text}"
+        );
+
+        // And identical lead-ins produce no diff line at all.
+        let same = super::describe_input_differences(&base, &base);
+        assert!(
+            !same.contains("lead-in"),
+            "equal lead-ins must not be reported: {same}"
+        );
     }
 }

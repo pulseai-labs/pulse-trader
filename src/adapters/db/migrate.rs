@@ -689,7 +689,7 @@ mod tests {
         match outcome {
             MigrationOutcome::Migrated { from, to, backup } => {
                 assert_eq!(from, 1, "from must be the pre-migration version");
-                assert_eq!(to, 11, "to must be the embedded max");
+                assert_eq!(to, 12, "to must be the embedded max");
                 assert!(
                     backup.exists(),
                     "backup file must exist: {}",
@@ -707,7 +707,7 @@ mod tests {
         }
 
         let db = Db::with_path(&path).await.expect("reopen db");
-        assert_eq!(applied_max(&db).await, 11, "schema must now be at 0011");
+        assert_eq!(applied_max(&db).await, 12, "schema must now be at 0012");
         assert!(
             index_present(&db).await,
             "idx_strategy_name must exist after migrate"
@@ -733,7 +733,7 @@ mod tests {
 
         match outcome {
             MigrationOutcome::AlreadyCurrent { version } => {
-                assert_eq!(version, 11, "version must be the embedded max");
+                assert_eq!(version, 12, "version must be the embedded max");
             }
             other @ MigrationOutcome::Migrated { .. } => {
                 panic!("expected AlreadyCurrent, got {other:?}")
@@ -920,38 +920,38 @@ mod tests {
         let db = Db::with_path(&path).await.expect("reopen");
         assert_eq!(
             applied_max(&db).await,
-            11,
+            12,
             "schema reached the embedded max"
         );
     }
 
     #[tokio::test]
     async fn migration_up_down_round_run_undo_rerun() {
-        // run → undo_to(1) → re-run. Index gone then back; max 11→1→11.
-        // The embedded max is 11, not 5: `0005`/`0006` were reserved for `r1.s2`
+        // run → undo_to(1) → re-run. Index gone then back; max 12→1→12.
+        // The embedded max is 12, not 5: `0005`/`0006` were reserved for `r1.s2`
         // and `r1.s3`, allocated at release planning so parallel spines cannot
         // collide on a migration number. sqlx applies versions in numeric order
         // and does not require them to be contiguous.
         let (_tmp, path) = db_at_0001().await;
 
-        // Up: 1 → 11 (the embedded max, now that r2.s2.w2's 0011 ships).
-        run_migrations_with_backup(&path).await.expect("up to 0011");
+        // Up: 1 → 12 (the embedded max, now that r2.s3.w2's 0012 ships).
+        run_migrations_with_backup(&path).await.expect("up to 0012");
         let db = Db::with_path(&path).await.expect("reopen after up");
-        assert_eq!(applied_max(&db).await, 11, "after run, max == 11");
+        assert_eq!(applied_max(&db).await, 12, "after run, max == 12");
         assert!(index_present(&db).await, "after run, index present");
 
-        // Down: 11 → 1.
+        // Down: 12 → 1.
         undo_to(db.pool(), 1).await.expect("undo to 1");
         assert_eq!(applied_max(&db).await, 1, "after undo, max == 1");
         assert!(!index_present(&db).await, "after undo, index gone");
         drop(db);
 
-        // Re-run: 1 → 11.
+        // Re-run: 1 → 12.
         run_migrations_with_backup(&path)
             .await
-            .expect("re-run to 0011");
+            .expect("re-run to 0012");
         let db = Db::with_path(&path).await.expect("reopen after re-run");
-        assert_eq!(applied_max(&db).await, 11, "after re-run, max == 11");
+        assert_eq!(applied_max(&db).await, 12, "after re-run, max == 12");
         assert!(index_present(&db).await, "after re-run, index back");
     }
 
@@ -1152,17 +1152,20 @@ mod reserved_number_tests {
         // The "older binary": the shipped set as it stood while `0005` was still a
         // reserved gap and `0007` had already shipped. Withhold the real 0005 —
         // and, since r1.s4.w4 the real 0008, since r2.s1.w1 the real 0009 and
-        // 0010, and since r2.s2.w2 the real 0011 as well.
+        // 0010, since r2.s2.w2 the real 0011, and since r2.s3.w2 the real 0012
+        // as well.
         //
         // `0008` REBUILDS the two tables `0005` creates, so a set holding `0008`
         // without `0005` is not an older binary, it is an impossible one ("no such
         // table: coaching_proposals"). `0009` indexes `coaching_sessions`,
-        // `0010` alters `backtest_run`, and `0011` alters `trade` for the same
-        // reason. Withholding all five is also what keeps this test testing what
-        // it says: the property under test is that filling a reserved gap runs a
-        // migration WITHOUT moving the maximum, and letting `0008`/`0009`/`0010`/
-        // `0011` ride along in the same run would move it past 7 and make the
-        // `from: 7, to: 7` assertion below meaningless.
+        // `0010` alters `backtest_run`, `0011` alters `trade`, and `0012` alters
+        // `backtest_run` for the same reason. Withholding all six is also what
+        // keeps this test testing what it says: the property under test is that
+        // filling a reserved gap runs a migration WITHOUT moving the maximum,
+        // and letting `0008`/`0009`/`0010`/`0011`/`0012` ride along in the same
+        // run would move it past 7 and make the `from: 7, to: 7` assertion
+        // below meaningless.
+        let withheld_0012 = withhold(&dir, "0012_");
         let withheld_0011 = withhold(&dir, "0011_");
         let withheld_0010 = withhold(&dir, "0010_");
         let withheld_0009 = withhold(&dir, "0009_");
@@ -1214,11 +1217,12 @@ mod reserved_number_tests {
             "0005 is recorded at its own version, not appended after 0007"
         );
 
-        // Put 0008-0011 back so the scratch directory is the shipped set again.
+        // Put 0008-0012 back so the scratch directory is the shipped set again.
         restore(&dir, &withheld_0008);
         restore(&dir, &withheld_0009);
         restore(&dir, &withheld_0010);
         restore(&dir, &withheld_0011);
+        restore(&dir, &withheld_0012);
     }
 
     /// A database carrying a migration this binary does not ship is refused as

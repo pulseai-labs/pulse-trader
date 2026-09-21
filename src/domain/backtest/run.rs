@@ -104,6 +104,50 @@ pub struct BacktestInputs {
     /// (r2.s1.w1). `None` is the whole snapshot — every pre-`0009` row, and
     /// every run saved before windowing existed or without one.
     pub window: Option<CandleWindow>,
+    /// The `open_time` of the first candle the engine consumed for a windowed
+    /// run — the lead-in start (r2.s3.w2). Both series load from the
+    /// snapshot's first candle so the engines step every bar before `from`
+    /// and indicators are warm at the window's lower edge; only `[from, to)`
+    /// counts. `None` for an unwindowed run and every pre-`0012` row — the
+    /// lead-in a legacy run consumed is not recoverable and is never
+    /// backfilled (ADR-0018).
+    ///
+    /// Wire name `lead_in_from`, rendered RFC 3339 — the persisted integer is
+    /// `backtest_run.window_lead_in_from_ms`.
+    #[serde(rename = "lead_in_from", default, with = "lead_in_from_ms_serde")]
+    pub lead_in_from_ms: Option<i64>,
+}
+
+/// Serde for [`BacktestInputs::lead_in_from_ms`]: the wire shape is an RFC 3339
+/// string (millisecond precision, `Z` — the same timestamp shape the rest of
+/// the surface uses), the column is UTC epoch millis.
+mod lead_in_from_ms_serde {
+    use chrono::{DateTime, SecondsFormat};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    // serde's `serialize_with` passes `&self.field` — `&Option<i64>` is the
+    // contract, not a choice.
+    #[allow(clippy::ref_option)]
+    pub(super) fn serialize<S: Serializer>(ms: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+        match ms {
+            Some(ms) => s.serialize_str(
+                &DateTime::from_timestamp_millis(*ms)
+                    .ok_or_else(|| serde::ser::Error::custom("lead_in_from_ms out of range"))?
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+            ),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|raw| {
+                DateTime::parse_from_rfc3339(&raw)
+                    .map(|dt| dt.timestamp_millis())
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
 }
 
 /// The candle slice of a snapshot a run consumed, when it was windowed

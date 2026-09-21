@@ -43,7 +43,7 @@
 use rust_decimal::Decimal;
 
 use crate::application::backtest::{
-    BacktestAppError, PrepareError, ReadBackFailure, prepare_backtest,
+    BacktestAppError, PrepareError, ReadBackFailure, apply_lead_in_window, prepare_backtest,
 };
 use crate::domain::backtest::SummaryStats;
 use crate::domain::strategy::VersionId;
@@ -574,7 +574,7 @@ async fn prepare_offthread<C, E>(
     candles: C,
     exchange: E,
     validated: ValidatedDsl,
-    inputs: crate::domain::BacktestInputs,
+    mut inputs: crate::domain::BacktestInputs,
     starting_equity: Decimal,
 ) -> Result<PreparedBacktest, StagedFailure>
 where
@@ -598,34 +598,32 @@ where
             None => None,
         };
         // r2.s1 G1: "the parent's exact persisted inputs" INCLUDES the window —
-        // a windowed parent's child must replay the same slice, or the re-run
-        // silently computes over the full snapshot while the inputs claim a
-        // window. Same rule as the standalone path: slice both series, an empty
-        // PRIMARY slice is a refusal, and a `to` cutting before the snapshot's
-        // real last candle makes the series end a window edge — not end-of-data.
-        let mut series_end = SeriesEnd::SnapshotEnd;
-        if let Some(w) = &inputs.window {
-            let snapshot_last_open = primary.candles.last().map(|c| c.open_time);
-            primary = primary.windowed(w);
-            if primary.candles.is_empty() {
-                return Err(StagedFailure {
-                    stage: AcceptFailureStage::Backtest,
-                    message: BacktestAppError::WindowEmpty {
-                        pair: inputs.pair.clone(),
-                        timeframe: inputs.primary.timeframe,
-                        from_ms: w.from_ms,
-                        to_ms: w.to_ms,
-                    }
-                    .to_string(),
-                    subject: Some(inputs.pair.as_str().to_owned()),
-                });
-            }
-            if snapshot_last_open
-                .is_some_and(|last| primary.candles.last().is_some_and(|c| c.open_time < last))
-            {
-                series_end = SeriesEnd::WindowEdge;
-            }
-            htf = htf.map(|series| series.windowed(w));
+        // a windowed parent's child must replay the same counted slice, or the
+        // re-run silently computes over the full snapshot while the inputs
+        // claim a window. Same rule as the standalone path (r2.s3.w2): both
+        // series keep their lead-in — `[snapshot_start, to_ms)` — an empty
+        // COUNTED slice is a refusal, and a `to` cutting before the snapshot's
+        // real last candle makes the series end a window edge — not
+        // end-of-data. The child recomputes its OWN lead-in start from the
+        // snapshots it loaded: the parent may predate `0012` (no recorded
+        // lead-in) or name a snapshot whose start differs.
+        let lead_in = apply_lead_in_window(
+            inputs.window.as_ref(),
+            &mut primary,
+            &mut htf,
+            &inputs.pair,
+            inputs.primary.timeframe,
+        )
+        .map_err(|e| StagedFailure {
+            stage: AcceptFailureStage::Backtest,
+            message: e.to_string(),
+            subject: Some(inputs.pair.as_str().to_owned()),
+        })?;
+        let series_end = lead_in
+            .as_ref()
+            .map_or(SeriesEnd::SnapshotEnd, |lead_in| lead_in.series_end);
+        if let Some(lead_in) = lead_in {
+            inputs.lead_in_from_ms = Some(lead_in.lead_in_from_ms);
         }
         // Symbol filters are pinned exchange METADATA, not price data — resolving
         // them is not "fetching candles from an exchange", which the accept path

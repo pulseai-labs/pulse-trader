@@ -124,6 +124,8 @@ const SEEDED_RUN: BacktestRunDto = {
   takerFeeBps: "4.0000",
   slippageBps: "2.0000",
   funding: "snapshot_rates",
+  // Unwindowed run — no recorded lead-in (r2.s3.w2).
+  leadInFrom: null,
   engineFingerprint: "sha256:abc123def456",
   engineTarget: "aarch64-apple-darwin",
   resultContentHash: "sha256:9876fedcba",

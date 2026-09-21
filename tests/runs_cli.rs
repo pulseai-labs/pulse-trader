@@ -123,6 +123,7 @@ async fn seed_prior_run_with_bogus_fingerprint(db_path: &str, version_id: &Versi
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
         window: None,
+        lead_in_from_ms: None,
     };
     repo.save_run(
         version_id,
