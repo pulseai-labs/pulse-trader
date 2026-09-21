@@ -1286,6 +1286,7 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
                 slippage_bps: Decimal::new(1, 0),
                 funding: pulse::FundingConfig::SnapshotRates,
                 window: None,
+                lead_in_from_ms: None,
             },
             result: pulse::BacktestResult {
                 trades,

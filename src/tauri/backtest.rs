@@ -197,6 +197,11 @@ pub struct BacktestRunDto {
     pub slippage_bps: String,
     /// How funding was sourced (`snapshot_rates`).
     pub funding: String,
+    /// The `open_time` of the first candle the engines consumed — the lead-in
+    /// start (r2.s3.w2), RFC 3339 like `created_at`. `null` for an unwindowed
+    /// run and for every row persisted before migration `0012`, whose lead-in
+    /// is not recoverable.
+    pub lead_in_from: Option<String>,
 
     // --- engine ---------------------------------------------------------
     /// The recording engine's build fingerprint.
@@ -517,6 +522,12 @@ pub fn backtest_run_dto(outcome: &BacktestOutcome) -> Result<BacktestRunDto, Bac
         taker_fee_bps: dec(inputs.taker_fee_bps),
         slippage_bps: dec(inputs.slippage_bps),
         funding: funding_label(inputs.funding).to_owned(),
+        // Same RFC 3339 millisecond shape `BacktestInputs::lead_in_from` puts
+        // on the MCP wire — one timestamp spelling across the surfaces.
+        lead_in_from: inputs.lead_in_from_ms.and_then(|ms| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        }),
 
         engine_fingerprint: run.engine_fingerprint.clone(),
         engine_target: run.engine_target.clone(),

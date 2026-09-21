@@ -179,6 +179,7 @@ const LANDED_RUN = {
   takerFeeBps: "4",
   slippageBps: "2",
   funding: "snapshot_rates",
+  leadInFrom: null,
   engineFingerprint: "sha256:abc",
   engineTarget: "aarch64-apple-darwin",
   resultContentHash: "sha256:def",

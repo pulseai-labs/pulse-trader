@@ -78,9 +78,18 @@ impl BacktestConfig {
 /// `EndOfData` force-close — a position open at a window edge is left open
 /// rather than booked as a trade the strategy never chose.
 ///
+/// `count_from_ms` is the lead-in boundary (r2.s3.w2): when `Some(from)`, bars
+/// with `open_time < from` are **lead-in** — both indicator engines and the
+/// regime detector step through them so the strategy arrives at `from` warm,
+/// but nothing counts: no entry evaluation, no pending entry or fill, no
+/// exit, no funding accrual, no equity mark, no excursion update, no regime
+/// tally. The first counted bar is the first `open_time >= from`. `None`
+/// counts every bar — the unwindowed shape.
+///
 /// # Errors
 ///
 /// Returns [`BacktestError`] for strategy preconditions or sizing failures.
+#[allow(clippy::too_many_lines)]
 pub fn run_backtest(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -88,6 +97,7 @@ pub fn run_backtest(
     config: &BacktestConfig,
     filters: &SymbolFilters,
     series_end: SeriesEnd,
+    count_from_ms: Option<i64>,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
@@ -130,28 +140,36 @@ pub fn run_backtest(
     let funding_index = build_funding_index(primary);
 
     for bar in align(primary, htf) {
-        // The regime in effect for an entry filling at THIS bar's open is the one
-        // determined by already-closed bars (the detector is stepped at the
-        // bottom of the loop, mirroring `engine.step`) — the same no-look-ahead
-        // discipline the entry signal itself obeys. `current()` is `Unknown` until
-        // the EMA200/ADX warm.
-        let regime = detector.current();
-        fill_pending_entry(
-            &mut state,
-            bar.primary,
-            direction,
-            &exit_plan,
-            config,
-            filters,
-            regime,
-        )?;
-        if let Some(position) = state.position.as_mut() {
-            // Fold this bar (the just-opened entry bar, or any held bar including
-            // the full exit bar) into the running MFE/MAE before the close reads
-            // it. C5: after fill, before close.
-            update_excursion(position, bar.primary);
+        // r2.s3.w2: a lead-in bar (`open_time < count_from_ms`) warms both
+        // indicator engines and the regime detector but counts for NOTHING —
+        // no fill, no exit, no funding, no equity mark, no excursion, no
+        // entry or pending-entry evaluation. The trading-relevant blocks below
+        // are all gated on `counted`; the three warm-up steps are not.
+        let counted = count_from_ms.is_none_or(|from| bar.primary.open_time >= from);
+        if counted {
+            // The regime in effect for an entry filling at THIS bar's open is
+            // the one determined by already-closed bars (the detector is
+            // stepped at the bottom of the loop, mirroring `engine.step`) —
+            // the same no-look-ahead discipline the entry signal itself
+            // obeys. `current()` is `Unknown` until the EMA200/ADX warm.
+            let regime = detector.current();
+            fill_pending_entry(
+                &mut state,
+                bar.primary,
+                direction,
+                &exit_plan,
+                config,
+                filters,
+                regime,
+            )?;
+            if let Some(position) = state.position.as_mut() {
+                // Fold this bar (the just-opened entry bar, or any held bar
+                // including the full exit bar) into the running MFE/MAE before
+                // the close reads it. C5: after fill, before close.
+                update_excursion(position, bar.primary);
+            }
+            close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
         }
-        close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
 
         engine.step(bar.primary);
         // Step the HTF engine with EVERY HTF candle that has closed at or
@@ -183,7 +201,8 @@ pub fn run_backtest(
             htf: htf_engine.as_ref(),
         };
 
-        if state.position.is_some()
+        if counted
+            && state.position.is_some()
             && state.pending_exit.is_none()
             // r2.s2 round-1 fix F3: when the strategy needs the higher
             // timeframe a signal exit must not evaluate before a closed HTF
@@ -199,7 +218,8 @@ pub fn run_backtest(
             });
         }
 
-        if state.position.is_none()
+        if counted
+            && state.position.is_none()
             && state.pending_entry.is_none()
             && bar.index > 0
             && engine.is_warm()
@@ -254,10 +274,16 @@ pub fn run_backtest(
             _ => None,
         }
     };
-    // The leading equity point's time is the run's first primary candle open
-    // (README C2 / D5). An empty primary series has no run-start bar; fall back to
-    // 0 (the run produced no trades either, so the curve is just the leading point).
-    let run_start_time_ms = primary.candles.first().map_or(0, |candle| candle.open_time);
+    // The leading equity point's time is the run's first COUNTED primary
+    // candle open (README C2 / D5) — under lead-in that is the first bar at
+    // or after `count_from_ms`, not the snapshot's first bar. An empty counted
+    // slice has no run-start bar; fall back to 0 (the run produced no trades
+    // either, so the curve is just the leading point).
+    let run_start_time_ms = primary
+        .candles
+        .iter()
+        .find(|candle| count_from_ms.is_none_or(|from| candle.open_time >= from))
+        .map_or(0, |candle| candle.open_time);
     Ok(state.into_result(config, run_start_time_ms, open_position))
 }
 
@@ -1302,6 +1328,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1325,6 +1352,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1345,6 +1373,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1368,6 +1397,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1390,6 +1420,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1412,6 +1443,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1561,6 +1593,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
@@ -1596,6 +1629,7 @@ mod tests {
                 &config(),
                 &SymbolFilters::unconstrained(),
                 SeriesEnd::SnapshotEnd,
+                None,
             )
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
@@ -1608,6 +1642,7 @@ mod tests {
                 &config(),
                 &SymbolFilters::unconstrained(),
                 SeriesEnd::SnapshotEnd,
+                None,
             )
             .unwrap_err(),
             BacktestError::UnsupportedExit(_)
@@ -1635,6 +1670,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .expect("atr stop is modelled since r2.s2.w2");
         assert!(result.trades.is_empty());
@@ -1654,6 +1690,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1684,6 +1721,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::WindowEdge,
+            None,
         )
         .unwrap();
 
@@ -1720,6 +1758,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::WindowEdge,
+            None,
         )
         .unwrap();
         assert!(result.trades.is_empty());
@@ -1739,6 +1778,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1770,6 +1810,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1824,6 +1865,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1879,6 +1921,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1919,6 +1962,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1952,6 +1996,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -1990,6 +2035,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::WindowEdge,
+            None,
         )
         .unwrap();
         assert!(
@@ -2006,6 +2052,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
         assert_eq!(closed.trades[0].exit_reason, ExitReason::EndOfData);
@@ -2029,6 +2076,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 
@@ -2148,6 +2196,7 @@ mod tests {
             &bad,
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, BacktestError::InvalidConfig(_)));
@@ -2179,6 +2228,7 @@ mod tests {
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, BacktestError::ImpossibleTakeProfit(_)));
@@ -2201,6 +2251,7 @@ mod tests {
                 &config(),
                 &SymbolFilters::unconstrained(),
                 SeriesEnd::SnapshotEnd,
+                None,
             )
             .is_ok()
         );
@@ -2229,6 +2280,7 @@ mod tests {
             &cfg,
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
+            None,
         )
         .unwrap();
 

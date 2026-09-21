@@ -231,6 +231,13 @@ export type BacktestRunDto = {
 	slippageBps: string,
 	/**  How funding was sourced (`snapshot_rates`). */
 	funding: string,
+	/**
+	 *  The `open_time` of the first candle the engines consumed — the lead-in
+	 *  start (r2.s3.w2), RFC 3339 like `created_at`. `null` for an unwindowed
+	 *  run and for every row persisted before migration `0012`, whose lead-in
+	 *  is not recoverable.
+	 */
+	leadInFrom: string | null,
 	/**  The recording engine's build fingerprint. */
 	engineFingerprint: string,
 	/**  The recording engine's target triple. */

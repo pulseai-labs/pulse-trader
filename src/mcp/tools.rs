@@ -782,10 +782,13 @@ impl PulseMcp {
     /// The request resolves through [`resolve_default_request`]: the version's
     /// parent's latest run (then its own, then the app defaults) supplies the
     /// pair, timeframes, cost model and exact snapshot pins. `from`/`to` are an
-    /// optional RFC 3339 window — both or neither — sliced at load time and
-    /// recorded on the run's `inputs.window`.
+    /// optional RFC 3339 window — both or neither — the counted half-open
+    /// slice `[from, to)`: both series still load from the snapshot's start so
+    /// the engines step every bar before `from` and arrive warm (r2.s3.w2);
+    /// the window and the lead-in start record on the run's `inputs.window`
+    /// and `inputs.lead_in_from`.
     #[tool(
-        description = "Run a backtest of one strategy version. Optional from/to (RFC 3339, both or neither) slice the candles to [from, to). Defaults resolve from the version's parent run, then its own latest run, then app defaults."
+        description = "Run a backtest of one strategy version. Optional from/to (RFC 3339, both or neither) count only the candles in [from, to) while indicators warm on the full history before `from`. Defaults resolve from the version's parent run, then its own latest run, then app defaults."
     )]
     async fn run_backtest(
         &self,

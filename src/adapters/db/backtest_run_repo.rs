@@ -357,6 +357,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                  funding_config          AS "funding_config?: String",
                  window_from_ms          AS "window_from_ms?: i64",
                  window_to_ms            AS "window_to_ms?: i64",
+                 window_lead_in_from_ms  AS "window_lead_in_from_ms?: i64",
                  open_position           AS "open_position?: String"
                FROM backtest_run WHERE id = ?1"#,
             id_str,
@@ -491,6 +492,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             r.funding_config.as_deref(),
             r.window_from_ms,
             r.window_to_ms,
+            r.window_lead_in_from_ms,
         )?;
 
         Ok(Some(PersistedRun {
@@ -801,6 +803,7 @@ fn decode_inputs(
     funding_config: Option<&str>,
     window_from_ms: Option<i64>,
     window_to_ms: Option<i64>,
+    window_lead_in_from_ms: Option<i64>,
 ) -> Result<Option<BacktestInputs>, DataError> {
     let required = [
         pair,
@@ -821,7 +824,7 @@ fn decode_inputs(
     // pair is NULL there too, and is decoded with it rather than counted among
     // the `0006` shapes (a legacy row has no inputs at all).
     if present == 0 && htf_present == 0 {
-        if window_from_ms.is_some() || window_to_ms.is_some() {
+        if window_from_ms.is_some() || window_to_ms.is_some() || window_lead_in_from_ms.is_some() {
             return Err(DataError::Db(format!(
                 "run `{run_id}` carries window bounds but no input provenance: \
                  a row that cannot name its snapshot cannot name a slice of it"
@@ -860,6 +863,15 @@ fn decode_inputs(
             )));
         }
     };
+    // r2.s3.w2: the lead-in start is only meaningful relative to a counted
+    // window — the same shape `0012`'s pair trigger refuses on INSERT,
+    // checked again on the way out.
+    if window.is_none() && window_lead_in_from_ms.is_some() {
+        return Err(DataError::Db(format!(
+            "run `{run_id}` carries a lead-in start but no window pair: \
+             window_lead_in_from_ms requires a complete window (r2.s3.w2)"
+        )));
+    }
 
     let pair = require_col("backtest_run.pair", pair)?;
     let primary_timeframe = require_col("backtest_run.primary_timeframe", primary_timeframe)?;
@@ -891,6 +903,7 @@ fn decode_inputs(
         slippage_bps: parse_decimal("backtest_run.slippage_bps", slippage_bps)?,
         funding: parse_funding("backtest_run.funding_config", funding_config)?,
         window,
+        lead_in_from_ms: window_lead_in_from_ms,
     }))
 }
 
@@ -1045,6 +1058,10 @@ pub(crate) async fn insert_run_row(
     // `0009` trigger refuses it anyway. Both bounds are UTC epoch-ms INTEGERs.
     let window_from_ms = inputs.window.as_ref().map(|w| w.from_ms);
     let window_to_ms = inputs.window.as_ref().map(|w| w.to_ms);
+    // r2.s3.w2: the lead-in start rides the same provenance row — `0012`'s
+    // trigger refuses it without a complete window pair, which the
+    // application layer already guarantees (lead-in is set only with `window`).
+    let window_lead_in_from_ms = inputs.lead_in_from_ms;
     // r2.s1 G1(b): the window-edge open-position mark is one JSON column (the
     // `regime_breakdown`/`fills` precedent) — NULL for a run that ended flat
     // or at the snapshot's real last bar. Never a trade row, so the
@@ -1065,10 +1082,10 @@ pub(crate) async fn insert_run_row(
           regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
           taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms, \
-          open_position) \
+          window_lead_in_from_ms, open_position) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
-                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
         run_id,
         version_id_str,
         schema_version,
@@ -1111,6 +1128,7 @@ pub(crate) async fn insert_run_row(
         funding_config,
         window_from_ms,
         window_to_ms,
+        window_lead_in_from_ms,
         open_position_json,
     )
     .execute(&mut **tx)
@@ -1285,6 +1303,7 @@ mod tests {
             slippage_bps: d(1, 0),
             funding: FundingConfig::SnapshotRates,
             window: None,
+            lead_in_from_ms: None,
         }
     }
 

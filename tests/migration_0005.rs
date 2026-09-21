@@ -67,8 +67,9 @@ async fn columns_of(pool: &SqlitePool, table: &str) -> Vec<String> {
 /// such table: `coaching_proposals`". r2.s1.w1 adds `0009` for the same reason —
 /// its pending-claim index targets `coaching_sessions`, a `0005` table — and G1
 /// adds `0010`, which would lift the fixture's maximum off its pin. r2.s2.w2
-/// adds `0011` (`trade.stop_price`), the same reason. The binary being simulated
-/// here predates all five.
+/// adds `0011` (`trade.stop_price`), the same reason, and r2.s3.w2 adds `0012`
+/// (`backtest_run.window_lead_in_from_ms`). The binary being simulated here
+/// predates all six.
 fn shipped_set_without_0005(dir: &Path) {
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
@@ -259,10 +260,11 @@ async fn migration_0005_applies_to_a_database_already_at_0007() {
     );
     // The subject of this test is that `0005` APPLIED even though it sorts BELOW
     // the maximum the database already held — the reserved-number property. The
-    // maximum itself moved to 11 across r1.s4.w4, r2.s1.w1, G1 and r2.s2.w2
-    // because the same run also applies `0008`, `0009`, `0010` and `0011`,
-    // which the fixture withheld; asserting `Some(7)` here would now be
-    // asserting that they did not run, which is a different (and false) claim.
+    // maximum itself moved to 12 across r1.s4.w4, r2.s1.w1, G1, r2.s2.w2 and
+    // r2.s3.w2 because the same run also applies `0008`, `0009`, `0010`, `0011`
+    // and `0012`, which the fixture withheld; asserting `Some(7)` here would
+    // now be asserting that they did not run, which is a different (and false)
+    // claim.
     assert!(
         applied.contains(&8),
         "0008 rides along in the same run: {applied:?}"
@@ -279,10 +281,14 @@ async fn migration_0005_applies_to_a_database_already_at_0007() {
         applied.contains(&11),
         "0011 rides along in the same run: {applied:?}"
     );
+    assert!(
+        applied.contains(&12),
+        "0012 rides along in the same run: {applied:?}"
+    );
     assert_eq!(
         applied.iter().copied().max(),
-        Some(11),
-        "0005 is recorded at its own version, below the new maximum 0011 sets"
+        Some(12),
+        "0005 is recorded at its own version, below the new maximum 0012 sets"
     );
 
     assert!(

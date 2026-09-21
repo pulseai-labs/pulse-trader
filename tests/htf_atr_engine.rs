@@ -234,6 +234,7 @@ fn run(
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         series_end,
+        None,
     )
     .expect("backtest runs")
 }
@@ -721,6 +722,7 @@ fn engine_refuses_a_non_higher_htf_series() {
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect_err("an equal-timeframe htf series must refuse");
     assert!(
@@ -752,6 +754,7 @@ fn engine_refuses_a_non_higher_htf_series() {
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect_err("a lower-timeframe htf series must refuse");
     assert!(
@@ -803,6 +806,7 @@ fn engine_refuses_a_mismatched_pair_htf_series() {
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect_err("a different-pair htf series must refuse");
     match err {
@@ -829,6 +833,7 @@ fn engine_refuses_a_mismatched_pair_htf_series() {
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect("a same-pair htf series still runs");
 }
@@ -1313,6 +1318,7 @@ fn atr_stop_resolving_non_positive_is_a_typed_refusal() {
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect_err("a non-positive ATR stop must refuse");
     assert!(
@@ -1369,6 +1375,7 @@ fn atr_stop_resolving_to_zero_distance_is_a_typed_refusal() {
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect_err("a zero-distance ATR stop must refuse");
     assert!(
