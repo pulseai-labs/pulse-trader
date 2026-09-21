@@ -305,6 +305,12 @@ export type BacktestRunDto = {
 	mae: HistogramDto,
 	/**  Every persisted trade, in `seq` order, with exact values. */
 	trades: TradeRowDto[],
+	/**
+	 *  Which `rolling-oos/v1` walk-forward run this run is a fold of — `null`
+	 *  for a standalone run and for every row persisted before migration
+	 *  `0013`.
+	 */
+	walkForward: WalkForwardMembershipDto | null,
 };
 
 /**
@@ -1048,6 +1054,18 @@ export type VersionStats = {
 	winRate: string,
 	/**  Completed trades in the run. */
 	trades: number,
+};
+
+/**
+ *  The walk-forward membership a run carries, on the wire (r2.s3.w3 — the
+ *  `0013` `backtest_run` pair, both-or-neither by trigger, so one `Option`
+ *  carries them together).
+ */
+export type WalkForwardMembershipDto = {
+	/**  The parent `walk_forward_run` id. */
+	walkForwardRunId: string,
+	/**  This run's position in the parent's scheme (`0..k`). */
+	foldIndex: number,
 };
 
 /* Tauri Specta runtime */

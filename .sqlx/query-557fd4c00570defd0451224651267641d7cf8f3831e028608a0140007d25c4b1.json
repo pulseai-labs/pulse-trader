@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                 id                      AS \"id!: String\",\n                 strategy_version_id     AS \"strategy_version_id!: String\",\n                 schema_version          AS \"schema_version!: i64\",\n                 created_at              AS \"created_at!: String\",\n                 engine_fingerprint      AS \"engine_fingerprint!: String\",\n                 engine_target           AS \"engine_target!: String\",\n                 result_content_hash     AS \"result_content_hash!: String\",\n                 starting_equity         AS \"starting_equity!: String\",\n                 net_pnl                 AS \"net_pnl!: String\",\n                 fees_total              AS \"fees_total!: String\",\n                 funding_total           AS \"funding_total!: String\",\n                 slippage_total          AS \"slippage_total!: String\",\n                 expectancy              AS \"expectancy?: String\",\n                 win_rate                AS \"win_rate?: String\",\n                 profit_factor           AS \"profit_factor?: String\",\n                 gross_profit            AS \"gross_profit?: String\",\n                 gross_loss              AS \"gross_loss?: String\",\n                 avg_win                 AS \"avg_win?: String\",\n                 avg_loss                AS \"avg_loss?: String\",\n                 max_drawdown            AS \"max_drawdown?: String\",\n                 trade_count             AS \"trade_count?: i64\",\n                 wins                    AS \"wins?: i64\",\n                 losses                  AS \"losses?: i64\",\n                 breakeven               AS \"breakeven?: i64\",\n                 max_win_streak          AS \"max_win_streak?: i64\",\n                 max_loss_streak         AS \"max_loss_streak?: i64\",\n                 sharpe                  AS \"sharpe?: String\",\n                 sortino                 AS \"sortino?: String\",\n                 regime_breakdown        AS \"regime_breakdown?: String\",\n                 skipped_sub_lot         AS \"skipped_sub_lot?: i64\",\n                 skipped_sub_notional    AS \"skipped_sub_notional?: i64\",\n                 skipped_leverage_capped AS \"skipped_leverage_capped?: i64\",\n                 pair                    AS \"pair?: String\",\n                 primary_timeframe       AS \"primary_timeframe?: String\",\n                 primary_data_version    AS \"primary_data_version?: String\",\n                 htf_timeframe           AS \"htf_timeframe?: String\",\n                 htf_data_version        AS \"htf_data_version?: String\",\n                 taker_fee_bps           AS \"taker_fee_bps?: String\",\n                 slippage_bps            AS \"slippage_bps?: String\",\n                 funding_config          AS \"funding_config?: String\",\n                 window_from_ms          AS \"window_from_ms?: i64\",\n                 window_to_ms            AS \"window_to_ms?: i64\",\n                 window_lead_in_from_ms  AS \"window_lead_in_from_ms?: i64\",\n                 open_position           AS \"open_position?: String\"\n               FROM backtest_run WHERE id = ?1",
+  "query": "SELECT\n                 id                      AS \"id!: String\",\n                 strategy_version_id     AS \"strategy_version_id!: String\",\n                 schema_version          AS \"schema_version!: i64\",\n                 created_at              AS \"created_at!: String\",\n                 engine_fingerprint      AS \"engine_fingerprint!: String\",\n                 engine_target           AS \"engine_target!: String\",\n                 result_content_hash     AS \"result_content_hash!: String\",\n                 starting_equity         AS \"starting_equity!: String\",\n                 net_pnl                 AS \"net_pnl!: String\",\n                 fees_total              AS \"fees_total!: String\",\n                 funding_total           AS \"funding_total!: String\",\n                 slippage_total          AS \"slippage_total!: String\",\n                 expectancy              AS \"expectancy?: String\",\n                 win_rate                AS \"win_rate?: String\",\n                 profit_factor           AS \"profit_factor?: String\",\n                 gross_profit            AS \"gross_profit?: String\",\n                 gross_loss              AS \"gross_loss?: String\",\n                 avg_win                 AS \"avg_win?: String\",\n                 avg_loss                AS \"avg_loss?: String\",\n                 max_drawdown            AS \"max_drawdown?: String\",\n                 trade_count             AS \"trade_count?: i64\",\n                 wins                    AS \"wins?: i64\",\n                 losses                  AS \"losses?: i64\",\n                 breakeven               AS \"breakeven?: i64\",\n                 max_win_streak          AS \"max_win_streak?: i64\",\n                 max_loss_streak         AS \"max_loss_streak?: i64\",\n                 sharpe                  AS \"sharpe?: String\",\n                 sortino                 AS \"sortino?: String\",\n                 regime_breakdown        AS \"regime_breakdown?: String\",\n                 skipped_sub_lot         AS \"skipped_sub_lot?: i64\",\n                 skipped_sub_notional    AS \"skipped_sub_notional?: i64\",\n                 skipped_leverage_capped AS \"skipped_leverage_capped?: i64\",\n                 pair                    AS \"pair?: String\",\n                 primary_timeframe       AS \"primary_timeframe?: String\",\n                 primary_data_version    AS \"primary_data_version?: String\",\n                 htf_timeframe           AS \"htf_timeframe?: String\",\n                 htf_data_version        AS \"htf_data_version?: String\",\n                 taker_fee_bps           AS \"taker_fee_bps?: String\",\n                 slippage_bps            AS \"slippage_bps?: String\",\n                 funding_config          AS \"funding_config?: String\",\n                 window_from_ms          AS \"window_from_ms?: i64\",\n                 window_to_ms            AS \"window_to_ms?: i64\",\n                 window_lead_in_from_ms  AS \"window_lead_in_from_ms?: i64\",\n                 open_position           AS \"open_position?: String\",\n                 walk_forward_run_id     AS \"walk_forward_run_id?: String\",\n                 fold_index              AS \"fold_index?: i64\"\n               FROM backtest_run WHERE id = ?1",
   "describe": {
     "columns": [
       {
@@ -222,6 +222,16 @@
         "name": "open_position?: String",
         "ordinal": 43,
         "type_info": "Text"
+      },
+      {
+        "name": "walk_forward_run_id?: String",
+        "ordinal": 44,
+        "type_info": "Text"
+      },
+      {
+        "name": "fold_index?: i64",
+        "ordinal": 45,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
@@ -271,8 +281,10 @@
       true,
       true,
       true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "81a024842d2bbbd38e77249843cca50251e8a2968e86b6f5fb5a54426b071cd2"
+  "hash": "557fd4c00570defd0451224651267641d7cf8f3831e028608a0140007d25c4b1"
 }

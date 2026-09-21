@@ -348,6 +348,13 @@ pub struct PersistedRun {
     /// them have a position to report. The mark is never a [`Trade`] and never
     /// enters the summary's closed-trade statistics.
     pub open_position: Option<OpenPositionMark>,
+    /// The walk-forward run this run is a fold of, as persisted (r2.s3.w3,
+    /// `0013` `walk_forward_run_id` + `fold_index`). `None` for an ordinary
+    /// standalone run and for every pre-`0013` row; `Some` carries the parent
+    /// `walk_forward_run` id and the fold's position in it — the two columns
+    /// are set together or not at all (the `0013` pair trigger).
+    #[serde(default)]
+    pub walk_forward: Option<super::walk_forward::WalkForwardMembership>,
 }
 
 /// The typed list projection of one run for the catalog

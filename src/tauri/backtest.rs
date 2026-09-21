@@ -47,7 +47,9 @@ use serde::{Deserialize, Serialize};
 use crate::application::backtest::{
     BacktestAppError, BacktestOutcome, Histogram, ReadBackFailure, ReadBackStage,
 };
-use crate::domain::backtest::{EquityCurve, ExitReason, Regime, RegimeCell, TradeSource};
+use crate::domain::backtest::{
+    EquityCurve, ExitReason, Regime, RegimeBreakdown, RegimeCell, TradeSource,
+};
 use crate::domain::{BacktestInputs, BacktestRunId, Direction, FundingConfig, PersistedRun, Trade};
 
 use super::coach::SummaryDto;
@@ -275,6 +277,33 @@ pub struct BacktestRunDto {
     pub mae: HistogramDto,
     /// Every persisted trade, in `seq` order, with exact values.
     pub trades: Vec<TradeRowDto>,
+
+    // --- walk-forward membership (r2.s3.w3, additive) ---------------------
+    /// Which `rolling-oos/v1` walk-forward run this run is a fold of — `null`
+    /// for a standalone run and for every row persisted before migration
+    /// `0013`.
+    pub walk_forward: Option<WalkForwardMembershipDto>,
+}
+
+/// The walk-forward membership a run carries, on the wire (r2.s3.w3 — the
+/// `0013` `backtest_run` pair, both-or-neither by trigger, so one `Option`
+/// carries them together).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WalkForwardMembershipDto {
+    /// The parent `walk_forward_run` id.
+    pub walk_forward_run_id: String,
+    /// This run's position in the parent's scheme (`0..k`).
+    pub fold_index: u32,
+}
+
+/// The membership projection (r2.s3.w3) — kept out of `backtest_run_dto` so
+/// that function's line count is unchanged (#204).
+fn walk_forward_dto(run: &PersistedRun) -> Option<WalkForwardMembershipDto> {
+    run.walk_forward.as_ref().map(|m| WalkForwardMembershipDto {
+        walk_forward_run_id: m.run_id.as_str().to_owned(),
+        fold_index: u32::from(m.fold_index),
+    })
 }
 
 /// What `compare_child_run` is asked for: one persisted run id (r2.s1.w4 C3).
@@ -431,6 +460,22 @@ fn equity_dto(curve: &EquityCurve) -> Vec<EquityPointDto> {
         .collect()
 }
 
+/// The four-regime vec, fixed order (extracted from `backtest_run_dto` so the
+/// r2.s3.w3 membership field does not grow it past its r2.s3.w2 count, #204):
+/// a chart that reorders its categories between runs is unreadable, and an
+/// absent regime is a zero, not a gap.
+fn regimes_dto(
+    run_id: &BacktestRunId,
+    breakdown: &RegimeBreakdown,
+) -> Result<Vec<RegimeCellDto>, BacktestAppError> {
+    Ok(vec![
+        regime_dto(run_id, "trending_up", breakdown.trending_up())?,
+        regime_dto(run_id, "trending_down", breakdown.trending_down())?,
+        regime_dto(run_id, "ranging", breakdown.ranging())?,
+        regime_dto(run_id, "unknown", breakdown.unknown())?,
+    ])
+}
+
 fn regime_dto(
     run_id: &BacktestRunId,
     regime: &str,
@@ -567,16 +612,10 @@ pub fn backtest_run_dto(outcome: &BacktestOutcome) -> Result<BacktestRunDto, Bac
         )?,
 
         equity: equity_dto(&outcome.equity_curve()),
-        // Fixed order, always four entries: a chart that reorders its categories
-        // between runs is unreadable, and an absent regime is a zero, not a gap.
-        regimes: vec![
-            regime_dto(run_id, "trending_up", breakdown.trending_up())?,
-            regime_dto(run_id, "trending_down", breakdown.trending_down())?,
-            regime_dto(run_id, "ranging", breakdown.ranging())?,
-            regime_dto(run_id, "unknown", breakdown.unknown())?,
-        ],
+        regimes: regimes_dto(run_id, breakdown)?,
         mfe: histogram_dto(&outcome.mfe),
         mae: histogram_dto(&outcome.mae),
         trades: outcome.trades.iter().map(trade_dto).collect(),
+        walk_forward: walk_forward_dto(run),
     })
 }

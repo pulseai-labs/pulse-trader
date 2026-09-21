@@ -1,0 +1,394 @@
+//! The `SQLite` adapter implementing the [`WalkForwardRunRepository`] port
+//! (r2.s3.w3 — `rolling-oos/v1` + `wf-v1`, ADR-0025).
+//!
+//! Implemented on [`SqliteBacktestRunRepo`]: a walk-forward run is a parent row
+//! whose K folds are **ordinary persisted windowed `backtest_run` rows** — so
+//! the write path is `insert_run_row` + `insert_trade_rows` (with the `0013`
+//! membership pair set), and `list_runs_for_version` / `get_run` keep seeing the
+//! folds like any other run (L8). This module adds only the parent + fold-row
+//! surface: `save_walk_forward_run` is **one transaction** (a9 — the ownership
+//! check, the `walk_forward_run` row, then per fold the run + trades + fold
+//! row; any failure rolls everything back), and `get_walk_forward_run` is
+//! fail-closed like `get_run` — a corrupt column or a fold whose `backtest_run`
+//! is missing is an `Err`, never a partial read.
+//!
+//! The `sqlx` confinement rule is unchanged: this file is still `adapters::db`.
+
+use uuid::Uuid;
+
+use crate::adapters::db::backtest_run_repo::{
+    SqliteBacktestRunRepo, check_inputs_path_safe, decimal_text, insert_run_row, insert_trade_rows,
+    parse_decimal,
+};
+use crate::domain::backtest::{
+    BacktestRunId, CandleWindow, FoldScheme, FoldVerdict, N_MIN, RunVerdict, VerdictRule,
+    WalkForwardFold, WalkForwardMembership, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
+};
+use crate::domain::strategy::VersionId;
+use crate::domain::{Clock, DataError, WalkForwardRunRepository};
+
+/// The `walk_forward_run` parent-row insert — one statement inside `tx`.
+async fn insert_walk_forward_run_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    wf_run_id: &str,
+    version_id_str: &str,
+    created_at: &str,
+    draft: &WalkForwardRunDraft,
+) -> Result<(), DataError> {
+    let scheme_name = draft.scheme.name();
+    let rule_name = draft.rule.name();
+    let k_i64 = i64::from(draft.scheme.k());
+    let folds_holding = i64::from(draft.verdict.folds_holding);
+    let folds_required = i64::from(draft.verdict.folds_required);
+    let pooled_n = i64::try_from(draft.verdict.pooled.n)
+        .map_err(|e| DataError::Db(format!("pooled_n overflows i64: {e}")))?;
+    let pooled_mean_r = decimal_text(draft.verdict.pooled.mean_r);
+    sqlx::query!(
+        "INSERT INTO walk_forward_run \
+         (id, strategy_version_id, created_at, scheme, rule, k, \
+          span_from_ms, span_to_ms, from_defaulted, engine_fingerprint, \
+          folds_holding, folds_required, pooled_n, pooled_mean_r, \
+          pooled_lower_bound, pass) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        wf_run_id,
+        version_id_str,
+        created_at,
+        scheme_name,
+        rule_name,
+        k_i64,
+        draft.span.from_ms,
+        draft.span.to_ms,
+        draft.from_defaulted,
+        draft.engine_fingerprint,
+        folds_holding,
+        folds_required,
+        pooled_n,
+        pooled_mean_r,
+        draft.verdict.pooled.lower_bound,
+        draft.verdict.pass,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// One fold's three writes: the ordinary `backtest_run` (with the 0013
+/// membership pair), its `trade` rows, and the `walk_forward_fold` row.
+async fn insert_fold_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    wf_run_id: &str,
+    version_id_str: &str,
+    created_at: &str,
+    fold: &crate::domain::backtest::WalkForwardFoldDraft,
+) -> Result<(), DataError> {
+    let run_id = Uuid::new_v4().to_string();
+    let membership = WalkForwardMembership {
+        run_id: WalkForwardRunId::new(wf_run_id),
+        fold_index: fold.index,
+    };
+    insert_run_row(
+        tx,
+        &run_id,
+        version_id_str,
+        created_at,
+        &fold.inputs,
+        &fold.result,
+        &fold.summary,
+        fold.starting_equity,
+        Some(&membership),
+    )
+    .await?;
+    insert_trade_rows(tx, &run_id, &fold.result.trades).await?;
+    let fold_index_i64 = i64::from(fold.index);
+    let fold_n = i64::try_from(fold.verdict.n)
+        .map_err(|e| DataError::Db(format!("fold n overflows i64: {e}")))?;
+    let fold_mean_r = decimal_text(fold.verdict.mean_r);
+    sqlx::query!(
+        "INSERT INTO walk_forward_fold \
+         (walk_forward_run_id, fold_index, window_from_ms, window_to_ms, \
+          backtest_run_id, n, mean_r, lower_bound, holds) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        wf_run_id,
+        fold_index_i64,
+        fold.window.from_ms,
+        fold.window.to_ms,
+        run_id,
+        fold_n,
+        fold_mean_r,
+        fold.verdict.lower_bound,
+        fold.verdict.holds,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// The persisted scheme/rule names decode through the same domain validation
+/// the writer used — an unknown name or an out-of-range `k` is corrupt, not
+/// defaulted.
+fn decode_scheme_and_rule(
+    id_str: &str,
+    scheme_text: &str,
+    rule_text: &str,
+    k_i64: i64,
+) -> Result<(FoldScheme, VerdictRule), DataError> {
+    let k = u8::try_from(k_i64)
+        .map_err(|e| DataError::Db(format!("walk_forward_run `{id_str}` k={k_i64}: {e}")))?;
+    let scheme = match scheme_text {
+        "rolling-oos/v1" => FoldScheme::rolling_oos(k)
+            .map_err(|e| DataError::Db(format!("walk_forward_run `{id_str}` k={k}: {e}")))?,
+        other => {
+            return Err(DataError::Db(format!(
+                "walk_forward_run `{id_str}` has unknown scheme `{other}`"
+            )));
+        }
+    };
+    let rule = match rule_text {
+        "wf-v1" => VerdictRule::WfV1,
+        other => {
+            return Err(DataError::Db(format!(
+                "walk_forward_run `{id_str}` has unknown rule `{other}`"
+            )));
+        }
+    };
+    Ok((scheme, rule))
+}
+
+/// The `walk_forward_run` row's `RunVerdict` decode — `pooled.holds` is derived
+/// (`n >= N_MIN && lower_bound > 0`), not a column, so it is recomputed and
+/// round-trips exactly.
+fn decode_run_verdict(
+    folds_holding: i64,
+    folds_required: i64,
+    pooled_n: i64,
+    pooled_mean_r: &str,
+    pooled_lower_bound: f64,
+    pass: i64,
+) -> Result<RunVerdict, DataError> {
+    let n = usize::try_from(pooled_n)
+        .map_err(|e| DataError::Db(format!("pooled_n {pooled_n}: {e}")))?;
+    Ok(RunVerdict {
+        folds_holding: u8::try_from(folds_holding)
+            .map_err(|e| DataError::Db(format!("folds_holding {folds_holding}: {e}")))?,
+        folds_required: u8::try_from(folds_required)
+            .map_err(|e| DataError::Db(format!("folds_required {folds_required}: {e}")))?,
+        pooled: FoldVerdict {
+            n,
+            mean_r: parse_decimal("walk_forward_run.pooled_mean_r", pooled_mean_r)?,
+            lower_bound: pooled_lower_bound,
+            holds: n >= N_MIN && pooled_lower_bound > 0.0,
+        },
+        pass: pass != 0,
+    })
+}
+
+/// The raw `walk_forward_fold` row shape the read path decodes.
+struct FoldRow {
+    fold_index: i64,
+    window_from_ms: i64,
+    window_to_ms: i64,
+    backtest_run_id: String,
+    n: i64,
+    mean_r: String,
+    lower_bound: f64,
+    holds: i64,
+}
+
+/// One `walk_forward_fold` row's decode — fail-closed: a fold pointing at a
+/// missing `backtest_run` row is an `Err` (the port's contract), not a skipped
+/// row.
+async fn fetch_fold(
+    pool: &sqlx::SqlitePool,
+    parent_id: &str,
+    f: &FoldRow,
+) -> Result<WalkForwardFold, DataError> {
+    let run_exists = sqlx::query!(
+        r#"SELECT 1 AS "one!: i64" FROM backtest_run WHERE id = ?1"#,
+        f.backtest_run_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+    if run_exists.is_none() {
+        return Err(DataError::Db(format!(
+            "walk_forward_run `{parent_id}` fold {} references missing backtest_run `{}`",
+            f.fold_index, f.backtest_run_id
+        )));
+    }
+    Ok(WalkForwardFold {
+        index: u8::try_from(f.fold_index)
+            .map_err(|e| DataError::Db(format!("walk_forward_fold index {}: {e}", f.fold_index)))?,
+        window: CandleWindow::new(f.window_from_ms, f.window_to_ms)
+            .map_err(|e| DataError::Db(format!("walk_forward_fold `{parent_id}` window: {e}")))?,
+        backtest_run_id: BacktestRunId::new(f.backtest_run_id.clone()),
+        verdict: FoldVerdict {
+            n: usize::try_from(f.n)
+                .map_err(|e| DataError::Db(format!("walk_forward_fold n {}: {e}", f.n)))?,
+            mean_r: parse_decimal("walk_forward_fold.mean_r", &f.mean_r)?,
+            lower_bound: f.lower_bound,
+            holds: f.holds != 0,
+        },
+    })
+}
+
+/// The `walk_forward_run` row, raw — `None` when no such parent exists.
+async fn fetch_run_row(pool: &sqlx::SqlitePool, id_str: &str) -> Result<Option<RunRow>, DataError> {
+    sqlx::query_as!(
+        RunRow,
+        r#"SELECT
+             id                  AS "id!: String",
+             strategy_version_id AS "strategy_version_id!: String",
+             created_at          AS "created_at!: String",
+             scheme              AS "scheme!: String",
+             rule                AS "rule!: String",
+             k                   AS "k!: i64",
+             span_from_ms        AS "span_from_ms!: i64",
+             span_to_ms          AS "span_to_ms!: i64",
+             from_defaulted      AS "from_defaulted!: i64",
+             engine_fingerprint  AS "engine_fingerprint!: String",
+             folds_holding       AS "folds_holding!: i64",
+             folds_required      AS "folds_required!: i64",
+             pooled_n            AS "pooled_n!: i64",
+             pooled_mean_r       AS "pooled_mean_r!: String",
+             pooled_lower_bound  AS "pooled_lower_bound!: f64",
+             pass                AS "pass!: i64"
+           FROM walk_forward_run WHERE id = ?1"#,
+        id_str,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))
+}
+
+/// The raw `walk_forward_run` row shape the read path decodes.
+struct RunRow {
+    id: String,
+    strategy_version_id: String,
+    created_at: String,
+    scheme: String,
+    rule: String,
+    k: i64,
+    span_from_ms: i64,
+    span_to_ms: i64,
+    from_defaulted: i64,
+    engine_fingerprint: String,
+    folds_holding: i64,
+    folds_required: i64,
+    pooled_n: i64,
+    pooled_mean_r: String,
+    pooled_lower_bound: f64,
+    pass: i64,
+}
+
+impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<C> {
+    // One transaction: the ownership guard `save_run` makes, the parent row,
+    // then per fold the ordinary `backtest_run` + `trade` rows (with the 0013
+    // membership pair) and the `walk_forward_fold` row (a9). Any failure rolls
+    // everything back — nothing partial persists.
+    async fn save_walk_forward_run(
+        &self,
+        strategy_version_id: &VersionId,
+        draft: &WalkForwardRunDraft,
+    ) -> Result<WalkForwardRunId, DataError> {
+        let version_id_str = strategy_version_id.as_str().to_owned();
+        let wf_run_id = Uuid::new_v4().to_string();
+        let created_at = self.now_rfc3339()?;
+
+        // The version tags are checked BEFORE the transaction opens (the
+        // `save_run` precedent — an unsafe one persists nothing at all).
+        for fold in &draft.folds {
+            check_inputs_path_safe(&fold.inputs)?;
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+
+        // #39 ownership-on-write, same shape as `save_run`'s.
+        let owns = sqlx::query!(
+            r#"SELECT 1 AS "one!: i64" FROM strategy_version WHERE id = ?1"#,
+            version_id_str,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+        if owns.is_none() {
+            return Err(DataError::Db(format!(
+                "cannot save walk-forward run: strategy_version `{version_id_str}` does not exist (#39 ownership-on-write)"
+            )));
+        }
+
+        insert_walk_forward_run_row(&mut tx, &wf_run_id, &version_id_str, &created_at, draft)
+            .await?;
+        for fold in &draft.folds {
+            insert_fold_rows(&mut tx, &wf_run_id, &version_id_str, &created_at, fold).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        Ok(WalkForwardRunId::new(wf_run_id))
+    }
+
+    // Fail-closed read (the `get_run` discipline): any corrupt column or a fold
+    // whose backtest_run row is gone is an `Err`, never a partial read.
+    async fn get_walk_forward_run(
+        &self,
+        id: &WalkForwardRunId,
+    ) -> Result<Option<WalkForwardRun>, DataError> {
+        let id_str = id.as_str();
+        let Some(r) = fetch_run_row(&self.pool, id_str).await? else {
+            return Ok(None);
+        };
+
+        let (scheme, rule) = decode_scheme_and_rule(id_str, &r.scheme, &r.rule, r.k)?;
+        let fold_rows = sqlx::query_as!(
+            FoldRow,
+            r#"SELECT
+                 fold_index       AS "fold_index!: i64",
+                 window_from_ms   AS "window_from_ms!: i64",
+                 window_to_ms     AS "window_to_ms!: i64",
+                 backtest_run_id  AS "backtest_run_id!: String",
+                 n                AS "n!: i64",
+                 mean_r           AS "mean_r!: String",
+                 lower_bound      AS "lower_bound!: f64",
+                 holds            AS "holds!: i64"
+               FROM walk_forward_fold WHERE walk_forward_run_id = ?1
+               ORDER BY fold_index"#,
+            id_str,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        let mut folds = Vec::with_capacity(fold_rows.len());
+        for f in &fold_rows {
+            folds.push(fetch_fold(&self.pool, id_str, f).await?);
+        }
+
+        Ok(Some(WalkForwardRun {
+            id: WalkForwardRunId::new(r.id),
+            strategy_version_id: VersionId::new(r.strategy_version_id),
+            created_at: r.created_at,
+            scheme,
+            rule,
+            span: CandleWindow::new(r.span_from_ms, r.span_to_ms)
+                .map_err(|e| DataError::Db(format!("walk_forward_run `{id_str}` span: {e}")))?,
+            from_defaulted: r.from_defaulted != 0,
+            engine_fingerprint: r.engine_fingerprint,
+            verdict: decode_run_verdict(
+                r.folds_holding,
+                r.folds_required,
+                r.pooled_n,
+                &r.pooled_mean_r,
+                r.pooled_lower_bound,
+                r.pass,
+            )?,
+            folds,
+        }))
+    }
+}

@@ -54,7 +54,7 @@ use crate::adapters::clock::SystemClock;
 use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, CandleWindow, EquityCurve, ExitReason, Fill,
     FundingConfig, OpenPositionMark, PersistedRun, Regime, RegimeBreakdown, RunSummary,
-    SnapshotSelection, SummaryStats, Trade, TradeSource,
+    SnapshotSelection, SummaryStats, Trade, TradeSource, WalkForwardMembership, WalkForwardRunId,
 };
 use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
@@ -78,7 +78,7 @@ const RUN_SCHEMA_VERSION: i64 = 1;
 /// No `#[derive(Debug)]`: `C: Clock` carries no `Debug` bound (mirror
 /// `SqliteStrategyRepo`).
 pub struct SqliteBacktestRunRepo<C: Clock> {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
     clock: C,
 }
 
@@ -105,7 +105,9 @@ impl<C: Clock> SqliteBacktestRunRepo<C> {
 
     /// The current `created_at`, sourced from the injected [`Clock`] (D7),
     /// serialized as an RFC3339 millisecond UTC string for the `TEXT` column.
-    fn now_rfc3339(&self) -> Result<String, DataError> {
+    /// `pub(crate)` so `walk_forward_run_repo`'s impl mints the same timestamp
+    /// shape (r2.s3.w3).
+    pub(crate) fn now_rfc3339(&self) -> Result<String, DataError> {
         let now_ms = self.clock.now_ms();
         let dt = DateTime::from_timestamp_millis(now_ms).ok_or_else(|| {
             DataError::Db(format!("clock.now_ms() {now_ms} is out of DateTime range"))
@@ -118,12 +120,12 @@ impl<C: Clock> SqliteBacktestRunRepo<C> {
 /// `feed_decimal` does — `.normalize().to_string()` — so a reloaded run re-derives
 /// the IDENTICAL `result_content_hash` (D2). `0.10` and `0.1` collapse to one
 /// canonical text; `Decimal` has no `-0`/`NaN`/`Inf`, so this is total.
-fn decimal_text(value: Decimal) -> String {
+pub(crate) fn decimal_text(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
 /// Parse a `Decimal` `TEXT` column back, fail-closed on a malformed value (D5).
-fn parse_decimal(column: &str, s: &str) -> Result<Decimal, DataError> {
+pub(crate) fn parse_decimal(column: &str, s: &str) -> Result<Decimal, DataError> {
     s.parse::<Decimal>()
         .map_err(|e| DataError::Db(format!("malformed Decimal in `{column}` = `{s}`: {e}")))
 }
@@ -285,6 +287,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             result,
             summary,
             starting_equity,
+            None,
         )
         .await?;
         insert_trade_rows(&mut tx, &run_id, &result.trades).await?;
@@ -358,7 +361,9 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                  window_from_ms          AS "window_from_ms?: i64",
                  window_to_ms            AS "window_to_ms?: i64",
                  window_lead_in_from_ms  AS "window_lead_in_from_ms?: i64",
-                 open_position           AS "open_position?: String"
+                 open_position           AS "open_position?: String",
+                 walk_forward_run_id     AS "walk_forward_run_id?: String",
+                 fold_index              AS "fold_index?: i64"
                FROM backtest_run WHERE id = ?1"#,
             id_str,
         )
@@ -405,33 +410,18 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             None => None,
         };
 
-        // #39 re-validate-on-read (D4): reconstruct the FULL hash input — run totals
-        // + regime_breakdown + skipped_entries + the seq-ordered trades — by
-        // rebuilding a BacktestResult and re-deriving result_content_hash (which
-        // feeds feed_money_math + feed_regime_breakdown in the frozen order). The
-        // summary/equity_curve/engine_fingerprint are oracle-EXCLUDED, so defaults
-        // here cannot perturb the hash (proven by AC-6). Reject a mismatch.
-        let rebuilt = BacktestResult {
-            trades: trades.clone(),
+        rederive_run_hash(
+            &r.id,
+            &r.result_content_hash,
+            &trades,
             net_pnl,
             fees_total,
             funding_total,
             slippage_total,
-            regime_breakdown,
+            &regime_breakdown,
             skipped_entries,
-            open_position: open_position.clone(),
-            engine_fingerprint: EngineFingerprint::default(),
-            summary: SummaryStats::default(),
-            equity_curve: EquityCurve::default(),
-        };
-        let derived = rebuilt.result_content_hash();
-        if derived != r.result_content_hash {
-            return Err(DataError::Db(format!(
-                "result_content_hash mismatch for run `{}`: stored {}, derived {derived} \
-                 (#39 re-validate-on-read tamper guard)",
-                r.id, r.result_content_hash
-            )));
-        }
+            open_position.clone(),
+        )?;
 
         // Reconstruct the typed SummaryStats projection from its columns.
         let summary = SummaryStats {
@@ -494,6 +484,10 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             r.window_to_ms,
             r.window_lead_in_from_ms,
         )?;
+        // r2.s3.w3: the run's walk-forward membership, same defended read —
+        // `0013`'s pair trigger's shape is checked again here.
+        let walk_forward =
+            decode_walk_forward_membership(&r.id, r.walk_forward_run_id, r.fold_index)?;
 
         Ok(Some(PersistedRun {
             id: BacktestRunId::new(r.id),
@@ -518,6 +512,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             regime_breakdown,
             skipped_entries,
             open_position,
+            walk_forward,
         }))
     }
 
@@ -846,32 +841,8 @@ fn decode_inputs(
              must both be present or both absent (#110)"
         )));
     }
-    // r2.s1.w1: the window is both bounds or neither, and from < to — the same
-    // shape `0009`'s pair trigger refuses on INSERT, checked again on the way
-    // out (a defended read does not trust the trigger to have seen the write).
-    let window = match (window_from_ms, window_to_ms) {
-        (None, None) => None,
-        (Some(from_ms), Some(to_ms)) => {
-            Some(CandleWindow::new(from_ms, to_ms).map_err(|e| {
-                DataError::Db(format!("run `{run_id}` stores an invalid window: {e}"))
-            })?)
-        }
-        _ => {
-            return Err(DataError::Db(format!(
-                "run `{run_id}` has a half-present window: window_from_ms and window_to_ms \
-                 must both be present or both absent (r2.s1.w1)"
-            )));
-        }
-    };
-    // r2.s3.w2: the lead-in start is only meaningful relative to a counted
-    // window — the same shape `0012`'s pair trigger refuses on INSERT,
-    // checked again on the way out.
-    if window.is_none() && window_lead_in_from_ms.is_some() {
-        return Err(DataError::Db(format!(
-            "run `{run_id}` carries a lead-in start but no window pair: \
-             window_lead_in_from_ms requires a complete window (r2.s3.w2)"
-        )));
-    }
+    let window =
+        decode_window_and_lead_in(run_id, window_from_ms, window_to_ms, window_lead_in_from_ms)?;
 
     let pair = require_col("backtest_run.pair", pair)?;
     let primary_timeframe = require_col("backtest_run.primary_timeframe", primary_timeframe)?;
@@ -905,6 +876,115 @@ fn decode_inputs(
         window,
         lead_in_from_ms: window_lead_in_from_ms,
     }))
+}
+
+/// The window/lead-in decode and its two refusals, extracted from
+/// `decode_inputs` (#204 — r2.s3.w3 keeps that function under the 80-line cap).
+///
+/// r2.s1.w1: the window is both bounds or neither, and `from < to` — the same
+/// shape `0009`'s pair trigger refuses on INSERT, checked again on the way out
+/// (a defended read does not trust the trigger to have seen the write).
+/// r2.s3.w2: the lead-in start is only meaningful relative to a counted window
+/// — the same shape `0012`'s pair trigger refuses on INSERT.
+fn decode_window_and_lead_in(
+    run_id: &str,
+    window_from_ms: Option<i64>,
+    window_to_ms: Option<i64>,
+    window_lead_in_from_ms: Option<i64>,
+) -> Result<Option<CandleWindow>, DataError> {
+    let window = match (window_from_ms, window_to_ms) {
+        (None, None) => None,
+        (Some(from_ms), Some(to_ms)) => {
+            Some(CandleWindow::new(from_ms, to_ms).map_err(|e| {
+                DataError::Db(format!("run `{run_id}` stores an invalid window: {e}"))
+            })?)
+        }
+        _ => {
+            return Err(DataError::Db(format!(
+                "run `{run_id}` has a half-present window: window_from_ms and window_to_ms \
+                 must both be present or both absent (r2.s1.w1)"
+            )));
+        }
+    };
+    if window.is_none() && window_lead_in_from_ms.is_some() {
+        return Err(DataError::Db(format!(
+            "run `{run_id}` carries a lead-in start but no window pair: \
+             window_lead_in_from_ms requires a complete window (r2.s3.w2)"
+        )));
+    }
+    Ok(window)
+}
+
+/// The walk-forward membership decode (r2.s3.w3): `walk_forward_run_id` and
+/// `fold_index` are set together or not at all — the same shape `0013`'s pair
+/// trigger refuses on INSERT, checked again on the way out.
+fn decode_walk_forward_membership(
+    run_id: &str,
+    walk_forward_run_id: Option<String>,
+    fold_index: Option<i64>,
+) -> Result<Option<WalkForwardMembership>, DataError> {
+    match (walk_forward_run_id, fold_index) {
+        (None, None) => Ok(None),
+        (Some(wf_id), Some(idx)) => {
+            let fold_index = u8::try_from(idx).map_err(|e| {
+                DataError::Db(format!(
+                    "run `{run_id}` carries an out-of-range fold_index {idx}: {e}"
+                ))
+            })?;
+            Ok(Some(WalkForwardMembership {
+                run_id: WalkForwardRunId::new(wf_id),
+                fold_index,
+            }))
+        }
+        _ => Err(DataError::Db(format!(
+            "run `{run_id}` has a half-present walk-forward membership: \
+             walk_forward_run_id and fold_index must both be present or both absent (r2.s3.w3)"
+        ))),
+    }
+}
+
+/// The #39 re-validate-on-read half of `get_run` (D4), extracted so `get_run`
+/// stays inside the #204 line cap with the `0013` membership columns added
+/// (r2.s3.w3): reconstruct the FULL hash input — run totals +
+/// `regime_breakdown` + `skipped_entries` + the seq-ordered trades — by
+/// rebuilding a [`BacktestResult`] and re-deriving `result_content_hash` (which
+/// feeds `feed_money_math` + `feed_regime_breakdown` in the frozen order). The
+/// `summary`/`equity_curve`/`engine_fingerprint` are oracle-EXCLUDED, so
+/// defaults here cannot perturb the hash (proven by AC-6). Reject a mismatch.
+#[allow(clippy::too_many_arguments)]
+fn rederive_run_hash(
+    run_id: &str,
+    stored_hash: &str,
+    trades: &[Trade],
+    net_pnl: Decimal,
+    fees_total: Decimal,
+    funding_total: Decimal,
+    slippage_total: Decimal,
+    regime_breakdown: &RegimeBreakdown,
+    skipped_entries: SkippedEntryCounts,
+    open_position: Option<OpenPositionMark>,
+) -> Result<(), DataError> {
+    let rebuilt = BacktestResult {
+        trades: trades.to_vec(),
+        net_pnl,
+        fees_total,
+        funding_total,
+        slippage_total,
+        regime_breakdown: *regime_breakdown,
+        skipped_entries,
+        open_position,
+        engine_fingerprint: EngineFingerprint::default(),
+        summary: SummaryStats::default(),
+        equity_curve: EquityCurve::default(),
+    };
+    let derived = rebuilt.result_content_hash();
+    if derived != stored_hash {
+        return Err(DataError::Db(format!(
+            "result_content_hash mismatch for run `{run_id}`: stored {stored_hash}, derived {derived} \
+             (#39 re-validate-on-read tamper guard)"
+        )));
+    }
+    Ok(())
 }
 
 fn usize_from(column: &str, value: Option<i64>) -> Result<usize, DataError> {
@@ -973,6 +1053,7 @@ pub(crate) async fn insert_run_row(
     result: &BacktestResult,
     summary: &SummaryStats,
     starting_equity: Decimal,
+    membership: Option<&WalkForwardMembership>,
 ) -> Result<(), DataError> {
     // Scalar / canonicalized column values (D2 — Decimal-as-TEXT via
     // `.normalize().to_string()`; D2b — sharpe/sortino finite-or-NULL).
@@ -1018,12 +1099,8 @@ pub(crate) async fn insert_run_row(
     // the hash feed on read — D4b proves this).
     let regime_breakdown_json = serde_json::to_string(&result.regime_breakdown)
         .map_err(|e| DataError::Db(e.to_string()))?;
-    let skipped_sub_lot = i64::try_from(result.skipped_entries.sub_lot)
-        .map_err(|e| DataError::Db(format!("skipped_sub_lot overflows i64: {e}")))?;
-    let skipped_sub_notional = i64::try_from(result.skipped_entries.sub_notional)
-        .map_err(|e| DataError::Db(format!("skipped_sub_notional overflows i64: {e}")))?;
-    let skipped_leverage_capped = i64::try_from(result.skipped_entries.leverage_capped)
-        .map_err(|e| DataError::Db(format!("skipped_leverage_capped overflows i64: {e}")))?;
+    let (skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) =
+        skipped_entry_i64s(result)?;
 
     // r1.s3.w2 (#110) — the eight INPUT provenance columns. Timeframes and the
     // funding discriminant ride their serde tokens (`15m`/`4h`,
@@ -1062,6 +1139,12 @@ pub(crate) async fn insert_run_row(
     // trigger refuses it without a complete window pair, which the
     // application layer already guarantees (lead-in is set only with `window`).
     let window_lead_in_from_ms = inputs.lead_in_from_ms;
+    // r2.s3.w3: walk-forward membership rides the same provenance row —
+    // `0013`'s pair trigger refuses a half-set pair, which the application
+    // layer already guarantees (a fold's run is written only inside
+    // `save_walk_forward_run`).
+    let walk_forward_run_id = membership.map(|m| m.run_id.as_str().to_owned());
+    let fold_index = membership.map(|m| i64::from(m.fold_index));
     // r2.s1 G1(b): the window-edge open-position mark is one JSON column (the
     // `regime_breakdown`/`fills` precedent) — NULL for a run that ended flat
     // or at the snapshot's real last bar. Never a trade row, so the
@@ -1082,10 +1165,10 @@ pub(crate) async fn insert_run_row(
           regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
           taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms, \
-          window_lead_in_from_ms, open_position) \
+          window_lead_in_from_ms, open_position, walk_forward_run_id, fold_index) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
-                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
         run_id,
         version_id_str,
         schema_version,
@@ -1130,11 +1213,26 @@ pub(crate) async fn insert_run_row(
         window_to_ms,
         window_lead_in_from_ms,
         open_position_json,
+        walk_forward_run_id,
+        fold_index,
     )
     .execute(&mut **tx)
     .await
     .map_err(|e| DataError::Db(e.to_string()))?;
     Ok(())
+}
+
+/// The three `skipped_entries` count columns as `i64` (extracted from
+/// `insert_run_row` for #204 — the `0013` membership columns push it past its
+/// r2.s3.w2 count otherwise; r2.s3.w3).
+fn skipped_entry_i64s(result: &BacktestResult) -> Result<(i64, i64, i64), DataError> {
+    let sub_lot = i64::try_from(result.skipped_entries.sub_lot)
+        .map_err(|e| DataError::Db(format!("skipped_sub_lot overflows i64: {e}")))?;
+    let sub_notional = i64::try_from(result.skipped_entries.sub_notional)
+        .map_err(|e| DataError::Db(format!("skipped_sub_notional overflows i64: {e}")))?;
+    let leverage_capped = i64::try_from(result.skipped_entries.leverage_capped)
+        .map_err(|e| DataError::Db(format!("skipped_leverage_capped overflows i64: {e}")))?;
+    Ok((sub_lot, sub_notional, leverage_capped))
 }
 
 /// Insert every `trade` row for `run_id`, in `seq` order (0-based chronological),

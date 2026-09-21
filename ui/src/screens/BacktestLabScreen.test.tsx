@@ -211,6 +211,8 @@ const SEEDED_RUN: BacktestRunDto = {
       stopPrice: null,
     },
   ],
+  // A standalone run carries no walk-forward membership (pre-0013 shape).
+  walkForward: null,
 };
 
 /** A second fresh run, differing exactly where the null/warning paths need

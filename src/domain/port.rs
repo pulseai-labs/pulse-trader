@@ -31,7 +31,8 @@ use std::future::Future;
 
 use crate::domain::backtest::SummaryStats;
 use crate::domain::backtest::{
-    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade,
+    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade, WalkForwardRun,
+    WalkForwardRunDraft, WalkForwardRunId,
 };
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{
@@ -516,6 +517,53 @@ pub trait BacktestRunRepository {
         &self,
         id: &BacktestRunId,
     ) -> impl Future<Output = Result<Vec<Trade>, DataError>> + Send;
+}
+
+/// The walk-forward run port (r2.s3.w3 — `rolling-oos/v1` + `wf-v1`, ADR-0025).
+///
+/// Implemented by the same `SqliteBacktestRunRepo` adapter: a walk-forward run
+/// is a parent row whose K folds are **ordinary persisted windowed
+/// `backtest_run` rows** — they stay visible through
+/// [`BacktestRunRepository::list_runs_for_version`] /
+/// [`get_run`](BacktestRunRepository::get_run) (L8) and carry their membership
+/// ([`PersistedRun::walk_forward`]). This port adds only the parent + fold-row
+/// surface; the run-log surface is unchanged.
+///
+/// **Walk-forward runs are create + read only**, like every run row (the
+/// `0013` `BEFORE UPDATE` / `BEFORE DELETE` triggers enforce it).
+pub trait WalkForwardRunRepository {
+    /// Persist one walk-forward run **in one transaction** (a9): the
+    /// ownership check [`save_run`](BacktestRunRepository::save_run) makes, the
+    /// `walk_forward_run` row, then per fold the `backtest_run` + `trade` rows
+    /// (with `walk_forward_run_id` + `fold_index` set) and the
+    /// `walk_forward_fold` row — any failure rolls everything back; nothing
+    /// partial persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] if the `strategy_version_id` is absent, a fold
+    /// draft violates the schema (a non-windowed run, a duplicated
+    /// `fold_index`), or the store fails.
+    fn save_walk_forward_run(
+        &self,
+        strategy_version_id: &VersionId,
+        draft: &WalkForwardRunDraft,
+    ) -> impl Future<Output = Result<WalkForwardRunId, DataError>> + Send;
+
+    /// Fetch one persisted walk-forward run by id (`Ok(None)` if no such row),
+    /// with its folds ordered by `fold_index`. **Fail-closed** like
+    /// [`get_run`](BacktestRunRepository::get_run): a fold whose `backtest_run`
+    /// is missing or whose columns are corrupt is an `Err`, never a partial
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
+    /// failure.
+    fn get_walk_forward_run(
+        &self,
+        id: &WalkForwardRunId,
+    ) -> impl Future<Output = Result<Option<WalkForwardRun>, DataError>> + Send;
 }
 
 /// `PulseTrader`'s own LLM chat port (VS-1.3.1 work-1.01, FR-23 / FR-24, README
@@ -1455,6 +1503,9 @@ mod backtest_run_repository_tests {
                 regime_breakdown: result.regime_breakdown,
                 skipped_entries: result.skipped_entries,
                 open_position: result.open_position.clone(),
+                // The fake's `save_run` is the standalone path — it never
+                // persists a run as a walk-forward fold.
+                walk_forward: None,
             };
             self.runs
                 .lock()

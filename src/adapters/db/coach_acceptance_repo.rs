@@ -312,6 +312,7 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             &prepared.result,
             &prepared.summary,
             prepared.starting_equity,
+            None,
         )
         .await?;
         insert_trade_rows(&mut tx, &run_id, &prepared.result.trades).await?;

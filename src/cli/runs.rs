@@ -145,6 +145,17 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
     // says so in words rather than printing blanks that read like zeros.
     println!("{}", render_inputs(persisted.inputs.as_ref()));
 
+    // r2.s3.w3 (additive): a fold run names the walk-forward it belongs to —
+    // the `0013` membership pair renders as one stable line, present only when
+    // the run IS a fold (a standalone run's output is unchanged, AC-5).
+    if let Some(m) = persisted.walk_forward.as_ref() {
+        println!(
+            "membership\twalk_forward_run={}\tfold_index={}",
+            m.run_id.as_str(),
+            m.fold_index,
+        );
+    }
+
     // Run-level money totals (the cost readout, FR-6).
     println!(
         "totals\tstarting_equity={}\tnet_pnl={}\tfees_total={}\tfunding_total={}\tslippage_total={}",

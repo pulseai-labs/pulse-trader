@@ -899,39 +899,16 @@ where
             )?),
             None => None,
         };
-        // r2.s3.w2 (supersedes the r2.s1.w3 ruling-1 slice): both series keep
-        // their lead-in — sliced to `[snapshot_start, to_ms)`, not
-        // `[from_ms, to_ms)` — AFTER the whole-snapshot gap check. The engine
-        // steps every candle before `from` so both engines arrive at the
-        // counted window warm, and nothing forces a flat at `to`. An empty
-        // COUNTED slice is still `WindowEmpty`; an empty HTF slice stays legal
-        // (every aligned HTF bar is simply `None`).
-        let lead_in =
-            apply_lead_in_window(window.as_ref(), &mut primary, &mut htf, &pair, primary_tf)?;
-        let series_end = lead_in
-            .as_ref()
-            .map_or(SeriesEnd::SnapshotEnd, |lead_in| lead_in.series_end);
-        let lead_in_from_ms = lead_in.map(|lead_in| lead_in.lead_in_from_ms);
-        let filters: SymbolFilters = exchange.symbol_filters(&pair)?;
-        // Provenance from the series the engine is ABOUT to consume, so the
-        // prepared run and the row it becomes name the same snapshots.
-        let inputs = inputs_from_run(&primary, htf.as_ref(), &config, window, lead_in_from_ms);
-        let prepared = prepare_backtest(
+        let prepared = prepare_over_loaded_series(
             &validated,
-            inputs,
-            &primary,
-            htf.as_ref(),
-            &filters,
-            config.starting_equity,
-            series_end,
-        )
-        .map_err(|e| match e {
-            PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
-            PrepareError::HtfRequired => BacktestAppError::HtfRequired {
-                field: "inputs.htf",
-            },
-            PrepareError::Engine(source) => BacktestAppError::Engine(source),
-        })?;
+            &exchange,
+            &pair,
+            primary_tf,
+            &config,
+            window,
+            &mut primary,
+            &mut htf,
+        )?;
         Ok(EngineOutput { prepared })
     })
     .await;
@@ -944,6 +921,62 @@ where
     }
 }
 
+/// The post-load half of `run_engine_offthread`'s closure (r2.s3.w3 — a13 /
+/// #201), extracted unchanged so `run_walk_forward` runs the same sequence once
+/// per fold inside its single blocking task: the lead-in slice, the
+/// `series_end` resolution, the filters lookup, the provenance `inputs`, and
+/// `prepare_backtest`. `primary`/`htf` arrive whole-snapshot and leave sliced
+/// to `[snapshot_start, window.to)` — the caller that wants the intact series
+/// clones it first (walk-forward does, once per fold). Behaviour-preserving:
+/// every existing windowed and unwindowed outcome is byte-identical (AC-4).
+///
+/// r2.s3.w2 (supersedes the r2.s1.w3 ruling-1 slice): both series keep their
+/// lead-in — sliced to `[snapshot_start, to_ms)`, not `[from_ms, to_ms)` —
+/// AFTER the whole-snapshot gap check. The engine steps every candle before
+/// `from` so both engines arrive at the counted window warm, and nothing
+/// forces a flat at `to`. An empty COUNTED slice is still `WindowEmpty`; an
+/// empty HTF slice stays legal (every aligned HTF bar is simply `None`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_over_loaded_series<E>(
+    validated: &ValidatedDsl,
+    exchange: &E,
+    pair: &Pair,
+    primary_tf: Timeframe,
+    config: &BacktestConfig,
+    window: Option<CandleWindow>,
+    primary: &mut CandleSeries,
+    htf: &mut Option<CandleSeries>,
+) -> Result<PreparedBacktest, BacktestAppError>
+where
+    E: ExchangeAdapter,
+{
+    let lead_in = apply_lead_in_window(window.as_ref(), primary, htf, pair, primary_tf)?;
+    let series_end = lead_in
+        .as_ref()
+        .map_or(SeriesEnd::SnapshotEnd, |lead_in| lead_in.series_end);
+    let lead_in_from_ms = lead_in.map(|lead_in| lead_in.lead_in_from_ms);
+    let filters: SymbolFilters = exchange.symbol_filters(pair)?;
+    // Provenance from the series the engine is ABOUT to consume, so the
+    // prepared run and the row it becomes name the same snapshots.
+    let inputs = inputs_from_run(primary, htf.as_ref(), config, window, lead_in_from_ms);
+    prepare_backtest(
+        validated,
+        inputs,
+        primary,
+        htf.as_ref(),
+        &filters,
+        config.starting_equity,
+        series_end,
+    )
+    .map_err(|e| match e {
+        PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
+        PrepareError::HtfRequired => BacktestAppError::HtfRequired {
+            field: "inputs.htf",
+        },
+        PrepareError::Engine(source) => BacktestAppError::Engine(source),
+    })
+}
+
 /// Load one snapshot — the pinned `data_version` when `pin` names one, else
 /// `HEAD` — and refuse it if the engine cannot interpret it.
 ///
@@ -952,7 +985,7 @@ where
 /// exact snapshots that run recorded, never whatever `HEAD` points at now. Gap
 /// validation stays on the WHOLE snapshot either way (unchanged; `r2.s3` owns
 /// fold-aware handling) — the window slice happens after this function returns.
-fn load_series<C>(
+pub(crate) fn load_series<C>(
     candles: &C,
     pair: &Pair,
     timeframe: Timeframe,
@@ -1641,6 +1674,7 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             open_position: None,
+            walk_forward: None,
         }
     }
 
