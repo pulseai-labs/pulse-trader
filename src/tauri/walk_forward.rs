@@ -319,6 +319,12 @@ fn parse_rfc3339_bound(field: &str, raw: &str) -> Result<i64, BusError> {
 /// guard on every exit path — the `#141` single-flight rule `run_backtest`
 /// carries, on its own key so a `Busy` refusal names the true operation.
 ///
+/// That key is per KIND and version, not per version (#209): a concurrent
+/// `run_backtest_version` for the SAME version is admitted and runs alongside
+/// this one. Per-version exclusion is the Backtest Lab's busy flag, and
+/// `pulse mcp` holds no app latch at all — this latch refuses the same key
+/// twice, nothing more.
+///
 /// # Errors
 ///
 /// Returns a [`BusError`]; see [`From<WalkForwardAppError>`](super::error) for

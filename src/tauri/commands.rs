@@ -188,8 +188,13 @@ pub struct DesktopState {
     operations: Mutex<HashSet<OperationKey>>,
 }
 
-/// What the `#141` latch is keyed on: one running operation per version, and one
-/// per coaching session.
+/// What the `#141` latch is keyed on: one running operation per KEY — the
+/// typed `(kind, id)` pair — and keys are distinct kinds.
+///
+/// So the latch is NOT per-version exclusion (#209): a backtest of a version and
+/// a walk-forward of the SAME version are two keys, and `begin_operation` admits
+/// both concurrently. Per-version exclusion is the UI's (the Backtest Lab's busy
+/// flag), and `pulse mcp` holds no app latch at all.
 ///
 /// A typed key rather than a formatted string, so a version id and a session id
 /// that happen to share text cannot collide, and so the exhaustive `match` in
@@ -201,8 +206,9 @@ pub enum OperationKey {
     /// A coach turn or decision for one coaching session.
     Coach(CoachingSessionId),
     /// A walk-forward of one strategy version (r2.s3.w5) — a K-fold battery of
-    /// ordinary runs under the same one-operation-per-version latch, on its
-    /// own key so a `Busy` refusal names the true operation.
+    /// ordinary runs, on its own key so a `Busy` refusal names the true
+    /// operation. It does NOT lock the version against a concurrent backtest:
+    /// `Backtest(v)` and `WalkForward(v)` are distinct keys and both run (#209).
     WalkForward(VersionId),
 }
 

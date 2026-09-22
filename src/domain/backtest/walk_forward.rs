@@ -140,12 +140,19 @@ pub enum WalkForwardError {
 
 /// Cut the counted span into `k` contiguous half-open windows of equal length
 /// (`len = (to − from) / k`, integer division; **the last fold absorbs the
-/// remainder**). The union of the returned windows is exactly `[from, to)` and
-/// each is non-empty in milliseconds (`step >= 1` is guaranteed by `k <= 12`
-/// versus any span the caller has already proven holds candles — a span under
-/// `k` milliseconds wide is refused by [`CandleWindow`]'s own construction or
-/// degenerates to `step == 0`, which this function refuses to emit by falling
-/// through to the last fold's remainder).
+/// remainder**). The union of the returned windows is exactly `[from, to)`.
+///
+/// **A returned window can be EMPTY in milliseconds.** `step` is
+/// `(to − from) / k`, so a counted span narrower than `k` milliseconds hands
+/// `from == to` to the first `k − 1` windows and lets the last absorb the whole
+/// span. This function promises no non-emptiness and refuses nothing — it is a
+/// pure cut of the span it is given, and `step == 0` is a legal input to it.
+///
+/// The guarantee that matters — every fold counts at least one candle — lives one
+/// layer up, where the candles are known: `run_walk_forward_blocking` refuses a
+/// fold whose window holds no primary candle as its typed
+/// [`FoldEmpty`](crate::application::walk_forward::WalkForwardAppError::FoldEmpty)
+/// BEFORE any fold run starts.
 ///
 /// The caller validates `k` through [`FoldScheme::rolling_oos`] before calling;
 /// this function is total for `k >= 1` and a valid `span`.
