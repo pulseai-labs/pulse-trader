@@ -37,8 +37,8 @@ use pulse::{
     RegimeBreakdown, RunVerdict, SeqIdSource, SessionOutcome, SkippedEntryCounts,
     SqliteBacktestRunRepo, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, SqliteStrategyRepo,
     StrategyRepository, SummaryStats, Timeframe, VerdictRule, VersionId, WalkForwardFoldDraft,
-    WalkForwardRunDraft, WalkForwardRunRepository, fold_windows, run_coach_decision,
-    run_version_backtest,
+    WalkForwardRunDraft, WalkForwardRunRepository, fold_windows, folds_required,
+    run_coach_decision, run_version_backtest,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -303,12 +303,30 @@ async fn decide(world: &World, action: CoachAction) -> CoachDecisionOutcome {
 /// persists is the recorded verdict, and the certification seam is the pointer
 /// plus that `pass` column — which is exactly what a synthetic draft exercises.
 fn passing_draft(inputs: &BacktestInputs, span: CandleWindow) -> WalkForwardRunDraft {
+    draft_with_fold_verdict(inputs, span, true)
+}
+
+/// A synthetic draft whose recorded run verdict AGREES with its own fold
+/// verdicts — the coherence the persistence boundary now demands (F5's
+/// `validate_draft`: `folds_holding` counts the folds' `holds`, `folds_required`
+/// is the scheme's `⌈2K/3⌉`, and `pass` follows both). `folds_hold` picks the
+/// two coherent extremes the tests need: every fold holding (the run passes) or
+/// none holding (the run fails, so a save de-certifies).
+fn draft_with_fold_verdict(
+    inputs: &BacktestInputs,
+    span: CandleWindow,
+    folds_hold: bool,
+) -> WalkForwardRunDraft {
     let k = 2_u8;
     let holds = FoldVerdict {
         n: 32,
-        mean_r: Decimal::new(45, 2),
-        lower_bound: 0.21,
-        holds: true,
+        mean_r: if folds_hold {
+            Decimal::new(45, 2)
+        } else {
+            Decimal::new(-30, 2)
+        },
+        lower_bound: if folds_hold { 0.21 } else { -0.4 },
+        holds: folds_hold,
     };
     let folds = fold_windows(&span, k)
         .iter()
@@ -348,17 +366,21 @@ fn passing_draft(inputs: &BacktestInputs, span: CandleWindow) -> WalkForwardRunD
             }
         })
         .collect();
+    let folds_holding = if folds_hold { k } else { 0 };
+    let required = folds_required(k);
+    // Computed before `holds` moves into `pooled` below.
+    let pass = folds_holding >= required && holds.holds;
     WalkForwardRunDraft {
-        scheme: FoldScheme::rolling_oos(k).unwrap(),
+        scheme: FoldScheme::rolling_oos(i64::from(k)).unwrap(),
         rule: VerdictRule::WfV1,
         span,
         from_defaulted: false,
         engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
         verdict: RunVerdict {
-            folds_holding: k,
-            folds_required: 2,
+            folds_holding,
+            folds_required: required,
             pooled: holds,
-            pass: true,
+            pass,
         },
         folds,
     }
@@ -807,19 +829,11 @@ async fn a_replay_reports_the_childs_current_pointer() {
     );
 
     // A LATER walk-forward on the child — this one failing — advances the
-    // pointer; the replay must answer with the new run, not the original.
-    let mut failing = passing_draft(&world.parent_inputs, fixture_span());
-    failing.verdict = RunVerdict {
-        folds_holding: 0,
-        folds_required: 2,
-        pooled: FoldVerdict {
-            n: 4,
-            mean_r: Decimal::new(-30, 2),
-            lower_bound: -0.4,
-            holds: false,
-        },
-        pass: false,
-    };
+    // pointer; the replay must answer with the new run, not the original. The
+    // failing draft is COHERENT: its folds do not hold either, because the
+    // persistence boundary refuses a run whose recorded verdict its own fold
+    // verdicts contradict (F5's `validate_draft`).
+    let failing = draft_with_fold_verdict(&world.parent_inputs, fixture_span(), false);
     let later =
         SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(CERTIFY_MS + 60_000))
             .save_walk_forward_run(&committed.child_version_id, &failing)

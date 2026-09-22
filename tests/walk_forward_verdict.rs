@@ -86,7 +86,9 @@ fn fold_windows_are_exactly_equal_when_the_span_divides() {
 
 #[test]
 fn rolling_oos_refuses_k_outside_two_to_twelve() {
-    for k in [0u8, 1, 13, u8::MAX] {
+    // The wire value arrives as i64 — negatives and values past u8 refuse as
+    // themselves, not as a decode failure (F4).
+    for k in [0_i64, 1, 13, i64::from(u8::MAX), 256, -1] {
         assert_eq!(
             FoldScheme::rolling_oos(k),
             Err(WalkForwardError::KOutOfRange { k, min: 2, max: 12 }),
@@ -94,7 +96,11 @@ fn rolling_oos_refuses_k_outside_two_to_twelve() {
         );
     }
     for k in K_MIN..=K_MAX {
-        assert_eq!(FoldScheme::rolling_oos(k).unwrap().k(), k, "K={k}");
+        assert_eq!(
+            FoldScheme::rolling_oos(i64::from(k)).unwrap().k(),
+            k,
+            "K={k}"
+        );
     }
 }
 

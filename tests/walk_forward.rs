@@ -476,7 +476,7 @@ async fn k_out_of_range_is_refused() {
     let world = world().await;
     let version = make_version(&world, &oracle_dsl()).await;
 
-    for k in [1u8, 13] {
+    for k in [1_i64, 13, -1, 256] {
         let mut req = request(&version);
         req.k = Some(k);
         let err = run_walk_forward(

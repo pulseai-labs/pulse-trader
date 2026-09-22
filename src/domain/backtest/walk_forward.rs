@@ -57,15 +57,19 @@ impl FoldScheme {
     ///
     /// # Errors
     ///
-    /// [`WalkForwardError::KOutOfRange`] naming the bounds.
-    pub fn rolling_oos(k: u8) -> Result<Self, WalkForwardError> {
-        if !(K_MIN..=K_MAX).contains(&k) {
-            return Err(WalkForwardError::KOutOfRange {
+    /// [`WalkForwardError::KOutOfRange`] naming the refused value and the
+    /// bounds. `k` arrives as `i64` — the transports carry a wider signed wire
+    /// than the domain's `u8` so an out-of-range value reaches THIS check as
+    /// itself (`-1`, `256`) instead of dying in wire decoding.
+    pub fn rolling_oos(k: i64) -> Result<Self, WalkForwardError> {
+        let k = u8::try_from(k)
+            .ok()
+            .filter(|k| (K_MIN..=K_MAX).contains(k))
+            .ok_or(WalkForwardError::KOutOfRange {
                 k,
                 min: K_MIN,
                 max: K_MAX,
-            });
-        }
+            })?;
         Ok(Self::RollingOos { k })
     }
 
@@ -121,11 +125,12 @@ pub fn folds_required(k: u8) -> u8 {
 /// application layer adds the request/persist failures around it).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WalkForwardError {
-    /// `k` fell outside `2..=12`.
+    /// `k` fell outside `2..=12`. The refused value is `i64` — wider than the
+    /// legal `u8` so the error can name what the wire actually sent.
     #[error("the fold count must be in {min}..={max}, got {k}")]
     KOutOfRange {
-        /// The refused fold count.
-        k: u8,
+        /// The refused fold count, as sent.
+        k: i64,
         /// The lowest legal count.
         min: u8,
         /// The highest legal count.

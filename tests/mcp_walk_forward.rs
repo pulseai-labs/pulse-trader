@@ -355,8 +355,10 @@ async fn run_walk_forward_refusals_name_their_field() {
     let (fixture, client) = wf_fixture().await;
     let (_parent, child, _run) = &fixture.seed;
 
-    // `k` outside 2..=12 names the `k` field, both directions.
-    for k in [13_u8, 1_u8] {
+    // `k` outside 2..=12 names the `k` field, both directions — including the
+    // wire values a `u8` could not even decode (-1, 256), which still reach the
+    // typed refusal (F4).
+    for k in [13_i64, 1, -1, 256] {
         let err = call_err(
             &client,
             "run_walk_forward",

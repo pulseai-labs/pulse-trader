@@ -61,9 +61,11 @@ pub struct WalkForwardRunRequest {
     /// bound may be given alone.
     #[serde(default)]
     pub to: Option<String>,
-    /// The fold count `k`, in `2..=12`. `None` defaults to 6.
+    /// The fold count `k`, in `2..=12`. `None` defaults to 6. Wider than the
+    /// legal `u8` on purpose: an out-of-range value must reach the domain's
+    /// `KOutOfRange` refusal (a `BusError` naming `k`), not die in decoding.
     #[serde(default)]
-    pub k: Option<u8>,
+    pub k: Option<i64>,
 }
 
 /// What `get_walk_forward_run` is asked for: one persisted walk-forward run

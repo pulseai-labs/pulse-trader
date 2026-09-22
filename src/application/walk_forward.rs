@@ -66,8 +66,11 @@ pub struct WalkForwardRequest {
     /// The counted span's exclusive upper bound; `None` defaults to the
     /// snapshot's last candle's `close_time`.
     pub to_ms: Option<i64>,
-    /// The fold count; `None` defaults to [`K_DEFAULT`]. In `2..=12`.
-    pub k: Option<u8>,
+    /// The fold count; `None` defaults to [`K_DEFAULT`]. In `2..=12` —
+    /// carried as `i64` (wider than the legal `u8`) so an out-of-range wire
+    /// value reaches [`FoldScheme::rolling_oos`]'s typed `KOutOfRange` refusal
+    /// instead of dying in transport decoding.
+    pub k: Option<i64>,
 }
 
 /// The use case's answer — built from the saved rows, never the in-memory
@@ -531,7 +534,7 @@ where
         }
         .into());
     }
-    let scheme = FoldScheme::rolling_oos(request.k.unwrap_or(K_DEFAULT))?;
+    let scheme = FoldScheme::rolling_oos(request.k.unwrap_or(i64::from(K_DEFAULT)))?;
 
     // ONE blocking task for the snapshot loads, the warm-bar probe, the span
     // resolution, and all K fold runs (a13, #201) — the shared unpersisted

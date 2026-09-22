@@ -139,11 +139,9 @@ fn decode_scheme_and_rule(
     rule_text: &str,
     k_i64: i64,
 ) -> Result<(FoldScheme, VerdictRule), DataError> {
-    let k = u8::try_from(k_i64)
-        .map_err(|e| DataError::Db(format!("walk_forward_run `{id_str}` k={k_i64}: {e}")))?;
     let scheme = match scheme_text {
-        "rolling-oos/v1" => FoldScheme::rolling_oos(k)
-            .map_err(|e| DataError::Db(format!("walk_forward_run `{id_str}` k={k}: {e}")))?,
+        "rolling-oos/v1" => FoldScheme::rolling_oos(k_i64)
+            .map_err(|e| DataError::Db(format!("walk_forward_run `{id_str}`: {e}")))?,
         other => {
             return Err(DataError::Db(format!(
                 "walk_forward_run `{id_str}` has unknown scheme `{other}`"
@@ -294,6 +292,88 @@ struct RunRow {
 /// persisted walk-forward advances `latest_walk_forward_run_id`, pass or fail —
 /// a newer failing run is exactly how a version de-certifies).
 ///
+/// Fail closed on a draft that is not internally the scheme's own shape (F5).
+/// `WalkForwardRunDraft` is a public struct with unconstrained fields — a
+/// caller can build `k=6` with zero folds and `pass=true` and, absent this
+/// gate, the pointer update below would still read the version "certified".
+/// So the SHARED insert path — the one funnel `save_walk_forward_run` and the
+/// coach accept both pass through — refuses an incoherent draft before a
+/// single row is written:
+///
+/// - the fold count IS the scheme's `k`, and `folds[i].index == i`;
+/// - the fold windows tile `draft.span` contiguously and in order (what
+///   `fold_windows` produces — `from <= to` per window, first `from` at
+///   `span.from_ms`, each `to` the next `from`, last `to` at `span.to_ms`);
+/// - every fold's engine fingerprint IS the draft's recorded fingerprint;
+/// - the recorded verdict is what the recorded fold verdicts say:
+///   `folds_holding` counts the folds' `holds`, `folds_required` is the
+///   scheme's `⌈2K/3⌉`, and `pass` is `holding >= required && pooled.holds`.
+///
+/// Consistency, not re-derivation: re-running the engine over fold inputs is
+/// the application's job upstream; this boundary proves the draft's own claims
+/// agree with each other, so an incoherent draft cannot smuggle a
+/// certification past the pointer update.
+fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
+    let incoherent = |what: String| DataError::Db(format!("walk-forward draft refused: {what}"));
+    let k = draft.scheme.k();
+    if draft.folds.len() != usize::from(k) {
+        return Err(incoherent(format!(
+            "scheme k={k} but {} fold(s) recorded",
+            draft.folds.len()
+        )));
+    }
+    let mut cursor = draft.span.from_ms;
+    for (fold, want_index) in draft.folds.iter().zip(0..k) {
+        if fold.index != want_index {
+            return Err(incoherent(format!(
+                "fold {want_index} expected but index {} recorded",
+                fold.index
+            )));
+        }
+        if fold.window.from_ms != cursor || fold.window.from_ms > fold.window.to_ms {
+            return Err(incoherent(format!(
+                "fold {} window {cursor}.. does not continue the counted span",
+                fold.index
+            )));
+        }
+        if fold.result.engine_fingerprint.as_str() != draft.engine_fingerprint.as_str() {
+            return Err(incoherent(format!(
+                "fold {} ran under a different engine fingerprint than the run records",
+                fold.index
+            )));
+        }
+        cursor = fold.window.to_ms;
+    }
+    if cursor != draft.span.to_ms {
+        return Err(incoherent(format!(
+            "the folds end at {cursor}, not the recorded span's {}",
+            draft.span.to_ms
+        )));
+    }
+    let holding = draft.folds.iter().filter(|f| f.verdict.holds).count();
+    if usize::from(draft.verdict.folds_holding) != holding {
+        return Err(incoherent(format!(
+            "verdict records {} holding folds but the fold verdicts hold {holding}",
+            draft.verdict.folds_holding
+        )));
+    }
+    let required = crate::domain::backtest::folds_required(k);
+    if draft.verdict.folds_required != required {
+        return Err(incoherent(format!(
+            "verdict claims folds_required {} but the scheme's is {required}",
+            draft.verdict.folds_required
+        )));
+    }
+    let pass = holding >= usize::from(required) && draft.verdict.pooled.holds;
+    if draft.verdict.pass != pass {
+        return Err(incoherent(format!(
+            "verdict records pass={} but the fold verdicts make it {pass}",
+            draft.verdict.pass
+        )));
+    }
+    Ok(())
+}
+
 /// `wf_run_id` and `created_at` are minted by the caller (`Uuid`/`Clock` on the
 /// standalone path; the coach accept's injected `IdSource`/`Clock` inside
 /// `commit_acceptance`), so the same insert lands identically under both
@@ -306,6 +386,7 @@ pub(crate) async fn insert_walk_forward_in_tx(
     wf_run_id: &str,
     created_at: &str,
 ) -> Result<WalkForwardRunId, DataError> {
+    validate_draft(draft)?;
     insert_walk_forward_run_row(tx, wf_run_id, version_id_str, created_at, draft).await?;
     for fold in &draft.folds {
         insert_fold_rows(tx, wf_run_id, version_id_str, created_at, fold).await?;

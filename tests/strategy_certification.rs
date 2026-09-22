@@ -18,8 +18,9 @@
 mod support;
 
 use pulse::{
-    CreatedBy, Db, FakeClock, MIGRATOR, NewVersion, SqliteBacktestRunRepo, SqliteStrategyRepo,
-    StrategyRepository, StrategyVersion, VersionId, WalkForwardRunId, WalkForwardRunRepository,
+    CreatedBy, Db, FakeClock, FoldScheme, MIGRATOR, NewVersion, SqliteBacktestRunRepo,
+    SqliteStrategyRepo, StrategyRepository, StrategyVersion, VersionId, WalkForwardRunId,
+    WalkForwardRunRepository,
 };
 use sqlx::SqlitePool;
 use support::mcp::seeded_walk_forward_draft;
@@ -244,6 +245,57 @@ async fn same_millisecond_saves_advance_the_pointer_in_save_order() {
         .await
         .expect("read the seq column");
     assert_eq!(seqs, vec![1, 2], "seq mints in insertion order");
+}
+
+/// F5: the persistence boundary refuses an INCOHERENT draft before a single
+/// row lands — the disposition's attack verbatim: `k=6`, zero folds, and a
+/// recorded `pass=true` would otherwise advance the pointer and read
+/// "certified". One refusal per broken invariant, and each refusal persists
+/// nothing (no run row, no pointer move).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incoherent_draft_is_refused_and_persists_nothing() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    // The attack: scheme k=6, zero folds, recorded pass=true.
+    let mut draft = seeded_walk_forward_draft(true);
+    draft.scheme = FoldScheme::rolling_oos(6).unwrap();
+    draft.folds.clear();
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &draft)
+        .await
+        .expect_err("k=6 with zero folds must refuse");
+    assert!(
+        err.to_string().contains("walk-forward draft refused"),
+        "the refusal names the boundary: {err}"
+    );
+
+    // A full fold set whose recorded verdict lies — folds don't hold but the
+    // run claims pass.
+    let mut lying = seeded_walk_forward_draft(false);
+    lying.verdict.pass = true;
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &lying)
+        .await
+        .expect_err("a verdict the folds contradict must refuse");
+    assert!(
+        err.to_string().contains("walk-forward draft refused"),
+        "the refusal names the boundary: {err}"
+    );
+
+    // Fail closed: nothing persisted, the pointer never moved, the version
+    // still reads uncertified.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_run")
+        .fetch_one(world.pool())
+        .await
+        .expect("count walk-forward runs");
+    assert_eq!(count, 0, "a refused draft wrote no run row");
+    let version = world.get().await;
+    assert!(
+        version.latest_walk_forward_run_id.is_none() && !version.certified,
+        "a refused draft cannot advance certification"
+    );
 }
 
 /// iv. `certified` follows the JOIN's `pass`, never the pointer alone: a

@@ -191,9 +191,11 @@ pub(crate) struct RunWalkForwardArgs {
     /// snapshot's last candle's close.
     #[serde(default)]
     to: Option<String>,
-    /// The fold count — `2..=12`; omitted defaults to 6.
+    /// The fold count — `2..=12`; omitted defaults to 6. Wider than the legal
+    /// `u8` on purpose: an out-of-range value must reach the domain's
+    /// `KOutOfRange` refusal (a `field_error` naming `k`), not die in decoding.
     #[serde(default)]
-    k: Option<u8>,
+    k: Option<i64>,
 }
 
 /// `get_walk_forward_run` args (r2.s3.w5).
