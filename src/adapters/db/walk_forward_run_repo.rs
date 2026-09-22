@@ -327,21 +327,22 @@ struct RunRow {
 ///   `fold_windows` produces — `from <= to` per window, first `from` at
 ///   `span.from_ms`, each `to` the next `from`, last `to` at `span.to_ms`);
 /// - every fold's engine fingerprint IS the draft's recorded fingerprint;
-/// - every `holds` flag IS its derivation (`n >= N_MIN && lower_bound > 0.0`),
-///   per fold and pooled — `holds` is a function of those two numbers, not data;
-/// - `pooled.n` IS the folds' trade counts summed;
-/// - the recorded verdict is what the recorded fold verdicts say:
-///   `folds_holding` counts the folds' `holds`, `folds_required` is the
-///   scheme's `⌈2K/3⌉`, and `pass` is `holding >= required && pooled.holds`.
+/// - every fold's verdict IS the verdict of the trades that fold run carries —
+///   its `realized_r` series through `FoldVerdict::from_rs`, the same rule the
+///   app path applies and the read re-derives;
+/// - the run verdict IS `RunVerdict::assess` over those derived fold verdicts
+///   and their pooled `realized_r` series: the fold tallies, the scheme's
+///   `⌈2K/3⌉` and the pooled verdict over every fold's trades concatenated in
+///   fold order (L5).
 ///
-/// Consistency, not re-derivation: re-running the ENGINE over fold inputs is the
-/// application's job upstream. Everything a reader DERIVES, though, is recomputed
-/// here — `holds` is not a measurement but a function of `n` and the bound, and
-/// both `decode_run_verdict` and `FoldVerdict::from_rs` recompute it on the way
-/// back out, so a draft may not store a flag those numbers contradict. That is
-/// the smuggled-certification shape: persist `pooled.holds = true` over a
-/// negative bound and the run reads back with `hold == false` beside a `pass`
-/// that trusted the flag.
+/// Re-running the ENGINE over fold inputs is still the application's job
+/// upstream, and that stays out of scope here. What is in scope is every number
+/// the verdict claims: they are DERIVED, not cross-checked (R1). Checking the
+/// caller's `n` and `lower_bound` against a `holds` flag left the numbers
+/// themselves unattested — a fold run with ZERO trades could claim `n = 20`, a
+/// positive bound and `holds = true`, agree with itself everywhere, and be
+/// persisted into a certification whose folds show no trades. Deriving makes the
+/// trades the only evidence, so a verdict no trade supports is refused.
 fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
     let incoherent = |what: String| DataError::Db(format!("walk-forward draft refused: {what}"));
     let k = draft.scheme.k();
@@ -352,6 +353,12 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
         )));
     }
     let mut cursor = draft.span.from_ms;
+    // The trades are the evidence for both levels: each fold's `realized_r`
+    // series derives that fold's verdict, and every fold's series concatenated in
+    // fold order derives the pooled one (L5) — the run verdict is then
+    // `RunVerdict::assess`, exactly as the app path builds the draft it saves.
+    let mut pooled_rs = Vec::new();
+    let mut derived_folds = Vec::with_capacity(draft.folds.len());
     for (fold, want_index) in draft.folds.iter().zip(0..k) {
         if fold.index != want_index {
             return Err(incoherent(format!(
@@ -371,19 +378,34 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
                 fold.index
             )));
         }
-        // `holds` is not data, it is a function of the fold's own numbers —
-        // `n >= N_MIN && lower_bound > 0` is exactly what the READ re-derives
-        // (`decode_run_verdict`, and `FoldVerdict::from_rs` for a fold row). A
-        // flag that disagrees is the smuggled-pass shape this gate exists for:
-        // persist it and the run reads back with `holds` recomputed to the truth
-        // beside a `pass` that trusted the lie.
-        let fold_holds = fold.verdict.n >= N_MIN && fold.verdict.lower_bound > 0.0;
-        if fold.verdict.holds != fold_holds {
+        // The fold's verdict is DERIVED from the trades its run actually carries
+        // (R1), by the same rule the app path and the read use: every trade's
+        // `realized_r`, through `FoldVerdict::from_rs`. Cross-checking the
+        // caller's `n` and `lower_bound` against a `holds` flag was not enough —
+        // those numbers are the caller's too, so a fold run with ZERO trades
+        // could claim `n = 20`, a positive bound and `holds = true` and still be
+        // persisted into a certification. Re-deriving makes the trades the only
+        // evidence, so a verdict no trade supports is refused.
+        let rs: Vec<_> = fold.result.trades.iter().map(|t| t.realized_r).collect();
+        let derived = FoldVerdict::from_rs(&rs);
+        if derived != fold.verdict {
             return Err(incoherent(format!(
-                "fold {} records holds={} but its n={} and lower_bound={} derive {fold_holds}",
-                fold.index, fold.verdict.holds, fold.verdict.n, fold.verdict.lower_bound
+                "fold {} records n={} mean_r={} lower_bound={} holds={} but its {} trade(s) \
+                 derive n={} mean_r={} lower_bound={} holds={}",
+                fold.index,
+                fold.verdict.n,
+                fold.verdict.mean_r,
+                fold.verdict.lower_bound,
+                fold.verdict.holds,
+                rs.len(),
+                derived.n,
+                derived.mean_r,
+                derived.lower_bound,
+                derived.holds
             )));
         }
+        pooled_rs.extend_from_slice(&rs);
+        derived_folds.push(derived);
         cursor = fold.window.to_ms;
     }
     if cursor != draft.span.to_ms {
@@ -392,46 +414,33 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
             draft.span.to_ms
         )));
     }
-    // The pooled verdict's own numbers must add up too: `pooled.n` is every
-    // fold's trade count, and `pooled.holds` is derived the same way the read
-    // derives it.
-    let folded_n = draft
-        .folds
-        .iter()
-        .try_fold(0_usize, |acc, f| acc.checked_add(f.verdict.n))
-        .ok_or_else(|| incoherent("the folds' trade counts overflow usize".to_owned()))?;
-    if folded_n != draft.verdict.pooled.n {
+    // The run verdict is the same kind of derivation, one level up: the fold
+    // tallies and the pooled verdict over every fold's trades concatenated in
+    // fold order. `assess` recomputes `folds_holding`, the scheme's
+    // `folds_required` for this fold count, `pooled` from the pooled series, and
+    // `pass` from both — so a draft that agrees with its trades at the fold level
+    // cannot disagree with them here.
+    let derived_run = RunVerdict::assess(&derived_folds, &pooled_rs);
+    if draft.verdict != derived_run {
         return Err(incoherent(format!(
-            "verdict records pooled n={} but the folds' trade counts sum to {folded_n}",
-            draft.verdict.pooled.n
-        )));
-    }
-    let pooled_holds = draft.verdict.pooled.n >= N_MIN && draft.verdict.pooled.lower_bound > 0.0;
-    if draft.verdict.pooled.holds != pooled_holds {
-        return Err(incoherent(format!(
-            "verdict records pooled holds={} but its n={} and lower_bound={} derive {pooled_holds}",
-            draft.verdict.pooled.holds, draft.verdict.pooled.n, draft.verdict.pooled.lower_bound
-        )));
-    }
-    let holding = draft.folds.iter().filter(|f| f.verdict.holds).count();
-    if usize::from(draft.verdict.folds_holding) != holding {
-        return Err(incoherent(format!(
-            "verdict records {} holding folds but the fold verdicts hold {holding}",
-            draft.verdict.folds_holding
-        )));
-    }
-    let required = crate::domain::backtest::folds_required(k);
-    if draft.verdict.folds_required != required {
-        return Err(incoherent(format!(
-            "verdict claims folds_required {} but the scheme's is {required}",
-            draft.verdict.folds_required
-        )));
-    }
-    let pass = holding >= usize::from(required) && draft.verdict.pooled.holds;
-    if draft.verdict.pass != pass {
-        return Err(incoherent(format!(
-            "verdict records pass={} but the fold verdicts make it {pass}",
-            draft.verdict.pass
+            "verdict records folds_holding={} folds_required={} pooled(n={}, mean_r={}, \
+             lower_bound={}, holds={}) pass={} but the folds' trades derive \
+             folds_holding={} folds_required={} pooled(n={}, mean_r={}, lower_bound={}, holds={}) \
+             pass={}",
+            draft.verdict.folds_holding,
+            draft.verdict.folds_required,
+            draft.verdict.pooled.n,
+            draft.verdict.pooled.mean_r,
+            draft.verdict.pooled.lower_bound,
+            draft.verdict.pooled.holds,
+            draft.verdict.pass,
+            derived_run.folds_holding,
+            derived_run.folds_required,
+            derived_run.pooled.n,
+            derived_run.pooled.mean_r,
+            derived_run.pooled.lower_bound,
+            derived_run.pooled.holds,
+            derived_run.pass
         )));
     }
     Ok(())

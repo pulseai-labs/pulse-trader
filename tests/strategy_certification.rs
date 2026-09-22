@@ -298,57 +298,57 @@ async fn an_incoherent_draft_is_refused_and_persists_nothing() {
     );
 }
 
-/// The gate re-derives what every READER derives. `holds` is not data — it is a
-/// function of a verdict's own `n` and bound (`n >= N_MIN && lower_bound > 0`),
-/// which `decode_run_verdict` and `FoldVerdict::from_rs` recompute on the way
-/// back out — and `pooled.n` is the folds' trade counts. A draft that stores
-/// flags its own numbers contradict is the smuggled-pass shape this boundary
-/// exists for: persisting `pooled.holds = true` over a negative bound would leave
-/// the run reading back `holds = false` beside a `pass = true` the flag carried,
-/// with the version certified.
+/// The gate DERIVES the verdicts from the trades, and refuses any disagreement
+/// (R1). The stored verdict is not evidence about itself: each fold's verdict is
+/// recomputed from its run's `realized_r` series (`FoldVerdict::from_rs`) and the
+/// run verdict from those folds and their pooled series (`RunVerdict::assess`) —
+/// the identical derivation the app path and the read apply — so a draft that
+/// stores a number its own trades contradict is refused before a row is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_draft_whose_holds_flags_its_numbers_contradict_is_refused() {
+async fn a_draft_that_disagrees_with_its_own_trades_is_refused() {
     let world = world().await;
     let runs =
         SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
 
-    // The pooled row claims `holds` over a bound that derives the opposite.
+    // The pooled bound is moved while `holds` keeps claiming the derived truth:
+    // the pooled verdict no longer describes the pooled trades.
     let mut smuggled_pooled = seeded_walk_forward_draft(true);
     smuggled_pooled.verdict.pooled.lower_bound = -0.5;
     let err = runs
         .save_walk_forward_run(&world.version_id, &smuggled_pooled)
         .await
-        .expect_err("a pooled `holds` its own bound contradicts must refuse");
+        .expect_err("a pooled bound the pooled trades do not support must refuse");
     assert!(
         err.to_string()
-            .contains("verdict records pooled holds=true but its n=64 and lower_bound=-0.5"),
-        "the refusal names the derived value: {err}"
+            .contains("verdict records folds_holding=2 folds_required=2 pooled(n=40")
+            && err.to_string().contains("but the folds' trades derive"),
+        "the refusal shows both the record and the derivation: {err}"
     );
 
-    // One FOLD's flag is fabricated — its bound derives the other truth.
+    // One FOLD's flag is fabricated over a series that derives the other truth.
     let mut smuggled_fold = seeded_walk_forward_draft(false);
     smuggled_fold.folds[0].verdict.holds = true;
     let err = runs
         .save_walk_forward_run(&world.version_id, &smuggled_fold)
         .await
-        .expect_err("a fold `holds` its own bound contradicts must refuse");
+        .expect_err("a fold `holds` its own trades contradict must refuse");
     assert!(
-        err.to_string()
-            .contains("fold 0 records holds=true but its n=32 and lower_bound=-0.4"),
-        "the refusal names the fold and its numbers: {err}"
+        err.to_string().contains("fold 0 records")
+            && err.to_string().contains("20 trade(s) derive")
+            && err.to_string().contains("holds=false"),
+        "the refusal names the fold and the derived flag: {err}"
     );
 
-    // The pooled count is not the folds' trades summed.
+    // The pooled count is not the trades it claims to summarise.
     let mut short_pooled = seeded_walk_forward_draft(true);
-    short_pooled.verdict.pooled.n = 40;
+    short_pooled.verdict.pooled.n = 3;
     let err = runs
         .save_walk_forward_run(&world.version_id, &short_pooled)
         .await
-        .expect_err("a pooled count that is not the folds' sum must refuse");
+        .expect_err("a pooled count the trades do not support must refuse");
     assert!(
-        err.to_string()
-            .contains("verdict records pooled n=40 but the folds' trade counts sum to 64"),
-        "the refusal names both counts: {err}"
+        err.to_string().contains("pooled(n=3,"),
+        "the refusal names the recorded count: {err}"
     );
 
     // All three refused before a single row: fail-closed, and the version is
@@ -362,6 +362,53 @@ async fn a_draft_whose_holds_flags_its_numbers_contradict_is_refused() {
     assert!(
         version.latest_walk_forward_run_id.is_none() && !version.certified,
         "no refused draft advanced certification"
+    );
+}
+
+/// R1's pin: a draft whose folds carry ZERO trades cannot be certified by the
+/// numbers it claims. The verdict is left exactly as the fixture derived it for
+/// twenty trades — `n = 20`, a positive bound, `holds = true`, pooled totals to
+/// match and `pass = true` — and the only change is that the trades are GONE.
+/// Before the gate derived the verdicts from the trades, every check passed: the
+/// counts agreed with each other, so a certification no trade supports advanced
+/// the pointer and the persisted DTO reported a certified run whose folds show no
+/// trades at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_whose_folds_hold_no_trades_is_refused() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    let mut trade_less = seeded_walk_forward_draft(true);
+    assert!(
+        trade_less.verdict.pass,
+        "the fixture certifies on its numbers"
+    );
+    for fold in &mut trade_less.folds {
+        fold.result.trades.clear();
+    }
+
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &trade_less)
+        .await
+        .expect_err("a fold claiming a verdict no trade supports must refuse");
+    assert!(
+        err.to_string().contains("fold 0 records n=20")
+            && err.to_string().contains("0 trade(s) derive")
+            && err.to_string().contains("holds=false"),
+        "the refusal shows what the trades derive: {err}"
+    );
+
+    // Nothing persisted, and the version is still uncertified.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_run")
+        .fetch_one(world.pool())
+        .await
+        .expect("count walk-forward runs");
+    assert_eq!(count, 0, "a refused draft wrote no run row");
+    let version = world.get().await;
+    assert!(
+        version.latest_walk_forward_run_id.is_none() && !version.certified,
+        "a refused draft cannot advance certification"
     );
 }
 

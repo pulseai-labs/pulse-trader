@@ -37,12 +37,12 @@ use pulse::{
     RegimeBreakdown, RunVerdict, SeqIdSource, SessionOutcome, SkippedEntryCounts,
     SqliteBacktestRunRepo, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, SqliteStrategyRepo,
     StrategyRepository, SummaryStats, Timeframe, VerdictRule, VersionId, WalkForwardFoldDraft,
-    WalkForwardRunDraft, WalkForwardRunRepository, fold_windows, folds_required,
-    run_coach_decision, run_version_backtest,
+    WalkForwardRunDraft, WalkForwardRunRepository, fold_windows, run_coach_decision,
+    run_version_backtest,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use support::mcp::{FIXTURE_STORE, copy_tree, manifest, seeded_trade};
+use support::mcp::{FIXTURE_STORE, copy_tree, manifest, seeded_fold_trades, seeded_trade};
 use tempfile::TempDir;
 
 /// A pinned instant, so `created_at` is deterministic everywhere.
@@ -299,46 +299,46 @@ async fn decide(world: &World, action: CoachAction) -> CoachDecisionOutcome {
 // ---------------------------------------------------------------------------
 
 /// A walk-forward draft whose recorded verdict PASSES — two folds, both
-/// holding, over the parent run's own inputs. The fixture cannot produce this
-/// verdict honestly, so the draft is built by hand: what `save_walk_forward_run`
-/// persists is the recorded verdict, and the certification seam is the pointer
-/// plus that `pass` column — which is exactly what a synthetic draft exercises.
+/// holding, over the parent run's own inputs.
 fn passing_draft(inputs: &BacktestInputs, span: CandleWindow) -> WalkForwardRunDraft {
     draft_with_fold_verdict(inputs, span, true)
 }
 
-/// A synthetic draft whose recorded run verdict AGREES with its own fold
-/// verdicts — the coherence the persistence boundary now demands (F5's
-/// `validate_draft`: `folds_holding` counts the folds' `holds`, `folds_required`
-/// is the scheme's `⌈2K/3⌉`, and `pass` follows both). `folds_hold` picks the
-/// two coherent extremes the tests need: every fold holding (the run passes) or
-/// none holding (the run fails, so a save de-certifies).
+/// A synthetic draft whose verdicts are DERIVED from the trades its folds carry
+/// (R1): each fold takes twenty trades alternating around a positive (or
+/// negative) mean, and the fold and run verdicts come from `FoldVerdict::from_rs`
+/// / `RunVerdict::assess` over them — the identical derivation the write gate and
+/// the read apply, so this fixture cannot claim a verdict its trades do not
+/// support. `folds_hold` picks the two coherent extremes the tests need: every
+/// fold holding (the run passes) or none holding (the run fails, so a save
+/// de-certifies).
 fn draft_with_fold_verdict(
     inputs: &BacktestInputs,
     span: CandleWindow,
     folds_hold: bool,
 ) -> WalkForwardRunDraft {
     let k = 2_u8;
-    let holds = FoldVerdict {
-        n: 32,
-        mean_r: if folds_hold {
-            Decimal::new(45, 2)
-        } else {
-            Decimal::new(-30, 2)
-        },
-        lower_bound: if folds_hold { 0.21 } else { -0.4 },
-        holds: folds_hold,
+    let (lo, hi) = if folds_hold {
+        (Decimal::new(5, 1), Decimal::new(15, 1))
+    } else {
+        (Decimal::new(-5, 1), Decimal::new(-15, 1))
     };
-    let folds = fold_windows(&span, k)
+    let folds: Vec<WalkForwardFoldDraft> = fold_windows(&span, k)
         .iter()
         .enumerate()
         .map(|(i, window)| {
-            let trade = seeded_trade();
+            let trades = seeded_fold_trades(20, lo, hi, i);
+            let rs: Vec<Decimal> = trades.iter().map(|t| t.realized_r).collect();
+            let verdict = FoldVerdict::from_rs(&rs);
+            let net_pnl: Decimal = trades.iter().map(|t| t.realized_pnl).sum();
+            let fees_total: Decimal = trades.iter().map(|t| t.fees_total).sum();
+            let funding_total: Decimal = trades.iter().map(|t| t.funding_total).sum();
+            let slippage_total: Decimal = trades.iter().map(|t| t.slippage_total).sum();
             let summary = SummaryStats::from_trades(
-                std::slice::from_ref(&trade),
-                trade.realized_pnl,
-                trade.fees_total,
-                trade.funding_total,
+                &trades,
+                net_pnl,
+                fees_total,
+                funding_total,
                 &EquityCurve::default(),
             );
             let mut fold_inputs = inputs.clone();
@@ -347,14 +347,14 @@ fn draft_with_fold_verdict(
             WalkForwardFoldDraft {
                 index: u8::try_from(i).unwrap(),
                 window: window.clone(),
-                verdict: holds.clone(),
+                verdict,
                 inputs: fold_inputs,
                 result: BacktestResult {
-                    trades: vec![trade.clone()],
-                    net_pnl: trade.realized_pnl,
-                    fees_total: trade.fees_total,
-                    funding_total: trade.funding_total,
-                    slippage_total: trade.slippage_total,
+                    trades,
+                    net_pnl,
+                    fees_total,
+                    funding_total,
+                    slippage_total,
                     regime_breakdown: RegimeBreakdown::new(),
                     skipped_entries: SkippedEntryCounts::new(),
                     open_position: None,
@@ -367,28 +367,18 @@ fn draft_with_fold_verdict(
             }
         })
         .collect();
-    let folds_holding = if folds_hold { k } else { 0 };
-    let required = folds_required(k);
-    // The pooled row's `n` is the folds' trade counts summed, which the write
-    // gate re-derives — the fixture has to add up the way a real verdict does.
-    let pooled = FoldVerdict {
-        n: holds.n * usize::from(k),
-        ..holds.clone()
-    };
-    // Computed before `holds` moves into `pooled` below.
-    let pass = folds_holding >= required && pooled.holds;
+    let pooled_rs: Vec<Decimal> = folds
+        .iter()
+        .flat_map(|f| f.result.trades.iter().map(|t| t.realized_r))
+        .collect();
+    let fold_verdicts: Vec<FoldVerdict> = folds.iter().map(|f| f.verdict.clone()).collect();
     WalkForwardRunDraft {
         scheme: FoldScheme::rolling_oos(i64::from(k)).unwrap(),
         rule: VerdictRule::WfV1,
         span,
         from_defaulted: false,
         engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
-        verdict: RunVerdict {
-            folds_holding,
-            folds_required: required,
-            pooled,
-            pass,
-        },
+        verdict: RunVerdict::assess(&fold_verdicts, &pooled_rs),
         folds,
     }
 }

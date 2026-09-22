@@ -240,31 +240,106 @@ pub async fn seed(db: &Db) -> Seed {
 /// certification seam — the pointer plus the recorded `pass` column — is what
 /// a synthetic draft exercises: `save_walk_forward_run` persists the recorded
 /// verdict, and the derived `certified` reads it back through the JOIN.
+/// One trade whose `realized_r` is `r`, with the rest of its numbers CONSISTENT
+/// with that R-multiple: a long entered at 90 000 with its stop 1 000 below
+/// closes at `90 000 + 1 000·r`, so `(exit − entry) / stop_distance == r` exactly
+/// and the trade does not contradict the verdict it feeds.
+///
+/// `idx` staggers the timestamps so a fold's trades are distinct bars.
+pub fn seeded_trade_at_r(idx: i64, r: Decimal) -> Trade {
+    let entry = Decimal::new(90_000, 0);
+    let stop = Decimal::new(89_000, 0);
+    let stop_distance = entry - stop;
+    let exit = entry + r * stop_distance;
+    let qty = Decimal::ONE;
+    let open_ms = 1_700_000_000_000 + idx * 900_000;
+    let close_ms = open_ms + 900_000;
+    let fees = Decimal::new(2, 2);
+    Trade {
+        direction: Direction::Long,
+        qty,
+        entry_price: entry,
+        exit_price: exit,
+        entry_signal_time: open_ms,
+        entry_fill_time: open_ms,
+        exit_signal_time: close_ms,
+        exit_fill_time: close_ms,
+        fills: vec![
+            Fill {
+                price: entry,
+                qty,
+                time_ms: open_ms,
+                fee: Decimal::new(1, 2),
+            },
+            Fill {
+                price: exit,
+                qty,
+                time_ms: close_ms,
+                fee: Decimal::new(1, 2),
+            },
+        ],
+        fees_total: fees,
+        funding_total: Decimal::ZERO,
+        slippage_total: Decimal::ZERO,
+        realized_pnl: (exit - entry) * qty - fees,
+        realized_r: r,
+        mfe_r: if r > Decimal::ZERO { r } else { Decimal::ZERO },
+        mae_r: if r < Decimal::ZERO { r } else { Decimal::ZERO },
+        exit_reason: if r > Decimal::ZERO {
+            ExitReason::TakeProfit
+        } else {
+            ExitReason::StopLoss
+        },
+        source: TradeSource::Backtest,
+        regime: Regime::TrendingUp,
+        stop_price: Some(stop),
+    }
+}
+
+/// One fold's trades: `count` bars whose R-multiples alternate `lo`/`hi` around
+/// their mean, so the `wf-v1` bound is computed over a real standard error rather
+/// than a zero one. `fold_index` staggers the timestamps between folds.
+pub fn seeded_fold_trades(count: usize, lo: Decimal, hi: Decimal, fold_index: usize) -> Vec<Trade> {
+    (0..count)
+        .map(|i| {
+            let r = if i % 2 == 0 { lo } else { hi };
+            seeded_trade_at_r(i64::try_from(fold_index * count + i).unwrap_or(i64::MAX), r)
+        })
+        .collect()
+}
+
 pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
     let span = CandleWindow::new(1_735_702_200_000, 1_738_000_000_000).unwrap();
-    let fold_verdict = FoldVerdict {
-        n: 32,
-        mean_r: Decimal::new(45, 2),
-        lower_bound: if pass { 0.21 } else { -0.4 },
-        holds: pass,
+    // The R-multiples the folds carry: a genuinely HOLDING fold needs `n >= 20`
+    // trades and a positive bound, which one trade cannot produce — so the
+    // fixture says it with twenty, alternating around a positive mean (a real
+    // standard error, not a zero one). Both folds take the same pattern, so the
+    // pooled series holds with them.
+    let (lo, hi) = if pass {
+        (Decimal::new(5, 1), Decimal::new(15, 1))
+    } else {
+        (Decimal::new(-5, 1), Decimal::new(-15, 1))
     };
-    // Two folds, so the POOLED trade count is their sum: the write gate
-    // re-derives `pooled.n` from the folds and `pooled.holds` from that count and
-    // the bound, so a synthetic verdict has to add up the way a real one does.
-    let pooled_verdict = FoldVerdict {
-        n: 64,
-        ..fold_verdict.clone()
-    };
-    let folds = fold_windows(&span, 2)
+    let folds: Vec<WalkForwardFoldDraft> = fold_windows(&span, 2)
         .iter()
         .enumerate()
         .map(|(i, window)| {
-            let trade = seeded_trade();
+            let trades = seeded_fold_trades(20, lo, hi, i);
+            let rs: Vec<Decimal> = trades.iter().map(|t| t.realized_r).collect();
+            // The verdict is DERIVED from the trades, never asserted alongside
+            // them (R1): the write gate recomputes exactly this from
+            // `result.trades`, so a fixture that fabricated the verdict could not
+            // persist at all.
+            let verdict = FoldVerdict::from_rs(&rs);
+            let net_pnl: Decimal = trades.iter().map(|t| t.realized_pnl).sum();
+            let fees_total: Decimal = trades.iter().map(|t| t.fees_total).sum();
+            let funding_total: Decimal = trades.iter().map(|t| t.funding_total).sum();
+            let slippage_total: Decimal = trades.iter().map(|t| t.slippage_total).sum();
             let summary = SummaryStats::from_trades(
-                std::slice::from_ref(&trade),
-                trade.realized_pnl,
-                trade.fees_total,
-                trade.funding_total,
+                &trades,
+                net_pnl,
+                fees_total,
+                funding_total,
                 &EquityCurve::default(),
             );
             let mut inputs = seeded_inputs();
@@ -273,14 +348,14 @@ pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
             WalkForwardFoldDraft {
                 index: u8::try_from(i).unwrap(),
                 window: window.clone(),
-                verdict: fold_verdict.clone(),
+                verdict,
                 inputs,
                 result: BacktestResult {
-                    trades: vec![trade.clone()],
-                    net_pnl: trade.realized_pnl,
-                    fees_total: trade.fees_total,
-                    funding_total: trade.funding_total,
-                    slippage_total: trade.slippage_total,
+                    trades,
+                    net_pnl,
+                    fees_total,
+                    funding_total,
+                    slippage_total,
                     regime_breakdown: RegimeBreakdown::new(),
                     skipped_entries: SkippedEntryCounts::new(),
                     open_position: None,
@@ -293,18 +368,18 @@ pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
             }
         })
         .collect();
+    let pooled_rs: Vec<Decimal> = folds
+        .iter()
+        .flat_map(|f| f.result.trades.iter().map(|t| t.realized_r))
+        .collect();
+    let fold_verdicts: Vec<FoldVerdict> = folds.iter().map(|f| f.verdict.clone()).collect();
     WalkForwardRunDraft {
         scheme: FoldScheme::rolling_oos(2).unwrap(),
         rule: VerdictRule::WfV1,
         span,
         from_defaulted: false,
         engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
-        verdict: RunVerdict {
-            folds_holding: if pass { 2 } else { 0 },
-            folds_required: 2,
-            pooled: pooled_verdict,
-            pass,
-        },
+        verdict: RunVerdict::assess(&fold_verdicts, &pooled_rs),
         folds,
     }
 }
