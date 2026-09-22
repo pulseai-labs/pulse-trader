@@ -11,7 +11,7 @@
 //!   iii. an added in-set `.rs` file changes the hex;
 //!   iv.  an out-of-set change, and a non-`.rs` file under an in-set root, do not;
 //!   v.   the hex is independent of the order the walker visits entries;
-//!   vi.  `ENGINE_SOURCE_ROOTS` is the literal seven-root list the spec locks
+//!   vi.  `ENGINE_SOURCE_ROOTS` is the literal eight-root list the spec locks
 //!        (L2) — asserted here so an edit cannot silently drift from the build;
 //!   viii. the relative path bytes are in the frame — swapping two in-set
 //!        files' contents, or moving identical bytes to a different in-set
@@ -29,7 +29,7 @@ use std::path::Path;
 include!("../build_support/engine_source_set.rs");
 include!("../build_support/source_tree_hash.rs");
 
-/// The spec's locked root list (SPINE.md L2): four directories plus three single
+/// The spec's locked root list (SPINE.md L2): four directories plus four single
 /// files. Written out literally so `roots_match_the_locked_list_and_exist`
 /// fails on any drift in `build_support/engine_source_set.rs`.
 const LOCKED_ROOTS: &[&str] = &[
@@ -40,10 +40,11 @@ const LOCKED_ROOTS: &[&str] = &[
     "src/domain/indicator.rs",
     "src/domain/series.rs",
     "src/domain/candle.rs",
+    "src/domain/sizing.rs",
 ];
 
 /// The mini-tree every property test starts from: one `.rs` file per directory
-/// root, the three file roots, an out-of-set `.rs` control, and a non-`.rs`
+/// root, the four file roots, an out-of-set `.rs` control, and a non-`.rs`
 /// control under an in-set root.
 const TREE_FILES: &[(&str, &str)] = &[
     ("src/domain/backtest/engine.rs", "pub fn a() {}\n"),
@@ -54,11 +55,12 @@ const TREE_FILES: &[(&str, &str)] = &[
     ("src/domain/indicator.rs", "pub fn f() {}\n"),
     ("src/domain/series.rs", "pub fn g() {}\n"),
     ("src/domain/candle.rs", "pub fn h() {}\n"),
+    ("src/domain/sizing.rs", "pub fn i() {}\n"),
     ("src/application/backtest.rs", "pub fn outside() {}\n"),
     ("src/domain/backtest/NOTES.md", "not rust\n"),
 ];
 
-/// The eight in-set `.rs` files of `TREE_FILES`, as relative paths — the exact
+/// The nine in-set `.rs` files of `TREE_FILES`, as relative paths — the exact
 /// set `source_tree_files` must enumerate on the mini-tree.
 const IN_SET_FILES: &[&str] = &[
     "src/adapters/backtest/engine.rs",
@@ -69,6 +71,7 @@ const IN_SET_FILES: &[&str] = &[
     "src/domain/dsl/strategy.rs",
     "src/domain/indicator.rs",
     "src/domain/series.rs",
+    "src/domain/sizing.rs",
 ];
 
 fn write_file(base: &Path, rel: &str, contents: &str) {
@@ -83,8 +86,8 @@ fn write_tree(base: &Path, files: &[(&str, &str)]) {
     }
 }
 
-/// Creates all seven locked roots under `base` — the four directories empty,
-/// the three file roots as files holding `body` — so `hash` can run on a
+/// Creates all eight locked roots under `base` — the four directories empty,
+/// the four file roots as files holding `body` — so `hash` can run on a
 /// minimal probe tree without tripping the missing-root build error.
 fn scaffold_roots(base: &Path, body: &str) {
     for root in ENGINE_SOURCE_ROOTS {

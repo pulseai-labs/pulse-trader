@@ -13,7 +13,7 @@
 // grepped root in a comment here either.
 
 /// The engine source-set roots hashed into `engine_fingerprint` input (d):
-/// four directories (walked recursively for `.rs` files) and three single
+/// four directories (walked recursively for `.rs` files) and four single
 /// files. This is the whole of "engine code" for fingerprint purposes — not
 /// the compiled artifact, not all of `src/`.
 #[rustfmt::skip]
@@ -25,4 +25,5 @@ pub const ENGINE_SOURCE_ROOTS: &[&str] = &[
     "src/domain/indicator.rs",
     "src/domain/series.rs",
     "src/domain/candle.rs",
+    "src/domain/sizing.rs",
 ];
