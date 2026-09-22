@@ -248,6 +248,13 @@ pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
         lower_bound: if pass { 0.21 } else { -0.4 },
         holds: pass,
     };
+    // Two folds, so the POOLED trade count is their sum: the write gate
+    // re-derives `pooled.n` from the folds and `pooled.holds` from that count and
+    // the bound, so a synthetic verdict has to add up the way a real one does.
+    let pooled_verdict = FoldVerdict {
+        n: 64,
+        ..fold_verdict.clone()
+    };
     let folds = fold_windows(&span, 2)
         .iter()
         .enumerate()
@@ -295,7 +302,7 @@ pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
         verdict: RunVerdict {
             folds_holding: if pass { 2 } else { 0 },
             folds_required: 2,
-            pooled: fold_verdict,
+            pooled: pooled_verdict,
             pass,
         },
         folds,

@@ -369,8 +369,14 @@ fn draft_with_fold_verdict(
         .collect();
     let folds_holding = if folds_hold { k } else { 0 };
     let required = folds_required(k);
+    // The pooled row's `n` is the folds' trade counts summed, which the write
+    // gate re-derives — the fixture has to add up the way a real verdict does.
+    let pooled = FoldVerdict {
+        n: holds.n * usize::from(k),
+        ..holds.clone()
+    };
     // Computed before `holds` moves into `pooled` below.
-    let pass = folds_holding >= required && holds.holds;
+    let pass = folds_holding >= required && pooled.holds;
     WalkForwardRunDraft {
         scheme: FoldScheme::rolling_oos(i64::from(k)).unwrap(),
         rule: VerdictRule::WfV1,
@@ -380,7 +386,7 @@ fn draft_with_fold_verdict(
         verdict: RunVerdict {
             folds_holding,
             folds_required: required,
-            pooled: holds,
+            pooled,
             pass,
         },
         folds,

@@ -327,14 +327,21 @@ struct RunRow {
 ///   `fold_windows` produces — `from <= to` per window, first `from` at
 ///   `span.from_ms`, each `to` the next `from`, last `to` at `span.to_ms`);
 /// - every fold's engine fingerprint IS the draft's recorded fingerprint;
+/// - every `holds` flag IS its derivation (`n >= N_MIN && lower_bound > 0.0`),
+///   per fold and pooled — `holds` is a function of those two numbers, not data;
+/// - `pooled.n` IS the folds' trade counts summed;
 /// - the recorded verdict is what the recorded fold verdicts say:
 ///   `folds_holding` counts the folds' `holds`, `folds_required` is the
 ///   scheme's `⌈2K/3⌉`, and `pass` is `holding >= required && pooled.holds`.
 ///
-/// Consistency, not re-derivation: re-running the engine over fold inputs is
-/// the application's job upstream; this boundary proves the draft's own claims
-/// agree with each other, so an incoherent draft cannot smuggle a
-/// certification past the pointer update.
+/// Consistency, not re-derivation: re-running the ENGINE over fold inputs is the
+/// application's job upstream. Everything a reader DERIVES, though, is recomputed
+/// here — `holds` is not a measurement but a function of `n` and the bound, and
+/// both `decode_run_verdict` and `FoldVerdict::from_rs` recompute it on the way
+/// back out, so a draft may not store a flag those numbers contradict. That is
+/// the smuggled-certification shape: persist `pooled.holds = true` over a
+/// negative bound and the run reads back with `hold == false` beside a `pass`
+/// that trusted the flag.
 fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
     let incoherent = |what: String| DataError::Db(format!("walk-forward draft refused: {what}"));
     let k = draft.scheme.k();
@@ -364,12 +371,46 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
                 fold.index
             )));
         }
+        // `holds` is not data, it is a function of the fold's own numbers —
+        // `n >= N_MIN && lower_bound > 0` is exactly what the READ re-derives
+        // (`decode_run_verdict`, and `FoldVerdict::from_rs` for a fold row). A
+        // flag that disagrees is the smuggled-pass shape this gate exists for:
+        // persist it and the run reads back with `holds` recomputed to the truth
+        // beside a `pass` that trusted the lie.
+        let fold_holds = fold.verdict.n >= N_MIN && fold.verdict.lower_bound > 0.0;
+        if fold.verdict.holds != fold_holds {
+            return Err(incoherent(format!(
+                "fold {} records holds={} but its n={} and lower_bound={} derive {fold_holds}",
+                fold.index, fold.verdict.holds, fold.verdict.n, fold.verdict.lower_bound
+            )));
+        }
         cursor = fold.window.to_ms;
     }
     if cursor != draft.span.to_ms {
         return Err(incoherent(format!(
             "the folds end at {cursor}, not the recorded span's {}",
             draft.span.to_ms
+        )));
+    }
+    // The pooled verdict's own numbers must add up too: `pooled.n` is every
+    // fold's trade count, and `pooled.holds` is derived the same way the read
+    // derives it.
+    let folded_n = draft
+        .folds
+        .iter()
+        .try_fold(0_usize, |acc, f| acc.checked_add(f.verdict.n))
+        .ok_or_else(|| incoherent("the folds' trade counts overflow usize".to_owned()))?;
+    if folded_n != draft.verdict.pooled.n {
+        return Err(incoherent(format!(
+            "verdict records pooled n={} but the folds' trade counts sum to {folded_n}",
+            draft.verdict.pooled.n
+        )));
+    }
+    let pooled_holds = draft.verdict.pooled.n >= N_MIN && draft.verdict.pooled.lower_bound > 0.0;
+    if draft.verdict.pooled.holds != pooled_holds {
+        return Err(incoherent(format!(
+            "verdict records pooled holds={} but its n={} and lower_bound={} derive {pooled_holds}",
+            draft.verdict.pooled.holds, draft.verdict.pooled.n, draft.verdict.pooled.lower_bound
         )));
     }
     let holding = draft.folds.iter().filter(|f| f.verdict.holds).count();

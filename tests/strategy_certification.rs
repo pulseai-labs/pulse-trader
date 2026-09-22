@@ -298,6 +298,73 @@ async fn an_incoherent_draft_is_refused_and_persists_nothing() {
     );
 }
 
+/// The gate re-derives what every READER derives. `holds` is not data — it is a
+/// function of a verdict's own `n` and bound (`n >= N_MIN && lower_bound > 0`),
+/// which `decode_run_verdict` and `FoldVerdict::from_rs` recompute on the way
+/// back out — and `pooled.n` is the folds' trade counts. A draft that stores
+/// flags its own numbers contradict is the smuggled-pass shape this boundary
+/// exists for: persisting `pooled.holds = true` over a negative bound would leave
+/// the run reading back `holds = false` beside a `pass = true` the flag carried,
+/// with the version certified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_whose_holds_flags_its_numbers_contradict_is_refused() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    // The pooled row claims `holds` over a bound that derives the opposite.
+    let mut smuggled_pooled = seeded_walk_forward_draft(true);
+    smuggled_pooled.verdict.pooled.lower_bound = -0.5;
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &smuggled_pooled)
+        .await
+        .expect_err("a pooled `holds` its own bound contradicts must refuse");
+    assert!(
+        err.to_string()
+            .contains("verdict records pooled holds=true but its n=64 and lower_bound=-0.5"),
+        "the refusal names the derived value: {err}"
+    );
+
+    // One FOLD's flag is fabricated — its bound derives the other truth.
+    let mut smuggled_fold = seeded_walk_forward_draft(false);
+    smuggled_fold.folds[0].verdict.holds = true;
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &smuggled_fold)
+        .await
+        .expect_err("a fold `holds` its own bound contradicts must refuse");
+    assert!(
+        err.to_string()
+            .contains("fold 0 records holds=true but its n=32 and lower_bound=-0.4"),
+        "the refusal names the fold and its numbers: {err}"
+    );
+
+    // The pooled count is not the folds' trades summed.
+    let mut short_pooled = seeded_walk_forward_draft(true);
+    short_pooled.verdict.pooled.n = 40;
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &short_pooled)
+        .await
+        .expect_err("a pooled count that is not the folds' sum must refuse");
+    assert!(
+        err.to_string()
+            .contains("verdict records pooled n=40 but the folds' trade counts sum to 64"),
+        "the refusal names both counts: {err}"
+    );
+
+    // All three refused before a single row: fail-closed, and the version is
+    // still uncertified.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_run")
+        .fetch_one(world.pool())
+        .await
+        .expect("count walk-forward runs");
+    assert_eq!(count, 0, "no refused draft wrote a run row");
+    let version = world.get().await;
+    assert!(
+        version.latest_walk_forward_run_id.is_none() && !version.certified,
+        "no refused draft advanced certification"
+    );
+}
+
 /// iv. `certified` follows the JOIN's `pass`, never the pointer alone: a
 /// version whose pointer names a FAILING run reads uncertified — the pointer's
 /// presence is not the credential.
