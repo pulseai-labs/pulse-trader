@@ -11,7 +11,7 @@
 //! - (c) the DSL schema-version string (`DSL_SCHEMA_VERSION`, shared via the
 //!   `schema_version_const.rs` seam);
 //! - (d) the engine source set — a sha2-256 over the `.rs` files under the
-//!   eight locked roots in `build_support/engine_source_set.rs`, folded behind
+//!   nine locked roots in `build_support/engine_source_set.rs`, folded behind
 //!   the `b"engine-source-v1\0"` domain prefix (r2.s3.w1, #155);
 //! - (e) the full target triple.
 //!

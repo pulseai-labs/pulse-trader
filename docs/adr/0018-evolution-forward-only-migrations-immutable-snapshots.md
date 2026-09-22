@@ -66,7 +66,8 @@ graph); **(b)** the resolved `rustc -vV` filtered to its `release:` +
 `schema_version_const.rs` seam; **(d)** a sha2-256 over the engine source set —
 the `.rs` files under `src/domain/backtest/`, `src/adapters/backtest/`,
 `src/adapters/indicators/` and `src/domain/dsl/`, plus `src/domain/indicator.rs`,
-`src/domain/series.rs`, `src/domain/candle.rs` and `src/domain/sizing.rs`,
+`src/domain/series.rs`, `src/domain/candle.rs`, `src/domain/sizing.rs` and
+`src/adapters/broker/mod.rs`,
 sorted by path bytes and folded behind the `b"engine-source-v1\0"` domain
 prefix (r2.s3.w1, #155);
 **(e)** the full target triple. `build.rs` emits `cargo:rerun-if-changed` for

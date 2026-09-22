@@ -11,7 +11,7 @@
 //!      `rustup override` cannot silently desync the binary from its toolchain;
 //!   (c) the DSL schema-version string (`DSL_SCHEMA_VERSION`, `include!`'d from the
 //!      SAME `schema_version_const.rs` the crate reads — the non-drift seam);
-//!   (d) the engine source set — a sha2-256 over the `.rs` files under the eight
+//!   (d) the engine source set — a sha2-256 over the `.rs` files under the nine
 //!      locked roots in `build_support/engine_source_set.rs`, folded behind the
 //!      `b"engine-source-v1\0"` domain prefix (r2.s3.w1, #155);
 //!   (e) the full target triple (`$TARGET`, set by Cargo for build scripts).
@@ -108,7 +108,7 @@ fn main() {
     hasher.update(DSL_SCHEMA_VERSION.as_bytes());
     hasher.update([0u8]);
     // Input (d): the engine source set — sha2-256 over the `.rs` files under the
-    // eight locked roots, folded behind its own domain-separation prefix so the
+    // nine locked roots, folded behind its own domain-separation prefix so the
     // source-tree hex can never be mistaken for a continuation of input (c).
     hasher.update(b"engine-source-v1\0");
     hasher.update(source_tree_hash(Path::new(&manifest_dir), ENGINE_SOURCE_ROOTS).as_bytes());
