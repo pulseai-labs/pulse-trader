@@ -47,6 +47,17 @@ function version(
   certified = false,
   latestWalkForwardRunId: string | null = null,
 ): LibraryVersion {
+  // The version's one persisted run, as both the catalogue's row and the
+  // version's latest run (a fixture with nothing but an ordinary backtest).
+  const runRow =
+    versionStats === null
+      ? null
+      : {
+          id: "run-2222-3333",
+          createdAt: "2026-08-21T08:30:00.000Z",
+          expectancy: versionStats.expectancy,
+          trades: versionStats.trades,
+        };
   return {
     id,
     parentId,
@@ -66,17 +77,8 @@ function version(
     },
     stats: versionStats,
     deltaVsParent: delta,
-    recentRuns:
-      versionStats === null
-        ? []
-        : [
-            {
-              id: "run-2222-3333",
-              createdAt: "2026-08-21T08:30:00.000Z",
-              expectancy: versionStats.expectancy,
-              trades: versionStats.trades,
-            },
-          ],
+    recentRuns: runRow === null ? [] : [runRow],
+    latestRun: runRow,
   };
 }
 

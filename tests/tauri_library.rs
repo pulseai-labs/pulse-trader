@@ -473,3 +473,86 @@ async fn certification_fields_reach_the_wire() {
     assert!(!beta.versions[0].certified);
     assert_eq!(beta.versions[0].latest_walk_forward_run_id, None);
 }
+
+// ---------------------------------------------------------------------------
+// R2 — the latest run the screen may compare against is not a fold
+// ---------------------------------------------------------------------------
+
+/// R2: the Lab's parent comparison names the version's latest NON-fold run.
+///
+/// After a walk-forward completes, its folds head the run catalogue: they are
+/// ordinary rows (L8 — so they stay listed) that share ONE `created_at`, and here
+/// that instant is strictly later than the version's ordinary run. So
+/// `recent_runs[0]` is an arbitrary UUID-selected sub-window fold, which is
+/// exactly what the screen used to read as "the latest run" — while `latest_run`
+/// answers the ordinary run, from the same `latest_run_for_version` read the KPIs
+/// use (N1's discriminator).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_run_is_the_version_latest_non_fold_run() {
+    let (state, _tmp, alpha_versions, _beta_root) = seeded_state().await;
+
+    // A walk-forward strictly LATER than the SystemClock-dated ordinary run, so
+    // its folds really do head the catalogue (that ordering is the bug's setup).
+    let late = SqliteBacktestRunRepo::with_deps(
+        state.db().pool().clone(),
+        FakeClock::at(1_900_000_000_000),
+    );
+    let wf_id = late
+        .save_walk_forward_run(&alpha_versions[1], &seeded_walk_forward_draft(true))
+        .await
+        .expect("the walk-forward run persists");
+    let wf = late
+        .get_walk_forward_run(&wf_id)
+        .await
+        .expect("the walk-forward reads back")
+        .expect("the run exists");
+    let fold_ids: Vec<&str> = wf
+        .folds
+        .iter()
+        .map(|f| f.backtest_run_id.as_str())
+        .collect();
+    assert_eq!(fold_ids.len(), 2, "the fixture is a two-fold run");
+
+    let overview = library_overview_core(&state)
+        .await
+        .expect("the library read succeeds");
+    let va2 = overview
+        .strategies
+        .iter()
+        .flat_map(|s| s.versions.iter())
+        .find(|v| v.id == alpha_versions[1].as_str())
+        .expect("va2 is listed");
+
+    // The catalogue keeps every row, folds included — and a fold heads it.
+    assert!(
+        fold_ids.contains(&va2.recent_runs[0].id.as_str()),
+        "a fold heads recent_runs: {}",
+        va2.recent_runs[0].id
+    );
+
+    // The latest run is NOT that fold, and it is older than it.
+    let latest = va2.latest_run.as_ref().expect("va2 has an ordinary run");
+    assert!(
+        !fold_ids.contains(&latest.id.as_str()),
+        "the latest run is not a fold: {}",
+        latest.id
+    );
+    assert!(
+        latest.created_at < va2.recent_runs[0].created_at,
+        "the fold is NEWER than the latest run — the selection this fixes"
+    );
+
+    // The KPIs answer from that same ordinary run (N1's half).
+    assert_eq!(
+        va2.stats.as_ref().map(|s| s.trades),
+        Some(64),
+        "va2's KPIs are its ordinary run's"
+    );
+
+    // And the certification pointer is the walk-forward, which is not the latest
+    // RUN — the two are different questions about the same version.
+    assert_eq!(
+        va2.latest_walk_forward_run_id.as_deref(),
+        Some(wf_id.as_str())
+    );
+}

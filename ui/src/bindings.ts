@@ -932,9 +932,23 @@ export type LibraryVersion = {
 	deltaVsParent: string | null,
 	/**
 	 *  This version's run catalog (best-effort — one corrupt row costs its row
-	 *  here, not the screen), newest first.
+	 *  here, not the screen), newest first. Walk-forward folds are IN this list:
+	 *  a fold is an ordinary run on the catalog read (L8), and the Lab's fold
+	 *  table opens it as one.
 	 */
 	recentRuns: LibraryRunSummary[],
+	/**
+	 *  The version's most recent run **excluding walk-forward folds** — N1's
+	 *  discriminator, from the same `latest_run_for_version` read the KPIs use.
+	 *  The Lab's parent comparison names this run when the screen has not just
+	 *  finished a fresher one: the folds of a walk-forward share ONE
+	 *  `created_at`, so reading `recent_runs[0]` as "the latest" would compare a
+	 *  fresh full-span run against an arbitrary UUID-selected sub-window fold.
+	 *  `None` when the version has no ordinary run (only folds, or none at all)
+	 *  — there is then nothing comparable to show, which is a state to report
+	 *  rather than a fold to substitute.
+	 */
+	latestRun: LibraryRunSummary | null,
 	/**
 	 *  Whether the version's latest walk-forward run passed — the badge signal
 	 *  (r2.s3.w4); `false` until a run passes AND whenever a newer run failed.

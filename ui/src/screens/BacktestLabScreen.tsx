@@ -1607,20 +1607,33 @@ type CompareState =
  * The selected version's latest run beside its parent's latest — for ANY child
  * version, not only a coach accept (r2.s1.w4 C3). The child run named is the
  * freshest one the screen can prove: the run this screen just finished when it
- * is newer than the catalog's, else the catalog's latest (`recentRuns` arrives
- * `created_at DESC`). A typed refusal renders its reason line instead of the
- * table — a child whose parent has no run is a state to report, not an error
- * to raise.
+ * is newer than the catalogue's, else the catalogue's latest.
+ *
+ * The catalogue's latest is `version.latestRun`, NOT `recentRuns[0]` (R2):
+ * `recentRuns` is the whole run catalogue and a walk-forward's folds are in it —
+ * they are ordinary runs (L8), and the fold table opens them as such — so after a
+ * walk-forward completes its folds sit at the head of that list, sharing one
+ * `created_at` with each other. Comparing against whichever UUID sorted first
+ * would compare a fresh full-span run against a sub-window fold. `latestRun` is
+ * the server's answer to "the version's latest run" (the same
+ * `latest_run_for_version` read the KPIs use, which excludes folds), so the
+ * comparison has a full-span run on both sides. A version with no ordinary run
+ * has `latestRun: null` and there is nothing to compare — a state to report
+ * rather than a fold to substitute.
+ *
+ * A typed refusal renders its reason line instead of the table — a child whose
+ * parent has no run is a state to report, not an error to raise.
  */
 function CompareWithParent({ version, run }: { version: LibraryVersion; run: RunState }) {
   const [outcome, setOutcome] = useState<CompareState>({ kind: "loading" });
 
-  const persistedRunId = version.recentRuns[0]?.id ?? null;
+  const catalogueLatest = version.latestRun ?? null;
+  const persistedRunId = catalogueLatest?.id ?? null;
   const freshRunId =
     run.kind === "done" &&
     run.dto.strategyVersionId === version.id &&
-    (version.recentRuns[0] === undefined ||
-      run.dto.createdAt >= version.recentRuns[0].createdAt)
+    (catalogueLatest === null ||
+      run.dto.createdAt >= catalogueLatest.createdAt)
       ? run.dto.runId
       : null;
   const latestRunId = freshRunId ?? persistedRunId;

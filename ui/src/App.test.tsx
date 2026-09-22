@@ -153,6 +153,7 @@ const ONE_VERSION = {
           stats: null,
           deltaVsParent: null,
           recentRuns: [],
+          latestRun: null,
           createdBy: "human",
           agentName: null,
           hypothesis: null,

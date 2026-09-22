@@ -43,6 +43,7 @@ import type {
   CompareChildRunDto,
   HistogramBinDto,
   LibraryOverview,
+  LibraryRunSummary,
   LibraryVersion,
   SummaryDto,
   WalkForwardRunDto,
@@ -62,7 +63,12 @@ const getRunMock = vi.mocked(commands.getBacktestRun);
 // distinct so a verbatim assertion can only pass on the real payload path.
 // ---------------------------------------------------------------------------
 
-function catalogVersion(id: string, parentId: string | null): LibraryVersion {
+function catalogVersion(
+  id: string,
+  parentId: string | null,
+  latestRun: LibraryRunSummary | null = null,
+  recentRuns: LibraryRunSummary[] = [],
+): LibraryVersion {
   return {
     id,
     parentId,
@@ -80,7 +86,8 @@ function catalogVersion(id: string, parentId: string | null): LibraryVersion {
     },
     stats: null,
     deltaVsParent: null,
-    recentRuns: [],
+    recentRuns,
+    latestRun,
     certified: false,
     latestWalkForwardRunId: null,
   };
@@ -1314,6 +1321,16 @@ describe("BacktestLabScreen (the coach rail)", () => {
 
 /** A catalog where the child version carries one persisted run — the shape the
  * Library serves after `pulse mcp`'s `run_backtest` writes it. */
+/** The child version's one persisted run — both the catalogue's row and the
+ * version's latest run, which is the shape when nothing but an ordinary backtest
+ * has run. */
+const CHILD_RUN: LibraryRunSummary = {
+  id: "run-child-1",
+  createdAt: "2026-08-22T09:00:00.000Z",
+  expectancy: "20.250",
+  trades: 6,
+};
+
 const CHILD_CATALOG: LibraryOverview = {
   strategies: [
     {
@@ -1325,14 +1342,8 @@ const CHILD_CATALOG: LibraryOverview = {
         catalogVersion("v-alpha-1", null),
         {
           ...catalogVersion("v-alpha-2", "v-alpha-1"),
-          recentRuns: [
-            {
-              id: "run-child-1",
-              createdAt: "2026-08-22T09:00:00.000Z",
-              expectancy: "20.250",
-              trades: 6,
-            },
-          ],
+          recentRuns: [CHILD_RUN],
+          latestRun: CHILD_RUN,
         },
       ],
     },
@@ -1376,6 +1387,50 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     const badge = screen.getByText("inputs differ");
     expect(badge.className).toContain("badge-inputs-differ");
     expect(badge.getAttribute("title")).toBe(COMPARE_DTO.inputsNote);
+  });
+
+  it("compares against the latest run, not a fold that heads the catalogue (R2)", async () => {
+    // A walk-forward's folds share ONE `created_at` and are newer than the
+    // version's ordinary run, so the catalogue (newest first) is headed by an
+    // arbitrary fold. `latestRun` is the server's non-fold answer — the same
+    // `latest_run_for_version` read the KPIs use — so the comparison must name it,
+    // not `recentRuns[0]`, which is what the screen read before.
+    const foldRow: LibraryRunSummary = {
+      id: "run-fold-0",
+      createdAt: "2026-08-23T09:00:00.000Z",
+      expectancy: "3.000",
+      trades: 4,
+    };
+    const foldHeaded: LibraryOverview = {
+      strategies: [
+        {
+          id: "strat-alpha",
+          name: "Alpha Wave",
+          createdAt: "2026-08-01T09:00:00.000Z",
+          pinnedVersionId: null,
+          versions: [
+            catalogVersion("v-alpha-1", null),
+            {
+              ...catalogVersion("v-alpha-2", "v-alpha-1"),
+              recentRuns: [foldRow, CHILD_RUN],
+              latestRun: CHILD_RUN,
+              certified: true,
+              latestWalkForwardRunId: "wf-1",
+            },
+          ],
+        },
+      ],
+    };
+    catalogMock.mockResolvedValue({ status: "ok", data: foldHeaded });
+    compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
+    render(<BacktestLabScreen />);
+
+    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+
+    await waitFor(() => {
+      expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
+    });
+    expect(compareMock).not.toHaveBeenCalledWith({ childRunId: "run-fold-0" });
   });
 
   it("renders the same table with NO badge when the runs' inputs match", async () => {

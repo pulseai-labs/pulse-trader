@@ -66,7 +66,7 @@ use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 use super::library::{
     LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
-    recent_run_summary, version_stats,
+    latest_run_summary, recent_run_summary, version_stats,
 };
 use super::walk_forward::{
     GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardRunDto, WalkForwardRunRequest,
@@ -580,6 +580,10 @@ async fn library_strategy(
                 .take(RECENT_RUN_LIMIT)
                 .map(recent_run_summary)
                 .collect(),
+            // The same `latest_run_for_version` read the KPIs use, in the catalog
+            // row shape: the Lab's compare names this run, never `recent_runs[0]`
+            // (which a walk-forward's folds can occupy — R2).
+            latest_run: latest.as_ref().map(latest_run_summary),
             certified: version.certified,
             latest_walk_forward_run_id: version
                 .latest_walk_forward_run_id
