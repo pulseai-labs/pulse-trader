@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE strategy_version SET latest_walk_forward_run_id = ?1 WHERE id = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "be76c4a197ae623c43e1a1e34914e840a781079d978e685e0a026926bb29c2b2"
+}

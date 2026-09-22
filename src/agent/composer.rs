@@ -451,6 +451,8 @@ fn build_version(validated: &ValidatedDsl, llm_call_ids: &[LlmCallId]) -> Strate
             .map(|id| id.as_str().to_owned())
             .collect(),
         created_at: chrono::DateTime::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now),
+        latest_walk_forward_run_id: None,
+        certified: false,
     }
 }
 

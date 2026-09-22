@@ -31,6 +31,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::backtest::WalkForwardRunId;
 use super::dsl::{SchemaVersion, StrategyDsl};
 
 /// Identifier of a [`Strategy`] — a `#[serde(transparent)]` `String` newtype.
@@ -176,6 +177,23 @@ pub struct StrategyVersion {
     pub creating_llm_call_ids: Vec<String>,
     /// Creation timestamp (adapter-supplied; the RFC3339 `TEXT` column).
     pub created_at: DateTime<Utc>,
+    /// The version's certification pointer (r2.s3.w4, migration `0014`): the
+    /// LATEST persisted walk-forward run of this version. `None` until one is
+    /// saved — a created or pre-`0014` version carries no certification record.
+    /// The only mutable column on an otherwise immutable row; the
+    /// `strategy_version_certification_owner` trigger keeps it honest (this
+    /// version's runs only, strictly advancing).
+    pub latest_walk_forward_run_id: Option<WalkForwardRunId>,
+    /// Whether this version is certified — **derived**, never stored: `false`
+    /// when [`Self::latest_walk_forward_run_id`] is `None`, otherwise the named
+    /// run's persisted `pass`. A newer failing walk-forward therefore
+    /// de-certifies the version by taking the pointer, not by flipping a flag.
+    ///
+    /// `#[serde(default)]`: the field is absent from records serialized before
+    /// certification existed, and `deny_unknown_fields` makes the missing key
+    /// an error unless the default covers it — the honest default is `false`.
+    #[serde(default)]
+    pub certified: bool,
 }
 
 /// The create-version request the adapter (1.03) consumes (FR-11 clone = parent
@@ -521,6 +539,8 @@ mod tests {
             created_by: CreatedBy::Human,
             creating_llm_call_ids: vec![],
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            latest_walk_forward_run_id: None,
+            certified: false,
         }
     }
 

@@ -75,6 +75,8 @@ function catalogVersion(id: string, parentId: string | null): LibraryVersion {
     stats: null,
     deltaVsParent: null,
     recentRuns: [],
+    certified: false,
+    latestWalkForwardRunId: null,
   };
 }
 
@@ -1038,6 +1040,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
           before: PARENT_SUMMARY,
           after: CHILD_SUMMARY,
           readBack: "ok",
+          walkForwardRunId: null,
         },
       },
     });
@@ -1082,6 +1085,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
           before: PARENT_SUMMARY,
           after: CHILD_SUMMARY,
           readBack: "ok",
+          walkForwardRunId: null,
         },
       },
     });
@@ -1253,6 +1257,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
           before: PARENT_SUMMARY,
           after: null,
           readBack: { failure: "the saved child run could not be re-read" },
+          walkForwardRunId: null,
         },
       },
     });

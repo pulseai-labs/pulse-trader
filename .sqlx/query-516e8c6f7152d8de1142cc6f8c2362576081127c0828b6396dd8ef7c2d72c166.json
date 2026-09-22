@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 v.id                    AS \"id!: String\",\n                 v.strategy_id           AS \"strategy_id!: String\",\n                 v.parent_version_id     AS \"parent_version_id?: String\",\n                 v.dsl_schema_version    AS \"dsl_schema_version!: String\",\n                 v.dsl_original          AS \"dsl_original!: String\",\n                 v.version_hash          AS \"version_hash!: String\",\n                 v.created_by            AS \"created_by!: String\",\n                 v.creating_llm_call_ids AS \"creating_llm_call_ids!: String\",\n                 v.created_at            AS \"created_at!: String\",\n                 v.latest_walk_forward_run_id AS \"latest_walk_forward_run_id?: String\",\n                 w.pass                  AS \"certifying_pass?: i64\"\n               FROM strategy_version v\n               LEFT JOIN walk_forward_run w ON w.id = v.latest_walk_forward_run_id\n               WHERE v.strategy_id = ?1 ORDER BY v.created_at, v.id",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "strategy_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "parent_version_id?: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "dsl_schema_version!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "dsl_original!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "version_hash!: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_by!: String",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "creating_llm_call_ids!: String",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: String",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "latest_walk_forward_run_id?: String",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "certifying_pass?: i64",
+        "ordinal": 10,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "516e8c6f7152d8de1142cc6f8c2362576081127c0828b6396dd8ef7c2d72c166"
+}

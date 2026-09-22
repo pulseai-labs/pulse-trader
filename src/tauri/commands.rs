@@ -557,6 +557,11 @@ async fn library_strategy(
                 .take(RECENT_RUN_LIMIT)
                 .map(recent_run_summary)
                 .collect(),
+            certified: version.certified,
+            latest_walk_forward_run_id: version
+                .latest_walk_forward_run_id
+                .as_ref()
+                .map(|run| run.as_str().to_owned()),
         });
     }
 

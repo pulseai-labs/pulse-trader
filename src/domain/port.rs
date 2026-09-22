@@ -1255,6 +1255,8 @@ mod repository_tests {
                 created_by: request.created_by,
                 creating_llm_call_ids: request.creating_llm_call_ids,
                 created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                latest_walk_forward_run_id: None,
+                certified: false,
             };
             self.versions
                 .lock()

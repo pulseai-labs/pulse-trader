@@ -14,12 +14,16 @@
 //! ones this test pinned).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod support;
+
 use pulse::{
     AgentHypothesis, AgentName, BacktestInputs, BacktestResult, BacktestRunRepository, CreatedBy,
-    DataVersion, DesktopState, EngineFingerprint, EquityCurve, FundingConfig, NewAgentSubmission,
-    NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, StrategyRepository,
-    SummaryStats, Timeframe, VersionId, library_overview_core,
+    DataVersion, DesktopState, EngineFingerprint, EquityCurve, FakeClock, FundingConfig,
+    NewAgentSubmission, NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
+    SqliteBacktestRunRepo, StrategyRepository, SummaryStats, Timeframe, VersionId,
+    WalkForwardRunRepository, library_overview_core,
 };
+use support::mcp::seeded_walk_forward_draft;
 
 /// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
 /// tests are about coach/library behaviour, not provenance, so the tuple is a
@@ -408,4 +412,64 @@ async fn provenance_and_hypothesis_reach_the_wire_per_version_kind() {
         "a missing submission row is not an error"
     );
     assert_eq!(bare.hypothesis, None);
+}
+
+// ---------------------------------------------------------------------------
+// r2.s3.w4 — a12: the Library wire carries certification
+// ---------------------------------------------------------------------------
+
+/// `LibraryVersion.certified`/`latest_walk_forward_run_id` are filled from the
+/// version's joined latest walk-forward run: `true` + the run id when it
+/// passed, `false` + `None` everywhere else — never invented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certification_fields_reach_the_wire() {
+    let (state, _tmp, alpha_versions, _beta_root) = seeded_state().await;
+
+    // Certify va1 with a synthetic passing walk-forward — the pointer +
+    // recorded `pass` is the seam, and `save_walk_forward_run` is the only
+    // product path that moves it.
+    let wf_id = SqliteBacktestRunRepo::with_deps(
+        state.db().pool().clone(),
+        FakeClock::at(1_756_512_000_000),
+    )
+    .save_walk_forward_run(&alpha_versions[0], &seeded_walk_forward_draft(true))
+    .await
+    .expect("the certifying walk-forward run persists");
+
+    let overview = library_overview_core(&state)
+        .await
+        .expect("the library read succeeds");
+    let alpha = overview
+        .strategies
+        .iter()
+        .find(|s| s.name == "Alpha")
+        .expect("Alpha is listed");
+    let beta = overview
+        .strategies
+        .iter()
+        .find(|s| s.name == "Beta")
+        .expect("Beta is listed");
+    let wire = |id: &VersionId| {
+        alpha
+            .versions
+            .iter()
+            .find(|v| v.id == id.as_str())
+            .unwrap_or_else(|| panic!("version {} in the overview", id.as_str()))
+    };
+
+    let certified = wire(&alpha_versions[0]);
+    assert!(certified.certified, "va1's latest walk-forward passed");
+    assert_eq!(
+        certified.latest_walk_forward_run_id.as_deref(),
+        Some(wf_id.as_str()),
+        "the pointer names the certifying run"
+    );
+
+    for id in [&alpha_versions[1], &alpha_versions[2]] {
+        let version = wire(id);
+        assert!(!version.certified, "{}: no run — uncertified", id.as_str());
+        assert_eq!(version.latest_walk_forward_run_id, None);
+    }
+    assert!(!beta.versions[0].certified);
+    assert_eq!(beta.versions[0].latest_walk_forward_run_id, None);
 }

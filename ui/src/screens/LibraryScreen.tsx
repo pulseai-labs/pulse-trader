@@ -445,6 +445,14 @@ function VersionNode({
             ★
           </span>
         )}
+        {/* d22 (r2.s3.w4): the certification badge follows the version's
+            LATEST walk-forward run — rendered when `certified` is true, absent
+            entirely when false so the mark can't fade into decoration. */}
+        {version.certified && (
+          <span className="vnode-cert" title="Latest walk-forward passed">
+            certified
+          </span>
+        )}
         {delta !== null && (
           <span className={`vnode-delta mono ${down ? "bear" : "bull"}`}>
             {down ? "▼" : "▲"} {delta}
@@ -520,6 +528,21 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
         <DslBlock title="Risk" lines={version.dsl.risk} />
         {/* The mock's `pair` / `timeframes` lines are deliberately absent:
             `StrategyDsl` carries neither field. */}
+      </section>
+
+      {/* d22 (r2.s3.w4): certification state is part of the version's record,
+          so the pane always states it — "certified" or "uncertified" — and
+          names the certifying walk-forward run only when the pointer is set. */}
+      <section className="d-section">
+        <h4 className="dsl-h">Certification</h4>
+        <div className="d-cert">
+          <span className={`d-cert-state${version.certified ? " is-certified" : ""}`}>
+            {version.certified ? "certified" : "uncertified"}
+          </span>
+          {version.latestWalkForwardRunId !== null && (
+            <span className="d-cert-run mono">{version.latestWalkForwardRunId}</span>
+          )}
+        </div>
       </section>
 
       {/* C1 (r2.s1.w4): the agent's stated hypothesis in full — the node's

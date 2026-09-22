@@ -1304,6 +1304,7 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
             summary,
             starting_equity,
         },
+        walk_forward: None,
     }
 }
 

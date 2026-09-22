@@ -282,11 +282,50 @@ struct RunRow {
     pass: i64,
 }
 
+/// The whole write shape of one walk-forward run, on the CALLER's transaction
+/// (r2.s3.w4): the `walk_forward_run` parent row, each fold's ordinary
+/// `backtest_run` + `trade` + `walk_forward_fold` rows, and — last — the owning
+/// version's certification pointer moved to this run (ADR-0025 L6: EVERY
+/// persisted walk-forward advances `latest_walk_forward_run_id`, pass or fail —
+/// a newer failing run is exactly how a version de-certifies).
+///
+/// `wf_run_id` and `created_at` are minted by the caller (`Uuid`/`Clock` on the
+/// standalone path; the coach accept's injected `IdSource`/`Clock` inside
+/// `commit_acceptance`), so the same insert lands identically under both
+/// writers. The ownership guard stays with the callers: the standalone path
+/// checks before minting; the coach path just inserted the child row itself.
+pub(crate) async fn insert_walk_forward_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    version_id_str: &str,
+    draft: &WalkForwardRunDraft,
+    wf_run_id: &str,
+    created_at: &str,
+) -> Result<WalkForwardRunId, DataError> {
+    insert_walk_forward_run_row(tx, wf_run_id, version_id_str, created_at, draft).await?;
+    for fold in &draft.folds {
+        insert_fold_rows(tx, wf_run_id, version_id_str, created_at, fold).await?;
+    }
+
+    // The pointer moves INSIDE the same transaction — a walk-forward run and
+    // the certification it implies are one atomic fact, never two writes that
+    // could disagree.
+    sqlx::query!(
+        "UPDATE strategy_version SET latest_walk_forward_run_id = ?1 WHERE id = ?2",
+        wf_run_id,
+        version_id_str,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+
+    Ok(WalkForwardRunId::new(wf_run_id))
+}
+
 impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<C> {
-    // One transaction: the ownership guard `save_run` makes, the parent row,
-    // then per fold the ordinary `backtest_run` + `trade` rows (with the 0013
-    // membership pair) and the `walk_forward_fold` row (a9). Any failure rolls
-    // everything back — nothing partial persists.
+    // One transaction: the ownership guard `save_run` makes, then the shared
+    // insert (parent row, per-fold run + trades + fold row, the version's
+    // certification pointer — a9 + r2.s3.w4's L6). Any failure rolls everything
+    // back — nothing partial persists.
     async fn save_walk_forward_run(
         &self,
         strategy_version_id: &VersionId,
@@ -322,16 +361,14 @@ impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<
             )));
         }
 
-        insert_walk_forward_run_row(&mut tx, &wf_run_id, &version_id_str, &created_at, draft)
-            .await?;
-        for fold in &draft.folds {
-            insert_fold_rows(&mut tx, &wf_run_id, &version_id_str, &created_at, fold).await?;
-        }
+        let wf_id =
+            insert_walk_forward_in_tx(&mut tx, &version_id_str, draft, &wf_run_id, &created_at)
+                .await?;
 
         tx.commit()
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
-        Ok(WalkForwardRunId::new(wf_run_id))
+        Ok(wf_id)
     }
 
     // Fail-closed read (the `get_run` discipline): any corrupt column or a fold
