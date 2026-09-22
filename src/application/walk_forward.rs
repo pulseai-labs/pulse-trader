@@ -67,10 +67,12 @@ pub struct WalkForwardRequest {
     /// snapshot's last candle's `close_time`.
     pub to_ms: Option<i64>,
     /// The fold count; `None` defaults to [`K_DEFAULT`]. In `2..=12` —
-    /// carried as `i64` (wider than the legal `u8`) so an out-of-range wire
-    /// value reaches [`FoldScheme::rolling_oos`]'s typed `KOutOfRange` refusal
-    /// instead of dying in transport decoding.
-    pub k: Option<i64>,
+    /// carried as `i32` (wider than the legal `u8`, and the widest signed type
+    /// specta exports to TypeScript) so an out-of-range wire value reaches
+    /// [`FoldScheme::rolling_oos`]'s typed `KOutOfRange` refusal instead of dying
+    /// in transport decoding. Widened to `i64` for that call below: the domain
+    /// keeps the wider comparison so the refusal can name what was sent.
+    pub k: Option<i32>,
 }
 
 /// The use case's answer — built from the saved rows, never the in-memory
@@ -534,7 +536,7 @@ where
         }
         .into());
     }
-    let scheme = FoldScheme::rolling_oos(request.k.unwrap_or(i64::from(K_DEFAULT)))?;
+    let scheme = FoldScheme::rolling_oos(request.k.map_or(i64::from(K_DEFAULT), i64::from))?;
 
     // ONE blocking task for the snapshot loads, the warm-bar probe, the span
     // resolution, and all K fold runs (a13, #201) — the shared unpersisted

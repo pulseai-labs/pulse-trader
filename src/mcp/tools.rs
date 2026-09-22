@@ -194,8 +194,13 @@ pub(crate) struct RunWalkForwardArgs {
     /// The fold count — `2..=12`; omitted defaults to 6. Wider than the legal
     /// `u8` on purpose: an out-of-range value must reach the domain's
     /// `KOutOfRange` refusal (a `field_error` naming `k`), not die in decoding.
+    ///
+    /// `i32`, matching the Tauri transport: the two surfaces carry one wire type
+    /// for `k`, and it is the widest signed one specta exports (the `BigInt`-style
+    /// integers are refused, so `i64` would break the bindings export rather than
+    /// this decode).
     #[serde(default)]
-    k: Option<i64>,
+    k: Option<i32>,
 }
 
 /// `get_walk_forward_run` args (r2.s3.w5).

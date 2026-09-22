@@ -919,7 +919,10 @@ export type LibraryVersion = {
 	dsl: DslSummary,
 	/**
 	 *  The latest persisted run's stats, or `None` when no run exists — the
-	 *  screen renders an em dash on `None` (grill A1).
+	 *  screen renders an em dash on `None` (grill A1). A walk-forward fold is
+	 *  not the latest run (N1): the folds of one walk-forward share one
+	 *  `created_at`, so reading one as "the latest" would render an arbitrary
+	 *  sub-window as the version's result.
 	 */
 	stats: VersionStats | null,
 	/**
@@ -1239,7 +1242,18 @@ export type WalkForwardRunRequest = {
 	 *  bound may be given alone.
 	 */
 	to?: string | null,
-	/**  The fold count `k`, in `2..=12`. `None` defaults to 6. */
+	/**
+	 *  The fold count `k`, in `2..=12`. `None` defaults to 6. Wider than the
+	 *  legal `u8` on purpose: an out-of-range value must reach the domain's
+	 *  `KOutOfRange` refusal (a `BusError` naming `k`), not die in decoding.
+	 * 
+	 *  `i32` is the WIDEST signed type specta can export: it refuses the
+	 *  `BigInt`-style integers outright (`i64`/`u64`/`usize`/`isize`/`i128`/
+	 *  `u128` risk precision loss crossing as a TS `number`), so `i64` here does
+	 *  not fail at runtime — it fails the bindings EXPORT, which is a generated
+	 *  artifact this repo commits and gates. `i32` still carries `-1` and `256`
+	 *  to the typed refusal instead of dying in transport decoding.
+	 */
 	k?: number | null,
 };
 

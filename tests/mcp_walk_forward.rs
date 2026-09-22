@@ -358,7 +358,7 @@ async fn run_walk_forward_refusals_name_their_field() {
     // `k` outside 2..=12 names the `k` field, both directions — including the
     // wire values a `u8` could not even decode (-1, 256), which still reach the
     // typed refusal (F4).
-    for k in [13_i64, 1, -1, 256] {
+    for k in [13_i32, 1, -1, 256] {
         let err = call_err(
             &client,
             "run_walk_forward",

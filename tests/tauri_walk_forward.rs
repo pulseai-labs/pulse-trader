@@ -332,9 +332,9 @@ async fn walk_forward_refusals_map_to_the_pinned_bus_error_shape() {
     let state = env.cold_state().await;
 
     // `k` outside 2..=12 — validation, and the message names `k`. The wire
-    // value is i64: -1 and 256 refuse as BusErrors naming `k`, not as argument
-    // decode failures (F4).
-    for k in [13_i64, 1, -1, 256] {
+    // value is `i32` (the widest signed type specta exports): -1 and 256 refuse
+    // as BusErrors naming `k`, not as argument decode failures (F4).
+    for k in [13_i32, 1, -1, 256] {
         let err = run_walk_forward_version_core(
             &state,
             WalkForwardRunRequest {

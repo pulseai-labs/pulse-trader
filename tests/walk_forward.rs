@@ -477,7 +477,7 @@ async fn k_out_of_range_is_refused() {
     let world = world().await;
     let version = make_version(&world, &oracle_dsl()).await;
 
-    for k in [1_i64, 13, -1, 256] {
+    for k in [1_i32, 13, -1, 256] {
         let mut req = request(&version);
         req.k = Some(k);
         let err = run_walk_forward(
@@ -491,7 +491,11 @@ async fn k_out_of_range_is_refused() {
         .expect_err("K outside 2..=12 must refuse");
         assert_eq!(
             err,
-            WalkForwardAppError::Domain(WalkForwardError::KOutOfRange { k, min: 2, max: 12 }),
+            WalkForwardAppError::Domain(WalkForwardError::KOutOfRange {
+                k: i64::from(k),
+                min: 2,
+                max: 12
+            }),
             "K={k}"
         );
     }
