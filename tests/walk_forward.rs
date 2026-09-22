@@ -751,6 +751,39 @@ async fn a_fold_whose_run_does_not_decode_is_refused() {
     );
 }
 
+/// MINOR (droid): a LOST fold row is a short read, not a smaller run. The write
+/// guarantees `k` fold rows indexed `0..k`, so a read whose row set does not
+/// match the scheme it declares refuses rather than answering `Ok` with a tally
+/// that describes fewer folds than the run claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_whose_fold_rows_were_lost_is_refused() {
+    let world = world().await;
+    let version = make_version(&world, &oracle_dsl()).await;
+    let outcome = run(&world, &request(&version)).await;
+
+    // Lift 0013's fold immutability rule and drop ONE fold row.
+    coach_support::with_trigger_lifted(
+        world.db.pool(),
+        "walk_forward_fold_no_delete",
+        &[&format!(
+            "DELETE FROM walk_forward_fold WHERE walk_forward_run_id = '{}' AND fold_index = 2",
+            outcome.run.id.as_str()
+        )],
+    )
+    .await;
+
+    let err = world
+        .runs
+        .get_walk_forward_run(&outcome.run.id)
+        .await
+        .expect_err("a run missing a fold row must refuse");
+    assert!(
+        err.to_string()
+            .contains("scheme k=6 but 5 fold row(s) are recorded"),
+        "the refusal names the scheme and the row set it found: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The version's latest run is not a fold (N1, review fix)
 // ---------------------------------------------------------------------------

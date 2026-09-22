@@ -554,8 +554,9 @@ impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<
         Ok(wf_id)
     }
 
-    // Fail-closed read (the `get_run` discipline): any corrupt column or a fold
-    // whose backtest_run row is gone is an `Err`, never a partial read.
+    // Fail-closed read (the `get_run` discipline): any corrupt column, a fold
+    // whose `backtest_run` row is gone or does not decode, or a fold-row set that
+    // does not match the scheme's `k` is an `Err`, never a partial read.
     async fn get_walk_forward_run(
         &self,
         id: &WalkForwardRunId,
@@ -585,8 +586,30 @@ impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<
         .await
         .map_err(|e| DataError::Db(e.to_string()))?;
 
+        // The write guarantees exactly `k` fold rows indexed `0..k`
+        // (`validate_draft`), so the read refuses a row set that does not match
+        // the scheme it declares. Without this a fold row lost to a partial
+        // external edit reads back as a SHORT run — scheme k=6 answered with five
+        // folds and a tally describing them — which is the partial read this
+        // read's contract forbids. The rows arrive `ORDER BY fold_index`, so
+        // position IS the index.
+        let scheme_k = usize::from(scheme.k());
+        if fold_rows.len() != scheme_k {
+            return Err(DataError::Db(format!(
+                "walk_forward_run `{id_str}`: scheme k={} but {} fold row(s) are recorded",
+                scheme.k(),
+                fold_rows.len()
+            )));
+        }
         let mut folds = Vec::with_capacity(fold_rows.len());
-        for f in &fold_rows {
+        for (position, f) in fold_rows.iter().enumerate() {
+            if i64::try_from(position).ok() != Some(f.fold_index) {
+                return Err(DataError::Db(format!(
+                    "walk_forward_run `{id_str}`: fold rows must be indexed 0..{scheme_k} in \
+                     order, but position {position} records index {}",
+                    f.fold_index
+                )));
+            }
             folds.push(fetch_fold(self, id_str, f).await?);
         }
 
