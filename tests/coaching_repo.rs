@@ -22,6 +22,8 @@
 //! `MIGRATOR`), `TempDir`-isolated, and deterministic through a `FakeClock`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod support;
+
 use chrono::{DateTime, SecondsFormat};
 use pulse::{
     AcceptFailureStage, BacktestRunId, CoachAcceptFailure, CoachAcceptanceRepository, CoachFailure,
@@ -35,6 +37,7 @@ use pulse::{
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
+use support::mcp::seeded_walk_forward_draft;
 use tempfile::TempDir;
 
 const NOW_MS: i64 = 1_756_425_600_000; // 2026-08-29T00:00:00Z
@@ -1468,6 +1471,64 @@ async fn the_in_memory_adapter_refuses_a_moved_certification_pointer() {
     repo.commit_acceptance(matching)
         .await
         .expect("a pointer that still matches commits");
+}
+
+/// The in-memory replay answers the child's CURRENT certification pointer, the
+/// way the SQLite replay does
+/// (`coach_walk_forward_gate::a_replay_reports_the_childs_current_pointer`): the
+/// accept writes the child's initial pointer in the same act as its row, and a
+/// later memory-side walk-forward save — the `record_certification` seam — is
+/// what a replay reports afterwards. Reading the accept-time field instead would
+/// certify stale replay behavior in every test built on this adapter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_replay_reports_the_childs_current_pointer() {
+    let repo = in_memory_repo();
+
+    // A gate-passing draft, so the accept mints the child's certification id.
+    let mut certified = prepared_acceptance();
+    certified.walk_forward = Some(seeded_walk_forward_draft(true));
+    let committed = repo
+        .commit_acceptance(certified)
+        .await
+        .expect("the commit lands");
+    let original = committed
+        .walk_forward_run_id
+        .clone()
+        .expect("the accept certifies the child");
+
+    // The first replay answers the accept's own certifying run.
+    let replay = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect("replaying an accept is idempotent");
+    assert_eq!(
+        replay
+            .walk_forward_run_id
+            .as_ref()
+            .map(WalkForwardRunId::as_str),
+        Some(original.as_str()),
+        "the child's pointer is the run the accept committed"
+    );
+
+    // A LATER walk-forward ON THE CHILD — the memory-side save moves the child's
+    // pointer — and the replay must answer with the new run, not the original.
+    repo.record_certification(
+        &committed.child_version_id,
+        WalkForwardRunId::new("wf-later"),
+    )
+    .expect("move the child's pointer");
+    let replay = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect("the second replay resolves");
+    assert_eq!(
+        replay
+            .walk_forward_run_id
+            .as_ref()
+            .map(WalkForwardRunId::as_str),
+        Some("wf-later"),
+        "the replay names the child's CURRENT pointer, not the accept's run"
+    );
 }
 
 /// The in-memory adapter refuses what the real one refuses: a failed accept on a
