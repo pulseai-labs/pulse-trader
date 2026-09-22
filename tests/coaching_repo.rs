@@ -603,11 +603,12 @@ async fn an_accept_whose_proposal_changed_underneath_it_is_refused() {
 async fn certify_ver_1(pool: &SqlitePool) {
     sqlx::query(
         "INSERT INTO walk_forward_run \
-         (id, strategy_version_id, created_at, scheme, rule, k, \
+         (id, seq, strategy_version_id, created_at, scheme, rule, k, \
           span_from_ms, span_to_ms, from_defaulted, engine_fingerprint, \
           folds_holding, folds_required, pooled_n, pooled_mean_r, \
           pooled_lower_bound, pass) \
-         VALUES ('wf-1', 'ver-1', '2026-08-29T01:00:00.000Z', 'rolling-oos/v1', 'wf-v1', \
+         VALUES ('wf-1', (SELECT COALESCE(MAX(seq), 0) + 1 FROM walk_forward_run), \
+                 'ver-1', '2026-08-29T01:00:00.000Z', 'rolling-oos/v1', 'wf-v1', \
                  6, 0, 1_000, 1, 'fp-1', 4, 4, 80, '0.5', 0.2, 1)",
     )
     .execute(pool)

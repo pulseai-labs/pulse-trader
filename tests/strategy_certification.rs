@@ -123,8 +123,9 @@ async fn world() -> World {
 }
 
 /// Persist a synthetic `k=2` draft (shared `seeded_walk_forward_draft`) against
-/// the version at `at_ms` — the injected clock makes the `(created_at, id)`
-/// pointer order deterministic.
+/// the version at `at_ms` — the injected clock pins `created_at`, and `seq`
+/// minted at insert makes the `(created_at, seq)` pointer order follow save
+/// order even inside one millisecond.
 async fn save_wf(world: &World, pass: bool, at_ms: i64) -> pulse::WalkForwardRunId {
     SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(at_ms))
         .save_walk_forward_run(&world.version_id, &seeded_walk_forward_draft(pass))
@@ -208,6 +209,41 @@ async fn a_later_failing_run_decertifies_on_every_read() {
             "{surface}: a newer failing run de-certifies"
         );
     }
+}
+
+/// Two saves inside ONE millisecond — the tie case the `seq` tiebreak exists
+/// for (F3): under the old `(created_at, id)` rule the second save's random
+/// UUID could sort before the first's and be refused as a backward move. `seq`
+/// minted `MAX(seq)+1` at insert makes the later save strictly later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_millisecond_saves_advance_the_pointer_in_save_order() {
+    let world = world().await;
+    let at = 1_756_512_000_000;
+
+    let first = save_wf(&world, true, at).await;
+    let second = save_wf(&world, false, at).await;
+    assert_ne!(first, second, "two distinct runs at one timestamp");
+
+    // The pointer names the SECOND save — insertion order won, whatever the
+    // two ids' lexical order happened to be.
+    let version = world.get().await;
+    assert_eq!(
+        version
+            .latest_walk_forward_run_id
+            .as_ref()
+            .map(|p| p.as_str()),
+        Some(second.as_str()),
+        "the later same-millisecond save advances the pointer"
+    );
+    assert!(!version.certified, "the newer run's verdict rules");
+
+    // And the minted seqs really are the insertion sequence the trigger orders
+    // by — pinned, not assumed.
+    let seqs: Vec<i64> = sqlx::query_scalar("SELECT seq FROM walk_forward_run ORDER BY seq")
+        .fetch_all(world.pool())
+        .await
+        .expect("read the seq column");
+    assert_eq!(seqs, vec![1, 2], "seq mints in insertion order");
 }
 
 /// iv. `certified` follows the JOIN's `pass`, never the pointer alone: a

@@ -29,6 +29,7 @@
 -- ---------------------------------------------------------------------------
 CREATE TABLE walk_forward_run (
   id                   TEXT PRIMARY KEY NOT NULL,
+  seq                  INTEGER NOT NULL UNIQUE,       -- insertion order, minted MAX(seq)+1 inside the write tx — the created_at tiebreak 0014's pointer rule shares (a random UUID is not a clock)
   strategy_version_id  TEXT NOT NULL REFERENCES strategy_version(id),
   created_at           TEXT NOT NULL,                 -- injected Clock (RFC3339 UTC)
   scheme               TEXT NOT NULL,                 -- 'rolling-oos/v1'

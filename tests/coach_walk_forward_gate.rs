@@ -48,7 +48,7 @@ use tempfile::TempDir;
 /// A pinned instant, so `created_at` is deterministic everywhere.
 const NOW_MS: i64 = 1_756_425_600_000; // 2026-08-29T00:00:00Z
 
-/// The certifying run's timestamp — the pointer orders on `(created_at, id)`.
+/// The certifying run's timestamp — the pointer orders on `(created_at, seq)`.
 const CERTIFY_MS: i64 = 1_756_512_000_000; // 2026-08-30T00:00:00Z
 
 /// The one-and-only request fingerprint the fixture session claims under.

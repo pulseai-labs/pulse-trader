@@ -202,15 +202,18 @@ async fn seed_windowed_run(pool: &SqlitePool, run: &str, membership: Option<(&st
     .expect("seed windowed backtest_run");
 }
 
-/// One `walk_forward_run` parent row owned by `ver-1`.
+/// One `walk_forward_run` parent row owned by `ver-1`. `seq` mints the way the
+/// product mints it — `MAX(seq)+1` at insert — so seed order IS chronological
+/// order under `0014`'s `(created_at, seq)` rule.
 async fn seed_walk_forward_run(pool: &SqlitePool, run: &str) {
     sqlx::query(
         "INSERT INTO walk_forward_run \
-         (id, strategy_version_id, created_at, scheme, rule, k, \
+         (id, seq, strategy_version_id, created_at, scheme, rule, k, \
           span_from_ms, span_to_ms, from_defaulted, engine_fingerprint, \
           folds_holding, folds_required, pooled_n, pooled_mean_r, \
           pooled_lower_bound, pass) \
-         VALUES (?1, 'ver-1', '2026-08-29T00:00:00.000Z', 'rolling-oos/v1', 'wf-v1', 6, \
+         VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM walk_forward_run), \
+                 'ver-1', '2026-08-29T00:00:00.000Z', 'rolling-oos/v1', 'wf-v1', 6, \
                  1740787200000, 1743379200000, 1, 'fp-1', \
                  0, 4, 0, '0', 0.0, 0)",
     )

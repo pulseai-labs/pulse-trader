@@ -11,7 +11,7 @@
 -- write-once for every 0001 column — the pointer is the one mutable cell, and
 -- `strategy_version_certification_owner` below is what makes its mutability
 -- honest: it may only name a walk-forward run OF THIS VERSION, and it may only
--- advance in (created_at, id) order. A version cannot reach back to an earlier
+-- advance in (created_at, seq) order. A version cannot reach back to an earlier
 -- run, cannot borrow another version's run, and (with the product never writing
 -- NULL) cannot be quietly un-certified by clearing the cell.
 --
@@ -65,8 +65,11 @@ BEGIN
 END;
 
 -- The pointer's own law: this version's runs only, and strictly newer than the
--- run it replaces (`created_at`, then `id` — the same order the read side and
--- `walk_forward_run`'s chronology share). A NULL NEW is allowed only because
+-- run it replaces (`created_at`, then `seq` — the same order the read side and
+-- `walk_forward_run`'s chronology share; `seq` is the monotonic insertion
+-- sequence 0013 mints, so two runs in one millisecond still order by which
+-- saved first — a random UUID tiebreak would refuse a legitimate later save).
+-- A NULL NEW is allowed only because
 -- 0014 introduces the column NULL on every pre-existing row; the product never
 -- writes NULL over a set pointer — and this trigger refuses it as a backward
 -- move anyway, since certification is revoked by a NEWER failing run, not by
@@ -84,7 +87,7 @@ BEGIN
     THEN RAISE(ABORT, 'strategy_version: latest_walk_forward_run_id must name a walk-forward run of this version')
   END;
   -- Once set, the pointer only advances: clearing it, or pointing it at a run
-  -- that is not strictly later in (created_at, id) order, is refused.
+  -- that is not strictly later in (created_at, seq) order, is refused.
   SELECT CASE
     WHEN OLD.latest_walk_forward_run_id IS NOT NULL
      AND (NEW.latest_walk_forward_run_id IS NULL
@@ -94,7 +97,7 @@ BEGIN
               JOIN walk_forward_run o ON o.id = OLD.latest_walk_forward_run_id
              WHERE n.id = NEW.latest_walk_forward_run_id
                AND (n.created_at > o.created_at
-                    OR (n.created_at = o.created_at AND n.id > o.id))))
+                    OR (n.created_at = o.created_at AND n.seq > o.seq))))
     THEN RAISE(ABORT, 'strategy_version: latest_walk_forward_run_id only advances')
   END;
 END;

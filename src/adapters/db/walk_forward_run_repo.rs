@@ -43,13 +43,18 @@ async fn insert_walk_forward_run_row(
     let pooled_n = i64::try_from(draft.verdict.pooled.n)
         .map_err(|e| DataError::Db(format!("pooled_n overflows i64: {e}")))?;
     let pooled_mean_r = decimal_text(draft.verdict.pooled.mean_r);
+    // `seq` mints inside the statement: `MAX(seq)+1` under the write lock makes
+    // it the monotonic insertion sequence `0014`'s pointer rule orders by —
+    // two saves in one `created_at` millisecond order by which committed the
+    // row first, never by the random id's lexical luck.
     sqlx::query!(
         "INSERT INTO walk_forward_run \
-         (id, strategy_version_id, created_at, scheme, rule, k, \
+         (id, seq, strategy_version_id, created_at, scheme, rule, k, \
           span_from_ms, span_to_ms, from_defaulted, engine_fingerprint, \
           folds_holding, folds_required, pooled_n, pooled_mean_r, \
           pooled_lower_bound, pass) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM walk_forward_run), \
+                 ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         wf_run_id,
         version_id_str,
         created_at,
