@@ -37,6 +37,19 @@ async fn applied_versions(pool: &SqlitePool) -> BTreeSet<i64> {
     versions.into_iter().collect()
 }
 
+/// Assert every version in `versions` is present in the applied set — the
+/// "rides along in the same run" checks this binary shares, named once so a new
+/// migration in that run is one more number here rather than another four-line
+/// assertion block inside the test.
+fn assert_all_rode_along(applied: &BTreeSet<i64>, versions: &[i64]) {
+    for version in versions {
+        assert!(
+            applied.contains(version),
+            "{version:04} rides along in the same run: {applied:?}"
+        );
+    }
+}
+
 /// Whether a named object exists in `sqlite_master`.
 async fn object_present(pool: &SqlitePool, kind: &str, name: &str) -> bool {
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2")
@@ -266,34 +279,7 @@ async fn migration_0005_applies_to_a_database_already_at_0007() {
     // withheld; asserting
     // `Some(7)` here would now be asserting that they did not run, which is a
     // different (and false) claim.
-    assert!(
-        applied.contains(&8),
-        "0008 rides along in the same run: {applied:?}"
-    );
-    assert!(
-        applied.contains(&9),
-        "0009 rides along in the same run: {applied:?}"
-    );
-    assert!(
-        applied.contains(&10),
-        "0010 rides along in the same run: {applied:?}"
-    );
-    assert!(
-        applied.contains(&11),
-        "0011 rides along in the same run: {applied:?}"
-    );
-    assert!(
-        applied.contains(&12),
-        "0012 rides along in the same run: {applied:?}"
-    );
-    assert!(
-        applied.contains(&13),
-        "0013 rides along in the same run: {applied:?}"
-    );
-    assert!(
-        applied.contains(&14),
-        "0014 rides along in the same run: {applied:?}"
-    );
+    assert_all_rode_along(&applied, &[8, 9, 10, 11, 12, 13, 14]);
     assert_eq!(
         applied.iter().copied().max(),
         Some(14),
