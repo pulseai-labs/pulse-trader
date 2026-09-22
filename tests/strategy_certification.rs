@@ -22,6 +22,7 @@ use pulse::{
     SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyRepository, StrategyVersion, VersionId,
     WalkForwardRunId, WalkForwardRunRepository,
 };
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use support::mcp::{seeded_walk_forward_draft, seeded_walk_forward_draft_k};
 use tempfile::TempDir;
@@ -512,6 +513,57 @@ async fn a_draft_whose_fold_run_window_differs_from_its_fold_is_refused() {
     assert!(
         err.to_string().contains("fold 0 was run over"),
         "the refusal names the fold and the window it was given: {err}"
+    );
+
+    // Fail closed: nothing persisted, the version still uncertified.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_run")
+        .fetch_one(world.pool())
+        .await
+        .expect("count walk-forward runs");
+    assert_eq!(count, 0, "a refused draft wrote no run row");
+    let version = world.get().await;
+    assert!(
+        version.latest_walk_forward_run_id.is_none() && !version.certified,
+        "a refused draft cannot advance certification"
+    );
+}
+
+/// R9: every fold is the SAME EXPERIMENT. The gate checked each fold's fingerprint
+/// and its trade-derived verdict, but never required the provenance inputs to
+/// agree — so a caller of the public repository port could combine different
+/// pairs, snapshot versions, timeframes, cost settings or starting equities into
+/// one passing run and advance certification, a run that is not one walk-forward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_whose_folds_are_different_experiments_is_refused() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    // A different TAKER FEE on one fold — a valid value, a different experiment.
+    let mut mixed = seeded_walk_forward_draft(true);
+    mixed.folds[1].inputs.taker_fee_bps = Decimal::new(7, 0);
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &mixed)
+        .await
+        .expect_err("folds that disagree on an input must refuse");
+    assert!(
+        err.to_string()
+            .contains("fold 1 disagrees with fold 0 on the taker fee"),
+        "the refusal names the fold and the field: {err}"
+    );
+
+    // And a different STARTING EQUITY — the other named field, and not part of
+    // `inputs` at all.
+    let mut revalued = seeded_walk_forward_draft(true);
+    revalued.folds[1].starting_equity = Decimal::new(5_000, 0);
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &revalued)
+        .await
+        .expect_err("folds with different starting equities must refuse");
+    assert!(
+        err.to_string()
+            .contains("fold 1 disagrees with fold 0 on the starting equity"),
+        "the refusal names the fold and the field: {err}"
     );
 
     // Fail closed: nothing persisted, the version still uncertified.

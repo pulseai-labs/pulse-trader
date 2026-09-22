@@ -333,6 +333,9 @@ struct RunRow {
 /// - every fold's RUN was given the fold's own window — `inputs.window` IS
 ///   `fold.window`, the interval the persisted `backtest_run` names as its
 ///   provenance;
+/// - every fold is the SAME EXPERIMENT (R9): pair, both snapshot selections,
+///   the taker fee, the slippage, the funding configuration and the starting
+///   equity agree across folds, so only the window (and its lead-in) differs;
 /// - every fold's verdict IS the verdict of the trades that fold run carries —
 ///   its `realized_r` series through `FoldVerdict::from_rs`, the same rule the
 ///   app path applies and the read re-derives;
@@ -349,16 +352,16 @@ struct RunRow {
 /// positive bound and `holds = true`, agree with itself everywhere, and be
 /// persisted into a certification whose folds show no trades. Deriving makes the
 /// trades the only evidence, so a verdict no trade supports is refused.
-fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
+/// The SCHEME is revalidated, not trusted (R5). `FoldScheme::RollingOos` is a
+/// public variant, so a caller can hand the gate a `k` the domain refuses to
+/// construct — `rolling_oos(13)` cannot return it — and the row such a draft
+/// writes is one the READ rejects (`decode_scheme_and_rule` re-derives the scheme
+/// through that same constructor) while `get_version` still derives `certified`
+/// from the stored `pass`. Reconstructing it refuses the draft before a single
+/// row exists, so the write path and the read path cannot disagree about which
+/// schemes exist.
+fn validate_scheme(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
     let incoherent = |what: String| DataError::Db(format!("walk-forward draft refused: {what}"));
-    // The SCHEME is revalidated, not trusted (R5). `FoldScheme::RollingOos` is a
-    // public variant, so a caller can hand this gate a `k` the domain refuses to
-    // construct — `rolling_oos(13)` cannot return it — and the row such a draft
-    // writes is one the READ rejects (`decode_scheme_and_rule` re-derives the
-    // scheme through that same constructor) while `get_version` still derives
-    // `certified` from the stored `pass`. Reconstructing it here refuses the
-    // draft before a single row exists, so the write path and the read path
-    // cannot disagree about which schemes exist.
     let reconstructed = FoldScheme::rolling_oos(i64::from(draft.scheme.k())).map_err(|e| {
         incoherent(format!(
             "scheme `{}` is not constructible: {e}",
@@ -371,6 +374,81 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
             draft.scheme.name()
         )));
     }
+    Ok(())
+}
+
+/// The fold's verdict DERIVED from the trades its run actually carries (R1), by
+/// the same rule the app path and the read use: every trade's `realized_r`
+/// through [`FoldVerdict::from_rs`]. Cross-checking the caller's `n` and
+/// `lower_bound` against a `holds` flag left the numbers themselves unattested,
+/// so a fold run with ZERO trades could claim `n = 20`, a positive bound and
+/// `holds = true` and be persisted into a certification. Returns the fold's
+/// series with the verdict — the series is what the pooled verdict is assessed
+/// over (L5).
+fn derive_fold(
+    fold: &crate::domain::backtest::WalkForwardFoldDraft,
+) -> Result<(Vec<rust_decimal::Decimal>, FoldVerdict), DataError> {
+    let rs: Vec<rust_decimal::Decimal> = fold.result.trades.iter().map(|t| t.realized_r).collect();
+    let derived = FoldVerdict::from_rs(&rs);
+    if derived != fold.verdict {
+        return Err(DataError::Db(format!(
+            "walk-forward draft refused: fold {} records n={} mean_r={} lower_bound={} holds={} \
+             but its {} trade(s) derive n={} mean_r={} lower_bound={} holds={}",
+            fold.index,
+            fold.verdict.n,
+            fold.verdict.mean_r,
+            fold.verdict.lower_bound,
+            fold.verdict.holds,
+            rs.len(),
+            derived.n,
+            derived.mean_r,
+            derived.lower_bound,
+            derived.holds
+        )));
+    }
+    Ok((rs, derived))
+}
+
+/// What `fold` disagrees with `first` about, if anything (R9) — the experiment's
+/// parameters, which every fold shares. The window is the one thing a fold may
+/// differ in, and the lead-in start is per-fold by construction
+/// (`apply_lead_in_window` derives it from the series that fold loaded), so both
+/// are excluded. Returns the field's name for the refusal.
+fn experiment_disagreement(
+    first: &crate::domain::backtest::WalkForwardFoldDraft,
+    fold: &crate::domain::backtest::WalkForwardFoldDraft,
+) -> Option<&'static str> {
+    [
+        ("the pair", first.inputs.pair != fold.inputs.pair),
+        (
+            "the primary snapshot",
+            first.inputs.primary != fold.inputs.primary,
+        ),
+        ("the htf snapshot", first.inputs.htf != fold.inputs.htf),
+        (
+            "the taker fee",
+            first.inputs.taker_fee_bps != fold.inputs.taker_fee_bps,
+        ),
+        (
+            "the slippage",
+            first.inputs.slippage_bps != fold.inputs.slippage_bps,
+        ),
+        (
+            "the funding configuration",
+            first.inputs.funding != fold.inputs.funding,
+        ),
+        (
+            "the starting equity",
+            first.starting_equity != fold.starting_equity,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(what, differs)| differs.then_some(what))
+}
+
+fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
+    let incoherent = |what: String| DataError::Db(format!("walk-forward draft refused: {what}"));
+    validate_scheme(draft)?;
     let k = draft.scheme.k();
     if draft.folds.len() != usize::from(k) {
         return Err(incoherent(format!(
@@ -417,32 +495,15 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
                 fold.index
             )));
         }
-        // The fold's verdict is DERIVED from the trades its run actually carries
-        // (R1), by the same rule the app path and the read use: every trade's
-        // `realized_r`, through `FoldVerdict::from_rs`. Cross-checking the
-        // caller's `n` and `lower_bound` against a `holds` flag was not enough —
-        // those numbers are the caller's too, so a fold run with ZERO trades
-        // could claim `n = 20`, a positive bound and `holds = true` and still be
-        // persisted into a certification. Re-deriving makes the trades the only
-        // evidence, so a verdict no trade supports is refused.
-        let rs: Vec<_> = fold.result.trades.iter().map(|t| t.realized_r).collect();
-        let derived = FoldVerdict::from_rs(&rs);
-        if derived != fold.verdict {
+        if let Some(what) = experiment_disagreement(&draft.folds[0], fold) {
             return Err(incoherent(format!(
-                "fold {} records n={} mean_r={} lower_bound={} holds={} but its {} trade(s) \
-                 derive n={} mean_r={} lower_bound={} holds={}",
-                fold.index,
-                fold.verdict.n,
-                fold.verdict.mean_r,
-                fold.verdict.lower_bound,
-                fold.verdict.holds,
-                rs.len(),
-                derived.n,
-                derived.mean_r,
-                derived.lower_bound,
-                derived.holds
+                "fold {} disagrees with fold 0 on {what}: every fold of one \
+                 walk-forward is the same experiment",
+                fold.index
             )));
         }
+
+        let (rs, derived) = derive_fold(fold)?;
         pooled_rs.extend_from_slice(&rs);
         derived_folds.push(derived);
         cursor = fold.window.to_ms;
