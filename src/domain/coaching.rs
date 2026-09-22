@@ -48,7 +48,7 @@ use rust_decimal::Decimal;
 
 use super::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RegimeBreakdown, SummaryStats,
-    Trade,
+    Trade, WalkForwardRunDraft, WalkForwardRunId,
 };
 use super::dsl::{Mutation, MutationError, StrategyDsl};
 use super::llm_call::LlmCallId;
@@ -334,6 +334,11 @@ pub enum AcceptFailureStage {
     Compile,
     /// Running the deterministic backtest over the loaded snapshots.
     Backtest,
+    /// The r2.s3.w4 certification gate: walking the candidate child forward
+    /// under the certified parent's certifying scheme and span. Only reachable
+    /// when the coached version is certified — an uncertified parent has no
+    /// gate and can never record this stage.
+    WalkForward,
     /// The final write itself.
     Persist,
 }
@@ -358,6 +363,7 @@ impl AcceptFailureStage {
             Self::LoadSnapshots => "load_snapshots",
             Self::Compile => "compile",
             Self::Backtest => "backtest",
+            Self::WalkForward => "walk_forward",
             Self::Persist => "persist",
         }
     }
@@ -776,15 +782,28 @@ pub struct PreparedCoachAcceptance {
     pub child_dsl: StrategyDsl,
     /// The deterministic re-backtest of that candidate.
     pub prepared_run: PreparedBacktest,
+    /// The candidate's certification run, already computed and not yet
+    /// persisted (r2.s3.w4): `Some` exactly when the coached parent is
+    /// certified and the gate's walk-forward PASSED — a failed gate records an
+    /// `AcceptFailureStage::WalkForward` refusal and never reaches this struct.
+    /// The accepting transaction persists it beside the child and moves the
+    /// child's certification pointer, so the child is born certified.
+    pub walk_forward: Option<WalkForwardRunDraft>,
 }
 
-/// What one committed accept produced: the minted child and its re-backtest run.
+/// What one committed accept produced: the minted child, its re-backtest run,
+/// and its certification run when the gate produced one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedCoachOutcome {
     /// The child `StrategyVersion` the accept minted.
     pub child_version_id: VersionId,
     /// The run of that child version.
     pub accepted_run_id: BacktestRunId,
+    /// The walk-forward run certifying the child — `Some` iff the accept's
+    /// certification gate ran and passed (r2.s3.w4). On an idempotent replay
+    /// this is the child's CURRENT `latest_walk_forward_run_id`: a later
+    /// walk-forward may have advanced the pointer since the accept.
+    pub walk_forward_run_id: Option<WalkForwardRunId>,
 }
 
 /// Fixed-size MFE/MAE aggregates over a run's trades.

@@ -44,6 +44,8 @@ function version(
   createdBy = "human",
   agentName: string | null = null,
   hypothesis: string | null = null,
+  certified = false,
+  latestWalkForwardRunId: string | null = null,
 ): LibraryVersion {
   return {
     id,
@@ -52,6 +54,8 @@ function version(
     createdBy,
     agentName,
     hypothesis,
+    certified,
+    latestWalkForwardRunId,
     dsl: {
       name: "RSI Oversold",
       direction: "long",
@@ -337,6 +341,89 @@ describe("LibraryScreen (C1 — provenance and hypothesis, r2.s1.w4)", () => {
     const inPane = within(pane as HTMLElement);
     await inPane.findByText("Alpha Wave");
     expect(inPane.queryByText("Hypothesis")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r2.s3.w4 — d22: the certification badge + the pane's certification line
+// ---------------------------------------------------------------------------
+
+/** The seeded tree with v-alpha-2 certified by a walk-forward run — the shape
+ * the Library serves after the accept gate (or a direct walk-forward) lands a
+ * passing run on the version. */
+const CERTIFIED: LibraryOverview = {
+  strategies: [
+    {
+      id: "strat-alpha",
+      name: "Alpha Wave",
+      createdAt: "2026-08-01T09:00:00.000Z",
+      pinnedVersionId: null,
+      versions: [
+        version("v-alpha-1", null, stats("+0.3R", "46.2%", 38)),
+        version(
+          "v-alpha-2",
+          "v-alpha-1",
+          stats("+0.42R", "48.3%", 64),
+          "+0.12R",
+          "human",
+          null,
+          null,
+          true,
+          "wf-run-7f3a9c21",
+        ),
+        version("v-alpha-3", "v-alpha-2", null),
+      ],
+    },
+  ],
+};
+
+describe("LibraryScreen (d22 — certification badge, r2.s3.w4)", () => {
+  it("renders the certified badge on the certified node and nothing on the others", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap");
+    expect(tree).not.toBeNull();
+    const inTree = within(tree as HTMLElement);
+
+    const certifiedNode = inTree.getByText("v2").closest(".vnode") as HTMLElement;
+    expect(within(certifiedNode).getByText("certified")).toBeTruthy();
+
+    for (const label of ["v1", "v3"]) {
+      const node = inTree.getByText(label).closest(".vnode") as HTMLElement;
+      expect(within(node).queryByText("certified")).toBeNull();
+    }
+  });
+
+  it("the details pane reads 'certified' and names the walk-forward run", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v2"));
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const inPane = within(pane);
+    expect(await inPane.findByText("Certification")).toBeTruthy();
+    expect(inPane.getByText("certified")).toBeTruthy();
+    expect(inPane.getByText("wf-run-7f3a9c21")).toBeTruthy();
+  });
+
+  it("the details pane reads 'uncertified' with no run id when the pointer is absent", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v1"));
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const inPane = within(pane);
+    expect(await inPane.findByText("Certification")).toBeTruthy();
+    expect(inPane.getByText("uncertified")).toBeTruthy();
+    expect(inPane.queryByText("wf-run-7f3a9c21")).toBeNull();
   });
 });
 

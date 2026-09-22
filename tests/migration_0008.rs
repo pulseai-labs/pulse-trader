@@ -1939,6 +1939,7 @@ fn prepared(session: &str) -> PreparedCoachAcceptance {
         expected_mutation: a_proposal().mutation,
         child_dsl: child_dsl(),
         prepared_run: prepared_backtest(),
+        walk_forward: None,
     }
 }
 

@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Mutex;
 
-use crate::domain::backtest::BacktestRunId;
+use crate::domain::backtest::{BacktestRunId, WalkForwardRunId};
 use crate::domain::strategy::{CreatedBy, StrategyId, VersionId};
 use crate::domain::{
     AcceptedCoachOutcome, Clock, CoachAcceptFailure, CoachAcceptanceRepository, CoachingSessionId,
@@ -78,6 +78,10 @@ pub struct MemoryAcceptedChild {
     pub child_dsl: StrategyDsl,
     /// The deterministic re-backtest that was committed with it.
     pub prepared_run: PreparedBacktest,
+    /// The certification run id minted for a gate-passing accept (r2.s3.w4).
+    /// The in-memory store keeps no walk-forward table, so this is the
+    /// accept-time pointer — the best truth the model carries.
+    pub walk_forward_run_id: Option<WalkForwardRunId>,
 }
 
 /// The mutable half, behind one lock.
@@ -174,6 +178,26 @@ fn open_proposal<'a>(
         SessionOutcome::Pending | SessionOutcome::Failed { .. } => Err(DataError::Db(format!(
             "coaching session `{session_id}`: the turn produced no proposal to accept"
         ))),
+    }
+}
+
+/// The idempotent-retry read of an already-accepted pair — the certification id
+/// rides along from the stored child, matching the SQLite replay's current
+/// pointer read.
+fn replayed_outcome(
+    state: &MemoryState,
+    child_version_id: &VersionId,
+    accepted_run_id: &BacktestRunId,
+) -> AcceptedCoachOutcome {
+    let walk_forward_run_id = state
+        .children
+        .iter()
+        .find(|c| c.child_version_id == *child_version_id)
+        .and_then(|c| c.walk_forward_run_id.clone());
+    AcceptedCoachOutcome {
+        child_version_id: child_version_id.clone(),
+        accepted_run_id: accepted_run_id.clone(),
+        walk_forward_run_id,
     }
 }
 
@@ -279,10 +303,7 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
                 child_version_id,
                 accepted_run_id,
             } => {
-                return Ok(AcceptedCoachOutcome {
-                    child_version_id: child_version_id.clone(),
-                    accepted_run_id: accepted_run_id.clone(),
-                });
+                return Ok(replayed_outcome(&state, child_version_id, accepted_run_id));
             }
             Disposition::Rejected => {
                 return Err(DataError::Db(format!(
@@ -299,10 +320,15 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
             ))
         })?;
 
-        // Mint in the SAME order the SQLite adapter does — child, then run — so a
-        // test written against one reads the same ids from the other.
+        // Mint in the SAME order the SQLite adapter does — child, run, then the
+        // certification id when a gate-passing draft came through — so a test
+        // written against one reads the same ids from the other.
         let child_version_id = VersionId::new(self.ids.next_id());
         let accepted_run_id = BacktestRunId::new(self.ids.next_id());
+        let walk_forward_run_id = acceptance
+            .walk_forward
+            .as_ref()
+            .map(|_| WalkForwardRunId::new(self.ids.next_id()));
         let created_at = self.now_rfc3339()?;
 
         state.children.push(MemoryAcceptedChild {
@@ -315,6 +341,7 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
             created_at,
             child_dsl: acceptance.child_dsl,
             prepared_run: acceptance.prepared_run,
+            walk_forward_run_id: walk_forward_run_id.clone(),
         });
 
         let proposal = open_proposal(&id, state.turns.get_mut(&id))?;
@@ -328,6 +355,7 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
         Ok(AcceptedCoachOutcome {
             child_version_id,
             accepted_run_id,
+            walk_forward_run_id,
         })
     }
 }

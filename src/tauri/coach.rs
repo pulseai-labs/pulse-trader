@@ -313,6 +313,10 @@ pub struct AcceptedCoachDto {
     pub after: Option<SummaryDto>,
     /// Whether that read back succeeded.
     pub read_back: ReadBackDto,
+    /// The walk-forward run that certified the child, when the parent was
+    /// certified and the gate ran (r2.s3.w4). `None` on the uncertified-parent
+    /// path and on replays of pre-0014 accepts.
+    pub walk_forward_run_id: Option<String>,
 }
 
 /// The durable result of one decision.
@@ -552,6 +556,10 @@ fn accepted_dto(accepted: &AcceptedCoachResult) -> Result<AcceptedCoachDto, BusE
                 failure: failure.to_string(),
             },
         },
+        walk_forward_run_id: accepted
+            .walk_forward_run_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
     })
 }
 

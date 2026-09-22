@@ -334,7 +334,11 @@ pub struct WalkForwardRun {
 /// persists: the run's provenance + verdict, and per fold the same pieces
 /// [`save_run`](crate::domain::port::BacktestRunRepository::save_run) persists
 /// for an ordinary windowed run.
-#[derive(Debug)]
+///
+/// `Clone`/`PartialEq` are for [`PreparedCoachAcceptance`](crate::domain::PreparedCoachAcceptance)
+/// (r2.s3.w4), which carries a computed-but-unpersisted draft across the accept
+/// boundary — the payload has to be cloneable and comparable like its siblings.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WalkForwardRunDraft {
     /// The scheme the folds were cut under.
     pub scheme: FoldScheme,
@@ -355,7 +359,7 @@ pub struct WalkForwardRunDraft {
 /// One fold's persistable payload — the window and verdict it is recorded
 /// under, plus the ordinary-run pieces `insert_run_row`/`insert_trade_rows`
 /// already know how to write.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WalkForwardFoldDraft {
     /// The fold's position in the scheme.
     pub index: u8,

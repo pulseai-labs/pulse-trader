@@ -19,11 +19,12 @@ use std::process::Stdio;
 
 use pulse::{
     BacktestConfig, BacktestInputs, BacktestRequest, BacktestResult, BacktestRunId,
-    BacktestRunRepository, BinanceAdapter, CandleStore, CreatedBy, DataVersion, Db, Direction,
-    EngineFingerprint, EquityCurve, ExitReason, Fill, FundingConfig, MIGRATOR, NewVersion, Pair,
-    Regime, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
-    SqliteStrategyRepo, StrategyId, StrategyRepository, SummaryStats, Timeframe, Trade,
-    TradeSource, VersionId, run_version_backtest,
+    BacktestRunRepository, BinanceAdapter, CandleStore, CandleWindow, CreatedBy, DataVersion, Db,
+    Direction, EngineFingerprint, EquityCurve, ExitReason, Fill, FoldScheme, FoldVerdict,
+    FundingConfig, MIGRATOR, NewVersion, Pair, Regime, RegimeBreakdown, RunVerdict,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId,
+    StrategyRepository, SummaryStats, Timeframe, Trade, TradeSource, VerdictRule, VersionId,
+    WalkForwardFoldDraft, WalkForwardRunDraft, fold_windows, run_version_backtest,
 };
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
@@ -232,6 +233,73 @@ pub async fn seed(db: &Db) -> Seed {
     let (parent_id, child_id) = seed_versions(db).await;
     let run_id = seed_run_with_inputs(db, &child_id, &seeded_inputs()).await;
     (parent_id, child_id, run_id)
+}
+
+/// A synthetic `k=2` walk-forward draft whose recorded verdict is `pass`
+/// (r2.s3.w4). The fixture cannot yield a passing verdict honestly, so the
+/// certification seam — the pointer plus the recorded `pass` column — is what
+/// a synthetic draft exercises: `save_walk_forward_run` persists the recorded
+/// verdict, and the derived `certified` reads it back through the JOIN.
+pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
+    let span = CandleWindow::new(1_735_702_200_000, 1_738_000_000_000).unwrap();
+    let fold_verdict = FoldVerdict {
+        n: 32,
+        mean_r: Decimal::new(45, 2),
+        lower_bound: if pass { 0.21 } else { -0.4 },
+        holds: pass,
+    };
+    let folds = fold_windows(&span, 2)
+        .iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let trade = seeded_trade();
+            let summary = SummaryStats::from_trades(
+                std::slice::from_ref(&trade),
+                trade.realized_pnl,
+                trade.fees_total,
+                trade.funding_total,
+                &EquityCurve::default(),
+            );
+            let mut inputs = seeded_inputs();
+            inputs.window = Some(window.clone());
+            inputs.lead_in_from_ms = Some(window.from_ms);
+            WalkForwardFoldDraft {
+                index: u8::try_from(i).unwrap(),
+                window: window.clone(),
+                verdict: fold_verdict.clone(),
+                inputs,
+                result: BacktestResult {
+                    trades: vec![trade.clone()],
+                    net_pnl: trade.realized_pnl,
+                    fees_total: trade.fees_total,
+                    funding_total: trade.funding_total,
+                    slippage_total: trade.slippage_total,
+                    regime_breakdown: RegimeBreakdown::new(),
+                    skipped_entries: SkippedEntryCounts::new(),
+                    open_position: None,
+                    engine_fingerprint: EngineFingerprint::current(),
+                    summary: summary.clone(),
+                    equity_curve: EquityCurve::default(),
+                },
+                summary,
+                starting_equity: Decimal::new(10_000, 0),
+            }
+        })
+        .collect();
+    WalkForwardRunDraft {
+        scheme: FoldScheme::rolling_oos(2).unwrap(),
+        rule: VerdictRule::WfV1,
+        span,
+        from_defaulted: false,
+        engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
+        verdict: RunVerdict {
+            folds_holding: if pass { 2 } else { 0 },
+            folds_required: 2,
+            pooled: fold_verdict,
+            pass,
+        },
+        folds,
+    }
 }
 
 /// Run a REAL backtest on `version_id` over the copied fixture store, in-test,

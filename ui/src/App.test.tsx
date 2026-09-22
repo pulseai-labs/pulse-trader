@@ -156,6 +156,8 @@ const ONE_VERSION = {
           createdBy: "human",
           agentName: null,
           hypothesis: null,
+          certified: false,
+          latestWalkForwardRunId: null,
         },
       ],
     },

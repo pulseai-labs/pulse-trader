@@ -419,18 +419,20 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     // which withholds `0008` precisely so it can still state it.
     // r2.s1.w1: `0009` rides along too, and G1's `0010` as well, moving the
     // maximum to 10; r2.s2.w2's `0011` rides along likewise, to 11;
-    // r2.s3.w2's `0012` (window lead-in) moves it to 12; and r2.s3.w3's `0013`
-    // (walk-forward run kind) moves it to 13.
+    // r2.s3.w2's `0012` (window lead-in) moves it to 12; r2.s3.w3's `0013`
+    // (walk-forward run kind) moves it to 13; and r2.s3.w4's `0014`
+    // (certification pointer) moves it to 14.
     assert!(applied.contains(&8), "0008 rides along: {applied:?}");
     assert!(applied.contains(&9), "0009 rides along: {applied:?}");
     assert!(applied.contains(&10), "0010 rides along: {applied:?}");
     assert!(applied.contains(&11), "0011 rides along: {applied:?}");
     assert!(applied.contains(&12), "0012 rides along: {applied:?}");
     assert!(applied.contains(&13), "0013 rides along: {applied:?}");
+    assert!(applied.contains(&14), "0014 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(13),
-        "0006 is recorded at its own version, below the maximum 0013 sets"
+        Some(14),
+        "0006 is recorded at its own version, below the maximum 0014 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;

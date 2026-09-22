@@ -191,10 +191,13 @@ pub enum WalkForwardAppError {
 // The use case
 // ---------------------------------------------------------------------------
 
-/// What the blocking section produces.
-struct WalkForwardBlockingOutput {
+/// What the blocking section produces. `pub(crate)` for r2.s3.w4's coach
+/// certification gate: [`walk_forward_unpersisted`] hands the computed draft to
+/// `accept`, which persists it inside `commit_acceptance`'s one transaction
+/// instead of saving it standalone.
+pub(crate) struct WalkForwardBlockingOutput {
     /// The persistable parent + fold drafts.
-    draft: WalkForwardRunDraft,
+    pub(crate) draft: WalkForwardRunDraft,
 }
 
 /// The counted span resolution (L3): `to` defaults to the snapshot's last
@@ -403,6 +406,81 @@ where
     })
 }
 
+/// The fold-parameter bundle the unpersisted path takes — every input
+/// [`run_walk_forward_blocking`] consumes, minus the strategy (already
+/// validated + compiled by the caller).
+///
+/// A separate struct (not [`WalkForwardRequest`]) because the coach gate's
+/// parameters come from the parent's CERTIFYING run and persisted inputs, not
+/// from a user-facing request — and `pub(crate)` so the application ring can
+/// build it without making the field names part of the public surface.
+#[derive(Debug, Clone)]
+pub(crate) struct WalkForwardUnpersistedParams {
+    /// The pair to load candles for.
+    pub pair: Pair,
+    /// The primary timeframe the engine steps over.
+    pub primary_timeframe: Timeframe,
+    /// The higher timeframe for MTF alignment, when the run uses one.
+    pub htf_timeframe: Option<Timeframe>,
+    /// Starting equity and the cost model, exactly as the fold runs receive it.
+    pub config: BacktestConfig,
+    /// Exact `data_version`s to load instead of `HEAD`; `None` loads `HEAD`.
+    pub snapshots: Option<SnapshotPins>,
+    /// The counted span's lower bound — `Some` pins it, `None` defaults to the
+    /// first fully-warm bar.
+    pub from_ms: Option<i64>,
+    /// The counted span's exclusive upper bound — `Some` pins it, `None`
+    /// defaults to the snapshot's last candle's `close_time`.
+    pub to_ms: Option<i64>,
+    /// The fold scheme the span is cut under.
+    pub scheme: FoldScheme,
+}
+
+/// The walk-forward computation with NO persistence — the one `spawn_blocking`
+/// around [`run_walk_forward_blocking`] extracted so `run_walk_forward` and the
+/// coach accept's certification gate share it byte-for-byte (a13, #201).
+///
+/// The caller owns validation, compilation and the fold parameters; this is
+/// exactly steps "load snapshots → resolve span → run folds" of the standalone
+/// path, minus the save.
+///
+/// # Errors
+///
+/// The same [`WalkForwardAppError`]s `run_walk_forward` can produce before its
+/// save — plus [`WalkForwardAppError::Internal`] for a failed task join.
+pub(crate) async fn walk_forward_unpersisted<C, E>(
+    candles: C,
+    exchange: E,
+    validated: ValidatedDsl,
+    compiled: CompiledStrategy,
+    params: WalkForwardUnpersistedParams,
+) -> Result<WalkForwardBlockingOutput, WalkForwardAppError>
+where
+    C: CandleSeriesRepository + Send + 'static,
+    E: ExchangeAdapter + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        run_walk_forward_blocking(
+            &candles,
+            &exchange,
+            &params.pair,
+            params.primary_timeframe,
+            params.htf_timeframe,
+            params.snapshots.as_ref(),
+            &params.config,
+            &validated,
+            &compiled,
+            params.from_ms,
+            params.to_ms,
+            params.scheme,
+        )
+    })
+    .await
+    .map_err(|e| {
+        WalkForwardAppError::Internal(format!("the walk-forward worker thread failed: {e}"))
+    })?
+}
+
 /// Run one persisted strategy version's walk-forward and answer from the saved
 /// rows.
 ///
@@ -456,36 +534,25 @@ where
     let scheme = FoldScheme::rolling_oos(request.k.unwrap_or(K_DEFAULT))?;
 
     // ONE blocking task for the snapshot loads, the warm-bar probe, the span
-    // resolution, and all K fold runs (a13, #201).
-    let pair = request.pair.clone();
-    let primary_tf = request.primary_timeframe;
-    let htf_tf = request.htf_timeframe;
-    let config = request.config;
-    let pins = request.snapshots.clone();
-    let from_ms = request.from_ms;
-    let to_ms = request.to_ms;
-    let candles_owned = candles.clone();
-    let exchange_owned = exchange.clone();
-    let output = tokio::task::spawn_blocking(move || {
-        run_walk_forward_blocking(
-            &candles_owned,
-            &exchange_owned,
-            &pair,
-            primary_tf,
-            htf_tf,
-            pins.as_ref(),
-            &config,
-            &validated,
-            &compiled,
-            from_ms,
-            to_ms,
+    // resolution, and all K fold runs (a13, #201) — the shared unpersisted
+    // computation, byte-for-byte what the coach gate runs before it saves.
+    let output = walk_forward_unpersisted(
+        candles.clone(),
+        exchange.clone(),
+        validated,
+        compiled,
+        WalkForwardUnpersistedParams {
+            pair: request.pair.clone(),
+            primary_timeframe: request.primary_timeframe,
+            htf_timeframe: request.htf_timeframe,
+            config: request.config,
+            snapshots: request.snapshots.clone(),
+            from_ms: request.from_ms,
+            to_ms: request.to_ms,
             scheme,
-        )
-    })
-    .await
-    .map_err(|e| {
-        WalkForwardAppError::Internal(format!("the walk-forward worker thread failed: {e}"))
-    })??;
+        },
+    )
+    .await?;
 
     // One transaction: parent + folds + every fold's ordinary run rows (a9);
     // then answer from the saved rows (the `run_version_backtest` read-back

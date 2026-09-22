@@ -192,6 +192,12 @@ export type AcceptedCoachDto = {
 	after: SummaryDto | null,
 	/**  Whether that read back succeeded. */
 	readBack: ReadBackDto,
+	/**
+	 *  The walk-forward run that certified the child, when the parent was
+	 *  certified and the gate ran (r2.s3.w4). `None` on the uncertified-parent
+	 *  path and on replays of pre-0014 accepts.
+	 */
+	walkForwardRunId: string | null,
 };
 
 /**
@@ -858,6 +864,16 @@ export type LibraryVersion = {
 	 *  here, not the screen), newest first.
 	 */
 	recentRuns: LibraryRunSummary[],
+	/**
+	 *  Whether the version's latest walk-forward run passed — the badge signal
+	 *  (r2.s3.w4); `false` until a run passes AND whenever a newer run failed.
+	 */
+	certified: boolean,
+	/**
+	 *  The certifying run's id — `None` until a walk-forward run is persisted.
+	 *  The Details pane renders it when present.
+	 */
+	latestWalkForwardRunId: string | null,
 };
 
 /**  The proposed change: one path, one value. */

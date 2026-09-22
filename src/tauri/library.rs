@@ -84,6 +84,12 @@ pub struct LibraryVersion {
     /// This version's run catalog (best-effort — one corrupt row costs its row
     /// here, not the screen), newest first.
     pub recent_runs: Vec<LibraryRunSummary>,
+    /// Whether the version's latest walk-forward run passed — the badge signal
+    /// (r2.s3.w4); `false` until a run passes AND whenever a newer run failed.
+    pub certified: bool,
+    /// The certifying run's id — `None` until a walk-forward run is persisted.
+    /// The Details pane renders it when present.
+    pub latest_walk_forward_run_id: Option<String>,
 }
 
 /// The three headline KPIs the screen renders per version, pre-formatted from
