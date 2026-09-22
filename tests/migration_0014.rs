@@ -5,7 +5,8 @@
 //! IS certification — narrows `strategy_version_no_update` to admit exactly
 //! that one mutable cell, installs `strategy_version_certification_owner` (the
 //! pointer must name a walk-forward run OF THIS VERSION and may only advance in
-//! `(created_at, seq)` order), and rebuilds `coaching_proposals` so
+//! `seq` order, the monotonic insertion sequence rather than the wall clock),
+//! and rebuilds `coaching_proposals` so
 //! `accept_failure_stage` can carry `'walk_forward'`.
 //!
 //! **Why raw SQL.** As with `0009`/`0012`/`0013`, the value is in the shapes the
@@ -163,8 +164,8 @@ const MINIMAL_DSL: &str = r#"{
 
 /// One `walk_forward_run` parent row owned by `version`, at `created_at`,
 /// with `pass` as given. `seq` mints the way the product mints it —
-/// `MAX(seq)+1` at insert — so SEED ORDER is the chronological tiebreak
-/// `0014`'s pointer rule applies under a shared `created_at`.
+/// `MAX(seq)+1` at insert — so SEED ORDER is the insertion order `0014`'s
+/// pointer rule orders by, and the only one it consults.
 async fn seed_walk_forward_run(
     pool: &SqlitePool,
     run: &str,
@@ -495,17 +496,34 @@ async fn the_pointer_cannot_borrow_another_versions_run() {
     assert!(ptr.is_none(), "the refused write left the pointer NULL");
 }
 
-/// Once set the pointer only advances in `(created_at, seq)` order — a newer
-/// run lands, an older-or-equal one is refused, and NULL is a backward move
+/// Once set the pointer only advances in `seq` order ALONE — a later-inserted
+/// run lands, an earlier-inserted one is refused, and NULL is a backward move
 /// (the product de-certifies by writing a NEWER failing run, never by
-/// clearing). `seq` is the monotonic insertion sequence `0013` mints — the
-/// tiebreak a same-millisecond pair needs, which a random id could not give.
+/// clearing). `seq` is the monotonic insertion sequence `0013` mints
+/// (`MAX(seq)+1` inside the write transaction), so it is the true write order —
+/// and the only one: `created_at` is wall-clock, minted before the write lock,
+/// so it can run backwards. The second half of this test is that case.
 #[tokio::test]
 async fn the_pointer_only_advances() {
     let (_tmp, db) = db_at_0014().await;
+    // Seeded in INSERTION order, `seq` minted the way the product mints it, so
+    // seed order IS `seq` order (the helper's `MAX(seq)+1`).
+    //
+    // `wf-future` goes in FIRST though it carries the LATEST wall-clock instant:
+    // a clock that ran ahead and was corrected back is exactly what `seq` alone
+    // must not be fooled by, and under the old `(created_at, seq)` rule it was a
+    // legal "forward" move.
+    seed_walk_forward_run(
+        db.pool(),
+        "wf-future",
+        "ver-1",
+        "2026-08-29T09:00:00.000Z",
+        1,
+    )
+    .await;
     seed_walk_forward_run(db.pool(), "wf-old", "ver-1", "2026-08-29T01:00:00.000Z", 1).await;
-    // Same timestamp as wf-new but the EARLIER seq — the (created_at, seq)
-    // tiebreak makes this a backward move, not a lateral one.
+    // Same timestamp as wf-new but the EARLIER seq — a backward move, not a
+    // lateral one.
     seed_walk_forward_run(db.pool(), "wf-aaa", "ver-1", "2026-08-29T02:00:00.000Z", 1).await;
     seed_walk_forward_run(db.pool(), "wf-new", "ver-1", "2026-08-29T02:00:00.000Z", 0).await;
 
@@ -517,7 +535,7 @@ async fn the_pointer_only_advances() {
     .await
     .expect("the first pointer set lands");
 
-    // Backward in (created_at, seq): same instant, earlier insert — refused.
+    // Backward by sequence: the same instant, an earlier insert — refused.
     let err = sqlx::query(
         "UPDATE strategy_version SET latest_walk_forward_run_id = 'wf-aaa' WHERE id = 'ver-1'",
     )
@@ -529,7 +547,7 @@ async fn the_pointer_only_advances() {
         "the refusal is the chronology rule's: {err}"
     );
 
-    // Backward in time: the older run — refused.
+    // Backward in time AND sequence: the older run — refused.
     let err = sqlx::query(
         "UPDATE strategy_version SET latest_walk_forward_run_id = 'wf-old' WHERE id = 'ver-1'",
     )
@@ -537,6 +555,20 @@ async fn the_pointer_only_advances() {
     .await
     .expect_err("an older run is refused");
     assert!(err.to_string().contains("only advances"), "{err}");
+
+    // Backward by sequence though LATER by wall clock: `seq` alone decides, so
+    // a corrected clock cannot make an earlier insertion the version's latest
+    // run — and cannot refuse the save that carried it either.
+    let err = sqlx::query(
+        "UPDATE strategy_version SET latest_walk_forward_run_id = 'wf-future' WHERE id = 'ver-1'",
+    )
+    .execute(db.pool())
+    .await
+    .expect_err("a later instant never outranks an earlier insertion");
+    assert!(
+        err.to_string().contains("only advances"),
+        "the wall clock does not decide the pointer's order: {err}"
+    );
 
     // Clearing is a backward move too — refused, not a quiet de-certify.
     let err = sqlx::query(

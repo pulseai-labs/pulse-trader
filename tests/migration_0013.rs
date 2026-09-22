@@ -203,8 +203,9 @@ async fn seed_windowed_run(pool: &SqlitePool, run: &str, membership: Option<(&st
 }
 
 /// One `walk_forward_run` parent row owned by `ver-1`. `seq` mints the way the
-/// product mints it — `MAX(seq)+1` at insert — so seed order IS chronological
-/// order under `0014`'s `(created_at, seq)` rule.
+/// product mints it — `MAX(seq)+1` at insert — so seed order IS the
+/// chronological order `0014`'s pointer rule orders by (`seq` alone; the wall
+/// clock never outranks the insertion sequence).
 async fn seed_walk_forward_run(pool: &SqlitePool, run: &str) {
     sqlx::query(
         "INSERT INTO walk_forward_run \

@@ -11,7 +11,8 @@
 -- write-once for every 0001 column — the pointer is the one mutable cell, and
 -- `strategy_version_certification_owner` below is what makes its mutability
 -- honest: it may only name a walk-forward run OF THIS VERSION, and it may only
--- advance in (created_at, seq) order. A version cannot reach back to an earlier
+-- advance in `seq` order — the monotonic insertion sequence 0013 mints, which
+-- is the true write order. A version cannot reach back to an earlier
 -- run, cannot borrow another version's run, and (with the product never writing
 -- NULL) cannot be quietly un-certified by clearing the cell.
 --
@@ -65,10 +66,14 @@ BEGIN
 END;
 
 -- The pointer's own law: this version's runs only, and strictly newer than the
--- run it replaces (`created_at`, then `seq` — the same order the read side and
--- `walk_forward_run`'s chronology share; `seq` is the monotonic insertion
--- sequence 0013 mints, so two runs in one millisecond still order by which
--- saved first — a random UUID tiebreak would refuse a legitimate later save).
+-- run it replaces by `seq` ALONE. `seq` is the monotonic insertion sequence
+-- 0013 mints (`MAX(seq)+1` inside the write transaction), so it IS the order in
+-- which the runs were written — and it is the only ordering that is:
+-- `created_at` comes from the wall clock, which is not monotonic, and it is
+-- minted BEFORE the transaction takes its write lock, so a clock correction (or
+-- two saves ordered by lock acquisition) can hand a later insertion an earlier
+-- instant. Ordering by `(created_at, seq)` let that earlier instant outrank the
+-- higher sequence and refused an otherwise valid save with 'only advances'.
 -- A NULL NEW is allowed only because
 -- 0014 introduces the column NULL on every pre-existing row; the product never
 -- writes NULL over a set pointer — and this trigger refuses it as a backward
@@ -87,7 +92,7 @@ BEGIN
     THEN RAISE(ABORT, 'strategy_version: latest_walk_forward_run_id must name a walk-forward run of this version')
   END;
   -- Once set, the pointer only advances: clearing it, or pointing it at a run
-  -- that is not strictly later in (created_at, seq) order, is refused.
+  -- whose `seq` is not strictly higher, is refused.
   SELECT CASE
     WHEN OLD.latest_walk_forward_run_id IS NOT NULL
      AND (NEW.latest_walk_forward_run_id IS NULL
@@ -96,8 +101,7 @@ BEGIN
               FROM walk_forward_run n
               JOIN walk_forward_run o ON o.id = OLD.latest_walk_forward_run_id
              WHERE n.id = NEW.latest_walk_forward_run_id
-               AND (n.created_at > o.created_at
-                    OR (n.created_at = o.created_at AND n.seq > o.seq))))
+               AND n.seq > o.seq))
     THEN RAISE(ABORT, 'strategy_version: latest_walk_forward_run_id only advances')
   END;
 END;

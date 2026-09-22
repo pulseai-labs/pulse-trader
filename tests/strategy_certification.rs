@@ -125,8 +125,8 @@ async fn world() -> World {
 
 /// Persist a synthetic `k=2` draft (shared `seeded_walk_forward_draft`) against
 /// the version at `at_ms` — the injected clock pins `created_at`, and `seq`
-/// minted at insert makes the `(created_at, seq)` pointer order follow save
-/// order even inside one millisecond.
+/// minted at insert is the pointer rule's whole order, so the pointer follows
+/// save order — even inside one millisecond, and even if a clock went back.
 async fn save_wf(world: &World, pass: bool, at_ms: i64) -> pulse::WalkForwardRunId {
     SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(at_ms))
         .save_walk_forward_run(&world.version_id, &seeded_walk_forward_draft(pass))
