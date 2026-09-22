@@ -255,9 +255,15 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
 
         // INSERT run + ALL trades + read-back in ONE transaction (D3, mirror
         // `create_version`'s begin → insert → commit → read-back).
+        // `BEGIN IMMEDIATE` (R4's class, closed here too): the ownership READ
+        // below is the transaction's first statement, and a deferred transaction
+        // that reads first and writes later can be beaten by a concurrent commit
+        // in WAL — the upgrade then fails with `SQLITE_BUSY_SNAPSHOT`, which
+        // `busy_timeout` does not retry. Taking the write lock up front makes the
+        // concurrent save wait for it instead (the timeout does cover that).
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
 

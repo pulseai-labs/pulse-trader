@@ -527,9 +527,18 @@ impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<
             check_inputs_path_safe(&fold.inputs)?;
         }
 
+        // `BEGIN IMMEDIATE`, not a deferred `begin()` (R4): the first statement
+        // inside is the ownership READ below, and in WAL two connections can take
+        // read snapshots before either writes — the loser then cannot upgrade its
+        // stale snapshot and fails with `SQLITE_BUSY_SNAPSHOT`, which
+        // `busy_timeout` does NOT retry (it covers a held lock, not a moved
+        // snapshot), losing an otherwise valid experiment to a scheduling
+        // accident. Taking the write lock up front makes a concurrent save WAIT
+        // for the lock, which the timeout does cover. Same rule
+        // `strategy_repo`'s version+submission write states.
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
 

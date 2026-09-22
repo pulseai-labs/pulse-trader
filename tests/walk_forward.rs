@@ -54,7 +54,7 @@ use pulse::{
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use support::mcp::{FIXTURE_STORE, copy_tree, manifest, migrated_db};
+use support::mcp::{FIXTURE_STORE, copy_tree, manifest, migrated_db, seeded_walk_forward_draft};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -884,4 +884,61 @@ async fn a_walk_forward_does_not_displace_the_versions_latest_run() {
         .await
         .expect("the catalog reads");
     assert_eq!(catalog.len(), 7, "one ordinary run + six folds");
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent saves both succeed (R4, review fix)
+// ---------------------------------------------------------------------------
+
+/// R4: two walk-forward saves racing on one database both SUCCEED.
+///
+/// In a DEFERRED transaction each save's first statement is the ownership
+/// `SELECT`, so two connections can take read snapshots before either writes;
+/// after one commits, the other cannot upgrade its stale WAL snapshot and fails
+/// with `SQLITE_BUSY_SNAPSHOT` — which `busy_timeout` does not retry, because it
+/// covers a held lock and not a moved snapshot. The save then loses an otherwise
+/// valid experiment to a scheduling accident, which is reachable for different
+/// versions through desktop windows and for any concurrent MCP calls. The
+/// transaction now opens `BEGIN IMMEDIATE`, so a concurrent save WAITS for the
+/// write lock (which the timeout does cover).
+///
+/// Eight versions, so the saves contend on the database rather than on one
+/// version's certification pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_walk_forward_saves_all_succeed() {
+    let world = world().await;
+    let mut versions = Vec::new();
+    for _ in 0..8 {
+        versions.push(make_version(&world, &oracle_dsl()).await);
+    }
+
+    let mut handles = Vec::new();
+    for version in versions {
+        let pool = world.db.pool().clone();
+        handles.push(tokio::spawn(async move {
+            SqliteBacktestRunRepo::new(pool)
+                .save_walk_forward_run(&version, &seeded_walk_forward_draft(true))
+                .await
+        }));
+    }
+    for handle in handles {
+        let saved = handle.await.expect("the save task does not panic");
+        assert!(
+            saved.is_ok(),
+            "every concurrent save succeeds: {:?}",
+            saved.err()
+        );
+    }
+
+    // And all eight persisted, each with its own folds.
+    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_run")
+        .fetch_one(world.db.pool())
+        .await
+        .expect("count walk-forward runs");
+    assert_eq!(runs, 8, "one run row per save");
+    let folds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_fold")
+        .fetch_one(world.db.pool())
+        .await
+        .expect("count fold rows");
+    assert_eq!(folds, 16, "two folds per run");
 }
