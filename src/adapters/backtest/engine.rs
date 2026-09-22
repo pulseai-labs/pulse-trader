@@ -421,7 +421,14 @@ pub fn first_fully_warm_bar_ms(
                 bar.primary.close_time,
             );
         }
-        if engine.is_warm()
+        // The engine's own entry gate, not just warmness (N6): `run_backtest`
+        // requires `bar.index > 0` before it will evaluate an entry, so the first
+        // bar an entry can fire on is never the series' first. An indicator-free
+        // strategy — or one whose only indicator is ready after a single step —
+        // is warm at index 0, and reporting that bar as fully warm shifts every
+        // default walk-forward span and fold boundary one candle early.
+        if bar.index > 0
+            && engine.is_warm()
             && htf_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
             && (htf_engine.is_none() || bar.htf.is_some())
         {
@@ -1213,8 +1220,8 @@ fn atr_take_profit_price(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        BacktestConfig, OpenPosition, build_funding_index, funding_between, run_backtest,
-        update_excursion,
+        BacktestConfig, OpenPosition, build_funding_index, first_fully_warm_bar_ms,
+        funding_between, run_backtest, update_excursion,
     };
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
@@ -1405,6 +1412,46 @@ mod tests {
         .unwrap();
 
         assert!(result.trades.is_empty());
+    }
+
+    /// N6: the warm-bar probe applies the engine's OWN entry gate, so it reports
+    /// the first bar an entry can actually fire on — never bar 0, which
+    /// `run_backtest` refuses to evaluate an entry on (`bar.index > 0`).
+    ///
+    /// This strategy is indicator-free, so `is_warm` is vacuously true the moment
+    /// bar 0 is stepped; before the fix the probe answered bar 0 and every
+    /// defaulted walk-forward span and fold boundary started one candle early.
+    /// Both halves are asserted against the same series: the probe's answer, and
+    /// the engine's first entry signal, which is the bar it named.
+    #[test]
+    fn warm_probe_reports_the_first_bar_an_entry_can_fire_on() {
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 110, 112, 108, 111),
+            candle(2, 120, 121, 119, 120),
+        ]);
+
+        assert_eq!(
+            first_fully_warm_bar_ms(&base_strategy(), &primary, None),
+            Some(primary.candles[1].open_time),
+            "bar 0 is warm but unenterable; the probe reports bar 1"
+        );
+
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(
+            result.trades[0].entry_signal_time, primary.candles[1].close_time,
+            "the engine's first entry signal is on the bar the probe named"
+        );
     }
 
     #[test]
