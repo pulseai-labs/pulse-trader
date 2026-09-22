@@ -41,7 +41,7 @@ use crate::adapters::db::coaching_repo::fetch_proposal_tx;
 use crate::adapters::db::strategy_repo::{VersionInsert, insert_version_row, version_hash};
 use crate::adapters::db::walk_forward_run_repo::insert_walk_forward_in_tx;
 use crate::adapters::ids::UuidIdSource;
-use crate::domain::backtest::{BacktestRunId, WalkForwardRunId};
+use crate::domain::backtest::{BacktestRunId, WalkForwardRunDraft, WalkForwardRunId};
 use crate::domain::strategy::{CreatedBy, VersionId};
 use crate::domain::{
     AcceptedCoachOutcome, Clock, CoachAcceptFailure, CoachAcceptanceRepository, CoachingSessionId,
@@ -84,6 +84,28 @@ impl<C: Clock, I: IdSource> SqliteCoachAcceptanceRepo<C, I> {
             DataError::Db(format!("clock.now_ms() {now_ms} is out of DateTime range"))
         })?;
         Ok(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
+    }
+
+    /// The accept's identity, minted from the injected [`IdSource`]/[`Clock`]
+    /// INSIDE the transaction. The walk-forward id is minted only when a
+    /// gate-passing draft came through the gate (D2): no draft, no id, no
+    /// pointer. Every fold's `backtest_run` id is minted from the same source in
+    /// the same act (F9) — a fold run IS an ordinary run, and it would otherwise
+    /// be the one row in this transaction named by something other than the
+    /// injected source.
+    fn mint_acceptance(
+        &self,
+        draft: Option<&WalkForwardRunDraft>,
+    ) -> Result<MintedAcceptance, DataError> {
+        Ok(MintedAcceptance {
+            child_id: self.ids.next_id(),
+            run_id: self.ids.next_id(),
+            walk_forward_run_id: draft.map(|_| self.ids.next_id()),
+            fold_run_ids: draft.map_or_else(Vec::new, |draft| {
+                draft.folds.iter().map(|_| self.ids.next_id()).collect()
+            }),
+            created_at: self.now_rfc3339()?,
+        })
     }
 }
 
@@ -276,15 +298,9 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
 
         let session = self.coached_session(&mut tx, &id).await?;
 
-        // Mint identity INSIDE the transaction, from the injected sources. The
-        // walk-forward id is minted only when a certification draft came through
-        // the gate (D2): no draft, no id, no pointer.
-        let minted = MintedAcceptance {
-            child_id: self.ids.next_id(),
-            run_id: self.ids.next_id(),
-            walk_forward_run_id: acceptance.walk_forward.as_ref().map(|_| self.ids.next_id()),
-            created_at: self.now_rfc3339()?,
-        };
+        // Mint identity INSIDE the transaction, from the injected sources (see
+        // `mint_acceptance`).
+        let minted = self.mint_acceptance(acceptance.walk_forward.as_ref())?;
 
         insert_child_version(&mut tx, &session, &minted, &serialized).await?;
 
@@ -312,8 +328,15 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             &acceptance.walk_forward,
             minted.walk_forward_run_id.as_deref(),
         ) {
-            insert_walk_forward_in_tx(&mut tx, &minted.child_id, draft, wf_id, &minted.created_at)
-                .await?;
+            insert_walk_forward_in_tx(
+                &mut tx,
+                &minted.child_id,
+                draft,
+                wf_id,
+                &minted.fold_run_ids,
+                &minted.created_at,
+            )
+            .await?;
         }
 
         settle_proposal_tx(&mut tx, &id, &minted.child_id, &minted.run_id).await?;
@@ -373,6 +396,12 @@ struct MintedAcceptance {
     /// The certification run's id — `Some` only when the accept carries a
     /// gate-passing draft to persist.
     walk_forward_run_id: Option<String>,
+    /// One id per certification fold, minted from the same source and in the
+    /// same act (F9): the draft's folds are `backtest_run` rows like any other,
+    /// and every other id in this transaction comes from the injected
+    /// [`IdSource`] — a fold run minted elsewhere would be the one exception.
+    /// Empty when the accept carries no draft.
+    fold_run_ids: Vec<String>,
     /// The one timestamp every row shares.
     created_at: String,
 }

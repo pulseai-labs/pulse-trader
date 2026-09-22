@@ -41,6 +41,7 @@
 //!      bit-identical (`f64::to_bits`).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod coach_support;
 mod support;
 
 use pulse::{
@@ -693,6 +694,60 @@ fn fold_windows_cover_the_span_contiguously() {
     assert!(
         folds[5].to_ms - folds[5].from_ms >= step,
         "the last fold absorbs the remainder"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The fold read is fail-closed about the run it points at (F11, review fix)
+// ---------------------------------------------------------------------------
+
+/// F11: the fold read is DECODABILITY-aware, not existence-aware. A fold row
+/// whose referenced `backtest_run` is present but unreadable is an `Err` — the
+/// port's contract ("missing or corrupt is an `Err`, never a partial read") —
+/// where an existence probe returned the fold anyway and handed the caller a run
+/// id they could not follow anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fold_whose_run_does_not_decode_is_refused() {
+    let world = world().await;
+    let version = make_version(&world, &oracle_dsl()).await;
+    let outcome = run(&world, &request(&version)).await;
+
+    // The read is healthy while every fold's run decodes — so the refusal below
+    // is the corruption's doing, not this read's default answer.
+    world
+        .runs
+        .get_walk_forward_run(&outcome.run.id)
+        .await
+        .expect("a healthy walk-forward reads")
+        .expect("the run exists");
+
+    // Corrupt ONE fold's run with a schema tag `get_run` refuses (D1b).
+    let victim = outcome.run.folds[2].backtest_run_id.clone();
+    coach_support::with_run_immutability_lifted(
+        world.db.pool(),
+        &[&format!(
+            "UPDATE backtest_run SET schema_version = 99 WHERE id = '{}'",
+            victim.as_str()
+        )],
+    )
+    .await;
+
+    let err = world
+        .runs
+        .get_walk_forward_run(&outcome.run.id)
+        .await
+        .expect_err("a fold whose run does not decode must refuse");
+    assert!(
+        err.to_string().contains("corrupt backtest_run")
+            && err.to_string().contains(victim.as_str()),
+        "the refusal names the fold's run: {err}"
+    );
+
+    // And the two reads agree — the row the fold points at is exactly the row
+    // `get_run` refuses, which is what the fold read now honours.
+    assert!(
+        world.runs.get_run(&victim).await.is_err(),
+        "the corrupted run does not decode"
     );
 }
 

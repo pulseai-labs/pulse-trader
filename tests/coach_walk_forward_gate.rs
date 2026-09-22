@@ -701,6 +701,46 @@ async fn a_passed_gate_persists_the_whole_shape_atomically() {
     }
 }
 
+/// F9: every id the accept MINTS comes from the injected `IdSource` — including
+/// each fold's `backtest_run` id. A fold run is an ordinary run, and before this
+/// it was the one row in the accept's transaction named by `Uuid::new_v4()`
+/// instead: a test that injects a deterministic source could not predict it, and
+/// an adapter that takes its identity from one place had one id that did not come
+/// from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_accept_mints_every_fold_run_id_from_the_injected_source() {
+    let world = world().await;
+    let outcome = world
+        .acceptance()
+        .commit_acceptance(acceptance_payload(&world))
+        .await
+        .expect("the commit lands");
+    let wf_id = outcome
+        .walk_forward_run_id
+        .as_ref()
+        .expect("the committed outcome names the certifying run");
+
+    // The documented mint order — child, accepted run, certification run — is
+    // unchanged by the fold ids being minted here too.
+    assert_eq!(outcome.child_version_id.as_str(), "minted-0");
+    assert_eq!(outcome.accepted_run_id.as_str(), "minted-1");
+    assert_eq!(wf_id.as_str(), "minted-2");
+
+    // Then one id per fold, in fold order — from the same source.
+    let fold_run_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM backtest_run WHERE walk_forward_run_id = ?1 ORDER BY fold_index",
+    )
+    .bind(wf_id.as_str())
+    .fetch_all(world.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        fold_run_ids,
+        vec!["minted-3".to_owned(), "minted-4".to_owned()],
+        "each fold's run id comes from the injected source, in fold order"
+    );
+}
+
 /// v. AC-1(v)'s injected mid-transaction failure: a fold draft whose run lands
 /// with a NULL window pair is refused by 0013's `walk_forward_fold_windowed`
 /// trigger — INSIDE the transaction, after the child row exists — and the whole

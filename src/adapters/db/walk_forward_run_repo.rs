@@ -25,7 +25,7 @@ use crate::domain::backtest::{
     WalkForwardFold, WalkForwardMembership, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
 };
 use crate::domain::strategy::VersionId;
-use crate::domain::{Clock, DataError, WalkForwardRunRepository};
+use crate::domain::{BacktestRunRepository, Clock, DataError, WalkForwardRunRepository};
 
 /// The `walk_forward_run` parent-row insert — one statement inside `tx`.
 async fn insert_walk_forward_run_row(
@@ -80,21 +80,26 @@ async fn insert_walk_forward_run_row(
 
 /// One fold's three writes: the ordinary `backtest_run` (with the 0013
 /// membership pair), its `trade` rows, and the `walk_forward_fold` row.
+///
+/// `run_id` is minted by the caller and passed in (F9), for the same reason
+/// `wf_run_id` is: the coach-accept path mints every id in its transaction from
+/// the injected `IdSource`, and a fold run minted here from `Uuid::new_v4()`
+/// would be the one id in that transaction the injected source did not choose.
 async fn insert_fold_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     wf_run_id: &str,
     version_id_str: &str,
     created_at: &str,
     fold: &crate::domain::backtest::WalkForwardFoldDraft,
+    run_id: &str,
 ) -> Result<(), DataError> {
-    let run_id = Uuid::new_v4().to_string();
     let membership = WalkForwardMembership {
         run_id: WalkForwardRunId::new(wf_run_id),
         fold_index: fold.index,
     };
     insert_run_row(
         tx,
-        &run_id,
+        run_id,
         version_id_str,
         created_at,
         &fold.inputs,
@@ -104,7 +109,7 @@ async fn insert_fold_rows(
         Some(&membership),
     )
     .await?;
-    insert_trade_rows(tx, &run_id, &fold.result.trades).await?;
+    insert_trade_rows(tx, run_id, &fold.result.trades).await?;
     let fold_index_i64 = i64::from(fold.index);
     let fold_n = i64::try_from(fold.verdict.n)
         .map_err(|e| DataError::Db(format!("fold n overflows i64: {e}")))?;
@@ -199,26 +204,43 @@ struct FoldRow {
     holds: i64,
 }
 
-/// One `walk_forward_fold` row's decode — fail-closed: a fold pointing at a
-/// missing `backtest_run` row is an `Err` (the port's contract), not a skipped
-/// row.
-async fn fetch_fold(
-    pool: &sqlx::SqlitePool,
+/// One `walk_forward_fold` row's decode — fail-closed, and fail-closed about the
+/// run it points at too (F11).
+///
+/// The port's contract for this read is "missing or corrupt is an `Err`, never a
+/// partial read", and a fold's `backtest_run` can fail it two ways: the row can
+/// be ABSENT, or it can be present and not DECODE — a corrupt money column, an
+/// unsupported `schema_version`, a broken tamper hash. An existence probe sees
+/// only the first, so it hands back a fold whose run id the caller cannot follow
+/// anywhere: a partial read wearing a valid id.
+///
+/// So the check is the run's own read, `get_run` — the same decodability
+/// definition `get_backtest_run` and the fold surfaces use, so a fold is refused
+/// in exactly the cases its run would be. It is a real decode per fold (trades
+/// and the hash included), which is what the callers already do one layer up
+/// when they load each fold's run.
+async fn fetch_fold<C: Clock + Send + Sync>(
+    repo: &SqliteBacktestRunRepo<C>,
     parent_id: &str,
     f: &FoldRow,
 ) -> Result<WalkForwardFold, DataError> {
-    let run_exists = sqlx::query!(
-        r#"SELECT 1 AS "one!: i64" FROM backtest_run WHERE id = ?1"#,
-        f.backtest_run_id,
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| DataError::Db(e.to_string()))?;
-    if run_exists.is_none() {
-        return Err(DataError::Db(format!(
-            "walk_forward_run `{parent_id}` fold {} references missing backtest_run `{}`",
-            f.fold_index, f.backtest_run_id
-        )));
+    match repo
+        .get_run(&BacktestRunId::new(f.backtest_run_id.clone()))
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(DataError::Db(format!(
+                "walk_forward_run `{parent_id}` fold {} references missing backtest_run `{}`",
+                f.fold_index, f.backtest_run_id
+            )));
+        }
+        Err(e) => {
+            return Err(DataError::Db(format!(
+                "walk_forward_run `{parent_id}` fold {} references corrupt backtest_run `{}`: {e}",
+                f.fold_index, f.backtest_run_id
+            )));
+        }
     }
     Ok(WalkForwardFold {
         index: u8::try_from(f.fold_index)
@@ -374,22 +396,40 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
     Ok(())
 }
 
-/// `wf_run_id` and `created_at` are minted by the caller (`Uuid`/`Clock` on the
-/// standalone path; the coach accept's injected `IdSource`/`Clock` inside
-/// `commit_acceptance`), so the same insert lands identically under both
-/// writers. The ownership guard stays with the callers: the standalone path
-/// checks before minting; the coach path just inserted the child row itself.
+/// `wf_run_id`, every fold's `backtest_run` id, and `created_at` are minted by
+/// the caller (`Uuid`/`Clock` on the standalone path; the coach accept's
+/// injected `IdSource`/`Clock` inside `commit_acceptance`), so the same insert
+/// lands identically under both writers — including the fold-run ids, which the
+/// coach path mints from the one source that mints every other id in its
+/// transaction (F9). The ownership guard stays with the callers: the standalone
+/// path checks before minting; the coach path just inserted the child row
+/// itself.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] when the draft is incoherent (see
+/// [`validate_draft`]) or when `fold_run_ids` does not name exactly one id per
+/// draft fold — a caller-side mismatch is refused here rather than silently
+/// pairing ids with the wrong folds.
 pub(crate) async fn insert_walk_forward_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     version_id_str: &str,
     draft: &WalkForwardRunDraft,
     wf_run_id: &str,
+    fold_run_ids: &[String],
     created_at: &str,
 ) -> Result<WalkForwardRunId, DataError> {
     validate_draft(draft)?;
+    if fold_run_ids.len() != draft.folds.len() {
+        return Err(DataError::Db(format!(
+            "walk-forward draft refused: {} fold run id(s) minted for {} fold(s)",
+            fold_run_ids.len(),
+            draft.folds.len()
+        )));
+    }
     insert_walk_forward_run_row(tx, wf_run_id, version_id_str, created_at, draft).await?;
-    for fold in &draft.folds {
-        insert_fold_rows(tx, wf_run_id, version_id_str, created_at, fold).await?;
+    for (fold, run_id) in draft.folds.iter().zip(fold_run_ids) {
+        insert_fold_rows(tx, wf_run_id, version_id_str, created_at, fold, run_id).await?;
     }
 
     // The pointer moves INSIDE the same transaction — a walk-forward run and
@@ -419,6 +459,16 @@ impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<
     ) -> Result<WalkForwardRunId, DataError> {
         let version_id_str = strategy_version_id.as_str().to_owned();
         let wf_run_id = Uuid::new_v4().to_string();
+        // The fold-run ids, minted here beside the parent's so the shared insert
+        // pairs each with its fold (F9). This path has no injected `IdSource` —
+        // `Uuid` is what it mints the walk-forward id with — and it stays that
+        // way: the seam's behaviour is unchanged, only the coach path's ids now
+        // come from its source.
+        let fold_run_ids: Vec<String> = draft
+            .folds
+            .iter()
+            .map(|_| Uuid::new_v4().to_string())
+            .collect();
         let created_at = self.now_rfc3339()?;
 
         // The version tags are checked BEFORE the transaction opens (the
@@ -447,9 +497,15 @@ impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<
             )));
         }
 
-        let wf_id =
-            insert_walk_forward_in_tx(&mut tx, &version_id_str, draft, &wf_run_id, &created_at)
-                .await?;
+        let wf_id = insert_walk_forward_in_tx(
+            &mut tx,
+            &version_id_str,
+            draft,
+            &wf_run_id,
+            &fold_run_ids,
+            &created_at,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -490,7 +546,7 @@ impl<C: Clock + Send + Sync> WalkForwardRunRepository for SqliteBacktestRunRepo<
 
         let mut folds = Vec::with_capacity(fold_rows.len());
         for f in &fold_rows {
-            folds.push(fetch_fold(&self.pool, id_str, f).await?);
+            folds.push(fetch_fold(self, id_str, f).await?);
         }
 
         Ok(Some(WalkForwardRun {
