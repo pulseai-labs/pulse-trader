@@ -309,6 +309,14 @@ pub fn seeded_fold_trades(count: usize, lo: Decimal, hi: Decimal, fold_index: us
 }
 
 pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
+    seeded_walk_forward_draft_k(pass, 2)
+}
+
+/// The same draft at any fold count `k` — one coherent fold per scheme fold, so
+/// an out-of-range `k` can be exercised with the folds a real caller would
+/// supply. The scheme is built as the raw public variant, which is what lets a
+/// test hand the gate one the domain would refuse to construct (R5).
+pub fn seeded_walk_forward_draft_k(pass: bool, k: u8) -> WalkForwardRunDraft {
     let span = CandleWindow::new(1_735_702_200_000, 1_738_000_000_000).unwrap();
     // The R-multiples the folds carry: a genuinely HOLDING fold needs `n >= 20`
     // trades and a positive bound, which one trade cannot produce — so the
@@ -320,7 +328,7 @@ pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
     } else {
         (Decimal::new(-5, 1), Decimal::new(-15, 1))
     };
-    let folds: Vec<WalkForwardFoldDraft> = fold_windows(&span, 2)
+    let folds: Vec<WalkForwardFoldDraft> = fold_windows(&span, k)
         .iter()
         .enumerate()
         .map(|(i, window)| {
@@ -374,7 +382,7 @@ pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
         .collect();
     let fold_verdicts: Vec<FoldVerdict> = folds.iter().map(|f| f.verdict.clone()).collect();
     WalkForwardRunDraft {
-        scheme: FoldScheme::rolling_oos(2).unwrap(),
+        scheme: FoldScheme::RollingOos { k },
         rule: VerdictRule::WfV1,
         span,
         from_defaulted: false,

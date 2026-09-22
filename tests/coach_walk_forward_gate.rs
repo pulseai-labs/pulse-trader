@@ -737,14 +737,21 @@ async fn the_accept_mints_every_fold_run_id_from_the_injected_source() {
     );
 }
 
-/// v. AC-1(v)'s injected mid-transaction failure: a fold draft whose run lands
-/// with a NULL window pair is refused by 0013's `walk_forward_fold_windowed`
-/// trigger — INSIDE the transaction, after the child row exists — and the whole
-/// accept rolls back: no child, no run, no walk-forward rows, no pointer.
+/// v. AC-1(v)'s injected mid-transaction failure: a fold draft whose run carries
+/// NO window is refused — INSIDE the transaction, after the child row exists —
+/// and the whole accept rolls back: no child, no run, no walk-forward rows, no
+/// pointer.
+///
+/// The refusal now comes from `validate_draft`, the write gate: a fold's run must
+/// be given the fold's own window (R6), so a windowless one never reaches 0013's
+/// `walk_forward_fold_windowed` trigger. That trigger still guards the same
+/// property in the SCHEMA — it is the second line behind a writer that did not go
+/// through the gate — but a writer that DID cannot reach it, which is why this
+/// test pins the rollback at the gate's boundary.
 ///
 /// (`inputs.window` and `inputs.lead_in_from_ms` are cleared together: a lead-in
-/// with no window trips 0012's pair trigger on the fold's run insert, one
-/// statement EARLIER than the fold trigger this test names.)
+/// with no window trips 0012's pair trigger one statement earlier, which would
+/// prove a different refusal.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_null_windowed_fold_rolls_the_whole_accept_back() {
     let world = world().await;
@@ -759,10 +766,11 @@ async fn a_null_windowed_fold_rolls_the_whole_accept_back() {
         .acceptance()
         .commit_acceptance(payload)
         .await
-        .expect_err("0013's fold trigger refuses a windowless fold run");
+        .expect_err("the draft gate refuses a fold run that was given no window");
     assert!(
-        err.to_string().contains("windowed backtest_run"),
-        "the refusal is the fold trigger's own message: {err}"
+        err.to_string().contains("walk-forward draft refused")
+            && err.to_string().contains("was run over None"),
+        "the refusal names the fold and the window it was given: {err}"
     );
 
     assert_eq!(

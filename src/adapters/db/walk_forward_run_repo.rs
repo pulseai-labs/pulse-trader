@@ -322,11 +322,17 @@ struct RunRow {
 /// coach accept both pass through — refuses an incoherent draft before a
 /// single row is written:
 ///
+/// - the SCHEME IS one [`FoldScheme::rolling_oos`] reconstructs from its own `k`
+///   — revalidated, not trusted (`RollingOos` is a public variant), so a `k` the
+///   domain refuses cannot reach the row the read would then reject;
 /// - the fold count IS the scheme's `k`, and `folds[i].index == i`;
 /// - the fold windows tile `draft.span` contiguously and in order (what
 ///   `fold_windows` produces — `from <= to` per window, first `from` at
 ///   `span.from_ms`, each `to` the next `from`, last `to` at `span.to_ms`);
 /// - every fold's engine fingerprint IS the draft's recorded fingerprint;
+/// - every fold's RUN was given the fold's own window — `inputs.window` IS
+///   `fold.window`, the interval the persisted `backtest_run` names as its
+///   provenance;
 /// - every fold's verdict IS the verdict of the trades that fold run carries —
 ///   its `realized_r` series through `FoldVerdict::from_rs`, the same rule the
 ///   app path applies and the read re-derives;
@@ -345,6 +351,26 @@ struct RunRow {
 /// trades the only evidence, so a verdict no trade supports is refused.
 fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
     let incoherent = |what: String| DataError::Db(format!("walk-forward draft refused: {what}"));
+    // The SCHEME is revalidated, not trusted (R5). `FoldScheme::RollingOos` is a
+    // public variant, so a caller can hand this gate a `k` the domain refuses to
+    // construct — `rolling_oos(13)` cannot return it — and the row such a draft
+    // writes is one the READ rejects (`decode_scheme_and_rule` re-derives the
+    // scheme through that same constructor) while `get_version` still derives
+    // `certified` from the stored `pass`. Reconstructing it here refuses the
+    // draft before a single row exists, so the write path and the read path
+    // cannot disagree about which schemes exist.
+    let reconstructed = FoldScheme::rolling_oos(i64::from(draft.scheme.k())).map_err(|e| {
+        incoherent(format!(
+            "scheme `{}` is not constructible: {e}",
+            draft.scheme.name()
+        ))
+    })?;
+    if reconstructed != draft.scheme {
+        return Err(incoherent(format!(
+            "scheme `{}` is not the scheme `rolling_oos` reconstructs from its own k",
+            draft.scheme.name()
+        )));
+    }
     let k = draft.scheme.k();
     if draft.folds.len() != usize::from(k) {
         return Err(incoherent(format!(
@@ -370,6 +396,19 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
             return Err(incoherent(format!(
                 "fold {} window {cursor}.. does not continue the counted span",
                 fold.index
+            )));
+        }
+        // The window the verdict was computed over IS the window its run was
+        // given (R6): `fold.window` is what `wf-v1` judged, and
+        // `fold.inputs.window` is what the ordinary `backtest_run` persists as its
+        // provenance — the interval a reader of that run sees. The schema only
+        // requires a fold run to BE windowed, so without this a draft could
+        // certify a fold whose inspectable provenance names a different interval:
+        // the stored record contradicting the certified verdict.
+        if fold.inputs.window.as_ref() != Some(&fold.window) {
+            return Err(incoherent(format!(
+                "fold {} was run over {:?} but its verdict is recorded for {}..{}",
+                fold.index, fold.inputs.window, fold.window.from_ms, fold.window.to_ms
             )));
         }
         if fold.result.engine_fingerprint.as_str() != draft.engine_fingerprint.as_str() {

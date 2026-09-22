@@ -18,12 +18,12 @@
 mod support;
 
 use pulse::{
-    CreatedBy, Db, FakeClock, FoldScheme, MIGRATOR, NewVersion, SqliteBacktestRunRepo,
-    SqliteStrategyRepo, StrategyRepository, StrategyVersion, VersionId, WalkForwardRunId,
-    WalkForwardRunRepository,
+    CandleWindow, CreatedBy, Db, FakeClock, FoldScheme, MIGRATOR, NewVersion,
+    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyRepository, StrategyVersion, VersionId,
+    WalkForwardRunId, WalkForwardRunRepository,
 };
 use sqlx::SqlitePool;
-use support::mcp::seeded_walk_forward_draft;
+use support::mcp::{seeded_walk_forward_draft, seeded_walk_forward_draft_k};
 use tempfile::TempDir;
 
 const MINIMAL_DSL: &str = r#"{
@@ -432,5 +432,97 @@ async fn a_pointer_at_a_failing_run_is_not_certification() {
     assert!(
         !version.certified,
         "a pointer at a failing run is uncertified — certification is the joined pass"
+    );
+}
+
+/// R5: the gate revalidates the SCHEME, not only the folds. `FoldScheme::RollingOos`
+/// is a public variant, so a repository caller can hand it a `k` the domain
+/// refuses to construct — `rolling_oos(13)` cannot return it — and the row such
+/// a draft writes is one the READ rejects (`decode_scheme_and_rule` re-derives
+/// the scheme through that same constructor) while `get_version` still derives
+/// `certified = true` from the stored `pass`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_whose_scheme_the_domain_cannot_construct_is_refused() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    // A FULLY COHERENT k = 13 draft — thirteen folds, honest trades and a derived
+    // passing verdict — whose only defect is the scheme. Before the gate
+    // revalidated the scheme this draft saved and advanced the pointer.
+    let out_of_range = seeded_walk_forward_draft_k(true, 13);
+    assert!(
+        out_of_range.verdict.pass && out_of_range.folds.len() == 13,
+        "the fixture's only defect is the scheme"
+    );
+
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &out_of_range)
+        .await
+        .expect_err("a scheme the domain cannot construct must refuse");
+    assert!(
+        err.to_string().contains("walk-forward draft refused")
+            && err.to_string().contains("not constructible"),
+        "the refusal names the scheme: {err}"
+    );
+
+    // And the legal range still reconstructs — the refusal is the bound, not a
+    // blanket one.
+    for legal in pulse::K_MIN..=pulse::K_MAX {
+        assert!(
+            FoldScheme::rolling_oos(i64::from(legal)).is_ok(),
+            "k={legal} is legal"
+        );
+    }
+
+    // Fail closed: no row, no pointer move, the version still uncertified.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_run")
+        .fetch_one(world.pool())
+        .await
+        .expect("count walk-forward runs");
+    assert_eq!(count, 0, "a refused draft wrote no run row");
+    let version = world.get().await;
+    assert!(
+        version.latest_walk_forward_run_id.is_none() && !version.certified,
+        "a refused draft cannot advance certification"
+    );
+}
+
+/// R6: a fold's recorded window IS the window its run was given. `fold.window`
+/// is what `wf-v1` judged; `fold.inputs.window` is what the ordinary
+/// `backtest_run` persists as its provenance — the interval a reader of that run
+/// sees. The schema only requires a fold run to be windowed, so without this the
+/// stored record could name a different interval than the certified verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_whose_fold_run_window_differs_from_its_fold_is_refused() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    // A VALID nonempty window, just not the one this fold was judged over — the
+    // shape the schema cannot see: the run stays windowed either way.
+    let mut mismatched = seeded_walk_forward_draft(true);
+    mismatched.folds[0].inputs.window =
+        Some(CandleWindow::new(1_735_702_200_000, 1_736_000_000_000).expect("a valid window"));
+
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &mismatched)
+        .await
+        .expect_err("a fold whose run was given another window must refuse");
+    assert!(
+        err.to_string().contains("fold 0 was run over"),
+        "the refusal names the fold and the window it was given: {err}"
+    );
+
+    // Fail closed: nothing persisted, the version still uncertified.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM walk_forward_run")
+        .fetch_one(world.pool())
+        .await
+        .expect("count walk-forward runs");
+    assert_eq!(count, 0, "a refused draft wrote no run row");
+    let version = world.get().await;
+    assert!(
+        version.latest_walk_forward_run_id.is_none() && !version.certified,
+        "a refused draft cannot advance certification"
     );
 }
