@@ -137,6 +137,23 @@ pub enum WalkForwardAppError {
         earliest_allowed_ms: i64,
     },
 
+    /// An explicit `to_ms` later than the primary snapshot's last candle — the
+    /// counted span would claim a period the data does not cover, and the last
+    /// fold would run only to the snapshot's real end while the persisted span
+    /// and window said otherwise.
+    #[error(
+        "walk-forward {field} {to_ms} is later than the primary snapshot's last candle \
+         {latest_allowed_ms} — a fold cannot count a period with no data"
+    )]
+    ToPastSnapshot {
+        /// The request field at fault — always `"to"`.
+        field: &'static str,
+        /// The refused explicit bound.
+        to_ms: i64,
+        /// The latest allowed `to_ms` (the snapshot's last candle close).
+        latest_allowed_ms: i64,
+    },
+
     /// The strategy's entry warm gate never holds anywhere on the snapshot —
     /// there is no bar a fold could count from.
     #[error("the strategy is never fully warm on this snapshot — no fold can count")]
@@ -219,8 +236,25 @@ fn resolve_counted_span(
 ) -> Result<(CandleWindow, bool), WalkForwardAppError> {
     let first_warm =
         first_fully_warm_bar_ms(compiled, primary, htf).ok_or(WalkForwardAppError::NeverWarm)?;
-    let resolved_to =
-        to_ms.unwrap_or_else(|| primary.candles.last().map_or(first_warm, |c| c.close_time));
+    // The snapshot's real end: the last candle's close, or the first warm bar on
+    // a snapshot too short to have one.
+    let snapshot_end = primary.candles.last().map_or(first_warm, |c| c.close_time);
+    // An explicit `to` may not reach PAST that end (R8): every fold would still
+    // hold a candle, so the empty-fold check below cannot catch it, and the last
+    // fold would run only through the snapshot's real end while the persisted
+    // span and its windows claimed coverage through the later requested time —
+    // certifying a period for which no data was evaluated. The bound is refused
+    // with its own typed error, naming the field and the latest allowed value.
+    if let Some(explicit) = to_ms
+        && explicit > snapshot_end
+    {
+        return Err(WalkForwardAppError::ToPastSnapshot {
+            field: "to",
+            to_ms: explicit,
+            latest_allowed_ms: snapshot_end,
+        });
+    }
+    let resolved_to = to_ms.unwrap_or(snapshot_end);
     let (resolved_from, from_defaulted) = match from_ms {
         Some(explicit) => {
             if explicit < first_warm {

@@ -513,12 +513,16 @@ async fn a_fold_with_no_counted_candle_refuses_before_any_persist() {
     let m15 = fixture_series(Timeframe::M15);
     let compiled = compile_dsl(&dsl);
     let warm = first_fully_warm_bar_ms(&compiled, &m15, None).unwrap();
-    let last_close = m15.candles.last().unwrap().close_time;
 
-    // A `to` twice the natural span: folds 3..5 start beyond the snapshot's
-    // last candle — the first empty fold (index 3) must refuse.
+    // A counted span NARROWER than the bar spacing: six one-minute windows over
+    // fifteen-minute candles, so fold 1 falls between two candle opens and no
+    // fold after it holds one either — the first empty fold (index 1) must
+    // refuse. (The shape used to be a `to` reaching past the snapshot; that is
+    // refused earlier now, as an over-reaching bound — R8 — so the starvation
+    // is produced INSIDE the snapshot instead.)
     let mut req = request(&version);
-    req.to_ms = Some(last_close + (last_close - warm));
+    req.from_ms = Some(warm);
+    req.to_ms = Some(warm + 6 * 60_000);
     let before = counts(world.db.pool()).await;
     let err = run_walk_forward(
         &world.strategies,
@@ -531,7 +535,7 @@ async fn a_fold_with_no_counted_candle_refuses_before_any_persist() {
     .expect_err("a fold with no counted candle must refuse");
     match err {
         WalkForwardAppError::FoldEmpty { fold_index, .. } => {
-            assert_eq!(fold_index, 3, "the first empty fold names itself");
+            assert_eq!(fold_index, 1, "the first empty fold names itself");
         }
         other => panic!("expected FoldEmpty, got {other}"),
     }
@@ -941,4 +945,46 @@ async fn concurrent_walk_forward_saves_all_succeed() {
         .await
         .expect("count fold rows");
     assert_eq!(folds, 16, "two folds per run");
+}
+
+/// R8: an explicit `to` may not reach past the primary snapshot. Every fold would
+/// still hold a candle, so the empty-fold check cannot catch it; the last fold
+/// would run only through the snapshot's real end while the persisted span and
+/// its windows claimed coverage through the later requested time — certifying a
+/// period for which no data was evaluated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn to_past_the_snapshot_is_refused_naming_the_latest_allowed() {
+    let world = world().await;
+    let version = make_version(&world, &oracle_dsl()).await;
+    let snapshot_end = fixture_series(Timeframe::M15)
+        .candles
+        .last()
+        .expect("the snapshot has candles")
+        .close_time;
+
+    let mut req = request(&version);
+    req.to_ms = Some(snapshot_end + 30 * 60_000); // two M15 bars later
+    let err = run_walk_forward(
+        &world.strategies,
+        &world.store,
+        &BinanceAdapter::new(),
+        &world.runs,
+        &req,
+    )
+    .await
+    .expect_err("a span reaching past the snapshot must refuse");
+    assert_eq!(
+        err,
+        WalkForwardAppError::ToPastSnapshot {
+            field: "to",
+            to_ms: snapshot_end + 30 * 60_000,
+            latest_allowed_ms: snapshot_end,
+        }
+    );
+
+    // The defaulted bound IS the snapshot's end, and an explicit one equal to it
+    // is legal — the refusal is the over-reach, not the bound.
+    let mut explicit_end = request(&version);
+    explicit_end.to_ms = Some(snapshot_end);
+    run(&world, &explicit_end).await;
 }

@@ -466,6 +466,19 @@ fn walk_forward_error_result(err: &WalkForwardAppError) -> CallToolResult {
                 rfc3339_secs(*earliest_allowed_ms)
             ),
         ),
+        // The mirror of `FromBeforeWarm`: an explicit `to` past the snapshot
+        // names its field and renders the latest allowed bound as RFC 3339.
+        WalkForwardAppError::ToPastSnapshot {
+            field,
+            latest_allowed_ms,
+            ..
+        } => field_error(
+            field,
+            format!(
+                "{err} — latest allowed: {}",
+                rfc3339_secs(*latest_allowed_ms)
+            ),
+        ),
         WalkForwardAppError::InvalidRange { field, .. } => field_error(field, err),
         // The empty fold's window `to` is the bound that starves it (ruling
         // (d) on `src/application/walk_forward.rs`'s field-less variant).

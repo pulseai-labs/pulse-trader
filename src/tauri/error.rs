@@ -280,6 +280,7 @@ impl From<WalkForwardAppError> for BusError {
             WalkForwardAppError::Domain(_)
             | WalkForwardAppError::InvalidRange { .. }
             | WalkForwardAppError::FromBeforeWarm { .. }
+            | WalkForwardAppError::ToPastSnapshot { .. }
             | WalkForwardAppError::NeverWarm
             | WalkForwardAppError::FoldEmpty { .. } => BusErrorCode::Validation,
             WalkForwardAppError::Persist(_)
@@ -306,6 +307,16 @@ impl From<WalkForwardAppError> for BusError {
             } => format!(
                 "`{field}`: {err} — earliest allowed: {}",
                 rfc3339_secs(*earliest_allowed_ms)
+            ),
+            // and the mirror bound for an explicit `to` past the snapshot,
+            // rendered the same way.
+            WalkForwardAppError::ToPastSnapshot {
+                field,
+                latest_allowed_ms,
+                ..
+            } => format!(
+                "`{field}`: {err} — latest allowed: {}",
+                rfc3339_secs(*latest_allowed_ms)
             ),
             WalkForwardAppError::FoldEmpty { .. } => format!("`to`: {err}"),
             _ => err.to_string(),
