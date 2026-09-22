@@ -68,6 +68,10 @@ use super::library::{
     LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
     recent_run_summary, version_stats,
 };
+use super::walk_forward::{
+    GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardRunDto, WalkForwardRunRequest,
+    get_backtest_run_core, get_walk_forward_run_core, run_walk_forward_version_core,
+};
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
     Db, SqliteBacktestRunRepo, SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path,
@@ -126,6 +130,9 @@ pub const BUS_COMMANDS: &[&str] = &[
     "coach_turn",
     "coach_decide",
     "compare_child_run",
+    "run_walk_forward_version",
+    "get_walk_forward_run",
+    "get_backtest_run",
 ];
 
 // ---------------------------------------------------------------------------
@@ -193,6 +200,10 @@ pub enum OperationKey {
     Backtest(VersionId),
     /// A coach turn or decision for one coaching session.
     Coach(CoachingSessionId),
+    /// A walk-forward of one strategy version (r2.s3.w5) — a K-fold battery of
+    /// ordinary runs under the same one-operation-per-version latch, on its
+    /// own key so a `Busy` refusal names the true operation.
+    WalkForward(VersionId),
 }
 
 impl OperationKey {
@@ -202,6 +213,9 @@ impl OperationKey {
         match self {
             Self::Backtest(version) => format!("a backtest of version `{}`", version.as_str()),
             Self::Coach(session) => format!("a coach operation for session `{}`", session.as_str()),
+            Self::WalkForward(version) => {
+                format!("a walk-forward of version `{}`", version.as_str())
+            }
         }
     }
 }
@@ -1618,6 +1632,53 @@ pub async fn coach_decide(
     request: CoachDecisionRequestDto,
 ) -> Result<CoachDecisionDto, BusError> {
     coach_decide_core(&state, request).await
+}
+
+/// `run_walk_forward_version` — the Backtest Lab's walk-forward action
+/// (r2.s3.w5): K `rolling-oos/v1` folds judged by `wf-v1`, each fold an
+/// ordinary persisted run.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`run_walk_forward_version_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn run_walk_forward_version(
+    state: tauri::State<'_, DesktopState>,
+    request: WalkForwardRunRequest,
+) -> Result<WalkForwardRunDto, BusError> {
+    run_walk_forward_version_core(&state, request).await
+}
+
+/// `get_walk_forward_run` — read one persisted walk-forward run back, in the
+/// same DTO the run command answers with (r2.s3.w5).
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`get_walk_forward_run_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn get_walk_forward_run(
+    state: tauri::State<'_, DesktopState>,
+    request: GetWalkForwardRunRequest,
+) -> Result<WalkForwardRunDto, BusError> {
+    get_walk_forward_run_core(&state, request).await
+}
+
+/// `get_backtest_run` — one persisted run id in, the same [`BacktestRunDto`]
+/// `run_backtest_version` answers with out (r2.s3.w5). A walk-forward fold's
+/// id opens as an ordinary run carrying its `walkForward` membership.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`get_backtest_run_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn get_backtest_run(
+    state: tauri::State<'_, DesktopState>,
+    request: GetBacktestRunRequest,
+) -> Result<BacktestRunDto, BusError> {
+    get_backtest_run_core(&state, request).await
 }
 
 #[cfg(test)]

@@ -1,11 +1,16 @@
-//! The nine tools of `pulse mcp` (r2.s1.w2, w3).
+//! The eleven tools of `pulse mcp` (r2.s1.w2, w3; r2.s3.w5).
 //!
 //! Seven read tools (`w2`): five query the strategy/run repositories and two
 //! read the candle store, with exports landing under the per-process exports
 //! dir. Two write tools (`w3`): `submit_strategy_version` persists an
 //! agent-authored DSL variant through the application submit use case, and
 //! `run_backtest` runs a version through the shared application flow with an
-//! optional `[from, to)` candle window.
+//! optional `[from, to)` candle window. Two walk-forward tools (r2.s3.w5):
+//! `run_walk_forward` walks a version over `rolling-oos/v1` folds through the
+//! same shared flow and `get_walk_forward_run` reads one persisted run back —
+//! both answer the ONE `WalkForwardRunDetail` shape, and every fold is an
+//! ordinary `backtest_run` row the unchanged `list_runs`/`get_run` surfaces
+//! resolve.
 //!
 //! Argument validation failures come back as tool errors in the
 //! `{"field", "message"}` shape (the spec's `FieldError` contract); store/repo
@@ -32,11 +37,16 @@ use crate::application::mcp_read::{
 use crate::application::mcp_write::{
     SubmitError, SubmitRequest, SubmitTarget, submit_agent_version,
 };
+use crate::application::walk_forward::{WalkForwardAppError, WalkForwardRequest, run_walk_forward};
+use crate::application::walk_forward_read::{
+    load_fold_runs, rfc3339_secs, run_summary_of, walk_forward_run_detail,
+};
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
     CompiledValue, DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun,
-    Series, StrategyRepository, Timeframe, ValidationCode,
+    Series, StrategyRepository, Timeframe, ValidationCode, WalkForwardRunId,
+    WalkForwardRunRepository,
 };
 
 use super::PulseMcp;
@@ -162,6 +172,36 @@ pub(crate) struct RunBacktestArgs {
     /// Exclusive window end, RFC 3339. Must be paired with `from`.
     #[serde(default)]
     to: Option<String>,
+}
+
+/// `run_walk_forward` args (r2.s3.w5). `from`/`to` are RFC 3339 UTC timestamps —
+/// **each independent**, unlike `run_backtest`'s both-or-neither window: an
+/// omitted `from` defaults to the first fully-warm bar, an omitted `to` to the
+/// snapshot's last candle's `close_time`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunWalkForwardArgs {
+    /// The strategy-version id to walk forward.
+    version_id: String,
+    /// The counted span's inclusive start, RFC 3339; omitted defaults to the
+    /// first fully-warm bar.
+    #[serde(default)]
+    from: Option<String>,
+    /// The counted span's exclusive end, RFC 3339; omitted defaults to the
+    /// snapshot's last candle's close.
+    #[serde(default)]
+    to: Option<String>,
+    /// The fold count — `2..=12`; omitted defaults to 6.
+    #[serde(default)]
+    k: Option<u8>,
+}
+
+/// `get_walk_forward_run` args (r2.s3.w5).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GetWalkForwardRunArgs {
+    /// The walk-forward run id.
+    walk_forward_run_id: String,
 }
 
 /// One tool error in the `{"field", "message"}` shape.
@@ -381,6 +421,51 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         BacktestAppError::Engine(
             BacktestError::HtfPairMismatch { .. } | BacktestError::HtfCoverageShort { .. },
         ) => field_error("inputs.htf", err),
+        _ => tool_error(err),
+    }
+}
+
+/// Parse ONE independent RFC 3339 bound — `run_walk_forward`'s `from`/`to`,
+/// each optional on its own (unlike `run_backtest`'s both-or-neither pair,
+/// which [`parse_window`] owns).
+fn parse_bound(field: &'static str, raw: Option<&str>) -> Result<Option<i64>, CallToolResult> {
+    raw.map(|s| parse_rfc3339_ms(s).map_err(|e| field_error(field, e)))
+        .transpose()
+}
+
+/// Map a [`WalkForwardAppError`] onto the tool-error shapes for the two
+/// walk-forward tools: the shared-path failures delegate to
+/// [`backtest_error_result`] verbatim (a fold run IS an ordinary run, so its
+/// failure vocabulary is the same), the request refusals name their field, and
+/// everything else — including the saved-but-unreadable pair, whose prose
+/// already names the persisted run id — carries `message` only.
+fn walk_forward_error_result(err: &WalkForwardAppError) -> CallToolResult {
+    match err {
+        WalkForwardAppError::Shared(e) => backtest_error_result(e),
+        // The domain taxonomy has exactly one variant today —
+        // `WalkForwardError::KOutOfRange` — so `k` is the field.
+        WalkForwardAppError::Domain(_) => field_error("k", err),
+        // `field` is `"from"`, and the refusal also names the earliest allowed
+        // bound as RFC 3339 — a wire timestamp, not the raw ms the Display
+        // carries.
+        WalkForwardAppError::FromBeforeWarm {
+            field,
+            earliest_allowed_ms,
+            ..
+        } => field_error(
+            field,
+            format!(
+                "{err} — earliest allowed: {}",
+                rfc3339_secs(*earliest_allowed_ms)
+            ),
+        ),
+        WalkForwardAppError::InvalidRange { field, .. } => field_error(field, err),
+        // The empty fold's window `to` is the bound that starves it (ruling
+        // (d) on `src/application/walk_forward.rs`'s field-less variant).
+        WalkForwardAppError::FoldEmpty { .. } => field_error("to", err),
+        // `NeverWarm` names no argument — the strategy warms nowhere on this
+        // snapshot — and `Persist`/`SavedButReadBack*`/`Internal` already say
+        // what they are in prose.
         _ => tool_error(err),
     }
 }
@@ -836,5 +921,115 @@ impl PulseMcp {
             payload["fingerprint_warning"] = json!(warning);
         }
         Ok(CallToolResult::structured(payload))
+    }
+
+    /// Walk a persisted strategy version over `rolling-oos/v1` folds (r2.s3.w5).
+    ///
+    /// `from`/`to` are INDEPENDENT RFC 3339 bounds — either may be given alone:
+    /// `from` defaults to the first fully-warm bar, `to` to the snapshot's last
+    /// candle's `close_time`. `k` defaults to `K_DEFAULT` (6). Pair, timeframes,
+    /// cost model and the exact snapshot pins resolve through the same
+    /// [`resolve_default_request`] seam `run_backtest` uses — the surfaces run a
+    /// version identically — and the answer is the one `WalkForwardRunDetail`
+    /// shape, built from the saved rows.
+    #[tool(
+        description = "Walk one strategy version forward: rolling-oos/v1 cuts the counted span into K contiguous out-of-sample folds (k in 2..=12, default 6) and judges the run under wf-v1. Each fold is an ordinary persisted windowed backtest run with full-history lead-in — visible through list_runs and get_run with its walk_forward membership. Optional from/to are RFC 3339 bounds given independently: `from` defaults to the first fully-warm bar, `to` to the snapshot's last close."
+    )]
+    async fn run_walk_forward(
+        &self,
+        Parameters(args): Parameters<RunWalkForwardArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let from_ms = match parse_bound("from", args.from.as_deref()) {
+            Ok(bound) => bound,
+            Err(result) => return Ok(result),
+        };
+        let to_ms = match parse_bound("to", args.to.as_deref()) {
+            Ok(bound) => bound,
+            Err(result) => return Ok(result),
+        };
+
+        let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
+        let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        let version_id = VersionId::new(args.version_id);
+        // The shared resolver supplies pair, timeframes, costs and pins; the
+        // walk-forward's own `from`/`to` are NOT its `window` (the backtest
+        // window is a both-or-neither pair — these bounds are independent), so
+        // `window` stays `None` here and the counted span resolves inside.
+        let resolved = match resolve_default_request(&strategies, &runs, &version_id, None).await {
+            Ok(request) => request,
+            Err(e @ BacktestAppError::VersionNotFound(_)) => {
+                return Ok(field_error("version_id", e));
+            }
+            Err(e) => return Ok(backtest_error_result(&e)),
+        };
+        let request = WalkForwardRequest {
+            version_id,
+            pair: resolved.pair,
+            primary_timeframe: resolved.primary_timeframe,
+            htf_timeframe: resolved.htf_timeframe,
+            config: resolved.config,
+            snapshots: resolved.snapshots,
+            from_ms,
+            to_ms,
+            k: args.k,
+        };
+        let outcome = match run_walk_forward(
+            &strategies,
+            &self.state.candles,
+            &self.state.exchange,
+            &runs,
+            &request,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => return Ok(walk_forward_error_result(&e)),
+        };
+        let detail = match walk_forward_run_detail(&outcome.run, &outcome.fold_summaries) {
+            Ok(detail) => detail,
+            Err(e) => return Ok(walk_forward_error_result(&e)),
+        };
+        Ok(CallToolResult::structured(
+            serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
+        ))
+    }
+
+    /// Fetch one persisted walk-forward run — the SAME `WalkForwardRunDetail`
+    /// `run_walk_forward` answers with, assembled from the stored rows: the
+    /// parent's provenance and verdict, plus each fold's run re-read through
+    /// the ordinary run log (`get_run` per `backtest_run_id`, fail closed).
+    #[tool(
+        description = "Fetch one walk-forward run by id: the same WalkForwardRunDetail shape run_walk_forward returns — scheme, rule, counted span, the wf-v1 verdict and one row per fold (window, fold verdict, and the fold's ordinary run summary)."
+    )]
+    async fn get_walk_forward_run(
+        &self,
+        Parameters(args): Parameters<GetWalkForwardRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        let run = match runs
+            .get_walk_forward_run(&WalkForwardRunId::new(args.walk_forward_run_id))
+            .await
+        {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                return Ok(field_error(
+                    "walk_forward_run_id",
+                    "no such walk-forward run",
+                ));
+            }
+            Err(e) => return Ok(tool_error(e)),
+        };
+        let fold_runs = match load_fold_runs(&runs, &run).await {
+            Ok(fold_runs) => fold_runs,
+            Err(e) => return Ok(walk_forward_error_result(&e)),
+        };
+        let summaries: Vec<_> = fold_runs.iter().map(run_summary_of).collect();
+        let detail = match walk_forward_run_detail(&run, &summaries) {
+            Ok(detail) => detail,
+            Err(e) => return Ok(walk_forward_error_result(&e)),
+        };
+        Ok(CallToolResult::structured(
+            serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
+        ))
     }
 }

@@ -143,6 +143,78 @@
   color: var(--text-2);
 }
 
+/* ---- walk-forward pane (r2.s3.w5) ---- */
+
+.bt-folds {
+  font: inherit;
+  font-size: var(--fs-13);
+  color: var(--text-1);
+  background: var(--bg-input);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-6);
+  padding: var(--sp-1) var(--sp-2);
+  width: 4.5rem;
+}
+
+.bt-folds:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.bt-wf-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-4);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-8);
+  background: var(--bg-raised);
+}
+
+.bt-wf-verdict {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-13);
+  color: var(--text-2);
+}
+
+.bt-wf-verdict-word {
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-caps);
+}
+
+.bt-wf-pass .bt-wf-verdict-word {
+  color: var(--bull-1);
+}
+
+.bt-wf-fail .bt-wf-verdict-word {
+  color: var(--bear-1);
+}
+
+/* The fold-open affordance is a BUTTON: its destination is this screen's own
+   result view, not a route — `coach-link-run`'s shape, named for its table. */
+.bt-wf-open {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-3);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  background: var(--bg-raised);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-4);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.bt-wf-open:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
 /* ---- result sections ---- */
 
 .bt-result {

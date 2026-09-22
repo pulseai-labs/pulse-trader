@@ -28,6 +28,9 @@ vi.mock("../bindings", () => ({
     coachDecide: vi.fn(),
     // r2.s1.w4 C3: the child-vs-parent comparison, mocked on the same terms.
     compareChildRun: vi.fn(),
+    // r2.s3.w5: the walk-forward gate and the fold-run read, same terms.
+    runWalkForwardVersion: vi.fn(),
+    getBacktestRun: vi.fn(),
   },
 }));
 
@@ -42,6 +45,7 @@ import type {
   LibraryOverview,
   LibraryVersion,
   SummaryDto,
+  WalkForwardRunDto,
 } from "../bindings";
 import BacktestLabScreen from "./BacktestLabScreen";
 import { RouteContent } from "../App";
@@ -50,6 +54,8 @@ import { resolveRoute } from "../routes";
 const catalogMock = vi.mocked(commands.libraryOverview);
 const runMock = vi.mocked(commands.runBacktestVersion);
 const compareMock = vi.mocked(commands.compareChildRun);
+const walkForwardMock = vi.mocked(commands.runWalkForwardVersion);
+const getRunMock = vi.mocked(commands.getBacktestRun);
 
 // ---------------------------------------------------------------------------
 // Fixtures — shaped exactly like the generated types, values chosen to be
@@ -268,6 +274,8 @@ beforeEach(() => {
   catalogMock.mockReset();
   runMock.mockReset();
   compareMock.mockReset();
+  walkForwardMock.mockReset();
+  getRunMock.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -1466,5 +1474,258 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     await waitFor(() => {
       expect(select.value).toBe("v-alpha-1");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r2.s3.w5 — the walk-forward gate: Walk forward action, per-fold table,
+// fold rows opening as ordinary runs
+// ---------------------------------------------------------------------------
+//
+// Same discipline as the rest of this file: every value asserted below is a
+// fixture value, so a pass means the pane rendered the DTO's own payload. The
+// scheme and rule fixtures are SENTINELS — a pane that hard-coded
+// "rolling-oos/v1"/"wf-v1" instead of rendering the DTO's fields fails these
+// tests, which is the difference between pinning the surface and pinning the
+// current backend constants.
+
+/** A two-fold walk-forward result with sentinel scheme/rule names and values
+ * distinct per fold, so only the real payload path can satisfy the asserts. */
+const WF_DTO: WalkForwardRunDto = {
+  walkForwardRunId: "wf-44aa19c2",
+  versionId: "v-alpha-1",
+  scheme: "scheme-sentinel/v9",
+  k: 2,
+  rule: "rule-sentinel",
+  spanFrom: "2026-08-01T00:00:00.000Z",
+  spanTo: "2026-08-31T23:59:59.000Z",
+  fromDefaulted: true,
+  engineFingerprint: "sha256:wfengine9",
+  verdict: {
+    pass: false,
+    foldsHolding: 1,
+    foldsRequired: 2,
+    pooled: { n: 5, meanR: "-0.500", lowerBound: -0.8123, holds: false },
+  },
+  folds: [
+    {
+      index: 0,
+      windowFrom: "2026-08-01T00:00:00.000Z",
+      windowTo: "2026-08-15T12:00:00.000Z",
+      backtestRunId: "run-fold-0",
+      n: 2,
+      meanR: "0.250",
+      lowerBound: -0.4,
+      holds: true,
+      trades: 2,
+      expectancy: "0.250",
+      winRate: "0.500",
+    },
+    {
+      index: 1,
+      windowFrom: "2026-08-15T12:00:00.000Z",
+      windowTo: "2026-08-31T23:59:59.000Z",
+      backtestRunId: "run-fold-1",
+      n: 3,
+      meanR: "-1.000",
+      lowerBound: -1.7,
+      holds: false,
+      trades: 3,
+      expectancy: "-1.000",
+      winRate: "0.333",
+    },
+  ],
+};
+
+/** The ordinary persisted run fold 0 ran as — its DTO carries the membership. */
+const FOLD_RUN: BacktestRunDto = {
+  ...SEEDED_RUN,
+  runId: "run-fold-0",
+  walkForward: { walkForwardRunId: "wf-44aa19c2", foldIndex: 0 },
+};
+
+const WF_ERROR: BusError = {
+  code: "validation",
+  message: "k must be in 2..=12, got 13",
+  run_id: null, session_id: null, child_run_id: null,
+};
+
+/** Render + catalog, then click Walk forward and wait for `awaitText`. */
+async function renderWalkForward(
+  outcome: WalkForwardRunDto | BusError,
+  catalog: LibraryOverview = CATALOG,
+) {
+  catalogMock.mockResolvedValue({ status: "ok", data: catalog });
+  const isDto = "walkForwardRunId" in outcome;
+  walkForwardMock.mockResolvedValue(
+    isDto ? { status: "ok", data: outcome } : { status: "error", error: outcome },
+  );
+  const { container } = render(<BacktestLabScreen />);
+  fireEvent.click(await screen.findByRole("button", { name: /walk forward/i }));
+  await screen.findByText(isDto ? outcome.walkForwardRunId : outcome.message);
+  return container;
+}
+
+describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
+  it("never invokes runWalkForwardVersion from mount — StrictMode included", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    walkForwardMock.mockResolvedValue({ status: "ok", data: WF_DTO });
+
+    render(
+      <StrictMode>
+        <BacktestLabScreen />
+      </StrictMode>,
+    );
+    await screen.findByRole("button", { name: /walk forward/i });
+    // Flush microtasks so an erroneous mount-effect call would have landed.
+    await Promise.resolve();
+
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(getRunMock).not.toHaveBeenCalled();
+  });
+
+  it("invokes runWalkForwardVersion exactly once per click with the selected version and k", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    walkForwardMock.mockResolvedValue({ status: "ok", data: WF_DTO });
+    render(<BacktestLabScreen />);
+
+    // The folds input defaults to the backend's own default — 6 — and that is
+    // what the request carries.
+    fireEvent.click(await screen.findByRole("button", { name: /walk forward/i }));
+    await screen.findByText("wf-44aa19c2");
+    expect(walkForwardMock).toHaveBeenCalledTimes(1);
+    expect(walkForwardMock).toHaveBeenLastCalledWith({ versionId: "v-alpha-1", k: 6 });
+  });
+
+  it("sends the folds input's value as k when the trader sets it", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    walkForwardMock.mockResolvedValue({ status: "ok", data: WF_DTO });
+    render(<BacktestLabScreen />);
+
+    fireEvent.change(await screen.findByLabelText(/folds/i), { target: { value: "3" } });
+    fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
+
+    await screen.findByText("wf-44aa19c2");
+    expect(walkForwardMock).toHaveBeenLastCalledWith({ versionId: "v-alpha-1", k: 3 });
+  });
+
+  it("renders the scheme and rule as the DTO names them, the span, and the verdict line", async () => {
+    const container = await renderWalkForward(WF_DTO);
+    const pane = container.querySelector(".bt-walkforward") as HTMLElement;
+    expect(pane).not.toBeNull();
+    const text = pane.textContent ?? "";
+
+    // Sentinel values — renderable only off the DTO, never a baked-in label.
+    expect(text).toContain("scheme-sentinel/v9");
+    expect(text).toContain("rule-sentinel");
+    expect(text).toContain("2026-08-01T00:00:00.000Z");
+    expect(text).toContain("2026-08-31T23:59:59.000Z");
+    expect(text).toContain("wf-44aa19c2");
+    // The verdict line: the word, the holding/required tally, the pooled bound.
+    expect(text).toContain("FAIL");
+    expect(text).toContain("1/2");
+    expect(text).toContain("-0.8123");
+    // `from_defaulted` is surfaced as provenance, not silently applied.
+    expect(text).toContain("defaulted");
+  });
+
+  it("renders one row per fold with window, trades, lower bound and holds", async () => {
+    const container = await renderWalkForward(WF_DTO);
+    const region = within(container).getByRole("region", { name: /fold rows/i });
+    const rows = Array.from(region.querySelectorAll("tbody tr"));
+    expect(rows).toHaveLength(2);
+
+    const first = rows[0].textContent ?? "";
+    expect(first).toContain("2026-08-01T00:00:00.000Z");
+    expect(first).toContain("2026-08-15T12:00:00.000Z");
+    expect(first).toContain("2");
+    expect(first).toContain("-0.4");
+    expect(first).toContain("yes");
+    // The fold run's own summary fields ride the same row.
+    expect(first).toContain("0.250");
+    expect(first).toContain("0.500");
+
+    const second = rows[1].textContent ?? "";
+    expect(second).toContain("3");
+    expect(second).toContain("-1.7");
+    expect(second).toContain("no");
+    expect(second).toContain("-1.000");
+    expect(second).toContain("0.333");
+  });
+
+  it("opens a fold as an ordinary run: getBacktestRun on the fold's id lands in the existing result view", async () => {
+    const container = await renderWalkForward(WF_DTO);
+    getRunMock.mockResolvedValue({ status: "ok", data: FOLD_RUN });
+
+    const region = within(container).getByRole("region", { name: /fold rows/i });
+    fireEvent.click(within(region).getByRole("button", { name: /open run run-fold-0/i }));
+
+    await waitFor(() => {
+      expect(getRunMock).toHaveBeenCalledWith({ runId: "run-fold-0" });
+    });
+    // The existing result view answers with the fold run: provenance band, KPI
+    // tiles, equity chart — the same sections a Run render carries. (The id
+    // also sits in the fold row's own button, so the wait is on the band.)
+    await waitFor(() => {
+      expect(container.querySelector(".bt-provenance")).not.toBeNull();
+    });
+    expect(within(container.querySelector(".bt-provenance") as HTMLElement)
+      .getByText("run-fold-0")).toBeTruthy();
+    expect(container.querySelector(".bt-kpis")).not.toBeNull();
+    expect(container.querySelector(".bt-equity")).not.toBeNull();
+    // And the walk-forward pane stays put — the run opened beneath it.
+    expect(container.querySelector(".bt-walkforward")).not.toBeNull();
+  });
+
+  it("renders a walk-forward BusError's code and message like the run error does", async () => {
+    await renderWalkForward(WF_ERROR);
+
+    const alert = screen.getAllByRole("alert").find((a) =>
+      a.textContent?.includes(WF_ERROR.message),
+    );
+    expect(alert).toBeDefined();
+    expect(alert?.textContent).toContain("validation");
+  });
+
+  it("locks the selector and both actions while a walk-forward is in flight", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    let resolveWf: (value: { status: "ok"; data: WalkForwardRunDto }) => void = () => {};
+    walkForwardMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveWf = resolve;
+        }),
+    );
+    render(<BacktestLabScreen />);
+
+    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
+
+    await screen.findByRole("button", { name: /walking forward/i });
+    expect(select.disabled).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: /run backtest/i }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: /walking forward/i }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+
+    resolveWf({ status: "ok", data: WF_DTO });
+    await screen.findByText("wf-44aa19c2");
+    expect(select.disabled).toBe(false);
+    expect(
+      (screen.getByRole("button", { name: /walk forward/i }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
+  it("clears a rendered walk-forward result when the selector changes", async () => {
+    const container = await renderWalkForward(WF_DTO);
+    expect(container.querySelector(".bt-walkforward")).not.toBeNull();
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+
+    expect(container.querySelector(".bt-walkforward")).toBeNull();
+    expect(screen.queryByText("wf-44aa19c2")).toBeNull();
   });
 });

@@ -64,6 +64,18 @@ export function backtestKey(versionId: string): string {
   return `backtest:${versionId}`;
 }
 
+/**
+ * The key one version's walk-forward runs under (r2.s3.w5).
+ *
+ * A fold row's "open run" does NOT use this key: a fold run is an ordinary
+ * persisted run, so opening one starts `get_backtest_run` under the version's
+ * own `backtestKey` — the existing result view answers with it, and the
+ * store's in-flight refusal on that key is the only locking the open needs.
+ */
+export function walkForwardKey(versionId: string): string {
+  return `walk-forward:${versionId}`;
+}
+
 /** The key one coaching session's turn and decisions run under. */
 export function coachKey(sessionId: string): string {
   return `coach:${sessionId}`;

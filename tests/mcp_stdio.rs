@@ -36,8 +36,8 @@ async fn tools_and_dsl_schema_resource_are_served() {
     copy_tree(&manifest(FIXTURE_STORE), &store_dir);
     let client = spawn_client(&db_path, &store_dir).await;
 
-    // Exactly the nine declared tools — the seven read tools plus w3's two
-    // write tools, no more, no fewer.
+    // Exactly the eleven declared tools — the seven read tools, w3's two
+    // write tools, and r2.s3.w5's two walk-forward tools — no more, no fewer.
     let tools = client.list_tools(None).await.expect("tools/list").tools;
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     names.sort_unstable();
@@ -49,12 +49,14 @@ async fn tools_and_dsl_schema_resource_are_served() {
             "export_trades",
             "get_run",
             "get_version",
+            "get_walk_forward_run",
             "list_runs",
             "list_strategies",
             "run_backtest",
+            "run_walk_forward",
             "submit_strategy_version",
         ],
-        "the advertised tool set is exactly the nine declared tools"
+        "the advertised tool set is exactly the eleven declared tools"
     );
 
     // The one advertised resource, then its document body.

@@ -620,6 +620,13 @@ pub use crate::tauri::{
     export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
     shell_info_core, summarize_dsl,
 };
+// r2.s3.w5: the walk-forward wire contract — the request/response DTOs plus
+// the three transport-free cores `tests/tauri_walk_forward.rs` (AC-2) drives.
+pub use crate::tauri::{
+    FoldVerdictDto, GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardFoldDto,
+    WalkForwardRunDto, WalkForwardRunRequest, WalkForwardVerdictDto, get_backtest_run_core,
+    get_walk_forward_run_core, run_walk_forward_version_core,
+};
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the
 // REAL cores through these — the `run_backtest_version_core` precedent, with the

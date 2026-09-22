@@ -37,6 +37,10 @@ pub(crate) mod events;
 // A separate module so `commands.rs` stays the registration surface while the
 // projection logic lives next to its own unit tests.
 pub(crate) mod library;
+// r2.s3.w5: the walk-forward wire contract (DTOs + the projection) and the
+// three command cores. A separate module so `commands.rs` stays the
+// registration surface while the read/run behavior lives beside its own file.
+pub(crate) mod walk_forward;
 
 pub use backtest::{
     BacktestRunDto, BacktestRunRequest, CompareChildRunDto, CompareChildRunRequest, EquityPointDto,
@@ -59,6 +63,11 @@ pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
 pub use library::{
     DslSummary, LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, VersionStats,
     dsl_summary,
+};
+pub use walk_forward::{
+    FoldVerdictDto, GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardFoldDto,
+    WalkForwardRunDto, WalkForwardRunRequest, WalkForwardVerdictDto, get_backtest_run_core,
+    get_walk_forward_run_core, run_walk_forward_version_core,
 };
 
 /// Build the `tauri-specta` builder that owns the command registry.
@@ -84,6 +93,9 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::coach_turn,
         commands::coach_decide,
         commands::compare_child_run,
+        commands::run_walk_forward_version,
+        commands::get_walk_forward_run,
+        commands::get_backtest_run,
     ])
 }
 

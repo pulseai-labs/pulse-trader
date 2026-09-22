@@ -4,7 +4,10 @@
 //! go to stderr, and the ring names no secrets/LLM adapter so the credential
 //! gate holds by construction (`scripts/check-mcp-boundary.sh` scans for it).
 //! Seven read tools (`w2`) plus two write tools (`w3`):
-//! `submit_strategy_version` and the windowed `run_backtest`.
+//! `submit_strategy_version` and the windowed `run_backtest` — and the two
+//! walk-forward tools of r2.s3.w5: `run_walk_forward` (K `rolling-oos/v1`
+//! folds under `wf-v1`, each fold an ordinary persisted run) and
+//! `get_walk_forward_run` (the same detail shape read back).
 //!
 //! The import boundary (enforced by the script): `crate::domain`,
 //! `crate::application`, `crate::adapters::{db, store, indicators, backtest,
@@ -99,7 +102,10 @@ impl ServerHandler for PulseMcp {
              list_strategies, get_version, list_runs, get_run, export_trades, \
              export_candles, export_indicators. Write tools: submit_strategy_version \
              (persist an agent-authored DSL variant with its hypothesis) and \
-             run_backtest (run a version, optionally windowed to [from, to)). The \
+             run_backtest (run a version, optionally windowed to [from, to)). \
+             Walk-forward tools: run_walk_forward (walk a version over \
+             rolling-oos/v1 folds judged by wf-v1) and get_walk_forward_run \
+             (read one persisted walk-forward run back). The \
              pulse://dsl/schema resource carries the DSL grammar.",
         )
     }
