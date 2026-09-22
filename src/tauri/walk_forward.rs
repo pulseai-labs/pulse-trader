@@ -22,14 +22,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::adapters::broker::BinanceAdapter;
-use crate::application::backtest::{read_back, resolve_default_request};
+use crate::application::backtest::{
+    BacktestAppError, ReadBackFailure, ReadBackStage, read_back, resolve_default_request,
+};
 use crate::application::walk_forward::{WalkForwardRequest, run_walk_forward};
 use crate::application::walk_forward_read::{load_fold_runs, rfc3339_ms};
 use crate::domain::backtest::FoldVerdict;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, PersistedRun, WalkForwardRun, WalkForwardRunId,
-    WalkForwardRunRepository,
+    BacktestRunId, PersistedRun, WalkForwardRun, WalkForwardRunId, WalkForwardRunRepository,
 };
 
 use super::backtest::{BacktestRunDto, backtest_run_dto, dec};
@@ -430,15 +431,28 @@ pub async fn get_backtest_run_core(
 ) -> Result<BacktestRunDto, BusError> {
     let runs = state.backtest_run_repo();
     let run_id = BacktestRunId::new(&request.run_id);
-    // An id that names nothing is `not_found`, not a read-back fault — the
-    // same refusal `compare_child_run` gives.
-    if runs.get_run(&run_id).await?.is_none() {
-        return Err(BusError::with_child_run_id(
-            BusErrorCode::NotFound,
-            format!("no backtest run {}", request.run_id),
-            request.run_id,
-        ));
-    }
-    let outcome = read_back(state.candles(), &runs, run_id, None).await?;
+    // ONE read. `read_back` loads the very run this command projects, and it
+    // already reports an absent row as `SavedButReadBackFailed { stage: Run,
+    // failure: Missing }` — so the id that names nothing is answerable from that
+    // read instead of from a probe before it (which decoded the run, its trades
+    // and its `#39` hash only to throw the result away and read it again).
+    //
+    // The refusal is unchanged: `not_found`, naming the asked-for id — which
+    // rides `child_run_id`, the same slot `compare_child_run`'s refusal uses.
+    let outcome = match read_back(state.candles(), &runs, run_id, None).await {
+        Ok(outcome) => outcome,
+        Err(BacktestAppError::SavedButReadBackFailed {
+            stage: ReadBackStage::Run,
+            failure: ReadBackFailure::Missing,
+            ..
+        }) => {
+            return Err(BusError::with_child_run_id(
+                BusErrorCode::NotFound,
+                format!("no backtest run {}", request.run_id),
+                request.run_id,
+            ));
+        }
+        Err(other) => return Err(other.into()),
+    };
     Ok(backtest_run_dto(&outcome)?)
 }
