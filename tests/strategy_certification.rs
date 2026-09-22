@@ -19,7 +19,7 @@ mod support;
 
 use pulse::{
     CreatedBy, Db, FakeClock, MIGRATOR, NewVersion, SqliteBacktestRunRepo, SqliteStrategyRepo,
-    StrategyRepository, StrategyVersion, VersionId, WalkForwardRunRepository,
+    StrategyRepository, StrategyVersion, VersionId, WalkForwardRunId, WalkForwardRunRepository,
 };
 use sqlx::SqlitePool;
 use support::mcp::seeded_walk_forward_draft;
@@ -231,7 +231,7 @@ async fn same_millisecond_saves_advance_the_pointer_in_save_order() {
         version
             .latest_walk_forward_run_id
             .as_ref()
-            .map(|p| p.as_str()),
+            .map(WalkForwardRunId::as_str),
         Some(second.as_str()),
         "the later same-millisecond save advances the pointer"
     );

@@ -257,7 +257,7 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             != acceptance
                 .expected_certification_pointer
                 .as_ref()
-                .map(|p| p.as_str())
+                .map(WalkForwardRunId::as_str)
         {
             return Err(DataError::Db(format!(
                 "coaching session `{id}`: the parent's certification pointer moved while this \
