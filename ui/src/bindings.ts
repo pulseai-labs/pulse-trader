@@ -164,6 +164,35 @@ export const commands = {
 	 *  Returns a [`BusError`]; see [`compare_child_run_core`].
 	 */
 	compareChildRun: (request: CompareChildRunRequest) => typedError<CompareChildRunDto, BusError>(__TAURI_INVOKE("compare_child_run", { request })),
+	/**
+	 *  `run_walk_forward_version` — the Backtest Lab's walk-forward action
+	 *  (r2.s3.w5): K `rolling-oos/v1` folds judged by `wf-v1`, each fold an
+	 *  ordinary persisted run.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`run_walk_forward_version_core`].
+	 */
+	runWalkForwardVersion: (request: WalkForwardRunRequest) => typedError<WalkForwardRunDto, BusError>(__TAURI_INVOKE("run_walk_forward_version", { request })),
+	/**
+	 *  `get_walk_forward_run` — read one persisted walk-forward run back, in the
+	 *  same DTO the run command answers with (r2.s3.w5).
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`get_walk_forward_run_core`].
+	 */
+	getWalkForwardRun: (request: GetWalkForwardRunRequest) => typedError<WalkForwardRunDto, BusError>(__TAURI_INVOKE("get_walk_forward_run", { request })),
+	/**
+	 *  `get_backtest_run` — one persisted run id in, the same [`BacktestRunDto`]
+	 *  `run_backtest_version` answers with out (r2.s3.w5). A walk-forward fold's
+	 *  id opens as an ordinary run carrying its `walkForward` membership.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`get_backtest_run_core`].
+	 */
+	getBacktestRun: (request: GetBacktestRunRequest) => typedError<BacktestRunDto, BusError>(__TAURI_INVOKE("get_backtest_run", { request })),
 };
 
 /* Types */
@@ -759,6 +788,45 @@ export type EquityPointDto = {
 	equity: string,
 };
 
+/**
+ *  One `wf-v1` verdict block — a fold's verdict and the pooled verdict share
+ *  this shape. `mean_r` crosses as exact decimal text; `lower_bound` is the
+ *  one genuinely `f64` value the rule computes.
+ */
+export type FoldVerdictDto = {
+	/**  The number of out-of-sample trades the verdict saw. */
+	n: number,
+	/**  `Σ rᵢ / n`, exact decimal string. */
+	meanR: string,
+	/**
+	 *  `mean − 1.645 · sqrt(var / n)` — the one-sided expectancy lower bound
+	 *  in R.
+	 */
+	lowerBound: number | null,
+	/**  `n >= 20 && lower_bound > 0` — `wf-v1`'s fold rule. */
+	holds: boolean,
+};
+
+/**
+ *  What `get_backtest_run` is asked for: one persisted run id — a standalone
+ *  run or a walk-forward fold alike (a fold IS an ordinary `backtest_run`).
+ */
+export type GetBacktestRunRequest = {
+	/**  The backtest run id. */
+	runId: string,
+};
+
+/**
+ *  What `get_walk_forward_run` is asked for: one persisted walk-forward run
+ *  id. A request struct rather than a bare `String` — the
+ *  `CompareChildRunRequest` shape — so the wire argument names itself
+ *  (`{ walkForwardRunId }`).
+ */
+export type GetWalkForwardRunRequest = {
+	/**  The walk-forward run id. */
+	walkForwardRunId: string,
+};
+
 /**  One `[lower, upper)` histogram bin and its count. */
 export type HistogramBinDto = {
 	/**  Inclusive lower bound in R, exact decimal string. */
@@ -1057,6 +1125,36 @@ export type VersionStats = {
 };
 
 /**
+ *  One fold's row: its counted window, the `wf-v1` verdict recorded on it, the
+ *  ordinary `backtest_run` it ran as, and that run's own headline stats — the
+ *  numbers the Backtest Lab's per-fold table renders.
+ */
+export type WalkForwardFoldDto = {
+	/**  The fold's position in the scheme (`0..k`). */
+	index: number,
+	/**  The counted window's inclusive start, RFC 3339 ms. */
+	windowFrom: string,
+	/**  The counted window's exclusive end, RFC 3339 ms. */
+	windowTo: string,
+	/**  The ordinary `backtest_run` this fold ran as — `get_backtest_run`'s id. */
+	backtestRunId: string,
+	/**  The trades the `wf-v1` verdict saw (equals `trades`). */
+	n: number,
+	/**  `Σ rᵢ / n`, exact decimal string. */
+	meanR: string,
+	/**  The one-sided expectancy lower bound in R. */
+	lowerBound: number | null,
+	/**  Whether the fold holds under `wf-v1`. */
+	holds: boolean,
+	/**  The fold run's persisted trade count. */
+	trades: number,
+	/**  The fold run's mean P&L per trade, exact decimal string. */
+	expectancy: string,
+	/**  The fold run's win rate, exact decimal string. */
+	winRate: string,
+};
+
+/**
  *  The walk-forward membership a run carries, on the wire (r2.s3.w3 — the
  *  `0013` `backtest_run` pair, both-or-neither by trigger, so one `Option`
  *  carries them together).
@@ -1066,6 +1164,82 @@ export type WalkForwardMembershipDto = {
 	walkForwardRunId: string,
 	/**  This run's position in the parent's scheme (`0..k`). */
 	foldIndex: number,
+};
+
+/**
+ *  The walk-forward run both `run_walk_forward_version` and
+ *  `get_walk_forward_run` answer with: the persisted parent's provenance and
+ *  verdict plus one row per fold. `PartialEq` (not `Eq`) — `lower_bound` is
+ *  `f64`, the same reason [`BacktestRunDto`] carries only `PartialEq`.
+ */
+export type WalkForwardRunDto = {
+	/**  The walk-forward run's opaque id. */
+	walkForwardRunId: string,
+	/**  The `strategy_version` the run was produced against. */
+	versionId: string,
+	/**  The fold scheme's pinned name (`rolling-oos/v1`). */
+	scheme: string,
+	/**  The fold count. */
+	k: number,
+	/**  The verdict rule's pinned name (`wf-v1`). */
+	rule: string,
+	/**  The counted span's inclusive start, RFC 3339 ms. */
+	spanFrom: string,
+	/**  The counted span's exclusive end, RFC 3339 ms. */
+	spanTo: string,
+	/**
+	 *  Whether `span_from` was defaulted to the first fully-warm bar rather
+	 *  than requested explicitly.
+	 */
+	fromDefaulted: boolean,
+	/**  The engine fingerprint the fold runs share. */
+	engineFingerprint: string,
+	/**  The recorded `wf-v1` run verdict. */
+	verdict: WalkForwardVerdictDto,
+	/**  The folds in `fold_index` order. */
+	folds: WalkForwardFoldDto[],
+};
+
+/**
+ *  What `run_walk_forward_version` is asked for: one persisted strategy
+ *  version, plus the `rolling-oos/v1` knobs the wire may set.
+ * 
+ *  Pair, timeframes and costs are **not** here — the shared
+ *  [`resolve_default_request`] seam supplies them from the version's recorded
+ *  lineage (parent's latest run, then its own, then the app defaults), so a
+ *  walk-forward runs a version identically on every surface.
+ */
+export type WalkForwardRunRequest = {
+	/**  The immutable strategy version to walk forward. */
+	versionId: string,
+	/**
+	 *  The counted span's inclusive start, RFC 3339. `None` defaults to the
+	 *  first fully-warm bar; an explicit earlier value refuses.
+	 */
+	from?: string | null,
+	/**
+	 *  The counted span's exclusive end, RFC 3339. `None` defaults to the
+	 *  snapshot's last candle's `close_time`. Independent of `from` — either
+	 *  bound may be given alone.
+	 */
+	to?: string | null,
+	/**  The fold count `k`, in `2..=12`. `None` defaults to 6. */
+	k?: number | null,
+};
+
+/**
+ *  The `wf-v1` run verdict on the wire: the fold tallies plus the pooled
+ *  bound over every out-of-sample trade.
+ */
+export type WalkForwardVerdictDto = {
+	/**  `folds_holding >= folds_required && pooled.holds`. */
+	pass: boolean,
+	/**  How many of the run's folds held. */
+	foldsHolding: number,
+	/**  `⌈2K/3⌉` — how many must hold for the run to pass. */
+	foldsRequired: number,
+	/**  The verdict over every fold's trades concatenated in fold order. */
+	pooled: FoldVerdictDto,
 };
 
 /* Tauri Specta runtime */

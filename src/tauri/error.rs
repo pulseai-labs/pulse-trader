@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::ComposerError;
 use crate::application::backtest::BacktestAppError;
+use crate::application::walk_forward::WalkForwardAppError;
+use crate::application::walk_forward_read::rfc3339_secs;
 use crate::domain::{BacktestError, DataError, ExchangeError, LlmError, ValidationErrors};
 
 /// Which family a [`BusError`] came from — a closed set the frontend can branch on.
@@ -250,6 +252,65 @@ impl From<BacktestAppError> for BusError {
             Some(run_id) => Self::with_run_id(code, message, run_id),
             None => Self::new(code, message),
         }
+    }
+}
+
+/// The application ring's walk-forward failures (r2.s3.w5).
+///
+/// The `Shared` arm delegates to [`From<BacktestAppError>`] verbatim — a fold
+/// run IS an ordinary windowed run, so its failure vocabulary (and its
+/// `run_id` carry, should a `backtest_run` id be the one that persisted)
+/// maps identically. The walk-forward request refusals are all
+/// caller-correctable — `k` out of `2..=12`, `from` before the first
+/// fully-warm bar, `to` at-or-before `from`, the fold `to` starves — and
+/// `NeverWarm` joins them: the strategy warms nowhere on the snapshot, which
+/// is a request-family refusal, not a store fault (ruling (e)). **No new
+/// `BusErrorCode` variant is added.**
+///
+/// The saved-but-unreadable pair maps to `Data` with `run_id: None` on
+/// purpose: `run_id` is documented as a *backtest* run id, which a
+/// `walk_forward_run` id is not — `get_backtest_run` would refuse it. The id
+/// rides the message instead, where the screen renders it verbatim.
+impl From<WalkForwardAppError> for BusError {
+    fn from(err: WalkForwardAppError) -> Self {
+        if let WalkForwardAppError::Shared(shared) = &err {
+            return Self::from(shared.clone());
+        }
+        let code = match &err {
+            WalkForwardAppError::Domain(_)
+            | WalkForwardAppError::InvalidRange { .. }
+            | WalkForwardAppError::FromBeforeWarm { .. }
+            | WalkForwardAppError::NeverWarm
+            | WalkForwardAppError::FoldEmpty { .. } => BusErrorCode::Validation,
+            WalkForwardAppError::Persist(_)
+            | WalkForwardAppError::SavedButReadBackFailed { .. }
+            | WalkForwardAppError::SavedButReadBackMissing(_) => BusErrorCode::Data,
+            WalkForwardAppError::FingerprintMismatch { .. } | WalkForwardAppError::Internal(_) => {
+                BusErrorCode::Internal
+            }
+            WalkForwardAppError::Shared(_) => unreachable!("the shared arm returned above"),
+        };
+        let message = match &err {
+            // A request refusal's message names its field: `k` for the domain
+            // taxonomy (whose only variant today is `KOutOfRange`), `from`/`to`
+            // per the variant's own `field` — and `FoldEmpty` names `to`, the
+            // bound that starves the fold (ruling (d)).
+            WalkForwardAppError::Domain(_) => format!("`k`: {err}"),
+            WalkForwardAppError::InvalidRange { field, .. } => format!("`{field}`: {err}"),
+            // `FromBeforeWarm` also renders the earliest allowed bound as RFC
+            // 3339 — a wire timestamp, not the raw ms the `Display` carries.
+            WalkForwardAppError::FromBeforeWarm {
+                field,
+                earliest_allowed_ms,
+                ..
+            } => format!(
+                "`{field}`: {err} — earliest allowed: {}",
+                rfc3339_secs(*earliest_allowed_ms)
+            ),
+            WalkForwardAppError::FoldEmpty { .. } => format!("`to`: {err}"),
+            _ => err.to_string(),
+        };
+        Self::new(code, message)
     }
 }
 

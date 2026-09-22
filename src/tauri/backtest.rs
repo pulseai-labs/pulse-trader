@@ -347,7 +347,9 @@ pub struct CompareChildRunDto {
 }
 
 /// Exact decimal text — the same `.normalize()`d form the database stores.
-fn dec(value: Decimal) -> String {
+/// `pub(crate)` so `walk_forward.rs`'s fold/verdict projections render under
+/// the identical rule (r2.s3.w5).
+pub(crate) fn dec(value: Decimal) -> String {
     value.normalize().to_string()
 }
 

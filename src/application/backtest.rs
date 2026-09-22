@@ -735,7 +735,9 @@ where
 }
 
 /// Steps 7-8: reload the saved run, its trades and its exact snapshots.
-async fn read_back<C, R>(
+/// `pub(crate)` so r2.s3.w5's `get_backtest_run` core reads one persisted run
+/// back through this same pipeline (a fold opens as an ordinary run).
+pub(crate) async fn read_back<C, R>(
     candles: C,
     runs: &R,
     run_id: BacktestRunId,

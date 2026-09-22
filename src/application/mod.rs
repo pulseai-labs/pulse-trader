@@ -61,3 +61,9 @@ pub(crate) mod mcp_write;
 // ordinary persisted windowed runs, `wf-v1` verdicts, one blocking task for
 // all folds (a13/#201), one transaction for the parent + fold rows + fold runs.
 pub(crate) mod walk_forward;
+
+// r2.s3.w5: the walk-forward READ projection — `load_fold_runs` (the L8
+// seam's read half: a fold is an ordinary `backtest_run`) plus the one
+// `WalkForwardRunDetail` wire shape both MCP walk-forward tools return, so no
+// delivery ring re-derives its own read.
+pub(crate) mod walk_forward_read;

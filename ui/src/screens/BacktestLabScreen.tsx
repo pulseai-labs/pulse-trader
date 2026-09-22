@@ -34,9 +34,19 @@ import type {
   RegimeCellDto,
   SummaryDto,
   TradeRowDto,
+  WalkForwardRunDto,
 } from "../bindings";
-import { backtestKey, coachKey, useActiveOperations } from "../hooks/useActiveOperations";
-import type { BusResult, OperationRecord } from "../hooks/useActiveOperations";
+import {
+  backtestKey,
+  coachKey,
+  useActiveOperations,
+  walkForwardKey,
+} from "../hooks/useActiveOperations";
+import type {
+  ActiveOperations,
+  BusResult,
+  OperationRecord,
+} from "../hooks/useActiveOperations";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 
 /** The em dash every null renders — a statement that no value exists, never
@@ -115,6 +125,79 @@ function runStateOf(record: OperationRecord | undefined): RunState {
   return outcome.status === "ok"
     ? { kind: "done", dto: outcome.data }
     : { kind: "failed", error: outcome.error };
+}
+
+// ---------------------------------------------------------------------------
+// Walk-forward state (r2.s3.w5) — the same per-version operation discipline
+// ---------------------------------------------------------------------------
+
+type WalkForwardState =
+  | { kind: "idle" }
+  | { kind: "running" }
+  | { kind: "failed"; error: BusError }
+  | { kind: "done"; dto: WalkForwardRunDto };
+
+/** The shared operation record projected into the walk-forward pane's states —
+ * the same four shapes the run machine uses, over `WalkForwardRunDto`. */
+function walkForwardStateOf(record: OperationRecord | undefined): WalkForwardState {
+  if (record === undefined) {
+    return { kind: "idle" };
+  }
+  if (record.running) {
+    return { kind: "running" };
+  }
+  const outcome = record.outcome as BusResult<WalkForwardRunDto> | undefined;
+  if (outcome === undefined) {
+    return { kind: "idle" };
+  }
+  return outcome.status === "ok"
+    ? { kind: "done", dto: outcome.data }
+    : { kind: "failed", error: outcome.error };
+}
+
+/**
+ * The selected version's walk-forward operation: its record (keyed by version,
+ * so a remount reattaches and a selection change stops attributing the old
+ * version's result to the new one — the Lab's existing staleness rule), the
+ * folds input's draft, and the two invocations.
+ *
+ * `start` is the Walk forward button's only path to the bus; `openFold` starts
+ * `getBacktestRun` under the version's BACKTEST key (approved deviation F/G):
+ * a fold run is an ordinary persisted run, so opening one is the existing
+ * result view answering with it — and the store's own in-flight refusal on
+ * that key is the only locking the open needs.
+ */
+function useWalkForward(operations: ActiveOperations, versionId: string | null) {
+  // The input mirrors the backend's default (K_DEFAULT = 6); an emptied input
+  // sends no `k` and the backend applies the same default itself.
+  const [folds, setFolds] = useState("6");
+  const state = walkForwardStateOf(
+    versionId === null ? undefined : operations.lookup(walkForwardKey(versionId)),
+  );
+
+  const start = useCallback(() => {
+    if (versionId === null) return;
+    // The toolbar's `busy` lock is rendered state; this is the structural half —
+    // a click that beats the re-render still meets a live backtest record here.
+    if (operations.lookup(backtestKey(versionId))?.running === true) return;
+    const parsed = Number.parseInt(folds, 10);
+    operations.start(walkForwardKey(versionId), () =>
+      commands.runWalkForwardVersion({
+        versionId,
+        k: Number.isNaN(parsed) ? undefined : parsed,
+      }),
+    );
+  }, [operations, versionId, folds]);
+
+  const openFold = useCallback(
+    (runId: string) => {
+      if (versionId === null) return;
+      operations.start(backtestKey(versionId), () => commands.getBacktestRun({ runId }));
+    },
+    [operations, versionId],
+  );
+
+  return { state, folds, setFolds, start, openFold };
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +438,14 @@ export default function BacktestLabScreen() {
     currentId === null ? undefined : operations.lookup(backtestKey(currentId)),
   );
 
+  /** This version's walk-forward operation (r2.s3.w5), same per-version keying —
+   * changing the selector stops rendering the previous version's pane. */
+  const wf = useWalkForward(operations, currentId);
+
+  /** The selector and both actions lock while EITHER operation is in flight:
+   * a walk-forward is K engine runs, so it holds Run's latch discipline. */
+  const busy = run.kind === "running" || wf.state.kind === "running";
+
   /** The selected version's own record — the compare section needs its
    * `parentId` and `recentRuns`, which the selector's flattened options drop. */
   const selectedVersion =
@@ -393,9 +484,10 @@ export default function BacktestLabScreen() {
    *
    * The store refuses a key already in flight before the bus is called, and the
    * backend's latch refuses it again if reached, so a double-click that beats
-   * this re-render still starts exactly one run. */
+   * this re-render still starts exactly one run. The walk-forward operation
+   * holds the same latch: `busy` covers it. */
   function onRun() {
-    if (currentId === null || run.kind === "running") return;
+    if (currentId === null || busy) return;
     operations.start(backtestKey(currentId), () =>
       commands.runBacktestVersion({ versionId: currentId }),
     );
@@ -514,7 +606,7 @@ export default function BacktestLabScreen() {
             className="bt-select"
             value={currentId ?? ""}
             onChange={(event) => onSelectorChange(event.target.value)}
-            disabled={run.kind === "running"}
+            disabled={busy}
           >
             {options.map((option) => (
               <option key={option.value} value={option.value}>
@@ -526,11 +618,36 @@ export default function BacktestLabScreen() {
             type="button"
             className="bt-run btn-prim"
             onClick={onRun}
-            disabled={run.kind === "running" || currentId === null}
+            disabled={busy || currentId === null}
           >
             {run.kind === "running" ? "Running…" : "Run backtest"}
           </button>
-          {/* No percentage, no cancel — the run is request/response. */}
+          {/* r2.s3.w5: the acceptance gate on the same selector — K folds of
+              rolling out-of-sample windows, K defaulted to the backend's own
+              default and bounded to its 2..=12 range. Same latch discipline
+              as Run: in flight, everything here is disabled. */}
+          <label className="bt-select-label" htmlFor="bt-folds">
+            Folds
+          </label>
+          <input
+            id="bt-folds"
+            className="bt-folds mono"
+            type="number"
+            min={2}
+            max={12}
+            value={wf.folds}
+            onChange={(event) => wf.setFolds(event.target.value)}
+            disabled={busy}
+          />
+          <button
+            type="button"
+            className="bt-walk btn-sec"
+            onClick={wf.start}
+            disabled={busy || currentId === null}
+          >
+            {wf.state.kind === "running" ? "Walking forward…" : "Walk forward"}
+          </button>
+          {/* No percentage, no cancel — both commands are request/response. */}
         </div>
       )}
 
@@ -542,6 +659,10 @@ export default function BacktestLabScreen() {
         (run.kind === "done" || selectedVersion.recentRuns.length > 0) && (
           <CompareWithParent version={selectedVersion} run={run} />
         )}
+
+      {/* r2.s3.w5: the walk-forward result pane sits ABOVE the run result —
+          a fold row's "open run" lands in the ordinary result view below it. */}
+      <WalkForwardPane state={wf.state} onOpenFold={wf.openFold} />
 
       {run.kind === "running" && (
         <div className="bt-state dim" role="status">
@@ -588,6 +709,129 @@ export default function BacktestLabScreen() {
         </div>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The walk-forward pane (r2.s3.w5) — verdict under the rule the run names,
+// one row per fold, each fold opening as an ordinary run
+// ---------------------------------------------------------------------------
+//
+// Every string here is the DTO's own: the scheme and rule render exactly as the
+// run recorded them (`rolling-oos/v1`, `wf-v1` today — never a hard-coded
+// label, so a `v2` scheme lands without a screen change), bounds are the DTO's
+// numbers, and the verdict words are the recorded tallies. The pane computes
+// no verdict of its own.
+
+/** The pane's three visible states — idle renders nothing at all. */
+function WalkForwardPane({
+  state,
+  onOpenFold,
+}: {
+  state: WalkForwardState;
+  onOpenFold: (runId: string) => void;
+}) {
+  if (state.kind === "running") {
+    return (
+      <div className="bt-state dim" role="status">
+        Running the walk-forward…
+      </div>
+    );
+  }
+  if (state.kind === "failed") {
+    // The same shape the run error renders: code family + the backend's own
+    // message. Walk-forward errors never carry `run_id` (that field names a
+    // backtest run id), so no saved-run line exists here.
+    return (
+      <div className="bt-run-error" role="alert">
+        <div>
+          <span className="mono">{state.error.code}</span> {state.error.message}
+        </div>
+      </div>
+    );
+  }
+  if (state.kind === "done") {
+    return <WalkForwardResult dto={state.dto} onOpenFold={onOpenFold} />;
+  }
+  return null;
+}
+
+/** The recorded run: provenance fields, the `wf-v1` verdict line, the fold table. */
+function WalkForwardResult({
+  dto,
+  onOpenFold,
+}: {
+  dto: WalkForwardRunDto;
+  onOpenFold: (runId: string) => void;
+}) {
+  const verdict = dto.verdict;
+  return (
+    <section className="bt-section bt-walkforward" aria-label="Walk-forward result">
+      <h3 className="bt-h">Walk-forward</h3>
+      <div className="bt-wf-meta">
+        <Field label="scheme">{dto.scheme}</Field>
+        <Field label="rule">{dto.rule}</Field>
+        <Field label="folds">{dto.k}</Field>
+        <Field label="span">
+          {dto.spanFrom} → {dto.spanTo}
+        </Field>
+        {/* `from_defaulted` is stated either way — an explicit bound and a
+            defaulted one are different provenance, both worth seeing. */}
+        <Field label="from">
+          {dto.fromDefaulted ? "defaulted (first fully-warm bar)" : "requested"}
+        </Field>
+        <Field label="engine">{dto.engineFingerprint}</Field>
+        <Field label="run">{dto.walkForwardRunId}</Field>
+      </div>
+      <p className={`bt-wf-verdict ${verdict.pass ? "bt-wf-pass" : "bt-wf-fail"}`}>
+        <span className="bt-wf-verdict-word">{verdict.pass ? "PASS" : "FAIL"}</span>{" "}
+        <span className="mono">
+          {verdict.foldsHolding}/{verdict.foldsRequired}
+        </span>{" "}
+        folds hold · pooled lower bound{" "}
+        <span className="mono">{verdict.pooled.lowerBound ?? EM_DASH}</span>
+      </p>
+      <div className="bt-table-scroll" role="region" aria-label="Fold rows" tabIndex={0}>
+        <table className="bt-trades bt-wf-folds">
+          <thead>
+            <tr>
+              <th scope="col">fold</th>
+              <th scope="col">window from</th>
+              <th scope="col">window to</th>
+              <th scope="col">trades</th>
+              <th scope="col">lower bound</th>
+              <th scope="col">holds</th>
+              <th scope="col">expectancy</th>
+              <th scope="col">win rate</th>
+              <th scope="col">run</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dto.folds.map((fold) => (
+              <tr key={fold.index}>
+                <td className="mono">{fold.index}</td>
+                <td className="mono">{fold.windowFrom}</td>
+                <td className="mono">{fold.windowTo}</td>
+                <td className="mono">{fold.n}</td>
+                <td className="mono">{fold.lowerBound ?? EM_DASH}</td>
+                <td>{fold.holds ? "yes" : "no"}</td>
+                <td className="mono">{fold.expectancy}</td>
+                <td className="mono">{fold.winRate}</td>
+                <td>
+                  <button
+                    type="button"
+                    className="bt-wf-open"
+                    onClick={() => onOpenFold(fold.backtestRunId)}
+                  >
+                    open run <span className="mono">{fold.backtestRunId}</span>
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
