@@ -145,6 +145,17 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
     // says so in words rather than printing blanks that read like zeros.
     println!("{}", render_inputs(persisted.inputs.as_ref()));
 
+    // r2.s3.w3 (additive): a fold run names the walk-forward it belongs to —
+    // the `0013` membership pair renders as one stable line, present only when
+    // the run IS a fold (a standalone run's output is unchanged, AC-5).
+    if let Some(m) = persisted.walk_forward.as_ref() {
+        println!(
+            "membership\twalk_forward_run={}\tfold_index={}",
+            m.run_id.as_str(),
+            m.fold_index,
+        );
+    }
+
     // Run-level money totals (the cost readout, FR-6).
     println!(
         "totals\tstarting_equity={}\tnet_pnl={}\tfees_total={}\tfunding_total={}\tslippage_total={}",
@@ -228,8 +239,28 @@ fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
             )
         },
     );
+    // r2.s3.w2: a windowed run names the window it counted AND the lead-in its
+    // engines warmed on — the half-open bounds render RFC 3339 like the Tauri
+    // diff surface. `lead_in_from=none` is the honest read for a pre-0012
+    // windowed row: the lead-in it consumed is not recoverable.
+    let windowed = i.window.as_ref().map_or_else(String::new, |w| {
+        let lead_in = i.lead_in_from_ms.map_or_else(
+            || "none".to_owned(),
+            |ms| {
+                chrono::DateTime::from_timestamp_millis(ms)
+                    .map_or_else(|| format!("{ms}ms"), |dt| dt.to_rfc3339())
+            },
+        );
+        format!(
+            "\twindow=[{},{})\tlead_in_from={lead_in}",
+            chrono::DateTime::from_timestamp_millis(w.from_ms)
+                .map_or_else(|| format!("{}ms", w.from_ms), |dt| dt.to_rfc3339()),
+            chrono::DateTime::from_timestamp_millis(w.to_ms)
+                .map_or_else(|| format!("{}ms", w.to_ms), |dt| dt.to_rfc3339()),
+        )
+    });
     format!(
-        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}\tfee_bps={}\tslippage_bps={}\tfunding={}",
+        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}\tfee_bps={}\tslippage_bps={}\tfunding={}{windowed}",
         i.pair,
         i.primary.timeframe.binance_interval(),
         i.primary.data_version,
@@ -321,6 +352,7 @@ mod tests {
             slippage_bps: Decimal::new(2, 2),
             funding: FundingConfig::SnapshotRates,
             window: None,
+            lead_in_from_ms: None,
         };
 
         assert_eq!(

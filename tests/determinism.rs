@@ -119,6 +119,7 @@ fn run_once(
         &BacktestConfig::default(),
         filters,
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect("backtest runs over the fixture")
 }

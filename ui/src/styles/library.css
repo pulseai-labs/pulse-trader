@@ -224,6 +224,17 @@
   color: var(--warn-1);
   font-size: var(--fs-10);
 }
+.vnode-cert {
+  font-size: var(--fs-10);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--bull-1);
+  border: 1px solid var(--bull-1);
+  border-radius: var(--r-4);
+  padding: 1px 4px;
+  line-height: 1;
+}
 .vnode-delta {
   margin-left: auto;
   font-size: var(--fs-10);
@@ -329,6 +340,22 @@
   letter-spacing: var(--tracking-caps);
   color: var(--text-3);
   font-weight: var(--fw-medium);
+}
+.d-cert {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+.d-cert-state {
+  font-size: var(--fs-12);
+  font-weight: var(--fw-semibold);
+  color: var(--text-2);
+}
+.d-cert-state.is-certified { color: var(--bull-1); }
+.d-cert-run {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  overflow-wrap: anywhere;
 }
 .dsl-block {
   margin-bottom: var(--sp-3);

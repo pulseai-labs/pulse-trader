@@ -66,7 +66,11 @@ use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 use super::library::{
     LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
-    recent_run_summary, version_stats,
+    latest_run_summary, recent_run_summary, version_stats,
+};
+use super::walk_forward::{
+    GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardRunDto, WalkForwardRunRequest,
+    get_backtest_run_core, get_walk_forward_run_core, run_walk_forward_version_core,
 };
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
@@ -126,6 +130,9 @@ pub const BUS_COMMANDS: &[&str] = &[
     "coach_turn",
     "coach_decide",
     "compare_child_run",
+    "run_walk_forward_version",
+    "get_walk_forward_run",
+    "get_backtest_run",
 ];
 
 // ---------------------------------------------------------------------------
@@ -181,8 +188,13 @@ pub struct DesktopState {
     operations: Mutex<HashSet<OperationKey>>,
 }
 
-/// What the `#141` latch is keyed on: one running operation per version, and one
-/// per coaching session.
+/// What the `#141` latch is keyed on: one running operation per KEY — the
+/// typed `(kind, id)` pair — and keys are distinct kinds.
+///
+/// So the latch is NOT per-version exclusion (#209): a backtest of a version and
+/// a walk-forward of the SAME version are two keys, and `begin_operation` admits
+/// both concurrently. Per-version exclusion is the UI's (the Backtest Lab's busy
+/// flag), and `pulse mcp` holds no app latch at all.
 ///
 /// A typed key rather than a formatted string, so a version id and a session id
 /// that happen to share text cannot collide, and so the exhaustive `match` in
@@ -193,6 +205,11 @@ pub enum OperationKey {
     Backtest(VersionId),
     /// A coach turn or decision for one coaching session.
     Coach(CoachingSessionId),
+    /// A walk-forward of one strategy version (r2.s3.w5) — a K-fold battery of
+    /// ordinary runs, on its own key so a `Busy` refusal names the true
+    /// operation. It does NOT lock the version against a concurrent backtest:
+    /// `Backtest(v)` and `WalkForward(v)` are distinct keys and both run (#209).
+    WalkForward(VersionId),
 }
 
 impl OperationKey {
@@ -202,6 +219,9 @@ impl OperationKey {
         match self {
             Self::Backtest(version) => format!("a backtest of version `{}`", version.as_str()),
             Self::Coach(session) => format!("a coach operation for session `{}`", session.as_str()),
+            Self::WalkForward(version) => {
+                format!("a walk-forward of version `{}`", version.as_str())
+            }
         }
     }
 }
@@ -465,7 +485,10 @@ const RECENT_RUN_LIMIT: usize = 5;
 /// delta vs the parent when both carry a run, and its recent run catalog.
 ///
 /// `latest_run_for_version` is fail-closed by design (#39): one corrupt run row
-/// is a `BusError` naming the row, not a silently missing KPI. The recent-runs
+/// is a `BusError` naming the row, not a silently missing KPI — and it reads the
+/// version's most recent NON-FOLD run (N1), so completing a walk-forward never
+/// swaps a single fold's sub-window stats in as the version's latest result.
+/// The recent-runs
 /// list reads `list_runs_for_version`, the one best-effort read in the port — a
 /// bad row costs its row there, not the screen.
 ///
@@ -557,6 +580,15 @@ async fn library_strategy(
                 .take(RECENT_RUN_LIMIT)
                 .map(recent_run_summary)
                 .collect(),
+            // The same `latest_run_for_version` read the KPIs use, in the catalog
+            // row shape: the Lab's compare names this run, never `recent_runs[0]`
+            // (which a walk-forward's folds can occupy — R2).
+            latest_run: latest.as_ref().map(latest_run_summary),
+            certified: version.certified,
+            latest_walk_forward_run_id: version
+                .latest_walk_forward_run_id
+                .as_ref()
+                .map(|run| run.as_str().to_owned()),
         });
     }
 
@@ -1384,6 +1416,17 @@ fn describe_input_differences(child: &BacktestInputs, parent: &BacktestInputs) -
             window(&parent.window)
         ));
     }
+    // r2.s3.w2: a lead-in difference is a real provenance difference — two runs
+    // over the same counted window warmed on different history. A legacy
+    // (pre-0012) parent reports `none`, which is honest, not "same".
+    if child.lead_in_from_ms != parent.lead_in_from_ms {
+        let lead_in = |v: Option<i64>| v.map_or_else(|| "none".to_owned(), ms_rfc3339);
+        diffs.push(format!(
+            "lead-in from (child {}, parent {})",
+            lead_in(child.lead_in_from_ms),
+            lead_in(parent.lead_in_from_ms)
+        ));
+    }
     format!("recorded inputs differ: {}", diffs.join(", "))
 }
 
@@ -1604,6 +1647,53 @@ pub async fn coach_decide(
     coach_decide_core(&state, request).await
 }
 
+/// `run_walk_forward_version` — the Backtest Lab's walk-forward action
+/// (r2.s3.w5): K `rolling-oos/v1` folds judged by `wf-v1`, each fold an
+/// ordinary persisted run.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`run_walk_forward_version_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn run_walk_forward_version(
+    state: tauri::State<'_, DesktopState>,
+    request: WalkForwardRunRequest,
+) -> Result<WalkForwardRunDto, BusError> {
+    run_walk_forward_version_core(&state, request).await
+}
+
+/// `get_walk_forward_run` — read one persisted walk-forward run back, in the
+/// same DTO the run command answers with (r2.s3.w5).
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`get_walk_forward_run_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn get_walk_forward_run(
+    state: tauri::State<'_, DesktopState>,
+    request: GetWalkForwardRunRequest,
+) -> Result<WalkForwardRunDto, BusError> {
+    get_walk_forward_run_core(&state, request).await
+}
+
+/// `get_backtest_run` — one persisted run id in, the same [`BacktestRunDto`]
+/// `run_backtest_version` answers with out (r2.s3.w5). A walk-forward fold's
+/// id opens as an ordinary run carrying its `walkForward` membership.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`get_backtest_run_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn get_backtest_run(
+    state: tauri::State<'_, DesktopState>,
+    request: GetBacktestRunRequest,
+) -> Result<BacktestRunDto, BusError> {
+    get_backtest_run_core(&state, request).await
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1682,5 +1772,53 @@ mod tests {
     #[test]
     fn internal_errors_carry_the_internal_code() {
         assert_eq!(BusError::internal("x").code, BusErrorCode::Internal);
+    }
+
+    /// r2.s3.w2: a lead-in difference is provenance the badge must name —
+    /// a windowed child replaying a legacy (pre-0012) parent has `Some`/`None`
+    /// lead-ins, and the hover says so rather than reading "inputs equal".
+    #[test]
+    fn describe_input_differences_names_a_lead_in_difference() {
+        use crate::domain::{
+            BacktestInputs, CandleWindow, DataVersion, FundingConfig, Pair, SnapshotSelection,
+            Timeframe,
+        };
+        use rust_decimal::Decimal;
+
+        let base = BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new("v-primary"),
+            },
+            htf: None,
+            taker_fee_bps: Decimal::new(4, 0),
+            slippage_bps: Decimal::new(1, 0),
+            funding: FundingConfig::SnapshotRates,
+            window: Some(CandleWindow::new(1_700_000_000_000, 1_700_086_400_000).unwrap()),
+            lead_in_from_ms: Some(1_699_999_000_000),
+        };
+        // Same tuple, but the parent predates 0012 — no recorded lead-in.
+        let legacy_parent = BacktestInputs {
+            lead_in_from_ms: None,
+            ..base.clone()
+        };
+
+        let text = super::describe_input_differences(&base, &legacy_parent);
+        assert!(
+            text.contains("lead-in from"),
+            "the diff must name the lead-in field: {text}"
+        );
+        assert!(
+            text.contains("none"),
+            "a legacy parent's absent lead-in renders as `none`: {text}"
+        );
+
+        // And identical lead-ins produce no diff line at all.
+        let same = super::describe_input_differences(&base, &base);
+        assert!(
+            !same.contains("lead-in"),
+            "equal lead-ins must not be reported: {same}"
+        );
     }
 }

@@ -42,17 +42,21 @@
 
 use rust_decimal::Decimal;
 
+use crate::adapters::backtest::BacktestConfig;
 use crate::application::backtest::{
-    BacktestAppError, PrepareError, ReadBackFailure, prepare_backtest,
+    BacktestAppError, PrepareError, ReadBackFailure, SnapshotPins, apply_lead_in_window,
+    prepare_backtest,
 };
-use crate::domain::backtest::SummaryStats;
-use crate::domain::strategy::VersionId;
+use crate::application::walk_forward::{WalkForwardUnpersistedParams, walk_forward_unpersisted};
+use crate::domain::backtest::{RunVerdict, SummaryStats, WalkForwardRunDraft, WalkForwardRunId};
+use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
-    AcceptFailureStage, BacktestRunId, BacktestRunRepository, CandleSeries, CandleSeriesRepository,
-    CoachAcceptFailure, CoachAcceptanceRepository, CoachingRepository, CoachingSession,
-    CoachingSessionId, DataError, Disposition, DispositionKind, EngineFingerprint, ExchangeAdapter,
-    Mutation, MutationError, PersistedRun, PreparedBacktest, PreparedCoachAcceptance, Proposal,
-    SeriesEnd, SessionOutcome, StrategyRepository, SymbolFilters, ValidatedDsl, apply,
+    AcceptFailureStage, BacktestRunId, BacktestRunRepository, CandidateDsl, CandleSeries,
+    CandleSeriesRepository, CoachAcceptFailure, CoachAcceptanceRepository, CoachingRepository,
+    CoachingSession, CoachingSessionId, DataError, Disposition, DispositionKind, EngineFingerprint,
+    ExchangeAdapter, Mutation, MutationError, PersistedRun, PreparedBacktest,
+    PreparedCoachAcceptance, Proposal, SeriesEnd, SessionOutcome, StrategyRepository,
+    SymbolFilters, ValidatedDsl, WalkForwardRunRepository, apply, compile,
 };
 
 // ---------------------------------------------------------------------------
@@ -128,6 +132,11 @@ pub struct AcceptedCoachResult {
     pub child_version_id: VersionId,
     /// The re-backtest run OF that child.
     pub accepted_run_id: BacktestRunId,
+    /// The child's certifying walk-forward run, when the certification gate ran
+    /// and passed (r2.s3.w4). On an idempotent replay this is the child's
+    /// CURRENT `latest_walk_forward_run_id` — a later walk-forward may have
+    /// advanced the pointer since the accept.
+    pub walk_forward_run_id: Option<WalkForwardRunId>,
     /// The PARENT run's persisted summary — the "before" half of the comparison,
     /// read from the stored row rather than recomputed.
     pub before: SummaryStats,
@@ -258,7 +267,7 @@ where
     S: StrategyRepository,
     C: CandleSeriesRepository + Clone + Send + 'static,
     E: ExchangeAdapter + Clone + Send + 'static,
-    R: BacktestRunRepository,
+    R: BacktestRunRepository + WalkForwardRunRepository,
     A: CoachAcceptanceRepository,
     Q: CoachingRepository,
 {
@@ -378,7 +387,7 @@ where
     S: StrategyRepository,
     C: CandleSeriesRepository + Clone + Send + 'static,
     E: ExchangeAdapter + Clone + Send + 'static,
-    R: BacktestRunRepository,
+    R: BacktestRunRepository + WalkForwardRunRepository,
     A: CoachAcceptanceRepository,
 {
     // 1. IDEMPOTENCY FIRST. The session id is the accept idempotency key, so a
@@ -389,7 +398,7 @@ where
         accepted_run_id,
     } = &proposal.disposition
     {
-        return replay_accepted(runs, session, child_version_id, accepted_run_id).await;
+        return replay_accepted(strategies, runs, session, child_version_id, accepted_run_id).await;
     }
     if proposal.disposition == Disposition::Rejected {
         return Err(CoachDecisionError::NotActionable {
@@ -401,21 +410,9 @@ where
     // 2. APPLY — the CURRENT mutation: the original proposal's, or the latest one a
     //    modify stored in its place.
     let parent = parent_dsl(strategies, session).await?;
-    let mutation_path = match &proposal.mutation {
-        Mutation::SetParam { path, .. } => path.clone(),
-    };
-    let candidate = match apply(&parent.dsl, &proposal.mutation) {
+    let candidate = match apply_candidate(&parent, proposal) {
         Ok(candidate) => candidate,
-        Err(error) => {
-            return record_failure(
-                acceptance,
-                &session.id,
-                AcceptFailureStage::Apply,
-                error.to_string(),
-                Some(mutation_path),
-            )
-            .await;
-        }
+        Err(failure) => return record_staged(acceptance, &session.id, failure).await,
     };
 
     // 3. LOAD INPUTS — the parent run's own persisted provenance. A pre-`0006` run
@@ -447,43 +444,50 @@ where
     // 5b. THE ENGINE MUST BE THE ONE THAT PRODUCED THE PARENT — see
     //     `engine_divergence`. Checked before the commit, so a refusal leaves no
     //     child behind to mislead anyone.
-    if let Some(message) = engine_divergence(&parent_run, &prepared) {
-        return record_failure(
-            acceptance,
-            &session.id,
-            AcceptFailureStage::Backtest,
-            message,
-            Some("engine fingerprint".to_owned()),
-        )
-        .await;
+    if let Some(failure) = engine_staged(&parent_run, &prepared) {
+        return record_staged(acceptance, &session.id, failure).await;
     }
+
+    // 5c. THE CERTIFICATION GATE (r2.s3.w4, ADR-0025): a certified parent's child
+    //     must pass the parent's own walk-forward parameters before anything
+    //     commits. An uncertified parent carries no gate — the path is exactly
+    //     r1.s4's. A refused gate is a recorded `WalkForward` failure and
+    //     persists nothing.
+    let walk_forward = match certify_gate(
+        candles,
+        exchange,
+        runs,
+        &parent,
+        &parent_run,
+        &prepared,
+        candidate.validated(),
+    )
+    .await
+    {
+        Ok(draft) => draft,
+        Err(failure) => return record_staged(acceptance, &session.id, failure).await,
+    };
 
     // 6. COMMIT — W4's one transaction. The adapter mints the child id, the run id
     //    and `created_at`, and DERIVES the strategy, the parent and the creating
-    //    call from the claimed session row. `expected_mutation` is the optimistic
-    //    lock: everything above ran outside the transaction, so the adapter refuses
-    //    unless the proposal still carries the mutation this child came from.
-    let committed = match acceptance
-        .commit_acceptance(PreparedCoachAcceptance {
-            session_id: session.id.clone(),
-            expected_mutation: proposal.mutation.clone(),
-            child_dsl: candidate.dsl().clone(),
-            prepared_run: prepared,
-        })
-        .await
+    //    call from the claimed session row. `expected_mutation` and the parent's
+    //    certification pointer are the optimistic locks: everything above ran
+    //    outside the transaction, so the adapter refuses unless the proposal still
+    //    carries the mutation this child came from AND the parent still names the
+    //    certifying run the gate walked the candidate forward on.
+    let committed = match commit_step(
+        acceptance,
+        session,
+        proposal,
+        &candidate,
+        prepared,
+        walk_forward,
+        parent.latest_walk_forward_run_id.clone(),
+    )
+    .await
     {
         Ok(outcome) => outcome,
-        Err(e) => {
-            // A NEW transaction, on a rolled-back write: no child exists.
-            return record_failure(
-                acceptance,
-                &session.id,
-                AcceptFailureStage::Persist,
-                e.to_string(),
-                None,
-            )
-            .await;
-        }
+        Err(failure) => return record_staged(acceptance, &session.id, failure).await,
     };
 
     // 7. READ BACK. Past this line the accept has SUCCEEDED — the child, its run and
@@ -493,10 +497,165 @@ where
     Ok(CoachDecisionOutcome::Accepted(AcceptedCoachResult {
         child_version_id: committed.child_version_id,
         accepted_run_id: committed.accepted_run_id,
+        walk_forward_run_id: committed.walk_forward_run_id,
         before: parent_run.summary,
         after,
         read_back,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// The certification gate (r2.s3.w4)
+// ---------------------------------------------------------------------------
+
+/// Walk the candidate forward on the PARENT'S certifying parameters when the
+/// parent is certified — the acceptance gate ADR-0025 installs at the one seam.
+///
+/// `Ok(None)` means "no gate": the coached parent is uncertified and the accept
+/// is exactly r1.s4's. `Ok(Some(draft))` means the gate ran and `wf-v1` passed —
+/// the draft crosses into `PreparedCoachAcceptance` unpersisted and commits
+/// inside the same transaction as the child. `Err(StagedFailure)` is a refusal
+/// at [`AcceptFailureStage::WalkForward`] (or [`AcceptFailureStage::Compile`]
+/// when the candidate itself does not compile — the stage taxonomy's own slot
+/// for that failure, D6).
+///
+/// Every parameter comes from the parent's persisted state, never a default:
+/// `k` and the counted span from the certifying run's row, the pair/timeframes/
+/// cost config/snapshot pins from the parent run's recorded inputs (the same
+/// values `prepare_offthread` just replayed, read back off `prepared`).
+async fn certify_gate<C, E, R>(
+    candles: &C,
+    exchange: &E,
+    runs: &R,
+    parent: &crate::domain::strategy::StrategyVersion,
+    parent_run: &PersistedRun,
+    prepared: &PreparedBacktest,
+    candidate: &ValidatedDsl,
+) -> Result<Option<WalkForwardRunDraft>, StagedFailure>
+where
+    C: CandleSeriesRepository + Clone + Send + 'static,
+    E: ExchangeAdapter + Clone + Send + 'static,
+    R: WalkForwardRunRepository,
+{
+    if !parent.certified {
+        return Ok(None);
+    }
+
+    // `certified` is DERIVED from the pointer's `pass`, so the run exists
+    // whenever the read is honest — a corrupt or absent row is exactly the
+    // case this gate exists to refuse, so the load is spelled out, not unwrapped.
+    let certifying = certifying_run(runs, parent).await?;
+
+    // The CANDIDATE is what walks forward — its own compile, mapped to the stage
+    // the taxonomy reserves for it (D6).
+    let compiled = compile(candidate).map_err(|e| StagedFailure {
+        stage: AcceptFailureStage::Compile,
+        message: e.to_string(),
+        subject: None,
+    })?;
+
+    let output = walk_forward_unpersisted(
+        candles.clone(),
+        exchange.clone(),
+        candidate.clone(),
+        compiled,
+        WalkForwardUnpersistedParams {
+            pair: prepared.inputs.pair.clone(),
+            primary_timeframe: prepared.inputs.primary.timeframe,
+            htf_timeframe: prepared.inputs.htf.as_ref().map(|s| s.timeframe),
+            config: BacktestConfig {
+                starting_equity: parent_run.starting_equity,
+                taker_fee_bps: prepared.inputs.taker_fee_bps,
+                slippage_bps: prepared.inputs.slippage_bps,
+            },
+            snapshots: Some(SnapshotPins {
+                primary: prepared.inputs.primary.data_version.clone(),
+                htf: prepared.inputs.htf.as_ref().map(|s| s.data_version.clone()),
+            }),
+            from_ms: Some(certifying.span.from_ms),
+            to_ms: Some(certifying.span.to_ms),
+            scheme: certifying.scheme,
+        },
+    )
+    .await
+    .map_err(|e| StagedFailure {
+        stage: AcceptFailureStage::WalkForward,
+        message: e.to_string(),
+        subject: Some(certifying.id.as_str().to_owned()),
+    })?;
+
+    gate_decision(&output.draft.verdict).map_err(|detail| StagedFailure {
+        stage: AcceptFailureStage::WalkForward,
+        message: format!(
+            "the certification gate refuses the child: {} k={} over [{}, {}) under {} — {}",
+            certifying.scheme.name(),
+            certifying.scheme.k(),
+            certifying.span.from_ms,
+            certifying.span.to_ms,
+            certifying.rule.name(),
+            detail,
+        ),
+        subject: Some("walk-forward".to_owned()),
+    })?;
+    Ok(Some(output.draft))
+}
+
+/// The certified parent's certifying walk-forward run. `certified` derives one
+/// hop from the pointer's `pass`, so `Some` is guaranteed when the rows are
+/// honest — a corrupt or absent run is exactly what this gate refuses, and
+/// every arm names the pointer it could not honor.
+async fn certifying_run<R>(
+    runs: &R,
+    parent: &StrategyVersion,
+) -> Result<crate::domain::backtest::WalkForwardRun, StagedFailure>
+where
+    R: WalkForwardRunRepository,
+{
+    let id = parent
+        .latest_walk_forward_run_id
+        .clone()
+        .ok_or_else(|| StagedFailure {
+            stage: AcceptFailureStage::WalkForward,
+            message: format!(
+                "the parent version `{}` reads certified but names no certifying \
+                 walk-forward run",
+                parent.id.as_str()
+            ),
+            subject: Some(parent.id.as_str().to_owned()),
+        })?;
+    runs.get_walk_forward_run(&id)
+        .await
+        .map_err(|e| StagedFailure {
+            stage: AcceptFailureStage::WalkForward,
+            message: format!(
+                "the certifying walk-forward run `{id}` could not be read: {e}",
+                id = id.as_str()
+            ),
+            subject: Some(id.as_str().to_owned()),
+        })?
+        .ok_or_else(|| StagedFailure {
+            stage: AcceptFailureStage::WalkForward,
+            message: format!(
+                "the certifying walk-forward run `{id}` no longer exists",
+                id = id.as_str()
+            ),
+            subject: Some(id.as_str().to_owned()),
+        })
+}
+
+/// The `wf-v1` verdict-to-action mapping, pure so the branch is falsifiable
+/// without a fixture that yields a pass (the one-month M15 store cannot reach
+/// `n >= 20` per fold).
+fn gate_decision(verdict: &RunVerdict) -> Result<(), String> {
+    if verdict.pass {
+        return Ok(());
+    }
+    Err(format!(
+        "folds_holding {holding} < folds_required {required}, pooled lower bound {lb}",
+        holding = verdict.folds_holding,
+        required = verdict.folds_required,
+        lb = verdict.pooled.lower_bound,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -505,20 +664,36 @@ where
 
 /// Step 1: the ALREADY-accepted answer — both stored ids and the two persisted run
 /// summaries, with nothing applied, computed or written.
-async fn replay_accepted<R>(
+async fn replay_accepted<S, R>(
+    strategies: &S,
     runs: &R,
     session: &CoachingSession,
     child_version_id: &VersionId,
     accepted_run_id: &BacktestRunId,
 ) -> Result<CoachDecisionOutcome, CoachDecisionError>
 where
+    S: StrategyRepository,
     R: BacktestRunRepository,
 {
     let before = parent_summary(runs, session).await?;
     let (after, read_back) = child_summary(runs, accepted_run_id).await;
+    // The outcome names the child's CURRENT certifying run, not the run the
+    // original accept persisted (D5): a later walk-forward may have advanced
+    // the pointer, and replay must answer what is true now.
+    let walk_forward_run_id = strategies
+        .get_version(child_version_id)
+        .await?
+        .ok_or_else(|| {
+            CoachDecisionError::Data(DataError::Db(format!(
+                "the accepted child version `{}` no longer exists",
+                child_version_id.as_str()
+            )))
+        })?
+        .latest_walk_forward_run_id;
     Ok(CoachDecisionOutcome::Accepted(AcceptedCoachResult {
         child_version_id: child_version_id.clone(),
         accepted_run_id: accepted_run_id.clone(),
+        walk_forward_run_id,
         before,
         after,
         read_back,
@@ -574,7 +749,7 @@ async fn prepare_offthread<C, E>(
     candles: C,
     exchange: E,
     validated: ValidatedDsl,
-    inputs: crate::domain::BacktestInputs,
+    mut inputs: crate::domain::BacktestInputs,
     starting_equity: Decimal,
 ) -> Result<PreparedBacktest, StagedFailure>
 where
@@ -598,34 +773,32 @@ where
             None => None,
         };
         // r2.s1 G1: "the parent's exact persisted inputs" INCLUDES the window —
-        // a windowed parent's child must replay the same slice, or the re-run
-        // silently computes over the full snapshot while the inputs claim a
-        // window. Same rule as the standalone path: slice both series, an empty
-        // PRIMARY slice is a refusal, and a `to` cutting before the snapshot's
-        // real last candle makes the series end a window edge — not end-of-data.
-        let mut series_end = SeriesEnd::SnapshotEnd;
-        if let Some(w) = &inputs.window {
-            let snapshot_last_open = primary.candles.last().map(|c| c.open_time);
-            primary = primary.windowed(w);
-            if primary.candles.is_empty() {
-                return Err(StagedFailure {
-                    stage: AcceptFailureStage::Backtest,
-                    message: BacktestAppError::WindowEmpty {
-                        pair: inputs.pair.clone(),
-                        timeframe: inputs.primary.timeframe,
-                        from_ms: w.from_ms,
-                        to_ms: w.to_ms,
-                    }
-                    .to_string(),
-                    subject: Some(inputs.pair.as_str().to_owned()),
-                });
-            }
-            if snapshot_last_open
-                .is_some_and(|last| primary.candles.last().is_some_and(|c| c.open_time < last))
-            {
-                series_end = SeriesEnd::WindowEdge;
-            }
-            htf = htf.map(|series| series.windowed(w));
+        // a windowed parent's child must replay the same counted slice, or the
+        // re-run silently computes over the full snapshot while the inputs
+        // claim a window. Same rule as the standalone path (r2.s3.w2): both
+        // series keep their lead-in — `[snapshot_start, to_ms)` — an empty
+        // COUNTED slice is a refusal, and a `to` cutting before the snapshot's
+        // real last candle makes the series end a window edge — not
+        // end-of-data. The child recomputes its OWN lead-in start from the
+        // snapshots it loaded: the parent may predate `0012` (no recorded
+        // lead-in) or name a snapshot whose start differs.
+        let lead_in = apply_lead_in_window(
+            inputs.window.as_ref(),
+            &mut primary,
+            &mut htf,
+            &inputs.pair,
+            inputs.primary.timeframe,
+        )
+        .map_err(|e| StagedFailure {
+            stage: AcceptFailureStage::Backtest,
+            message: e.to_string(),
+            subject: Some(inputs.pair.as_str().to_owned()),
+        })?;
+        let series_end = lead_in
+            .as_ref()
+            .map_or(SeriesEnd::SnapshotEnd, |lead_in| lead_in.series_end);
+        if let Some(lead_in) = lead_in {
+            inputs.lead_in_from_ms = Some(lead_in.lead_in_from_ms);
         }
         // Symbol filters are pinned exchange METADATA, not price data — resolving
         // them is not "fetching candles from an exchange", which the accept path
@@ -834,6 +1007,64 @@ where
     }
 }
 
+/// Step 5b's engine check, staged: a divergent engine records `Backtest`
+/// naming the fingerprint, through the same `record_staged` lane.
+fn engine_staged(parent_run: &PersistedRun, prepared: &PreparedBacktest) -> Option<StagedFailure> {
+    engine_divergence(parent_run, prepared).map(|message| StagedFailure {
+        stage: AcceptFailureStage::Backtest,
+        message,
+        subject: Some("engine fingerprint".to_owned()),
+    })
+}
+
+/// Step 6's commit, staged: a rolled-back write records `Persist` — a NEW
+/// transaction on a rolled-back one, so no child exists to mislead.
+async fn commit_step<A>(
+    acceptance: &A,
+    session: &CoachingSession,
+    proposal: &Proposal,
+    candidate: &CandidateDsl,
+    prepared: PreparedBacktest,
+    walk_forward: Option<WalkForwardRunDraft>,
+    expected_certification_pointer: Option<WalkForwardRunId>,
+) -> Result<crate::domain::AcceptedCoachOutcome, StagedFailure>
+where
+    A: CoachAcceptanceRepository,
+{
+    acceptance
+        .commit_acceptance(PreparedCoachAcceptance {
+            session_id: session.id.clone(),
+            expected_mutation: proposal.mutation.clone(),
+            expected_certification_pointer,
+            child_dsl: candidate.dsl().clone(),
+            prepared_run: prepared,
+            walk_forward,
+        })
+        .await
+        .map_err(|e| StagedFailure {
+            stage: AcceptFailureStage::Persist,
+            message: e.to_string(),
+            subject: None,
+        })
+}
+
+/// Step 2's mutation apply, staged: a mutation that no longer applies records
+/// `Apply` naming its own path, through the same `record_staged` lane as every
+/// other step.
+fn apply_candidate(
+    parent: &StrategyVersion,
+    proposal: &Proposal,
+) -> Result<CandidateDsl, StagedFailure> {
+    let mutation_path = match &proposal.mutation {
+        Mutation::SetParam { path, .. } => path.clone(),
+    };
+    apply(&parent.dsl, &proposal.mutation).map_err(|error| StagedFailure {
+        stage: AcceptFailureStage::Apply,
+        message: error.to_string(),
+        subject: Some(mutation_path),
+    })
+}
+
 /// The coached version's DSL — the ONE document a mutation is applied to.
 async fn parent_dsl<S>(
     strategies: &S,
@@ -920,6 +1151,50 @@ fn guard_actionable(
                 current: proposal.disposition.kind(),
                 action,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::domain::backtest::FoldVerdict;
+
+    /// A `RunVerdict` built by hand — the fixture cannot produce a passing one,
+    /// so AC-1(vi) drives `gate_decision` with synthetic verdicts.
+    fn verdict(pass: bool, holding: u8, required: u8, lower_bound: f64) -> RunVerdict {
+        RunVerdict {
+            folds_holding: holding,
+            folds_required: required,
+            pooled: FoldVerdict {
+                n: 40,
+                mean_r: Decimal::new(50, 2),
+                lower_bound,
+                holds: lower_bound > 0.0,
+            },
+            pass,
+        }
+    }
+
+    /// AC-1(vi), pass arm: a persisted `pass = true` verdict maps to `Ok`.
+    #[test]
+    fn gate_decision_passes_a_passing_verdict() {
+        assert_eq!(gate_decision(&verdict(true, 2, 2, 0.21)), Ok(()));
+    }
+
+    /// AC-1(vi), fail arm: a failing verdict is `Err` naming the fold tally and
+    /// the pooled bound the refusal rides on.
+    #[test]
+    fn gate_decision_refuses_a_failing_verdict_naming_the_tally() {
+        let err =
+            gate_decision(&verdict(false, 1, 2, -0.05)).expect_err("a failing verdict is refused");
+        for needle in [
+            "folds_holding 1",
+            "folds_required 2",
+            "pooled lower bound -0.05",
+        ] {
+            assert!(err.contains(needle), "the refusal names {needle:?}: {err}");
         }
     }
 }

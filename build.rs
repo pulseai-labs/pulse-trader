@@ -1,17 +1,20 @@
 //! Build-time `engine_fingerprint` computation (VS-1.2.3 work-3.01, decision D5).
 //!
 //! Runs BEFORE the crate compiles (so it cannot import crate types) and computes a
-//! deterministic sha2-256 hex digest over the four D5 inputs that pin a
+//! deterministic sha2-256 hex digest over the five D5 inputs that pin a
 //! byte-reproducible engine build:
-//!   1. the raw bytes of the workspace `Cargo.lock` (the full resolved dep graph);
-//!   2. the *resolved* `rustc -vV` filtered to its `release:` + `commit-hash:`
+//!   (a) the raw bytes of the workspace `Cargo.lock` (the full resolved dep graph);
+//!   (b) the *resolved* `rustc -vV` filtered to its `release:` + `commit-hash:`
 //!      lines — the `host:` line is EXCLUDED (it varies by build host and is not
 //!      the property we fingerprint; the target triple below covers arch). The
 //!      resolved compiler is hashed (not `rust-toolchain.toml`'s text) so a stray
 //!      `rustup override` cannot silently desync the binary from its toolchain;
-//!   3. the DSL schema-version string (`DSL_SCHEMA_VERSION`, `include!`'d from the
+//!   (c) the DSL schema-version string (`DSL_SCHEMA_VERSION`, `include!`'d from the
 //!      SAME `schema_version_const.rs` the crate reads — the non-drift seam);
-//!   4. the full target triple (`$TARGET`, set by Cargo for build scripts).
+//!   (d) the engine source set — a sha2-256 over the `.rs` files under the eleven
+//!      locked roots in `build_support/engine_source_set.rs`, folded behind the
+//!      `b"engine-source-v1\0"` domain prefix (r2.s3.w1, #155);
+//!   (e) the full target triple (`$TARGET`, set by Cargo for build scripts).
 //!
 //! **r1.s1.w1 (ADR-0020) additions.** The script also (a) guarantees the frontend
 //! `dist` directory exists before `tauri_build::build()` runs, and (b) runs
@@ -20,8 +23,10 @@
 //!
 //! It then bakes the digest into the binary via
 //! `cargo:rustc-env=PULSE_ENGINE_FINGERPRINT=<hex>` and the triple via
-//! `PULSE_TARGET_TRIPLE`, plus `cargo:rerun-if-changed=` for `Cargo.lock` and the
-//! schema-const file so the fingerprint stays correct without over-rebuilding.
+//! `PULSE_TARGET_TRIPLE`, plus `cargo:rerun-if-changed=` for `Cargo.lock`, the
+//! schema-const file, every directory the engine source-set walk enters (root or
+//! nested) and every hashed file in it, so the fingerprint stays correct without
+//! over-rebuilding.
 
 // The crate-wide `[lints.clippy]` table denies `unwrap_used`/`expect_used` so
 // *library* paths cannot panic (audit C5). A build script is the opposite case:
@@ -42,6 +47,13 @@ use sha2::{Digest, Sha256};
 // so the schema input to the fingerprint can never drift from `SchemaVersion::CURRENT`
 // (the crate's non-drift test asserts the equality).
 include!("src/domain/dsl/schema_version_const.rs");
+
+// r2.s3.w1 (#155): input (d) — the engine source-set root list and its hasher.
+// `tests/engine_fingerprint_source.rs` `include!`s the SAME two files, so the
+// roots the build hashes/watches and the roots the test asserts are one list,
+// and the function folded here is the function the suite exercises.
+include!("build_support/engine_source_set.rs");
+include!("build_support/source_tree_hash.rs");
 
 /// Marks a `ui/dist/index.html` written by `ensure_frontend_dist` as a placeholder rather
 /// than real Vite output. Embedded as an HTML comment in the placeholder body so it can
@@ -83,10 +95,10 @@ fn main() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Input (d): the full target triple Cargo is building for.
+    // Input (e): the full target triple Cargo is building for.
     let target = env::var("TARGET").expect("TARGET is always set by Cargo for a build script");
 
-    // sha2-256 over the four inputs, domain-separated by a NUL byte so no input's
+    // sha2-256 over the five inputs, domain-separated by a NUL byte so no input's
     // tail can be confused with the next input's head.
     let mut hasher = Sha256::new();
     hasher.update(&lock_bytes);
@@ -96,6 +108,12 @@ fn main() {
     // Input (c): the DSL schema version (from the `include!`'d single-source const).
     hasher.update(DSL_SCHEMA_VERSION.as_bytes());
     hasher.update([0u8]);
+    // Input (d): the engine source set — sha2-256 over the `.rs` files under the
+    // eleven locked roots, folded behind its own domain-separation prefix so the
+    // source-tree hex can never be mistaken for a continuation of input (c).
+    hasher.update(b"engine-source-v1\0");
+    hasher.update(source_tree_hash(Path::new(&manifest_dir), ENGINE_SOURCE_ROOTS).as_bytes());
+    hasher.update([0u8]);
     hasher.update(target.as_bytes());
     let fingerprint = hex::encode(hasher.finalize());
 
@@ -103,11 +121,26 @@ fn main() {
     println!("cargo:rustc-env=PULSE_ENGINE_FINGERPRINT={fingerprint}");
     println!("cargo:rustc-env=PULSE_TARGET_TRIPLE={target}");
 
-    // rerun-if-changed hygiene: recompute only when the lock graph or the schema
-    // const changes (the fingerprint stays correct without over-rebuilding). The
-    // resolved rustc / target are picked up on every build invocation anyway.
+    // rerun-if-changed hygiene: recompute only when the lock graph, the schema
+    // const or the engine source set changes (the fingerprint stays correct
+    // without over-rebuilding). The resolved rustc / target are picked up on
+    // every build invocation anyway.
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src/domain/dsl/schema_version_const.rs");
+    // a2 (r2.s3.w1), corrected in review: EVERY directory the enumeration walks
+    // gets a `rerun-if-changed`, not only the roots. A Cargo directory watch is
+    // NOT recursive, so watching the roots alone missed a `.rs` file added or
+    // removed inside a NESTED subdirectory: that changes the subdirectory's
+    // mtime, not the root's, and the file is not on the previous build's watched
+    // list either — the fingerprint went stale exactly where the original comment
+    // said it could not. The files catch content edits; the directories catch adds
+    // and removals at any depth.
+    for dir in source_tree_dirs(Path::new(&manifest_dir), ENGINE_SOURCE_ROOTS) {
+        println!("cargo:rerun-if-changed={}", dir.display());
+    }
+    for (_, rel) in source_tree_files(Path::new(&manifest_dir), ENGINE_SOURCE_ROOTS) {
+        println!("cargo:rerun-if-changed={}", rel.display());
+    }
     println!("cargo:rerun-if-env-changed=PULSE_ALLOW_PLACEHOLDER_DIST");
 
     // r1.s1.w1 (ADR-0020): the desktop half. Order matters -- the dist directory must

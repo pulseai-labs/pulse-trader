@@ -1923,6 +1923,7 @@ fn prepared_backtest() -> PreparedBacktest {
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,
             window: None,
+            lead_in_from_ms: None,
         },
         result,
         summary,
@@ -1936,8 +1937,12 @@ fn prepared(session: &str) -> PreparedCoachAcceptance {
         // The accept's optimistic lock: the fixture proposal's own mutation, so the
         // guard passes for every case that is not testing the guard itself.
         expected_mutation: a_proposal().mutation,
+        // The fixture versions carry no certification pointer — `None` is the
+        // pointer the accept read.
+        expected_certification_pointer: None,
         child_dsl: child_dsl(),
         prepared_run: prepared_backtest(),
+        walk_forward: None,
     }
 }
 

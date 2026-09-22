@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Mutex;
 
-use crate::domain::backtest::BacktestRunId;
+use crate::domain::backtest::{BacktestRunId, WalkForwardRunId};
 use crate::domain::strategy::{CreatedBy, StrategyId, VersionId};
 use crate::domain::{
     AcceptedCoachOutcome, Clock, CoachAcceptFailure, CoachAcceptanceRepository, CoachingSessionId,
@@ -52,6 +52,11 @@ pub struct MemoryCoachTurn {
     pub parent_version_id: VersionId,
     /// The one attributable provider call, when the turn correlated one.
     pub llm_call_id: Option<LlmCallId>,
+    /// The coached parent's `latest_walk_forward_run_id` as the version store
+    /// holds it. Registration seeds the certification map with it; a later
+    /// [`InMemoryCoachAcceptanceRepo::record_certification`] is how a
+    /// memory-side walk-forward save moves it.
+    pub parent_certification: Option<WalkForwardRunId>,
     /// What the turn produced.
     pub outcome: SessionOutcome,
 }
@@ -78,6 +83,11 @@ pub struct MemoryAcceptedChild {
     pub child_dsl: StrategyDsl,
     /// The deterministic re-backtest that was committed with it.
     pub prepared_run: PreparedBacktest,
+    /// The certification run id minted for a gate-passing accept (r2.s3.w4) —
+    /// what the accept WROTE as the child's first pointer. The replay does not
+    /// read this field: the child's CURRENT pointer is the certification map's
+    /// entry (a later save moves it), so this records the accept's own act only.
+    pub walk_forward_run_id: Option<WalkForwardRunId>,
 }
 
 /// The mutable half, behind one lock.
@@ -85,6 +95,13 @@ pub struct MemoryAcceptedChild {
 struct MemoryState {
     turns: BTreeMap<String, MemoryCoachTurn>,
     children: Vec<MemoryAcceptedChild>,
+    /// The `strategy_version.latest_walk_forward_run_id` column, modelled per
+    /// version id: the certification pointer a walk-forward save moves and the
+    /// accept commit's optimistic lock re-reads — the same cell the SQLite
+    /// adapter guards. An accept that commits a gate-passing draft records the
+    /// CHILD's initial pointer here too, so the entry is the child's column and
+    /// the replay reads the current value from it.
+    certification: BTreeMap<String, WalkForwardRunId>,
 }
 
 /// A deterministic in-memory [`CoachAcceptanceRepository`].
@@ -112,9 +129,32 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
     /// Returns [`DataError::Db`] when the lock is poisoned.
     pub fn register_turn(&self, turn: MemoryCoachTurn) -> Result<(), DataError> {
         let mut state = self.lock()?;
+        if let Some(pointer) = &turn.parent_certification {
+            state
+                .certification
+                .insert(turn.parent_version_id.as_str().to_owned(), pointer.clone());
+        }
         state
             .turns
             .insert(turn.session_id.as_str().to_owned(), turn);
+        Ok(())
+    }
+
+    /// Move one version's certification pointer — the memory-side stand-in for
+    /// `save_walk_forward_run`'s `latest_walk_forward_run_id` write, so a test
+    /// can advance a pointer between an accept's computation and its commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the lock is poisoned.
+    pub fn record_certification(
+        &self,
+        version_id: &VersionId,
+        run_id: WalkForwardRunId,
+    ) -> Result<(), DataError> {
+        self.lock()?
+            .certification
+            .insert(version_id.as_str().to_owned(), run_id);
         Ok(())
     }
 
@@ -174,6 +214,30 @@ fn open_proposal<'a>(
         SessionOutcome::Pending | SessionOutcome::Failed { .. } => Err(DataError::Db(format!(
             "coaching session `{session_id}`: the turn produced no proposal to accept"
         ))),
+    }
+}
+
+/// The idempotent-retry read of an already-accepted pair — the certification id
+/// rides along from the child's CURRENT pointer, matching the SQLite replay's
+/// `SELECT latest_walk_forward_run_id FROM strategy_version WHERE id = child`.
+///
+/// That pointer is read from the certification map — the column this model
+/// carries — and NOT from the stored [`MemoryAcceptedChild`], which records only
+/// what the accept itself wrote. The distinction is the whole point of the
+/// replay: a later `record_certification(child, run)` (the memory-side
+/// walk-forward save) must be visible here, exactly as the SQLite read sees the
+/// moved column. A child the accept committed with no gate-passing draft has no
+/// map entry, which is this model's NULL.
+fn replayed_outcome(
+    state: &MemoryState,
+    child_version_id: &VersionId,
+    accepted_run_id: &BacktestRunId,
+) -> AcceptedCoachOutcome {
+    let walk_forward_run_id = state.certification.get(child_version_id.as_str()).cloned();
+    AcceptedCoachOutcome {
+        child_version_id: child_version_id.clone(),
+        accepted_run_id: accepted_run_id.clone(),
+        walk_forward_run_id,
     }
 }
 
@@ -249,6 +313,15 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
             let turn = state.turns.get(&id).cloned().ok_or_else(|| {
                 DataError::Db(format!("coaching session `{id}`: no such session"))
             })?;
+            // Read BEFORE `open_proposal` takes the turns borrow: the
+            // certification map is the `latest_walk_forward_run_id` column this
+            // model carries, and the guard below compares it inside the same
+            // lock — the same optimistic-lock re-read the SQLite adapter makes
+            // inside its transaction.
+            let current_pointer = state
+                .certification
+                .get(turn.parent_version_id.as_str())
+                .cloned();
             let proposal = open_proposal(&id, state.turns.get_mut(&id))?;
 
             // The proposal must still say what this child was built from — the same
@@ -261,6 +334,18 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
                     "coaching session `{id}`: the proposal changed while this accept was being \
                      computed, so the child would not match the mutation now on record; \
                      re-run the accept against the current proposal"
+                )));
+            }
+
+            // The parent's certification pointer must still be the one the gate
+            // read — the second optimistic lock: a walk-forward landing between
+            // the gate's computation and this commit certifies the child from
+            // fold parameters that are no longer the parent's current ones.
+            if current_pointer != acceptance.expected_certification_pointer {
+                return Err(DataError::Db(format!(
+                    "coaching session `{id}`: the parent's certification pointer moved while \
+                     this accept was being computed, so the child would be certified from \
+                     stale fold parameters; re-run the accept against the current state"
                 )));
             }
 
@@ -279,10 +364,7 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
                 child_version_id,
                 accepted_run_id,
             } => {
-                return Ok(AcceptedCoachOutcome {
-                    child_version_id: child_version_id.clone(),
-                    accepted_run_id: accepted_run_id.clone(),
-                });
+                return Ok(replayed_outcome(&state, child_version_id, accepted_run_id));
             }
             Disposition::Rejected => {
                 return Err(DataError::Db(format!(
@@ -299,10 +381,15 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
             ))
         })?;
 
-        // Mint in the SAME order the SQLite adapter does — child, then run — so a
-        // test written against one reads the same ids from the other.
+        // Mint in the SAME order the SQLite adapter does — child, run, then the
+        // certification id when a gate-passing draft came through — so a test
+        // written against one reads the same ids from the other.
         let child_version_id = VersionId::new(self.ids.next_id());
         let accepted_run_id = BacktestRunId::new(self.ids.next_id());
+        let walk_forward_run_id = acceptance
+            .walk_forward
+            .as_ref()
+            .map(|_| WalkForwardRunId::new(self.ids.next_id()));
         let created_at = self.now_rfc3339()?;
 
         state.children.push(MemoryAcceptedChild {
@@ -315,7 +402,20 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
             created_at,
             child_dsl: acceptance.child_dsl,
             prepared_run: acceptance.prepared_run,
+            walk_forward_run_id: walk_forward_run_id.clone(),
         });
+
+        // The child's `latest_walk_forward_run_id` cell, written in the same act
+        // as its row — the SQLite `insert_child_version` carries it on the INSERT.
+        // A gate-passing draft's run id is the child's FIRST pointer; a child
+        // accepted without one simply has no entry, which is this model's NULL.
+        // The replay reads THIS, not the row above, so a later
+        // `record_certification(child, run)` is visible to it.
+        if let Some(run_id) = &walk_forward_run_id {
+            state
+                .certification
+                .insert(child_version_id.as_str().to_owned(), run_id.clone());
+        }
 
         let proposal = open_proposal(&id, state.turns.get_mut(&id))?;
         proposal.disposition = Disposition::Accepted {
@@ -328,6 +428,7 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
         Ok(AcceptedCoachOutcome {
             child_version_id,
             accepted_run_id,
+            walk_forward_run_id,
         })
     }
 }

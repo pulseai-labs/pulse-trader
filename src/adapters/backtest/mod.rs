@@ -7,5 +7,5 @@ mod engine;
 // `domain::backtest::regime`.
 mod regime;
 
-pub use engine::{BacktestConfig, run_backtest};
+pub use engine::{BacktestConfig, first_fully_warm_bar_ms, run_backtest};
 pub use regime::RegimeDetector;

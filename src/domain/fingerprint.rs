@@ -2,15 +2,18 @@
 //! engine (VS-1.2.3 work-3.01, FR-7 / NFR-2).
 //!
 //! The fingerprint is a sha2-256 hex digest computed in `build.rs` (decision D5)
-//! over four inputs that, together, pin a byte-reproducible engine build:
-//! 1. the raw bytes of the workspace `Cargo.lock` (the full resolved dependency
-//!    graph);
-//! 2. the *resolved* `rustc -vV` filtered to its `release:` + `commit-hash:` lines
-//!    (the `host:` line is excluded — it varies by build host and is not the
-//!    property we fingerprint; the **target triple** below covers arch);
-//! 3. the DSL schema-version string (`DSL_SCHEMA_VERSION`, shared via the
-//!    `schema_version_const.rs` seam);
-//! 4. the full target triple.
+//! over five inputs that, together, pin a byte-reproducible engine build:
+//! - (a) the raw bytes of the workspace `Cargo.lock` (the full resolved
+//!   dependency graph);
+//! - (b) the *resolved* `rustc -vV` filtered to its `release:` + `commit-hash:`
+//!   lines (the `host:` line is excluded — it varies by build host and is not
+//!   the property we fingerprint; the **target triple** below covers arch);
+//! - (c) the DSL schema-version string (`DSL_SCHEMA_VERSION`, shared via the
+//!   `schema_version_const.rs` seam);
+//! - (d) the engine source set — a sha2-256 over the `.rs` files under the
+//!   eleven locked roots in `build_support/engine_source_set.rs`, folded behind
+//!   the `b"engine-source-v1\0"` domain prefix (r2.s3.w1, #155);
+//! - (e) the full target triple.
 //!
 //! The hex digest is baked into the binary by `build.rs` via
 //! `cargo:rustc-env=PULSE_ENGINE_FINGERPRINT=<hex>` and the triple via
@@ -30,8 +33,9 @@ use serde::{Deserialize, Serialize};
 
 /// The build-time identity of the backtest engine.
 ///
-/// A newtype over the sha2-256 hex digest of the four D5 inputs (`Cargo.lock`,
-/// resolved `rustc`, DSL schema version, target triple). Two builds with identical
+/// A newtype over the sha2-256 hex digest of the five D5 inputs (`Cargo.lock`,
+/// resolved `rustc`, DSL schema version, engine source set, target triple).
+/// Two builds with identical
 /// fingerprints are byte-reproducible peers; a differing fingerprint means the
 /// engine, its dependency graph, its compiler, or its target changed — and any
 /// backtest results carrying different fingerprints are not directly comparable

@@ -31,6 +31,9 @@ mod stats;
 // projections of a persisted run (explicit columns per README C4, NOT a
 // `BacktestResult` blob — #68 / D1). `SqliteBacktestRunRepo` writes/reads them.
 mod run;
+// r2.s3.w3: walk-forward as a run kind — `rolling-oos/v1` folds + the `wf-v1`
+// verdict rule, their constants, and the persisted-run projections (ADR-0025).
+mod walk_forward;
 
 // Re-exports kept at the `domain::backtest` surface so `domain/mod.rs` + `lib.rs`
 // can curate them onto the crate's public API (an un-re-exported public domain
@@ -47,3 +50,8 @@ pub use run::{
 };
 pub use stats::{EquityCurve, EquityPoint, SummaryStats};
 pub use trade::{ExitReason, Fill, Trade, TradeSource};
+pub use walk_forward::{
+    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
+    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
+    WalkForwardRunDraft, WalkForwardRunId, Z, fold_windows, folds_required,
+};

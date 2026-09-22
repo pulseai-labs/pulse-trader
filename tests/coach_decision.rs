@@ -33,7 +33,8 @@ use pulse::{
     InitialCoachOutcome, LlmCallId, MIGRATOR, Migrator, Mutation, NewVersion, Pair, ParamValue,
     PersistedRun, Proposal, ReadBackFailure, RunSummary, SeqIdSource, SeriesEnd, SessionOutcome,
     SqliteBacktestRunRepo, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, SqliteStrategyRepo,
-    StrategyDsl, StrategyRepository, SummaryStats, SymbolFilters, Timeframe, VersionId, apply,
+    StrategyDsl, StrategyRepository, SummaryStats, SymbolFilters, Timeframe, VersionId,
+    WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId, WalkForwardRunRepository, apply,
     compile, run_backtest, run_coach_decision, run_version_backtest,
 };
 mod coach_support;
@@ -201,6 +202,29 @@ impl<R: BacktestRunRepository + Send + Sync> BacktestRunRepository for ReadBackF
 
     async fn get_trades(&self, id: &BacktestRunId) -> Result<Vec<pulse::Trade>, DataError> {
         self.inner.get_trades(id).await
+    }
+}
+
+// The walk-forward reads the accept gate performs pass straight through — the
+// injected failure is a read-BACK failure on `get_run`, nothing else.
+impl<R: WalkForwardRunRepository + Send + Sync> WalkForwardRunRepository
+    for ReadBackFailingRuns<R>
+{
+    async fn save_walk_forward_run(
+        &self,
+        strategy_version_id: &VersionId,
+        draft: &WalkForwardRunDraft,
+    ) -> Result<WalkForwardRunId, DataError> {
+        self.inner
+            .save_walk_forward_run(strategy_version_id, draft)
+            .await
+    }
+
+    async fn get_walk_forward_run(
+        &self,
+        id: &WalkForwardRunId,
+    ) -> Result<Option<WalkForwardRun>, DataError> {
+        self.inner.get_walk_forward_run(id).await
     }
 }
 
@@ -836,6 +860,7 @@ async fn a_child_of_a_windowed_parent_replays_the_parents_slice() {
         &BacktestConfig::default(),
         &filters,
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .expect("the probe runs");
     // The LAST multi-bar hold: every trade before it closed inside the window,

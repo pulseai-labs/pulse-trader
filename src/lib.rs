@@ -328,7 +328,7 @@ pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 // VS-1.2.1 work-1.03: deterministic, sequential backtest engine. The adapter
 // owns the concrete indicator engine while composing the pure domain backtest
 // types and money-math primitives.
-pub use adapters::backtest::{BacktestConfig, run_backtest};
+pub use adapters::backtest::{BacktestConfig, first_fully_warm_bar_ms, run_backtest};
 
 // VS-1.1.4 work-1.01: the SQLite persistence foundation. `Db` is the WAL pool
 // wrapper (`with_path`/`open_default`/`pool`); `MIGRATOR` is the embedded
@@ -473,6 +473,19 @@ pub use domain::{
     FundingConfig, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
 };
 
+// r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025) —
+// the domain types, the `WalkForwardRunRepository` port (one-transaction save +
+// fail-closed read), and the use case. No MCP tool / Tauri command (w5's).
+pub use application::walk_forward::{
+    WalkForwardAppError, WalkForwardOutcome, WalkForwardRequest, run_walk_forward,
+};
+pub use domain::{
+    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
+    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
+    WalkForwardRunDraft, WalkForwardRunId, WalkForwardRunRepository, Z, fold_windows,
+    folds_required,
+};
+
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
 // `d11`). Re-exported because `tests/tauri_backtest.rs` injects post-save read
 // failures through the real ports, and because the desktop adapter maps this exact
@@ -606,6 +619,13 @@ pub use crate::tauri::{
     backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core, dsl_summary,
     export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
     shell_info_core, summarize_dsl,
+};
+// r2.s3.w5: the walk-forward wire contract — the request/response DTOs plus
+// the three transport-free cores `tests/tauri_walk_forward.rs` (AC-2) drives.
+pub use crate::tauri::{
+    FoldVerdictDto, GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardFoldDto,
+    WalkForwardRunDto, WalkForwardRunRequest, WalkForwardVerdictDto, get_backtest_run_core,
+    get_walk_forward_run_core, run_walk_forward_version_core,
 };
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the

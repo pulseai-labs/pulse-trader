@@ -19,11 +19,12 @@ use std::process::Stdio;
 
 use pulse::{
     BacktestConfig, BacktestInputs, BacktestRequest, BacktestResult, BacktestRunId,
-    BacktestRunRepository, BinanceAdapter, CandleStore, CreatedBy, DataVersion, Db, Direction,
-    EngineFingerprint, EquityCurve, ExitReason, Fill, FundingConfig, MIGRATOR, NewVersion, Pair,
-    Regime, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
-    SqliteStrategyRepo, StrategyId, StrategyRepository, SummaryStats, Timeframe, Trade,
-    TradeSource, VersionId, run_version_backtest,
+    BacktestRunRepository, BinanceAdapter, CandleStore, CandleWindow, CreatedBy, DataVersion, Db,
+    Direction, EngineFingerprint, EquityCurve, ExitReason, Fill, FoldScheme, FoldVerdict,
+    FundingConfig, MIGRATOR, NewVersion, Pair, Regime, RegimeBreakdown, RunVerdict,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId,
+    StrategyRepository, SummaryStats, Timeframe, Trade, TradeSource, VerdictRule, VersionId,
+    WalkForwardFoldDraft, WalkForwardRunDraft, fold_windows, run_version_backtest,
 };
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
@@ -144,6 +145,7 @@ pub fn seeded_inputs() -> BacktestInputs {
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
         window: None,
+        lead_in_from_ms: None,
     }
 }
 
@@ -231,6 +233,163 @@ pub async fn seed(db: &Db) -> Seed {
     let (parent_id, child_id) = seed_versions(db).await;
     let run_id = seed_run_with_inputs(db, &child_id, &seeded_inputs()).await;
     (parent_id, child_id, run_id)
+}
+
+/// A synthetic `k=2` walk-forward draft whose recorded verdict is `pass`
+/// (r2.s3.w4). The fixture cannot yield a passing verdict honestly, so the
+/// certification seam — the pointer plus the recorded `pass` column — is what
+/// a synthetic draft exercises: `save_walk_forward_run` persists the recorded
+/// verdict, and the derived `certified` reads it back through the JOIN.
+/// One trade whose `realized_r` is `r`, with the rest of its numbers CONSISTENT
+/// with that R-multiple: a long entered at 90 000 with its stop 1 000 below
+/// closes at `90 000 + 1 000·r`, so `(exit − entry) / stop_distance == r` exactly
+/// and the trade does not contradict the verdict it feeds.
+///
+/// `idx` staggers the timestamps so a fold's trades are distinct bars.
+pub fn seeded_trade_at_r(idx: i64, r: Decimal) -> Trade {
+    let entry = Decimal::new(90_000, 0);
+    let stop = Decimal::new(89_000, 0);
+    let stop_distance = entry - stop;
+    let exit = entry + r * stop_distance;
+    let qty = Decimal::ONE;
+    let open_ms = 1_700_000_000_000 + idx * 900_000;
+    let close_ms = open_ms + 900_000;
+    let fees = Decimal::new(2, 2);
+    Trade {
+        direction: Direction::Long,
+        qty,
+        entry_price: entry,
+        exit_price: exit,
+        entry_signal_time: open_ms,
+        entry_fill_time: open_ms,
+        exit_signal_time: close_ms,
+        exit_fill_time: close_ms,
+        fills: vec![
+            Fill {
+                price: entry,
+                qty,
+                time_ms: open_ms,
+                fee: Decimal::new(1, 2),
+            },
+            Fill {
+                price: exit,
+                qty,
+                time_ms: close_ms,
+                fee: Decimal::new(1, 2),
+            },
+        ],
+        fees_total: fees,
+        funding_total: Decimal::ZERO,
+        slippage_total: Decimal::ZERO,
+        realized_pnl: (exit - entry) * qty - fees,
+        realized_r: r,
+        mfe_r: if r > Decimal::ZERO { r } else { Decimal::ZERO },
+        mae_r: if r < Decimal::ZERO { r } else { Decimal::ZERO },
+        exit_reason: if r > Decimal::ZERO {
+            ExitReason::TakeProfit
+        } else {
+            ExitReason::StopLoss
+        },
+        source: TradeSource::Backtest,
+        regime: Regime::TrendingUp,
+        stop_price: Some(stop),
+    }
+}
+
+/// One fold's trades: `count` bars whose R-multiples alternate `lo`/`hi` around
+/// their mean, so the `wf-v1` bound is computed over a real standard error rather
+/// than a zero one. `fold_index` staggers the timestamps between folds.
+pub fn seeded_fold_trades(count: usize, lo: Decimal, hi: Decimal, fold_index: usize) -> Vec<Trade> {
+    (0..count)
+        .map(|i| {
+            let r = if i % 2 == 0 { lo } else { hi };
+            seeded_trade_at_r(i64::try_from(fold_index * count + i).unwrap_or(i64::MAX), r)
+        })
+        .collect()
+}
+
+pub fn seeded_walk_forward_draft(pass: bool) -> WalkForwardRunDraft {
+    seeded_walk_forward_draft_k(pass, 2)
+}
+
+/// The same draft at any fold count `k` — one coherent fold per scheme fold, so
+/// an out-of-range `k` can be exercised with the folds a real caller would
+/// supply. The scheme is built as the raw public variant, which is what lets a
+/// test hand the gate one the domain would refuse to construct (R5).
+pub fn seeded_walk_forward_draft_k(pass: bool, k: u8) -> WalkForwardRunDraft {
+    let span = CandleWindow::new(1_735_702_200_000, 1_738_000_000_000).unwrap();
+    // The R-multiples the folds carry: a genuinely HOLDING fold needs `n >= 20`
+    // trades and a positive bound, which one trade cannot produce — so the
+    // fixture says it with twenty, alternating around a positive mean (a real
+    // standard error, not a zero one). Both folds take the same pattern, so the
+    // pooled series holds with them.
+    let (lo, hi) = if pass {
+        (Decimal::new(5, 1), Decimal::new(15, 1))
+    } else {
+        (Decimal::new(-5, 1), Decimal::new(-15, 1))
+    };
+    let folds: Vec<WalkForwardFoldDraft> = fold_windows(&span, k)
+        .iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let trades = seeded_fold_trades(20, lo, hi, i);
+            let rs: Vec<Decimal> = trades.iter().map(|t| t.realized_r).collect();
+            // The verdict is DERIVED from the trades, never asserted alongside
+            // them (R1): the write gate recomputes exactly this from
+            // `result.trades`, so a fixture that fabricated the verdict could not
+            // persist at all.
+            let verdict = FoldVerdict::from_rs(&rs);
+            let net_pnl: Decimal = trades.iter().map(|t| t.realized_pnl).sum();
+            let fees_total: Decimal = trades.iter().map(|t| t.fees_total).sum();
+            let funding_total: Decimal = trades.iter().map(|t| t.funding_total).sum();
+            let slippage_total: Decimal = trades.iter().map(|t| t.slippage_total).sum();
+            let summary = SummaryStats::from_trades(
+                &trades,
+                net_pnl,
+                fees_total,
+                funding_total,
+                &EquityCurve::default(),
+            );
+            let mut inputs = seeded_inputs();
+            inputs.window = Some(window.clone());
+            inputs.lead_in_from_ms = Some(window.from_ms);
+            WalkForwardFoldDraft {
+                index: u8::try_from(i).unwrap(),
+                window: window.clone(),
+                verdict,
+                inputs,
+                result: BacktestResult {
+                    trades,
+                    net_pnl,
+                    fees_total,
+                    funding_total,
+                    slippage_total,
+                    regime_breakdown: RegimeBreakdown::new(),
+                    skipped_entries: SkippedEntryCounts::new(),
+                    open_position: None,
+                    engine_fingerprint: EngineFingerprint::current(),
+                    summary: summary.clone(),
+                    equity_curve: EquityCurve::default(),
+                },
+                summary,
+                starting_equity: Decimal::new(10_000, 0),
+            }
+        })
+        .collect();
+    let pooled_rs: Vec<Decimal> = folds
+        .iter()
+        .flat_map(|f| f.result.trades.iter().map(|t| t.realized_r))
+        .collect();
+    let fold_verdicts: Vec<FoldVerdict> = folds.iter().map(|f| f.verdict.clone()).collect();
+    WalkForwardRunDraft {
+        scheme: FoldScheme::RollingOos { k },
+        rule: VerdictRule::WfV1,
+        span,
+        from_defaulted: false,
+        engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
+        verdict: RunVerdict::assess(&fold_verdicts, &pooled_rs),
+        folds,
+    }
 }
 
 /// Run a REAL backtest on `version_id` over the copied fixture store, in-test,

@@ -47,7 +47,9 @@ use serde::{Deserialize, Serialize};
 use crate::application::backtest::{
     BacktestAppError, BacktestOutcome, Histogram, ReadBackFailure, ReadBackStage,
 };
-use crate::domain::backtest::{EquityCurve, ExitReason, Regime, RegimeCell, TradeSource};
+use crate::domain::backtest::{
+    EquityCurve, ExitReason, Regime, RegimeBreakdown, RegimeCell, TradeSource,
+};
 use crate::domain::{BacktestInputs, BacktestRunId, Direction, FundingConfig, PersistedRun, Trade};
 
 use super::coach::SummaryDto;
@@ -197,6 +199,11 @@ pub struct BacktestRunDto {
     pub slippage_bps: String,
     /// How funding was sourced (`snapshot_rates`).
     pub funding: String,
+    /// The `open_time` of the first candle the engines consumed — the lead-in
+    /// start (r2.s3.w2), RFC 3339 like `created_at`. `null` for an unwindowed
+    /// run and for every row persisted before migration `0012`, whose lead-in
+    /// is not recoverable.
+    pub lead_in_from: Option<String>,
 
     // --- engine ---------------------------------------------------------
     /// The recording engine's build fingerprint.
@@ -270,6 +277,33 @@ pub struct BacktestRunDto {
     pub mae: HistogramDto,
     /// Every persisted trade, in `seq` order, with exact values.
     pub trades: Vec<TradeRowDto>,
+
+    // --- walk-forward membership (r2.s3.w3, additive) ---------------------
+    /// Which `rolling-oos/v1` walk-forward run this run is a fold of — `null`
+    /// for a standalone run and for every row persisted before migration
+    /// `0013`.
+    pub walk_forward: Option<WalkForwardMembershipDto>,
+}
+
+/// The walk-forward membership a run carries, on the wire (r2.s3.w3 — the
+/// `0013` `backtest_run` pair, both-or-neither by trigger, so one `Option`
+/// carries them together).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WalkForwardMembershipDto {
+    /// The parent `walk_forward_run` id.
+    pub walk_forward_run_id: String,
+    /// This run's position in the parent's scheme (`0..k`).
+    pub fold_index: u32,
+}
+
+/// The membership projection (r2.s3.w3) — kept out of `backtest_run_dto` so
+/// that function's line count is unchanged (#204).
+fn walk_forward_dto(run: &PersistedRun) -> Option<WalkForwardMembershipDto> {
+    run.walk_forward.as_ref().map(|m| WalkForwardMembershipDto {
+        walk_forward_run_id: m.run_id.as_str().to_owned(),
+        fold_index: u32::from(m.fold_index),
+    })
 }
 
 /// What `compare_child_run` is asked for: one persisted run id (r2.s1.w4 C3).
@@ -313,7 +347,9 @@ pub struct CompareChildRunDto {
 }
 
 /// Exact decimal text — the same `.normalize()`d form the database stores.
-fn dec(value: Decimal) -> String {
+/// `pub(crate)` so `walk_forward.rs`'s fold/verdict projections render under
+/// the identical rule (r2.s3.w5).
+pub(crate) fn dec(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
@@ -426,6 +462,22 @@ fn equity_dto(curve: &EquityCurve) -> Vec<EquityPointDto> {
         .collect()
 }
 
+/// The four-regime vec, fixed order (extracted from `backtest_run_dto` so the
+/// r2.s3.w3 membership field does not grow it past its r2.s3.w2 count, #204):
+/// a chart that reorders its categories between runs is unreadable, and an
+/// absent regime is a zero, not a gap.
+fn regimes_dto(
+    run_id: &BacktestRunId,
+    breakdown: &RegimeBreakdown,
+) -> Result<Vec<RegimeCellDto>, BacktestAppError> {
+    Ok(vec![
+        regime_dto(run_id, "trending_up", breakdown.trending_up())?,
+        regime_dto(run_id, "trending_down", breakdown.trending_down())?,
+        regime_dto(run_id, "ranging", breakdown.ranging())?,
+        regime_dto(run_id, "unknown", breakdown.unknown())?,
+    ])
+}
+
 fn regime_dto(
     run_id: &BacktestRunId,
     regime: &str,
@@ -517,6 +569,12 @@ pub fn backtest_run_dto(outcome: &BacktestOutcome) -> Result<BacktestRunDto, Bac
         taker_fee_bps: dec(inputs.taker_fee_bps),
         slippage_bps: dec(inputs.slippage_bps),
         funding: funding_label(inputs.funding).to_owned(),
+        // Same RFC 3339 millisecond shape `BacktestInputs::lead_in_from` puts
+        // on the MCP wire — one timestamp spelling across the surfaces.
+        lead_in_from: inputs.lead_in_from_ms.and_then(|ms| {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        }),
 
         engine_fingerprint: run.engine_fingerprint.clone(),
         engine_target: run.engine_target.clone(),
@@ -556,16 +614,10 @@ pub fn backtest_run_dto(outcome: &BacktestOutcome) -> Result<BacktestRunDto, Bac
         )?,
 
         equity: equity_dto(&outcome.equity_curve()),
-        // Fixed order, always four entries: a chart that reorders its categories
-        // between runs is unreadable, and an absent regime is a zero, not a gap.
-        regimes: vec![
-            regime_dto(run_id, "trending_up", breakdown.trending_up())?,
-            regime_dto(run_id, "trending_down", breakdown.trending_down())?,
-            regime_dto(run_id, "ranging", breakdown.ranging())?,
-            regime_dto(run_id, "unknown", breakdown.unknown())?,
-        ],
+        regimes: regimes_dto(run_id, breakdown)?,
         mfe: histogram_dto(&outcome.mfe),
         mae: histogram_dto(&outcome.mae),
         trades: outcome.trades.iter().map(trade_dto).collect(),
+        walk_forward: walk_forward_dto(run),
     })
 }

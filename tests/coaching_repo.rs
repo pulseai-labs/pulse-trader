@@ -22,6 +22,8 @@
 //! `MIGRATOR`), `TempDir`-isolated, and deterministic through a `FakeClock`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod support;
+
 use chrono::{DateTime, SecondsFormat};
 use pulse::{
     AcceptFailureStage, BacktestRunId, CoachAcceptFailure, CoachAcceptanceRepository, CoachFailure,
@@ -31,10 +33,11 @@ use pulse::{
     InitialCoachOutcome, LlmCallId, MIGRATOR, MemoryCoachTurn, Mutation, MutationError, ParamValue,
     PreparedBacktest, PreparedCoachAcceptance, Proposal, RiskParams, SchemaVersion, SeqIdSource,
     Series, SessionOutcome, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, StrategyDsl, StrategyId,
-    SweepableValue, ValueSource, VersionId, apply,
+    SweepableValue, ValueSource, VersionId, WalkForwardRunId, apply,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
+use support::mcp::seeded_walk_forward_draft;
 use tempfile::TempDir;
 
 const NOW_MS: i64 = 1_756_425_600_000; // 2026-08-29T00:00:00Z
@@ -596,6 +599,72 @@ async fn an_accept_whose_proposal_changed_underneath_it_is_refused() {
         ),
         other => panic!("expected an open proposal, got {other:?}"),
     }
+}
+
+/// Point `ver-1`'s `latest_walk_forward_run_id` at a real run row — the cell
+/// the accept's second optimistic lock re-reads inside its transaction.
+async fn certify_ver_1(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO walk_forward_run \
+         (id, seq, strategy_version_id, created_at, scheme, rule, k, \
+          span_from_ms, span_to_ms, from_defaulted, engine_fingerprint, \
+          folds_holding, folds_required, pooled_n, pooled_mean_r, \
+          pooled_lower_bound, pass) \
+         VALUES ('wf-1', (SELECT COALESCE(MAX(seq), 0) + 1 FROM walk_forward_run), \
+                 'ver-1', '2026-08-29T01:00:00.000Z', 'rolling-oos/v1', 'wf-v1', \
+                 6, 0, 1_000, 1, 'fp-1', 4, 4, 80, '0.5', 0.2, 1)",
+    )
+    .execute(pool)
+    .await
+    .expect("seed the certifying walk-forward run");
+    sqlx::query(
+        "UPDATE strategy_version SET latest_walk_forward_run_id = 'wf-1' WHERE id = 'ver-1'",
+    )
+    .execute(pool)
+    .await
+    .expect("advance the parent's certification pointer");
+}
+
+/// A walk-forward landing between the gate's read and the commit moves the
+/// parent's `latest_walk_forward_run_id` — and the accept must refuse, exactly
+/// like a proposal whose mutation changed underneath it: the certification
+/// draft was computed against the run the pointer USED to name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_whose_parent_certification_pointer_moved_is_refused() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+    certify_ver_1(&pool).await;
+
+    // `prepared_for` carries `None` — the pointer as it stood when the accept
+    // was computed, before `certify_ver_1` moved it.
+    let err = accepts(&pool)
+        .commit_acceptance(prepared_for("sess-1"))
+        .await
+        .expect_err("an accept computed against a stale certification pointer is refused");
+    assert!(
+        err.to_string().contains("certification pointer moved"),
+        "the refusal names the moved pointer, not merely that something failed: {err}"
+    );
+
+    // Nothing was written: no child, and the proposal is still actionable.
+    let got = repo.get_session(&id).await.expect("get").expect("present");
+    match &got.outcome {
+        SessionOutcome::Proposed { proposal } => assert_eq!(
+            proposal.disposition,
+            Disposition::Proposed,
+            "the refused accept left the proposal open"
+        ),
+        other => panic!("expected an open proposal, got {other:?}"),
+    }
+
+    // The same accept with the pointer it SHOULD have read commits — the guard
+    // is a compare, not a blanket refusal.
+    let mut matching = prepared_for("sess-1");
+    matching.expected_certification_pointer = Some(WalkForwardRunId::new("wf-1"));
+    accepts(&pool)
+        .commit_acceptance(matching)
+        .await
+        .expect("a pointer that still matches the parent's commits");
 }
 
 /// An accept whose proposal was modified AND accepted by someone else is refused —
@@ -1246,6 +1315,7 @@ fn in_memory_repo() -> InMemoryCoachAcceptanceRepo<FakeClock, SeqIdSource> {
         strategy_id: StrategyId::new("strat-1"),
         parent_version_id: VersionId::new("ver-1"),
         llm_call_id: Some(LlmCallId::new("call-1")),
+        parent_certification: None,
         outcome: SessionOutcome::Proposed {
             proposal: a_proposal(),
         },
@@ -1273,6 +1343,10 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
         // The accept's optimistic lock: the fixture proposal's own mutation, so the
         // guard passes for every case that is not testing the guard itself.
         expected_mutation: a_proposal().mutation,
+        // The second optimistic lock: the fixture versions carry no certification
+        // pointer, so `None` is what the accept read — the cases that test the
+        // guard itself move the pointer explicitly.
+        expected_certification_pointer: None,
         child_dsl: rsi_oversold_strategy(),
         prepared_run: PreparedBacktest {
             inputs: pulse::BacktestInputs {
@@ -1286,6 +1360,7 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
                 slippage_bps: Decimal::new(1, 0),
                 funding: pulse::FundingConfig::SnapshotRates,
                 window: None,
+                lead_in_from_ms: None,
             },
             result: pulse::BacktestResult {
                 trades,
@@ -1303,6 +1378,7 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
             summary,
             starting_equity,
         },
+        walk_forward: None,
     }
 }
 
@@ -1363,6 +1439,98 @@ async fn the_in_memory_adapter_mints_and_derives_the_same_way() {
     );
 }
 
+/// The in-memory adapter carries the same second optimistic lock the SQLite one
+/// does: a parent certification pointer that moved between the gate's read and
+/// the commit is refused, not committed against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_adapter_refuses_a_moved_certification_pointer() {
+    let repo = in_memory_repo();
+
+    // A memory-side walk-forward save landing between the accept's computation
+    // and its commit — the parent's pointer is no longer the `None` the gate read.
+    repo.record_certification(&VersionId::new("ver-1"), WalkForwardRunId::new("wf-later"))
+        .expect("move the parent's pointer");
+
+    let err = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect_err("a stale expected certification pointer is refused");
+    assert!(
+        err.to_string().contains("certification pointer moved"),
+        "the refusal names the moved pointer: {err}"
+    );
+    assert!(
+        repo.accepted_children().expect("children").is_empty(),
+        "nothing was minted"
+    );
+
+    // The pointer the accept SHOULD have read commits — the guard compares, it
+    // does not blanket-refuse.
+    let mut matching = prepared_acceptance();
+    matching.expected_certification_pointer = Some(WalkForwardRunId::new("wf-later"));
+    repo.commit_acceptance(matching)
+        .await
+        .expect("a pointer that still matches commits");
+}
+
+/// The in-memory replay answers the child's CURRENT certification pointer, the
+/// way the SQLite replay does
+/// (`coach_walk_forward_gate::a_replay_reports_the_childs_current_pointer`): the
+/// accept writes the child's initial pointer in the same act as its row, and a
+/// later memory-side walk-forward save — the `record_certification` seam — is
+/// what a replay reports afterwards. Reading the accept-time field instead would
+/// certify stale replay behavior in every test built on this adapter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_replay_reports_the_childs_current_pointer() {
+    let repo = in_memory_repo();
+
+    // A gate-passing draft, so the accept mints the child's certification id.
+    let mut certified = prepared_acceptance();
+    certified.walk_forward = Some(seeded_walk_forward_draft(true));
+    let committed = repo
+        .commit_acceptance(certified)
+        .await
+        .expect("the commit lands");
+    let original = committed
+        .walk_forward_run_id
+        .clone()
+        .expect("the accept certifies the child");
+
+    // The first replay answers the accept's own certifying run.
+    let replay = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect("replaying an accept is idempotent");
+    assert_eq!(
+        replay
+            .walk_forward_run_id
+            .as_ref()
+            .map(WalkForwardRunId::as_str),
+        Some(original.as_str()),
+        "the child's pointer is the run the accept committed"
+    );
+
+    // A LATER walk-forward ON THE CHILD — the memory-side save moves the child's
+    // pointer — and the replay must answer with the new run, not the original.
+    repo.record_certification(
+        &committed.child_version_id,
+        WalkForwardRunId::new("wf-later"),
+    )
+    .expect("move the child's pointer");
+    let replay = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect("the second replay resolves");
+    assert_eq!(
+        replay
+            .walk_forward_run_id
+            .as_ref()
+            .map(WalkForwardRunId::as_str),
+        Some("wf-later"),
+        "the replay names the child's CURRENT pointer, not the accept's run"
+    );
+}
+
 /// The in-memory adapter refuses what the real one refuses: a failed accept on a
 /// settled proposal, and an accept on a turn that produced none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1414,6 +1582,7 @@ async fn the_in_memory_adapter_refuses_what_the_sqlite_one_refuses() {
             strategy_id: StrategyId::new("strat-1"),
             parent_version_id: VersionId::new("ver-1"),
             llm_call_id: None,
+            parent_certification: None,
             outcome: SessionOutcome::Failed {
                 failure: CoachFailure::ZeroCalls,
             },

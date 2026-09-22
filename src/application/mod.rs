@@ -56,3 +56,14 @@ pub(crate) mod mcp_read;
 // field failure and a compile failure are distinguishable, and the `dsl` path
 // collects EVERY validation error rather than stopping at the first.
 pub(crate) mod mcp_write;
+
+// r2.s3.w3 (ADR-0025): the walk-forward use case — `rolling-oos/v1` folds as
+// ordinary persisted windowed runs, `wf-v1` verdicts, one blocking task for
+// all folds (a13/#201), one transaction for the parent + fold rows + fold runs.
+pub(crate) mod walk_forward;
+
+// r2.s3.w5: the walk-forward READ projection — `load_fold_runs` (the L8
+// seam's read half: a fold is an ordinary `backtest_run`) plus the one
+// `WalkForwardRunDetail` wire shape both MCP walk-forward tools return, so no
+// delivery ring re-derives its own read.
+pub(crate) mod walk_forward_read;

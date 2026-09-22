@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO walk_forward_run (id, seq, strategy_version_id, created_at, scheme, rule, k, span_from_ms, span_to_ms, from_defaulted, engine_fingerprint, folds_holding, folds_required, pooled_n, pooled_mean_r, pooled_lower_bound, pass) VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM walk_forward_run), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 16
+    },
+    "nullable": []
+  },
+  "hash": "a7c47b50da0c80475a1c6ffb0acaf03c1777c151b9ca528283c902e443bb2fe2"
+}

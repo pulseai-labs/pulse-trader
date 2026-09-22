@@ -204,6 +204,7 @@ where
         &config,
         &filters,
         SeriesEnd::SnapshotEnd,
+        None,
     )
     .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
 

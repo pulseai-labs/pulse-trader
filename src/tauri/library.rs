@@ -20,7 +20,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::StrategyDsl;
-use crate::domain::backtest::{RunSummary, SummaryStats};
+use crate::domain::backtest::{PersistedRun, RunSummary, SummaryStats};
 use crate::domain::dsl::render;
 
 // ---------------------------------------------------------------------------
@@ -76,14 +76,35 @@ pub struct LibraryVersion {
     /// The version's DSL, rendered to summary lines.
     pub dsl: DslSummary,
     /// The latest persisted run's stats, or `None` when no run exists — the
-    /// screen renders an em dash on `None` (grill A1).
+    /// screen renders an em dash on `None` (grill A1). A walk-forward fold is
+    /// not the latest run (N1): the folds of one walk-forward share one
+    /// `created_at`, so reading one as "the latest" would render an arbitrary
+    /// sub-window as the version's result.
     pub stats: Option<VersionStats>,
     /// The expectancy delta vs the parent's, formatted (e.g. `"+0.12R"`), when
     /// BOTH this version and its parent carry a run. `None` otherwise.
     pub delta_vs_parent: Option<String>,
     /// This version's run catalog (best-effort — one corrupt row costs its row
-    /// here, not the screen), newest first.
+    /// here, not the screen), newest first. Walk-forward folds are IN this list:
+    /// a fold is an ordinary run on the catalog read (L8), and the Lab's fold
+    /// table opens it as one.
     pub recent_runs: Vec<LibraryRunSummary>,
+    /// The version's most recent run **excluding walk-forward folds** — N1's
+    /// discriminator, from the same `latest_run_for_version` read the KPIs use.
+    /// The Lab's parent comparison names this run when the screen has not just
+    /// finished a fresher one: the folds of a walk-forward share ONE
+    /// `created_at`, so reading `recent_runs[0]` as "the latest" would compare a
+    /// fresh full-span run against an arbitrary UUID-selected sub-window fold.
+    /// `None` when the version has no ordinary run (only folds, or none at all)
+    /// — there is then nothing comparable to show, which is a state to report
+    /// rather than a fold to substitute.
+    pub latest_run: Option<LibraryRunSummary>,
+    /// Whether the version's latest walk-forward run passed — the badge signal
+    /// (r2.s3.w4); `false` until a run passes AND whenever a newer run failed.
+    pub certified: bool,
+    /// The certifying run's id — `None` until a walk-forward run is persisted.
+    /// The Details pane renders it when present.
+    pub latest_walk_forward_run_id: Option<String>,
 }
 
 /// The three headline KPIs the screen renders per version, pre-formatted from
@@ -171,6 +192,19 @@ pub fn recent_run_summary(run: &RunSummary) -> LibraryRunSummary {
         created_at: run.created_at.clone(),
         expectancy: format_expectancy(run.expectancy),
         trades: u32::try_from(run.trade_count).unwrap_or(u32::MAX),
+    }
+}
+
+/// Project the `latest_run_for_version` read into the catalog row shape — the
+/// same four cells [`recent_run_summary`] builds, from a [`PersistedRun`] rather
+/// than the catalog's lighter `RunSummary`.
+#[must_use]
+pub fn latest_run_summary(run: &PersistedRun) -> LibraryRunSummary {
+    LibraryRunSummary {
+        id: run.id.as_str().to_owned(),
+        created_at: run.created_at.clone(),
+        expectancy: format_expectancy(run.summary.expectancy),
+        trades: u32::try_from(run.summary.trade_count).unwrap_or(u32::MAX),
     }
 }
 

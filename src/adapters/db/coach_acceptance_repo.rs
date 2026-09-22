@@ -39,8 +39,9 @@ use crate::adapters::db::backtest_run_repo::{
 };
 use crate::adapters::db::coaching_repo::fetch_proposal_tx;
 use crate::adapters::db::strategy_repo::{VersionInsert, insert_version_row, version_hash};
+use crate::adapters::db::walk_forward_run_repo::insert_walk_forward_in_tx;
 use crate::adapters::ids::UuidIdSource;
-use crate::domain::backtest::BacktestRunId;
+use crate::domain::backtest::{BacktestRunId, WalkForwardRunDraft, WalkForwardRunId};
 use crate::domain::strategy::{CreatedBy, VersionId};
 use crate::domain::{
     AcceptedCoachOutcome, Clock, CoachAcceptFailure, CoachAcceptanceRepository, CoachingSessionId,
@@ -83,6 +84,28 @@ impl<C: Clock, I: IdSource> SqliteCoachAcceptanceRepo<C, I> {
             DataError::Db(format!("clock.now_ms() {now_ms} is out of DateTime range"))
         })?;
         Ok(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
+    }
+
+    /// The accept's identity, minted from the injected [`IdSource`]/[`Clock`]
+    /// INSIDE the transaction. The walk-forward id is minted only when a
+    /// gate-passing draft came through the gate (D2): no draft, no id, no
+    /// pointer. Every fold's `backtest_run` id is minted from the same source in
+    /// the same act (F9) — a fold run IS an ordinary run, and it would otherwise
+    /// be the one row in this transaction named by something other than the
+    /// injected source.
+    fn mint_acceptance(
+        &self,
+        draft: Option<&WalkForwardRunDraft>,
+    ) -> Result<MintedAcceptance, DataError> {
+        Ok(MintedAcceptance {
+            child_id: self.ids.next_id(),
+            run_id: self.ids.next_id(),
+            walk_forward_run_id: draft.map(|_| self.ids.next_id()),
+            fold_run_ids: draft.map_or_else(Vec::new, |draft| {
+                draft.folds.iter().map(|_| self.ids.next_id()).collect()
+            }),
+            created_at: self.now_rfc3339()?,
+        })
     }
 }
 
@@ -160,31 +183,13 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
         Ok(proposal)
     }
 
-    // The line count is intrinsic: this is ONE transaction that has to check four
-    // preconditions, mint three values, write four kinds of row and settle a
-    // proposal, and splitting it would mean handing the open transaction across a
-    // function boundary — which is exactly how the atomicity guarantee gets lost.
-    // (`save_run` carries the same allow, for the same reason.)
-    #[allow(clippy::too_many_lines)]
     async fn commit_acceptance(
         &self,
         acceptance: PreparedCoachAcceptance,
     ) -> Result<AcceptedCoachOutcome, DataError> {
         let id = acceptance.session_id.as_str().to_owned();
         let prepared = &acceptance.prepared_run;
-
-        // Path-safety of the two data-version tags is settled BEFORE the
-        // transaction opens, exactly as `save_run` does it: an unsafe tag must
-        // persist nothing at all rather than abort a partly-built write.
-        check_inputs_path_safe(&prepared.inputs)?;
-
-        // Serialize the child's columns before taking the lock. Nothing here can
-        // fail for a reason the transaction should be open for.
-        let child_dsl_json = serde_json::to_string(&acceptance.child_dsl)
-            .map_err(|e| DataError::Db(e.to_string()))?;
-        let schema_version_str = SchemaVersion::CURRENT.to_string();
-        let created_by_text = serde_json::to_string(&CreatedBy::CoachLlm)
-            .map_err(|e| DataError::Db(e.to_string()))?;
+        let serialized = preflight(&acceptance)?;
 
         let mut tx = self
             .pool
@@ -249,102 +254,270 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             // landed — the session id IS the accept idempotency key, so that must
             // succeed and insert nothing — or the proposal is settled some other
             // way, which is not something an accept may undo.
-            return match &proposal.disposition {
-                Disposition::Accepted {
-                    child_version_id,
-                    accepted_run_id,
-                } => Ok(AcceptedCoachOutcome {
-                    child_version_id: child_version_id.clone(),
-                    accepted_run_id: accepted_run_id.clone(),
-                }),
-                other => Err(DataError::Db(format!(
-                    "coaching session `{id}`: the proposal is `{}` and cannot be accepted",
-                    other.kind()
-                ))),
-            };
+            return replay_acceptance(&mut tx, &id, &proposal).await;
+        }
+
+        // THE PARENT'S CERTIFICATION POINTER MUST STILL BE THE ONE THE GATE READ
+        // — the second optimistic lock, checked HERE: on the OPEN path only (R7).
+        //
+        // The gate walked the candidate forward on the parameters of the
+        // walk-forward run this pointer named when the parent was loaded — all
+        // of it outside this transaction. A `save_walk_forward_run` landing in
+        // that window moves `latest_walk_forward_run_id`, and committing then
+        // certifies the child from fold parameters that are no longer the
+        // parent's current ones, with every constraint still passing.
+        //
+        // It sits AFTER the replay branch, not before it. The mutation guard
+        // above keeps its place ahead of that branch (PR #128 H2): a settled
+        // proposal carrying a DIFFERENT mutation must not be answered with
+        // someone else's ids. But a settled accept writes NOTHING — its child is
+        // committed and certified by its own run — so a later walk-forward moving
+        // the PARENT's pointer is not a stale-parameter hazard for it: refusing
+        // there turns the documented idempotent retry (a delayed concurrent
+        // accept, a direct repository retry) into an error over a commit that can
+        // no longer happen. Only a flow that can still write needs a current
+        // pointer.
+        let current_pointer = sqlx::query!(
+            r#"SELECT v.latest_walk_forward_run_id AS "pointer?: String"
+               FROM coaching_sessions s
+               JOIN strategy_version v ON v.id = s.strategy_version_id
+               WHERE s.id = ?1"#,
+            id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?
+        .and_then(|row| row.pointer);
+        if current_pointer.as_deref()
+            != acceptance
+                .expected_certification_pointer
+                .as_ref()
+                .map(WalkForwardRunId::as_str)
+        {
+            return Err(DataError::Db(format!(
+                "coaching session `{id}`: the parent's certification pointer moved while this \
+                 accept was being computed, so the child would be certified from stale fold \
+                 parameters; re-run the accept against the current state"
+            )));
         }
 
         let session = self.coached_session(&mut tx, &id).await?;
 
-        // Mint identity INSIDE the transaction, from the injected sources.
-        let child_id = self.ids.next_id();
-        let run_id = self.ids.next_id();
-        let created_at = self.now_rfc3339()?;
-        let llm_ids_json = serde_json::to_string(&vec![session.llm_call_id.clone()])
-            .map_err(|e| DataError::Db(e.to_string()))?;
-        let hash = version_hash(
-            &session.strategy_id,
-            Some(session.parent_version_id.as_str()),
-            &schema_version_str,
-            &child_dsl_json,
-        );
+        // Mint identity INSIDE the transaction, from the injected sources (see
+        // `mint_acceptance`).
+        let minted = self.mint_acceptance(acceptance.walk_forward.as_ref())?;
 
-        // The child is the `apply()` output, so `dsl` and `dsl_original` are the
-        // same bytes: it was authored at the current schema and has never been
-        // through a migration. Storing a different `dsl_original` would claim an
-        // authoring history the child does not have.
-        insert_version_row(
-            &mut tx,
-            &VersionInsert {
-                id: &child_id,
-                strategy_id: &session.strategy_id,
-                parent_version_id: Some(&session.parent_version_id),
-                dsl_schema_version: &schema_version_str,
-                dsl: &child_dsl_json,
-                dsl_original: &child_dsl_json,
-                version_hash: &hash,
-                created_by: &created_by_text,
-                creating_llm_call_ids: &llm_ids_json,
-                created_at: &created_at,
-            },
-        )
-        .await?;
+        insert_child_version(&mut tx, &session, &minted, &serialized).await?;
 
         // The run is written against the MINTED child, and the trades against the
         // MINTED run — the two links `0008`'s lineage trigger then re-checks from
         // the other side.
         insert_run_row(
             &mut tx,
-            &run_id,
-            &child_id,
-            &created_at,
+            &minted.run_id,
+            &minted.child_id,
+            &minted.created_at,
             &prepared.inputs,
             &prepared.result,
             &prepared.summary,
             prepared.starting_equity,
+            None,
         )
         .await?;
-        insert_trade_rows(&mut tx, &run_id, &prepared.result.trades).await?;
+        insert_trade_rows(&mut tx, &minted.run_id, &prepared.result.trades).await?;
 
-        // Settle the proposal last: the links it names now exist, so the trigger
-        // that proves lineage has something true to find.
-        let settled = sqlx::query!(
-            "UPDATE coaching_proposals \
-             SET disposition = 'accepted', child_version_id = ?1, accepted_run_id = ?2 \
-             WHERE session_id = ?3 AND disposition IN ('proposed', 'modified')",
-            child_id,
-            run_id,
-            id,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?
-        .rows_affected();
-        if settled != 1 {
-            return Err(DataError::Db(format!(
-                "coaching session `{id}`: the proposal stopped being open mid-accept"
-            )));
+        // The certification run persists in the SAME transaction and moves the
+        // child's `latest_walk_forward_run_id` pointer — the child is born
+        // certified exactly when its gate-passing draft lands.
+        if let (Some(draft), Some(wf_id)) = (
+            &acceptance.walk_forward,
+            minted.walk_forward_run_id.as_deref(),
+        ) {
+            insert_walk_forward_in_tx(
+                &mut tx,
+                &minted.child_id,
+                draft,
+                wf_id,
+                &minted.fold_run_ids,
+                &minted.created_at,
+            )
+            .await?;
         }
+
+        settle_proposal_tx(&mut tx, &id, &minted.child_id, &minted.run_id).await?;
 
         tx.commit()
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
 
         Ok(AcceptedCoachOutcome {
-            child_version_id: VersionId::new(child_id),
-            accepted_run_id: BacktestRunId::new(run_id),
+            child_version_id: VersionId::new(minted.child_id),
+            accepted_run_id: BacktestRunId::new(minted.run_id),
+            walk_forward_run_id: minted.walk_forward_run_id.map(WalkForwardRunId::new),
         })
     }
+}
+
+/// Everything `commit_acceptance` settles BEFORE the transaction opens:
+/// path-safety on every persisted data-version tag (the prepared run's and —
+/// exactly as `save_walk_forward_run` does it — every certification fold's)
+/// plus the child's serialized columns. None of it can fail for a reason a
+/// write lock should be held for.
+fn preflight(acceptance: &PreparedCoachAcceptance) -> Result<SerializedChild, DataError> {
+    check_inputs_path_safe(&acceptance.prepared_run.inputs)?;
+    if let Some(draft) = &acceptance.walk_forward {
+        for fold in &draft.folds {
+            check_inputs_path_safe(&fold.inputs)?;
+        }
+    }
+    Ok(SerializedChild {
+        child_dsl_json: serde_json::to_string(&acceptance.child_dsl)
+            .map_err(|e| DataError::Db(e.to_string()))?,
+        schema_version: SchemaVersion::CURRENT.to_string(),
+        created_by: serde_json::to_string(&CreatedBy::CoachLlm)
+            .map_err(|e| DataError::Db(e.to_string()))?,
+    })
+}
+
+/// The child row's serialized columns — computed before the transaction opens
+/// because none of them can fail for a reason a write lock should be held for.
+struct SerializedChild {
+    /// The candidate DSL as JSON (`dsl` and `dsl_original` are the same bytes —
+    /// a coach-minted child has no authoring history to claim).
+    child_dsl_json: String,
+    /// `SchemaVersion::CURRENT` rendered for the `dsl_schema_version` column.
+    schema_version: String,
+    /// `CreatedBy::CoachLlm` serialized for the `created_by` column.
+    created_by: String,
+}
+
+/// Everything `commit_acceptance` mints inside the transaction, from the
+/// injected [`IdSource`]/[`Clock`].
+struct MintedAcceptance {
+    /// The child `strategy_version` id.
+    child_id: String,
+    /// The accepted re-backtest run id.
+    run_id: String,
+    /// The certification run's id — `Some` only when the accept carries a
+    /// gate-passing draft to persist.
+    walk_forward_run_id: Option<String>,
+    /// One id per certification fold, minted from the same source and in the
+    /// same act (F9): the draft's folds are `backtest_run` rows like any other,
+    /// and every other id in this transaction comes from the injected
+    /// [`IdSource`] — a fold run minted elsewhere would be the one exception.
+    /// Empty when the accept carries no draft.
+    fold_run_ids: Vec<String>,
+    /// The one timestamp every row shares.
+    created_at: String,
+}
+
+/// The already-committed accept's answer, read on the same transaction.
+///
+/// The outcome names the child's CURRENT certification pointer (D5), not the
+/// run the original accept persisted: a later walk-forward may have advanced
+/// `latest_walk_forward_run_id`, and a replay must answer what is true now.
+async fn replay_acceptance(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    proposal: &Proposal,
+) -> Result<AcceptedCoachOutcome, DataError> {
+    match &proposal.disposition {
+        Disposition::Accepted {
+            child_version_id,
+            accepted_run_id,
+        } => {
+            let cid = child_version_id.as_str();
+            let row = sqlx::query!(
+                r#"SELECT latest_walk_forward_run_id AS "p?: String"
+                   FROM strategy_version WHERE id = ?1"#,
+                cid,
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?
+            .ok_or_else(|| {
+                DataError::Db(format!(
+                    "the accepted child version `{cid}` no longer exists"
+                ))
+            })?;
+            Ok(AcceptedCoachOutcome {
+                child_version_id: child_version_id.clone(),
+                accepted_run_id: accepted_run_id.clone(),
+                walk_forward_run_id: row.p.map(WalkForwardRunId::new),
+            })
+        }
+        other => Err(DataError::Db(format!(
+            "coaching session `{session_id}`: the proposal is `{}` and cannot be accepted",
+            other.kind()
+        ))),
+    }
+}
+
+/// The child `strategy_version` row: hash + creating-call provenance derived
+/// from the session row, then the shared `insert_version_row` mapping.
+async fn insert_child_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session: &CoachedSession,
+    minted: &MintedAcceptance,
+    serialized: &SerializedChild,
+) -> Result<(), DataError> {
+    let llm_ids_json = serde_json::to_string(&vec![session.llm_call_id.clone()])
+        .map_err(|e| DataError::Db(e.to_string()))?;
+    let hash = version_hash(
+        &session.strategy_id,
+        Some(session.parent_version_id.as_str()),
+        &serialized.schema_version,
+        &serialized.child_dsl_json,
+    );
+
+    // The child is the `apply()` output, so `dsl` and `dsl_original` are the
+    // same bytes: it was authored at the current schema and has never been
+    // through a migration. Storing a different `dsl_original` would claim an
+    // authoring history the child does not have.
+    insert_version_row(
+        tx,
+        &VersionInsert {
+            id: &minted.child_id,
+            strategy_id: &session.strategy_id,
+            parent_version_id: Some(&session.parent_version_id),
+            dsl_schema_version: &serialized.schema_version,
+            dsl: &serialized.child_dsl_json,
+            dsl_original: &serialized.child_dsl_json,
+            version_hash: &hash,
+            created_by: &serialized.created_by,
+            creating_llm_call_ids: &llm_ids_json,
+            created_at: &minted.created_at,
+        },
+    )
+    .await
+}
+
+/// Settle the proposal last: the links it names now exist, so `0008`'s lineage
+/// trigger has something true to find.
+async fn settle_proposal_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    child_id: &str,
+    run_id: &str,
+) -> Result<(), DataError> {
+    let settled = sqlx::query!(
+        "UPDATE coaching_proposals \
+         SET disposition = 'accepted', child_version_id = ?1, accepted_run_id = ?2 \
+         WHERE session_id = ?3 AND disposition IN ('proposed', 'modified')",
+        child_id,
+        run_id,
+        session_id,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?
+    .rows_affected();
+    if settled != 1 {
+        return Err(DataError::Db(format!(
+            "coaching session `{session_id}`: the proposal stopped being open mid-accept"
+        )));
+    }
+    Ok(())
 }
 
 impl<C: Clock, I: IdSource> SqliteCoachAcceptanceRepo<C, I> {

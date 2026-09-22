@@ -286,6 +286,7 @@ fn inputs_with_htf() -> BacktestInputs {
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
         window: None,
+        lead_in_from_ms: None,
     }
 }
 
@@ -417,15 +418,21 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     // `migrate.rs`'s `a_later_lower_numbered_migration_applies_through_the_startup_path`,
     // which withholds `0008` precisely so it can still state it.
     // r2.s1.w1: `0009` rides along too, and G1's `0010` as well, moving the
-    // maximum to 10; r2.s2.w2's `0011` rides along likewise, to 11.
+    // maximum to 10; r2.s2.w2's `0011` rides along likewise, to 11;
+    // r2.s3.w2's `0012` (window lead-in) moves it to 12; r2.s3.w3's `0013`
+    // (walk-forward run kind) moves it to 13; and r2.s3.w4's `0014`
+    // (certification pointer) moves it to 14.
     assert!(applied.contains(&8), "0008 rides along: {applied:?}");
     assert!(applied.contains(&9), "0009 rides along: {applied:?}");
     assert!(applied.contains(&10), "0010 rides along: {applied:?}");
     assert!(applied.contains(&11), "0011 rides along: {applied:?}");
+    assert!(applied.contains(&12), "0012 rides along: {applied:?}");
+    assert!(applied.contains(&13), "0013 rides along: {applied:?}");
+    assert!(applied.contains(&14), "0014 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(11),
-        "0006 is recorded at its own version, below the maximum 0011 sets"
+        Some(14),
+        "0006 is recorded at its own version, below the maximum 0014 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;
@@ -1156,8 +1163,11 @@ async fn a_run_saved_with_a_window_round_trips_its_bounds() {
     let result = empty_result();
     let version = VersionId::new("ver-1");
     let window = CandleWindow::new(1_700_000_000_000, 1_700_086_400_000).expect("a real window");
+    // r2.s3.w2: a windowed run's lead-in start rides the same provenance row —
+    // a value before `from`, exactly as a snapshot-start lead-in would record.
     let inputs = BacktestInputs {
         window: Some(window.clone()),
+        lead_in_from_ms: Some(1_699_999_000_000),
         ..inputs_with_htf()
     };
 
@@ -1182,18 +1192,29 @@ async fn a_run_saved_with_a_window_round_trips_its_bounds() {
         Some(window),
         "the window round-trips bound-for-bound"
     );
+    assert_eq!(
+        got.lead_in_from_ms,
+        Some(1_699_999_000_000),
+        "the lead-in start round-trips beside it"
+    );
 
-    // The columns hold UTC epoch milliseconds — two INTEGERs, not a blob.
-    let bounds: (Option<i64>, Option<i64>) =
-        sqlx::query_as("SELECT window_from_ms, window_to_ms FROM backtest_run WHERE id = ?1")
-            .bind(id.as_str())
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    // The columns hold UTC epoch milliseconds — three INTEGERs, not a blob.
+    let bounds: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT window_from_ms, window_to_ms, window_lead_in_from_ms FROM backtest_run \
+         WHERE id = ?1",
+    )
+    .bind(id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     assert_eq!(
         bounds,
-        (Some(1_700_000_000_000_i64), Some(1_700_086_400_000_i64)),
-        "the bounds persist as UTC epoch-ms integers"
+        (
+            Some(1_700_000_000_000_i64),
+            Some(1_700_086_400_000_i64),
+            Some(1_699_999_000_000_i64)
+        ),
+        "the bounds and the lead-in persist as UTC epoch-ms integers"
     );
 }
 

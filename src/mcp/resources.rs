@@ -34,7 +34,7 @@ const CONVENTIONS: &[(&str, &str)] = &[
     ("entry", "effective entry is entry AND all filters"),
     (
         "windows",
-        "a windowed backtest slices the series to `[from, to)` and indicators warm up inside the window",
+        "a windowed backtest warms indicators on the full snapshot history before `from` and counts only `[from, to)` — the run's `inputs.lead_in_from` records where the warm-up began",
     ),
     (
         "series_htf",
@@ -101,7 +101,7 @@ mod tests {
             .expect("conventions.windows is a string");
         assert_eq!(
             window,
-            "a windowed backtest slices the series to `[from, to)` and indicators warm up inside the window"
+            "a windowed backtest warms indicators on the full snapshot history before `from` and counts only `[from, to)` — the run's `inputs.lead_in_from` records where the warm-up began"
         );
         // r2.s2.w2 (b13): the schema-1.1.0 semantics the grammar cannot express.
         let htf = conventions

@@ -82,9 +82,14 @@ pub struct SnapshotPins {
 ///
 /// r2.s1.w3 adds two optional refinements: `snapshots` pins the exact
 /// `data_version`s to load instead of `HEAD` (the resolver's output), and
-/// `window` slices both series to `[from_ms, to_ms)` on `open_time` at load
-/// time — indicators warm up inside the window and the window is recorded on
-/// the run's `inputs`.
+/// `window` names the counted slice `[from_ms, to_ms)` of the snapshots.
+///
+/// r2.s3.w2 supersedes the r2.s1.w3 ruling-1 slice: both series load from the
+/// snapshot's first candle through `to_ms`, so both indicator engines step
+/// every bar before `from_ms` and arrive at the counted window warm —
+/// entries, fills, exits, funding, equity and `PnL` count only on `[from, to)`.
+/// The window is recorded on the run's `inputs` alongside the lead-in start
+/// (`lead_in_from_ms` — the first candle the engine consumed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacktestRequest {
     /// The immutable strategy version to run.
@@ -99,8 +104,10 @@ pub struct BacktestRequest {
     pub config: BacktestConfig,
     /// Exact `data_version`s to load instead of `HEAD`; `None` loads `HEAD`.
     pub snapshots: Option<SnapshotPins>,
-    /// The half-open candle window `[from_ms, to_ms)` to slice both series to;
-    /// `None` runs the whole snapshot.
+    /// The half-open candle window `[from_ms, to_ms)` whose bars COUNT;
+    /// `None` runs the whole snapshot. The series still load from the
+    /// snapshot start — the lead-in warms the engines, it never counts
+    /// (r2.s3.w2).
     pub window: Option<CandleWindow>,
 }
 
@@ -568,8 +575,20 @@ pub(crate) fn prepare_backtest(
         taker_fee_bps: inputs.taker_fee_bps,
         slippage_bps: inputs.slippage_bps,
     };
-    let result = run_backtest(&compiled, primary, htf, &config, filters, series_end)
-        .map_err(PrepareError::Engine)?;
+    // r2.s3.w2: the recorded `window` IS the counted bound — under lead-in the
+    // series start earlier, so the engine hears where counting begins, not a
+    // slice it cannot see. `None` counts every bar.
+    let count_from_ms = inputs.window.as_ref().map(|w| w.from_ms);
+    let result = run_backtest(
+        &compiled,
+        primary,
+        htf,
+        &config,
+        filters,
+        series_end,
+        count_from_ms,
+    )
+    .map_err(PrepareError::Engine)?;
     let summary = result.summary.clone();
     Ok(PreparedBacktest {
         inputs,
@@ -716,7 +735,9 @@ where
 }
 
 /// Steps 7-8: reload the saved run, its trades and its exact snapshots.
-async fn read_back<C, R>(
+/// `pub(crate)` so r2.s3.w5's `get_backtest_run` core reads one persisted run
+/// back through this same pipeline (a fold opens as an ordinary run).
+pub(crate) async fn read_back<C, R>(
     candles: C,
     runs: &R,
     run_id: BacktestRunId,
@@ -760,13 +781,15 @@ where
     )
     .await
     .map_err(|e| saved(ReadBackStage::PrimarySnapshot, ReadBackFailure::Data(e)))?;
-    // ruling 1 binds the read-back too: the engine consumed the WINDOWED slice
-    // of the snapshot the persisted inputs name, so the outcome answers from
-    // that same slice — `equity_curve()` opens at the window's first candle
-    // and no consumer sees candles the run did not. Slicing BEFORE the empty
-    // check keeps the refusal meaningful for a windowed run: a snapshot that
-    // no longer covers the window the run recorded is missing the run's data
-    // the same way an empty one is.
+    // The window binds the read-back too: the engine consumed `[start, to)`
+    // (lead-in included, r2.s3.w2), but the run's COUNTED span is `[from, to)`
+    // — so the outcome answers from exactly the bars that produced measured
+    // results, `equity_curve()` opens at the window's first candle (the same
+    // first counted bar the engine marked as `run_start_time_ms`), and the
+    // lead-in stays provenance (`lead_in_from_ms`) rather than outcome data.
+    // Slicing BEFORE the empty check keeps the refusal meaningful: a snapshot
+    // that no longer covers the window the run recorded is missing the run's
+    // data the same way an empty one is.
     if let Some(w) = &inputs.window {
         primary = primary.windowed(w);
     }
@@ -878,55 +901,16 @@ where
             )?),
             None => None,
         };
-        // ruling 1 (r2.s1.w3): slice BOTH series to `[from_ms, to_ms)` AFTER the
-        // whole-snapshot gap check. The engine only ever sees the window's
-        // candles, so indicators warm up inside the window and nothing forces a
-        // flat at `to`. An empty PRIMARY slice is a refusal — an empty HTF
-        // slice is legal (every aligned HTF bar is simply `None`).
-        let mut series_end = SeriesEnd::SnapshotEnd;
-        if let Some(w) = &window {
-            // The snapshot's real last candle, remembered BEFORE the slice: a
-            // window whose `to` still covers it ends at genuine end-of-data, so
-            // the engine's force-close stays correct (and an unwindowed run over
-            // the same extent agrees). A `to` cutting earlier makes the last bar
-            // a window edge — no flat is forced there (r2.s1 G1).
-            let snapshot_last_open = primary.candles.last().map(|c| c.open_time);
-            primary = primary.windowed(w);
-            if primary.candles.is_empty() {
-                return Err(BacktestAppError::WindowEmpty {
-                    pair: pair.clone(),
-                    timeframe: primary_tf,
-                    from_ms: w.from_ms,
-                    to_ms: w.to_ms,
-                });
-            }
-            if snapshot_last_open
-                .is_some_and(|last| primary.candles.last().is_some_and(|c| c.open_time < last))
-            {
-                series_end = SeriesEnd::WindowEdge;
-            }
-            htf = htf.map(|series| series.windowed(w));
-        }
-        let filters: SymbolFilters = exchange.symbol_filters(&pair)?;
-        // Provenance from the series the engine is ABOUT to consume, so the
-        // prepared run and the row it becomes name the same snapshots.
-        let inputs = inputs_from_run(&primary, htf.as_ref(), &config, window);
-        let prepared = prepare_backtest(
+        let prepared = prepare_over_loaded_series(
             &validated,
-            inputs,
-            &primary,
-            htf.as_ref(),
-            &filters,
-            config.starting_equity,
-            series_end,
-        )
-        .map_err(|e| match e {
-            PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
-            PrepareError::HtfRequired => BacktestAppError::HtfRequired {
-                field: "inputs.htf",
-            },
-            PrepareError::Engine(source) => BacktestAppError::Engine(source),
-        })?;
+            &exchange,
+            &pair,
+            primary_tf,
+            &config,
+            window,
+            &mut primary,
+            &mut htf,
+        )?;
         Ok(EngineOutput { prepared })
     })
     .await;
@@ -939,6 +923,62 @@ where
     }
 }
 
+/// The post-load half of `run_engine_offthread`'s closure (r2.s3.w3 — a13 /
+/// #201), extracted unchanged so `run_walk_forward` runs the same sequence once
+/// per fold inside its single blocking task: the lead-in slice, the
+/// `series_end` resolution, the filters lookup, the provenance `inputs`, and
+/// `prepare_backtest`. `primary`/`htf` arrive whole-snapshot and leave sliced
+/// to `[snapshot_start, window.to)` — the caller that wants the intact series
+/// clones it first (walk-forward does, once per fold). Behaviour-preserving:
+/// every existing windowed and unwindowed outcome is byte-identical (AC-4).
+///
+/// r2.s3.w2 (supersedes the r2.s1.w3 ruling-1 slice): both series keep their
+/// lead-in — sliced to `[snapshot_start, to_ms)`, not `[from_ms, to_ms)` —
+/// AFTER the whole-snapshot gap check. The engine steps every candle before
+/// `from` so both engines arrive at the counted window warm, and nothing
+/// forces a flat at `to`. An empty COUNTED slice is still `WindowEmpty`; an
+/// empty HTF slice stays legal (every aligned HTF bar is simply `None`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_over_loaded_series<E>(
+    validated: &ValidatedDsl,
+    exchange: &E,
+    pair: &Pair,
+    primary_tf: Timeframe,
+    config: &BacktestConfig,
+    window: Option<CandleWindow>,
+    primary: &mut CandleSeries,
+    htf: &mut Option<CandleSeries>,
+) -> Result<PreparedBacktest, BacktestAppError>
+where
+    E: ExchangeAdapter,
+{
+    let lead_in = apply_lead_in_window(window.as_ref(), primary, htf, pair, primary_tf)?;
+    let series_end = lead_in
+        .as_ref()
+        .map_or(SeriesEnd::SnapshotEnd, |lead_in| lead_in.series_end);
+    let lead_in_from_ms = lead_in.map(|lead_in| lead_in.lead_in_from_ms);
+    let filters: SymbolFilters = exchange.symbol_filters(pair)?;
+    // Provenance from the series the engine is ABOUT to consume, so the
+    // prepared run and the row it becomes name the same snapshots.
+    let inputs = inputs_from_run(primary, htf.as_ref(), config, window, lead_in_from_ms);
+    prepare_backtest(
+        validated,
+        inputs,
+        primary,
+        htf.as_ref(),
+        &filters,
+        config.starting_equity,
+        series_end,
+    )
+    .map_err(|e| match e {
+        PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
+        PrepareError::HtfRequired => BacktestAppError::HtfRequired {
+            field: "inputs.htf",
+        },
+        PrepareError::Engine(source) => BacktestAppError::Engine(source),
+    })
+}
+
 /// Load one snapshot — the pinned `data_version` when `pin` names one, else
 /// `HEAD` — and refuse it if the engine cannot interpret it.
 ///
@@ -947,7 +987,7 @@ where
 /// exact snapshots that run recorded, never whatever `HEAD` points at now. Gap
 /// validation stays on the WHOLE snapshot either way (unchanged; `r2.s3` owns
 /// fold-aware handling) — the window slice happens after this function returns.
-fn load_series<C>(
+pub(crate) fn load_series<C>(
     candles: &C,
     pair: &Pair,
     timeframe: Timeframe,
@@ -995,14 +1035,17 @@ where
 
 /// Provenance from the series the engine consumed and the config it ran with — no
 /// second `HEAD` read, which would record what is current rather than what ran.
-/// The `window` is the caller's request, recorded verbatim: the sliced series
+/// The `window` is the caller's request, recorded verbatim: the lead-in slice
 /// still names the whole snapshot's `data_version`, so the window columns are
-/// what distinguish this run's coverage from an unwindowed one.
+/// what distinguish this run's coverage from an unwindowed one — and
+/// `lead_in_from_ms` (r2.s3.w2) names the first candle the engine consumed,
+/// the lead-in's lower edge.
 fn inputs_from_run(
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
     config: &BacktestConfig,
     window: Option<CandleWindow>,
+    lead_in_from_ms: Option<i64>,
 ) -> BacktestInputs {
     BacktestInputs {
         pair: primary.pair.clone(),
@@ -1018,7 +1061,98 @@ fn inputs_from_run(
         slippage_bps: config.slippage_bps,
         funding: FundingConfig::SnapshotRates,
         window,
+        lead_in_from_ms,
     }
+}
+
+/// What a windowed run's lead-in slice leaves behind (r2.s3.w2): the persisted
+/// provenance and the `SeriesEnd` the engine must hear.
+pub(crate) struct LeadInWindow {
+    /// The `open_time` of the first candle the engine consumed — the snapshot's
+    /// first candle under full-history lead-in, equal to `window.from_ms` when
+    /// nothing precedes it. Persisted as `backtest_run.window_lead_in_from_ms`.
+    pub lead_in_from_ms: i64,
+    /// [`SeriesEnd::SnapshotEnd`] when the window's `to` still covers the
+    /// snapshot's real last bar, [`SeriesEnd::WindowEdge`] when it cuts earlier.
+    pub series_end: SeriesEnd,
+}
+
+/// Apply a counted window under full-history lead-in semantics (r2.s3.w2 —
+/// supersedes the r2.s1.w3 ruling-1 slice, where both series were cut to
+/// `[from_ms, to_ms)` and every indicator warmed from scratch inside the
+/// window).
+///
+/// Both series are truncated to `[snapshot_start, to_ms)` — every candle
+/// before `from_ms` stays in the feed so the indicator engines step through
+/// it and arrive at `from` warm — and the caller hands the engine
+/// `count_from_ms = Some(window.from_ms)`, the bound at which counting starts.
+/// A window holding no counted primary candle refuses [`BacktestAppError::
+/// WindowEmpty`] — an empty window is a bad argument, not a zero-trade run.
+///
+/// Returns `None` for `window: None` (the unwindowed shape), else the
+/// [`LeadInWindow`] provenance.
+pub(crate) fn apply_lead_in_window(
+    window: Option<&CandleWindow>,
+    primary: &mut CandleSeries,
+    htf: &mut Option<CandleSeries>,
+    pair: &Pair,
+    timeframe: Timeframe,
+) -> Result<Option<LeadInWindow>, BacktestAppError> {
+    let Some(w) = window else { return Ok(None) };
+    // The snapshot's real last candle, remembered BEFORE the slice: a window
+    // whose `to` still covers it ends at genuine end-of-data, so the engine's
+    // force-close stays correct (and an unwindowed run over the same extent
+    // agrees). A `to` cutting earlier makes the last bar a window edge — no
+    // flat is forced there (r2.s1 G1, unchanged by lead-in).
+    let snapshot_last_open = primary.candles.last().map(|c| c.open_time);
+    // A window holding no COUNTED primary candle refuses BEFORE the slice —
+    // including a `to` at-or-before the snapshot's first candle, which would
+    // otherwise leave an all-lead-in series that counts nothing.
+    if !primary
+        .candles
+        .iter()
+        .any(|c| c.open_time >= w.from_ms && c.open_time < w.to_ms)
+    {
+        return Err(BacktestAppError::WindowEmpty {
+            pair: pair.clone(),
+            timeframe,
+            from_ms: w.from_ms,
+            to_ms: w.to_ms,
+        });
+    }
+    // `[snapshot_start, to)`: an unbounded-below window over the same
+    // `open_time` rule keeps every candle strictly before `to` — the lead-in
+    // plus the counted slice. A struct literal because `from < to` is already
+    // proven (the counted check found a candle below `to_ms`).
+    let lead_in_slice = CandleWindow {
+        from_ms: i64::MIN,
+        to_ms: w.to_ms,
+    };
+    *primary = primary.windowed(&lead_in_slice);
+    *htf = htf.take().map(|series| series.windowed(&lead_in_slice));
+    let series_end = match snapshot_last_open {
+        Some(last) if primary.candles.last().is_some_and(|c| c.open_time < last) => {
+            SeriesEnd::WindowEdge
+        }
+        _ => SeriesEnd::SnapshotEnd,
+    };
+    // The first candle the engine consumes IS the lead-in start. An empty
+    // consumed slice is definitionally a `WindowEmpty` — the counted check
+    // above already refuses it, so this arm is unreachable in practice.
+    let lead_in_from_ms = primary
+        .candles
+        .first()
+        .ok_or_else(|| BacktestAppError::WindowEmpty {
+            pair: pair.clone(),
+            timeframe,
+            from_ms: w.from_ms,
+            to_ms: w.to_ms,
+        })?
+        .open_time;
+    Ok(Some(LeadInWindow {
+        lead_in_from_ms,
+        series_end,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,7 +1166,10 @@ fn inputs_from_run(
 /// Precedence: the version's **parent's** latest persisted run → the version's
 /// own latest persisted run → the application defaults (`BTCUSDT`, `M15`, `H4`,
 /// `BacktestConfig::default()`, `HEAD`). A run whose `inputs` is `None` (a
-/// pre-0006 row) is skipped, never an error. From a run the resolver takes the
+/// pre-0006 row) is skipped, never an error, and a walk-forward FOLD is never
+/// consulted (N1): a fold's pins describe one sub-window of a walk-forward, not
+/// a run of this version the caller would inherit comparably. From a run the
+/// resolver takes the
 /// pair, the timeframes, the taker/slippage bps and [`SnapshotPins`] naming the
 /// run's exact `data_version`s — an agent run is then comparable with the run
 /// it iterates on. `window` is NEVER inherited: it is always the caller's.
@@ -1118,7 +1255,8 @@ fn version_needs_htf(version: &StrategyVersion) -> bool {
 
 /// The version's latest persisted run's `inputs`, when it has a usable row.
 /// `inputs: None` (a pre-0006 row) reads the same as no run at all — skipped,
-/// never an error.
+/// never an error. Fold rows are excluded upstream by the read itself (N1), so
+/// this inherits from the version's most recent ordinary run.
 async fn latest_run_inputs<R>(
     runs: &R,
     version_id: &VersionId,
@@ -1484,6 +1622,8 @@ mod tests {
             created_by: CreatedBy::Human,
             creating_llm_call_ids: vec![],
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            latest_walk_forward_run_id: None,
+            certified: false,
         }
     }
 
@@ -1542,6 +1682,7 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             open_position: None,
+            walk_forward: None,
         }
     }
 
@@ -1568,6 +1709,7 @@ mod tests {
             slippage_bps: Decimal::new(slippage, 0),
             funding: FundingConfig::SnapshotRates,
             window: None,
+            lead_in_from_ms: None,
         }
     }
 

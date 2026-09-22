@@ -31,7 +31,8 @@ use std::future::Future;
 
 use crate::domain::backtest::SummaryStats;
 use crate::domain::backtest::{
-    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade,
+    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade, WalkForwardRun,
+    WalkForwardRunDraft, WalkForwardRunId,
 };
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{
@@ -478,8 +479,18 @@ pub trait BacktestRunRepository {
     ) -> impl Future<Output = Result<Option<PersistedRun>, DataError>> + Send;
 
     /// The most-recent run for a version (`ORDER BY created_at DESC, id DESC LIMIT
-    /// 1`, #40 stable) — the FR-7 prior-run lookup. Reuses `get_run`'s
-    /// fetch-trades-and-validate path (so it is fail-closed + tamper-checked).
+    /// 1` over its NON-FOLD runs, #40 stable) — the FR-7 prior-run lookup, and the
+    /// run the Library KPIs, the parent expectation delta and default resolution
+    /// read. Reuses `get_run`'s fetch-trades-and-validate path (so it is
+    /// fail-closed + tamper-checked).
+    ///
+    /// **A walk-forward fold is never this run (N1).** The K folds of one
+    /// walk-forward are `backtest_run` rows of the version sharing ONE
+    /// `created_at`, so the `id DESC` tie-break would pick an arbitrary fold and
+    /// report a sub-window measurement as the version's latest result — its KPIs,
+    /// its parent delta, and the snapshot/cost pins a later run inherits. Rows
+    /// carrying `walk_forward_run_id` are therefore excluded: the answer is the
+    /// version's most recent ordinary run, or `None` when it has none.
     ///
     /// # Errors
     ///
@@ -516,6 +527,53 @@ pub trait BacktestRunRepository {
         &self,
         id: &BacktestRunId,
     ) -> impl Future<Output = Result<Vec<Trade>, DataError>> + Send;
+}
+
+/// The walk-forward run port (r2.s3.w3 — `rolling-oos/v1` + `wf-v1`, ADR-0025).
+///
+/// Implemented by the same `SqliteBacktestRunRepo` adapter: a walk-forward run
+/// is a parent row whose K folds are **ordinary persisted windowed
+/// `backtest_run` rows** — they stay visible through
+/// [`BacktestRunRepository::list_runs_for_version`] /
+/// [`get_run`](BacktestRunRepository::get_run) (L8) and carry their membership
+/// ([`PersistedRun::walk_forward`]). This port adds only the parent + fold-row
+/// surface; the run-log surface is unchanged.
+///
+/// **Walk-forward runs are create + read only**, like every run row (the
+/// `0013` `BEFORE UPDATE` / `BEFORE DELETE` triggers enforce it).
+pub trait WalkForwardRunRepository {
+    /// Persist one walk-forward run **in one transaction** (a9): the
+    /// ownership check [`save_run`](BacktestRunRepository::save_run) makes, the
+    /// `walk_forward_run` row, then per fold the `backtest_run` + `trade` rows
+    /// (with `walk_forward_run_id` + `fold_index` set) and the
+    /// `walk_forward_fold` row — any failure rolls everything back; nothing
+    /// partial persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] if the `strategy_version_id` is absent, a fold
+    /// draft violates the schema (a non-windowed run, a duplicated
+    /// `fold_index`), or the store fails.
+    fn save_walk_forward_run(
+        &self,
+        strategy_version_id: &VersionId,
+        draft: &WalkForwardRunDraft,
+    ) -> impl Future<Output = Result<WalkForwardRunId, DataError>> + Send;
+
+    /// Fetch one persisted walk-forward run by id (`Ok(None)` if no such row),
+    /// with its folds ordered by `fold_index`. **Fail-closed** like
+    /// [`get_run`](BacktestRunRepository::get_run): a fold whose `backtest_run`
+    /// is missing or whose columns are corrupt is an `Err`, never a partial
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
+    /// failure.
+    fn get_walk_forward_run(
+        &self,
+        id: &WalkForwardRunId,
+    ) -> impl Future<Output = Result<Option<WalkForwardRun>, DataError>> + Send;
 }
 
 /// `PulseTrader`'s own LLM chat port (VS-1.3.1 work-1.01, FR-23 / FR-24, README
@@ -848,10 +906,14 @@ pub trait CoachAcceptanceRepository {
     ///
     /// Inside that transaction the adapter checks the session is `proposed` and has
     /// exactly one attributable `llm_call_id`; checks the proposal is
-    /// `proposed`/`modified` with no accepted child or run; MINTS the child
-    /// `VersionId`, the [`BacktestRunId`] and `created_at` from its injected
-    /// id/clock sources; and DERIVES the strategy id, the parent version id,
-    /// `CreatedBy::CoachLlm` and the creating call id from the claimed session row.
+    /// `proposed`/`modified` with no accepted child or run and still carries the
+    /// mutation the accept was computed from; re-reads the parent version's
+    /// `latest_walk_forward_run_id` and refuses when it moved since the accept
+    /// loaded the parent (the second optimistic lock — the certification gate
+    /// computed against the run it named); MINTS the child `VersionId`, the
+    /// [`BacktestRunId`] and `created_at` from its injected id/clock sources; and
+    /// DERIVES the strategy id, the parent version id, `CreatedBy::CoachLlm` and
+    /// the creating call id from the claimed session row.
     /// [`PreparedCoachAcceptance`] carries no identity precisely so the caller
     /// cannot supply provenance that disagrees with the session.
     ///
@@ -1207,6 +1269,8 @@ mod repository_tests {
                 created_by: request.created_by,
                 creating_llm_call_ids: request.creating_llm_call_ids,
                 created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                latest_walk_forward_run_id: None,
+                certified: false,
             };
             self.versions
                 .lock()
@@ -1455,6 +1519,9 @@ mod backtest_run_repository_tests {
                 regime_breakdown: result.regime_breakdown,
                 skipped_entries: result.skipped_entries,
                 open_position: result.open_position.clone(),
+                // The fake's `save_run` is the standalone path — it never
+                // persists a run as a walk-forward fold.
+                walk_forward: None,
             };
             self.runs
                 .lock()
@@ -1559,6 +1626,7 @@ mod backtest_run_repository_tests {
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,
             window: None,
+            lead_in_from_ms: None,
         };
         let id = repo
             .save_run(

@@ -33,6 +33,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::adapters::clock::SystemClock;
+use crate::domain::backtest::WalkForwardRunId;
 use crate::domain::strategy::{
     AgentName, AgentSubmission, AgentSubmissionId, CreatedBy, Hypothesis, NewAgentSubmission,
     NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
@@ -464,16 +465,20 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
         let sid = strategy_id.as_str();
         let rows = sqlx::query!(
             r#"SELECT
-                 id                    AS "id!: String",
-                 strategy_id           AS "strategy_id!: String",
-                 parent_version_id     AS "parent_version_id?: String",
-                 dsl_schema_version    AS "dsl_schema_version!: String",
-                 dsl_original          AS "dsl_original!: String",
-                 version_hash          AS "version_hash!: String",
-                 created_by            AS "created_by!: String",
-                 creating_llm_call_ids AS "creating_llm_call_ids!: String",
-                 created_at            AS "created_at!: String"
-               FROM strategy_version WHERE strategy_id = ?1 ORDER BY created_at, id"#,
+                 v.id                    AS "id!: String",
+                 v.strategy_id           AS "strategy_id!: String",
+                 v.parent_version_id     AS "parent_version_id?: String",
+                 v.dsl_schema_version    AS "dsl_schema_version!: String",
+                 v.dsl_original          AS "dsl_original!: String",
+                 v.version_hash          AS "version_hash!: String",
+                 v.created_by            AS "created_by!: String",
+                 v.creating_llm_call_ids AS "creating_llm_call_ids!: String",
+                 v.created_at            AS "created_at!: String",
+                 v.latest_walk_forward_run_id AS "latest_walk_forward_run_id?: String",
+                 w.pass                  AS "certifying_pass?: i64"
+               FROM strategy_version v
+               LEFT JOIN walk_forward_run w ON w.id = v.latest_walk_forward_run_id
+               WHERE v.strategy_id = ?1 ORDER BY v.created_at, v.id"#,
             sid,
         )
         .fetch_all(&self.pool)
@@ -492,6 +497,8 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
                 created_by: r.created_by,
                 creating_llm_call_ids: r.creating_llm_call_ids,
                 created_at: r.created_at,
+                latest_walk_forward_run_id: r.latest_walk_forward_run_id,
+                certifying_pass: r.certifying_pass,
             })?);
         }
         Ok(out)
@@ -746,6 +753,12 @@ struct VersionRow {
     created_by: String,
     creating_llm_call_ids: String,
     created_at: String,
+    /// The `0014` certification pointer — NULL on every version with no
+    /// walk-forward run yet.
+    latest_walk_forward_run_id: Option<String>,
+    /// The named run's `pass`, read through the `LEFT JOIN` — NULL both when
+    /// the pointer is NULL and (impossibly, under the FK) when it dangles.
+    certifying_pass: Option<i64>,
 }
 
 impl<C: Clock> SqliteStrategyRepo<C> {
@@ -805,16 +818,20 @@ impl<C: Clock> SqliteStrategyRepo<C> {
         let id_str = id.as_str();
         let row = sqlx::query!(
             r#"SELECT
-                 id                    AS "id!: String",
-                 strategy_id           AS "strategy_id!: String",
-                 parent_version_id     AS "parent_version_id?: String",
-                 dsl_schema_version    AS "dsl_schema_version!: String",
-                 dsl_original          AS "dsl_original!: String",
-                 version_hash          AS "version_hash!: String",
-                 created_by            AS "created_by!: String",
-                 creating_llm_call_ids AS "creating_llm_call_ids!: String",
-                 created_at            AS "created_at!: String"
-               FROM strategy_version WHERE id = ?1"#,
+                 v.id                    AS "id!: String",
+                 v.strategy_id           AS "strategy_id!: String",
+                 v.parent_version_id     AS "parent_version_id?: String",
+                 v.dsl_schema_version    AS "dsl_schema_version!: String",
+                 v.dsl_original          AS "dsl_original!: String",
+                 v.version_hash          AS "version_hash!: String",
+                 v.created_by            AS "created_by!: String",
+                 v.creating_llm_call_ids AS "creating_llm_call_ids!: String",
+                 v.created_at            AS "created_at!: String",
+                 v.latest_walk_forward_run_id AS "latest_walk_forward_run_id?: String",
+                 w.pass                  AS "certifying_pass?: i64"
+               FROM strategy_version v
+               LEFT JOIN walk_forward_run w ON w.id = v.latest_walk_forward_run_id
+               WHERE v.id = ?1"#,
             id_str,
         )
         .fetch_optional(executor)
@@ -833,6 +850,8 @@ impl<C: Clock> SqliteStrategyRepo<C> {
                 created_by: r.created_by,
                 creating_llm_call_ids: r.creating_llm_call_ids,
                 created_at: r.created_at,
+                latest_walk_forward_run_id: r.latest_walk_forward_run_id,
+                certifying_pass: r.certifying_pass,
             })?)),
         }
     }
@@ -920,6 +939,11 @@ impl<C: Clock> SqliteStrategyRepo<C> {
             created_by: parse_created_by(&row.created_by)?,
             creating_llm_call_ids: parse_json_str_array(&row.creating_llm_call_ids)?,
             created_at: parse_created_at(&row.created_at)?,
+            latest_walk_forward_run_id: row.latest_walk_forward_run_id.map(WalkForwardRunId::new),
+            // Derived, never stored: the joined run's `pass`. No pointer (or an
+            // impossibly dangling one) reads `false` — a version is certified
+            // only by a named, persisted, passing walk-forward run.
+            certified: row.certifying_pass.unwrap_or(0) != 0,
         })
     }
 }

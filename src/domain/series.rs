@@ -112,8 +112,10 @@ impl CandleSeries {
     /// window containing no candle yields an empty `candles` — whether that is
     /// a refusal is the caller's choice (a windowed backtest refuses an empty
     /// primary slice; an empty HTF slice is a legal all-`None` alignment).
-    /// Indicators warm up *inside* the window because the engine only ever sees
-    /// the sliced candles.
+    /// Whether the slice is the engine's whole input or only its counted span
+    /// is likewise the caller's: r2.s3.w2's backtest slices `[snapshot_start,
+    /// to)` so indicators warm on the full lead-in and only `[from, to)`
+    /// counts; `windowed` stays the pure `[from, to)` filter either way.
     #[must_use]
     pub fn windowed(&self, window: &CandleWindow) -> CandleSeries {
         CandleSeries {

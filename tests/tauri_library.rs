@@ -14,12 +14,16 @@
 //! ones this test pinned).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod support;
+
 use pulse::{
     AgentHypothesis, AgentName, BacktestInputs, BacktestResult, BacktestRunRepository, CreatedBy,
-    DataVersion, DesktopState, EngineFingerprint, EquityCurve, FundingConfig, NewAgentSubmission,
-    NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, StrategyRepository,
-    SummaryStats, Timeframe, VersionId, library_overview_core,
+    DataVersion, DesktopState, EngineFingerprint, EquityCurve, FakeClock, FundingConfig,
+    NewAgentSubmission, NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
+    SqliteBacktestRunRepo, StrategyRepository, SummaryStats, Timeframe, VersionId,
+    WalkForwardRunRepository, library_overview_core,
 };
+use support::mcp::seeded_walk_forward_draft;
 
 /// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
 /// tests are about coach/library behaviour, not provenance, so the tuple is a
@@ -37,6 +41,7 @@ fn seed_inputs() -> BacktestInputs {
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
         window: None,
+        lead_in_from_ms: None,
     }
 }
 use rust_decimal::Decimal;
@@ -407,4 +412,147 @@ async fn provenance_and_hypothesis_reach_the_wire_per_version_kind() {
         "a missing submission row is not an error"
     );
     assert_eq!(bare.hypothesis, None);
+}
+
+// ---------------------------------------------------------------------------
+// r2.s3.w4 — a12: the Library wire carries certification
+// ---------------------------------------------------------------------------
+
+/// `LibraryVersion.certified`/`latest_walk_forward_run_id` are filled from the
+/// version's joined latest walk-forward run: `true` + the run id when it
+/// passed, `false` + `None` everywhere else — never invented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certification_fields_reach_the_wire() {
+    let (state, _tmp, alpha_versions, _beta_root) = seeded_state().await;
+
+    // Certify va1 with a synthetic passing walk-forward — the pointer +
+    // recorded `pass` is the seam, and `save_walk_forward_run` is the only
+    // product path that moves it.
+    let wf_id = SqliteBacktestRunRepo::with_deps(
+        state.db().pool().clone(),
+        FakeClock::at(1_756_512_000_000),
+    )
+    .save_walk_forward_run(&alpha_versions[0], &seeded_walk_forward_draft(true))
+    .await
+    .expect("the certifying walk-forward run persists");
+
+    let overview = library_overview_core(&state)
+        .await
+        .expect("the library read succeeds");
+    let alpha = overview
+        .strategies
+        .iter()
+        .find(|s| s.name == "Alpha")
+        .expect("Alpha is listed");
+    let beta = overview
+        .strategies
+        .iter()
+        .find(|s| s.name == "Beta")
+        .expect("Beta is listed");
+    let wire = |id: &VersionId| {
+        alpha
+            .versions
+            .iter()
+            .find(|v| v.id == id.as_str())
+            .unwrap_or_else(|| panic!("version {} in the overview", id.as_str()))
+    };
+
+    let certified = wire(&alpha_versions[0]);
+    assert!(certified.certified, "va1's latest walk-forward passed");
+    assert_eq!(
+        certified.latest_walk_forward_run_id.as_deref(),
+        Some(wf_id.as_str()),
+        "the pointer names the certifying run"
+    );
+
+    for id in [&alpha_versions[1], &alpha_versions[2]] {
+        let version = wire(id);
+        assert!(!version.certified, "{}: no run — uncertified", id.as_str());
+        assert_eq!(version.latest_walk_forward_run_id, None);
+    }
+    assert!(!beta.versions[0].certified);
+    assert_eq!(beta.versions[0].latest_walk_forward_run_id, None);
+}
+
+// ---------------------------------------------------------------------------
+// R2 — the latest run the screen may compare against is not a fold
+// ---------------------------------------------------------------------------
+
+/// R2: the Lab's parent comparison names the version's latest NON-fold run.
+///
+/// After a walk-forward completes, its folds head the run catalogue: they are
+/// ordinary rows (L8 — so they stay listed) that share ONE `created_at`, and here
+/// that instant is strictly later than the version's ordinary run. So
+/// `recent_runs[0]` is an arbitrary UUID-selected sub-window fold, which is
+/// exactly what the screen used to read as "the latest run" — while `latest_run`
+/// answers the ordinary run, from the same `latest_run_for_version` read the KPIs
+/// use (N1's discriminator).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_run_is_the_version_latest_non_fold_run() {
+    let (state, _tmp, alpha_versions, _beta_root) = seeded_state().await;
+
+    // A walk-forward strictly LATER than the SystemClock-dated ordinary run, so
+    // its folds really do head the catalogue (that ordering is the bug's setup).
+    let late = SqliteBacktestRunRepo::with_deps(
+        state.db().pool().clone(),
+        FakeClock::at(1_900_000_000_000),
+    );
+    let wf_id = late
+        .save_walk_forward_run(&alpha_versions[1], &seeded_walk_forward_draft(true))
+        .await
+        .expect("the walk-forward run persists");
+    let wf = late
+        .get_walk_forward_run(&wf_id)
+        .await
+        .expect("the walk-forward reads back")
+        .expect("the run exists");
+    let fold_ids: Vec<&str> = wf
+        .folds
+        .iter()
+        .map(|f| f.backtest_run_id.as_str())
+        .collect();
+    assert_eq!(fold_ids.len(), 2, "the fixture is a two-fold run");
+
+    let overview = library_overview_core(&state)
+        .await
+        .expect("the library read succeeds");
+    let va2 = overview
+        .strategies
+        .iter()
+        .flat_map(|s| s.versions.iter())
+        .find(|v| v.id == alpha_versions[1].as_str())
+        .expect("va2 is listed");
+
+    // The catalogue keeps every row, folds included — and a fold heads it.
+    assert!(
+        fold_ids.contains(&va2.recent_runs[0].id.as_str()),
+        "a fold heads recent_runs: {}",
+        va2.recent_runs[0].id
+    );
+
+    // The latest run is NOT that fold, and it is older than it.
+    let latest = va2.latest_run.as_ref().expect("va2 has an ordinary run");
+    assert!(
+        !fold_ids.contains(&latest.id.as_str()),
+        "the latest run is not a fold: {}",
+        latest.id
+    );
+    assert!(
+        latest.created_at < va2.recent_runs[0].created_at,
+        "the fold is NEWER than the latest run — the selection this fixes"
+    );
+
+    // The KPIs answer from that same ordinary run (N1's half).
+    assert_eq!(
+        va2.stats.as_ref().map(|s| s.trades),
+        Some(64),
+        "va2's KPIs are its ordinary run's"
+    );
+
+    // And the certification pointer is the walk-forward, which is not the latest
+    // RUN — the two are different questions about the same version.
+    assert_eq!(
+        va2.latest_walk_forward_run_id.as_deref(),
+        Some(wf_id.as_str())
+    );
 }
