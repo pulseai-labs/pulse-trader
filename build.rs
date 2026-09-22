@@ -24,8 +24,9 @@
 //! It then bakes the digest into the binary via
 //! `cargo:rustc-env=PULSE_ENGINE_FINGERPRINT=<hex>` and the triple via
 //! `PULSE_TARGET_TRIPLE`, plus `cargo:rerun-if-changed=` for `Cargo.lock`, the
-//! schema-const file, every root directory of the engine source set and every
-//! hashed file in it, so the fingerprint stays correct without over-rebuilding.
+//! schema-const file, every directory the engine source-set walk enters (root or
+//! nested) and every hashed file in it, so the fingerprint stays correct without
+//! over-rebuilding.
 
 // The crate-wide `[lints.clippy]` table denies `unwrap_used`/`expect_used` so
 // *library* paths cannot panic (audit C5). A build script is the opposite case:
@@ -126,13 +127,16 @@ fn main() {
     // every build invocation anyway.
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src/domain/dsl/schema_version_const.rs");
-    // a2 (r2.s3.w1): every root directory of the source set AND every hashed file
-    // gets a `rerun-if-changed` — the directories catch adds/removals, the files
-    // catch content edits, so input (d) can never go stale silently.
-    for root in ENGINE_SOURCE_ROOTS {
-        if Path::new(&manifest_dir).join(root).is_dir() {
-            println!("cargo:rerun-if-changed={root}");
-        }
+    // a2 (r2.s3.w1), corrected in review: EVERY directory the enumeration walks
+    // gets a `rerun-if-changed`, not only the roots. A Cargo directory watch is
+    // NOT recursive, so watching the roots alone missed a `.rs` file added or
+    // removed inside a NESTED subdirectory: that changes the subdirectory's
+    // mtime, not the root's, and the file is not on the previous build's watched
+    // list either — the fingerprint went stale exactly where the original comment
+    // said it could not. The files catch content edits; the directories catch adds
+    // and removals at any depth.
+    for dir in source_tree_dirs(Path::new(&manifest_dir), ENGINE_SOURCE_ROOTS) {
+        println!("cargo:rerun-if-changed={}", dir.display());
     }
     for (_, rel) in source_tree_files(Path::new(&manifest_dir), ENGINE_SOURCE_ROOTS) {
         println!("cargo:rerun-if-changed={}", rel.display());

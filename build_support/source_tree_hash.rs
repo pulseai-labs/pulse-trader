@@ -44,10 +44,11 @@ fn source_tree_hash(base: &Path, roots: &[&str]) -> String {
 /// error surfaces.
 fn source_tree_files(base: &Path, roots: &[&str]) -> Vec<(Vec<u8>, std::path::PathBuf)> {
     let mut out = Vec::new();
+    let mut dirs = Vec::new();
     for root in roots {
         let root_path = base.join(root);
         if root_path.is_dir() {
-            collect_rs_files(std::path::Path::new(root), &root_path, &mut out);
+            collect_tree(std::path::Path::new(root), &root_path, &mut out, &mut dirs);
         } else if root_path.is_file() {
             let rel = std::path::PathBuf::from(root);
             out.push((rel_bytes(&rel), rel));
@@ -63,13 +64,46 @@ fn source_tree_files(base: &Path, roots: &[&str]) -> Vec<(Vec<u8>, std::path::Pa
     out
 }
 
-/// Recursive walk: push every `.rs` file under `abs_dir`, tracking each file's
-/// path relative to the tree base so the sort key never depends on where the
-/// checkout lives.
-fn collect_rs_files(
+/// Every DIRECTORY the enumeration walks: each directory root plus every
+/// subdirectory beneath it, sorted, deduped. Empty for file roots.
+///
+/// `build.rs` watches these alongside the files, and it has to: a Cargo
+/// `rerun-if-changed` on a directory is NOT recursive, so watching only the
+/// roots misses a `.rs` file added or removed inside a NESTED subdirectory —
+/// that changes the subdirectory's mtime, not the root's, and the new file is
+/// not on the previous build's file list either. Watching every walked directory
+/// covers adds and removals at any depth.
+///
+/// Missing roots panic, exactly as in [`source_tree_files`].
+fn source_tree_dirs(base: &Path, roots: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for root in roots {
+        let root_path = base.join(root);
+        if root_path.is_dir() {
+            dirs.push(std::path::PathBuf::from(root));
+            collect_tree(std::path::Path::new(root), &root_path, &mut files, &mut dirs);
+        } else if !root_path.is_file() {
+            panic!(
+                "engine source-set root does not exist: {root} (resolved under {})",
+                base.display()
+            );
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// The recursive walk both enumerations share: push every `.rs` file under
+/// `abs_dir` into `files`, and every subdirectory into `dirs`, tracking each
+/// entry's path relative to the tree base so the sort key never depends on where
+/// the checkout lives.
+fn collect_tree(
     rel_dir: &Path,
     abs_dir: &Path,
-    out: &mut Vec<(Vec<u8>, std::path::PathBuf)>,
+    files: &mut Vec<(Vec<u8>, std::path::PathBuf)>,
+    dirs: &mut Vec<std::path::PathBuf>,
 ) {
     let entries = std::fs::read_dir(abs_dir).unwrap_or_else(|e| {
         panic!("failed to read engine source-set dir {}: {e}", abs_dir.display())
@@ -84,9 +118,10 @@ fn collect_rs_files(
         let rel = rel_dir.join(entry.file_name());
         let abs = abs_dir.join(entry.file_name());
         if abs.is_dir() {
-            collect_rs_files(&rel, &abs, out);
+            dirs.push(rel.clone());
+            collect_tree(&rel, &abs, files, dirs);
         } else if abs.is_file() && abs.extension().is_some_and(|ext| ext == "rs") {
-            out.push((rel_bytes(&rel), rel));
+            files.push((rel_bytes(&rel), rel));
         }
     }
 }

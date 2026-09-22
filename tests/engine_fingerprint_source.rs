@@ -18,7 +18,10 @@
 //!        path, changes the hex;
 //!   ix.  the `<len as u64 LE>` field is in the frame — a byte shifted across a
 //!        file boundary changes the hex, and a fixed tree's digest matches a
-//!        golden value.
+//!        golden value;
+//!   x.   the watched-directory set covers every directory the walk ENTERS, so a
+//!        file added under a nested subdirectory of a root reruns the build
+//!        script — Cargo's directory watch is not recursive.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -244,6 +247,52 @@ fn enumeration_is_sorted_and_covers_the_set() {
     assert_eq!(
         rels, IN_SET_FILES,
         "the enumeration must cover exactly the in-set .rs files"
+    );
+}
+
+/// (x) The watched-directory set covers every directory the walk enters, not
+/// just the roots.
+///
+/// `build.rs` emits `cargo:rerun-if-changed` for these, and Cargo's directory
+/// watch is NOT recursive: a file added under a NESTED subdirectory of a root
+/// changes only that subdirectory's mtime, and it is not on the previous build's
+/// file list either, so a root-only watch let the fingerprint go stale. The
+/// mini-tree grows a nested directory here; `source_tree_dirs` must name it, and
+/// the nested file must be hashed.
+#[test]
+fn watched_dirs_cover_every_walked_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(tmp.path(), TREE_FILES);
+    write_file(
+        tmp.path(),
+        "src/domain/dsl/inner/nested.rs",
+        "pub fn n() {}\n",
+    );
+
+    let dirs: Vec<String> = source_tree_dirs(tmp.path(), ENGINE_SOURCE_ROOTS)
+        .iter()
+        .map(|d| d.display().to_string().replace('\\', "/"))
+        .collect();
+    assert!(
+        dirs.contains(&"src/domain/dsl/inner".to_owned()),
+        "a nested directory must be watched: {dirs:?}"
+    );
+    for root in ["src/domain/dsl", "src/domain/backtest"] {
+        assert!(
+            dirs.contains(&root.to_owned()),
+            "the roots stay watched: {root} missing from {dirs:?}"
+        );
+    }
+
+    // And the nested file is IN the hashed set — the watch is what notices it,
+    // the walk already covered it.
+    let rels: Vec<String> = source_tree_files(tmp.path(), ENGINE_SOURCE_ROOTS)
+        .iter()
+        .map(|(_, r)| r.display().to_string().replace('\\', "/"))
+        .collect();
+    assert!(
+        rels.contains(&"src/domain/dsl/inner/nested.rs".to_owned()),
+        "the nested file must be hashed: {rels:?}"
     );
 }
 
