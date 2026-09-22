@@ -249,9 +249,16 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             )));
         }
 
+        if opened != 1 {
+            // Nothing was open. Either this is the retry of an accept that already
+            // landed — the session id IS the accept idempotency key, so that must
+            // succeed and insert nothing — or the proposal is settled some other
+            // way, which is not something an accept may undo.
+            return replay_acceptance(&mut tx, &id, &proposal).await;
+        }
+
         // THE PARENT'S CERTIFICATION POINTER MUST STILL BE THE ONE THE GATE READ
-        // — the second optimistic lock, beside the mutation guard and checked
-        // BEFORE the already-accepted branch for the same reason.
+        // — the second optimistic lock, checked HERE: on the OPEN path only (R7).
         //
         // The gate walked the candidate forward on the parameters of the
         // walk-forward run this pointer named when the parent was loaded — all
@@ -260,10 +267,16 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
         // certifies the child from fold parameters that are no longer the
         // parent's current ones, with every constraint still passing.
         //
-        // Firing before the replay branch costs a concurrent-accept caller one
-        // re-run that lands on the honest replay; letting a stale pointer slip
-        // through instead commits a child certified against a run the parent no
-        // longer names.
+        // It sits AFTER the replay branch, not before it. The mutation guard
+        // above keeps its place ahead of that branch (PR #128 H2): a settled
+        // proposal carrying a DIFFERENT mutation must not be answered with
+        // someone else's ids. But a settled accept writes NOTHING — its child is
+        // committed and certified by its own run — so a later walk-forward moving
+        // the PARENT's pointer is not a stale-parameter hazard for it: refusing
+        // there turns the documented idempotent retry (a delayed concurrent
+        // accept, a direct repository retry) into an error over a commit that can
+        // no longer happen. Only a flow that can still write needs a current
+        // pointer.
         let current_pointer = sqlx::query!(
             r#"SELECT v.latest_walk_forward_run_id AS "pointer?: String"
                FROM coaching_sessions s
@@ -286,14 +299,6 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
                  accept was being computed, so the child would be certified from stale fold \
                  parameters; re-run the accept against the current state"
             )));
-        }
-
-        if opened != 1 {
-            // Nothing was open. Either this is the retry of an accept that already
-            // landed — the session id IS the accept idempotency key, so that must
-            // succeed and insert nothing — or the proposal is settled some other
-            // way, which is not something an accept may undo.
-            return replay_acceptance(&mut tx, &id, &proposal).await;
         }
 
         let session = self.coached_session(&mut tx, &id).await?;

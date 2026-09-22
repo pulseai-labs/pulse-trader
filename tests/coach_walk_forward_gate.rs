@@ -42,7 +42,9 @@ use pulse::{
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use support::mcp::{FIXTURE_STORE, copy_tree, manifest, seeded_fold_trades, seeded_trade};
+use support::mcp::{
+    FIXTURE_STORE, copy_tree, manifest, seeded_fold_trades, seeded_trade, seeded_walk_forward_draft,
+};
 use tempfile::TempDir;
 
 /// A pinned instant, so `created_at` is deterministic everywhere.
@@ -902,5 +904,47 @@ async fn a_replay_reports_the_childs_current_pointer() {
     assert!(
         !certified,
         "a newer failing walk-forward de-certifies the child"
+    );
+}
+
+/// R7: a SETTLED accept replays even after the parent's certification pointer has
+/// moved. The optimistic pointer lock guards a commit that can still write; an
+/// already-accepted proposal has nothing to write, so refusing there turns the
+/// documented idempotency key into an error — for a delayed concurrent accept, or
+/// for a direct repository retry after any walk-forward touched the parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_accept_replays_after_the_parents_pointer_moves() {
+    let world = world().await;
+    let first = world
+        .acceptance()
+        .commit_acceptance(acceptance_payload(&world))
+        .await
+        .expect("the first accept lands");
+
+    // A LATER walk-forward on the PARENT moves its certification pointer, so the
+    // retry's `expected_certification_pointer` (None, as the gate read it) is now
+    // stale — the state a delayed concurrent caller arrives in.
+    SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(CERTIFY_MS + 60_000))
+        .save_walk_forward_run(&world.version_id, &seeded_walk_forward_draft(true))
+        .await
+        .expect("the parent's pointer moves");
+
+    let replayed = world
+        .acceptance()
+        .commit_acceptance(acceptance_payload(&world))
+        .await
+        .expect("a settled accept replays rather than refusing");
+    assert_eq!(
+        replayed.child_version_id, first.child_version_id,
+        "the replay answers the existing child"
+    );
+    assert_eq!(
+        replayed.accepted_run_id, first.accepted_run_id,
+        "and the existing run"
+    );
+    assert_eq!(
+        world.table_count("strategy_version").await,
+        2,
+        "nothing new was minted"
     );
 }
