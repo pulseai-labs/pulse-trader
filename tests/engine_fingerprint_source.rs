@@ -32,7 +32,7 @@ use std::path::Path;
 include!("../build_support/engine_source_set.rs");
 include!("../build_support/source_tree_hash.rs");
 
-/// The spec's locked root list (SPINE.md L2): four directories plus five single
+/// The spec's locked root list (SPINE.md L2): four directories plus seven single
 /// files. Written out literally so `roots_match_the_locked_list_and_exist`
 /// fails on any drift in `build_support/engine_source_set.rs`.
 const LOCKED_ROOTS: &[&str] = &[
@@ -45,10 +45,12 @@ const LOCKED_ROOTS: &[&str] = &[
     "src/domain/candle.rs",
     "src/domain/sizing.rs",
     "src/adapters/broker/mod.rs",
+    "src/application/backtest.rs",
+    "src/application/walk_forward.rs",
 ];
 
 /// The mini-tree every property test starts from: one `.rs` file per directory
-/// root, the five file roots, an out-of-set `.rs` control, and a non-`.rs`
+/// root, the seven file roots, an out-of-set `.rs` control, and a non-`.rs`
 /// control under an in-set root.
 const TREE_FILES: &[(&str, &str)] = &[
     ("src/domain/backtest/engine.rs", "pub fn a() {}\n"),
@@ -61,16 +63,20 @@ const TREE_FILES: &[(&str, &str)] = &[
     ("src/domain/candle.rs", "pub fn h() {}\n"),
     ("src/domain/sizing.rs", "pub fn i() {}\n"),
     ("src/adapters/broker/mod.rs", "pub fn j() {}\n"),
-    ("src/application/backtest.rs", "pub fn outside() {}\n"),
+    ("src/application/backtest.rs", "pub fn k() {}\n"),
+    ("src/application/walk_forward.rs", "pub fn l() {}\n"),
+    ("src/tauri/commands.rs", "pub fn outside() {}\n"),
     ("src/domain/backtest/NOTES.md", "not rust\n"),
 ];
 
-/// The ten in-set `.rs` files of `TREE_FILES`, as relative paths — the exact
+/// The twelve in-set `.rs` files of `TREE_FILES`, as relative paths — the exact
 /// set `source_tree_files` must enumerate on the mini-tree.
 const IN_SET_FILES: &[&str] = &[
     "src/adapters/backtest/engine.rs",
     "src/adapters/broker/mod.rs",
     "src/adapters/indicators/ema.rs",
+    "src/application/backtest.rs",
+    "src/application/walk_forward.rs",
     "src/domain/backtest/engine.rs",
     "src/domain/backtest/stats.rs",
     "src/domain/candle.rs",
@@ -173,16 +179,11 @@ fn out_of_set_and_non_rs_changes_do_not_move_hash() {
     let tmp = tempfile::tempdir().unwrap();
     write_tree(tmp.path(), TREE_FILES);
     let before = hash(&tmp);
-    write_file(
-        tmp.path(),
-        "src/application/backtest.rs",
-        "pub fn changed() {}\n",
-    );
-    write_file(
-        tmp.path(),
-        "src/tauri/commands.rs",
-        "pub fn also_outside() {}\n",
-    );
+    // The `.rs` control is OUT of the set — `src/application/backtest.rs` used to
+    // be this control and is now a root (R3), so an edit there must MORE the
+    // fingerprint rather than leave it alone.
+    write_file(tmp.path(), "src/tauri/commands.rs", "pub fn changed() {}\n");
+    write_file(tmp.path(), "src/mcp/tools.rs", "pub fn also_outside() {}\n");
     write_file(tmp.path(), "src/domain/backtest/NOTES.md", "changed\n");
     write_file(tmp.path(), "src/domain/dsl/readme.txt", "not rust\n");
     assert_eq!(
