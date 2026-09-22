@@ -76,7 +76,10 @@ pub struct LibraryVersion {
     /// The version's DSL, rendered to summary lines.
     pub dsl: DslSummary,
     /// The latest persisted run's stats, or `None` when no run exists — the
-    /// screen renders an em dash on `None` (grill A1).
+    /// screen renders an em dash on `None` (grill A1). A walk-forward fold is
+    /// not the latest run (N1): the folds of one walk-forward share one
+    /// `created_at`, so reading one as "the latest" would render an arbitrary
+    /// sub-window as the version's result.
     pub stats: Option<VersionStats>,
     /// The expectancy delta vs the parent's, formatted (e.g. `"+0.12R"`), when
     /// BOTH this version and its parent carry a run. `None` otherwise.

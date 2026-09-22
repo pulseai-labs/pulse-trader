@@ -479,7 +479,10 @@ const RECENT_RUN_LIMIT: usize = 5;
 /// delta vs the parent when both carry a run, and its recent run catalog.
 ///
 /// `latest_run_for_version` is fail-closed by design (#39): one corrupt run row
-/// is a `BusError` naming the row, not a silently missing KPI. The recent-runs
+/// is a `BusError` naming the row, not a silently missing KPI — and it reads the
+/// version's most recent NON-FOLD run (N1), so completing a walk-forward never
+/// swaps a single fold's sub-window stats in as the version's latest result.
+/// The recent-runs
 /// list reads `list_runs_for_version`, the one best-effort read in the port — a
 /// bad row costs its row there, not the screen.
 ///

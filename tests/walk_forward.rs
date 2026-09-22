@@ -44,12 +44,12 @@
 mod support;
 
 use pulse::{
-    BacktestConfig, BacktestRunRepository, BinanceAdapter, CandleSeries, CandleStore, CandleWindow,
-    CompiledStrategy, Db, FoldScheme, FoldVerdict, Migrator, Pair, RunVerdict,
-    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, Timeframe,
-    VersionId, WalkForwardAppError, WalkForwardError, WalkForwardMembership, WalkForwardOutcome,
-    WalkForwardRequest, WalkForwardRunRepository, compile, first_fully_warm_bar_ms, fold_windows,
-    run_walk_forward, validate,
+    BacktestConfig, BacktestRequest, BacktestRunRepository, BinanceAdapter, CandleSeries,
+    CandleStore, CandleWindow, CompiledStrategy, Db, FakeClock, FoldScheme, FoldVerdict, Migrator,
+    Pair, RunVerdict, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
+    Timeframe, VersionId, WalkForwardAppError, WalkForwardError, WalkForwardMembership,
+    WalkForwardOutcome, WalkForwardRequest, WalkForwardRunRepository, compile,
+    first_fully_warm_bar_ms, fold_windows, run_version_backtest, run_walk_forward, validate,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -694,4 +694,102 @@ fn fold_windows_cover_the_span_contiguously() {
         folds[5].to_ms - folds[5].from_ms >= step,
         "the last fold absorbs the remainder"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The version's latest run is not a fold (N1, review fix)
+// ---------------------------------------------------------------------------
+
+/// N1: completing a walk-forward does not make one of its folds the version's
+/// "latest run".
+///
+/// The K folds of one walk-forward are `backtest_run` rows of the version that
+/// share ONE `created_at`, so `ORDER BY created_at DESC, id DESC` used to hand
+/// an arbitrary UUIDv4-selected fold that title — and with it the Library KPIs,
+/// the parent expectancy delta, and the pins a later run inherits by default.
+/// The clocks here are pinned so the pre-fix behaviour fails rather than
+/// sometimes passes: the ordinary run lands at `ORDINARY_MS` and every fold at
+/// the strictly later `FOLD_MS`, which is exactly the ordering that made a fold
+/// win before the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_walk_forward_does_not_displace_the_versions_latest_run() {
+    const ORDINARY_MS: i64 = 1_756_425_600_000; // 2025-08-29T00:00:00Z
+    const FOLD_MS: i64 = ORDINARY_MS + 300_000;
+
+    let world = world().await;
+    let version = make_version(&world, &oracle_dsl()).await;
+
+    // A REAL ordinary run of this version, on its own injected clock.
+    let early =
+        SqliteBacktestRunRepo::with_deps(world.db.pool().clone(), FakeClock::at(ORDINARY_MS));
+    let ordinary = run_version_backtest(
+        &world.strategies,
+        &world.store,
+        &BinanceAdapter::new(),
+        &early,
+        &BacktestRequest {
+            version_id: version.clone(),
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: None,
+            config: BacktestConfig::default(),
+            snapshots: None,
+            window: None,
+        },
+    )
+    .await
+    .expect("the ordinary run persists");
+    assert_eq!(
+        ordinary.run.created_at, "2025-08-29T00:00:00.000Z",
+        "the ordinary run's instant is the injected clock's (D7)"
+    );
+
+    // Then a walk-forward — whose folds are saved strictly later, all six at
+    // ONE instant.
+    let late = SqliteBacktestRunRepo::with_deps(world.db.pool().clone(), FakeClock::at(FOLD_MS));
+    run_walk_forward(
+        &world.strategies,
+        &world.store,
+        &BinanceAdapter::new(),
+        &late,
+        &request(&version),
+    )
+    .await
+    .expect("the walk-forward completes over the fixture");
+
+    let folds: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, created_at FROM backtest_run WHERE walk_forward_run_id IS NOT NULL \
+         ORDER BY id",
+    )
+    .fetch_all(world.db.pool())
+    .await
+    .expect("read the fold rows");
+    assert_eq!(folds.len(), 6, "K=6 folds persist as ordinary runs");
+    assert!(
+        folds
+            .iter()
+            .all(|(_, at)| *at == "2025-08-29T00:05:00.000Z"),
+        "every fold of one walk-forward shares one created_at"
+    );
+
+    // The latest run is still the ordinary one: a fold never displaces it.
+    let latest = world
+        .runs
+        .latest_run_for_version(&version)
+        .await
+        .expect("the latest-run read does not fail")
+        .expect("the version has a run");
+    assert_eq!(
+        latest.id, ordinary.run.id,
+        "the version's latest run is its ordinary run, not a fold"
+    );
+
+    // And the fold runs are still ordinary runs on the catalog read (L8) — the
+    // exclusion is scoped to the latest-run read, not to reading folds.
+    let catalog = world
+        .runs
+        .list_runs_for_version(&version)
+        .await
+        .expect("the catalog reads");
+    assert_eq!(catalog.len(), 7, "one ordinary run + six folds");
 }

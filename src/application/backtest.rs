@@ -1166,7 +1166,10 @@ pub(crate) fn apply_lead_in_window(
 /// Precedence: the version's **parent's** latest persisted run → the version's
 /// own latest persisted run → the application defaults (`BTCUSDT`, `M15`, `H4`,
 /// `BacktestConfig::default()`, `HEAD`). A run whose `inputs` is `None` (a
-/// pre-0006 row) is skipped, never an error. From a run the resolver takes the
+/// pre-0006 row) is skipped, never an error, and a walk-forward FOLD is never
+/// consulted (N1): a fold's pins describe one sub-window of a walk-forward, not
+/// a run of this version the caller would inherit comparably. From a run the
+/// resolver takes the
 /// pair, the timeframes, the taker/slippage bps and [`SnapshotPins`] naming the
 /// run's exact `data_version`s — an agent run is then comparable with the run
 /// it iterates on. `window` is NEVER inherited: it is always the caller's.
@@ -1252,7 +1255,8 @@ fn version_needs_htf(version: &StrategyVersion) -> bool {
 
 /// The version's latest persisted run's `inputs`, when it has a usable row.
 /// `inputs: None` (a pre-0006 row) reads the same as no run at all — skipped,
-/// never an error.
+/// never an error. Fold rows are excluded upstream by the read itself (N1), so
+/// this inherits from the version's most recent ordinary run.
 async fn latest_run_inputs<R>(
     runs: &R,
     version_id: &VersionId,

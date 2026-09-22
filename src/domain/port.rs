@@ -479,8 +479,18 @@ pub trait BacktestRunRepository {
     ) -> impl Future<Output = Result<Option<PersistedRun>, DataError>> + Send;
 
     /// The most-recent run for a version (`ORDER BY created_at DESC, id DESC LIMIT
-    /// 1`, #40 stable) — the FR-7 prior-run lookup. Reuses `get_run`'s
-    /// fetch-trades-and-validate path (so it is fail-closed + tamper-checked).
+    /// 1` over its NON-FOLD runs, #40 stable) — the FR-7 prior-run lookup, and the
+    /// run the Library KPIs, the parent expectation delta and default resolution
+    /// read. Reuses `get_run`'s fetch-trades-and-validate path (so it is
+    /// fail-closed + tamper-checked).
+    ///
+    /// **A walk-forward fold is never this run (N1).** The K folds of one
+    /// walk-forward are `backtest_run` rows of the version sharing ONE
+    /// `created_at`, so the `id DESC` tie-break would pick an arbitrary fold and
+    /// report a sub-window measurement as the version's latest result — its KPIs,
+    /// its parent delta, and the snapshot/cost pins a later run inherits. Rows
+    /// carrying `walk_forward_run_id` are therefore excluded: the answer is the
+    /// version's most recent ordinary run, or `None` when it has none.
     ///
     /// # Errors
     ///

@@ -522,10 +522,22 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
     ) -> Result<Option<PersistedRun>, DataError> {
         let sid = strategy_version_id.as_str();
         // #40 stable ordering: most-recent first, deterministic id tie-break.
+        //
+        // FOLD RUNS ARE NOT THE VERSION'S LATEST RUN (N1). A walk-forward's K
+        // folds are `backtest_run` rows of this version that share ONE
+        // `created_at` (the save's single injected-clock instant), so the
+        // `id DESC` tie-break would hand an arbitrary fold — a UUIDv4, not a
+        // clock — the title of "the version's latest run", and with it the
+        // Library KPIs, the parent expectancy delta, and the pins a later run
+        // inherits by default. A fold is a measurement of one sub-window, never
+        // the version's latest full-span result, so rows carrying
+        // `walk_forward_run_id` are excluded here. `list_runs_for_version` still
+        // lists them: they ARE runs, and the Lab's fold table reads them as such.
         let row = sqlx::query!(
             r#"SELECT id AS "id!: String"
                FROM backtest_run
                WHERE strategy_version_id = ?1
+                 AND walk_forward_run_id IS NULL
                ORDER BY created_at DESC, id DESC
                LIMIT 1"#,
             sid,

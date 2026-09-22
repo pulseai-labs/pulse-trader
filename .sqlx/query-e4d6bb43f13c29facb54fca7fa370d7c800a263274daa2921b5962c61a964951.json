@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!: String\"\n               FROM backtest_run\n               WHERE strategy_version_id = ?1\n                 AND walk_forward_run_id IS NULL\n               ORDER BY created_at DESC, id DESC\n               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e4d6bb43f13c29facb54fca7fa370d7c800a263274daa2921b5962c61a964951"
+}
