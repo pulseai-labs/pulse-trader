@@ -52,6 +52,11 @@ pub struct MemoryCoachTurn {
     pub parent_version_id: VersionId,
     /// The one attributable provider call, when the turn correlated one.
     pub llm_call_id: Option<LlmCallId>,
+    /// The coached parent's `latest_walk_forward_run_id` as the version store
+    /// holds it. Registration seeds the certification map with it; a later
+    /// [`InMemoryCoachAcceptanceRepo::record_certification`] is how a
+    /// memory-side walk-forward save moves it.
+    pub parent_certification: Option<WalkForwardRunId>,
     /// What the turn produced.
     pub outcome: SessionOutcome,
 }
@@ -89,6 +94,11 @@ pub struct MemoryAcceptedChild {
 struct MemoryState {
     turns: BTreeMap<String, MemoryCoachTurn>,
     children: Vec<MemoryAcceptedChild>,
+    /// The `strategy_version.latest_walk_forward_run_id` column, modelled per
+    /// version id: the certification pointer a walk-forward save moves and the
+    /// accept commit's optimistic lock re-reads — the same cell the SQLite
+    /// adapter guards.
+    certification: BTreeMap<String, WalkForwardRunId>,
 }
 
 /// A deterministic in-memory [`CoachAcceptanceRepository`].
@@ -116,9 +126,32 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
     /// Returns [`DataError::Db`] when the lock is poisoned.
     pub fn register_turn(&self, turn: MemoryCoachTurn) -> Result<(), DataError> {
         let mut state = self.lock()?;
+        if let Some(pointer) = &turn.parent_certification {
+            state
+                .certification
+                .insert(turn.parent_version_id.as_str().to_owned(), pointer.clone());
+        }
         state
             .turns
             .insert(turn.session_id.as_str().to_owned(), turn);
+        Ok(())
+    }
+
+    /// Move one version's certification pointer — the memory-side stand-in for
+    /// `save_walk_forward_run`'s `latest_walk_forward_run_id` write, so a test
+    /// can advance a pointer between an accept's computation and its commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the lock is poisoned.
+    pub fn record_certification(
+        &self,
+        version_id: &VersionId,
+        run_id: WalkForwardRunId,
+    ) -> Result<(), DataError> {
+        self.lock()?
+            .certification
+            .insert(version_id.as_str().to_owned(), run_id);
         Ok(())
     }
 
@@ -273,6 +306,15 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
             let turn = state.turns.get(&id).cloned().ok_or_else(|| {
                 DataError::Db(format!("coaching session `{id}`: no such session"))
             })?;
+            // Read BEFORE `open_proposal` takes the turns borrow: the
+            // certification map is the `latest_walk_forward_run_id` column this
+            // model carries, and the guard below compares it inside the same
+            // lock — the same optimistic-lock re-read the SQLite adapter makes
+            // inside its transaction.
+            let current_pointer = state
+                .certification
+                .get(turn.parent_version_id.as_str())
+                .cloned();
             let proposal = open_proposal(&id, state.turns.get_mut(&id))?;
 
             // The proposal must still say what this child was built from — the same
@@ -285,6 +327,18 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
                     "coaching session `{id}`: the proposal changed while this accept was being \
                      computed, so the child would not match the mutation now on record; \
                      re-run the accept against the current proposal"
+                )));
+            }
+
+            // The parent's certification pointer must still be the one the gate
+            // read — the second optimistic lock: a walk-forward landing between
+            // the gate's computation and this commit certifies the child from
+            // fold parameters that are no longer the parent's current ones.
+            if current_pointer != acceptance.expected_certification_pointer {
+                return Err(DataError::Db(format!(
+                    "coaching session `{id}`: the parent's certification pointer moved while \
+                     this accept was being computed, so the child would be certified from \
+                     stale fold parameters; re-run the accept against the current state"
                 )));
             }
 

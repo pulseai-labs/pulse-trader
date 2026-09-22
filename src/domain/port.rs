@@ -896,10 +896,14 @@ pub trait CoachAcceptanceRepository {
     ///
     /// Inside that transaction the adapter checks the session is `proposed` and has
     /// exactly one attributable `llm_call_id`; checks the proposal is
-    /// `proposed`/`modified` with no accepted child or run; MINTS the child
-    /// `VersionId`, the [`BacktestRunId`] and `created_at` from its injected
-    /// id/clock sources; and DERIVES the strategy id, the parent version id,
-    /// `CreatedBy::CoachLlm` and the creating call id from the claimed session row.
+    /// `proposed`/`modified` with no accepted child or run and still carries the
+    /// mutation the accept was computed from; re-reads the parent version's
+    /// `latest_walk_forward_run_id` and refuses when it moved since the accept
+    /// loaded the parent (the second optimistic lock — the certification gate
+    /// computed against the run it named); MINTS the child `VersionId`, the
+    /// [`BacktestRunId`] and `created_at` from its injected id/clock sources; and
+    /// DERIVES the strategy id, the parent version id, `CreatedBy::CoachLlm` and
+    /// the creating call id from the claimed session row.
     /// [`PreparedCoachAcceptance`] carries no identity precisely so the caller
     /// cannot supply provenance that disagrees with the session.
     ///

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT v.latest_walk_forward_run_id AS \"pointer?: String\"\n               FROM coaching_sessions s\n               JOIN strategy_version v ON v.id = s.strategy_version_id\n               WHERE s.id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "pointer?: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "da12555f56ae6a24dd42f621920d1194a9ce3925a4896ba68fbd9b1e1a9de620"
+}

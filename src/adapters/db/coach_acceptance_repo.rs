@@ -227,6 +227,45 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             )));
         }
 
+        // THE PARENT'S CERTIFICATION POINTER MUST STILL BE THE ONE THE GATE READ
+        // — the second optimistic lock, beside the mutation guard and checked
+        // BEFORE the already-accepted branch for the same reason.
+        //
+        // The gate walked the candidate forward on the parameters of the
+        // walk-forward run this pointer named when the parent was loaded — all
+        // of it outside this transaction. A `save_walk_forward_run` landing in
+        // that window moves `latest_walk_forward_run_id`, and committing then
+        // certifies the child from fold parameters that are no longer the
+        // parent's current ones, with every constraint still passing.
+        //
+        // Firing before the replay branch costs a concurrent-accept caller one
+        // re-run that lands on the honest replay; letting a stale pointer slip
+        // through instead commits a child certified against a run the parent no
+        // longer names.
+        let current_pointer = sqlx::query!(
+            r#"SELECT v.latest_walk_forward_run_id AS "pointer?: String"
+               FROM coaching_sessions s
+               JOIN strategy_version v ON v.id = s.strategy_version_id
+               WHERE s.id = ?1"#,
+            id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?
+        .and_then(|row| row.pointer);
+        if current_pointer.as_deref()
+            != acceptance
+                .expected_certification_pointer
+                .as_ref()
+                .map(|p| p.as_str())
+        {
+            return Err(DataError::Db(format!(
+                "coaching session `{id}`: the parent's certification pointer moved while this \
+                 accept was being computed, so the child would be certified from stale fold \
+                 parameters; re-run the accept against the current state"
+            )));
+        }
+
         if opened != 1 {
             // Nothing was open. Either this is the retry of an accept that already
             // landed — the session id IS the accept idempotency key, so that must

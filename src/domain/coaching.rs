@@ -778,6 +778,26 @@ pub struct PreparedCoachAcceptance {
     /// unless its mutation is still this one. The caller recomputes from whatever
     /// the proposal now says; nothing is silently reconciled.
     pub expected_mutation: Mutation,
+    /// The parent version's certification pointer — its
+    /// `latest_walk_forward_run_id` — as it stood when the accept loaded the
+    /// parent. The second optimistic-lock token, beside
+    /// [`expected_mutation`](Self::expected_mutation).
+    ///
+    /// The certification gate reads this pointer to find the parent's certifying
+    /// run, and the walk-forward it gates on is computed OUTSIDE the final
+    /// transaction — the same window the mutation guard exists for. A
+    /// `save_walk_forward_run` landing in that window moves the pointer, and the
+    /// child would then be certified from fold parameters that are no longer the
+    /// parent's current ones while every constraint still passes.
+    ///
+    /// So the adapter re-reads the parent's pointer inside the transaction and
+    /// refuses unless it is still this one. The caller recomputes from whatever
+    /// the parent now says; nothing is silently reconciled.
+    ///
+    /// Carrying it here does not soften the "no identity" rule this struct
+    /// documents: it is a READ assertion about a row the adapter owns, like the
+    /// expected mutation — never a minted id the caller could misroute.
+    pub expected_certification_pointer: Option<WalkForwardRunId>,
     /// The validated child candidate exactly as `apply()` produced it.
     pub child_dsl: StrategyDsl,
     /// The deterministic re-backtest of that candidate.

@@ -31,7 +31,7 @@ use pulse::{
     InitialCoachOutcome, LlmCallId, MIGRATOR, MemoryCoachTurn, Mutation, MutationError, ParamValue,
     PreparedBacktest, PreparedCoachAcceptance, Proposal, RiskParams, SchemaVersion, SeqIdSource,
     Series, SessionOutcome, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, StrategyDsl, StrategyId,
-    SweepableValue, ValueSource, VersionId, apply,
+    SweepableValue, ValueSource, VersionId, WalkForwardRunId, apply,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -596,6 +596,71 @@ async fn an_accept_whose_proposal_changed_underneath_it_is_refused() {
         ),
         other => panic!("expected an open proposal, got {other:?}"),
     }
+}
+
+/// Point `ver-1`'s `latest_walk_forward_run_id` at a real run row — the cell
+/// the accept's second optimistic lock re-reads inside its transaction.
+async fn certify_ver_1(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO walk_forward_run \
+         (id, strategy_version_id, created_at, scheme, rule, k, \
+          span_from_ms, span_to_ms, from_defaulted, engine_fingerprint, \
+          folds_holding, folds_required, pooled_n, pooled_mean_r, \
+          pooled_lower_bound, pass) \
+         VALUES ('wf-1', 'ver-1', '2026-08-29T01:00:00.000Z', 'rolling-oos/v1', 'wf-v1', \
+                 6, 0, 1_000, 1, 'fp-1', 4, 4, 80, '0.5', 0.2, 1)",
+    )
+    .execute(pool)
+    .await
+    .expect("seed the certifying walk-forward run");
+    sqlx::query(
+        "UPDATE strategy_version SET latest_walk_forward_run_id = 'wf-1' WHERE id = 'ver-1'",
+    )
+    .execute(pool)
+    .await
+    .expect("advance the parent's certification pointer");
+}
+
+/// A walk-forward landing between the gate's read and the commit moves the
+/// parent's `latest_walk_forward_run_id` — and the accept must refuse, exactly
+/// like a proposal whose mutation changed underneath it: the certification
+/// draft was computed against the run the pointer USED to name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_whose_parent_certification_pointer_moved_is_refused() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+    certify_ver_1(&pool).await;
+
+    // `prepared_for` carries `None` — the pointer as it stood when the accept
+    // was computed, before `certify_ver_1` moved it.
+    let err = accepts(&pool)
+        .commit_acceptance(prepared_for("sess-1"))
+        .await
+        .expect_err("an accept computed against a stale certification pointer is refused");
+    assert!(
+        err.to_string().contains("certification pointer moved"),
+        "the refusal names the moved pointer, not merely that something failed: {err}"
+    );
+
+    // Nothing was written: no child, and the proposal is still actionable.
+    let got = repo.get_session(&id).await.expect("get").expect("present");
+    match &got.outcome {
+        SessionOutcome::Proposed { proposal } => assert_eq!(
+            proposal.disposition,
+            Disposition::Proposed,
+            "the refused accept left the proposal open"
+        ),
+        other => panic!("expected an open proposal, got {other:?}"),
+    }
+
+    // The same accept with the pointer it SHOULD have read commits — the guard
+    // is a compare, not a blanket refusal.
+    let mut matching = prepared_for("sess-1");
+    matching.expected_certification_pointer = Some(WalkForwardRunId::new("wf-1"));
+    accepts(&pool)
+        .commit_acceptance(matching)
+        .await
+        .expect("a pointer that still matches the parent's commits");
 }
 
 /// An accept whose proposal was modified AND accepted by someone else is refused —
@@ -1246,6 +1311,7 @@ fn in_memory_repo() -> InMemoryCoachAcceptanceRepo<FakeClock, SeqIdSource> {
         strategy_id: StrategyId::new("strat-1"),
         parent_version_id: VersionId::new("ver-1"),
         llm_call_id: Some(LlmCallId::new("call-1")),
+        parent_certification: None,
         outcome: SessionOutcome::Proposed {
             proposal: a_proposal(),
         },
@@ -1273,6 +1339,10 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
         // The accept's optimistic lock: the fixture proposal's own mutation, so the
         // guard passes for every case that is not testing the guard itself.
         expected_mutation: a_proposal().mutation,
+        // The second optimistic lock: the fixture versions carry no certification
+        // pointer, so `None` is what the accept read — the cases that test the
+        // guard itself move the pointer explicitly.
+        expected_certification_pointer: None,
         child_dsl: rsi_oversold_strategy(),
         prepared_run: PreparedBacktest {
             inputs: pulse::BacktestInputs {
@@ -1365,6 +1435,40 @@ async fn the_in_memory_adapter_mints_and_derives_the_same_way() {
     );
 }
 
+/// The in-memory adapter carries the same second optimistic lock the SQLite one
+/// does: a parent certification pointer that moved between the gate's read and
+/// the commit is refused, not committed against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_adapter_refuses_a_moved_certification_pointer() {
+    let repo = in_memory_repo();
+
+    // A memory-side walk-forward save landing between the accept's computation
+    // and its commit — the parent's pointer is no longer the `None` the gate read.
+    repo.record_certification(&VersionId::new("ver-1"), WalkForwardRunId::new("wf-later"))
+        .expect("move the parent's pointer");
+
+    let err = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect_err("a stale expected certification pointer is refused");
+    assert!(
+        err.to_string().contains("certification pointer moved"),
+        "the refusal names the moved pointer: {err}"
+    );
+    assert!(
+        repo.accepted_children().expect("children").is_empty(),
+        "nothing was minted"
+    );
+
+    // The pointer the accept SHOULD have read commits — the guard compares, it
+    // does not blanket-refuse.
+    let mut matching = prepared_acceptance();
+    matching.expected_certification_pointer = Some(WalkForwardRunId::new("wf-later"));
+    repo.commit_acceptance(matching)
+        .await
+        .expect("a pointer that still matches commits");
+}
+
 /// The in-memory adapter refuses what the real one refuses: a failed accept on a
 /// settled proposal, and an accept on a turn that produced none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1416,6 +1520,7 @@ async fn the_in_memory_adapter_refuses_what_the_sqlite_one_refuses() {
             strategy_id: StrategyId::new("strat-1"),
             parent_version_id: VersionId::new("ver-1"),
             llm_call_id: None,
+            parent_certification: None,
             outcome: SessionOutcome::Failed {
                 failure: CoachFailure::ZeroCalls,
             },

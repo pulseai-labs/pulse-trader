@@ -428,6 +428,10 @@ fn acceptance_payload(world: &World) -> PreparedCoachAcceptance {
     PreparedCoachAcceptance {
         session_id: world.session_id.clone(),
         expected_mutation: proposed_mutation(21),
+        // The direct-commit tests run against an uncertified parent — `None` is
+        // the pointer the accept read. Cases that certify the parent go through
+        // `decide`, which reads the pointer itself.
+        expected_certification_pointer: None,
         child_dsl,
         prepared_run: PreparedBacktest {
             inputs: world.parent_inputs.clone(),

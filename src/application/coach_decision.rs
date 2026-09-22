@@ -470,9 +470,11 @@ where
 
     // 6. COMMIT — W4's one transaction. The adapter mints the child id, the run id
     //    and `created_at`, and DERIVES the strategy, the parent and the creating
-    //    call from the claimed session row. `expected_mutation` is the optimistic
-    //    lock: everything above ran outside the transaction, so the adapter refuses
-    //    unless the proposal still carries the mutation this child came from.
+    //    call from the claimed session row. `expected_mutation` and the parent's
+    //    certification pointer are the optimistic locks: everything above ran
+    //    outside the transaction, so the adapter refuses unless the proposal still
+    //    carries the mutation this child came from AND the parent still names the
+    //    certifying run the gate walked the candidate forward on.
     let committed = match commit_step(
         acceptance,
         session,
@@ -480,6 +482,7 @@ where
         &candidate,
         prepared,
         walk_forward,
+        parent.latest_walk_forward_run_id.clone(),
     )
     .await
     {
@@ -1023,6 +1026,7 @@ async fn commit_step<A>(
     candidate: &CandidateDsl,
     prepared: PreparedBacktest,
     walk_forward: Option<WalkForwardRunDraft>,
+    expected_certification_pointer: Option<WalkForwardRunId>,
 ) -> Result<crate::domain::AcceptedCoachOutcome, StagedFailure>
 where
     A: CoachAcceptanceRepository,
@@ -1031,6 +1035,7 @@ where
         .commit_acceptance(PreparedCoachAcceptance {
             session_id: session.id.clone(),
             expected_mutation: proposal.mutation.clone(),
+            expected_certification_pointer,
             child_dsl: candidate.dsl().clone(),
             prepared_run: prepared,
             walk_forward,
