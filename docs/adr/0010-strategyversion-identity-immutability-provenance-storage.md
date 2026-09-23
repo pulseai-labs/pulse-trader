@@ -69,9 +69,9 @@ The slice already trusts SQL for the load-bearing immutability guarantee (trigge
 
 ## Amendment — 2026-09-18 (r2.s1.w1, Accepted)
 
-*(This amendment was authored `Proposed` by `r2.s1.w1`; it flipped `Accepted` on
-2026-09-23 — the flip owed at `r2.s1`'s close and named as still owed in the r2
-release retrospective §7. Recorded with the shipped evidence:
+*(Authored `Proposed` by `r2.s1.w1`; accepted at the Release 2 close (tag `r2`,
+`d4eed261`), the release that shipped `r2.s1` through its merged PR #178. The
+amendment's implementation is recorded with its shipped evidence:
 `migrations/0009_external_agent_window_claim` and `tests/migration_0009.rs`.)*
 
 **Provenance gains a sixth kind: `external_agent`.** `CreatedBy` closes over
