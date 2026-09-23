@@ -67,11 +67,12 @@ The slice already trusts SQL for the load-bearing immutability guarantee (trigge
 - **Hard delete of strategies/versions** — rejected: archive-only preserves the immutable version tree and the audit trail the system-of-record exists to keep.
 - **All invariants in Rust only** — rejected as the *target* state (kept as the v1 *implementation* for speed): for a real-money system-of-record, critical invariants should be carried by the database so corruption is rejected at write regardless of the writer (#39).
 
-## Amendment — 2026-09-18 (r2.s1.w1, Proposed)
+## Amendment — 2026-09-18 (r2.s1.w1, Accepted)
 
-*(Authored `Proposed`; flips `Accepted` at `r2.s1` spine close. Recorded with the
-shipped evidence: `migrations/0009_external_agent_window_claim` and
-`tests/migration_0009.rs`.)*
+*(Authored `Proposed` by `r2.s1.w1`; accepted at the Release 2 close (tag `r2`,
+`d4eed261`), the release that shipped `r2.s1` through its merged PR #178. The
+amendment's implementation is recorded with its shipped evidence:
+`migrations/0009_external_agent_window_claim` and `tests/migration_0009.rs`.)*
 
 **Provenance gains a sixth kind: `external_agent`.** `CreatedBy` closes over
 `human`, `composer_llm`, `coach_llm`, `auto_optimizer`, `migration`, and now

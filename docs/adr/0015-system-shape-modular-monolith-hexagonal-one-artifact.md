@@ -123,9 +123,10 @@ encode helpers on the port would recreate `CandleStore` as a shallow interface a
 close nothing. Those stay inherent methods on the adapter, for its own tests and
 tooling.
 
-## Amendment — 2026-09-18 (r2.s1.w1, Proposed)
+## Amendment — 2026-09-18 (r2.s1.w1, Accepted)
 
-*(Authored `Proposed`; flips `Accepted` at `r2.s1` spine close.)*
+*(Authored `Proposed` by `r2.s1.w1`; accepted at the Release 2 close (tag `r2`,
+`d4eed261`), the release that shipped `r2.s1` through its merged PR #178.)*
 
 **`pulse mcp` is a second long-lived OS process on the same artifact and the
 same `pulse.db`.** An external coding agent drives the discovery loop over MCP
