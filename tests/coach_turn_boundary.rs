@@ -890,11 +890,9 @@ async fn a_pre_0006_run_is_recorded_as_missing_backtest_inputs_without_a_call() 
     // integrity re-derive honest: this is a genuinely readable run that predates the
     // provenance, not a corrupt one.
     //
-    // The whole DROP → INSERT → re-CREATE runs on ONE pooled connection, which is
-    // why it goes through the shared helper rather than three `execute(db.pool())`
-    // calls: handing the sequence back to the pool between statements lets another
-    // connection take its read snapshot before the DROP is visible, which surfaces
-    // as an intermittent "trigger ... already exists" on the re-CREATE (`#225`).
+    // DROP / INSERT / re-CREATE on ONE pooled connection (`#225`): as three
+    // `execute(db.pool())` calls they could land on different pooled connections,
+    // which failed the restore in 4 of 12 runs.
     let legacy_run = BacktestRunId::new("run-legacy");
     coach_support::with_trigger_lifted(
         db.pool(),

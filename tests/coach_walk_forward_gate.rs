@@ -835,9 +835,9 @@ async fn a_failing_pointer_update_rolls_the_whole_accept_back() {
         "the proposal settlement rolled back with it"
     );
 
-    // `IF EXISTS`: the drop may land on a pooled connection whose WAL snapshot
-    // predates the CREATE (#153's stale-snapshot class); the tempdir dies with
-    // the test either way, so a no-op drop is harmless.
+    // `IF EXISTS`: the CREATE above and this teardown can land on different
+    // pooled connections, so the drop may find no trigger to remove; the
+    // tempdir dies with the test either way, so a no-op drop is harmless.
     sqlx::query("DROP TRIGGER IF EXISTS w4_test_pointer_update_aborts")
         .execute(world.pool())
         .await
