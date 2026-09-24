@@ -47,6 +47,7 @@ use pulse::{
 use rust_decimal::Decimal;
 use tempfile::TempDir;
 
+mod coach_support;
 mod source_scan;
 use source_scan::{blank_comments, read_source};
 
@@ -1885,36 +1886,38 @@ async fn a_run_without_recorded_inputs_reports_no_verdict() {
     // an all-NULL provenance INSERT (0006), so the row is cloned with the ten
     // provenance columns NULL — exactly what a migration-era row stores and
     // what `decode_inputs` reads as `inputs: None`. The completeness trigger is
-    // dropped for the insert on this throwaway database; `result_content_hash`
-    // does not cover inputs, so the clone stays hash-consistent.
+    // lifted for that insert and restored after it; `result_content_hash` does
+    // not cover inputs, so the clone stays hash-consistent.
+    //
+    // DROP / INSERT / re-CREATE run on ONE pooled connection (`#225`): three
+    // `execute(db.pool())` calls could land on different connections and fail
+    // the restore intermittently.
     let db = env.db().await;
-    sqlx::query("DROP TRIGGER backtest_run_inputs_complete")
-        .execute(db.pool())
-        .await
-        .expect("drop the insert-only provenance guard");
-    sqlx::query(
-        "INSERT INTO backtest_run (\
-         id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
-         engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
-         funding_total, slippage_total, expectancy, win_rate, profit_factor, \
-         gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
-         wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
-         regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
-         pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
-         taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms) \
-         SELECT 'run-legacy-child', strategy_version_id, schema_version, created_at, \
-         engine_fingerprint, engine_target, result_content_hash, starting_equity, net_pnl, \
-         fees_total, funding_total, slippage_total, expectancy, win_rate, profit_factor, \
-         gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
-         wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
-         regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
-         NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL \
-         FROM backtest_run WHERE id = ?1",
+    coach_support::with_trigger_lifted(
+        db.pool(),
+        "backtest_run_inputs_complete",
+        &[&format!(
+            "INSERT INTO backtest_run (\
+             id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+             engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+             funding_total, slippage_total, expectancy, win_rate, profit_factor, \
+             gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
+             wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
+             regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+             pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
+             taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms) \
+             SELECT 'run-legacy-child', strategy_version_id, schema_version, created_at, \
+             engine_fingerprint, engine_target, result_content_hash, starting_equity, net_pnl, \
+             fees_total, funding_total, slippage_total, expectancy, win_rate, profit_factor, \
+             gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
+             wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
+             regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL \
+             FROM backtest_run WHERE id = '{source}'",
+            source = child_run.as_str(),
+        )],
     )
-    .bind(child_run.as_str())
-    .execute(db.pool())
-    .await
-    .expect("clone the run in the pre-provenance row shape");
+    .await;
 
     let state = env.cold_state().await;
     let dto = compare_child_run_core(
