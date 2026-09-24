@@ -1,0 +1,11 @@
+# The nightly PulseTrader backup schedule (r3.s3.w4, D12): 03:30 local time,
+# with Persistent=true so a powered-off host runs the missed backup at boot.
+[Unit]
+Description=Nightly PulseTrader backup at 03:30 local
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

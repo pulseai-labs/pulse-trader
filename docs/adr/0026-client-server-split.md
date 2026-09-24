@@ -67,3 +67,16 @@ The access model:
   `axum` as the only new HTTP dependency, riding the already-locked hyper/tower/http graph.
 - Touch surfaces for registration at spine close: `src/server/**`, `src/cli/serve.rs`,
   `src/cli/token.rs`, `src/cli/import.rs`, `src/adapters/db/client_token_repo.rs`, `deploy/**`.
+
+## Operations (r3.s3.w4)
+
+draco-desk runs the server under systemd's user manager: `deploy/pulse-serve.service` execs
+`~/.local/share/pulse-serve/bin/pulse serve --bind 100.90.203.21:8420` — the tailnet address and
+the port live in that unit only — and `just deploy <tag>` is the cutover step: build a tagged
+commit in `~/.cache/pulse-deploy/src`, install the binary (deliberately not on `PATH`) and the
+three units, then enable and restart. `just deploy-check` is the rehearsal: it verifies the units
+with `systemd-analyze` and dry-runs the deploy, installing nothing. `pulse import` moves the Mac's
+`pulse.db` and snapshots across with full hash verification, refusing the whole import on any
+mismatch; `pulse backup` takes the nightly online copy plus its snapshots into `~/pulse-backups/`
+(14 kept, `pulse-backup.timer` at 03:30 local); `pulse restore` verifies a backup the way import
+verifies a source, and `just restore` swaps it in with the unit stopped.

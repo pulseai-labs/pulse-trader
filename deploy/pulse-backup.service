@@ -1,0 +1,11 @@
+# The PulseTrader backup oneshot (r3.s3.w4, D12): one online `pulse backup`
+# into ~/pulse-backups (the 14 newest kept). Started by pulse-backup.timer, or
+# on demand by `just backup-now`. Safe while `pulse serve` holds the database
+# — the copy is taken through SQLite's VACUUM INTO from a read-only open.
+# No credential is set in the environment: `pulse backup` reads none.
+[Unit]
+Description=PulseTrader nightly backup (pulse backup)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/pulse-serve/bin/pulse backup

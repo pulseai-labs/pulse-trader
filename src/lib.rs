@@ -395,6 +395,16 @@ pub use adapters::memory::{InMemoryCoachAcceptanceRepo, MemoryAcceptedChild, Mem
 // not just the first. Append-only (keep-both with 1.03's re-exports at merge).
 pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
 
+// r3.s3.w4 (D7/D12): the copy/verify helpers the import/backup/restore verbs
+// compose (the raw-SQL tier beside the repositories). Re-exported ALL for the
+// same deny(warnings)/dead_code reason as the block above; `cli::import` and
+// `cli::backup` are the composition roots.
+pub use adapters::db::ops::{
+    SnapshotRef, all_run_ids, all_version_ids, open_read_only, referenced_snapshots,
+    stored_run_hashes, stored_version_hashes, table_count, table_names, target_row_counts,
+    vacuum_into_copy,
+};
+
 // r3.s3.w1 (ADR-0026): the server surface. `router` + `mount_scoped` build the
 // axum app (w2/w5 mount their routes through `mount_scoped`; the probe-route
 // tests do the same); `ServerState` carries pool + data dir + the log sink;
