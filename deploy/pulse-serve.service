@@ -1,0 +1,23 @@
+# The always-on PulseTrader server (r3.s3.w4, D6 / ADR-0026) as a systemd USER
+# unit. The tailnet address and port live HERE only — this unit is the one
+# place 100.90.203.21:8420 is written down; the server must never listen on a
+# wildcard.
+#
+# The environment sets no credential: the credential file is the operator's,
+# resolved by `pulse serve` itself from the app-data/config dir (w3, R3). No
+# token ever appears in this unit, in its logs, or in any recipe.
+[Unit]
+Description=PulseTrader always-on server (pulse serve)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/pulse-serve/bin/pulse serve --bind 100.90.203.21:8420
+# D6 boot-race contract (w1): the tailnet address may not be routable yet at
+# boot, so pulse serve retries the bind internally; systemd restarts the unit
+# on failure after 10 seconds.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

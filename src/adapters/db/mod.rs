@@ -86,6 +86,14 @@ pub mod client_token_repo;
 // module tree names it (callers map it into their own error vocabulary).
 pub use client_token_repo::{ClientToken, SqliteClientTokenRepo};
 
+// r3.s3.w4 (D7/D12, ADR-0026): the small copy/verify helper set the data-ops
+// verbs compose — the read-only source open, the VACUUM INTO copy, count/hash/
+// id reads and the referenced-snapshot projection. Raw `query`/`query_scalar`
+// only: NO `query!` macros, so the committed `.sqlx` cache is untouched.
+// (`lib.rs` re-exports the items from `adapters::db::ops::` directly, which is
+// what keeps them alive under deny(warnings)/dead_code.)
+pub mod ops;
+
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
 // item — under `#![deny(warnings)]` a `pub` item unused outside its module is a
 // `dead_code` BUILD ERROR, not a warning (VS-1.1.2 harvested gotcha). All three
