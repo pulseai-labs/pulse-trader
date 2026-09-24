@@ -29,6 +29,9 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 
+use crate::adapters::secrets::{self, CredentialProfile, StartupCredential};
+use crate::domain::CredentialSource;
+
 use super::log::RequestLog;
 use super::{ServerState, router};
 
@@ -74,6 +77,18 @@ pub enum ServeError {
     /// The serve loop itself failed.
     #[error("serve failed: {0}")]
     Serve(#[source] std::io::Error),
+    /// A credential file was found but refused at startup (r3.s3.w3, R3): the
+    /// server exits non-zero BEFORE binding rather than serve with an exposed
+    /// or broken credential source. The refusal names the path and the reason
+    /// and never the value — the file's bytes are never read before the very
+    /// checks that refused it.
+    #[error("pulse serve: refusing to start: {reason}")]
+    CredentialRefused {
+        /// Which file, and why — the owner/mode/open/read failure
+        /// ([`CredentialFileRefusal`]'s one-line rendering), worded for the
+        /// operator.
+        reason: String,
+    },
 }
 
 /// The pure bind-policy check (D6): accept or refuse with a named reason.
@@ -195,6 +210,21 @@ pub struct ServeConfig {
     pub data_dir: std::path::PathBuf,
 }
 
+/// The credential source's kebab-case LABEL — the same strings the ledger's
+/// `key_source` stores (the serde tags on
+/// [`CredentialSource`](crate::domain::CredentialSource)) — so the startup
+/// line and the audit trail name a source identically. A label only, never a
+/// value.
+fn credential_source_label(source: CredentialSource) -> &'static str {
+    match source {
+        CredentialSource::Env => "env",
+        CredentialSource::ConfigDir => "config-dir",
+        CredentialSource::CwdDotenv => "cwd-dotenv",
+        CredentialSource::AppDataDir => "app-data-dir",
+        CredentialSource::Keychain => "keychain",
+    }
+}
+
 /// Run the server until SIGTERM/SIGINT. See the module docs for the ordered
 /// startup steps and the w3 seam.
 ///
@@ -206,11 +236,32 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     let state = Arc::new(ServerState::new(config.db, config.data_dir));
     let sink = state.log().clone();
 
-    // ---- Step 3: CREDENTIAL RESOLUTION — THE w3 SEAM (r3.s4.w3) ------------
-    // w3 inserts the server credential-profile resolution HERE, between the
-    // migrated DB open (done by the composition root) and the bind check.
-    // Anything w3 resolves joins `ServerState` (or a sibling struct it owns);
-    // no step below moves. Until then this item serves with tokens only (D5).
+    // ---- Step 3: CREDENTIAL RESOLUTION — THE w3 SEAM (r3.s3.w3) ------------
+    // The server credential profile (R3): this process resolves the LLM
+    // credential only from the environment and the two permission-checked file
+    // locations — never the cwd/manifest dotenv, never the Keychain. The cell
+    // set here shapes EVERY later call through the ordinary resolver in this
+    // process (w2's compose and coach handlers included). The value below is
+    // dropped at once; handlers resolve per call as the desktop always has,
+    // and nothing joins `ServerState`.
+    secrets::set_credential_profile(CredentialProfile::Server);
+    match secrets::resolve_credential_for_startup() {
+        StartupCredential::Found(key) => sink.write(format!(
+            "pulse serve: LLM credential from {}",
+            credential_source_label(key.source())
+        )),
+        StartupCredential::Absent => sink.write(
+            "pulse serve: no LLM credential; compose and coach will refuse until one is provided"
+                .to_owned(),
+        ),
+        // A refused credential file stops the startup BEFORE the bind check:
+        // one line naming the file and the reason, never the value.
+        StartupCredential::Refused(refusal) => {
+            return Err(ServeError::CredentialRefused {
+                reason: refusal.to_string(),
+            });
+        }
+    }
     // ------------------------------------------------------------------------
 
     // ---- Step 4: the bind policy.

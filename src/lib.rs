@@ -585,11 +585,20 @@ pub use adapters::secrets::glm_api_key;
 // adapter half the out-of-crate suites (`tests/credential_source.rs`,
 // `tests/credential_redaction.rs`) drive.
 //
-// The zero-arg `pub(crate)` wrappers (`resolve_llm_api_key` /
-// `llm_credential_status`) are deliberately NOT re-exported: they read the real
-// process environment. `ApiKey::expose()` also stays `pub(crate)`, so an
-// out-of-crate caller can pass a key on but can never read one (least privilege).
+// The zero-arg `resolve_llm_api_key` stays `pub(crate)` — it reads the real
+// process environment, and `ApiKey::expose()` is `pub(crate)` too, so an
+// out-of-crate caller can pass a key on but can never read one (least
+// privilege). `llm_credential_status` is `pub` since r3.s3.w3, on the
+// operator's ruling: it returns the VALUE-FREE `CredentialStatus` label enum
+// and nothing else, which is what the credential-profile suite and the
+// `server_auth` credential cases need to drive the real process path.
+//
+// r3.s3.w3: the server credential profile — `pulse serve` narrows this
+// process's resolution to the deliberate sources via the write-once cell
+// (`set_credential_profile`, read back through `credential_profile`).
+pub use adapters::secrets::CredentialProfile;
 pub use adapters::secrets::CredentialSearch;
+pub use adapters::secrets::{credential_profile, llm_credential_status, set_credential_profile};
 pub use adapters::secrets::{llm_credential_status_in, resolve_llm_api_key_in};
 pub use domain::{ApiKey, CredentialSource, CredentialStatus};
 
