@@ -889,56 +889,37 @@ async fn a_pre_0006_run_is_recorded_as_missing_backtest_inputs_without_a_call() 
     // back. Copying every hash-relevant column from a real run keeps `get_run`'s
     // integrity re-derive honest: this is a genuinely readable run that predates the
     // provenance, not a corrupt one.
-    let completeness_trigger: String =
-        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1")
-            .bind("backtest_run_inputs_complete")
-            .fetch_one(db.pool())
-            .await
-            .expect("0006's completeness trigger is present before the fixture touches it");
-    sqlx::query("DROP TRIGGER backtest_run_inputs_complete")
-        .execute(db.pool())
-        .await
-        .expect("lift the completeness trigger for one insert");
-
+    //
+    // The whole DROP → INSERT → re-CREATE runs on ONE pooled connection, which is
+    // why it goes through the shared helper rather than three `execute(db.pool())`
+    // calls: handing the sequence back to the pool between statements lets another
+    // connection take its read snapshot before the DROP is visible, which surfaces
+    // as an intermittent "trigger ... already exists" on the re-CREATE (`#225`).
     let legacy_run = BacktestRunId::new("run-legacy");
-    sqlx::query(
-        "INSERT INTO backtest_run ( \
-           id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
-           engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
-           funding_total, slippage_total, expectancy, win_rate, profit_factor, gross_profit, \
-           gross_loss, avg_win, avg_loss, max_drawdown, trade_count, wins, losses, breakeven, \
-           max_win_streak, max_loss_streak, sharpe, sortino, regime_breakdown, \
-           skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) \
-         SELECT \
-           ?1, strategy_version_id, schema_version, created_at, engine_fingerprint, \
-           engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
-           funding_total, slippage_total, expectancy, win_rate, profit_factor, gross_profit, \
-           gross_loss, avg_win, avg_loss, max_drawdown, trade_count, wins, losses, breakeven, \
-           max_win_streak, max_loss_streak, sharpe, sortino, regime_breakdown, \
-           skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped \
-         FROM backtest_run WHERE id = ?2",
+    coach_support::with_trigger_lifted(
+        db.pool(),
+        "backtest_run_inputs_complete",
+        &[&format!(
+            "INSERT INTO backtest_run ( \
+               id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+               engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+               funding_total, slippage_total, expectancy, win_rate, profit_factor, gross_profit, \
+               gross_loss, avg_win, avg_loss, max_drawdown, trade_count, wins, losses, breakeven, \
+               max_win_streak, max_loss_streak, sharpe, sortino, regime_breakdown, \
+               skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) \
+             SELECT \
+               '{legacy}', strategy_version_id, schema_version, created_at, engine_fingerprint, \
+               engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+               funding_total, slippage_total, expectancy, win_rate, profit_factor, gross_profit, \
+               gross_loss, avg_win, avg_loss, max_drawdown, trade_count, wins, losses, breakeven, \
+               max_win_streak, max_loss_streak, sharpe, sortino, regime_breakdown, \
+               skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped \
+             FROM backtest_run WHERE id = '{source}'",
+            legacy = legacy_run.as_str(),
+            source = run_id.as_str(),
+        )],
     )
-    .bind(legacy_run.as_str().to_owned())
-    .bind(run_id.as_str().to_owned())
-    .execute(db.pool())
-    .await
-    .expect("insert the pre-0006 run");
-
-    sqlx::query(&completeness_trigger)
-        .execute(db.pool())
-        .await
-        .expect("restore the completeness trigger");
-    let restored: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
-    )
-    .bind("backtest_run_inputs_complete")
-    .fetch_one(db.pool())
-    .await
-    .expect("count the completeness trigger");
-    assert_eq!(
-        restored, 1,
-        "the fixture must not leave 0006's completeness rule lifted"
-    );
+    .await;
 
     let session_id = CoachingSessionId::new("sess-legacy");
     let (provider, calls) = ScriptedProvider::new(vec![propose("entry.lhs.indicator.rsi.period")]);
