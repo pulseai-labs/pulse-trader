@@ -280,6 +280,27 @@ impl DesktopState {
         })
     }
 
+    /// Assemble the desktop state over an ALREADY-opened pool — the server's
+    /// constructor (r3.s3.w2).
+    ///
+    /// `pulse serve` opens and migrates its pool exactly once (w1's bind path)
+    /// and hands that same [`Db`] here with a [`CandleStore`] rooted at the
+    /// server's data dir. Opening a SECOND pool over the same SQLite file
+    /// inside one server process is precisely the defect the work item names,
+    /// and the one-latch-map rule depends on this constructor: the
+    /// `compose_runs` map and the `operations` single-flight set below must be
+    /// THE server's, not some second state's.
+    #[must_use]
+    pub fn from_parts(db: Db, candles: CandleStore) -> Self {
+        Self {
+            db,
+            candles,
+            compose_runs: Mutex::new(HashMap::new()),
+            coach_registry: CoachTurnRegistry::new(),
+            operations: Mutex::new(HashSet::new()),
+        }
+    }
+
     /// Open the default `~/Library/Application Support/PulseTrader/pulse.db`.
     ///
     /// # Errors
