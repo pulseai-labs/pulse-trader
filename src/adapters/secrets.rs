@@ -50,6 +50,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use keyring::Entry;
 
@@ -95,6 +96,59 @@ pub fn glm_api_key() -> Result<ApiKey, LlmError> {
 // ---------------------------------------------------------------------------
 // r1.s1.w2 — the LLM credential resolver (the risk gate's registered surface).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// r3.s3.w3 — the server credential profile (R3): WHAT a process searches and
+// WHAT a refusal does, selected once per process.
+// ---------------------------------------------------------------------------
+
+/// How THIS process resolves the LLM credential (r3.s3.w3, R3).
+///
+/// The default is [`Desktop`](CredentialProfile::Desktop) — the desktop and
+/// CLI behaviour, byte for byte. [`pulse serve`](crate::server::bind::serve)
+/// selects [`Server`](CredentialProfile::Server) once, at its Step 3, before
+/// the listener accepts a request; every later resolution in the server
+/// process — the ordinary resolver's, and any handler's — then follows the
+/// server search. Nothing else selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialProfile {
+    /// The desktop/CLI search: the full chain — env, `$PULSE_CONFIG_DIR/.env`,
+    /// the cwd and manifest `.env`s, the app-data `.env`.
+    Desktop,
+    /// The server search: env, `$PULSE_CONFIG_DIR/.env`, the app-data `.env` —
+    /// never the cwd/manifest dotenv, never the Keychain. A found-but-refused
+    /// file stops `pulse serve`'s startup instead of reading as "absent".
+    Server,
+}
+
+/// The process-wide profile cell: written once by `serve`'s Step 3, read by
+/// every resolution.
+static CREDENTIAL_PROFILE: OnceLock<CredentialProfile> = OnceLock::new();
+
+/// Select this process's credential profile — the write-once cell `pulse
+/// serve` sets at its Step 3 (r3.s3.w3, R3). Nothing else sets it.
+///
+/// Setting it twice is a programming error: it **panics in debug builds**
+/// (test builds included) and **is ignored in release**, where the first
+/// selection stands — recorded behaviour, asserted by
+/// `tests/secrets_profile.rs::setting_the_profile_twice_is_a_programming_error_in_debug`.
+pub fn set_credential_profile(profile: CredentialProfile) {
+    let selection = CREDENTIAL_PROFILE.set(profile);
+    debug_assert!(
+        selection.is_ok(),
+        "the credential profile is already set; it is selected once per process"
+    );
+    // Release build: the second selection is deliberately ignored (the first
+    // stands), and `selection` is consumed in both profiles.
+    let _ = selection;
+}
+
+/// The credential profile this process resolves under —
+/// [`CredentialProfile::Desktop`] unless [`set_credential_profile`] ran.
+#[must_use]
+pub fn credential_profile() -> CredentialProfile {
+    *CREDENTIAL_PROFILE.get_or_init(|| CredentialProfile::Desktop)
+}
 
 /// The set of places one credential resolution will look, as DATA.
 ///
@@ -231,13 +285,20 @@ impl CredentialSearch {
     /// no way to reason about. On a developer's machine the directory exists and is
     /// searched exactly as before.
     pub(crate) fn from_process_env() -> Self {
+        // The server profile (r3.s3.w3, R3) narrows the FILE search to the two
+        // deliberate locations: no cwd `.env`, no compile-time manifest `.env`
+        // (which on a deployed server names a build machine's path anyway).
+        // The exhausted-search message is built from the same locations, so it
+        // never advertises a place the server would not read.
         let mut dotenv_dirs = Vec::new();
-        if let Ok(cwd) = std::env::current_dir() {
-            dotenv_dirs.push(cwd);
-        }
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        if manifest_dir.is_dir() && !dotenv_dirs.contains(&manifest_dir) {
-            dotenv_dirs.push(manifest_dir);
+        if credential_profile() == CredentialProfile::Desktop {
+            if let Ok(cwd) = std::env::current_dir() {
+                dotenv_dirs.push(cwd);
+            }
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            if manifest_dir.is_dir() && !dotenv_dirs.contains(&manifest_dir) {
+                dotenv_dirs.push(manifest_dir);
+            }
         }
 
         Self::empty()
@@ -275,20 +336,60 @@ impl CredentialSearch {
 /// `.env` → the application data directory's `.env`. `$PULSE_CONFIG_DIR` sits ahead
 /// of both defaults so ADR-0014's overlay seam is honoured rather than bypassed.
 ///
+/// Under the SERVER profile (r3.s3.w3, R3) the cwd and manifest `.env` slots are
+/// dropped from every search that reaches this core — injected searches included —
+/// so the guarantee "every call through the ordinary resolver in a server process
+/// follows the server profile" is structural, not caller-dependent: w2's compose
+/// and coach handlers inherit it without a new call of their own. Under the
+/// desktop profile this is a no-op and the behaviour is unchanged byte for byte.
+///
 /// # Errors
 ///
 /// Returns [`LlmError::Config`] when no location supplied a credential, naming
-/// every location that was searched.
+/// every location that was searched, and when a found credential file was
+/// refused — the refusal text is [`CredentialFileRefusal::desktop_message`],
+/// byte for byte what this module has always said.
 pub fn resolve_llm_api_key_in(search: &CredentialSearch) -> Result<ApiKey, LlmError> {
+    let filtered;
+    let search = if credential_profile() == CredentialProfile::Server {
+        filtered = CredentialSearch {
+            dotenv_dirs: Vec::new(),
+            ..search.clone()
+        };
+        &filtered
+    } else {
+        search
+    };
+    match resolve_llm_api_key_inner(search) {
+        Resolution::Found(key) => Ok(key),
+        Resolution::Absent => Err(LlmError::Config(missing_credential_message(search))),
+        Resolution::Refused(refusal) => Err(LlmError::Config(refusal.desktop_message())),
+    }
+}
+
+/// The tri-state heart of one resolution over one [`CredentialSearch`] — found,
+/// genuinely absent everywhere, or a REFUSED file (the fail-closed abort
+/// [`read_credential_file`] promises). [`resolve_llm_api_key_in`] words the last
+/// two for the desktop surfaces; [`resolve_credential_for_startup`] words the
+/// refusal for `pulse serve`'s startup line.
+enum Resolution {
+    Found(ApiKey),
+    Absent,
+    Refused(CredentialFileRefusal),
+}
+
+fn resolve_llm_api_key_inner(search: &CredentialSearch) -> Resolution {
     if let Some(key) = &search.env_key {
-        return Ok(ApiKey::new(key.clone(), CredentialSource::Env));
+        return Resolution::Found(ApiKey::new(key.clone(), CredentialSource::Env));
     }
     for (path, source) in search.file_locations() {
-        if let Some(value) = read_credential_file(&path, search.running_uid)? {
-            return Ok(ApiKey::new(value, source));
+        match read_credential_file(&path, search.running_uid) {
+            Ok(Some(value)) => return Resolution::Found(ApiKey::new(value, source)),
+            Ok(None) => {}
+            Err(refusal) => return Resolution::Refused(refusal),
         }
     }
-    Err(LlmError::Config(missing_credential_message(search)))
+    Resolution::Absent
 }
 
 /// The production resolver: search the real process environment.
@@ -305,6 +406,33 @@ pub fn resolve_llm_api_key_in(search: &CredentialSearch) -> Result<ApiKey, LlmEr
 /// credential file was found but refused by the permission checks.
 pub(crate) fn resolve_llm_api_key() -> Result<ApiKey, LlmError> {
     resolve_llm_api_key_in(&CredentialSearch::from_process_env())
+}
+
+/// The outcome of `pulse serve`'s once-per-process startup resolution — Step 3
+/// (r3.s3.w3, R3). `Found`'s value is dropped at once (handlers resolve per
+/// call, as the desktop always has); `Absent` starts the server anyway;
+/// `Refused` stops the startup with [`CredentialFileRefusal`]'s one-line
+/// rendering.
+pub(crate) enum StartupCredential {
+    /// A credential answered; carry the label to the startup line, drop the
+    /// value.
+    Found(ApiKey),
+    /// Nothing answered anywhere — start without a credential.
+    Absent,
+    /// A file was found and REFUSED — the startup must not continue.
+    Refused(CredentialFileRefusal),
+}
+
+/// Resolve the credential ONCE through the production search — which
+/// [`set_credential_profile`] has already narrowed to `Server` when called from
+/// `serve`'s Step 3. The distinction the startup acts on (absent versus
+/// refused) is structural, so `bind.rs` never parses error text.
+pub(crate) fn resolve_credential_for_startup() -> StartupCredential {
+    match resolve_llm_api_key_inner(&CredentialSearch::from_process_env()) {
+        Resolution::Found(key) => StartupCredential::Found(key),
+        Resolution::Absent => StartupCredential::Absent,
+        Resolution::Refused(refusal) => StartupCredential::Refused(refusal),
+    }
 }
 
 /// Report WHICH credential source would answer, without returning the key — the
@@ -334,14 +462,16 @@ pub fn llm_credential_status_in(search: &CredentialSearch) -> CredentialStatus {
 /// The production banner read: report which source would answer, from the real
 /// process environment.
 ///
-/// This is the seam `r1.s1.w5` renders its no-credential banner from. `pub(crate)` for
-/// the same reason as [`resolve_llm_api_key`]. `r1.s1.w5`'s `credential_status` Tauri
-/// command (`src/tauri/commands.rs`) is its first production caller — wiring that
-/// caller is what makes removing the `dead_code` allow this function used to carry
-/// sound: `deny(warnings)` would not have let it come off before a real caller
-/// existed. Until `w5`, the only callers were out-of-crate tests reaching
-/// [`llm_credential_status_in`] directly.
-pub(crate) fn llm_credential_status() -> CredentialStatus {
+/// This is the seam `r1.s1.w5` renders its no-credential banner from, and —
+/// since r3.s3.w3 — the value-free read the credential-profile suite and the
+/// `server_auth` credential cases drive from OUTSIDE the crate: it returns the
+/// [`CredentialStatus`] label enum and nothing else, so publishing it cannot
+/// leak credential material (the zero-arg [`resolve_llm_api_key`] stays
+/// `pub(crate)` for exactly that harvest reason). It consults the process's
+/// [`credential_profile`], so in a `pulse serve` process it reports the
+/// SERVER's status — the reading AC-1(c) pins for a cwd-only `.env`.
+#[must_use]
+pub fn llm_credential_status() -> CredentialStatus {
     llm_credential_status_in(&CredentialSearch::from_process_env())
 }
 
@@ -352,6 +482,151 @@ pub(crate) fn llm_credential_status() -> CredentialStatus {
 /// Deliberately a MASK test rather than `mode == 0o600`: an equality check would
 /// refuse `0400`, a file strictly safer than the one it accepts.
 const GROUP_AND_WORLD_BITS: u32 = 0o077;
+
+/// WHY a found credential file was refused — the structured shape of the
+/// fail-closed check (r3.s3.w3).
+///
+/// Two renderings hang off this one type: [`Self::desktop_message`] is the
+/// resolver's error text, BYTE FOR BYTE the strings this module has always
+/// returned (the desktop surfaces them unchanged — operator ruling, r3.s3.w3),
+/// and the [`Display`](std::fmt::Display) impl is `pulse serve`'s one-line
+/// startup refusal body, which `ServeError::CredentialRefused` (in
+/// `crate::server::bind`) frames with its `pulse serve: refusing to start: `
+/// lead-in. The credential VALUE is not part of the type — the file's bytes
+/// are never read before the checks pass — so no rendering of a refusal can
+/// leak one.
+#[derive(Debug)]
+pub(crate) enum CredentialFileRefusal {
+    /// The file could not be OPENED for a reason other than not-found.
+    Open {
+        /// The searched location (as the operator knows it).
+        path: PathBuf,
+        /// The open failure, rendered only through its kind on the serve line.
+        error: std::io::Error,
+    },
+    /// Opened, but its metadata could not be read from the handle.
+    Metadata {
+        /// The searched location.
+        path: PathBuf,
+        /// The metadata failure.
+        error: std::io::Error,
+    },
+    /// Owned by a uid other than the running one.
+    Owner {
+        /// The searched location.
+        path: PathBuf,
+        /// The file's actual owner.
+        owner: u32,
+        /// The uid the check compared against.
+        running_uid: u32,
+    },
+    /// Group or world bits set (`mode & 0o077 != 0`).
+    LooseMode {
+        /// The searched location.
+        path: PathBuf,
+        /// The offending permission mode, already masked to `0o777`.
+        mode: u32,
+    },
+    /// Passed the checks but the bytes could not be read.
+    Read {
+        /// The searched location.
+        path: PathBuf,
+        /// The read failure.
+        error: std::io::Error,
+    },
+}
+
+impl CredentialFileRefusal {
+    /// The resolver's refusal text: byte for byte what this module returned
+    /// before the profile existed (operator ruling, r3.s3.w3 — the desktop
+    /// message does not change).
+    fn desktop_message(&self) -> String {
+        match self {
+            Self::Open { path, error } => format!(
+                "refusing to fall through past the credential file {}: it could not be \
+                 opened ({error}) — a credential location that errors is not the same as \
+                 one that is absent, and silently using a lower-priority key would hide it. \
+                 The file was never read. Fix: make {} readable, or remove it.",
+                path.display(),
+                path.display(),
+            ),
+            Self::Metadata { path, error } => format!(
+                "refusing to read the credential file {}: its metadata could not be read after \
+                 opening it ({error}) — the file was opened but never read. Fix: make {} \
+                 accessible, or remove it.",
+                path.display(),
+                path.display(),
+            ),
+            Self::Owner {
+                path,
+                owner,
+                running_uid,
+            } => format!(
+                "refusing to read the credential file {}: it is owned by uid {owner} but this \
+                 process is running as uid {running_uid} — a credential file must be owned by \
+                 the user reading it, and this one was never read. Fix: chown {running_uid} {}",
+                path.display(),
+                path.display(),
+            ),
+            Self::LooseMode { path, mode } => format!(
+                "refusing to read the credential file {}: its mode is {mode:04o}, which grants \
+                 access to group or others — a credential file must be reachable only by its \
+                 owner, and this one was never read. Fix: chmod 0600 {}",
+                path.display(),
+                path.display(),
+            ),
+            Self::Read { path, error } => format!(
+                "the credential file {} passed its permission checks but could not be read: {error}",
+                path.display(),
+            ),
+        }
+    }
+}
+
+/// `pulse serve`'s Step-3 refusal body (operator ruling, r3.s3.w3): one line
+/// naming the path and the reason, never the value. The io failures render
+/// their KIND only — an OS error string can quote paths, never credential
+/// bytes, but the kind is what the operator needs.
+impl std::fmt::Display for CredentialFileRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LooseMode { path, mode } => write!(
+                f,
+                "{} is group/world-readable (mode {mode:04o}); chmod 600 it",
+                path.display()
+            ),
+            Self::Owner {
+                path,
+                owner,
+                running_uid,
+            } => write!(
+                f,
+                "{} is owned by uid {owner} but the server runs as uid {running_uid}; chown {running_uid} it",
+                path.display()
+            ),
+            Self::Open { path, error } => {
+                write!(
+                    f,
+                    "{} could not be opened ({})",
+                    path.display(),
+                    error.kind()
+                )
+            }
+            Self::Metadata { path, error } => write!(
+                f,
+                "{} could not be inspected ({})",
+                path.display(),
+                error.kind()
+            ),
+            Self::Read { path, error } => write!(
+                f,
+                "{} passed its checks but could not be read ({})",
+                path.display(),
+                error.kind()
+            ),
+        }
+    }
+}
 
 /// Validate one candidate credential file fail-closed, then read
 /// `OLLAMA_API_KEY` out of it.
@@ -399,7 +674,10 @@ const GROUP_AND_WORLD_BITS: u32 = 0o077;
 /// them with `symlink_metadata`/`lstat`, which reports the LINK's own owner and mode
 /// rather than the target's) would be a weaker check than this one, not a stronger
 /// one: it would validate the wrong inode instead of the one actually read.
-fn read_credential_file(path: &Path, running_uid: u32) -> Result<Option<String>, LlmError> {
+fn read_credential_file(
+    path: &Path,
+    running_uid: u32,
+) -> Result<Option<String>, CredentialFileRefusal> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt};
 
@@ -427,65 +705,52 @@ fn read_credential_file(path: &Path, running_uid: u32) -> Result<Option<String>,
         // Every OTHER open failure (an inaccessible parent directory, an I/O error,
         // a symlink loop, ...) is NOT the same as "this location does not answer" —
         // silently falling through would hide the exposed/broken location from the
-        // operator entirely. Refuse instead, in the same voice as the two checks
-        // below: name the path, say plainly what was wrong, say the file was never
-        // read, and give a "Fix:" clause.
+        // operator entirely. Refuse instead: the refusal carries the structured
+        // reason, and the desktop resolver's wording (`desktop_message`) is what
+        // this module has always said.
         Err(error) => {
-            return Err(LlmError::Config(format!(
-                "refusing to fall through past the credential file {}: it could not be \
-                 opened ({error}) — a credential location that errors is not the same as \
-                 one that is absent, and silently using a lower-priority key would hide it. \
-                 The file was never read. Fix: make {} readable, or remove it.",
-                path.display(),
-                path.display(),
-            )));
+            return Err(CredentialFileRefusal::Open {
+                path: path.to_path_buf(),
+                error,
+            });
         }
     };
 
     // `fstat` on the handle we already hold — the owner and mode below describe the
     // exact inode `file` will be read from, never a second, separately-resolved path.
-    let metadata = file.metadata().map_err(|error| {
-        LlmError::Config(format!(
-            "refusing to read the credential file {}: its metadata could not be read after \
-             opening it ({error}) — the file was opened but never read. Fix: make {} \
-             accessible, or remove it.",
-            path.display(),
-            path.display(),
-        ))
-    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| CredentialFileRefusal::Metadata {
+            path: path.to_path_buf(),
+            error,
+        })?;
     if !metadata.is_file() {
         return Ok(None);
     }
 
     let owner = metadata.uid();
     if owner != running_uid {
-        return Err(LlmError::Config(format!(
-            "refusing to read the credential file {}: it is owned by uid {owner} but this \
-             process is running as uid {running_uid} — a credential file must be owned by \
-             the user reading it, and this one was never read. Fix: chown {running_uid} {}",
-            path.display(),
-            path.display(),
-        )));
+        return Err(CredentialFileRefusal::Owner {
+            path: path.to_path_buf(),
+            owner,
+            running_uid,
+        });
     }
 
     let mode = metadata.permissions().mode() & 0o777;
     if mode & GROUP_AND_WORLD_BITS != 0 {
-        return Err(LlmError::Config(format!(
-            "refusing to read the credential file {}: its mode is {mode:04o}, which grants \
-             access to group or others — a credential file must be reachable only by its \
-             owner, and this one was never read. Fix: chmod 0600 {}",
-            path.display(),
-            path.display(),
-        )));
+        return Err(CredentialFileRefusal::LooseMode {
+            path: path.to_path_buf(),
+            mode,
+        });
     }
 
     let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|error| {
-        LlmError::Config(format!(
-            "the credential file {} passed its permission checks but could not be read: {error}",
-            path.display(),
-        ))
-    })?;
+    file.read_to_string(&mut text)
+        .map_err(|error| CredentialFileRefusal::Read {
+            path: path.to_path_buf(),
+            error,
+        })?;
     Ok(parse_dotenv(&text, OLLAMA_API_KEY_VAR))
 }
 
@@ -738,5 +1003,75 @@ mod tests {
             .expect("a normal owned 0600 file must still resolve after the restructuring");
         assert_eq!(key.source(), CredentialSource::ConfigDir);
         assert_eq!(key.expose(), "sk-HANDLEFIX1234abcd5678efgh9012ijkl");
+    }
+
+    // ---- r3.s3.w3: the profile, and the two refusal renderings -----------------
+
+    /// Operator ruling (r3.s3.w3): the DESKTOP refusal text is byte-for-byte
+    /// what this module always returned — only `pulse serve`'s startup line
+    /// got its own wording. This pins the desktop wording so a future edit
+    /// cannot silently drift it.
+    #[test]
+    fn the_desktop_mode_refusal_message_keeps_its_original_wording() {
+        let refusal = super::CredentialFileRefusal::LooseMode {
+            path: std::path::PathBuf::from("/tmp/example/.env"),
+            mode: 0o644,
+        };
+        let message = refusal.desktop_message();
+        assert!(
+            message.contains("grants access to group or others"),
+            "the desktop wording is unchanged; got: {message}"
+        );
+        assert!(
+            message.contains("chmod 0600"),
+            "the fix clause is unchanged; got: {message}"
+        );
+        assert!(
+            !message.contains("group/world"),
+            "the serve-only wording stays out of the desktop message; got: {message}"
+        );
+    }
+
+    /// `pulse serve`'s Step-3 refusal body (operator ruling, r3.s3.w3): the
+    /// exact wording AC-1(a) asserts on, naming the file and "group/world",
+    /// never a value.
+    #[test]
+    fn the_serve_refusal_body_names_group_world_and_the_mode() {
+        let refusal = super::CredentialFileRefusal::LooseMode {
+            path: std::path::PathBuf::from("/tmp/example/.env"),
+            mode: 0o644,
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "/tmp/example/.env is group/world-readable (mode 0644); chmod 600 it"
+        );
+    }
+
+    /// Under the server profile, the production search built from the process
+    /// environment carries NO cwd or manifest dotenv slot at all — the file
+    /// locations are the two deliberate ones only, and the exhausted-search
+    /// message therefore never advertises a location the server would not
+    /// read.
+    ///
+    /// (Process-global, like the suite's other profile cases: under the repo's
+    /// nextest runner this test owns its own process.)
+    #[test]
+    fn the_server_profile_process_search_skips_cwd_and_manifest() {
+        super::set_credential_profile(super::CredentialProfile::Server);
+        let search = super::CredentialSearch::from_process_env();
+        let cwd = std::env::current_dir().expect("cwd");
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (path, _) in search.file_locations() {
+            assert_ne!(
+                path.parent(),
+                Some(cwd.as_path()),
+                "no cwd dotenv slot under Server: {path:?}"
+            );
+            assert_ne!(
+                path.parent(),
+                Some(manifest),
+                "no manifest dotenv slot under Server: {path:?}"
+            );
+        }
     }
 }

@@ -709,3 +709,306 @@ async fn the_request_log_names_the_label_or_a_dash() {
         assert!(!line.contains(&token), "no header value is logged: {line}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// (ix) r3.s3.w3 AC-1 (ledger d31) — the server credential profile at the Step 3
+// seam: a loose credential file refuses the STARTUP (exit non-zero, naming the
+// file and "group/world", never the value), a tight one starts with the
+// `config-dir` label, and a cwd-only `.env` is ignored entirely. These drive
+// the REAL binary (`pulse serve` — the startup path systemd will run), with
+// every credential input pointed at temp dirs and `OLLAMA_API_KEY` removed.
+// ---------------------------------------------------------------------------
+
+/// API-key-SHAPED literals, unique per case so a leak is attributable by its
+/// distinctive middle. Not real credentials — but they must NEVER appear in
+/// the server's output, which is exactly what the assertions below scan for,
+/// and no assertion message ever prints one.
+const SERVE_LOOSE_KEY: &str = "sk-SERVELOOSE0644aa00bb11cc22dd33";
+const SERVE_CONFIG_KEY: &str = "sk-SERVECONFIG0600aa00bb11cc22dd33";
+const SERVE_CWD_KEY: &str = "sk-SERVECWDONLY0600aa00bb11cc22dd33";
+
+/// One isolated `pulse serve` layout: a temp dir holding `home/` (HOME),
+/// `config/` (`PULSE_CONFIG_DIR`), `cwd/` (the server's working directory),
+/// `pulse.db` and `data/`. Every credential-relevant input the binary reads is
+/// inside this one directory.
+struct ServeLayout {
+    _dir: TempDir,
+    home: PathBuf,
+    config_dir: PathBuf,
+    cwd: PathBuf,
+    db: PathBuf,
+    data_dir: PathBuf,
+}
+
+fn serve_layout() -> ServeLayout {
+    let dir = TempDir::new().expect("serve layout tempdir");
+    let home = dir.path().join("home");
+    let config_dir = dir.path().join("config");
+    let cwd = dir.path().join("cwd");
+    let data_dir = dir.path().join("data");
+    for path in [&home, &config_dir, &cwd, &data_dir] {
+        std::fs::create_dir_all(path).expect("create layout dir");
+    }
+    let db = dir.path().join("pulse.db");
+    ServeLayout {
+        _dir: dir,
+        home,
+        config_dir,
+        cwd,
+        db,
+        data_dir,
+    }
+}
+
+/// Write `.env` carrying `OLLAMA_API_KEY=<key>` into `dir` at `mode`.
+fn write_env(dir: &Path, mode: u32, key: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(".env");
+    std::fs::write(&path, format!("OLLAMA_API_KEY={key}\n")).expect("write .env");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod the .env");
+    path
+}
+
+/// A spawned `pulse serve` child: `--dev-loopback` on an ephemeral loopback
+/// port, `OLLAMA_API_KEY` removed, `PULSE_CONFIG_DIR`/`HOME`/`XDG_DATA_HOME`
+/// pointed at the layout, and stderr collected line-by-line on a reader thread
+/// (the production sink is stderr, so the startup lines land there). The child
+/// is killed and reaped on drop.
+struct ServeChild {
+    child: std::process::Child,
+    lines: Arc<std::sync::Mutex<Vec<String>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ServeChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl ServeChild {
+    fn snapshot(&self) -> Vec<String> {
+        use std::sync::PoisonError;
+        self.lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Poll the collected stderr lines for one containing `needle`, up to
+    /// `secs`; once the process exits, give the reader a beat and check once
+    /// more before giving up.
+    fn wait_for_line(&mut self, needle: &str, secs: u64) -> bool {
+        use std::sync::PoisonError;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            if self
+                .lines
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|line| line.contains(needle))
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            match self.child.try_wait().expect("try_wait the serve child") {
+                Some(_) => {
+                    // Exited on its own: the reader drains EOF promptly, so one
+                    // final check after a short join grace is sufficient.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    return self
+                        .lines
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .iter()
+                        .any(|line| line.contains(needle));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// Wait for the child to exit on its own (the refusal path), up to `secs`.
+    fn wait_for_exit(&mut self, secs: u64) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        None
+    }
+}
+
+fn spawn_serve(layout: &ServeLayout, use_cwd: bool) -> ServeChild {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_pulse"));
+    cmd.args(["serve", "--bind", "127.0.0.1:0", "--dev-loopback", "--db"])
+        .arg(&layout.db)
+        .args(["--data-dir"])
+        .arg(&layout.data_dir);
+    cmd.env_remove("OLLAMA_API_KEY");
+    cmd.env("PULSE_CONFIG_DIR", &layout.config_dir);
+    cmd.env("HOME", &layout.home);
+    cmd.env("XDG_DATA_HOME", &layout.home);
+    if use_cwd {
+        cmd.current_dir(&layout.cwd);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn pulse serve");
+    // Drain stdout so a chatty child can never block on a full pipe; the
+    // startup lines this item asserts on go to stderr.
+    let stdout = child.stdout.take().expect("take stdout");
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut sink = String::new();
+        let _ = std::io::BufReader::new(stdout).read_to_string(&mut sink);
+    });
+    let stderr = child.stderr.take().expect("take stderr");
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let collected = Arc::clone(&lines);
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    use std::sync::PoisonError;
+                    collected
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(line);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    ServeChild {
+        child,
+        lines,
+        reader: Some(reader),
+    }
+}
+
+/// (a) A `.env` of mode `0644` in the config dir: startup exits non-zero, its
+/// output names that path and "group/world", and the key string appears
+/// nowhere in stdout or stderr.
+#[test]
+fn a_loose_config_credentials_file_refuses_startup_and_never_names_the_key() {
+    let layout = serve_layout();
+    let dotenv = write_env(&layout.config_dir, 0o644, SERVE_LOOSE_KEY);
+    let mut child = spawn_serve(&layout, false);
+
+    assert!(
+        child.wait_for_line("pulse serve: refusing to start:", 30),
+        "a group/world-readable credential file must refuse the startup; \
+         lines: {:?}",
+        child.snapshot()
+    );
+    let status = child
+        .wait_for_exit(10)
+        .expect("the refusal must exit on its own");
+    let lines = child.snapshot().join("\n");
+
+    assert!(
+        !status.success(),
+        "the refusal must exit non-zero: {status}"
+    );
+    assert!(
+        lines.contains("pulse serve: refusing to start:"),
+        "the refusal is one operator-worded line; got: {lines}"
+    );
+    assert!(
+        lines.contains(dotenv.display().to_string().as_str()),
+        "the refusal names the refused file; got: {lines}"
+    );
+    assert!(
+        lines.contains("is group/world-readable (mode 0644); chmod 600 it"),
+        "the refusal states the group/world reason and the fix; got: {lines}"
+    );
+    assert!(
+        !lines.contains("listening on"),
+        "the refusal happens before any bind; got: {lines}"
+    );
+    assert!(
+        !lines.contains(SERVE_LOOSE_KEY),
+        "the key value must appear nowhere in the server's output"
+    );
+}
+
+/// (b) The same `.env` at mode `0600`: the server starts, and its startup line
+/// names `config-dir` — the label only, never the value.
+#[test]
+fn a_tight_config_credentials_file_starts_and_labels_config_dir() {
+    let layout = serve_layout();
+    write_env(&layout.config_dir, 0o600, SERVE_CONFIG_KEY);
+    let mut child = spawn_serve(&layout, false);
+
+    assert!(
+        child.wait_for_line("pulse serve: LLM credential from config-dir", 30),
+        "the startup line must name the config-dir label; lines: {:?}",
+        child.snapshot()
+    );
+    assert!(
+        child.wait_for_line("pulse serve: listening on", 30),
+        "the server must actually start; lines: {:?}",
+        child.snapshot()
+    );
+    let lines = child.snapshot();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("LLM credential from"))
+            .count(),
+        1,
+        "exactly one credential line: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains(SERVE_CONFIG_KEY)),
+        "the key value must appear nowhere in the server's output"
+    );
+}
+
+/// (c) Only a cwd `.env` (mode `0600`, a valid key): the server starts with
+/// "no LLM credential" — the cwd dotenv is not a server source. (w2 has not
+/// landed on this branch, so there is no credential-status route yet; the
+/// status-reading half of this case is asserted in `tests/secrets_profile.rs`
+/// through `llm_credential_status()`.)
+#[test]
+fn a_cwd_dotenv_alone_is_ignored_and_reports_no_credential() {
+    let layout = serve_layout();
+    write_env(&layout.cwd, 0o600, SERVE_CWD_KEY);
+    let mut child = spawn_serve(&layout, true);
+
+    assert!(
+        child.wait_for_line(
+            "pulse serve: no LLM credential; compose and coach will refuse until one is provided",
+            30,
+        ),
+        "a cwd-only `.env` must not answer; lines: {:?}",
+        child.snapshot()
+    );
+    assert!(
+        child.wait_for_line("pulse serve: listening on", 30),
+        "the server must still start; lines: {:?}",
+        child.snapshot()
+    );
+    let lines = child.snapshot();
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("LLM credential from")),
+        "no credential line when only a cwd `.env` exists: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains(SERVE_CWD_KEY)),
+        "the key value must appear nowhere in the server's output"
+    );
+}

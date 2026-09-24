@@ -4,10 +4,10 @@ Date: 2026-09-24
 
 ## Status
 
-Accepted. Refines [ADR-0015](0015-crates-and-targets.md) to "one crate, one binary, two targets,
+Accepted. Refines [ADR-0015](0015-system-shape-modular-monolith-hexagonal-one-artifact.md) to "one crate, one binary, two targets,
 one database — on the server host", and supersedes the MASTER-SPEC's local-database and
 Keychain-only statements (the app no longer owns a local `pulse.db`; secrets that were Keychain
-material move behind the server credential profile, r3.s4.w3).
+material move behind the server credential profile, r3.s3.w3).
 
 ## Context
 
@@ -50,7 +50,10 @@ The access model:
   surfaces, with MCP bounded by the `agent` scope). The server runs the FULL binary (R1) — no
   feature-gating, no separate server profile.
 - **Credentials:** the server credential profile (exchange access, LLM keys) resolves at server
-  startup (r3.s4.w3, R3); clients hold no market credentials at all. The Mac client's own access
+  startup (r3.s3.w3, R3); clients hold no market credentials at all. The LLM credential comes only
+  from the process environment and the two permission-checked `.env` locations — never the
+  working/manifest dotenv, never the Keychain — and a found-but-refused file stops the startup,
+  naming the file, with the existing source labels unchanged (R3). The Mac client's own access
   token lives behind the `client-token-storage` fake (D10), so the client tests stay hermetic.
 - **Logging:** one stderr line per request (`method, path, status, label, elapsed`); no header
   value, query string or token ever reaches a log.
