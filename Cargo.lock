@@ -4394,6 +4394,7 @@ dependencies = [
  "clap",
  "csv",
  "directories",
+ "futures-core",
  "getrandom 0.3.4",
  "hex",
  "keyring",

@@ -411,6 +411,14 @@ pub use server::bind::{
 };
 pub use server::log::{CaptureLog, RequestLog};
 pub use server::{API_VERSION, ServerState, mount_scoped, router};
+// r3.s3.w2: the operation registry's public seam. `SweepConfig` is the
+// injectable retention the spec requires ("tests use milliseconds");
+// `ComposeRunner`/`ComposeRunCtx` are the spec's narrowest test seam (the
+// compose-run factory — `LlmProvider` is not object-safe, so the seam is the
+// run body whose DEFAULT is the Tauri wrapper's exact credential-resolving
+// body). Re-exported because `tests/server_stream.rs` drives both through the
+// lib boundary.
+pub use server::ops::{ComposeRunCtx, ComposeRunner, SweepConfig};
 
 // VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,
 // BACKLOG-4). The trade-record entities (`Trade`/`Fill`/`ExitReason`/

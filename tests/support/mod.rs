@@ -6,3 +6,8 @@
 //! `call_tool` plumbing — instead of forking it.
 
 pub mod mcp;
+// r3.s3.w2: the shared in-process server harness the command-surface suites
+// (`tests/server_stream.rs`, `tests/server_routes.rs`) drive — real router,
+// fixture store under the server's own data dir, token CLI, sweep + compose
+// seams.
+pub mod server;

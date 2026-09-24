@@ -32,7 +32,7 @@ anyhow = "1"
 # `http2` and `system-proxy` are declared EXPLICITLY: pulsehive-openai 2.0.2 used
 # to pull reqwest 0.12 with them unified on, and 3.0.0 no longer pulls reqwest at
 # all — without them the Binance client silently loses both (PR #169, F1).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "system-proxy", "json"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1"
 # `signal` (r3.s3.w1): `pulse serve` shuts down gracefully on SIGTERM (the
@@ -108,8 +108,14 @@ schemars = { version = "1", features = ["rust_decimal1"] }
 # ---------------------------------------------------------------------------
 # The HTTP surface. axum 0.8 rides the ALREADY-locked hyper 1 / tower 0.5 /
 # http 1 graph (survey 4.5 — no version bumps); only the features the server
-# needs: http1 + tokio (axum::serve, graceful shutdown) + json (bodies).
+# needs: http1 + tokio (axum::serve, graceful shutdown) + json (bodies) — and,
+# since r3.s3.w2, sse-stream plumbing. axum's SSE itself is feature-free; the
+# per-operation stream is a hand-rolled Stream over an mpsc receiver, which
+# needs the `futures-core` trait name — ALREADY resolved in Cargo.lock as a
+# transitive dep of axum (a promotion, not a new edge, same as getrandom
+# below; no version bump, I/O not math).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+futures-core = "0.3"
 # D5: the CSPRNG behind token minting — 32 bytes straight from the OS source.
 # Already resolved in Cargo.lock as a transitive dep (a promotion, not a new
 # edge). I/O not math — not in any determinism fingerprint, so a caret is fine.
