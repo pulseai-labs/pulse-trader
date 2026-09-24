@@ -105,6 +105,16 @@ prepare:
     DATABASE_URL=sqlite://pulse-prepare.db cargo sqlx prepare
     rm -f pulse-prepare.db pulse-prepare.db-wal pulse-prepare.db-shm
 
+# r3.s3.w1 (d30) — the LIVE bind-policy check on draco-desk: builds the debug
+# binary, then proves the server binds its tailnet address only, refuses the
+# LAN address, answers the authenticated handshake over the tailnet and exits
+# 0 on SIGTERM. Needs `tailscale` + one UP non-loopback interface. NEVER runs
+# under `set -x` and never prints the issued token.
+check-serve-bind:
+    cargo build
+    bash scripts/check-serve-bind.sh
+
+
 # --- desktop bundle (r1.s1.w1) ----------------------------------------------
 
 # Build PulseTrader.app for a LOCAL dev run — this is what r1.s1.w5's AC-11 manual

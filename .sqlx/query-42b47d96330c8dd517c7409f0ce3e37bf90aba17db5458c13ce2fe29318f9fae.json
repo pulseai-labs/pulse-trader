@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO client_token (id, label, scope, token_sha256, created_at, revoked_at, created_by, schema_version) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "42b47d96330c8dd517c7409f0ce3e37bf90aba17db5458c13ce2fe29318f9fae"
+}

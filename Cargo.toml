@@ -35,7 +35,9 @@ anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "system-proxy"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `signal` (r3.s3.w1): `pulse serve` shuts down gracefully on SIGTERM (the
+# service-manager case) as well as SIGINT.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 hex = "0.4"
 # WI-1.1.1.04 (parquet persistence).
 polars = { version = "0.53", default-features = false, features = ["parquet"] }
@@ -101,6 +103,20 @@ rmcp = { version = "=3.4.0", features = ["transport-io"] }
 # `JsonSchema` derives on the DSL types feed the `pulse://dsl/schema` resource;
 # `rust_decimal1` gives `Decimal` its string/number wire schema.
 schemars = { version = "1", features = ["rust_decimal1"] }
+# ---------------------------------------------------------------------------
+# r3.s3.w1 (ADR-0026) — the `pulse serve` server ring.
+# ---------------------------------------------------------------------------
+# The HTTP surface. axum 0.8 rides the ALREADY-locked hyper 1 / tower 0.5 /
+# http 1 graph (survey 4.5 — no version bumps); only the features the server
+# needs: http1 + tokio (axum::serve, graceful shutdown) + json (bodies).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+# D5: the CSPRNG behind token minting — 32 bytes straight from the OS source.
+# Already resolved in Cargo.lock as a transitive dep (a promotion, not a new
+# edge). I/O not math — not in any determinism fingerprint, so a caret is fine.
+getrandom = "0.3"
+# D5: the unpadded base64url token encoding (`pt_` + 43 chars). Also already in
+# the lock (0.22.1) — a promotion.
+base64 = "0.22"
 
 # ---------------------------------------------------------------------------
 # r1.s1.w1 (ADR-0020) — the desktop shell.

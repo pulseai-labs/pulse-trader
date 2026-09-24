@@ -78,6 +78,14 @@ pub use coach_acceptance_repo::SqliteCoachAcceptanceRepo;
 // confined to this module tree (the `.sqlx` cache covers this file too).
 pub mod walk_forward_run_repo;
 
+// r3.s3.w1 (D5/D8, ADR-0026): the client-token store — `client_token` rows and
+// the append-only `token_audit` ledger. `query!` macros for these two tables are
+// confined here (the `.sqlx` cache is keyed to this file).
+pub mod client_token_repo;
+// `TokenStoreError` is deliberately NOT re-exported: nothing outside this
+// module tree names it (callers map it into their own error vocabulary).
+pub use client_token_repo::{ClientToken, SqliteClientTokenRepo};
+
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
 // item — under `#![deny(warnings)]` a `pub` item unused outside its module is a
 // `dead_code` BUILD ERROR, not a warning (VS-1.1.2 harvested gotcha). All three

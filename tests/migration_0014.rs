@@ -638,7 +638,11 @@ async fn the_narrowed_immutability_trigger_still_refuses_the_other_columns() {
 
 /// The down REFUSES while any pointer is set — a set `latest_walk_forward_run_id`
 /// is certification state 0013 cannot represent, and dropping it would falsify
-/// the record (the 0010/0011/0012/0013 refusal pattern).
+/// the record (the 0010/0011/0012/0013 refusal pattern). Since r3.s3.w1 the
+/// same `undo_to` first runs 0016's own legal down (the client-token tables
+/// have no refusal state), so the database legitimately lands at 0014 — the
+/// property under test is that the REFUSED 0014 down commits nothing of its
+/// own teardown.
 #[tokio::test]
 async fn the_down_refuses_a_set_pointer() {
     let (_tmp, db) = db_at_0014().await;
@@ -660,12 +664,13 @@ async fn the_down_refuses_a_set_pointer() {
     assert_eq!(
         applied_max(db.pool()).await,
         14,
-        "the refusal is transactional — the database stays at 0014"
+        "the refused 0014 down is transactional: 0016's legal down committed, 0014's refused one did not"
     );
 }
 
 /// The down REFUSES while any proposal records `walk_forward` — a stage the
-/// 0008 vocabulary cannot store.
+/// 0008 vocabulary cannot store. As in the pointer test, 0016's legal down
+/// commits first, so the database legitimately sits at 0014 after the refusal.
 #[tokio::test]
 async fn the_down_refuses_a_recorded_walk_forward_stage() {
     let (_tmp, db) = db_at_0014().await;
@@ -683,7 +688,11 @@ async fn the_down_refuses_a_recorded_walk_forward_stage() {
         .await
         .expect_err("a recorded walk_forward stage must refuse the down");
     assert!(err.to_string().contains("0014"), "{err}");
-    assert_eq!(applied_max(db.pool()).await, 14);
+    assert_eq!(
+        applied_max(db.pool()).await,
+        14,
+        "0016's down committed; the refused 0014 down did not"
+    );
 }
 
 /// With nothing the 0013 shape cannot hold, the down restores it exactly: the
@@ -752,6 +761,6 @@ async fn the_down_restores_the_0013_shape() {
 
     // The round trip closes: 0014 re-applies on top of the restored 0013.
     MIGRATOR.run(db.pool()).await.expect("re-run to 0014");
-    assert_eq!(applied_max(db.pool()).await, 14);
+    assert_eq!(applied_max(db.pool()).await, 16);
     assert_eq!(proposal_row(db.pool(), "prop-1").await, before);
 }

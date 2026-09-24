@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO token_audit (id, at, event, token_id, label, reason, route, peer, schema_version) VALUES (?, ?, 'revoked', ?, ?, NULL, NULL, NULL, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "d27e773e814b63aea00afd7e737bde7c53d9851b37615cd4e4fe519523a416cf"
+}
