@@ -24,6 +24,11 @@ mod entry;
 // may name `rmcp` (`scripts/check-mcp-boundary.sh` enforces it). Private like
 // `adapters`; `cli::mcp` is its composition root.
 mod mcp;
+// r3.s3.w1 (ADR-0026): the `pulse serve` server ring — the axum router, the
+// auth middleware, the request log and the bind policy. Private like
+// `adapters`; `cli::serve` is its composition root, and the curated re-exports
+// below are what the integration boundary (and the probe-route tests) reach.
+mod server;
 mod tauri;
 
 // The domain layer is the library's stable public API surface (the port traits
@@ -389,6 +394,23 @@ pub use adapters::memory::{InMemoryCoachAcceptanceRepo, MemoryAcceptedChild, Mem
 // build error, not a warning (VS-1.1.2 harvested gotcha); re-export ALL of them,
 // not just the first. Append-only (keep-both with 1.03's re-exports at merge).
 pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
+
+// r3.s3.w1 (ADR-0026): the server surface. `router` + `mount_scoped` build the
+// axum app (w2/w5 mount their routes through `mount_scoped`; the probe-route
+// tests do the same); `ServerState` carries pool + data dir + the log sink;
+// `RequestLog`/`CaptureLog` are the injectable sink; `API_VERSION`/`Scope` are
+// the D4/D5 vocabulary. `auth::mint_token`/`auth::hash_token` are re-exported
+// for the token CLI and its tests. `bind` is the D6 vocabulary: the pure
+// policy check, the injectable retry loop and the named startup errors. All of
+// it REQUIRED under `deny(warnings)` — a `pub` item unused outside `server` is
+// a `dead_code` build error otherwise.
+pub use server::auth::{Scope, hash_token, mint_token};
+pub use server::bind::{
+    BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, bind_with_retry,
+    check_bind,
+};
+pub use server::log::{CaptureLog, RequestLog};
+pub use server::{API_VERSION, ServerState, mount_scoped, router};
 
 // VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,
 // BACKLOG-4). The trade-record entities (`Trade`/`Fill`/`ExitReason`/

@@ -273,17 +273,17 @@ async fn migration_0005_applies_to_a_database_already_at_0007() {
     );
     // The subject of this test is that `0005` APPLIED even though it sorts BELOW
     // the maximum the database already held — the reserved-number property. The
-    // maximum itself moved to 14 across r1.s4.w4, r2.s1.w1, G1, r2.s2.w2,
-    // r2.s3.w2, r2.s3.w3 and r2.s3.w4 because the same run also applies `0008`,
-    // `0009`, `0010`, `0011`, `0012`, `0013` and `0014`, which the fixture
-    // withheld; asserting
+    // maximum itself moved to 16 across r1.s4.w4, r2.s1.w1, G1, r2.s2.w2,
+    // r2.s3.w2, r2.s3.w3, r2.s3.w4 and r3.s3.w1 because the same run also
+    // applies `0008`, `0009`, `0010`, `0011`, `0012`, `0013`, `0014` and
+    // `0016`, which the fixture withheld; asserting
     // `Some(7)` here would now be asserting that they did not run, which is a
     // different (and false) claim.
-    assert_all_rode_along(&applied, &[8, 9, 10, 11, 12, 13, 14]);
+    assert_all_rode_along(&applied, &[8, 9, 10, 11, 12, 13, 14, 16]);
     assert_eq!(
         applied.iter().copied().max(),
-        Some(14),
-        "0005 is recorded at its own version, below the new maximum 0014 sets"
+        Some(16),
+        "0005 is recorded at its own version, below the new maximum 0016 sets"
     );
 
     assert!(

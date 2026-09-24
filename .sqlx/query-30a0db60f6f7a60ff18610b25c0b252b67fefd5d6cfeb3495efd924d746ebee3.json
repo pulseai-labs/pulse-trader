@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE client_token SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "30a0db60f6f7a60ff18610b25c0b252b67fefd5d6cfeb3495efd924d746ebee3"
+}
