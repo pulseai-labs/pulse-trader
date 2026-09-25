@@ -31,7 +31,7 @@ use chrono::Utc;
 use clap::Args;
 
 use super::import::{
-    SourceSnapshot, VerifiedCopy, default_backup_out_dir, resolve_target_data_dir,
+    SourceSnapshot, VerifiedCopy, bytes_equal, default_backup_out_dir, resolve_target_data_dir,
     resolve_target_db, run_verified_copy, scan_snapshots,
 };
 use crate::adapters::db::ops;
@@ -131,7 +131,8 @@ pub(crate) struct BackupOutcome {
 /// # Errors
 ///
 /// A snapshot-layout problem in the source store (nothing is written at all),
-/// or a failed database/snapshot copy — the partial database file and the
+/// a snapshot the store already holds with different bytes (refused, naming
+/// it), or a failed database/snapshot copy — the partial database file and the
 /// snapshots this call added are deleted.
 pub(crate) async fn backup_target(
     db_path: &Path,
@@ -152,6 +153,23 @@ pub(crate) async fn backup_target(
     }
 
     let out_store = CandleStore::with_base_dir(out_dir.to_path_buf());
+    // Verify what the store ALREADY holds before anything is written. Snapshots
+    // are immutable and content-addressed, so an existing same-named file must
+    // be byte-identical: skipping it unverified would let a truncated or
+    // replaced file make every later backup report success while the database
+    // it writes references unusable bytes — and the restore would then refuse
+    // that backup, days after the fact.
+    for snap in &snapshots {
+        let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
+        if dest.exists() && !bytes_equal(&snap.path, &dest) {
+            anyhow::bail!(
+                "backup: the store already holds {} with different bytes than the source \
+                 snapshot {} — refusing to write a database that would reference it",
+                dest.display(),
+                snap.path.display()
+            );
+        }
+    }
 
     let backup_path = backup_database(db_path, out_dir).await?;
     let copied = copy_missing_snapshots(&out_store, &snapshots, &backup_path)?;

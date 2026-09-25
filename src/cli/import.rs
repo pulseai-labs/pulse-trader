@@ -619,14 +619,23 @@ pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Misma
     let mut out = Vec::new();
     let mut issues = Vec::new();
     let candles = data_dir.join("candles");
-    let Ok(pair_entries) = fs::read_dir(&candles) else {
-        issues.push(Mismatch::new(
-            "snapshot",
-            candles.display().to_string(),
-            "layout",
-            "the source data dir holds no candles/ directory",
-        ));
-        return (out, issues);
+    let pair_entries = match fs::read_dir(&candles) {
+        Ok(entries) => entries,
+        // A MISSING candles/ root is an EMPTY store, not a layout problem:
+        // every fresh install (a migrated database with no candles fetched yet)
+        // has one, and its nightly backup must still write the database.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (out, issues),
+        // Any other read error is a refusal: the store is there and cannot be
+        // read, which no backup may paper over.
+        Err(_) => {
+            issues.push(Mismatch::new(
+                "snapshot",
+                candles.display().to_string(),
+                "layout",
+                "the candle store directory is unreadable",
+            ));
+            return (out, issues);
+        }
     };
     for pair_entry in pair_entries.flatten() {
         if !pair_entry.path().is_dir() {

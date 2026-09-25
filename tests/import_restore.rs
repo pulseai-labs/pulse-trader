@@ -1175,6 +1175,107 @@ async fn a_target_holding_only_token_rows_is_not_empty() {
 // the backup store's integrity
 // ---------------------------------------------------------------------------
 
+/// A missing `<data>/candles` root is an EMPTY snapshot store, not a broken
+/// layout: a fresh install (a migrated database, no candles fetched yet) must
+/// still back its database up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_of_a_fresh_install_without_candles_writes_the_database() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let db_path = dir.path().join("server").join("pulse.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let data_dir = dir.path().join("server-data"); // never created: no candles/
+    open_migrated(&db_path).await.unwrap();
+    assert!(!data_dir.join("candles").exists(), "the store is empty");
+
+    let out_dir = dir.path().join("backups");
+    let out = run_pulse(
+        &home,
+        &[
+            "backup",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "a fresh install's backup must succeed: {text}"
+    );
+    assert!(
+        text.contains("snapshots copied 0 (store 0)"),
+        "the empty store is reported as empty: {text}"
+    );
+    assert_eq!(
+        backup_db_files(&out_dir).len(),
+        1,
+        "the database was backed up"
+    );
+}
+
+/// A snapshot the backup store ALREADY holds is verified, never skipped: a
+/// truncated file would otherwise let every later backup report success while
+/// its database references unusable bytes — and the restore would refuse that
+/// backup, days after the fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_snapshot_already_in_the_backup_store_is_refused() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+    assert!(import_once(&s, &target_db, &target_data).status.success());
+
+    let out_dir = s.dir.path().join("backups");
+    let backup_args = || {
+        vec![
+            "backup".to_owned(),
+            "--db".to_owned(),
+            target_db.display().to_string(),
+            "--data-dir".to_owned(),
+            target_data.display().to_string(),
+            "--out-dir".to_owned(),
+            out_dir.display().to_string(),
+        ]
+    };
+    let first = run_pulse(&s.home, &str_args(&backup_args()));
+    assert!(
+        first.status.success(),
+        "the first backup must succeed: {}",
+        combined(&first)
+    );
+    let written = backup_db_files(&out_dir);
+    assert_eq!(written.len(), 1, "one backup db");
+
+    // Truncate the store's copy of the 15m snapshot.
+    let victim = out_dir
+        .join("candles")
+        .join("BTCUSDT")
+        .join("15m")
+        .join(format!("{}.parquet", s.stems.0));
+    let truncated = fs::read(&victim).unwrap();
+    fs::write(&victim, &truncated[..truncated.len() / 2]).unwrap();
+
+    let second = run_pulse(&s.home, &str_args(&backup_args()));
+    let text = combined(&second);
+    assert!(
+        !second.status.success(),
+        "a corrupt file already in the store must refuse the backup: {text}"
+    );
+    assert!(
+        text.contains("already holds") && text.contains(&victim.display().to_string()),
+        "the refusal names the snapshot: {text}"
+    );
+    assert_eq!(
+        backup_db_files(&out_dir).len(),
+        1,
+        "the refusal wrote no new backup database"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // the restore --help precondition
 // ---------------------------------------------------------------------------
