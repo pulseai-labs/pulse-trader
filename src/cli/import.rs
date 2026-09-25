@@ -272,7 +272,15 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
         }
     };
     let steps = run_steps(&job, &opened).await;
-    drop(opened); // close the pool before any file surgery on either path
+    // CLOSE the copy's pool — do not merely drop the handle — before any file
+    // surgery on either path. A dropped handle releases the pool without
+    // closing its connections, so committed rows could still sit in the
+    // temporary database's `-wal` when the install renames only the database
+    // file: the rename would publish a database whose writes live in a WAL left
+    // behind (and the target's own stale sidecars are removed on the way in), so
+    // a fresh reader would see a database missing its most recent commits.
+    // Closing checkpoints the WAL into the file and removes it.
+    opened.pool().close().await;
 
     match steps {
         Err(StepFailure::Fatal { error, added }) => {

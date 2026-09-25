@@ -1066,6 +1066,60 @@ async fn no_token_or_credential_material_appears_in_any_output() {
 }
 
 // ---------------------------------------------------------------------------
+// round 4, Fix 1 — close the copy's pool before the file surgery
+// ---------------------------------------------------------------------------
+
+/// The install renames only the database file and removes the target's own
+/// stale sidecars on the way in, so the copy's pool must be CLOSED — not merely
+/// dropped — before the surgery: a dropped handle leaves the connections open,
+/// committed rows can still sit in the temporary database's `-wal`, and the
+/// rename would publish a database whose writes were left behind in a WAL that
+/// no longer travels with it.
+///
+/// Deterministic evidence: the temporary database's sidecars (`-wal`/`-shm`)
+/// do not travel with the rename, so an unfinished copy leaves them beside the
+/// installed target under the temporary's name — nothing removes them on the
+/// success path. Closing the pool checkpoints and removes them, so the target
+/// directory holds the database and nothing else, and a FRESH pool over the
+/// installed file reads every row back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_install_leaves_no_sidecars_and_every_row_reads_back() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+
+    let out = run_pulse(
+        &s.home,
+        &str_args(&import_args(&s, &target_db, &target_data, false)),
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "the import must succeed: {text}");
+
+    // Nothing left over from the copy that ran beside the target: no `-wal`/
+    // `-shm` (either the target's or the temporary's) and no `.partial` from a
+    // snapshot copy.
+    let dir = target_db.parent().expect("the target's directory");
+    let strays: Vec<String> = fs::read_dir(dir)
+        .expect("read the target directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| {
+            name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with(".partial")
+        })
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the install must leave no sidecar or partial file beside the target: {strays:?}"
+    );
+
+    // And the file the rename published is self-contained: a fresh pool reads
+    // every row back (a database whose writes were still in a WAL would be
+    // missing them).
+    assert_table_counts_equal(&s.from_db, &target_db).await;
+    assert_stored_hashes_equal(&s.from_db, &target_db).await;
+}
+
+// ---------------------------------------------------------------------------
 // the offline precondition, on import
 // ---------------------------------------------------------------------------
 
