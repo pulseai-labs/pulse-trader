@@ -315,6 +315,17 @@ function useReopenedWalkForward(
     if (lastRead.current?.version === version && lastRead.current.target === target) {
       return;
     }
+    // A read starts only where NOTHING is held for this id yet, or where the last
+    // one FAILED — F2's retry, and the only same-pointer re-read there is. A
+    // loaded run is immutable and is therefore never revalidated: the focus
+    // refetch cannot spend a second read on it, and a transient refresh failure
+    // cannot evict a run the trader is reading (review P2-B). A read already in
+    // flight is not restarted by a refetch either. `held` is read as the render
+    // that changed these deps saw it, and is deliberately NOT a dependency: the
+    // state this effect writes would otherwise re-run it.
+    if (held.id === target && (held.state.kind === "done" || held.state.kind === "loading")) {
+      return;
+    }
     lastRead.current = { version, target };
     // Claimed only where a read actually starts, so the StrictMode replay above
     // cannot supersede the read it is deduplicating.

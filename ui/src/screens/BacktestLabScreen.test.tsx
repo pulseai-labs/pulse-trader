@@ -2221,43 +2221,74 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
       message: "the server did not answer",
       run_id: null, session_id: null, child_run_id: null,
     };
-    // A fresh payload object per call, so the refetch really re-reads.
-    catalogMock.mockImplementation(async () => ({
-      status: "ok" as const,
-      data: reopenableCatalog("wf-6c1d9f38", null),
-    }));
-    const pending: Array<(answer: ReopenAnswer) => void> = [];
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", "wf-9a8b7c6d"),
+    });
+    const pending: Array<{ id: string; answer: (answer: ReopenAnswer) => void }> = [];
     reopenMock.mockImplementation(
-      () =>
+      (request) =>
         new Promise<ReopenAnswer>((resolve) => {
-          pending.push(resolve);
+          pending.push({ id: request.walkForwardRunId, answer: resolve });
         }),
     );
 
     render(<BacktestLabScreen />);
     await waitFor(() => {
-      expect(pending).toHaveLength(1);
+      expect(pending).toHaveLength(1); // v-alpha-1's first read
     });
 
-    // The window regains focus: the SAME pointer is read again.
-    fireEvent(window, new Event("focus"));
+    // Away and back while that read is still out: the SAME id is read twice.
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
     await waitFor(() => {
-      expect(pending).toHaveLength(2);
+      expect(pending).toHaveLength(2); // v-alpha-2's read
     });
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-1" } });
+    await waitFor(() => {
+      expect(pending).toHaveLength(3); // v-alpha-1 again
+    });
+    const sameId = pending.filter((entry) => entry.id === "wf-6c1d9f38");
+    expect(sameId).toHaveLength(2);
 
-    // The newer read succeeds...
+    // The NEWER read of that id succeeds...
     await act(async () => {
-      pending[1]({ status: "ok", data: REOPENED_DTO });
+      sameId[1].answer({ status: "ok", data: REOPENED_DTO });
     });
     expect(screen.getByText("wf-6c1d9f38")).toBeTruthy();
 
-    // ...and the older one fails LAST for that same id. The id matches, but the
-    // read is still superseded: the run stays, the stale failure is dropped.
+    // ...and the older one fails LAST, for the very same id. The id matches, but
+    // the read is still superseded: the run stays, the stale failure is dropped.
     await act(async () => {
-      pending[0]({ status: "error", error: offline });
+      sameId[0].answer({ status: "error", error: offline });
     });
     expect(screen.getByText("wf-6c1d9f38")).toBeTruthy();
     expect(screen.queryByText(offline.message)).toBeNull();
+  });
+
+  it("never revalidates a run it already shows: a refetch with the same pointer spends no read and evicts nothing (P2-B)", async () => {
+    // A fresh payload object per call, so the refetch really is a new catalogue.
+    catalogMock.mockImplementation(async () => ({
+      status: "ok" as const,
+      data: reopenableCatalog("wf-6c1d9f38", null),
+    }));
+    reopenMock.mockResolvedValue({ status: "ok", data: REOPENED_DTO });
+
+    render(<BacktestLabScreen />);
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+
+    // The window regains focus — a new catalogue, the same pointer. The run is
+    // immutable and already on screen, so there is nothing to revalidate: no
+    // second read, and no chance for a transient failure to evict it.
+    const callsOnMount = catalogMock.mock.calls.length;
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => {
+      expect(catalogMock.mock.calls.length).toBeGreaterThan(callsOnMount);
+    });
+
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("wf-6c1d9f38")).toBeTruthy();
+    expect(screen.queryByText("Opening the persisted walk-forward run…")).toBeNull();
   });
 });
 
