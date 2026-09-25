@@ -1453,12 +1453,17 @@ mod source_scan;
 /// The two coach composition sites, as `(file, the fn that opens the site, the
 /// call that closes it)`.
 ///
-/// Both wrappers resolve a live credential and construct a live transport, so
+/// Both sites resolve a live credential and construct a live transport, so
 /// neither is reachable from an offline test — and they are exactly where the two
 /// surfaces drifted: until #164 the desktop built `compose_config` (the composer's
 /// 4 096-token cap and 0.2 temperature) while `pulse coach` sent 0.0 and the CLI
 /// reasoning constant, and until PR #165's review round each built its provider
 /// inline, where swapping `single_attempt` for `new` would have passed every gate.
+///
+/// r3.s3.w5: the desktop became a thin client, so the SECOND site is the
+/// server's op arm now — the composition moved there byte for byte, and the
+/// scan follows it. The desktop's `coach_turn` is a proxy that builds no
+/// transport at all.
 const COACH_SITES: [(&str, &str, &str); 2] = [
     (
         "src/cli/coach.rs",
@@ -1466,8 +1471,8 @@ const COACH_SITES: [(&str, &str, &str); 2] = [
         "run_coach_with(",
     ),
     (
-        "src/tauri/commands.rs",
-        "pub async fn coach_turn(",
+        "src/server/ops.rs",
+        "async fn op_coach_turn(",
         "coach_turn_core(",
     ),
 ];

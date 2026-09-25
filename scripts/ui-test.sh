@@ -48,6 +48,7 @@ note_failure() { failures+=("$1"); }
 ui_tests=(
   "src/screens/LibraryScreen.test.tsx"
   "src/screens/BacktestLabScreen.test.tsx"
+  "src/screens/ConnectScreen.test.tsx"
   "src/hooks/useRefetchOnFocus.test.tsx"
 )
 

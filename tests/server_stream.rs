@@ -27,10 +27,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use pulse::{
-    BusError, ComposeDeps, ComposeResult, ComposeRunCtx, ComposeRunner, ComposeWiring,
+    BusError, ClientError, ComposeDeps, ComposeResult, ComposeRunCtx, ComposeRunner, ComposeWiring,
     CredentialSource, Db, FakeClock, LlmBackend, LlmConfig, LlmError, LlmProvider, LlmResponse,
-    Message, ModelPrice, OperationKey, PriceTable, Redactor, SqliteLlmCallRepo, SqliteStrategyRepo,
-    TokenUsage, ToolCall, ToolDefinition, VersionId, compose_strategy_core,
+    Message, ModelPrice, OperationKey, PriceTable, Redactor, ServerClient, SqliteLlmCallRepo,
+    SqliteStrategyRepo, TokenUsage, ToolCall, ToolDefinition, VersionId, compose_strategy_core,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -755,4 +755,80 @@ async fn the_fake_credential_value_never_reaches_a_frame_a_body_or_the_log() {
         json!(true),
         "the scripted run cancelled as staged"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AC-3 — the version-skew refusal (r3.s3.w5)
+// ---------------------------------------------------------------------------
+
+/// A raw TCP stub answering the handshake with the NEXT API generation and a
+/// body that is NOT a handshake body — so "the client refused on the version
+/// header" and "the client never parsed the body" are observable separately:
+/// a client that parsed first would answer `Unreachable { unreadable body }`,
+/// not `Skew`.
+#[tokio::test]
+async fn a_version_skewed_handshake_is_refused_before_any_body_is_parsed() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let addr = probe.local_addr().expect("probe addr");
+    drop(probe);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind stub");
+    let base = format!("http://{}", listener.local_addr().expect("stub local"));
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept the handshake");
+        // Drain the request head (and any body the client sent).
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            use tokio::io::AsyncReadExt as _;
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("read request byte");
+            buf.push(byte[0]);
+            let text = String::from_utf8_lossy(&buf);
+            if text.contains("\r\n\r\n") {
+                break;
+            }
+        }
+        // The sentinel body: deliberately not a handshake DTO. A client that
+        // deserialized before checking the version would answer with an
+        // "unreadable body" refusal and this test would catch the ordering.
+        let body = "{\"sentinel\": \"if you can read this, the body was parsed\"}";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     x-pulse-api-version: 2\r\nconnection: close\r\n\
+                     content-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("answer the skewed handshake");
+    });
+
+    let Err(error) = ServerClient::connect(&base, "any-token").await else {
+        panic!("a version-2 server must be refused");
+    };
+    handle.await.expect("stub completes");
+
+    match error {
+        ClientError::Skew { server_api_version } => {
+            assert_eq!(
+                server_api_version, 2,
+                "the skew names the generation the server announced"
+            );
+        }
+        other => panic!(
+            "a skewed handshake must refuse with Skew, got {other:?} — the version \
+             header must be checked before any body byte is parsed"
+        ),
+    }
 }

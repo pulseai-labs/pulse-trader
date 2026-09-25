@@ -15,7 +15,12 @@ mod agent;
 // boundary, and the composition roots (`cli::mod`, `tauri::commands::DesktopState`)
 // choose the implementations it is generic over.
 mod application;
+// r3.s3.w5: the thin-client core — the HTTP seam between the desktop command
+// bus and the always-on server. Private like `adapters`; `tauri::commands` is
+// its composition root and the curated re-exports below are what the tests
+// (`tests/client_proxy.rs`) and the commands reach.
 mod cli;
+mod client;
 // r1.s1.w1 (ADR-0020): the argv dispatch that decides GUI vs CLI. Kept OUT of
 // `cli` on purpose -- it runs BEFORE any surface is chosen, so it cannot live
 // inside one of them.
@@ -665,9 +670,16 @@ pub use crate::tauri::{
     ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EquityPointDto, EventSink,
     HistogramBinDto, HistogramDto, LibraryOverview, LibraryRunSummary, LibraryStrategy,
     LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
-    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core, dsl_summary,
-    export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
-    shell_info_core, summarize_dsl,
+    backtest_run_dto, compare_child_run_core, compose_strategy_body, compose_strategy_core,
+    demo_stream_core, dsl_summary, export_bindings, library_overview_core,
+    run_backtest_version_core, run_desktop, shell_info_core, summarize_dsl,
+};
+// r3.s3.w5: the thin-client surface — `tests/client_proxy.rs` (AC-1) drives the
+// client against the in-process server, and the proxied command wrappers in
+// `src/tauri/commands.rs` speak through `ClientState`.
+pub use crate::client::{
+    ClientError, ClientState, ConnectOutcome, RetryBackoff, RunOpOutcome, ServerClient,
+    ServerStatus, ServerStatusState,
 };
 // r2.s3.w5: the walk-forward wire contract — the request/response DTOs plus
 // the three transport-free cores `tests/tauri_walk_forward.rs` (AC-2) drives.

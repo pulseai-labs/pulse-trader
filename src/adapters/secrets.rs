@@ -628,8 +628,7 @@ impl std::fmt::Display for CredentialFileRefusal {
     }
 }
 
-/// Validate one candidate credential file fail-closed, then read
-/// `OLLAMA_API_KEY` out of it.
+/// Validate one candidate file fail-closed, then hand back its vetted bytes.
 ///
 /// `Ok(None)` means "this location does not answer" — the file genuinely does not
 /// exist (`File::open` fails with [`std::io::ErrorKind::NotFound`]), or it exists but
@@ -674,7 +673,16 @@ impl std::fmt::Display for CredentialFileRefusal {
 /// them with `symlink_metadata`/`lstat`, which reports the LINK's own owner and mode
 /// rather than the target's) would be a weaker check than this one, not a stronger
 /// one: it would validate the wrong inode instead of the one actually read.
-fn read_credential_file(
+/// r3.s3.w5: the client-core's connection file (`mcp-connection.toml`) rides
+/// the SAME vetted read — a visibility word plus this doc line, never a copy
+/// of the logic (the memory-bank seam convention). The caller parses its own
+/// keys out of the vetted text; the checks below are the only read path.
+pub(crate) fn read_vetted_file(path: &Path) -> Result<Option<String>, CredentialFileRefusal> {
+    read_vetted_file_with(path, running_uid())
+}
+
+/// [`read_vetted_file`] with the running uid injectable (the tests' seam).
+fn read_vetted_file_with(
     path: &Path,
     running_uid: u32,
 ) -> Result<Option<String>, CredentialFileRefusal> {
@@ -751,7 +759,22 @@ fn read_credential_file(
             path: path.to_path_buf(),
             error,
         })?;
-    Ok(parse_dotenv(&text, OLLAMA_API_KEY_VAR))
+    Ok(Some(text))
+}
+
+/// Validate one candidate credential file fail-closed, then read
+/// `OLLAMA_API_KEY` out of it.
+///
+/// `Ok(None)` means "this location does not answer" — the file genuinely does not
+/// exist (`File::open` fails with [`std::io::ErrorKind::NotFound`]), or it exists but
+/// carries no `OLLAMA_API_KEY` line, or it is a directory rather than a file. All
+/// three are ordinary misses that fall through to the next location.
+fn read_credential_file(
+    path: &Path,
+    running_uid: u32,
+) -> Result<Option<String>, CredentialFileRefusal> {
+    let text = read_vetted_file_with(path, running_uid)?;
+    Ok(text.and_then(|text| parse_dotenv(&text, OLLAMA_API_KEY_VAR)))
 }
 
 /// The error message for an exhausted search: it names every location actually

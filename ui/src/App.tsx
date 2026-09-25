@@ -13,6 +13,8 @@ import type { ReactNode } from "react";
 
 import { CredentialBanner } from "./components/CredentialBanner";
 import { ActiveOperationsProvider } from "./hooks/useActiveOperations";
+import { useServerStatus } from "./hooks/useServerStatus";
+import ConnectScreen from "./screens/ConnectScreen";
 import { NAV_ALL, Sidebar, WindowChrome } from "./shell/AppShell";
 import { resolveNavId, resolveRoute } from "./routes";
 import type { Route } from "./routes";
@@ -39,6 +41,12 @@ export function App() {
     resolveNavId(window.location.hash, KNOWN_NAV_IDS),
   );
 
+  // The connection gate (r3.s3.w5): the polled status decides whether the app
+  // renders at all. Until the FIRST read answers, render nothing — a flash of
+  // the full app before a "not connected" gate would be a lie on the way to
+  // the truth.
+  const { status: serverStatus, refresh: refreshStatus } = useServerStatus();
+
   useEffect(() => {
     const onHashChange = () => setNavId(resolveNavId(window.location.hash, KNOWN_NAV_IDS));
     window.addEventListener("hashchange", onHashChange);
@@ -57,6 +65,17 @@ export function App() {
   // content in (see `LibraryScreen.tsx`).
   const showDetailsPane = route?.details === true;
 
+  if (serverStatus === null) {
+    return null;
+  }
+  if (serverStatus.state !== "up") {
+    return (
+      <WindowChrome docTitle="Connect">
+        <ConnectScreen status={serverStatus} onConnected={refreshStatus} />
+      </WindowChrome>
+    );
+  }
+
   // r1.s4.w3 (#141): active operations are held ABOVE `RouteContent`, which is
   // the line a navigation re-mounts across. A backtest or a coach turn started in
   // the Lab therefore survives a trip to the Library and is still there — running
@@ -65,7 +84,7 @@ export function App() {
   // remount it exists to survive.
   return (
     <ActiveOperationsProvider>
-      <WindowChrome docTitle={title}>
+      <WindowChrome docTitle={title} serverStatus={serverStatus}>
         <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
           <Sidebar active={navId} />
           <main className="content">
