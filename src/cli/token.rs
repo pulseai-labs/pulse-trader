@@ -6,6 +6,13 @@
 //! line per token (label, scope, `created_at`, `revoked_at` or `active`) and
 //! NEVER prints a token or its hash.
 //!
+//! **A credential that cannot be revealed is revoked, not left behind.** The
+//! issue path writes its one line with a CHECKED write and, when that write
+//! fails (a broken pipe, a full disk), revokes the row it just issued and exits
+//! non-zero: only the hash is stored and labels are never reused, so a token
+//! that reached the database without reaching the operator would be
+//! permanently unrecoverable.
+//!
 //! These commands are the one sanctioned second writer to `pulse.db` beside a
 //! running server (WAL permits it; ADR-0026): a token cannot be issued over an
 //! API that needs a token.
@@ -77,8 +84,25 @@ pub(crate) async fn run_token(args: &TokenArgs) -> anyhow::Result<()> {
             repo.issue(name.as_str(), scope.as_str(), &hash, "cli:token-issue")
                 .await
                 .map_err(|e| anyhow::anyhow!("token issue refused: {e}"))?;
-            // The one stdout line — the only thing a capturing script sees.
-            println!("{token}");
+            // The one stdout line — the only thing a capturing script sees —
+            // written CHECKED, never with `println!` (which panics on a write
+            // failure, after the row exists and with the plaintext in hand).
+            // A failed write revokes the token it just issued, best effort, so
+            // no stored-but-unrevealable credential survives the command; the
+            // failure is loud on stderr with a non-zero exit.
+            if let Err(error) = write_token_line(&token) {
+                let revoke = repo.revoke(name.as_str()).await;
+                if let Err(refusal) = revoke {
+                    eprintln!(
+                        "pulse token: WARNING — could not revoke {}: {refusal}",
+                        name.as_str()
+                    );
+                }
+                anyhow::bail!(
+                    "token issue: the token was stored but could not be printed ({error}); \
+                     it has been revoked — re-run the command"
+                );
+            }
         }
         TokenAction::Revoke { label, db } => {
             let name =
@@ -107,4 +131,19 @@ pub(crate) async fn run_token(args: &TokenArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write the freshly minted token as the ONE stdout line, and report a write
+/// failure instead of panicking on it.
+///
+/// The distinction matters only here: this is the one place the process holds a
+/// plaintext credential that exists nowhere else, so a panic (what `println!`
+/// does on a failed write) would leave the operator with a token row they can
+/// never use and never reveal. The caller revokes on `Err`.
+fn write_token_line(token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut line = stdout.lock();
+    writeln!(line, "{token}")?;
+    line.flush()
 }

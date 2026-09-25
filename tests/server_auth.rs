@@ -430,6 +430,104 @@ async fn token_cli_issue_revoke_and_list_honor_the_contract() {
     );
 }
 
+/// A token that cannot be REVEALED is revoked, not left behind. Only the hash
+/// is stored and labels are never reused, so a credential that reached the
+/// database without reaching the operator would be permanently unusable and
+/// permanently unrecoverable — the one stdout line is written checked for
+/// exactly that reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unprintable_token_is_revoked_and_the_command_fails() {
+    use std::io::Read as _;
+
+    let server = spawn_server().await;
+    // The child's stdout is a pipe whose READ END is closed before it can
+    // write, so its one stdout line fails with EPIPE — the broken-pipe case the
+    // checked write exists for, with no Linux-only `/dev/full`. The child opens
+    // and migrates the database before it prints, so the close lands first.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "token",
+            "issue",
+            "--scope",
+            "app",
+            "--label",
+            "unprintable",
+            "--db",
+        ])
+        .arg(&server.db_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn pulse token issue");
+    drop(child.stdout.take());
+
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read the child's stderr");
+    let status = child.wait().expect("wait the child");
+
+    assert!(
+        !status.success(),
+        "a failed stdout write must exit non-zero: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not be printed"),
+        "the failure is loud on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("revoked"),
+        "and says what was done about it: {stderr}"
+    );
+
+    let revoked_at: Option<String> =
+        sqlx::query_scalar("SELECT revoked_at FROM client_token WHERE label = 'unprintable'")
+            .fetch_one(server.db.pool())
+            .await
+            .expect("the row was issued before the write failed");
+    assert!(
+        revoked_at.is_some(),
+        "the unrevealable token is revoked, not left active"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM token_audit WHERE event = 'revoked' AND label = 'unprintable'",
+    )
+    .fetch_one(server.db.pool())
+    .await
+    .expect("revoked audit count");
+    assert_eq!(audited, 1, "the revocation is audited like any other");
+
+    // And the label is spent: a retry collides with the revoked row (labels are
+    // never reused), which is exactly why the credential had to be revoked
+    // rather than left active — the operator picks another label and re-runs.
+    let retry = std::process::Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "token",
+            "issue",
+            "--scope",
+            "app",
+            "--label",
+            "unprintable",
+            "--db",
+        ])
+        .arg(&server.db_path)
+        .output()
+        .expect("spawn the retry");
+    assert!(
+        !retry.status.success(),
+        "the label is spent: a retry is refused as a duplicate"
+    );
+    assert!(
+        String::from_utf8_lossy(&retry.stderr).contains("unprintable"),
+        "the refusal names the label: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (iv) Nothing leaks.
 // ---------------------------------------------------------------------------
