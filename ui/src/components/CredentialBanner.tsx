@@ -12,6 +12,11 @@
 // variable, never a filesystem path, so it cannot even hint at where a credential
 // file would need to sit.
 //
+// r3.s3.w5 moved the resolution SERVER-side (`src/adapters/secrets.rs` resolves it
+// for `pulse serve`), so the copy names the server host: telling a Mac-app user to
+// set the variable in the app's own environment would send them to a place the
+// server never reads.
+//
 // Non-blocking (G4's whole point): a user with no credential can still open and
 // navigate the shell. This component renders a dismissible-by-navigation notice, not
 // a gate -- nothing else in the frame is disabled while it is showing.
@@ -63,9 +68,10 @@ export function CredentialBanner() {
 
   return (
     <div className="credential-banner" role="status">
-      No LLM credential found yet. Set the <code className="mono">OLLAMA_API_KEY</code>{" "}
-      environment variable to enable strategy composition — you can still browse the
-      shell without one.
+      No LLM credential found on the server yet. Set the{" "}
+      <code className="mono">OLLAMA_API_KEY</code> environment variable for the server —
+      on the host that runs <code className="mono">pulse serve</code>, then restart it —
+      to enable strategy composition. You can still browse the shell without one.
     </div>
   );
 }

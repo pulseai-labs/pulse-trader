@@ -3,8 +3,10 @@
 //
 // Two sources name a refusal, and both render verbatim: the `ServerStatus`
 // the parent passes (a `token_refused`/`skew` from ANY command flips the
-// connection state to refused, and this screen is where the UI lands), and
-// the `ConnectOutcome` a submit just produced. The token field is a real
+// connection state to refused, and this screen is where the UI lands) — derived
+// from the prop on every render, so a refusal that arrives after mount shows
+// too — and the `ConnectOutcome` a submit just produced, which wins while it
+// stands as the newer fact. The token field is a real
 // password input — the token is pasted from `pulse token issue` or the
 // `pulse mcp login` flow; nothing here stores it beyond the Connect command
 // itself, which persists it to the connection file server-side of this
@@ -48,32 +50,43 @@ export default function ConnectScreen({
 }) {
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
-  const [error, setError] = useState<string | null>(
-    status.state === "refused" ? (status.reason ?? "the connection was refused") : null,
-  );
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // The refusal the STATUS carries is derived from the prop on EVERY render,
+  // not seeded once on mount: a mounted screen's poll can flip to `refused`
+  // while the operator is reading the form, and that reason has to appear.
+  const statusReason =
+    status.state === "refused" ? (status.reason ?? "the connection was refused") : null;
+  // A reason a submit just produced is the newer fact, so it wins while it
+  // stands (`connect` clears it before each attempt).
+  const error = submitError ?? statusReason;
 
   const connect = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
-    setError(null);
+    setSubmitError(null);
     try {
-      const answer = await commands.serverConnect(url.trim(), token);
+      // BOTH fields are trimmed: a pasted token carrying whitespace would
+      // otherwise be hashed padded — a 401 `token_refused` that reads like a
+      // wrong token — or rejected outright as a bad header value. The login
+      // path (`pulse mcp login`) trims for the same reason.
+      const answer = await commands.serverConnect(url.trim(), token.trim());
       // The bus's `Result` shell (`typedError`): a real transport failure
       // (not-connected etc.) lands in the `error` arm and shows verbatim.
       if (answer.status === "error") {
-        setError(answer.error.message);
+        setSubmitError(answer.error.message);
         return;
       }
       const reason = outcomeReason(answer.data);
       if (reason === "") {
         onConnected();
       } else {
-        setError(reason);
+        setSubmitError(reason);
       }
     } catch (err) {
       // The bus's typed error — show its message, never a stack.
-      setError(err instanceof Error ? err.message : String(err));
+      setSubmitError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -111,7 +124,13 @@ export default function ConnectScreen({
               required
             />
           </label>
-          <button className="btn" type="submit" disabled={busy || url === "" || token === ""}>
+          <button
+            className="btn"
+            type="submit"
+            // The guard judges what `connect` would actually send: the trimmed
+            // values, so a whitespace-only field cannot arm the button.
+            disabled={busy || url.trim() === "" || token.trim() === ""}
+          >
             {busy ? "Connecting…" : "Connect"}
           </button>
         </form>

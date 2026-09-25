@@ -10,7 +10,7 @@
 // `App` is rendered (not `ConnectScreen` alone) so the GATE decision — what
 // mounts instead of the app — is itself under test.
 
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const statusMock = vi.fn();
@@ -26,6 +26,10 @@ vi.mock("../bindings", () => ({
 }));
 
 import { App } from "../App";
+import { commands } from "../bindings";
+
+/** The poll cadence `useServerStatus` runs at (15 s). */
+const POLL_MS = 15_000;
 
 // The `typedError` union the real bindings resolve to, with the wire's
 // snake_case status fields.
@@ -41,6 +45,15 @@ function ok(status: {
 function notConnected() {
   return ok({
     state: "not_connected",
+    binary_version: null,
+    engine_fingerprint: null,
+    reason: null,
+  });
+}
+
+function down() {
+  return ok({
+    state: "down",
     binary_version: null,
     engine_fingerprint: null,
     reason: null,
@@ -74,6 +87,66 @@ describe("the Connect gate", () => {
     render(<App />);
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("the server refused this token");
+  });
+
+  it("shows a refusal that arrives on a LATER poll, not only one it mounted with", async () => {
+    // Mounted on `down` — no reason to show yet.
+    statusMock.mockImplementationOnce(() => Promise.resolve(down()));
+    statusMock.mockImplementation(() =>
+      Promise.resolve(
+        ok({
+          state: "refused",
+          binary_version: null,
+          engine_fingerprint: null,
+          reason: "the server refused this token (HTTP 401 Unauthorized)",
+        }),
+      ),
+    );
+
+    vi.useFakeTimers();
+    try {
+      render(<App />);
+      await act(async () => {});
+      expect(screen.getByRole("heading", { name: "Connect to the server" })).toBeTruthy();
+      expect(screen.queryByRole("alert")).toBeNull();
+
+      // The poll flips the still-mounted screen to `refused`: the reason has to
+      // follow the prop, not the state it was seeded with on mount.
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      const alert = screen.getByRole("alert");
+      expect(alert.textContent).toContain("the server refused this token");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("trims the URL and the token before server_connect", async () => {
+    statusMock.mockResolvedValue(notConnected());
+    vi.mocked(commands.serverConnect).mockResolvedValue({
+      status: "ok",
+      data: { outcome: "connected", binary_version: "0.1.0", engine_fingerprint: "f0db" },
+    });
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Connect to the server" });
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "  http://draco-desk:17620  " },
+    });
+    fireEvent.change(screen.getByLabelText("Token"), {
+      target: { value: "  pt_pasted_with_whitespace  " },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    });
+
+    // A pasted token carrying whitespace would otherwise be hashed padded (a
+    // 401 that reads like a wrong token).
+    expect(commands.serverConnect).toHaveBeenCalledWith(
+      "http://draco-desk:17620",
+      "pt_pasted_with_whitespace",
+    );
   });
 
   it("reads the polled status into the titlebar strip when up", async () => {
