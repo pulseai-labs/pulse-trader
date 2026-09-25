@@ -152,26 +152,43 @@ struct Summary {
 /// so the target keeps exactly its previous contents.
 type Added = Vec<PathBuf>;
 
+/// What the steps changed in the target store — everything the failure cleanup
+/// has to undo, so the target is left exactly as it was.
+#[derive(Default)]
+struct StoreWrites {
+    /// The snapshot files this run added.
+    added: Added,
+    /// The `HEAD` pointers this run changed.
+    heads: Vec<HeadChange>,
+}
+
 /// How the steps ended: a counted summary, a hard failure, or mismatches.
 enum StepFailure {
     /// An I/O or database failure (not a verification mismatch). It carries
-    /// the snapshots this run had ALREADY added to the target — a step can fail
-    /// after `copy_snapshots` put files in place, and the cleanup must remove
-    /// them too, or the target is left dirty against the contract.
-    Fatal { error: anyhow::Error, added: Added },
+    /// what this run had ALREADY written to the target — a step can fail after
+    /// `copy_snapshots` put files in place or `publish_heads` moved a pointer,
+    /// and the cleanup must undo both, or the target is left dirty against the
+    /// contract.
+    Fatal {
+        error: anyhow::Error,
+        writes: StoreWrites,
+    },
     /// The verification found mismatches; the target must stay untouched.
     Mismatches {
         mismatches: Vec<Mismatch>,
-        added: Added,
+        writes: StoreWrites,
     },
 }
 
-/// A fatal step failure that carries the added-snapshot list to the cleanup —
-/// the shape EVERY fatal path in [`run_steps`] uses.
-fn fatal(error: anyhow::Error, added: &Added) -> StepFailure {
+/// A fatal step failure that carries the target writes to the cleanup — the
+/// shape EVERY fatal path in [`run_steps`] uses.
+fn fatal(error: anyhow::Error, writes: &StoreWrites) -> StepFailure {
     StepFailure::Fatal {
         error,
-        added: added.clone(),
+        writes: StoreWrites {
+            added: writes.added.clone(),
+            heads: writes.heads.clone(),
+        },
     }
 }
 
@@ -282,24 +299,33 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     // Closing checkpoints the WAL into the file and removes it.
     opened.pool().close().await;
 
+    // Undoing a step's writes is always the same two moves: the files it added
+    // and the store pointers it changed (the target must be left exactly as it
+    // was, whichever path failed).
+    let target_store = CandleStore::with_base_dir(job.data_target.to_path_buf());
+    let undo = |writes: &StoreWrites| {
+        remove_added_snapshots(&writes.added);
+        restore_heads(&target_store, &writes.heads);
+    };
     match steps {
-        Err(StepFailure::Fatal { error, added }) => {
-            // Every fatal path cleans up BOTH: the temporary database and any
-            // snapshot this run added before it failed.
+        Err(StepFailure::Fatal { error, writes }) => {
+            // Every fatal path cleans up BOTH: the temporary database and
+            // everything this run wrote to the target store before it failed.
             remove_tmp_db(&tmp_db);
-            remove_added_snapshots(&added);
+            undo(&writes);
             Err(error)
         }
-        Err(StepFailure::Mismatches { mismatches, added }) => {
+        Err(StepFailure::Mismatches { mismatches, writes }) => {
             remove_tmp_db(&tmp_db);
-            remove_added_snapshots(&added);
+            undo(&writes);
             print_refusal(label, &mismatches);
             anyhow::bail!(
                 "{label}: refused — the temporary database and every snapshot this run added \
-                 were deleted and the target is exactly as it was"
+                 were deleted, every pointer it moved was put back, and the target is exactly \
+                 as it was"
             );
         }
-        Ok((summary, added)) => {
+        Ok((summary, writes)) => {
             // ---- Step 7: atomic install. The target's stale -wal/-shm are
             // removed first so an old sidecar can never bleed into the
             // renamed file (the migration-protocol restore precedent).
@@ -307,7 +333,7 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
                 // The install is the last thing that can fail: it cleans up
                 // exactly as every earlier fatal path does.
                 remove_tmp_db(&tmp_db);
-                remove_added_snapshots(&added);
+                undo(&writes);
                 return Err(error);
             }
             if job.chmod_source {
@@ -320,12 +346,17 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     }
 }
 
-/// Steps 4–5 on the migrated copy: the snapshot copy and the five checks.
+/// Steps 4–5 on the migrated copy: the snapshot and pointer copy, and the five
+/// checks.
 ///
-/// Returns the summary AND the snapshots this run added, so the caller's
-/// success path can clean them up if the install itself fails. Every fatal path
-/// carries that list out with the error (see [`fatal`]).
-async fn run_steps(job: &VerifiedCopy<'_>, copied: &Db) -> Result<(Summary, Added), StepFailure> {
+/// Returns the summary AND what this run wrote to the target store (snapshots
+/// added, pointers moved), so the caller's success path can undo it if the
+/// install itself fails. Every fatal path carries those writes out with the
+/// error (see [`fatal`]).
+async fn run_steps(
+    job: &VerifiedCopy<'_>,
+    copied: &Db,
+) -> Result<(Summary, StoreWrites), StepFailure> {
     let copy_pool = copied.pool();
     let mut mismatches: Vec<Mismatch> = Vec::new();
 
@@ -334,42 +365,63 @@ async fn run_steps(job: &VerifiedCopy<'_>, copied: &Db) -> Result<(Summary, Adde
     let target_store = CandleStore::with_base_dir(job.data_target.to_path_buf());
     let (source_snapshots, scan_issues) = scan_snapshots(job.from_data_dir);
     mismatches.extend(scan_issues);
+    // The store's HEAD pointers are NOT snapshots (the scan steps over
+    // everything that is not a `.parquet` file) and they are read here so the
+    // last step can publish them with the snapshots they name.
+    let (source_heads, head_issues) = scan_heads(job.from_data_dir);
+    mismatches.extend(head_issues);
+    let mut writes = StoreWrites::default();
     // `copy_snapshots` adds files as it goes and can fail part-way: the error
     // carries whatever it had added by then.
-    let added = match copy_snapshots(&target_store, &source_snapshots, &mut mismatches) {
+    writes.added = match copy_snapshots(&target_store, &source_snapshots, &mut mismatches) {
         Ok(added) => added,
-        Err((error, added)) => return Err(fatal(error, &added)),
+        Err((error, added)) => {
+            let writes = StoreWrites {
+                added,
+                heads: Vec::new(),
+            };
+            return Err(fatal(error, &writes));
+        }
     };
 
     // ---- Step 5: verify everything, and do not stop at the first failure
-    // within a check. Every step below can fail AFTER snapshots were added, so
-    // each fatal path hands the added list to the cleanup.
+    // within a check. Every step below can fail AFTER the target was written
+    // to, so each fatal path hands the writes to the cleanup.
     let source = ops::open_read_only(job.from_db)
         .await
-        .map_err(|e| fatal(anyhow!("{e}"), &added))?;
+        .map_err(|e| fatal(anyhow!("{e}"), &writes))?;
     let tables = step_table_counts(&source, copy_pool, &mut mismatches)
         .await
-        .map_err(|e| fatal(e, &added))?;
+        .map_err(|e| fatal(e, &writes))?;
     step_stored_hashes(&source, copy_pool, &mut mismatches)
         .await
-        .map_err(|e| fatal(e, &added))?;
+        .map_err(|e| fatal(e, &writes))?;
     let (versions_verified, runs_verified) = step_repository_reads(copy_pool, &mut mismatches)
         .await
-        .map_err(|e| fatal(e, &added))?;
+        .map_err(|e| fatal(e, &writes))?;
     let snapshots_verified = step_snapshot_reads(&target_store, &source_snapshots, &mut mismatches);
     step_referenced_snapshots(&target_store, copy_pool, &mut mismatches)
         .await
-        .map_err(|e| fatal(e, &added))?;
+        .map_err(|e| fatal(e, &writes))?;
     source.close().await;
 
+    // ---- The pointers LAST, after every read-back above: a pointer is only
+    // published once the snapshot it names is verified to be there.
+    writes.heads = publish_heads(
+        &target_store,
+        job.data_target,
+        &source_heads,
+        &mut mismatches,
+    );
+
     if !mismatches.is_empty() {
-        return Err(StepFailure::Mismatches { mismatches, added });
+        return Err(StepFailure::Mismatches { mismatches, writes });
     }
     let mut table_counts = Vec::with_capacity(tables.len());
     for table in &tables {
         let count = ops::table_count(copy_pool, table)
             .await
-            .map_err(|e| fatal(anyhow!("{e}"), &added))?;
+            .map_err(|e| fatal(anyhow!("{e}"), &writes))?;
         table_counts.push((table.clone(), count));
     }
     Ok((
@@ -379,7 +431,7 @@ async fn run_steps(job: &VerifiedCopy<'_>, copied: &Db) -> Result<(Summary, Adde
             runs_verified,
             snapshots_verified,
         },
-        added,
+        writes,
     ))
 }
 
@@ -623,7 +675,16 @@ pub(crate) struct SourceSnapshot {
 /// Walk `<data>/candles/<PAIR>/<TF>/*.parquet` — every snapshot the source
 /// holds, plus the layout problems as mismatches (the caller decides whether
 /// those refuse an import or fail a backup).
-pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Mismatch>) {
+/// Every `(pair, timeframe)` directory a store holds, with the layout
+/// mismatches a broken one produces.
+///
+/// `kind` labels the mismatches (`snapshot` for the snapshot scan, `head` for
+/// the pointer scan) — the two scans walk the SAME directories on purpose, so
+/// they cannot disagree about what the store holds.
+fn store_dirs(
+    data_dir: &Path,
+    kind: &'static str,
+) -> (Vec<(Pair, Timeframe, PathBuf)>, Vec<Mismatch>) {
     let mut out = Vec::new();
     let mut issues = Vec::new();
     let candles = data_dir.join("candles");
@@ -637,7 +698,7 @@ pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Misma
         // read, which no backup may paper over.
         Err(_) => {
             issues.push(Mismatch::new(
-                "snapshot",
+                kind,
                 candles.display().to_string(),
                 "layout",
                 "the candle store directory is unreadable",
@@ -652,7 +713,7 @@ pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Misma
         let pair_name = pair_entry.file_name().to_string_lossy().to_string();
         let Ok(pair) = Pair::parse(&pair_name) else {
             issues.push(Mismatch::new(
-                "snapshot",
+                kind,
                 pair_name,
                 "layout",
                 "not a valid pair directory",
@@ -661,7 +722,7 @@ pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Misma
         };
         let Ok(tf_entries) = fs::read_dir(pair_entry.path()) else {
             issues.push(Mismatch::new(
-                "snapshot",
+                kind,
                 pair_name,
                 "layout",
                 "unreadable timeframe directory",
@@ -675,17 +736,28 @@ pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Misma
             let tf_name = tf_entry.file_name().to_string_lossy().to_string();
             let Some(timeframe) = timeframe_from_interval(&tf_name) else {
                 issues.push(Mismatch::new(
-                    "snapshot",
+                    kind,
                     tf_name,
                     "layout",
                     "not a known timeframe directory (15m / 4h)",
                 ));
                 continue;
             };
-            let Ok(files) = fs::read_dir(tf_entry.path()) else {
+            out.push((pair.clone(), timeframe, tf_entry.path()));
+        }
+    }
+    (out, issues)
+}
+
+pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Mismatch>) {
+    let (dirs, mut issues) = store_dirs(data_dir, "snapshot");
+    let mut out = Vec::new();
+    for (pair, timeframe, dir) in dirs {
+        {
+            let Ok(files) = fs::read_dir(&dir) else {
                 issues.push(Mismatch::new(
                     "snapshot",
-                    tf_name,
+                    dir.display().to_string(),
                     "layout",
                     "unreadable snapshot directory",
                 ));
@@ -731,12 +803,187 @@ pub(crate) fn scan_snapshots(data_dir: &Path) -> (Vec<SourceSnapshot>, Vec<Misma
     (out, issues)
 }
 
+/// One `HEAD` pointer in a store: the `(pair, timeframe)` it belongs to, the
+/// `data_version` it names, and the file itself.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceHead {
+    /// The pair directory it lives under.
+    pub pair: Pair,
+    /// The timeframe directory it lives under.
+    pub timeframe: Timeframe,
+    /// The data version it names.
+    pub version: DataVersion,
+    /// The `HEAD` file.
+    pub path: PathBuf,
+}
+
+/// Every `HEAD` pointer in `data_dir`, with the mismatches a broken one makes.
+///
+/// [`scan_snapshots`] walks the store's `.parquet` files and steps over
+/// everything else — HEAD pointers included, which is exactly how a copy left
+/// them behind. The pointer is the store's authoritative "current snapshot"
+/// (audit C6): a target without it resolves no current data at all, and a target
+/// with a STALE one silently selects the pre-import dataset.
+pub(crate) fn scan_heads(data_dir: &Path) -> (Vec<SourceHead>, Vec<Mismatch>) {
+    let (dirs, mut issues) = store_dirs(data_dir, "head");
+    let store = CandleStore::with_base_dir(data_dir.to_path_buf());
+    let mut out = Vec::new();
+    for (pair, timeframe, _dir) in dirs {
+        let path = store.head_path(&pair, timeframe);
+        if !path.exists() {
+            continue; // no pointer yet: a first run, not a fault
+        }
+        match store.read_head(&pair, timeframe) {
+            Ok(Some(version)) => out.push(SourceHead {
+                pair,
+                timeframe,
+                version,
+                path,
+            }),
+            // Vanished between the check and the read: treated as absent.
+            Ok(None) => {}
+            Err(error) => issues.push(Mismatch::new(
+                "head",
+                path.display().to_string(),
+                "read",
+                format!("the HEAD pointer does not read: {error}"),
+            )),
+        }
+    }
+    (out, issues)
+}
+
 /// The timeframe directory name (`15m` / `4h`) a snapshot lives under.
 fn timeframe_from_interval(name: &str) -> Option<Timeframe> {
     match name {
         "15m" => Some(Timeframe::M15),
         "4h" => Some(Timeframe::H4),
         _ => None,
+    }
+}
+
+/// What one published `HEAD` pointer replaced, so a later failure can put the
+/// store back exactly as it was.
+///
+/// Shared with `cli/backup.rs`: its store publishing writes the same pointers,
+/// and its failure path undoes them the same way.
+#[derive(Clone)]
+pub(crate) struct HeadChange {
+    /// The pair whose pointer changed.
+    pair: Pair,
+    /// The timeframe whose pointer changed.
+    timeframe: Timeframe,
+    /// The pointer's previous target, or `None` when there was none.
+    previous: Option<DataVersion>,
+}
+
+impl HeadChange {
+    /// Record one pointer's previous target.
+    pub(crate) fn new(pair: Pair, timeframe: Timeframe, previous: Option<DataVersion>) -> Self {
+        Self {
+            pair,
+            timeframe,
+            previous,
+        }
+    }
+}
+
+/// Publish the source store's `HEAD` pointers into the target, atomically, and
+/// drop the target pointers the source does not have.
+///
+/// Ordering IS the contract: each pointer goes through the store's own
+/// temp→fsync→rename ([`CandleStore::write_head`]) and only AFTER the snapshot
+/// it names is present AND verifies in the target — so there is never a window
+/// in which a target pointer names a snapshot that is not there. A target
+/// pointer the source does not have names the pre-import dataset (a `--replace`
+/// replaces the database while the store's snapshots survive), so it is removed
+/// rather than left to select it.
+///
+/// Returns the changes, for the cleanup a later failure runs.
+fn publish_heads(
+    target_store: &CandleStore,
+    target_dir: &Path,
+    source_heads: &[SourceHead],
+    mismatches: &mut Vec<Mismatch>,
+) -> Vec<HeadChange> {
+    let mut changes: Vec<HeadChange> = Vec::new();
+    for head in source_heads {
+        // The snapshot must be there and verify BEFORE its pointer is published.
+        if let Err(error) = target_store.read_snapshot(&head.pair, head.timeframe, &head.version) {
+            mismatches.push(Mismatch::new(
+                "head",
+                head.path.display().to_string(),
+                "snapshot",
+                format!(
+                    "the HEAD pointer names {} and the target does not verify it: {error}",
+                    head.version
+                ),
+            ));
+            continue;
+        }
+        let previous = target_store
+            .read_head(&head.pair, head.timeframe)
+            .unwrap_or(None);
+        changes.push(HeadChange {
+            pair: head.pair.clone(),
+            timeframe: head.timeframe,
+            previous,
+        });
+        if let Err(error) = target_store.write_head(&head.pair, head.timeframe, &head.version) {
+            mismatches.push(Mismatch::new(
+                "head",
+                head.path.display().to_string(),
+                "write",
+                format!("the HEAD pointer could not be published: {error}"),
+            ));
+        }
+    }
+
+    // Pointers the source does not have. The target's own layout problems are
+    // not the import's business here (its store is whatever it is), so only the
+    // directories come from the walk.
+    let (target_dirs, _target_issues) = store_dirs(target_dir, "head");
+    for (pair, timeframe, _dir) in target_dirs {
+        if source_heads
+            .iter()
+            .any(|head| head.pair == pair && head.timeframe == timeframe)
+        {
+            continue;
+        }
+        let path = target_store.head_path(&pair, timeframe);
+        if !path.exists() {
+            continue;
+        }
+        let previous = target_store.read_head(&pair, timeframe).unwrap_or(None);
+        changes.push(HeadChange {
+            pair: pair.clone(),
+            timeframe,
+            previous,
+        });
+        if let Err(error) = fs::remove_file(&path) {
+            mismatches.push(Mismatch::new(
+                "head",
+                path.display().to_string(),
+                "remove",
+                format!("a stale HEAD pointer could not be removed: {error}"),
+            ));
+        }
+    }
+    changes
+}
+
+/// Put back every pointer a publish step changed — the failure path: the store
+/// must be left exactly as it was.
+pub(crate) fn restore_heads(target_store: &CandleStore, changes: &[HeadChange]) {
+    for change in changes {
+        match &change.previous {
+            Some(version) => {
+                let _ = target_store.write_head(&change.pair, change.timeframe, version);
+            }
+            None => {
+                let _ = fs::remove_file(target_store.head_path(&change.pair, change.timeframe));
+            }
+        }
     }
 }
 

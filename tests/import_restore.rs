@@ -28,7 +28,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use pulse::{
-    BacktestInputs, BacktestResult, BacktestRunRepository, CreatedBy, DataVersion, Db,
+    BacktestInputs, BacktestResult, BacktestRunRepository, CandleStore, CreatedBy, DataVersion, Db,
     EngineFingerprint, EquityCurve, FundingConfig, NewVersion, Pair, RegimeBreakdown,
     SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId,
     StrategyRepository, SummaryStats, Timeframe, VersionId, hash_token, mint_token, open_migrated,
@@ -886,10 +886,31 @@ async fn pruning_keeps_three_newest_backups_and_unchanged_candles() {
         candle_listing(),
         "pruning never touches candles/"
     );
+    let parquet = |listing: &BTreeMap<String, u64>| -> Vec<String> {
+        listing
+            .keys()
+            .filter(|name| name.ends_with(".parquet"))
+            .cloned()
+            .collect()
+    };
+    let heads = |listing: &BTreeMap<String, u64>| -> Vec<String> {
+        listing
+            .keys()
+            .filter(|name| name.ends_with("HEAD"))
+            .cloned()
+            .collect()
+    };
     assert_eq!(
-        candles_after.len(),
+        parquet(&candles_after).len(),
         2,
-        "both fixture snapshots are retained"
+        "both fixture snapshots are retained: {:?}",
+        parquet(&candles_after)
+    );
+    assert_eq!(
+        heads(&candles_after).len(),
+        2,
+        "and so are the HEAD pointers that name them: {:?}",
+        heads(&candles_after)
     );
 }
 
@@ -1357,6 +1378,174 @@ async fn a_corrupt_snapshot_already_in_the_backup_store_is_refused() {
         1,
         "the refusal wrote no new backup database"
     );
+}
+
+// ---------------------------------------------------------------------------
+// round 5, Fix A — the HEAD pointers travel with the snapshots they name
+// ---------------------------------------------------------------------------
+
+/// The fixture store carries a `HEAD` pointer per `(pair, timeframe)` — the
+/// store's authoritative "current snapshot" (audit C6) — and the snapshot scan
+/// steps over it (it copies `.parquet` files only). An import that leaves it
+/// behind lands a target store that resolves NO current data at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_import_carries_the_head_pointers_into_the_target() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+
+    let out = run_pulse(
+        &s.home,
+        &str_args(&import_args(&s, &target_db, &target_data, false)),
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "the import must succeed: {text}");
+
+    let target_store = CandleStore::with_base_dir(target_data.clone());
+    let pair = Pair::parse("BTCUSDT").expect("the fixture pair");
+    for (timeframe, stem) in [(Timeframe::M15, &s.stems.0), (Timeframe::H4, &s.stems.1)] {
+        let head = target_store
+            .read_head(&pair, timeframe)
+            .expect("read the target HEAD")
+            .unwrap_or_else(|| panic!("the import must publish the {timeframe:?} HEAD pointer"));
+        assert_eq!(
+            head.to_string(),
+            *stem,
+            "the target's {timeframe:?} pointer is the source's"
+        );
+        // And the snapshot it names is there and verifies (the pointer is
+        // published only after that read-back).
+        target_store
+            .read_snapshot(&pair, timeframe, &head)
+            .unwrap_or_else(|error| {
+                panic!("the {timeframe:?} pointer must name a verified snapshot: {error}")
+            });
+    }
+}
+
+/// A `--replace` replaces the DATABASE while the target's store (snapshots and
+/// pointers) survives, so a pointer the source does not have keeps naming the
+/// pre-import dataset: the replace must drop it rather than leave it selected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replace_leaves_no_stale_pointer() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+
+    assert!(
+        import_once(&s, &target_db, &target_data).status.success(),
+        "the first import must succeed"
+    );
+    let target_store = CandleStore::with_base_dir(target_data.clone());
+    let pair = Pair::parse("BTCUSDT").expect("the fixture pair");
+    assert!(
+        target_store
+            .read_head(&pair, Timeframe::M15)
+            .expect("read the target HEAD")
+            .is_some(),
+        "the first import published the 15m pointer"
+    );
+
+    // The source loses its 15m pointer before the replace (a store whose
+    // primary timeframe was retired).
+    fs::remove_file(
+        s.from_data
+            .join("candles")
+            .join("BTCUSDT")
+            .join("15m")
+            .join("HEAD"),
+    )
+    .expect("drop the source's 15m pointer");
+
+    let out = run_pulse(
+        &s.home,
+        &str_args(&import_args(&s, &target_db, &target_data, true)),
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "the replace must succeed: {text}");
+
+    assert!(
+        target_store
+            .read_head(&pair, Timeframe::M15)
+            .expect("read the target HEAD")
+            .is_none(),
+        "the replace must drop the pointer the source no longer has"
+    );
+    let htf = target_store
+        .read_head(&pair, Timeframe::H4)
+        .expect("read the target HEAD")
+        .expect("the 4h pointer is still published");
+    assert_eq!(
+        htf.to_string(),
+        s.stems.1,
+        "and the pointer the source DOES have is the source's"
+    );
+}
+
+/// A backup carries the pointers too, so a restore from it lands a target store
+/// that is complete: the pointers are what tell the store which snapshot is
+/// current.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_restore_round_trip_preserves_the_pointers() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+    assert!(import_once(&s, &target_db, &target_data).status.success());
+
+    let backups_dir = s.dir.path().join("backups");
+    let backup = run_pulse(
+        &s.home,
+        &[
+            "backup",
+            "--db",
+            target_db.to_str().unwrap(),
+            "--data-dir",
+            target_data.to_str().unwrap(),
+            "--out-dir",
+            backups_dir.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&backup);
+    assert!(backup.status.success(), "the backup must succeed: {text}");
+    let written = backup_db_files(&backups_dir);
+    assert_eq!(written.len(), 1, "one backup database: {written:?}");
+
+    let restored_db = s.dir.path().join("restored").join("pulse.db");
+    let restored_data = s.dir.path().join("restored-data");
+    let restore = run_pulse(
+        &s.home,
+        &[
+            "restore",
+            written[0].to_str().unwrap(),
+            "--backup-dir",
+            backups_dir.to_str().unwrap(),
+            "--db",
+            restored_db.to_str().unwrap(),
+            "--data-dir",
+            restored_data.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&restore);
+    assert!(restore.status.success(), "the restore must succeed: {text}");
+
+    let restored_store = CandleStore::with_base_dir(restored_data);
+    let pair = Pair::parse("BTCUSDT").expect("the fixture pair");
+    for (timeframe, stem) in [(Timeframe::M15, &s.stems.0), (Timeframe::H4, &s.stems.1)] {
+        let head = restored_store
+            .read_head(&pair, timeframe)
+            .expect("read the restored HEAD")
+            .unwrap_or_else(|| panic!("the restore must land the {timeframe:?} pointer"));
+        assert_eq!(
+            head.to_string(),
+            *stem,
+            "the restored {timeframe:?} pointer is the source's"
+        );
+        restored_store
+            .read_snapshot(&pair, timeframe, &head)
+            .unwrap_or_else(|error| {
+                panic!("the restored {timeframe:?} pointer must name a snapshot: {error}")
+            });
+    }
 }
 
 // ---------------------------------------------------------------------------

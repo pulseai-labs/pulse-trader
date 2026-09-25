@@ -31,8 +31,9 @@ use chrono::Utc;
 use clap::Args;
 
 use super::import::{
-    SourceSnapshot, VerifiedCopy, bytes_equal, copy_snapshot_into, default_backup_out_dir,
-    resolve_target_data_dir, resolve_target_db, run_verified_copy, scan_snapshots,
+    HeadChange, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal, copy_snapshot_into,
+    default_backup_out_dir, resolve_target_data_dir, resolve_target_db, restore_heads,
+    run_verified_copy, scan_heads, scan_snapshots,
 };
 use crate::adapters::db::ops;
 use crate::adapters::store::CandleStore;
@@ -152,6 +153,21 @@ pub(crate) async fn backup_target(
         anyhow::bail!("backup: the data dir has snapshot-layout problems; nothing was backed up");
     }
 
+    // The store's HEAD pointers are not snapshots (the scan steps over
+    // everything that is not a `.parquet` file) and they travel with the
+    // snapshots they name: a backup store without them leaves a restore with a
+    // store the store itself resolves no current data from.
+    let (heads, head_issues) = scan_heads(data_dir);
+    if !head_issues.is_empty() {
+        for issue in &head_issues {
+            eprintln!(
+                "  mismatch: {} id={} field={}: {}",
+                issue.table, issue.id, issue.field, issue.detail
+            );
+        }
+        anyhow::bail!("backup: the data dir has HEAD-pointer problems; nothing was backed up");
+    }
+
     let out_store = CandleStore::with_base_dir(out_dir.to_path_buf());
     // Verify what the store ALREADY holds before anything is written. Snapshots
     // are immutable and content-addressed, so an existing same-named file must
@@ -172,7 +188,7 @@ pub(crate) async fn backup_target(
     }
 
     let backup_path = backup_database(db_path, out_dir).await?;
-    let copied = copy_missing_snapshots(&out_store, &snapshots, &backup_path)?;
+    let copied = publish_source_store(&out_store, &snapshots, &heads, &backup_path)?;
     Ok(BackupOutcome {
         path: backup_path,
         snapshots_copied: copied,
@@ -180,14 +196,20 @@ pub(crate) async fn backup_target(
     })
 }
 
-/// Copy every snapshot the store is missing into `<out-dir>/candles/` (one
-/// shared store), returning how many were added. A failure deletes the partial
-/// database file and every snapshot this call added, so no half backup
-/// survives — and each copy publishes through `copy_snapshot_into`, so a copy
-/// that fails part-way leaves no truncated file under a snapshot's name.
-fn copy_missing_snapshots(
+/// Publish the source store into `<out-dir>/candles/` (one shared store):
+/// every snapshot the store is missing, then the HEAD pointers that name them —
+/// the same rule the import's copy applies, so a backup that is restored lands
+/// a store whose current pointer is the one it was taken with. Returns how many
+/// snapshots were added.
+///
+/// A failure deletes the partial database file, every snapshot this call added
+/// and every pointer it moved, so no half backup survives — and each copy
+/// publishes through `copy_snapshot_into`, so a copy that fails part-way leaves
+/// no truncated file under a snapshot's name.
+fn publish_source_store(
     out_store: &CandleStore,
     snapshots: &[SourceSnapshot],
+    heads: &[SourceHead],
     backup_path: &Path,
 ) -> anyhow::Result<usize> {
     let mut added: Vec<PathBuf> = Vec::new();
@@ -205,15 +227,79 @@ fn copy_missing_snapshots(
         Ok(copied)
     })();
     match copied {
-        Ok(copied) => Ok(copied),
-        Err(error) => {
-            let _ = fs::remove_file(backup_path);
-            for path in &added {
-                let _ = fs::remove_file(path);
+        Ok(copied) => {
+            // ---- Then the pointers, once every snapshot they name is in place.
+            match publish_heads(out_store, heads) {
+                Ok(()) => Ok(copied),
+                Err((error, changes)) => {
+                    restore_heads(out_store, &changes);
+                    discard(backup_path, &added);
+                    Err(error)
+                }
             }
+        }
+        Err(error) => {
+            discard(backup_path, &added);
             Err(error)
         }
     }
+}
+
+/// The failure path's one move: no half backup survives — not the database file
+/// and not a snapshot this run added.
+fn discard(backup_path: &Path, added: &[PathBuf]) {
+    let _ = fs::remove_file(backup_path);
+    for path in added {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Write the source's `HEAD` pointers into the out-dir's store, each one only
+/// AFTER the snapshot it names is there and verifies, and each through the
+/// store's own temp→fsync→rename ([`CandleStore::write_head`]).
+///
+/// The out store is SHARED between backups, so a pointer the source does not
+/// have is left alone here (another backup's store may be using it) — the
+/// import is where stale pointers are dropped, because it replaces a database's
+/// whole store view.
+///
+/// # Errors
+///
+/// The error carries the pointers written before the failure, so the caller can
+/// put the store back exactly as it was.
+fn publish_heads(
+    out_store: &CandleStore,
+    heads: &[SourceHead],
+) -> Result<(), (anyhow::Error, Vec<HeadChange>)> {
+    let mut changes: Vec<HeadChange> = Vec::new();
+    for head in heads {
+        if let Err(error) = out_store.read_snapshot(&head.pair, head.timeframe, &head.version) {
+            return Err((
+                anyhow!(
+                    "backup: the HEAD pointer {} names {} and the backup store does not verify \
+                     it: {error}",
+                    head.path.display(),
+                    head.version
+                ),
+                changes,
+            ));
+        }
+        let previous = out_store
+            .read_head(&head.pair, head.timeframe)
+            .unwrap_or(None);
+        changes.push(HeadChange::new(head.pair.clone(), head.timeframe, previous));
+        if let Err(error) = out_store.write_head(&head.pair, head.timeframe, &head.version) {
+            return Err((
+                anyhow!(
+                    "backup: the HEAD pointer for {} {} could not be written: {error}",
+                    head.pair.as_str(),
+                    head.timeframe.binance_interval()
+                ),
+                changes,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The database-only online-copy primitive. Writes a `.partial` file, then
