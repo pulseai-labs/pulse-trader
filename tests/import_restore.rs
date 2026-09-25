@@ -1549,6 +1549,68 @@ async fn a_backup_restore_round_trip_preserves_the_pointers() {
 }
 
 // ---------------------------------------------------------------------------
+// round 5, Fix B / Fix C — the backup's copy set and the source's integrity
+// ---------------------------------------------------------------------------
+
+/// The copy set is derived from the FROZEN COPY, so a database that names a
+/// snapshot the store does not hold fails the backup instead of publishing a
+/// set only the restore could refuse. (A snapshot published after a pre-scan
+/// is the same disagreement seen from the other side.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_refuses_a_reference_the_store_does_not_hold() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+    assert!(import_once(&s, &target_db, &target_data).status.success());
+
+    // The 4h snapshot disappears; a committed run still names it.
+    let htf = target_data
+        .join("candles")
+        .join("BTCUSDT")
+        .join("4h")
+        .join(format!("{}.parquet", s.stems.1));
+    fs::remove_file(&htf).expect("drop the referenced snapshot");
+
+    let out_dir = s.dir.path().join("backups");
+    let out = run_pulse(
+        &s.home,
+        &[
+            "backup",
+            "--db",
+            target_db.to_str().unwrap(),
+            "--data-dir",
+            target_data.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a reference the store does not hold must fail the backup: {text}"
+    );
+    assert!(
+        text.contains(&s.stems.1),
+        "the failure names the missing snapshot: {text}"
+    );
+    assert!(
+        text.contains("nothing was backed up"),
+        "and says nothing was published: {text}"
+    );
+    assert!(
+        backup_db_files(&out_dir).is_empty(),
+        "no backup database was published: {:?}",
+        backup_db_files(&out_dir)
+    );
+    let candles = out_dir.join("candles");
+    assert!(
+        !candles.exists() || data_listing(&candles).is_empty(),
+        "and the store got nothing: {:?}",
+        data_listing(&candles)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // the restore --help precondition
 // ---------------------------------------------------------------------------
 

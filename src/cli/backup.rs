@@ -140,42 +140,187 @@ pub(crate) async fn backup_target(
     data_dir: &Path,
     out_dir: &Path,
 ) -> anyhow::Result<BackupOutcome> {
-    // The snapshot scan comes FIRST: a broken store must leave no backup
-    // files behind at all.
-    let (snapshots, scan_issues) = scan_snapshots(data_dir);
-    if !scan_issues.is_empty() {
-        for issue in &scan_issues {
-            eprintln!(
-                "  mismatch: {} id={} field={}: {}",
-                issue.table, issue.id, issue.field, issue.detail
-            );
-        }
-        anyhow::bail!("backup: the data dir has snapshot-layout problems; nothing was backed up");
-    }
-
-    // The store's HEAD pointers are not snapshots (the scan steps over
-    // everything that is not a `.parquet` file) and they travel with the
-    // snapshots they name: a backup store without them leaves a restore with a
-    // store the store itself resolves no current data from.
-    let (heads, head_issues) = scan_heads(data_dir);
-    if !head_issues.is_empty() {
-        for issue in &head_issues {
-            eprintln!(
-                "  mismatch: {} id={} field={}: {}",
-                issue.table, issue.id, issue.field, issue.detail
-            );
-        }
-        anyhow::bail!("backup: the data dir has HEAD-pointer problems; nothing was backed up");
-    }
-
     let out_store = CandleStore::with_base_dir(out_dir.to_path_buf());
-    // Verify what the store ALREADY holds before anything is written. Snapshots
-    // are immutable and content-addressed, so an existing same-named file must
-    // be byte-identical: skipping it unverified would let a truncated or
-    // replaced file make every later backup report success while the database
-    // it writes references unusable bytes — and the restore would then refuse
-    // that backup, days after the fact.
-    for snap in &snapshots {
+
+    // ---- Step 1: freeze the DATABASE first, and derive the snapshot set from
+    // THAT file (`publish_source_store` below). A scan taken before the copy
+    // would miss a snapshot published — and referenced by a run committed — in
+    // between: the backup would report success while the database it publishes
+    // names a file the copy set omitted, and `pulse restore` would refuse that
+    // backup later.
+    let backup_path = backup_database(db_path, out_dir).await?;
+    publish_source_store(&out_store, data_dir, &backup_path).await
+}
+
+/// Publish the source store into `<out-dir>/candles/` (one shared store):
+/// every snapshot the FROZEN COPY references, plus the `HEAD` pointers that
+/// name them (the same rule the import's copy applies, so a restored backup
+/// lands a store whose current pointer is the one it was taken with).
+///
+/// The order is the contract:
+///
+/// 1. the references come from the frozen copy, never from a pre-scan;
+/// 2. every source snapshot must verify (the store's own integrity read) — a
+///    backup must not report success over a store the restore would refuse;
+/// 3. every reference must resolve to a source snapshot, or the backup FAILS:
+///    publishing a database whose snapshot is missing would hand the restore a
+///    set it can only refuse;
+/// 4. only then are the files copied, and only then are the pointers written.
+///
+/// A failure deletes the partial database file, every snapshot this call added
+/// and every pointer it moved, so no half backup survives — and each copy
+/// publishes through `copy_snapshot_into`, so a copy that fails part-way leaves
+/// no truncated file under a snapshot's name.
+async fn publish_source_store(
+    out_store: &CandleStore,
+    data_dir: &Path,
+    backup_path: &Path,
+) -> anyhow::Result<BackupOutcome> {
+    let mut added: Vec<PathBuf> = Vec::new();
+
+    let published = publish_store_files(out_store, data_dir, backup_path, &mut added).await;
+    match published {
+        Ok((copied, total)) => Ok(BackupOutcome {
+            path: backup_path.to_path_buf(),
+            snapshots_copied: copied,
+            snapshots_total: total,
+        }),
+        Err(error) => {
+            discard(backup_path, &added);
+            Err(error)
+        }
+    }
+}
+
+/// The publishing body (see [`publish_source_store`] for the order it keeps),
+/// returning how many snapshots were added and how many the source holds.
+async fn publish_store_files(
+    out_store: &CandleStore,
+    data_dir: &Path,
+    backup_path: &Path,
+    added: &mut Vec<PathBuf>,
+) -> anyhow::Result<(usize, usize)> {
+    // 1. What the FROZEN COPY needs: the snapshots its runs name.
+    let references = frozen_references(backup_path).await?;
+    // 2. What the source store holds (layout problems refuse: nothing written).
+    let (snapshots, heads) = source_store_contents(data_dir)?;
+    // 3. Every reference must resolve to a source snapshot.
+    let wanted = resolve_copy_set(&snapshots, &heads, &references)?;
+    // 5. What the store already holds is verified, never skipped.
+    verify_store_bytes(out_store, &snapshots, &wanted)?;
+    // 6. Copy, then publish the pointers that name what was copied.
+    let copied = copy_wanted(out_store, &snapshots, &wanted, added)?;
+    match publish_heads(out_store, &heads) {
+        Ok(()) => Ok((copied, snapshots.len())),
+        Err((error, changes)) => {
+            restore_heads(out_store, &changes);
+            Err(error)
+        }
+    }
+}
+
+/// The snapshots the FROZEN COPY references — read from the copy itself, never
+/// from a scan taken before it: a snapshot published and referenced in between
+/// would otherwise be missing from the copy set while the database the backup
+/// publishes names it, and `pulse restore` would refuse that backup later.
+async fn frozen_references(backup_path: &Path) -> anyhow::Result<Vec<ops::SnapshotRef>> {
+    let copy_pool = ops::open_read_only(backup_path)
+        .await
+        .map_err(|e| anyhow!("read the frozen copy {}: {e}", backup_path.display()))?;
+    let referenced = ops::referenced_snapshots(&copy_pool).await;
+    copy_pool.close().await;
+    referenced.map_err(|e| anyhow!("{e}"))
+}
+
+/// What the source store holds: its snapshots and its `HEAD` pointers. Layout
+/// problems in either refuse the backup before anything is written.
+fn source_store_contents(
+    data_dir: &Path,
+) -> anyhow::Result<(Vec<SourceSnapshot>, Vec<SourceHead>)> {
+    let (snapshots, scan_issues) = scan_snapshots(data_dir);
+    let (heads, head_issues) = scan_heads(data_dir);
+    let issues: Vec<&super::import::Mismatch> =
+        scan_issues.iter().chain(head_issues.iter()).collect();
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!(
+                "  mismatch: {} id={} field={}: {}",
+                issue.table, issue.id, issue.field, issue.detail
+            );
+        }
+        anyhow::bail!(
+            "backup: the data dir has snapshot-layout or HEAD-pointer problems; nothing was \
+             backed up"
+        );
+    }
+    Ok((snapshots, heads))
+}
+
+/// The snapshots the backup must publish, as indices into `snapshots`: every
+/// one the frozen copy references, plus every one a `HEAD` pointer names (a
+/// pointer travels with its snapshot, and a pointer whose snapshot is missing
+/// fails the backup rather than publishing a set only the restore can refuse).
+fn resolve_copy_set(
+    snapshots: &[SourceSnapshot],
+    heads: &[SourceHead],
+    references: &[ops::SnapshotRef],
+) -> anyhow::Result<Vec<usize>> {
+    let find = |pair: &str, timeframe: &str, version: &str| -> Option<usize> {
+        snapshots.iter().position(|snap| {
+            snap.pair.as_str() == pair
+                && snap.timeframe.binance_interval() == timeframe
+                && snap.version.to_string() == version
+        })
+    };
+    let mut wanted: Vec<usize> = Vec::new();
+    for reference in references {
+        let Some(index) = find(
+            &reference.pair,
+            &reference.timeframe,
+            &reference.data_version,
+        ) else {
+            anyhow::bail!(
+                "backup: the frozen copy references {} {} {} and the data dir does not hold it; \
+                 nothing was backed up",
+                reference.pair,
+                reference.timeframe,
+                reference.data_version
+            );
+        };
+        if !wanted.contains(&index) {
+            wanted.push(index);
+        }
+    }
+    for head in heads {
+        let Some(index) = snapshots.iter().position(|snap| {
+            snap.pair == head.pair
+                && snap.timeframe == head.timeframe
+                && snap.version == head.version
+        }) else {
+            anyhow::bail!(
+                "backup: the HEAD pointer {} names {} and the data dir does not hold it; \
+                 nothing was backed up",
+                head.path.display(),
+                head.version
+            );
+        };
+        if !wanted.contains(&index) {
+            wanted.push(index);
+        }
+    }
+    Ok(wanted)
+}
+
+/// A snapshot the store ALREADY holds is verified, never skipped: an existing
+/// same-named file must be byte-identical, or the database this backup writes
+/// would reference bytes the restore must refuse.
+fn verify_store_bytes(
+    out_store: &CandleStore,
+    snapshots: &[SourceSnapshot],
+    wanted: &[usize],
+) -> anyhow::Result<()> {
+    for index in wanted {
+        let snap = &snapshots[*index];
         let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
         if dest.exists() && !bytes_equal(&snap.path, &dest) {
             anyhow::bail!(
@@ -186,63 +331,29 @@ pub(crate) async fn backup_target(
             );
         }
     }
-
-    let backup_path = backup_database(db_path, out_dir).await?;
-    let copied = publish_source_store(&out_store, &snapshots, &heads, &backup_path)?;
-    Ok(BackupOutcome {
-        path: backup_path,
-        snapshots_copied: copied,
-        snapshots_total: snapshots.len(),
-    })
+    Ok(())
 }
 
-/// Publish the source store into `<out-dir>/candles/` (one shared store):
-/// every snapshot the store is missing, then the HEAD pointers that name them —
-/// the same rule the import's copy applies, so a backup that is restored lands
-/// a store whose current pointer is the one it was taken with. Returns how many
-/// snapshots were added.
-///
-/// A failure deletes the partial database file, every snapshot this call added
-/// and every pointer it moved, so no half backup survives — and each copy
-/// publishes through `copy_snapshot_into`, so a copy that fails part-way leaves
-/// no truncated file under a snapshot's name.
-fn publish_source_store(
+/// Copy the wanted snapshots the store is missing, returning how many were
+/// added (recorded in `added` for the caller's cleanup).
+fn copy_wanted(
     out_store: &CandleStore,
     snapshots: &[SourceSnapshot],
-    heads: &[SourceHead],
-    backup_path: &Path,
+    wanted: &[usize],
+    added: &mut Vec<PathBuf>,
 ) -> anyhow::Result<usize> {
-    let mut added: Vec<PathBuf> = Vec::new();
-    let copied = (|| -> anyhow::Result<usize> {
-        let mut copied = 0usize;
-        for snap in snapshots {
-            let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
-            if dest.exists() {
-                continue;
-            }
-            copy_snapshot_into(&snap.path, &dest)?;
-            added.push(dest);
-            copied += 1;
+    let mut published = 0usize;
+    for index in wanted {
+        let snap = &snapshots[*index];
+        let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
+        if dest.exists() {
+            continue;
         }
-        Ok(copied)
-    })();
-    match copied {
-        Ok(copied) => {
-            // ---- Then the pointers, once every snapshot they name is in place.
-            match publish_heads(out_store, heads) {
-                Ok(()) => Ok(copied),
-                Err((error, changes)) => {
-                    restore_heads(out_store, &changes);
-                    discard(backup_path, &added);
-                    Err(error)
-                }
-            }
-        }
-        Err(error) => {
-            discard(backup_path, &added);
-            Err(error)
-        }
+        copy_snapshot_into(&snap.path, &dest)?;
+        added.push(dest);
+        published += 1;
     }
+    Ok(published)
 }
 
 /// The failure path's one move: no half backup survives — not the database file
