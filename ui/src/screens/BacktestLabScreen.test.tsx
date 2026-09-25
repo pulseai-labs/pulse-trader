@@ -14,7 +14,7 @@
 // pointer/keyboard tooltip parity with Left/Right/Home/End traversal, the
 // focusable trade-table scroll region, and the ≥24px inline hit targets.
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { flushSync } from "react-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -2171,6 +2171,94 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     expect(reopenMock).toHaveBeenLastCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
     expect(screen.queryByText(offline.message)).toBeNull();
   });
+
+  it("drops a superseded read's answer: the version on screen keeps its own run, and the pane never sticks on loading (N1)", async () => {
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", "wf-9a8b7c6d"),
+    });
+    // Both reads are held open and settled by hand, so the ORDER of the answers
+    // is the test's to choose: v-alpha-1's answer is the last one in.
+    const pending = new Map<string, (answer: ReopenAnswer) => void>();
+    reopenMock.mockImplementation(
+      (request) =>
+        new Promise<ReopenAnswer>((resolve) => {
+          pending.set(request.walkForwardRunId, resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+    await waitFor(() => {
+      expect(pending.has("wf-6c1d9f38")).toBe(true);
+    });
+
+    // The trader moves on while v-alpha-1's read is still out.
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await waitFor(() => {
+      expect(pending.has("wf-9a8b7c6d")).toBe(true);
+    });
+
+    // The version now on screen answers first...
+    await act(async () => {
+      pending.get("wf-9a8b7c6d")?.({ status: "ok", data: OTHER_WF_DTO });
+    });
+    expect(screen.getByText("wf-9a8b7c6d")).toBeTruthy();
+
+    // ...and the version the trader left answers LAST. Its run belongs to a pane
+    // that is gone: the screen may not swap to it, and may not fall back to
+    // "Opening…" with no effect left to run.
+    await act(async () => {
+      pending.get("wf-6c1d9f38")?.({ status: "ok", data: REOPENED_DTO });
+    });
+    expect(screen.getByText("wf-9a8b7c6d")).toBeTruthy();
+    expect(screen.queryByText("Opening the persisted walk-forward run…")).toBeNull();
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+  });
+
+  it("drops a superseded read's answer for the SAME id: an older failure cannot overwrite a newer success (N2)", async () => {
+    const offline: BusError = {
+      code: "internal",
+      message: "the server did not answer",
+      run_id: null, session_id: null, child_run_id: null,
+    };
+    // A fresh payload object per call, so the refetch really re-reads.
+    catalogMock.mockImplementation(async () => ({
+      status: "ok" as const,
+      data: reopenableCatalog("wf-6c1d9f38", null),
+    }));
+    const pending: Array<(answer: ReopenAnswer) => void> = [];
+    reopenMock.mockImplementation(
+      () =>
+        new Promise<ReopenAnswer>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+    await waitFor(() => {
+      expect(pending).toHaveLength(1);
+    });
+
+    // The window regains focus: the SAME pointer is read again.
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => {
+      expect(pending).toHaveLength(2);
+    });
+
+    // The newer read succeeds...
+    await act(async () => {
+      pending[1]({ status: "ok", data: REOPENED_DTO });
+    });
+    expect(screen.getByText("wf-6c1d9f38")).toBeTruthy();
+
+    // ...and the older one fails LAST for that same id. The id matches, but the
+    // read is still superseded: the run stays, the stale failure is dropped.
+    await act(async () => {
+      pending[0]({ status: "error", error: offline });
+    });
+    expect(screen.getByText("wf-6c1d9f38")).toBeTruthy();
+    expect(screen.queryByText(offline.message)).toBeNull();
+  });
 });
 
 /** Drive the selector's change through the DOM rather than `fireEvent`, so the
@@ -2183,3 +2271,8 @@ function switchSelectionOutsideAct(select: HTMLSelectElement, value: string): vo
     select.dispatchEvent(new Event("change", { bubbles: true }));
   });
 }
+
+/** One hold-open read's answer, settled by a test that chooses the order. */
+type ReopenAnswer =
+  | { status: "ok"; data: WalkForwardRunDto }
+  | { status: "error"; error: BusError };

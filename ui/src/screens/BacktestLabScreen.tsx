@@ -270,6 +270,12 @@ function reopenedStateFor(held: HeldReopened, target: string | null): ReopenedSt
  * instead of leaving a permanent error card. React's StrictMode re-runs a mount's
  * effects with the SAME props objects; `lastRead` deduplicates that, so one mount
  * is one read.
+ *
+ * **Only the newest read writes (review N1/N2).** An id tag alone still let a
+ * slow answer for the version the trader left overwrite the live one — and since
+ * that stale id no longer matches the target, the pane then read as loading for
+ * good, with no further effect to run. So each started read takes a generation,
+ * and `settle` drops anything that is not the current one.
  */
 function useReopenedWalkForward(
   operations: ActiveOperations,
@@ -288,9 +294,16 @@ function useReopenedWalkForward(
     version: LibraryVersion | null;
     target: string | null;
   } | null>(null);
+  /** Which read the pane is waiting for. Only the NEWEST one may write: a
+   * superseded read's answer is dropped whatever it says, the operation store's
+   * own rule ("a late result drops instead of speaking for an operation that is
+   * not it"). Without it, a slow answer for the version the trader left could
+   * overwrite the live one and strand the pane on "Opening…". */
+  const generation = useRef(0);
 
   useEffect(() => {
     if (target === null) {
+      generation.current += 1;
       lastRead.current = null;
       // Same-shaped state in, same object out: a refetch of a version with no
       // pointer re-renders nothing.
@@ -303,6 +316,9 @@ function useReopenedWalkForward(
       return;
     }
     lastRead.current = { version, target };
+    // Claimed only where a read actually starts, so the StrictMode replay above
+    // cannot supersede the read it is deduplicating.
+    const mine = (generation.current += 1);
     // A result already held for this id is kept while the re-read runs: a
     // refetch may confirm it, and a flash of "Opening…" over a rendered table
     // would be noise. A failure re-arm IS shown, because that is the retry.
@@ -311,7 +327,10 @@ function useReopenedWalkForward(
         ? current
         : { id: target, state: { kind: "loading" } },
     );
-    const settle = (next: ReopenedState) => setHeld({ id: target, state: next });
+    const settle = (next: ReopenedState) => {
+      if (generation.current !== mine) return;
+      setHeld({ id: target, state: next });
+    };
     try {
       commands
         .getWalkForwardRun({ walkForwardRunId: target })
@@ -1002,6 +1021,9 @@ function WalkForwardResult({
                 <td className="mono">{fold.index}</td>
                 <td className="mono">{fold.windowFrom}</td>
                 <td className="mono">{fold.windowTo}</td>
+                {/* The verdict's own count, not the fold run's (`fold.trades`):
+                    this is the per-fold VERDICT table, and bindings document `n`
+                    as "the trades the `wf-v1` verdict saw" (equal in production). */}
                 <td className="mono">{fold.n}</td>
                 <td className="mono">{fold.lowerBound ?? EM_DASH}</td>
                 <td>{fold.holds ? "yes" : "no"}</td>
