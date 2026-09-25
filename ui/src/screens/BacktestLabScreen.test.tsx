@@ -16,6 +16,7 @@
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
+import { flushSync } from "react-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../bindings", () => ({
@@ -1815,7 +1816,12 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
 // exactly the state #268 was walked in.
 
 /** One distinct window and tally per fold, so a row can only pass on its OWN
- * fold's numbers. Fold 3 has no lower bound — the em-dash path. */
+ * fold's numbers. Fold 3 has no lower bound — the em-dash path.
+ *
+ * Fold 2 deliberately carries `n` ≠ `trades` (4 vs 9): two separate fields on
+ * the wire, the count the `wf-v1` verdict saw and the fold run's persisted
+ * count, equal in production but not necessarily so. It is what pins the trades
+ * column to `n`, the field the column header names. */
 const REOPENED_FOLDS: WalkForwardFoldDto[] = [
   {
     index: 0, windowFrom: "2026-07-01T00:00:00.000Z", windowTo: "2026-07-02T00:00:00.000Z",
@@ -1830,7 +1836,7 @@ const REOPENED_FOLDS: WalkForwardFoldDto[] = [
   {
     index: 2, windowFrom: "2026-07-03T00:00:00.000Z", windowTo: "2026-07-04T00:00:00.000Z",
     backtestRunId: "run-fold-reopen-2", n: 4, meanR: "0.620", lowerBound: 0.16,
-    holds: true, trades: 4, expectancy: "0.620", winRate: "0.750",
+    holds: true, trades: 9, expectancy: "0.620", winRate: "0.750",
   },
   {
     index: 3, windowFrom: "2026-07-04T00:00:00.000Z", windowTo: "2026-07-05T00:00:00.000Z",
@@ -1920,7 +1926,13 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     });
     reopenMock.mockResolvedValue({ status: "ok", data: REOPENED_DTO });
 
-    const { container } = render(<BacktestLabScreen />);
+    // StrictMode, this file's convention for the mount claims: the double-invoked
+    // effect must still spend exactly ONE read on the pointer.
+    const { container } = render(
+      <StrictMode>
+        <BacktestLabScreen />
+      </StrictMode>,
+    );
 
     // The run id is on screen — the d29 walker ties the view to the run that was
     // STARTED, and this read is what put it there.
@@ -1947,18 +1959,26 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     // section, which is the same component on both paths.
     expect(container.querySelector(".bt-wf-origin")?.textContent).toContain("reopened by id");
 
-    // All SIX fold rows: window, trades, lower bound and holds, per row.
+    // All SIX fold rows, CELL BY CELL: window from/to, the trades column, the
+    // lower bound and holds — each cell asserted against its own field, so a
+    // column rendering the wrong field cannot pass on a coincidence. Fold 2's
+    // `n` and `trades` differ (4 vs 9), which pins the trades column to `n`:
+    // the count the verdict saw, the field that column names.
     const region = within(container).getByRole("region", { name: /fold rows/i });
     const rows = Array.from(region.querySelectorAll("tbody tr"));
     expect(rows).toHaveLength(6);
     REOPENED_FOLDS.forEach((fold, index) => {
-      const row = rows[index].textContent ?? "";
-      expect(row).toContain(fold.windowFrom);
-      expect(row).toContain(fold.windowTo);
-      expect(row).toContain(String(fold.trades));
-      expect(row).toContain(fold.holds ? "yes" : "no");
-      expect(row).toContain(fold.lowerBound === null ? "—" : String(fold.lowerBound));
+      const cells = Array.from(rows[index].querySelectorAll("td")).map(
+        (cell) => cell.textContent ?? "",
+      );
+      expect(cells[1]).toBe(fold.windowFrom);
+      expect(cells[2]).toBe(fold.windowTo);
+      expect(cells[3]).toBe(String(fold.n));
+      expect(cells[4]).toBe(fold.lowerBound === null ? "—" : String(fold.lowerBound));
+      expect(cells[5]).toBe(fold.holds ? "yes" : "no");
     });
+    // The fold whose two counts differ proves which one the column reads.
+    expect(String(REOPENED_FOLDS[2].n)).not.toBe(String(REOPENED_FOLDS[2].trades));
   });
 
   it("lets this session's own run win: a fresh result stays, and the persisted read is never consulted again", async () => {
@@ -2048,4 +2068,118 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     expect(container.querySelector(".bt-walkforward")).toBeNull();
     expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
   });
+
+  it("keys the read to its target: the render that lands on a new version shows neither the old run nor its failure", async () => {
+    const dropped: BusError = {
+      code: "internal",
+      message: "the connection dropped",
+      run_id: null, session_id: null, child_run_id: null,
+    };
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", "wf-9a8b7c6d"),
+    });
+    // v-alpha-1's read fails; v-alpha-2's answers with its own run.
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-6c1d9f38"
+        ? { status: "error" as const, error: dropped }
+        : { status: "ok" as const, data: OTHER_WF_DTO },
+    );
+
+    render(<BacktestLabScreen />);
+    const failure = (
+      await screen.findAllByRole("alert")
+    ).find((alert) => alert.textContent?.includes(dropped.message));
+    expect(failure).toBeTruthy();
+
+    // Change the selector OUTSIDE `act`: the render commits while the effect
+    // that re-reads has not run yet. That one frame is what review F1 is about —
+    // it must show the NEW target's in-flight state, never the old version's
+    // failure or run.
+    switchSelectionOutsideAct(screen.getByRole("combobox") as HTMLSelectElement, "v-alpha-2");
+
+    expect(screen.queryByText(dropped.message)).toBeNull();
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+    expect(screen.getByText("Opening the persisted walk-forward run…")).toBeTruthy();
+
+    // The new version's own read then lands, and the pane follows it.
+    await screen.findByText("wf-9a8b7c6d");
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+  });
+
+  it("keys the read to its target: a run already rendered for one version is not shown under the next one", async () => {
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", "wf-9a8b7c6d"),
+    });
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-6c1d9f38"
+        ? { status: "ok" as const, data: REOPENED_DTO }
+        : { status: "ok" as const, data: OTHER_WF_DTO },
+    );
+
+    const { container } = render(<BacktestLabScreen />);
+    await screen.findByText("wf-6c1d9f38");
+    expect(container.querySelector(".bt-walkforward")).not.toBeNull();
+
+    switchSelectionOutsideAct(screen.getByRole("combobox") as HTMLSelectElement, "v-alpha-2");
+
+    // One frame, un-act-ed: v-alpha-1's six fold rows may not stand in for
+    // v-alpha-2 — not even for a paint.
+    expect(container.querySelector(".bt-walkforward")).toBeNull();
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+    expect(screen.getByText("Opening the persisted walk-forward run…")).toBeTruthy();
+
+    await screen.findByText("wf-9a8b7c6d");
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+  });
+
+  it("retries a failed read when the catalog refetches with the same pointer", async () => {
+    const offline: BusError = {
+      code: "internal",
+      message: "the server did not answer",
+      run_id: null, session_id: null, child_run_id: null,
+    };
+    // A FRESH payload object per call, exactly as a real refetch parses one —
+    // that new identity is what the read's effect keys on.
+    catalogMock.mockImplementation(async () => ({
+      status: "ok" as const,
+      data: reopenableCatalog("wf-6c1d9f38", null),
+    }));
+    reopenMock.mockResolvedValueOnce({ status: "error", error: offline });
+    reopenMock.mockResolvedValue({ status: "ok", data: REOPENED_DTO });
+
+    const { container } = render(<BacktestLabScreen />);
+    const failure = (
+      await screen.findAllByRole("alert")
+    ).find((alert) => alert.textContent?.includes(offline.message));
+    expect(failure).toBeTruthy();
+    expect(container.querySelector(".bt-walkforward")).toBeNull();
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+
+    // The window regains focus: the catalogue is re-read — same version, same
+    // pointer — and the pane's read gets another go instead of leaving a dead
+    // error card behind.
+    const callsOnMount = catalogMock.mock.calls.length;
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => {
+      expect(catalogMock.mock.calls.length).toBeGreaterThan(callsOnMount);
+    });
+
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledTimes(2);
+    expect(reopenMock).toHaveBeenLastCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+    expect(screen.queryByText(offline.message)).toBeNull();
+  });
 });
+
+/** Drive the selector's change through the DOM rather than `fireEvent`, so the
+ * render commits while the passive effect that re-reads has NOT run: the frame
+ * review F1 found, made deterministic here by `flushSync` instead of relying on
+ * React's discrete-event flushing. */
+function switchSelectionOutsideAct(select: HTMLSelectElement, value: string): void {
+  flushSync(() => {
+    select.value = value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}

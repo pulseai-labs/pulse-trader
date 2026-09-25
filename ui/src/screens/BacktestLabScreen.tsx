@@ -17,7 +17,7 @@
 // default export, zero props — the shell mounts it from the route table and
 // all state is its own.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { commands } from "../bindings";
 import type {
@@ -220,6 +220,14 @@ type ReopenedState =
   | { kind: "failed"; error: BusError }
   | { kind: "done"; dto: WalkForwardRunDto };
 
+/** A read's state TOGETHER WITH the run id it is the answer for. The tag is what
+ * keeps an answer off a version it was not read for (review F1). */
+type HeldReopened = {
+  /** The run id this state belongs to; `null` while nothing has been read. */
+  readonly id: string | null;
+  readonly state: ReopenedState;
+};
+
 /** The read's own operational failure — the shape every other IPC failure uses. */
 function readFailure(): BusError {
   return {
@@ -227,6 +235,14 @@ function readFailure(): BusError {
     message: "The walk-forward read failed.",
     run_id: null, session_id: null, child_run_id: null,
   };
+}
+
+/** The read's state for THIS target. A state held for another run id is not this
+ * target's answer, so it reads as the in-flight state — never as a run or a
+ * failure belonging to a version the trader has already left (review F1). */
+function reopenedStateFor(held: HeldReopened, target: string | null): ReopenedState {
+  if (target === null) return { kind: "idle" };
+  return held.id === target ? held.state : { kind: "loading" };
 }
 
 /**
@@ -240,10 +256,20 @@ function readFailure(): BusError {
  * catalogue row carries no pointer is never read for either, and renders no
  * pane at all.
  *
- * It is a READ: nothing here calls `runWalkForwardVersion`, so a reopened run
- * can never restart the K engine runs behind it. `alive` drops a response for a
- * version the trader has moved away from, so a late answer cannot land on the
- * new selection's pane — the same rule `CompareWithParent` reads its parent by.
+ * **An answer belongs to the id it was read for (review F1).** The state is held
+ * WITH its run id and handed out through `reopenedStateFor`, so the render that
+ * lands when the selection moves — before this hook's effect has re-armed — shows
+ * the NEW target's in-flight state rather than the run (or the failure) of the
+ * version the trader just left. There is no `alive` flag to lean on instead: a
+ * tag is strictly stronger, because a late answer arrives carrying its own id and
+ * is therefore ignored by a new target's render for as long as the ids differ.
+ *
+ * **A refetch re-reads (review F2).** The effect keys on the version OBJECT, not
+ * on its id — `CompareWithParent`'s rule — so the focus refetch's fresh payload
+ * re-reads the pointer, and a read that failed on a dead connection retries
+ * instead of leaving a permanent error card. React's StrictMode re-runs a mount's
+ * effects with the SAME props objects; `lastRead` deduplicates that, so one mount
+ * is one read.
  */
 function useReopenedWalkForward(
   operations: ActiveOperations,
@@ -253,18 +279,39 @@ function useReopenedWalkForward(
     version !== null && operations.lookup(walkForwardKey(version.id)) === undefined
       ? version.latestWalkForwardRunId
       : null;
-  const [state, setState] = useState<ReopenedState>({ kind: "idle" });
+  const [held, setHeld] = useState<HeldReopened>({
+    id: null,
+    state: { kind: "idle" },
+  });
+  /** The inputs the last read was started for — see the StrictMode note above. */
+  const lastRead = useRef<{
+    version: LibraryVersion | null;
+    target: string | null;
+  } | null>(null);
 
   useEffect(() => {
     if (target === null) {
-      setState({ kind: "idle" });
+      lastRead.current = null;
+      // Same-shaped state in, same object out: a refetch of a version with no
+      // pointer re-renders nothing.
+      setHeld((current) =>
+        current.id === null ? current : { id: null, state: { kind: "idle" } },
+      );
       return;
     }
-    let alive = true;
-    const settle = (next: ReopenedState) => {
-      if (alive) setState(next);
-    };
-    setState({ kind: "loading" });
+    if (lastRead.current?.version === version && lastRead.current.target === target) {
+      return;
+    }
+    lastRead.current = { version, target };
+    // A result already held for this id is kept while the re-read runs: a
+    // refetch may confirm it, and a flash of "Opening…" over a rendered table
+    // would be noise. A failure re-arm IS shown, because that is the retry.
+    setHeld((current) =>
+      current.id === target && current.state.kind === "done"
+        ? current
+        : { id: target, state: { kind: "loading" } },
+    );
+    const settle = (next: ReopenedState) => setHeld({ id: target, state: next });
     try {
       commands
         .getWalkForwardRun({ walkForwardRunId: target })
@@ -285,14 +332,9 @@ function useReopenedWalkForward(
       // path the operation store guards.
       settle({ kind: "failed", error: readFailure() });
     }
-    return () => {
-      alive = false;
-    };
-    // `target` is the whole dependency: the same id is never read twice, and a
-    // focus refetch handing the screen a fresh version OBJECT does not re-read.
-  }, [target]);
+  }, [version, target]);
 
-  return state;
+  return reopenedStateFor(held, target);
 }
 
 /** The pane's state: this session's own operation, or the persisted read behind
@@ -301,7 +343,7 @@ type PaneState =
   | { kind: "idle" }
   | { kind: "running" }
   | { kind: "reopening" }
-  | { kind: "failed"; error: BusError; reopened?: boolean }
+  | { kind: "failed"; error: BusError }
   | { kind: "done"; dto: WalkForwardRunDto; reopened?: boolean };
 
 /** The record wins wherever it exists; the persisted read answers only where no
@@ -312,7 +354,7 @@ function paneStateOf(record: WalkForwardState, reopened: ReopenedState): PaneSta
   if (record.kind === "done") return { kind: "done", dto: record.dto };
   if (reopened.kind === "loading") return { kind: "reopening" };
   if (reopened.kind === "failed") {
-    return { kind: "failed", error: reopened.error, reopened: true };
+    return { kind: "failed", error: reopened.error };
   }
   if (reopened.kind === "done") {
     return { kind: "done", dto: reopened.dto, reopened: true };
