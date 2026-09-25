@@ -559,7 +559,8 @@ pub fn default_compose_runner() -> ComposeRunner {
 // The five op spawns
 // ---------------------------------------------------------------------------
 
-/// `POST /api/v1/ops/compose-strategy` — `{"nlTarget": "..."}`.
+/// `POST /api/v1/ops/compose-strategy` — `{"nl_target": "..."}` (the body the
+/// handler reads; the 422 below names the same field).
 ///
 /// Registers the compose latch BEFORE the 202 (the wrapper registers before
 /// the first event; over HTTP the ack comes first, so the registration comes
@@ -590,6 +591,7 @@ pub(crate) async fn op_compose_strategy(state: Arc<ServerState>, req: Request) -
     let registry = state.ops.clone();
     let task_op_id = op_id.clone();
     tokio::spawn(async move {
+        let finish = OpFinishGuard::new(registry, task_op_id);
         let ctx = ComposeRunCtx {
             desktop: desktop.clone(),
             run_id: run_id.clone(),
@@ -597,9 +599,12 @@ pub(crate) async fn op_compose_strategy(state: Arc<ServerState>, req: Request) -
             sink,
             cancelled,
         };
+        // Via the guard: a panicking runner still finishes the record.
         let outcome = runner(ctx).await;
-        registry.finish(&task_op_id, terminal_value(&outcome));
-        // Every exit path — success, cancellation and error alike.
+        finish.finish(terminal_value(&outcome));
+        // Every exit path — success, cancellation and error alike. (A panic
+        // above skips this, but the latch's own sweep closes it; the record is
+        // the part that must not be left Running.)
         desktop.finish_compose_run(&run_id);
     });
     accepted(&op_id)
@@ -620,6 +625,7 @@ pub(crate) async fn op_coach_turn(state: Arc<ServerState>, req: Request) -> Resp
     let registry = state.ops.clone();
     let task_op_id = op_id.clone();
     tokio::spawn(async move {
+        let finish = OpFinishGuard::new(registry, task_op_id);
         // The wrapper's body, line for line.
         let outcome = (|| async {
             let transport = load_llm_transport()
@@ -650,7 +656,7 @@ pub(crate) async fn op_coach_turn(state: Arc<ServerState>, req: Request) -> Resp
             coach_turn_core(&desktop, deps, request).await
         })()
         .await;
-        registry.finish(&task_op_id, terminal_value(&outcome));
+        finish.finish(terminal_value(&outcome));
     });
     accepted(&op_id)
 }
@@ -704,11 +710,67 @@ pub(crate) async fn op_start_demo_stream(state: Arc<ServerState>, req: Request) 
     let registry = state.ops.clone();
     let task_op_id = op_id.clone();
     tokio::spawn(async move {
+        let finish = OpFinishGuard::new(registry, task_op_id);
         let outcome: Result<StreamOutcome, BusError> =
             demo_stream_core(&run_id, steps.min(64), &sink).await;
-        registry.finish(&task_op_id, terminal_value(&outcome));
+        finish.finish(terminal_value(&outcome));
     });
     accepted(&op_id)
+}
+
+/// Finishes one op record on the way out — whether the spawned body RETURNED or
+/// panicked.
+///
+/// A panic that skipped `registry.finish` would leave the `OpRecord` in
+/// `Phase::Running` forever: its subscriber channels never close, so every
+/// attached `GET /api/v1/ops/{op_id}/events` stream hangs until the process
+/// ends, and the map entry with its event buffer leaks for the same lifetime.
+/// A guard drops on the unwind, so the record still becomes terminal — an
+/// `internal` error naming the panic — and the subscribers see it.
+///
+/// Used by EVERY spawn site, so the shape cannot drift between ops.
+struct OpFinishGuard {
+    registry: OpRegistry,
+    op_id: String,
+    finished: bool,
+}
+
+impl OpFinishGuard {
+    fn new(registry: OpRegistry, op_id: String) -> Self {
+        Self {
+            registry,
+            op_id,
+            finished: false,
+        }
+    }
+
+    /// The normal path: finish with the body's own outcome.
+    fn finish(mut self, terminal: Result<Value, BusError>) {
+        self.finished = true;
+        self.registry.finish(&self.op_id, terminal);
+    }
+
+    /// Push one bus event on this op's stream (the `started` frame).
+    fn push_event(&self, event: &SseRecord) {
+        self.registry.push_event(&self.op_id, event);
+    }
+}
+
+impl Drop for OpFinishGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            // The body panicked (or the task was cancelled mid-await): the
+            // record must still go terminal. `finish` itself is panic-free —
+            // a terminal frame's serialization cannot fail and falls back to
+            // `{}`.
+            self.registry.finish(
+                &self.op_id,
+                Err(BusError::internal(
+                    "the operation task ended without a result (it panicked)",
+                )),
+            );
+        }
+    }
 }
 
 /// A core's typed outcome as the terminal value: the DTO's JSON on success,
@@ -722,9 +784,10 @@ fn terminal_value<T: Serialize>(outcome: &Result<T, BusError>) -> Result<Value, 
 }
 
 /// The non-streaming op body: one `started` frame at seq 0, then the terminal
-/// at seq 1. Returns the 202 the route answers with. The work is a FACTORY
-/// over an owned `Arc<DesktopState>` because the core's future borrows the
-/// desktop state — and a spawned task cannot borrow the handler's stack.
+/// at seq 1 — on a panic too, through [`OpFinishGuard`]. Returns the 202 the
+/// route answers with. The work is a FACTORY over an owned `Arc<DesktopState>`
+/// because the core's future borrows the desktop state — and a spawned task
+/// cannot borrow the handler's stack.
 fn spawn_plain_op<T, Fut, F>(
     state: &Arc<ServerState>,
     command: &'static str,
@@ -746,9 +809,10 @@ where
         data: json!({ "command": command }).to_string(),
     };
     tokio::spawn(async move {
-        registry.push_event(&task_op_id, &started);
+        let finish = OpFinishGuard::new(registry, task_op_id);
+        finish.push_event(&started);
         let outcome = make_work(desktop).await;
-        registry.finish(&task_op_id, terminal_value(&outcome));
+        finish.finish(terminal_value(&outcome));
     });
     accepted(&op_id)
 }

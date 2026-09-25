@@ -20,7 +20,9 @@
 //! Every refusal body is JSON `{code, message}` whose message names the reason
 //! in words and NEVER echoes the presented value; every refusal writes exactly
 //! one `refused` audit row whose `route` is the method + path (never a query
-//! string, never a header value) and whose `peer` is the remote IP. A request
+//! string, never a header value — and the path passes the same structural
+//! [`Redactor`] pass the request log runs, since a path is user-influenced
+//! input) and whose `peer` is the remote IP. A request
 //! that authenticates carries the token's label into the request AND response
 //! extensions, so the log line and later handlers can name the client.
 
@@ -38,6 +40,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::adapters::db::{ClientToken, SqliteClientTokenRepo};
+use crate::domain::Redactor;
 
 use super::ServerState;
 
@@ -155,7 +158,13 @@ pub(crate) async fn require_scope(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().to_string());
-    let route = format!("{method} {path}");
+    // The path is user-influenced input that lands in the refusal audit row and
+    // in the lookup-failure log line: it goes through the SAME structural
+    // redaction pass the request log runs (log.rs) before either is written.
+    let route = format!(
+        "{method} {}",
+        Redactor::from_config(Vec::new()).redact(&path)
+    );
 
     let repo = SqliteClientTokenRepo::new(state.db.pool().clone());
 

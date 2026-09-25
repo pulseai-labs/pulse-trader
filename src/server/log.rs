@@ -63,10 +63,31 @@ impl RequestLog for CaptureLog {
     }
 }
 
+/// The marker the request-log middleware leaves on a request it has claimed.
+///
+/// It exists because the SAME request passes two log layers: `router()` layers
+/// this middleware over the whole router (so routes mounted after it returned —
+/// the probe routes in `tests/server_auth.rs` — and the 404 fallback are logged
+/// too), and `mount_scoped` gives every built-in route its own
+/// (version, log, auth) trio. Without the marker each built-in request wrote
+/// two stderr lines, against this module's "one stderr line per request".
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Logged;
+
 /// The request-log middleware (router-level, so the fallback is logged too).
 /// The label comes from the response extensions the auth middleware inserted;
 /// a refused or fallback request has none and logs `-`.
-pub(crate) async fn request_log(req: Request, next: Next, state: Arc<ServerState>) -> Response {
+///
+/// Exactly one line per request: the OUTERMOST log layer claims the request by
+/// inserting [`Logged`], and a nested layer that sees the marker passes the
+/// request straight through. Either layer works alone — a route mounted with no
+/// router-level layer still logs, because it is the one that claims.
+pub(crate) async fn request_log(mut req: Request, next: Next, state: Arc<ServerState>) -> Response {
+    if req.extensions().get::<Logged>().is_some() {
+        // An outer layer owns this request's line.
+        return next.run(req).await;
+    }
+    req.extensions_mut().insert(Logged);
     let start = Instant::now();
     let method = req.method().clone();
     let raw_path = req.uri().path().to_owned();

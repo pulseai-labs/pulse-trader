@@ -710,6 +710,42 @@ async fn the_request_log_names_the_label_or_a_dash() {
     }
 }
 
+/// One request, exactly ONE stderr line — in BOTH worlds. A built-in API route
+/// carries its own (version, log, auth) trio AND sits under the log layer
+/// `router()` applies to the whole router, so a layer that did not check
+/// whether the request was already claimed wrote two records per request; a
+/// probe route mounted after `router()` returned has ONLY the trio, and must
+/// keep logging (which is why the trio cannot simply be dropped).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_request_writes_exactly_one_log_line() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+    let token = issue_token("once-app", "app", &server.db_path);
+
+    for path in ["/api/v1/handshake", "/api/v1/shell-info", "/probe/app"] {
+        let before = server.log.lines().len();
+        let response = client
+            .get(format!("{}{path}", server.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK, "{path} answered");
+
+        let lines = server.log.lines();
+        let added: Vec<&String> = lines.iter().skip(before).collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "exactly one line for {path}, got {added:?} (all: {lines:?})"
+        );
+        assert!(
+            added[0].contains(path) && added[0].contains("once-app"),
+            "and the one line names the request: {added:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (ix) r3.s3.w3 AC-1 (ledger d31) — the server credential profile at the Step 3
 // seam: a loose credential file refuses the STARTUP (exit non-zero, naming the
