@@ -72,6 +72,15 @@ fn manifest(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+/// The manifest a backup carries, beside its database (the crate's own naming).
+fn manifest_path_for(backup_db: &Path) -> PathBuf {
+    let name = backup_db
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pulse-backup.db");
+    backup_db.with_file_name(format!("{name}.heads.json"))
+}
+
 /// Recursively copy a directory tree (the fixture store, so a test may tamper
 /// with its copy without touching the committed one).
 fn copy_tree(from: &Path, to: &Path) {
@@ -1678,6 +1687,219 @@ async fn a_backup_refuses_a_corrupt_source_snapshot() {
         1,
         "and the backup lands: {:?}",
         backup_db_files(&out_dir)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// round 6, Fix A — each backup carries its OWN pointer manifest
+// ---------------------------------------------------------------------------
+
+/// Write a SECOND version of the 15m snapshot into `data_dir` and make it the
+/// store's CURRENT one (its `HEAD` pointer moves with it): the fixture's data,
+/// minus its last bar, written back through the store so provenance and content
+/// hash are real.
+fn publish_a_second_version(data_dir: &Path, stem: &str) -> String {
+    let store = CandleStore::with_base_dir(data_dir.to_path_buf());
+    let pair = Pair::parse("BTCUSDT").expect("the fixture pair");
+    let mut series = store
+        .read_snapshot(&pair, Timeframe::M15, &DataVersion::new(stem.to_owned()))
+        .expect("read the fixture snapshot");
+    series.candles.pop();
+    series.version = CandleStore::content_version(&pair, Timeframe::M15, &series.candles);
+    store
+        .write_snapshot(&series)
+        .expect("write the second version");
+    // The pointer too: a backup manifests the pointers the store held when it
+    // froze the database, so a version nothing points at would travel nowhere.
+    store
+        .write_head(&pair, Timeframe::M15, &series.version)
+        .expect("move the current pointer to the second version");
+    let written = series.version.to_string();
+    assert_ne!(written, stem, "the second version is a different snapshot");
+    written
+}
+
+/// The out-dir's store holds ONE shared pointer set that every backup
+/// overwrites, so restoring an older backup used to publish the NEWEST pointers
+/// over its own database — silently combining an older database with newer
+/// current-candle pointers. Each backup now carries its own manifest, and a
+/// restore reads only the manifest of the backup it was handed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restoring_an_older_backup_lands_its_own_pointers() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+    assert!(import_once(&s, &target_db, &target_data).status.success());
+
+    let backups_dir = s.dir.path().join("backups");
+    let backup = |home: &Path| -> Output {
+        run_pulse(
+            home,
+            &[
+                "backup",
+                "--db",
+                target_db.to_str().unwrap(),
+                "--data-dir",
+                target_data.to_str().unwrap(),
+                "--out-dir",
+                backups_dir.to_str().unwrap(),
+            ],
+        )
+    };
+
+    // Backup #1: the fixture's pointers (V1).
+    let first = backup(&s.home);
+    assert!(first.status.success(), "backup 1: {}", combined(&first));
+    // Distinct wall-clock seconds keep the stamp names chronological.
+    sleep(Duration::from_millis(1100));
+
+    // The store moves on: a second version becomes current (V2).
+    let v2 = publish_a_second_version(&target_data, &s.stems.0);
+    let second = backup(&s.home);
+    assert!(second.status.success(), "backup 2: {}", combined(&second));
+
+    let written = backup_db_files(&backups_dir);
+    assert_eq!(written.len(), 2, "two backups: {written:?}");
+    let (older, newer) = (&written[0], &written[1]);
+
+    // Restoring the OLDER backup yields ITS pointers …
+    let older_data = s.dir.path().join("older-data");
+    let older_restore = run_pulse(
+        &s.home,
+        &[
+            "restore",
+            older.to_str().unwrap(),
+            "--backup-dir",
+            backups_dir.to_str().unwrap(),
+            "--db",
+            s.dir
+                .path()
+                .join("older")
+                .join("pulse.db")
+                .to_str()
+                .unwrap(),
+            "--data-dir",
+            older_data.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&older_restore);
+    assert!(older_restore.status.success(), "the older restore: {text}");
+    let pair = Pair::parse("BTCUSDT").expect("the fixture pair");
+    let older_store = CandleStore::with_base_dir(older_data.clone());
+    let older_head = older_store
+        .read_head(&pair, Timeframe::M15)
+        .expect("read the older target's pointer")
+        .expect("the older restore lands a pointer");
+    assert_eq!(
+        older_head.to_string(),
+        s.stems.0,
+        "the older backup carries the pointers of ITS database, not the shared store's newest"
+    );
+    assert_ne!(older_head.to_string(), v2, "and never the newer version");
+
+    // … and the NEWER one yields its own.
+    let newer_data = s.dir.path().join("newer-data");
+    let newer_restore = run_pulse(
+        &s.home,
+        &[
+            "restore",
+            newer.to_str().unwrap(),
+            "--backup-dir",
+            backups_dir.to_str().unwrap(),
+            "--db",
+            s.dir
+                .path()
+                .join("newer")
+                .join("pulse.db")
+                .to_str()
+                .unwrap(),
+            "--data-dir",
+            newer_data.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&newer_restore);
+    assert!(newer_restore.status.success(), "the newer restore: {text}");
+    let newer_store = CandleStore::with_base_dir(newer_data);
+    let newer_head = newer_store
+        .read_head(&pair, Timeframe::M15)
+        .expect("read the newer target's pointer")
+        .expect("the newer restore lands a pointer");
+    assert_eq!(
+        newer_head.to_string(),
+        v2,
+        "the newer backup carries the newer pointers"
+    );
+
+    // The manifest half of the contract, asserted LAST so the two restores above
+    // are what fails first without the fix: each backup carries its OWN manifest,
+    // which is the only reason those restores can tell the pointer sets apart.
+    for db in [older, newer] {
+        assert!(
+            manifest_path_for(db).exists(),
+            "every backup carries its own manifest: {}",
+            manifest_path_for(db).display()
+        );
+    }
+}
+
+/// The manifest is the ONLY pointer source a restore uses: a backup without one
+/// is refused by name, never guessed from the shared store's pointer directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_without_its_manifest_is_refused_by_restore() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+    assert!(import_once(&s, &target_db, &target_data).status.success());
+
+    let backups_dir = s.dir.path().join("backups");
+    let backup = run_pulse(
+        &s.home,
+        &[
+            "backup",
+            "--db",
+            target_db.to_str().unwrap(),
+            "--data-dir",
+            target_data.to_str().unwrap(),
+            "--out-dir",
+            backups_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(backup.status.success(), "the backup: {}", combined(&backup));
+    let written = backup_db_files(&backups_dir);
+    assert_eq!(written.len(), 1, "one backup: {written:?}");
+    let manifest = manifest_path_for(&written[0]);
+
+    // The manifest is what a restore reads: without it, the shared store's
+    // pointers are NOT a fallback.
+    fs::remove_file(&manifest).expect("drop the manifest");
+
+    let restored_db = s.dir.path().join("restored").join("pulse.db");
+    let out = run_pulse(
+        &s.home,
+        &[
+            "restore",
+            written[0].to_str().unwrap(),
+            "--backup-dir",
+            backups_dir.to_str().unwrap(),
+            "--db",
+            restored_db.to_str().unwrap(),
+            "--data-dir",
+            s.dir.path().join("restored-data").to_str().unwrap(),
+        ],
+    );
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a backup without its manifest must be refused: {text}"
+    );
+    assert!(
+        text.contains("HEAD-pointer manifest") && text.contains("refusing"),
+        "the refusal names the manifest and says it will not guess: {text}"
+    );
+    assert!(
+        !restored_db.exists(),
+        "and nothing was installed: {}",
+        restored_db.display()
     );
 }
 

@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use clap::Args;
+use serde::{Deserialize, Serialize};
 
 use crate::adapters::db::default_db_path;
 use crate::adapters::db::ops;
@@ -90,6 +91,7 @@ pub(crate) async fn run_import(args: &ImportArgs) -> anyhow::Result<()> {
         from_data_dir: &args.from_data_dir,
         db_target: &db_target,
         data_target: &data_target,
+        head_source: HeadSource::SourceStore,
         replace: args.replace,
         chmod_source: true,
     })
@@ -111,10 +113,31 @@ pub(crate) struct VerifiedCopy<'a> {
     pub db_target: &'a Path,
     /// The target data dir.
     pub data_target: &'a Path,
+    /// Where this copy's HEAD pointers come from (round 6, Fix A).
+    pub head_source: HeadSource,
     /// Back up the non-empty target first, then replace it.
     pub replace: bool,
     /// Set the source db a-w after a successful copy (import only).
     pub chmod_source: bool,
+}
+
+/// Where a verified copy takes its HEAD pointers from.
+///
+/// An IMPORT reads the source store's own pointer files: the data dir is the
+/// operator's store and its pointers are part of what travels.
+///
+/// A RESTORE must not: the backup store is SHARED by every backup in the
+/// out-dir and each one overwrites the same pointer files, so reading them back
+/// would publish the NEWEST pointers over an OLDER database — an older run's
+/// frozen snapshot set silently replaced by newer current candles. A restore
+/// therefore takes the pointers from the chosen backup's own manifest, and a
+/// backup with no manifest is refused by name rather than guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadSource {
+    /// The source store's own `HEAD` files (an import).
+    SourceStore,
+    /// The chosen backup's manifest, beside its database (a restore).
+    BackupManifest,
 }
 
 /// One named verification failure: the table, the id, the field.
@@ -238,6 +261,19 @@ pub(crate) fn default_backup_out_dir() -> anyhow::Result<PathBuf> {
 pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<()> {
     let label = job.source_label;
 
+    // ---- Round 6, Fix A: a RESTORE takes its pointers from the chosen
+    // backup's own manifest, never from the shared store's pointer directory
+    // (every backup overwrites that directory, so an older backup read from it
+    // would publish the newest pointers over its own database). Reading it here
+    // means a backup without one is refused before anything is touched.
+    let manifest_heads = match job.head_source {
+        HeadSource::SourceStore => None,
+        HeadSource::BackupManifest => Some(
+            read_head_manifest(&manifest_path(job.from_db))
+                .map_err(|error| anyhow!("{label}: {error}"))?,
+        ),
+    };
+
     // ---- Step 1: refuse a non-empty target; back it up first on --replace.
     if let Some(contents) = ops::target_row_counts(job.db_target)
         .await
@@ -288,7 +324,7 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
             return Err(anyhow!("migrate the copy forward: {e}"));
         }
     };
-    let steps = run_steps(&job, &opened).await;
+    let steps = run_steps(&job, &opened, manifest_heads.as_deref()).await;
     // CLOSE the copy's pool — do not merely drop the handle — before any file
     // surgery on either path. A dropped handle releases the pool without
     // closing its connections, so committed rows could still sit in the
@@ -356,6 +392,7 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
 async fn run_steps(
     job: &VerifiedCopy<'_>,
     copied: &Db,
+    manifest_heads: Option<&[SourceHead]>,
 ) -> Result<(Summary, StoreWrites), StepFailure> {
     let copy_pool = copied.pool();
     let mut mismatches: Vec<Mismatch> = Vec::new();
@@ -367,8 +404,13 @@ async fn run_steps(
     mismatches.extend(scan_issues);
     // The store's HEAD pointers are NOT snapshots (the scan steps over
     // everything that is not a `.parquet` file) and they are read here so the
-    // last step can publish them with the snapshots they name.
-    let (source_heads, head_issues) = scan_heads(job.from_data_dir);
+    // last step can publish them with the snapshots they name. An IMPORT reads
+    // them from the source store; a RESTORE uses the chosen backup's manifest
+    // (read by the caller), never the shared store's pointer directory.
+    let (source_heads, head_issues) = match manifest_heads {
+        Some(heads) => (heads.to_vec(), Vec::new()),
+        None => scan_heads(job.from_data_dir),
+    };
     mismatches.extend(head_issues);
     let mut writes = StoreWrites::default();
     // `copy_snapshots` adds files as it goes and can fail part-way: the error
@@ -815,6 +857,152 @@ pub(crate) struct SourceHead {
     pub version: DataVersion,
     /// The `HEAD` file.
     pub path: PathBuf,
+}
+
+/// One backup's pointer manifest: the `HEAD` pointers its database was frozen
+/// with, written beside the backup database (round 6, Fix A).
+///
+/// It exists because the out-dir's store holds ONE shared pointer set that every
+/// backup overwrites: with two retained backups restoring the OLDER database
+/// would otherwise find the shared directory's newest pointers, validate them
+/// (their snapshots are all still present) and publish them — silently
+/// combining an older database with newer current-candle pointers.
+#[derive(Debug, Serialize, Deserialize)]
+struct HeadManifest {
+    /// The manifest's own shape, so a future change can refuse an old file
+    /// loudly instead of misreading it.
+    version: u32,
+    /// The pointers, in the order the source store held them.
+    heads: Vec<ManifestHead>,
+}
+
+/// One pointer inside a [`HeadManifest`], as the store spells it on the wire.
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestHead {
+    /// The pair directory.
+    pair: String,
+    /// The timeframe directory (`15m` / `4h`).
+    timeframe: String,
+    /// The `data_version` the pointer names.
+    data_version: String,
+}
+
+/// The manifest's shape this build writes and understands.
+const MANIFEST_VERSION: u32 = 1;
+
+/// Where one backup's manifest lives: beside its database, named after it.
+pub(crate) fn manifest_path(backup_db: &Path) -> PathBuf {
+    let name = backup_db
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pulse-backup.db");
+    backup_db.with_file_name(format!("{name}.heads.json"))
+}
+
+/// Publish `bytes` at `path` ATOMICALLY — the same temp→fsync→rename discipline
+/// the snapshot copies use, so a reader never sees a half-written file and a
+/// crash never leaves a partial one under the final name.
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let temporary = temporary_sibling(path)?;
+    let _ = fs::remove_file(&temporary);
+    fs::write(&temporary, bytes).map_err(|e| anyhow!("write {}: {e}", temporary.display()))?;
+    let flushed = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .and_then(|handle| handle.sync_all());
+    if let Err(error) = flushed {
+        let _ = fs::remove_file(&temporary);
+        return Err(anyhow!("flush {}: {error}", temporary.display()));
+    }
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        anyhow!(
+            "install {} -> {}: {error}",
+            temporary.display(),
+            path.display()
+        )
+    })
+}
+
+/// Write one backup's pointer manifest beside it (atomically: the same
+/// discipline the rest of the surface uses).
+pub(crate) fn write_head_manifest(path: &Path, heads: &[SourceHead]) -> anyhow::Result<()> {
+    let manifest = HeadManifest {
+        version: MANIFEST_VERSION,
+        heads: heads
+            .iter()
+            .map(|head| ManifestHead {
+                pair: head.pair.as_str().to_owned(),
+                timeframe: head.timeframe.binance_interval().to_owned(),
+                data_version: head.version.to_string(),
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| anyhow!("serialize the HEAD manifest: {e}"))?;
+    write_file_atomic(path, &bytes)
+}
+
+/// Read one backup's pointer manifest — the ONLY pointer source a restore uses.
+///
+/// # Errors
+///
+/// A named refusal for a manifest that is absent, unreadable, corrupt, written
+/// by a shape this build does not know, or carrying an entry that does not parse
+/// as a `(pair, timeframe, data_version)`: the shared store's pointers are never
+/// guessed in its place.
+pub(crate) fn read_head_manifest(path: &Path) -> anyhow::Result<Vec<SourceHead>> {
+    let bytes = fs::read(path).map_err(|error| {
+        anyhow!(
+            "the backup has no readable HEAD-pointer manifest at {} ({error}); refusing rather \
+             than guessing the shared store's pointers",
+            path.display()
+        )
+    })?;
+    let manifest: HeadManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow!(
+            "the HEAD-pointer manifest {} is unreadable ({error}); refusing rather than guessing",
+            path.display()
+        )
+    })?;
+    if manifest.version != MANIFEST_VERSION {
+        anyhow::bail!(
+            "the HEAD-pointer manifest {} is shape {} and this build writes {MANIFEST_VERSION}; \
+             refusing rather than guessing",
+            path.display(),
+            manifest.version
+        );
+    }
+    let mut heads = Vec::with_capacity(manifest.heads.len());
+    for entry in &manifest.heads {
+        let pair = Pair::parse(&entry.pair).map_err(|e| {
+            anyhow!(
+                "the manifest {} names an unreadable pair: {e}",
+                path.display()
+            )
+        })?;
+        let timeframe = timeframe_from_interval(&entry.timeframe).ok_or_else(|| {
+            anyhow!(
+                "the manifest {} names an unknown timeframe {:?}",
+                path.display(),
+                entry.timeframe
+            )
+        })?;
+        let version = DataVersion::parse(&entry.data_version).map_err(|e| {
+            anyhow!(
+                "the manifest {} names an unreadable data_version: {e}",
+                path.display()
+            )
+        })?;
+        heads.push(SourceHead {
+            pair,
+            timeframe,
+            version,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(heads)
 }
 
 /// Every `HEAD` pointer in `data_dir`, with the mismatches a broken one makes.

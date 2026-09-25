@@ -5,10 +5,13 @@
 //! (SQLite's `VACUUM INTO` from a read-only open — readers never block a
 //! writer in WAL) into `<out-dir>/pulse-<UTC yyyymmddThhmmssZ>.db`, copies
 //! every snapshot not already present into `<out-dir>/candles/` (one shared
-//! store; snapshots are immutable), prunes the oldest `pulse-*.db` beyond
-//! `--keep` (never touching `candles/`), and prints one summary line with the
-//! path, size and counts. Any error exits non-zero and deletes the partial
-//! file.
+//! store; snapshots are immutable), writes that backup's OWN pointer manifest
+//! beside it (`pulse-<stamp>.db.heads.json`: the shared store's `HEAD` files are
+//! one set every backup overwrites, so a restore takes the pointers of the
+//! backup it was handed), prunes the oldest `pulse-*.db` beyond `--keep` along
+//! with their manifests (never touching `candles/`), and prints one summary line
+//! with the path, size and counts. Any error exits non-zero and deletes the
+//! partial file.
 //!
 //! `pulse restore` runs the SAME verification as import (steps 3–5 of the
 //! import contract) on the backup into a temporary file beside the target,
@@ -31,9 +34,10 @@ use chrono::Utc;
 use clap::Args;
 
 use super::import::{
-    HeadChange, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal, copy_snapshot_into,
-    default_backup_out_dir, resolve_target_data_dir, resolve_target_db, restore_heads,
-    run_verified_copy, scan_heads, scan_snapshots,
+    HeadChange, HeadSource, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal,
+    copy_snapshot_into, default_backup_out_dir, manifest_path, resolve_target_data_dir,
+    resolve_target_db, restore_heads, run_verified_copy, scan_heads, scan_snapshots,
+    write_head_manifest,
 };
 use crate::adapters::db::ops;
 use crate::adapters::store::CandleStore;
@@ -52,8 +56,9 @@ pub struct BackupArgs {
     /// The backup output directory. Defaults to `~/pulse-backups`.
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
-    /// How many `pulse-*.db` files to keep (the oldest are pruned; `candles/`
-    /// is one shared store and is never pruned).
+    /// How many `pulse-*.db` files to keep (the oldest are pruned, each with
+    /// its own `.heads.json` pointer manifest; `candles/` is one shared store
+    /// and is never pruned).
     #[arg(long, default_value_t = 14)]
     pub keep: u32,
 }
@@ -147,15 +152,36 @@ pub(crate) async fn backup_target(
     // would miss a snapshot published — and referenced by a run committed — in
     // between: the backup would report success while the database it publishes
     // names a file the copy set omitted, and `pulse restore` would refuse that
-    // backup later.
-    let backup_path = backup_database(db_path, out_dir).await?;
-    publish_source_store(&out_store, data_dir, &backup_path).await
+    // backup later. The copy stays a `.partial` file for now: it takes its
+    // `pulse-<stamp>.db` name only once everything it needs is published.
+    let staged = stage_database(db_path, out_dir).await?;
+    let mut added: Vec<PathBuf> = Vec::new();
+
+    // ---- Step 2: the snapshots it references, the shared store's pointers, and
+    // the backup's OWN pointer manifest — all in place BEFORE the database
+    // becomes visible, so a `pulse-<stamp>.db` never appears without the
+    // manifest a restore reads (round 6, Fix A).
+    let outcome = match publish_source_store(&out_store, data_dir, &staged, &mut added).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            discard(&staged, &added);
+            return Err(error);
+        }
+    };
+
+    // ---- Step 3: only now the database itself.
+    if let Err(error) = publish_staged_database(&staged) {
+        discard(&staged, &added);
+        return Err(error);
+    }
+    Ok(outcome)
 }
 
-/// Publish the source store into `<out-dir>/candles/` (one shared store):
-/// every snapshot the FROZEN COPY references, plus the `HEAD` pointers that
-/// name them (the same rule the import's copy applies, so a restored backup
-/// lands a store whose current pointer is the one it was taken with).
+/// Publish the source store into `<out-dir>/candles/` (one shared store): every
+/// snapshot the FROZEN COPY references, the `HEAD` pointers that name them (the
+/// same rule the import's copy applies, so a restored backup lands a store whose
+/// current pointer is the one it was taken with), and the backup's OWN pointer
+/// manifest beside its staged database (round 6, Fix A).
 ///
 /// The order is the contract:
 ///
@@ -165,33 +191,30 @@ pub(crate) async fn backup_target(
 /// 3. every reference must resolve to a source snapshot, or the backup FAILS:
 ///    publishing a database whose snapshot is missing would hand the restore a
 ///    set it can only refuse;
-/// 4. only then are the files copied, and only then are the pointers written.
+/// 4. only then are the files copied, only then are the pointers written, and
+///    only then is the manifest published — which the CALLER publishes the
+///    database after, so the database is the last thing to become visible.
 ///
-/// A failure deletes the partial database file, every snapshot this call added
-/// and every pointer it moved, so no half backup survives — and each copy
-/// publishes through `copy_snapshot_into`, so a copy that fails part-way leaves
-/// no truncated file under a snapshot's name.
+/// A failure is unwound by the caller ([`discard`]): the staged database copy,
+/// the manifest if it landed, every snapshot this call added and every pointer
+/// it moved are deleted here or there, so no half backup survives — and each
+/// copy publishes through `copy_snapshot_into`, so a copy that fails part-way
+/// leaves no truncated file under a snapshot's name.
 async fn publish_source_store(
     out_store: &CandleStore,
     data_dir: &Path,
-    backup_path: &Path,
+    staged: &StagedBackup,
+    added: &mut Vec<PathBuf>,
 ) -> anyhow::Result<BackupOutcome> {
     let source_store = CandleStore::with_base_dir(data_dir.to_path_buf());
-    let mut added: Vec<PathBuf> = Vec::new();
 
-    let published =
-        publish_store_files(out_store, &source_store, data_dir, backup_path, &mut added).await;
-    match published {
-        Ok((copied, total)) => Ok(BackupOutcome {
-            path: backup_path.to_path_buf(),
-            snapshots_copied: copied,
-            snapshots_total: total,
-        }),
-        Err(error) => {
-            discard(backup_path, &added);
-            Err(error)
-        }
-    }
+    let (copied, total) =
+        publish_store_files(out_store, &source_store, data_dir, staged, added).await?;
+    Ok(BackupOutcome {
+        path: staged.final_path.clone(),
+        snapshots_copied: copied,
+        snapshots_total: total,
+    })
 }
 
 /// The publishing body (see [`publish_source_store`] for the order it keeps),
@@ -200,11 +223,11 @@ async fn publish_store_files(
     out_store: &CandleStore,
     source_store: &CandleStore,
     data_dir: &Path,
-    backup_path: &Path,
+    staged: &StagedBackup,
     added: &mut Vec<PathBuf>,
 ) -> anyhow::Result<(usize, usize)> {
     // 1. What the FROZEN COPY needs: the snapshots its runs name.
-    let references = frozen_references(backup_path).await?;
+    let references = frozen_references(&staged.partial).await?;
     // 2. What the source store holds (layout problems refuse: nothing written).
     let (snapshots, heads) = source_store_contents(data_dir)?;
     // 3. Every source snapshot must VERIFY before this backup reports success.
@@ -215,9 +238,19 @@ async fn publish_store_files(
     verify_store_bytes(out_store, &snapshots, &wanted)?;
     // 6. Copy, then publish the pointers that name what was copied.
     let copied = copy_wanted(out_store, &snapshots, &wanted, added)?;
-    match publish_heads(out_store, &heads) {
+    // 7. And the backup's OWN manifest beside the database it is being published
+    // with — the shared store's pointers are for a store read directly, while a
+    // RESTORE takes the pointers of the backup it was handed (round 6, Fix A).
+    let (changes, published) = match publish_heads(out_store, &heads) {
+        Ok(changes) => (
+            changes,
+            write_head_manifest(&staged.manifest_path(), &heads),
+        ),
+        Err((error, changes)) => (changes, Err(error)),
+    };
+    match published {
         Ok(()) => Ok((copied, snapshots.len())),
-        Err((error, changes)) => {
+        Err(error) => {
             restore_heads(out_store, &changes);
             Err(error)
         }
@@ -380,10 +413,12 @@ fn copy_wanted(
     Ok(published)
 }
 
-/// The failure path's one move: no half backup survives — not the database file
-/// and not a snapshot this run added.
-fn discard(backup_path: &Path, added: &[PathBuf]) {
-    let _ = fs::remove_file(backup_path);
+/// The failure path's one move: no half backup survives — not the staged
+/// database copy, not the manifest published beside it, and not a snapshot this
+/// run added.
+fn discard(staged: &StagedBackup, added: &[PathBuf]) {
+    let _ = fs::remove_file(&staged.partial);
+    let _ = fs::remove_file(staged.manifest_path());
     for path in added {
         let _ = fs::remove_file(path);
     }
@@ -405,7 +440,7 @@ fn discard(backup_path: &Path, added: &[PathBuf]) {
 fn publish_heads(
     out_store: &CandleStore,
     heads: &[SourceHead],
-) -> Result<(), (anyhow::Error, Vec<HeadChange>)> {
+) -> Result<Vec<HeadChange>, (anyhow::Error, Vec<HeadChange>)> {
     let mut changes: Vec<HeadChange> = Vec::new();
     for head in heads {
         if let Err(error) = out_store.read_snapshot(&head.pair, head.timeframe, &head.version) {
@@ -434,19 +469,39 @@ fn publish_heads(
             ));
         }
     }
-    Ok(())
+    Ok(changes)
 }
 
-/// The database-only online-copy primitive. Writes a `.partial` file, then
-/// renames it to its `pulse-<stamp>.db` name; on any error the partial file is
-/// deleted. Callers that need the FULL backup — the one restore can consume —
-/// use [`backup_target`], which adds the snapshot store to this copy.
+/// A database copy that is written but NOT yet published: `partial` holds a
+/// complete copy, while `final_path` is the `pulse-<stamp>.db` name it takes
+/// once the snapshots it references, the shared store's pointers and its own
+/// pointer manifest are all in place (round 6, Fix A).
+struct StagedBackup {
+    /// `<out-dir>/pulse-<stamp>.db.partial` — a complete copy, not visible
+    /// under the backup's own name yet.
+    partial: PathBuf,
+    /// `<out-dir>/pulse-<stamp>.db` — the name it publishes under.
+    final_path: PathBuf,
+}
+
+impl StagedBackup {
+    /// This backup's OWN pointer manifest, beside the database it belongs to.
+    fn manifest_path(&self) -> PathBuf {
+        manifest_path(&self.final_path)
+    }
+}
+
+/// The database-only copy primitive, STAGED: an online, consistent copy of
+/// `db_path` into the `.partial` file this backup publishes under, deleted on
+/// any error. Callers that need the FULL backup — the one restore can consume —
+/// use [`backup_target`], which adds the snapshot store, the shared pointers and
+/// the backup's own manifest BEFORE publishing this copy under its own name.
 ///
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] when the source cannot be read or the copy
 /// cannot be written.
-pub(crate) async fn backup_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<PathBuf> {
+async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<StagedBackup> {
     fs::create_dir_all(out_dir)
         .map_err(|e| anyhow!("create backup dir {}: {e}", out_dir.display()))?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -470,12 +525,27 @@ pub(crate) async fn backup_database(db_path: &Path, out_dir: &Path) -> anyhow::R
             db_path.display()
         ));
     }
-    fs::rename(&partial, &final_path)
-        .map_err(|e| anyhow!("publish {}: {e}", final_path.display()))?;
-    if let Ok(handle) = fs::File::open(out_dir) {
+    Ok(StagedBackup {
+        partial,
+        final_path,
+    })
+}
+
+/// Publish the staged copy under its `pulse-<stamp>.db` name — the LAST step of
+/// a backup, run only once the snapshots it references, the shared store's
+/// pointers and its own manifest are all in place — and make the rename durable.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] when the rename fails.
+fn publish_staged_database(staged: &StagedBackup) -> anyhow::Result<()> {
+    fs::rename(&staged.partial, &staged.final_path)
+        .map_err(|e| anyhow!("publish {}: {e}", staged.final_path.display()))?;
+    let parent = staged.final_path.parent().unwrap_or(Path::new("."));
+    if let Ok(handle) = fs::File::open(parent) {
         let _ = handle.sync_all();
     }
-    Ok(final_path)
+    Ok(())
 }
 
 /// `pulse-<UTC stamp>.db`, with a `-N` suffix probed on a same-second
@@ -495,9 +565,11 @@ fn unique_backup_path(out_dir: &Path, stamp: &str) -> PathBuf {
 }
 
 /// Remove the oldest `pulse-*.db` beyond `keep` (never touching `candles/`),
-/// returning how many remain. The stamp names sort chronologically; a
-/// same-second `-N` collision keeps its arbitrary but stable order, and every
-/// older second still sorts first.
+/// returning how many remain. Each pruned backup's OWN pointer manifest goes
+/// with its database — a manifest whose database is gone names pointers for
+/// nothing, and leaving it behind would accumulate orphans in the out-dir. The
+/// stamp names sort chronologically; a same-second `-N` collision keeps its
+/// arbitrary but stable order, and every older second still sorts first.
 ///
 /// # Errors
 ///
@@ -523,6 +595,10 @@ fn prune_backups(out_dir: &Path, keep: u32) -> anyhow::Result<usize> {
     let pruned = backups.len().saturating_sub(keep);
     for victim in &backups[..pruned] {
         fs::remove_file(victim).map_err(|e| anyhow!("prune {}: {e}", victim.display()))?;
+        let manifest = manifest_path(victim);
+        if manifest.exists() {
+            fs::remove_file(&manifest).map_err(|e| anyhow!("prune {}: {e}", manifest.display()))?;
+        }
     }
     Ok(backups.len() - pruned)
 }
@@ -544,6 +620,9 @@ pub(crate) async fn run_restore(args: &RestoreArgs) -> anyhow::Result<()> {
         from_data_dir: &args.backup_dir,
         db_target: &db_target,
         data_target: &data_target,
+        // The chosen backup's OWN manifest (round 6, Fix A): the shared store's
+        // pointer directory holds one set that every backup overwrites.
+        head_source: HeadSource::BackupManifest,
         replace: args.replace,
         chmod_source: false,
     })
