@@ -2266,24 +2266,43 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
   });
 
   it("never revalidates a run it already shows: a refetch with the same pointer spends no read and evicts nothing (P2-B)", async () => {
-    // A fresh payload object per call, so the refetch really is a new catalogue.
-    catalogMock.mockImplementation(async () => ({
-      status: "ok" as const,
-      data: reopenableCatalog("wf-6c1d9f38", null),
-    }));
+    // The refetch's payload is HELD OPEN and handed over by the test, so the
+    // render it causes and the passive effect that render arms both run before
+    // the read count below is taken. Counting while the refetch was still in the
+    // air let the done-skip's own mutation pass (verifier re-check, claim 5b).
+    let landRefetch: (() => void) | null = null;
+    let calls = 0;
+    catalogMock.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { status: "ok" as const, data: reopenableCatalog("wf-6c1d9f38", null) };
+      }
+      // A fresh payload object, as a real refetch parses one.
+      return new Promise((resolve) => {
+        landRefetch = () =>
+          resolve({ status: "ok" as const, data: reopenableCatalog("wf-6c1d9f38", null) });
+      });
+    });
     reopenMock.mockResolvedValue({ status: "ok", data: REOPENED_DTO });
 
     render(<BacktestLabScreen />);
     await screen.findByText("wf-6c1d9f38");
+    expect(catalogMock).toHaveBeenCalledTimes(1);
     expect(reopenMock).toHaveBeenCalledTimes(1);
 
-    // The window regains focus — a new catalogue, the same pointer. The run is
-    // immutable and already on screen, so there is nothing to revalidate: no
-    // second read, and no chance for a transient failure to evict it.
-    const callsOnMount = catalogMock.mock.calls.length;
+    // The window regains focus: the catalogue is asked for again, and the test
+    // decides when that answer lands.
     fireEvent(window, new Event("focus"));
     await waitFor(() => {
-      expect(catalogMock.mock.calls.length).toBeGreaterThan(callsOnMount);
+      expect(landRefetch).not.toBeNull();
+    });
+
+    // Land it inside `act`: the refetch's render and the effect it arms have both
+    // run by the time the count is read. The run is immutable and already on
+    // screen, so nothing may be read a second time.
+    await act(async () => {
+      landRefetch?.();
+      await Promise.resolve();
     });
 
     expect(reopenMock).toHaveBeenCalledTimes(1);
