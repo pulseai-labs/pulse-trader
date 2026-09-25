@@ -772,17 +772,7 @@ fn copy_snapshots(
                 }
                 continue;
             }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
-            }
-            fs::copy(&snap.path, &dest).map_err(|e| {
-                anyhow!(
-                    "copy snapshot {} -> {}: {e}",
-                    snap.path.display(),
-                    dest.display()
-                )
-            })?;
+            copy_snapshot_into(&snap.path, &dest)?;
             added.push(dest);
         }
         Ok(())
@@ -791,6 +781,77 @@ fn copy_snapshots(
         Ok(()) => Ok(added),
         Err(error) => Err((error, added)),
     }
+}
+
+/// Copy one file to its final destination — never writing a partial file UNDER
+/// that name.
+///
+/// The destination name IS the snapshot's identity (immutable, content-
+/// addressed), so a truncated file left there by a failure part-way through a
+/// copy — `ENOSPC` is the likely case — is a snapshot no cleanup knows about: it
+/// stays behind under a valid name, every later run refuses it as a byte
+/// mismatch, and nothing can tell it apart from a deliberately replaced file.
+/// The bytes therefore go to a temporary SIBLING, are flushed to the filesystem,
+/// and only then is the temporary RENAMED onto the destination: the rename is
+/// atomic within one directory, so the destination only ever holds a complete
+/// file and a failure removes the temporary, leaving the destination exactly as
+/// it was (absent, or whatever was there).
+///
+/// Shared with `cli/backup.rs`, so the backup store's copy is the same copy the
+/// import makes.
+///
+/// # Errors
+///
+/// Any I/O failure — creating the destination's directory, copying, flushing or
+/// renaming — with the temporary removed. A temporary left by an earlier
+/// crashed run is deleted first: its bytes are not this run's.
+pub(crate) fn copy_snapshot_into(source: &Path, dest: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
+    }
+    let temporary = temporary_sibling(dest)?;
+    // Never reuse a temporary a crashed run left: those bytes are not ours.
+    let _ = fs::remove_file(&temporary);
+    fs::copy(source, &temporary).map_err(|e| {
+        anyhow!(
+            "copy snapshot {} -> {}: {e}",
+            source.display(),
+            temporary.display()
+        )
+    })?;
+    // The bytes must be ON DISK before the name that promises them exists: the
+    // rename publishes them, and a crash must not leave a durable name over
+    // bytes that never landed. (Opened read+write so the flush is legal on every
+    // platform, not just where `fsync` accepts a read-only handle.)
+    let flushed = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .and_then(|handle| handle.sync_all());
+    if let Err(error) = flushed {
+        let _ = fs::remove_file(&temporary);
+        return Err(anyhow!("flush {}: {error}", temporary.display()));
+    }
+    fs::rename(&temporary, dest).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        anyhow!(
+            "install snapshot {} -> {}: {error}",
+            temporary.display(),
+            dest.display()
+        )
+    })
+}
+
+/// The temporary sibling of one content-addressed destination: its own name
+/// plus `.partial` — a name no snapshot can hold (the store holds
+/// `<version>.parquet` files, and every store walk skips anything else).
+fn temporary_sibling(dest: &Path) -> anyhow::Result<PathBuf> {
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("unusable snapshot path: {}", dest.display()))?;
+    Ok(dest.with_file_name(format!("{name}.partial")))
 }
 
 /// Byte comparison of two files (a read failure counts as "not equal").
@@ -901,4 +962,94 @@ fn print_summary(label: &str, job: &VerifiedCopy<'_>, summary: &Summary) {
         "note: making the original pulse.db on the Mac read-only is a cutover-runbook step \
          at the release walk (D7), not this command's job."
     );
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::copy_snapshot_into;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Every `*.partial` file beside one destination.
+    fn partial_files(dest: &Path) -> Vec<PathBuf> {
+        let Some(parent) = dest.parent() else {
+            return Vec::new();
+        };
+        fs::read_dir(parent)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.to_string_lossy().ends_with(".partial"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Fix 2: a copy publishes through a temporary sibling, so a failure can
+    /// never leave a truncated file under a final content-addressed name — and
+    /// a successful one leaves no temporary behind.
+    #[test]
+    fn a_failed_copy_leaves_nothing_under_the_final_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("BTCUSDT").join("15m").join("dv1.parquet");
+
+        // A source that cannot be copied: a DIRECTORY. The real case this guards
+        // is a copy failing part-way (ENOSPC); a directory fails the same way
+        // without needing a filled disk.
+        let source_dir = dir.path().join("source-dir");
+        fs::create_dir_all(&source_dir).expect("source dir");
+        let error =
+            copy_snapshot_into(&source_dir, &dest).expect_err("a directory cannot be copied");
+        assert!(
+            error.to_string().contains("copy snapshot"),
+            "the failure names the copy: {error}"
+        );
+        assert!(
+            !dest.exists(),
+            "no file under the final name: {}",
+            dest.display()
+        );
+        assert!(
+            partial_files(&dest).is_empty(),
+            "and no temporary is left: {:?}",
+            partial_files(&dest)
+        );
+
+        // A good copy lands byte-identical, with no temporary left behind.
+        let source = dir.path().join("source.parquet");
+        fs::write(&source, b"snapshot bytes").expect("write the source");
+        copy_snapshot_into(&source, &dest).expect("copy");
+        assert_eq!(
+            fs::read(&dest).expect("read the destination"),
+            b"snapshot bytes"
+        );
+        assert!(
+            partial_files(&dest).is_empty(),
+            "the temporary is renamed away, not kept: {:?}",
+            partial_files(&dest)
+        );
+
+        // A temporary a crashed run left is never reused or published: the
+        // destination holds THIS run's bytes and the stray is gone.
+        let temporary = dir
+            .path()
+            .join("BTCUSDT")
+            .join("15m")
+            .join("dv1.parquet.partial");
+        fs::write(&temporary, b"stale partial bytes").expect("plant the stray temporary");
+        let second = dir.path().join("second.parquet");
+        fs::write(&second, b"second snapshot").expect("write the second source");
+        copy_snapshot_into(&second, &dest).expect("copy over");
+        assert_eq!(
+            fs::read(&dest).expect("read the destination"),
+            b"second snapshot",
+            "the published bytes are this run's"
+        );
+        assert!(
+            !temporary.exists(),
+            "and the stray temporary is gone, not left beside it"
+        );
+    }
 }

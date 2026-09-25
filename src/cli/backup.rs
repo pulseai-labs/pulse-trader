@@ -31,8 +31,8 @@ use chrono::Utc;
 use clap::Args;
 
 use super::import::{
-    SourceSnapshot, VerifiedCopy, bytes_equal, default_backup_out_dir, resolve_target_data_dir,
-    resolve_target_db, run_verified_copy, scan_snapshots,
+    SourceSnapshot, VerifiedCopy, bytes_equal, copy_snapshot_into, default_backup_out_dir,
+    resolve_target_data_dir, resolve_target_db, run_verified_copy, scan_snapshots,
 };
 use crate::adapters::db::ops;
 use crate::adapters::store::CandleStore;
@@ -183,7 +183,8 @@ pub(crate) async fn backup_target(
 /// Copy every snapshot the store is missing into `<out-dir>/candles/` (one
 /// shared store), returning how many were added. A failure deletes the partial
 /// database file and every snapshot this call added, so no half backup
-/// survives.
+/// survives — and each copy publishes through `copy_snapshot_into`, so a copy
+/// that fails part-way leaves no truncated file under a snapshot's name.
 fn copy_missing_snapshots(
     out_store: &CandleStore,
     snapshots: &[SourceSnapshot],
@@ -197,17 +198,7 @@ fn copy_missing_snapshots(
             if dest.exists() {
                 continue;
             }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
-            }
-            fs::copy(&snap.path, &dest).map_err(|e| {
-                anyhow!(
-                    "copy snapshot {} -> {}: {e}",
-                    snap.path.display(),
-                    dest.display()
-                )
-            })?;
+            copy_snapshot_into(&snap.path, &dest)?;
             added.push(dest);
             copied += 1;
         }
