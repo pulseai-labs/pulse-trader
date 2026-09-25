@@ -74,6 +74,36 @@ impl RetryBackoff {
     }
 }
 
+/// How long a TCP connection may take to establish before the request gives
+/// up. A black-holed route (a dropped VPN, a host that stopped answering)
+/// fails HERE — on the status poll's handshake, on every proxied command and
+/// on an SSE attach alike — instead of stalling them forever.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The whole-request deadline for ONE plain wire call: the handshake, a
+/// proxied read, an operation's issue POST (answered 202 immediately).
+///
+/// Applied PER REQUEST, deliberately never as a client-wide default: an SSE
+/// stream's body is open-ended by design and this wire sends no keep-alives, so
+/// a deadline covering the body would cut a healthy idle stream mid-operation.
+/// The streaming path bounds the attach instead — [`SSE_ATTACH_TIMEOUT`].
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long the response HEAD of an SSE attach may take. Once the head is in,
+/// the body streams untimed: an operation may legitimately run for minutes
+/// between two events, and a dropped stream is the resume loop's business, not
+/// a timeout's.
+const SSE_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The shared HTTP client: a bounded connect, and nothing client-wide (see
+/// [`REQUEST_TIMEOUT`] for why the request deadline is per request).
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// One authenticated connection to the server: base URL + bearer token + one
 /// HTTP client.
 #[derive(Clone)]
@@ -237,7 +267,7 @@ impl ServerClient {
         Self {
             base: base_url.trim_end_matches('/').to_owned(),
             token: token.to_owned(),
-            http: reqwest::Client::new(),
+            http: http_client(),
             backoff: RetryBackoff::default(),
         }
     }
@@ -249,7 +279,7 @@ impl ServerClient {
         Self {
             base: base_url.trim_end_matches('/').to_owned(),
             token: token.to_owned(),
-            http: reqwest::Client::new(),
+            http: http_client(),
             backoff,
         }
     }
@@ -287,6 +317,7 @@ impl ServerClient {
             .http
             .get(format!("{}/api/v1/handshake", self.base))
             .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|error| ClientError::Unreachable {
@@ -336,6 +367,7 @@ impl ServerClient {
             .http
             .get(self.url(path))
             .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|error| {
@@ -370,6 +402,7 @@ impl ServerClient {
             .http
             .post(self.url(path))
             .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
             .json(body)
             .send()
             .await
@@ -470,20 +503,56 @@ impl ServerClient {
         if let Some(seq) = *seen {
             request = request.header("Last-Event-ID", seq.to_string());
         }
-        // A connect-level failure to re-attach is a DROP: the operation is
-        // server-owned, and the resume loop re-tries with the same cursor.
-        let Ok(response) = request.send().await else {
+        // The ATTACH is bounded — the response HEAD, and only the head, so a
+        // half-open socket cannot hang this call forever. The body is not: no
+        // client-wide request deadline exists for exactly this reason.
+        let attach = tokio::time::timeout(SSE_ATTACH_TIMEOUT, request.send()).await;
+        let Ok(Ok(response)) = attach else {
+            // A connect-level failure (or a head that never came) to re-attach
+            // is a DROP: the operation is server-owned, and the resume loop
+            // re-tries with the same cursor.
             return Ok(StreamEnd::Dropped);
         };
         check_skew(response.headers()).map_err(WireFailure::Refusal)?;
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        // A refusal mid-operation must surface AS a refusal, the way `decode`
+        // does it: the managed state has to be able to flip to `refused` from
+        // an operation path, not report a generic internal error.
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(WireFailure::Refusal(ClientError::TokenRefused {
+                reason: format!("the server refused this token (HTTP {status} on {path})"),
+            }));
+        }
+        if !status.is_success() {
             let bytes = response.bytes().await.unwrap_or_default();
-            let err = serde_json::from_slice::<BusError>(&bytes)
-                .unwrap_or_else(|_| BusError::internal(format!("HTTP {status} from {path}")));
+            // Two refusal shapes reach this path: the bus's own error body
+            // (`{"code":"validation",…}`, decodable as `BusError`) and the ops
+            // routes' bare `{"code":"op_unknown","message":…}`
+            // (`src/server/ops.rs::op_unknown`). The route token is NOT a bus
+            // family, so that body cannot deserialize as a `BusError` — read
+            // the JSON `code` field first, or the typed expiry below would be
+            // unreachable on the wire the server actually sends.
+            let route_code = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|body| {
+                    body.get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
             // The spec's typed expiry (spec ~123): a 404 `op_unknown` met
             // while attaching or re-attaching is the operation-expired error,
             // whose message says the run may still be in the library.
+            if status == reqwest::StatusCode::NOT_FOUND
+                && route_code.as_deref() == Some("op_unknown")
+            {
+                return Err(WireFailure::Refusal(ClientError::OperationExpired {
+                    op_id: op_id.to_owned(),
+                }));
+            }
+            let err = serde_json::from_slice::<BusError>(&bytes)
+                .unwrap_or_else(|_| BusError::internal(format!("HTTP {status} from {path}")));
+            // A bus-shaped 404 carrying the same token is the same expiry — the
+            // shape a caller-side stub or an older server answers with.
             if status == reqwest::StatusCode::NOT_FOUND
                 && err.code == BusErrorCode::NotFound
                 && err.message.contains("op_unknown")
@@ -622,19 +691,25 @@ async fn decode<T: DeserializeOwned>(
 /// Incremental SSE framing: feed bytes, get complete frames.
 ///
 /// Mirrors the server's writer (`id:`/`event:`/`data:` lines, blank-line
-/// separated) and tolerates `\r\n`.
+/// separated) and accepts both separators — `\n\n` and a CRLF stream's
+/// `\r\n\r\n` — including one split across two network chunks.
 #[derive(Default)]
 struct SseParser {
-    buffer: String,
+    /// RAW bytes, never a decoded string: a multibyte character split across
+    /// two chunks must not be lossily decoded before its whole frame is here
+    /// (`from_utf8_lossy` on a partial chunk would put U+FFFD inside a payload).
+    buffer: Vec<u8>,
 }
 
 impl SseParser {
     /// Push bytes and drain every complete frame.
     fn push(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
-        while let Some(pos) = find_frame_end(&self.buffer) {
-            let block: String = self.buffer.drain(..pos).collect();
+        while let Some(end) = frame_end(&self.buffer) {
+            // Only a COMPLETE frame is decoded, so its bytes are all present.
+            let block = String::from_utf8_lossy(&self.buffer[..end]).into_owned();
+            self.buffer.drain(..end);
             let mut event = String::new();
             let mut data = String::new();
             for line in block.lines() {
@@ -660,13 +735,19 @@ struct SseFrame {
     data: String,
 }
 
-/// Find the offset just past the next blank line (`\n\n`, tolerating `\r`).
-fn find_frame_end(buffer: &str) -> Option<usize> {
-    let bytes = buffer.as_bytes();
+/// The offset just past the next frame separator: `\n\n`, or a CRLF stream's
+/// `\r\n\r\n`. Scanning BYTES (not a string) is what lets a separator split
+/// across two chunks complete on the second append.
+fn frame_end(buffer: &[u8]) -> Option<usize> {
     let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
-            return Some(i + 2);
+    while i < buffer.len() {
+        if buffer[i] == b'\n' {
+            if buffer.get(i + 1) == Some(&b'\n') {
+                return Some(i + 2);
+            }
+            if buffer.get(i + 1) == Some(&b'\r') && buffer.get(i + 2) == Some(&b'\n') {
+                return Some(i + 3);
+            }
         }
         i += 1;
     }
@@ -973,5 +1054,101 @@ impl ServerStatus {
             engine_fingerprint: None,
             reason: Some(reason),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The `(event, data)` pairs one push produced.
+    fn pushed(parser: &mut SseParser, chunk: &[u8]) -> Vec<(String, String)> {
+        parser
+            .push(chunk)
+            .into_iter()
+            .map(|frame| (frame.event, frame.data))
+            .collect()
+    }
+
+    /// Both separators frame: the LF writer and a CRLF one, byte for byte.
+    #[test]
+    fn the_parser_frames_lf_and_crlf_streams() {
+        let mut parser = SseParser::default();
+        let frames = pushed(&mut parser, b"id: 0\nevent: bus\ndata: {\"seq\":0}\n\n");
+        assert_eq!(
+            frames,
+            vec![("bus".to_owned(), "{\"seq\":0}".to_owned())],
+            "an LF frame"
+        );
+
+        let mut parser = SseParser::default();
+        let frames = pushed(
+            &mut parser,
+            b"id: 1\r\nevent: result\r\ndata: {\"ok\":true}\r\n\r\n",
+        );
+        assert_eq!(
+            frames,
+            vec![("result".to_owned(), "{\"ok\":true}".to_owned())],
+            "a CRLF frame completes too"
+        );
+
+        // Two frames in one chunk drain in order; a trailing partial stays.
+        let mut parser = SseParser::default();
+        let frames = pushed(
+            &mut parser,
+            b"event: bus\ndata: {\"seq\":1}\n\nevent: bus\ndata: {\"seq\":2}\n\nevent: bu",
+        );
+        assert_eq!(frames.len(), 2, "both complete frames: {frames:?}");
+        assert_eq!(frames[1].1, "{\"seq\":2}");
+    }
+
+    /// The separator itself may be split across chunks: `\r\n` then `\r\n`, or
+    /// `\n` then `\n`, completes the frame on the second push and not before.
+    #[test]
+    fn a_separator_split_across_chunks_completes_on_the_second_push() {
+        let body = b"event: bus\ndata: {\"seq\":3}";
+        for (first, second) in [
+            (&b"\r\n"[..], &b"\r\n"[..]),
+            (&b"\n"[..], &b"\n"[..]),
+            (&b"\r\n\r"[..], &b"\n"[..]),
+        ] {
+            let mut parser = SseParser::default();
+            let mut chunk = body.to_vec();
+            chunk.extend_from_slice(first);
+            assert!(
+                pushed(&mut parser, &chunk).is_empty(),
+                "no frame before the separator is complete: {first:?}"
+            );
+            let frames = pushed(&mut parser, second);
+            assert_eq!(
+                frames,
+                vec![("bus".to_owned(), "{\"seq\":3}".to_owned())],
+                "the frame completes on the split separator: {first:?} {second:?}"
+            );
+        }
+    }
+
+    /// A multibyte character split across two network chunks must survive whole
+    /// — the lossy decode of a partial chunk is the defect this pins.
+    #[test]
+    fn a_multibyte_character_split_across_chunks_is_not_mangled() {
+        let payload = "{\"message\":\"café — ✓ 日本語\"}";
+        let frame = format!("event: bus\ndata: {payload}\n\n");
+        let bytes = frame.as_bytes();
+        // Split INSIDE the first multibyte character (and inside the trailing
+        // separator, so both hazards are live at once).
+        let inside_char = frame.find('é').expect("a multibyte character") + 1;
+        let inside_separator = bytes.len() - 1;
+        let mut parser = SseParser::default();
+        assert!(pushed(&mut parser, &bytes[..inside_char]).is_empty());
+        assert!(pushed(&mut parser, &bytes[inside_char..inside_separator]).is_empty());
+        let frames = pushed(&mut parser, &bytes[inside_separator..]);
+        assert_eq!(frames.len(), 1, "one intact frame: {frames:?}");
+        assert_eq!(frames[0].1, payload, "no U+FFFD crept in");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&frames[0].1).is_ok(),
+            "the payload is still intact JSON"
+        );
     }
 }

@@ -21,7 +21,7 @@
 //! only** — the same env var the credential resolver honours.
 
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -130,6 +130,17 @@ pub(crate) fn load_mcp() -> Result<Option<ConnectionFile>, String> {
 /// Store the file at `path` the spec's way: a temporary file is opened with
 /// mode `0600` set at creation — BEFORE any token byte is written — the body
 /// goes to the temporary, and a rename makes the file atomic for every reader.
+///
+/// The temporary is deliberately NOT reused. `mode(0o600)` applies only when
+/// the file is CREATED, so a temp left behind by a crashed write — or planted
+/// by another local user — would keep its own mode while the fresh bearer token
+/// is written into it and renamed over the good file. Whatever is at the temp
+/// path is removed first, and the replacement is created with `create_new`,
+/// which refuses a symlink (or anything else that reappeared between the
+/// removal and the open: `O_CREAT|O_EXCL` never follows one) — so the bytes can
+/// only land in a file this call created, and the explicit `set_permissions`
+/// below pins the mode even if the process umask would have masked it at
+/// creation.
 fn store_at(path: &std::path::Path, connection: &ConnectionFile) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -138,13 +149,30 @@ fn store_at(path: &std::path::Path, connection: &ConnectionFile) -> Result<(), S
     let body = toml::to_string_pretty(connection)
         .map_err(|error| format!("cannot serialize the connection: {error}"))?;
     let tmp = path.with_extension("toml.tmp");
+    // A symlink at the temp path is refused outright, never removed and never
+    // written through: nothing legitimate creates one there, and following it
+    // would put the bearer token in whatever file some other local user chose.
+    if let Ok(metadata) = std::fs::symlink_metadata(&tmp)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to write {}: it is a symlink, not a temporary file",
+            tmp.display()
+        ));
+    }
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot clear {}: {error}", tmp.display())),
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)
         .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot secure {}: {error}", tmp.display()))?;
     file.write_all(body.as_bytes())
         .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|error| {
@@ -192,4 +220,79 @@ fn remove_at(path: &std::path::Path) -> Result<(), String> {
 /// Any removal failure other than absence.
 pub(crate) fn remove_app() -> Result<(), String> {
     remove_at(&app_path()?)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    // `PermissionsExt` comes in through `super::*` (the store path sets the mode).
+    use super::*;
+
+    fn connection() -> ConnectionFile {
+        ConnectionFile {
+            url: "http://100.64.0.1:7433".to_owned(),
+            token: "secret-token".to_owned(),
+        }
+    }
+
+    /// The stored file is 0600, and the temp is gone.
+    #[test]
+    fn a_stored_connection_is_owner_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(APP_FILE);
+        store_at(&path, &connection()).expect("store");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the connection file is owner-only");
+        assert!(
+            !dir.path().join("server-connection.toml.tmp").exists(),
+            "the temporary is renamed away"
+        );
+    }
+
+    /// A temp left behind by a crashed write (here: group/world-readable) must
+    /// not keep its mode while the fresh token is written into it.
+    #[test]
+    fn a_pre_existing_temp_never_keeps_its_own_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(APP_FILE);
+        let tmp = dir.path().join("server-connection.toml.tmp");
+        std::fs::write(&tmp, b"a crashed write left this here").expect("plant the temp");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        store_at(&path, &connection()).expect("store");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the token bytes went into an owner-only file");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("secret-token"),
+            "the connection landed: {text}"
+        );
+        assert!(
+            !text.contains("crashed write"),
+            "the old temp's bytes are gone, not renamed over the target"
+        );
+    }
+
+    /// A symlinked temp is refused outright: the token must never be written
+    /// through a link some other local user placed.
+    #[test]
+    fn a_symlinked_temp_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(APP_FILE);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"not mine").expect("target of the link");
+        let tmp = dir.path().join("server-connection.toml.tmp");
+        std::os::unix::fs::symlink(&elsewhere, &tmp).expect("plant the link");
+
+        let error = store_at(&path, &connection()).expect_err("a symlink must be refused");
+        assert!(error.contains("symlink"), "the reason names it: {error}");
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).expect("read the link target"),
+            "not mine",
+            "the link target was never written through"
+        );
+        assert!(!path.exists(), "nothing was stored");
+    }
 }

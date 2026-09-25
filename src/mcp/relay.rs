@@ -17,9 +17,29 @@
 //! discipline `check-mcp-boundary.sh` enforces on the serving path).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::RwLock;
+
+/// How long a TCP connection may take to establish. A black-holed route (a
+/// dropped VPN, a host that stopped answering) fails HERE rather than wedging
+/// the bridge before a single byte moved.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The whole-request deadline for ONE relayed POST. A relayed message is one
+/// MCP message, and a `tools/call` runs server-side (a persisted backtest can
+/// take minutes), so this is a diagnostic ceiling for a half-open socket — a
+/// server that accepted the connection and then said nothing — not an
+/// interactive deadline. It sits far above the app client's own 15 s
+/// (`crate::client`), which only ever issues fast commands and a 202 accept.
+const POST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long the response HEAD of the GET stream may take. The body is NOT
+/// bounded: the stream is server-initiated and open-ended by design, and this
+/// wire sends no keep-alives, so a body deadline would kill a healthy idle
+/// session.
+const STREAM_ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Everything the relay needs: where the server is and the token that works.
 #[derive(Clone)]
@@ -55,7 +75,7 @@ pub(crate) async fn run(
     stdin: impl tokio::io::AsyncRead + Unpin,
     mut stdout: impl tokio::io::AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
-    let http = reqwest::Client::new();
+    let http = http_client();
     let session = Arc::new(RwLock::new(RelaySession::default()));
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
@@ -126,6 +146,16 @@ pub(crate) async fn run(
     Ok(())
 }
 
+/// The relay's HTTP client: a bounded connect, and no client-wide request
+/// deadline (a POST carries [`POST_TIMEOUT`], the GET stream only its attach —
+/// see those constants for why).
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// POST one JSON-RPC message; return the payloads to write to stdout, one per
 /// string — a `data:`-unwrapped list for an SSE response, the bare body for a
 /// JSON one, empty for a bodyless ack.
@@ -148,6 +178,7 @@ async fn post_message(
         .bearer_auth(&config.token)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
+        .timeout(POST_TIMEOUT)
         .body(message.to_owned());
     {
         let mut guard = session.write().await;
@@ -301,36 +332,77 @@ fn spawn_server_stream(
                 request = request.header("mcp-protocol-version", version);
             }
         }
-        let Ok(response) = request.send().await else {
+        // A failed connect, or a head that never came: the stream is optional
+        // on the wire, so this is quiet — but it is not open-ended.
+        let Ok(Ok(response)) = tokio::time::timeout(STREAM_ATTACH_TIMEOUT, request.send()).await
+        else {
             return;
         };
         if !response.status().is_success() {
             return;
         }
-        // Frame-split the SSE body: payload = everything after "data: ".
-        let mut buffer = String::new();
+        // Frame-split the SSE body BYTE-WISE, and keep the final frames on EOF
+        // (`run` drains the channel after stdin closes).
+        let mut buffer: Vec<u8> = Vec::new();
         let body = response.bytes_stream();
         tokio::pin!(body);
         loop {
             let Some(Ok(chunk)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await else {
                 break;
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buffer.find("\n\n") {
-                let block: String = buffer.drain(..pos + 2).collect();
-                for line in block.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data.trim().is_empty() {
-                            continue; // a keep-alive, not a message
-                        }
-                        if tx.send(format!("{data}\n")).is_err() {
-                            return;
-                        }
-                    }
+            for frame in sse_frames(&mut buffer, &chunk) {
+                if tx.send(frame).is_err() {
+                    return;
                 }
             }
         }
     });
+}
+
+/// Append one network chunk and return every complete frame's `data:` payloads
+/// as stdout-ready lines (a keep-alive yields nothing).
+///
+/// Byte-wise on purpose: a chunk may split a multibyte character or the frame
+/// separator itself, so nothing is decoded until its whole frame is buffered,
+/// and both `\n\n` and a CRLF stream's `\r\n\r\n` end a frame. The client's
+/// `SseParser` frames the same way on the app side (the mcp ring cannot import
+/// `crate::client` — the boundary gate keeps that seam).
+fn sse_frames(buffer: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    buffer.extend_from_slice(chunk);
+    let mut frames = Vec::new();
+    while let Some(end) = frame_end(buffer) {
+        // Only a COMPLETE frame is decoded, so its bytes are all present.
+        let block = String::from_utf8_lossy(&buffer[..end]).into_owned();
+        buffer.drain(..end);
+        for line in block.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data.trim().is_empty() {
+                    continue; // a keep-alive, not a message
+                }
+                frames.push(format!("{data}\n"));
+            }
+        }
+    }
+    frames
+}
+
+/// The offset just past the next frame separator: `\n\n`, or `\r\n\r\n`.
+/// Scanning BYTES is what lets a separator split across two chunks complete on
+/// the second append.
+fn frame_end(buffer: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < buffer.len() {
+        if buffer[i] == b'\n' {
+            if buffer.get(i + 1) == Some(&b'\n') {
+                return Some(i + 2);
+            }
+            if buffer.get(i + 1) == Some(&b'\r') && buffer.get(i + 2) == Some(&b'\n') {
+                return Some(i + 3);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Write one protocol frame to stdout — the ONLY writes this module performs.
@@ -760,6 +832,51 @@ mod tests {
             posts[2].header("mcp-protocol-version").is_none(),
             "the recovery initialize carries no stale protocol version: {}",
             posts[2].head
+        );
+    }
+
+    /// C2.8 (this file's site): the GET stream frames BYTES — a multibyte
+    /// character or a CRLF separator split across two network chunks still
+    /// yields one intact frame, and a keep-alive yields nothing.
+    #[test]
+    fn the_get_stream_frames_bytes_across_chunk_boundaries() {
+        let payload = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"text\":\"café — ✓ 日本語\"}}";
+        let stream = format!("event: message\r\ndata: {payload}\r\n\r\n");
+        let bytes = stream.as_bytes();
+        // One split inside a multibyte character, one inside the separator.
+        let inside_char = stream.find('é').expect("a multibyte character") + 1;
+        let inside_separator = bytes.len() - 1;
+
+        let mut buffer = Vec::new();
+        assert!(
+            sse_frames(&mut buffer, &bytes[..inside_char]).is_empty(),
+            "no frame yet"
+        );
+        assert!(
+            sse_frames(&mut buffer, &bytes[inside_char..inside_separator]).is_empty(),
+            "the separator is not complete yet"
+        );
+        let frames = sse_frames(&mut buffer, &bytes[inside_separator..]);
+        assert_eq!(frames.len(), 1, "one intact frame: {frames:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(frames[0].trim_end()).expect("the frame is still JSON");
+        assert_eq!(
+            parsed["params"]["text"], "café — ✓ 日本語",
+            "no U+FFFD crept in: {frames:?}"
+        );
+
+        // A keep-alive (a bare `data:` with no payload) is not a message, and a
+        // `\n\n`-separated stream frames exactly like the CRLF one.
+        let mut buffer = Vec::new();
+        assert!(
+            sse_frames(&mut buffer, b"data: \n\n").is_empty(),
+            "a keep-alive is not a frame"
+        );
+        let frames = sse_frames(&mut buffer, b"data: {\"n\":1}\n\ndata: {\"n\":2}\n\n");
+        assert_eq!(
+            frames,
+            vec!["{\"n\":1}\n".to_owned(), "{\"n\":2}\n".to_owned()],
+            "two LF frames, in order"
         );
     }
 

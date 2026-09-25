@@ -630,6 +630,87 @@ async fn an_op_unknown_events_get_maps_to_the_typed_bus_error() {
     );
 }
 
+/// The 404 the ops route ACTUALLY sends: `{"code":"op_unknown","message":…}`
+/// (`src/server/ops.rs::op_unknown`) — a route token that is not a bus family
+/// and two fields, so it cannot deserialize as a `BusError` at all. The typed
+/// expiry must still be reached (reading the JSON `code` field), or the app
+/// would report a generic internal error for a server-forgotten operation.
+#[tokio::test]
+async fn the_servers_own_op_unknown_body_maps_to_the_typed_expiry() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub");
+    let base = format!("http://{}", listener.local_addr().expect("stub local"));
+    let handle = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        // POST → 202.
+        let (mut stream, _) = listener.accept().await.expect("accept POST");
+        let _ = read_request(&mut stream).await;
+        let body = json!({ "op_id": "gone-op" }).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\n\
+                     connection: close\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("answer 202");
+        // GET events → 404, the route's own shape (two fields, route token).
+        let (mut stream, _) = listener.accept().await.expect("accept GET");
+        let _ = read_request(&mut stream).await;
+        let body = json!({
+            "code": "op_unknown",
+            "message": "no operation with id gone-op was issued by this server, \
+                        or its record has expired"
+        })
+        .to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\
+                     connection: close\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("answer 404");
+    });
+
+    let client = ServerClient::new(&base, "any-token");
+    let err = client
+        .run_op::<StreamOutcome, _>(
+            "ops/start-demo-stream",
+            &json!({ "steps": 1 }),
+            &recording_channel().0,
+        )
+        .await
+        .expect_err("an op the server never issued must refuse");
+    handle.await.expect("stub completes");
+
+    assert_eq!(
+        err.code,
+        BusErrorCode::NotFound,
+        "the route's token maps to the typed expiry, not an internal error: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("gone-op"),
+        "the typed expiry names the op id: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("may still be in the library"),
+        "and says where the run may still be: {}",
+        err.message
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The connection lifecycle — the three new commands' state machine
 // ---------------------------------------------------------------------------
