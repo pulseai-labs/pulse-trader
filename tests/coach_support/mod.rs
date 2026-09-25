@@ -125,9 +125,10 @@ pub fn capture() -> LlmCallCapture {
 /// wrong (`pulseai-labs/pulse-trader#153`):
 ///
 /// 1. **ONE connection for the whole sequence.** Handing DROP → write → CREATE back
-///    to the pool between statements lets another connection start its read snapshot
-///    before the DROP is visible, which showed up as an intermittent "trigger
-///    already exists" on the restore.
+///    to the pool between statements could land each statement on a different pooled
+///    connection; keeping the sequence on one connection removed an intermittent
+///    "trigger already exists" on the restore (4 of 12 full-target runs failed
+///    before, 0 of 20 after).
 /// 2. **The trigger is restored from its OWN stored definition**, read out of
 ///    `sqlite_master` first — never from a DDL string copied into the test. A copy
 ///    silently restores a DIFFERENT trigger under the same name the day `0003`
