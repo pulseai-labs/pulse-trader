@@ -83,3 +83,24 @@ with `systemd-analyze` and dry-runs the deploy, installing nothing. `pulse impor
 mismatch; `pulse backup` takes the nightly online copy plus its snapshots into `~/pulse-backups/`
 (14 kept, `pulse-backup.timer` at 03:30 local); `pulse restore` verifies a backup the way import
 verifies a source, and `just restore` swaps it in with the unit stopped.
+
+## The thin client (r3.s3.w5)
+
+The Mac app is a thin client: every command speaks HTTP to the always-on
+server through a single `ServerClient` (`src/client/`) — plain routes, the
+`ops/` spawns, and the SSE event stream with `Last-Event-ID` resume under a
+capped, injectable backoff (1s → 30s). The app state is the connection
+(`ClientState`): `server_connect` handshakes, then persists
+`<data dir>/server-connection.toml` (`{ url, token }`, written through a
+temporary file plus rename at mode `0600`); `server_disconnect` deletes it;
+a relaunched app loads it and the 15 s status poll shows down, then up,
+across a server restart. `pulse mcp login` writes the relay's
+`mcp-connection.toml` BESIDE it under the same rules, and bare `pulse mcp`
+relays stdio to `/mcp` as a transparent byte bridge. MCP over HTTP serves the
+same `PulseMcp` the stdio transport serves, Agent-scoped, with the identity
+rule the spec pins: the authenticated token's LABEL is the agent's final
+identity — the auth middleware stamps it on the request, rmcp nests that
+request's `http::request::Parts` into the message extensions, and
+`initialize` reads the label through the nested Parts, so a version submitted
+through a token labelled `claude-code` records `agent_name = claude-code`
+no matter what the client calls itself.

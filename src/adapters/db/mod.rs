@@ -12,7 +12,10 @@
 //! real platform path; tests inject a `tempfile` path so the suite never touches
 //! the real `pulse.db`.
 
-mod paths;
+// r3.s3.w5: `pub(crate)` so the client-core's connection file resolves the
+// SAME platform data dir (`default_data_dir`) the database uses — one
+// location, never a second invented one.
+pub(crate) mod paths;
 pub mod strategy_repo;
 // VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter (FR-6 / FR-7).
 // `query!` macros for `backtest_run`/`trade` are confined here (the `.sqlx` cache

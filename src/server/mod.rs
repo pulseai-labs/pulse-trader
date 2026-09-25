@@ -152,6 +152,11 @@ async fn handshake() -> impl IntoResponse {
 /// the fallback too). Routes mounted afterwards via [`mount_scoped`] carry the
 /// same outer pair on themselves (axum layers only wrap routes that exist when
 /// `.layer` runs).
+/// # Panics
+///
+/// Panics at STARTUP only, when the `/mcp` mount cannot create the exports
+/// directory — a composition-root failure, surfaced with a named reason like
+/// every other startup refusal, never as a per-request error.
 pub fn router(state: Arc<ServerState>) -> axum::Router {
     // Each middleware owns its `Arc` (cloned per request inside the closure) —
     // a `move` closure must capture an owned handle, never a borrow.
@@ -166,6 +171,17 @@ pub fn router(state: Arc<ServerState>) -> axum::Router {
         axum::Router::new().route("/api/v1/handshake", handshake),
         &state,
     );
+    // r3.s3.w5 (AC-2): MCP over HTTP — the same `PulseMcp` the stdio transport
+    // serves, mounted at `/mcp` under the Agent scope. The mount consumes the
+    // server's own pool and data dir (the one-pool rule). A mount failure is
+    // a STARTUP failure, not a per-request one: surface it as a panic with a
+    // named reason, exactly like the other composition-root failures.
+    let mcp = crate::mcp::http::mcp_http_router(&crate::mcp::http::McpHttpDeps {
+        db: state.db.clone(),
+        data_dir: state.data_dir.clone(),
+    })
+    .unwrap_or_else(|error| panic!("mount /mcp: cannot create the exports directory: {error}"));
+    let base = mount_scoped(base, &state, auth::Scope::Agent, "/mcp", mcp);
     let log_state = state;
     base.layer(axum::middleware::from_fn(
         move |req: Request, next: axum::middleware::Next| {

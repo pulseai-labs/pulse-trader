@@ -15,8 +15,16 @@ vi.mock("../bindings", () => ({
   commands: {
     // "env" keeps the credential banner hidden so library content is the only
     // status-ish thing in the tree.
-    credentialStatus: vi.fn().mockResolvedValue("env"),
+    // r3.s3.w5: the bus's `Result` shell wraps every command answer, so the
+    // mock carries the `typedError` union shape.
+    credentialStatus: vi.fn().mockResolvedValue({ status: "ok", data: "env" }),
     libraryOverview: vi.fn(),
+    // r3.s3.w5: App polls the connection status (the Connect gate + the
+    // titlebar strip); an `up` answer keeps the Library where it always was.
+    serverStatus: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { state: "up", binary_version: "0.0.0", engine_fingerprint: null, reason: null },
+    }),
   },
 }));
 

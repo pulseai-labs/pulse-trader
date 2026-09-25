@@ -14,7 +14,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./bindings", () => ({
   commands: {
-    credentialStatus: vi.fn().mockResolvedValue("none"),
+    // r3.s3.w5: `credentialStatus` answers through the bus's `Result` shell,
+    // so the mock carries the `typedError` union shape (as `libraryOverview`
+    // below already does).
+    credentialStatus: vi.fn().mockResolvedValue({ status: "ok", data: "none" }),
+    // r3.s3.w5: App polls the connection status (the Connect gate + the
+    // titlebar strip); an `up` answer keeps the shell navigation these tests
+    // assert exactly where it was.
+    serverStatus: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { state: "up", binary_version: "0.0.0", engine_fingerprint: null, reason: null },
+    }),
     // r1.s1.w3: the default landing is now the Library screen, which reads
     // `libraryOverview` on mount — mocked to an empty payload so these shell
     // tests keep asserting the shell (the screen's own behaviour lives in

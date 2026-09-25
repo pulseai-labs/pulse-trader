@@ -89,14 +89,17 @@ fn credential_status_is_registered_on_the_bus() {
 }
 
 #[test]
-fn the_command_is_an_async_argument_free_command_returning_credential_status() {
+fn the_command_is_an_async_command_returning_credential_status() {
     let source = std::fs::read_to_string(manifest_path("src/tauri/commands.rs"))
         .expect("read src/tauri/commands.rs");
     assert!(
-        source.contains("pub async fn credential_status() -> CredentialStatus"),
-        "credential_status must be an async, argument-free command returning \
-         CredentialStatus directly -- the read has no failure mode, so a Result would \
-         claim one that does not exist"
+        source.contains(
+            "pub async fn credential_status(\n    state: tauri::State<'_, ClientState>,\n) -> Result<CredentialStatus, BusError>"
+        ),
+        "credential_status must be an async command returning CredentialStatus behind the \
+         bus's Result shell -- r3.s3.w5 moved the read across the wire, which gave it a \
+         failure mode the local read never had: an unreachable server must be a BusError, \
+         never a silent \"no credential\" the banner would render as a missing key"
     );
 }
 
@@ -117,12 +120,24 @@ fn the_command_calls_the_seams_zero_arg_wrapper() {
     // process-environment wrapper `w2` left carrying `#[allow(dead_code)]`) now has
     // a real caller. Asserted structurally because the wrapper is `pub(crate)` and
     // cannot be called directly from this out-of-crate test.
-    let source = std::fs::read_to_string(manifest_path("src/tauri/commands.rs"))
+    //
+    // r3.s3.w5: the caller is the SERVER's plain route now — the desktop is a
+    // thin client and reads the answer over the wire. The production caller
+    // survives one ring outward, and that is what keeps AC-3's
+    // `#[allow(dead_code)]` removal sound.
+    let server_source = std::fs::read_to_string(manifest_path("src/server/routes.rs"))
+        .expect("read src/server/routes.rs");
+    assert!(
+        server_source.contains("llm_credential_status()"),
+        "the credential-status route must call the seam's zero-arg wrapper, or AC-3's \
+         #[allow(dead_code)] removal is unsound"
+    );
+    let commands = std::fs::read_to_string(manifest_path("src/tauri/commands.rs"))
         .expect("read src/tauri/commands.rs");
     assert!(
-        source.contains("llm_credential_status()"),
-        "credential_status must call the seam's zero-arg wrapper, or AC-3's \
-         #[allow(dead_code)] removal is unsound"
+        !commands.contains("llm_credential_status()"),
+        "the thin client must not read the credential locally -- the banner's answer \
+         comes from the server that would actually use the key"
     );
 }
 

@@ -59,8 +59,7 @@ use super::backtest::{
     backtest_run_dto,
 };
 use super::coach::{
-    CoachDecisionDto, CoachDecisionRequestDto, CoachSessionDto, CoachTurnDeps, CoachTurnRequestDto,
-    coach_decide_core, coach_turn_core, summary_dto,
+    CoachDecisionDto, CoachDecisionRequestDto, CoachSessionDto, CoachTurnRequestDto, summary_dto,
 };
 use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -70,25 +69,18 @@ use super::library::{
 };
 use super::walk_forward::{
     GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardRunDto, WalkForwardRunRequest,
-    get_backtest_run_core, get_walk_forward_run_core, run_walk_forward_version_core,
 };
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
     Db, SqliteBacktestRunRepo, SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path,
     open_migrated,
 };
-use crate::adapters::llm::coach_transport::{coach_config, coach_provider};
-use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::secrets::{llm_credential_status, resolve_llm_api_key};
+// r3.s3.w5: the thin-client state every proxied command speaks through.
 use crate::agent::ComposerEvent;
-use crate::agent::config::{
-    load_coach_prompt_from, load_composer_prompt, load_llm_transport, load_price_table,
-    prompt_override_dir,
-};
 use crate::application::coach::CoachTurnRegistry;
-use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, compose_config, run_compose_with};
+use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, run_compose_with};
+use crate::client::{ClientState, ConnectOutcome, ServerStatus};
 use crate::domain::CoachingSessionId;
-use crate::domain::Redactor;
 use crate::domain::dsl::render;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
@@ -133,6 +125,9 @@ pub const BUS_COMMANDS: &[&str] = &[
     "run_walk_forward_version",
     "get_walk_forward_run",
     "get_backtest_run",
+    "server_connect",
+    "server_status",
+    "server_disconnect",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1096,8 +1091,8 @@ where
 /// Returns a [`BusError`] if the read through managed state fails.
 #[tauri::command]
 #[specta::specta]
-pub async fn shell_info(state: tauri::State<'_, DesktopState>) -> Result<ShellInfo, BusError> {
-    shell_info_core(&state).await
+pub async fn shell_info(state: tauri::State<'_, ClientState>) -> Result<ShellInfo, BusError> {
+    state.get("/api/v1/shell-info").await
 }
 
 /// A command that fails **on purpose**, so the error path is demonstrated rather than
@@ -1112,13 +1107,14 @@ pub async fn shell_info(state: tauri::State<'_, DesktopState>) -> Result<ShellIn
 /// Always. That is the point.
 #[tauri::command]
 #[specta::specta]
-pub async fn bus_selftest_failure() -> Result<(), BusError> {
-    // A real domain error, mapped through the real `From` impl -- not a synthetic
-    // BusError, so this exercises the mapping the frontend actually depends on.
-    Err(
-        crate::domain::DataError::Parse("deliberate bus self-test failure (r1.s1.w1)".to_owned())
-            .into(),
-    )
+pub async fn bus_selftest_failure(state: tauri::State<'_, ClientState>) -> Result<(), BusError> {
+    // The SERVER runs the deliberate failure through its route; the proxy's
+    // job is to deliver the mapped [`BusError`] body unchanged — which is the
+    // mapping the frontend actually depends on, now across the wire.
+    state
+        .post::<serde_json::Value, _>("/api/v1/bus-selftest-failure", &serde_json::json!({}))
+        .await
+        .map(|_| ())
 }
 
 /// Start the demo event stream on a **per-invocation** channel.
@@ -1133,11 +1129,27 @@ pub async fn bus_selftest_failure() -> Result<(), BusError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn start_demo_stream(
+    state: tauri::State<'_, ClientState>,
     steps: u32,
     channel: tauri::ipc::Channel<BusEvent>,
 ) -> Result<StreamOutcome, BusError> {
-    let run_id = RunId::new();
-    demo_stream_core(&run_id, steps.min(64), &channel).await
+    // The route clamps at 64 server-side too; the client mirrors the old
+    // wrapper's clamp so a local invocation behaves identically.
+    let outcome = state
+        .op::<StreamOutcome, _>(
+            "ops/start-demo-stream",
+            &serde_json::json!({ "steps": steps.min(64) }),
+            &channel,
+        )
+        .await?;
+    // The client's own counters are the honest answer to "how many events
+    // actually reached the far end": the server-owned op may have buffered
+    // more than a dead channel received.
+    Ok(StreamOutcome {
+        run_id: outcome.value.run_id,
+        emitted: outcome.emitted,
+        cancelled: outcome.cancelled || outcome.value.cancelled,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,13 +1164,21 @@ pub async fn start_demo_stream(
 /// a bare grep of convenience: `deny(warnings)` would not let the allow come off before
 /// a real caller existed.
 ///
-/// No `Result`: the read has no failure mode (an unresolvable credential reads as
-/// [`CredentialStatus::None`], not an error), so wrapping it in one would claim a
-/// failure mode this command does not have.
+/// The read now crosses the wire to the server (r3.s3.w5), which gives it a
+/// failure mode it never had as a local read: an unreachable server is a
+/// [`BusError`], never a silent "no credential" — the banner must not claim
+/// the key is missing when the truth is "cannot ask". This is the ONE place
+/// the spec's "keep their signatures" bends, and the report records it.
+///
+/// # Errors
+///
+/// A proxied-call failure — not-connected, refused, or the route's own error.
 #[tauri::command]
 #[specta::specta]
-pub async fn credential_status() -> CredentialStatus {
-    llm_credential_status()
+pub async fn credential_status(
+    state: tauri::State<'_, ClientState>,
+) -> Result<CredentialStatus, BusError> {
+    state.get("/api/v1/credential-status").await
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,9 +1198,9 @@ pub async fn credential_status() -> CredentialStatus {
 #[tauri::command]
 #[specta::specta]
 pub async fn library_overview(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
 ) -> Result<LibraryOverview, BusError> {
-    library_overview_core(&state).await
+    state.get("/api/v1/library-overview").await
 }
 
 // The compose command (r1.s1.w4) — the Designer's one bus entry
@@ -1207,60 +1227,42 @@ pub async fn library_overview(
 /// Returns a [`BusError`] on a config-load failure, an unresolvable credential,
 /// or a genuine compose/persist failure. A dropped channel is reported as
 /// `cancelled` in the [`ComposeResult`], not as an error.
+/// The compose operation's wire body — the route's LITERAL key (`nl_target`,
+/// `ops.rs::op_compose_strategy`'s own parse), per the binding F1 ruling that
+/// each route's shape is forwarded exactly as w2 landed it. A `nlTarget` body
+/// 422s on the route, which is what every Designer compose did before this
+/// was pinned by `the_compose_proxy_posts_the_routes_literal_body_key`.
+#[must_use]
+pub fn compose_strategy_body(nl_target: &str) -> serde_json::Value {
+    serde_json::json!({ "nl_target": nl_target })
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn compose_strategy(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     nl_target: String,
     channel: tauri::ipc::Channel<BusEvent>,
 ) -> Result<ComposeResult, BusError> {
-    // Config-driven overlays, loaded exactly as the CLI live arm loads them
-    // (ADR-0014): prompt + transport + prices are DATA, each with an embedded
-    // default, so a relocated binary is self-contained.
-    let transport =
-        load_llm_transport().map_err(|e| BusError::internal(format!("load llm transport: {e}")))?;
-    let prices =
-        load_price_table().map_err(|e| BusError::internal(format!("load price table: {e}")))?;
-    let prompt = load_composer_prompt()
-        .map_err(|e| BusError::internal(format!("load composer prompt: {e}")))?;
-
-    // The credential resolves inside the ring — `w2`'s seam. This is the
-    // least-privilege control: the value never appears in an argument, a
-    // return value, or an event, because it never leaves this function.
-    let key = resolve_llm_api_key().map_err(BusError::from)?;
-    // The provenance LABEL, captured before either consumer — all that reaches
-    // the persisted ledger rows (the audit-trail control).
-    let key_source = key.source();
-    // The key's two consumers, and its only two: the redactor (so the persisted
-    // copy is scrubbed) and the provider constructor (the live transport).
-    let redactor = Redactor::from_config(vec![key.expose().to_owned()]);
-    let provider = match transport.base_url {
-        Some(base_url) => OpenAiCompatProvider::with_base_url(key.expose().to_owned(), base_url),
-        None => OpenAiCompatProvider::new(key.expose().to_owned()),
-    };
-
-    let deps = ComposeDeps {
-        wiring: ComposeWiring {
-            provider,
-            llm_repo: state.llm_call_repo(),
-            redactor,
-            prices,
-            clock: SystemClock,
-            prompt,
-            key_source: Some(key_source),
-            config: compose_config(transport.model.as_deref()),
-        },
-        strategy_repo: state.strategy_repo(),
-    };
-
-    // Register BEFORE the run streams its first event, so the id the frontend
-    // learns from that event is always already cancellable, then deregister on
-    // every exit path — success, cancellation and error alike.
-    let run_id = RunId::new();
-    let cancelled = state.register_compose_run(&run_id);
-    let outcome = compose_strategy_core(&run_id, deps, &nl_target, &channel, cancelled).await;
-    state.finish_compose_run(&run_id);
-    outcome
+    // **Nothing but the target crosses the boundary in, and no credential
+    // crosses it in any direction, ever** (ADR-0016): the credential resolves
+    // on the SERVER now — the op arm's `ComposeWiring` — so this wrapper has
+    // even less to hold than before. The channel still IS the correlation
+    // (grill A2); `run_op` feeds it the server's buffered `bus` frames in
+    // order, with the original `run_id` and `seq`.
+    let outcome = state
+        .op::<ComposeResult, _>(
+            "ops/compose-strategy",
+            &compose_strategy_body(&nl_target),
+            &channel,
+        )
+        .await?;
+    Ok(ComposeResult {
+        run_id: outcome.value.run_id,
+        emitted: outcome.emitted,
+        cancelled: outcome.cancelled || outcome.value.cancelled,
+        strategy: outcome.value.strategy,
+    })
 }
 
 /// Cancel an in-flight compose run by id.
@@ -1281,14 +1283,21 @@ pub async fn compose_strategy(
 ///
 /// # Errors
 ///
-/// Never. The `Result` is the bus's uniform command shape.
+/// Never on an answered route; the proxied call itself can refuse
+/// (not-connected / unreachable), and that `Result` is the bus's uniform
+/// command shape.
 #[tauri::command]
 #[specta::specta]
 pub async fn compose_cancel(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     run_id: String,
 ) -> Result<bool, BusError> {
-    Ok(state.cancel_compose_run(&run_id))
+    state
+        .post(
+            "/api/v1/compose-cancel",
+            &serde_json::json!({ "runId": run_id }),
+        )
+        .await
 }
 
 /// Run one persisted strategy version and answer from the row it just wrote
@@ -1360,10 +1369,16 @@ pub async fn run_backtest_version_core(
 #[tauri::command]
 #[specta::specta]
 pub async fn run_backtest_version(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     request: BacktestRunRequest,
 ) -> Result<BacktestRunDto, BusError> {
-    run_backtest_version_core(&state, request).await
+    // A normal request/response command, not a `Channel` (r1.s3.w3): the op's
+    // only frame before the terminal is the non-streaming `started` marker,
+    // which no sink needs to see.
+    state
+        .op::<BacktestRunDto, _>("ops/run-backtest-version", &request, &NullSink)
+        .await
+        .map(|outcome| outcome.value)
 }
 
 /// A one-line, human-readable description of how two recorded
@@ -1577,10 +1592,10 @@ pub async fn compare_child_run_core(
 #[tauri::command]
 #[specta::specta]
 pub async fn compare_child_run(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     request: CompareChildRunRequest,
 ) -> Result<CompareChildRunDto, BusError> {
-    compare_child_run_core(&state, request).await
+    state.post("/api/v1/compare-child-run", &request).await
 }
 
 /// `coach_turn` — start or reload one coach turn for a persisted run (r1.s4.w3).
@@ -1608,46 +1623,17 @@ pub async fn compare_child_run(
 #[tauri::command]
 #[specta::specta]
 pub async fn coach_turn(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     request: CoachTurnRequestDto,
 ) -> Result<CoachSessionDto, BusError> {
-    let transport =
-        load_llm_transport().map_err(|e| BusError::internal(format!("load llm transport: {e}")))?;
-    let prices =
-        load_price_table().map_err(|e| BusError::internal(format!("load price table: {e}")))?;
-    // The operator's overlay is honoured here for the same reason `pulse coach`
-    // honours it: an overlay edit must change what the coach says AND what the
-    // ledger records.
-    let prompt = load_coach_prompt_from(prompt_override_dir().as_deref())
-        .map_err(|e| BusError::internal(format!("load coach prompt: {e}")))?;
-
-    // The credential resolves inside the ring and is consumed by exactly two
-    // things — the redactor (so the persisted copy is scrubbed) and the provider
-    // constructor — then dropped with this frame.
-    let key = resolve_llm_api_key().map_err(BusError::from)?;
-    let key_source = key.source();
-    let redactor = Redactor::from_config(vec![key.expose().to_owned()]);
-    // The SHARED coach transport (#165 review R6): one constructor, so this surface
-    // and `pulse coach` cannot end up with different retry, timeout or model
-    // postures — and so swapping in a retrying provider here would have to be a
-    // visible edit rather than a one-word substitution.
-    let provider = coach_provider(key.expose(), transport.base_url.as_deref());
-
-    let deps = CoachTurnDeps {
-        provider,
-        prices,
-        redactor,
-        key_source: Some(key_source),
-        // The COACH's knobs, shared with `pulse coach` (#164) — a coach turn asks a
-        // whole backtest's worth of question and the model reasons before it calls a
-        // tool, so the composer's step-sized cap cut the turn off mid-thought.
-        config: coach_config(transport.model.as_deref()),
-        prompt: prompt.text,
-        prompt_version: Some(prompt.version),
-        turn_timeout: None,
-        max_dsl_bytes: None,
-    };
-    coach_turn_core(&state, deps, request).await
+    // The credential lives on the SERVER now — the op arm resolves it inside
+    // its own spawned task, exactly as this wrapper used to (ADR-0016's
+    // discipline, one ring outward). The token this app presents is the
+    // connection's, and it rides the `Authorization` header only.
+    state
+        .op::<CoachSessionDto, _>("ops/coach-turn", &request, &NullSink)
+        .await
+        .map(|outcome| outcome.value)
 }
 
 /// `coach_decide` — modify, reject or accept one recorded proposal (r1.s4.w3).
@@ -1662,10 +1648,10 @@ pub async fn coach_turn(
 #[tauri::command]
 #[specta::specta]
 pub async fn coach_decide(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     request: CoachDecisionRequestDto,
 ) -> Result<CoachDecisionDto, BusError> {
-    coach_decide_core(&state, request).await
+    state.post("/api/v1/coach-decide", &request).await
 }
 
 /// `run_walk_forward_version` — the Backtest Lab's walk-forward action
@@ -1678,10 +1664,13 @@ pub async fn coach_decide(
 #[tauri::command]
 #[specta::specta]
 pub async fn run_walk_forward_version(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     request: WalkForwardRunRequest,
 ) -> Result<WalkForwardRunDto, BusError> {
-    run_walk_forward_version_core(&state, request).await
+    state
+        .op::<WalkForwardRunDto, _>("ops/run-walk-forward-version", &request, &NullSink)
+        .await
+        .map(|outcome| outcome.value)
 }
 
 /// `get_walk_forward_run` — read one persisted walk-forward run back, in the
@@ -1693,10 +1682,10 @@ pub async fn run_walk_forward_version(
 #[tauri::command]
 #[specta::specta]
 pub async fn get_walk_forward_run(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     request: GetWalkForwardRunRequest,
 ) -> Result<WalkForwardRunDto, BusError> {
-    get_walk_forward_run_core(&state, request).await
+    state.post("/api/v1/get-walk-forward-run", &request).await
 }
 
 /// `get_backtest_run` — one persisted run id in, the same [`BacktestRunDto`]
@@ -1709,10 +1698,73 @@ pub async fn get_walk_forward_run(
 #[tauri::command]
 #[specta::specta]
 pub async fn get_backtest_run(
-    state: tauri::State<'_, DesktopState>,
+    state: tauri::State<'_, ClientState>,
     request: GetBacktestRunRequest,
 ) -> Result<BacktestRunDto, BusError> {
-    get_backtest_run_core(&state, request).await
+    state.post("/api/v1/get-backtest-run", &request).await
+}
+
+// ---------------------------------------------------------------------------
+// The connection commands (r3.s3.w5) — Connect's three verbs
+// ---------------------------------------------------------------------------
+
+/// Connect the app to the server: handshake first, then persist the
+/// connection file and swap the connection on success. The named outcome
+/// (`connected` / `unreachable` / `token_refused` / `skew`) is what the
+/// Connect screen renders; a `token_refused`/`skew` ALSO records the refusal
+/// as the connection state, so `server_status` repeats it.
+///
+/// The token argument never appears in an error, a log line, or the
+/// connection file's directory listing — it is written `0600` to the
+/// connection file beside `server-connection.toml`, and nowhere else.
+///
+/// The `Result` shell is tauri's rule for async commands taking managed state
+/// (a reference input); the outcome carries every failure, so the error arm is
+/// never produced.
+#[tauri::command]
+#[specta::specta]
+pub async fn server_connect(
+    state: tauri::State<'_, ClientState>,
+    url: String,
+    token: String,
+) -> Result<ConnectOutcome, BusError> {
+    Ok(state.connect(&url, &token).await)
+}
+
+/// The status strip's read: `up`/`down` from a FRESH handshake against the
+/// stored connection (the 15 s poll; a server restart shows down, then up,
+/// without relaunching the app — d28), `not_connected` with nothing stored,
+/// `refused` with the last refusal's reason.
+///
+/// The `Result` shell is tauri's rule for async commands taking managed
+/// state; the status carries every outcome, so the error arm is never
+/// produced.
+#[tauri::command]
+#[specta::specta]
+pub async fn server_status(state: tauri::State<'_, ClientState>) -> Result<ServerStatus, BusError> {
+    Ok(state.status().await)
+}
+
+/// Disconnect: drop the live connection and delete the connection file.
+///
+/// # Errors
+///
+/// Never — the `Result` is the bus's uniform command shape.
+#[tauri::command]
+#[specta::specta]
+pub async fn server_disconnect(state: tauri::State<'_, ClientState>) -> Result<(), BusError> {
+    state.disconnect()
+}
+
+/// A no-op sink for operations the client drives without a channel: a
+/// non-streaming op's only frame before the terminal is the `started` marker,
+/// which carries no channel traffic.
+struct NullSink;
+
+impl EventSink for NullSink {
+    fn send_event(&self, _event: BusEvent) -> Result<(), BusError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

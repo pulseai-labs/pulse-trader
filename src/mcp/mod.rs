@@ -18,7 +18,9 @@
 //! capability.
 
 pub(crate) mod export;
+pub(crate) mod http;
 pub(crate) mod identity;
+pub(crate) mod relay;
 pub(crate) mod resources;
 pub(crate) mod tools;
 
@@ -51,7 +53,9 @@ pub(crate) struct McpState {
     /// The candle store rooted at the app data dir.
     pub(crate) candles: CandleStore,
     /// The per-process exports directory handle (`<data dir>/exports/<pid>-<start>/`).
-    pub(crate) exports: Exports,
+    /// `Arc` so every HTTP session shares the ONE per-process exports
+    /// directory (r3.s3.w5) — the seq counter is internal, so sharing is safe.
+    pub(crate) exports: std::sync::Arc<Exports>,
     /// The flag-resolved identity (`Flag` or the not-yet-upgraded `Unknown`).
     pub(crate) identity: AgentIdentity,
     /// The exchange adapter `run_backtest` needs for `symbol_filters` — its
@@ -113,6 +117,14 @@ impl ServerHandler for PulseMcp {
     /// Capture `clientInfo.name` into the resolved identity — the handshake
     /// half of the precedence table — before the default negotiation runs.
     /// A flag-resolved identity is final and is never overwritten.
+    ///
+    /// Over HTTP (r3.s3.w5) the authenticated token's LABEL is the agent's
+    /// final identity: the auth middleware puts [`crate::server::auth::
+    /// AuthenticatedLabel`] in the request extensions, which ride into this
+    /// context — a label present here outranks `clientInfo.name` exactly as a
+    /// `--agent-name` flag does (source `Flag`), so a version submitted
+    /// through a token labelled `claude-code` records `agent_name =
+    /// claude-code` no matter what the client calls itself.
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -120,7 +132,24 @@ impl ServerHandler for PulseMcp {
     ) -> Result<InitializeResult, McpError> {
         {
             let mut identity = self.identity_lock();
-            if identity.source != identity::AgentNameSource::Flag {
+            // rmcp nests the transport's `http::request::Parts` inside the
+            // message extensions (tower.rs inserts `parts` into
+            // `request.extensions_mut()`), so the auth middleware's label —
+            // which rode the REQUEST extensions — is reachable only through
+            // the nested Parts. Reading the top-level extensions map was the
+            // dead path the dispatch-2 verifier caught.
+            let label = context
+                .extensions
+                .get::<::http::request::Parts>()
+                .and_then(|parts| {
+                    parts
+                        .extensions
+                        .get::<crate::server::auth::AuthenticatedLabel>()
+                })
+                .map(|label| label.0.clone());
+            if let Some(label) = label {
+                *identity = AgentIdentity::resolve(Some(&label), None);
+            } else if identity.source != identity::AgentNameSource::Flag {
                 *identity = AgentIdentity::resolve(None, Some(&request.client_info.name));
             }
             let resolved = identity.clone();
