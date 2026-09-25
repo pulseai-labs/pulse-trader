@@ -112,6 +112,11 @@ pub enum Command {
     /// Move a Mac `pulse.db` + its candle snapshots onto this host with full
     /// hash verification (r3.s3.w4, D7). A non-empty target is refused
     /// without `--replace`; `--replace` backs the target up first.
+    /// Precondition: the server must be stopped — the install renames over
+    /// `pulse.db` and deletes its stale `-wal`/`-shm`, so a running `pulse
+    /// serve` would keep serving the unlinked old file and lose every write it
+    /// commits afterwards. Import does not check the process; D7's cutover
+    /// order is to quit the old Mac app, then import on the server host.
     Import(ImportArgs),
     /// Online-backup the local database + snapshots into `~/pulse-backups`
     /// (r3.s3.w4, D12) — consistent while `pulse serve` holds the database.

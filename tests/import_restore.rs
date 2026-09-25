@@ -142,6 +142,29 @@ fn run_pulse(home: &Path, args: &[&str]) -> Output {
         .expect("spawn the pulse binary")
 }
 
+/// The `pulse-*.db` files in a backup out-dir (never `candles/`, never a
+/// `.partial`), sorted by name.
+fn backup_db_files(out_dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(out_dir)
+        .map(|dir| {
+            dir.flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                            n.starts_with("pulse-")
+                                && Path::new(n)
+                                    .extension()
+                                    .is_some_and(|e| e.eq_ignore_ascii_case("db"))
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
 fn combined(out: &Output) -> String {
     format!(
         "{}\n{}",
@@ -640,13 +663,7 @@ async fn nonempty_target_is_refused_then_replace_backs_up_first_and_succeeds() {
     );
 
     let backups_dir = s.home.join("pulse-backups");
-    let before: Vec<String> = fs::read_dir(&backups_dir)
-        .map(|d| {
-            d.flatten()
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let before = backup_db_files(&backups_dir);
 
     let replaced = run_pulse(
         &s.home,
@@ -658,24 +675,57 @@ async fn nonempty_target_is_refused_then_replace_backs_up_first_and_succeeds() {
         text.contains("backed up to"),
         "the replace path names the backup path: {text}"
     );
-    let after: Vec<String> = fs::read_dir(&backups_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
+    let after = backup_db_files(&backups_dir);
     assert_eq!(
         after.len(),
         before.len() + 1,
-        "exactly one backup was written"
+        "exactly one backup database was written"
     );
-    let new_backup = after.iter().find(|n| !before.contains(n)).unwrap();
+    let new_backup = after.iter().find(|p| !before.contains(p)).unwrap();
     assert!(
-        new_backup.starts_with("pulse-")
-            && Path::new(new_backup)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("db")),
-        "the backup follows the pulse-<stamp>.db convention: {new_backup}"
+        new_backup
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("pulse-")),
+        "the backup follows the pulse-<stamp>.db convention: {}",
+        new_backup.display()
     );
+    // The safety backup is the SAME artifact `pulse backup` makes: the database
+    // AND the target's candle snapshots, so it can be restored with
+    // `pulse restore --backup-dir` — a database-only copy could not be.
+    for (tf, stem) in [("15m", &s.stems.0), ("4h", &s.stems.1)] {
+        let snap = backups_dir
+            .join("candles")
+            .join("BTCUSDT")
+            .join(tf)
+            .join(format!("{stem}.parquet"));
+        assert!(
+            snap.is_file(),
+            "the --replace backup holds the target's snapshot: {}",
+            snap.display()
+        );
+    }
+    let restored_db = s.dir.path().join("restored-from-replace").join("pulse.db");
+    let restored_data = s.dir.path().join("restored-from-replace-data");
+    let restored = run_pulse(
+        &s.home,
+        &[
+            "restore",
+            new_backup.to_str().unwrap(),
+            "--backup-dir",
+            backups_dir.to_str().unwrap(),
+            "--db",
+            restored_db.to_str().unwrap(),
+            "--data-dir",
+            restored_data.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&restored);
+    assert!(
+        restored.status.success(),
+        "the backup the --replace path named must restore: {text}"
+    );
+    assert_table_counts_equal(&s.from_db, &restored_db).await;
     assert_table_counts_equal(&s.from_db, &target_db).await;
 }
 
@@ -1014,6 +1064,116 @@ async fn no_token_or_credential_material_appears_in_any_output() {
         .unwrap();
     assert_eq!(tokens, 1, "the hashed client_token row was copied");
 }
+
+// ---------------------------------------------------------------------------
+// the offline precondition, on import
+// ---------------------------------------------------------------------------
+
+/// D7's other half of restore's precondition: `pulse import` REPLACES the
+/// database file (and deletes its stale `-wal`/`-shm`), so its `--help` and its
+/// module doc state that the server must be stopped — the cutover order is
+/// quit the old app, then import. The command still checks no process: the
+/// spec deliberately has none.
+#[test]
+fn import_help_states_the_server_stopped_precondition() {
+    let dir = TempDir::new().unwrap();
+    let out = run_pulse(dir.path(), &["import", "--help"]);
+    assert!(out.status.success(), "import --help must succeed");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("Precondition: the server must be stopped"),
+        "the --help text states the server-stopped precondition: {help}"
+    );
+    assert!(
+        help.contains("quit the old Mac app"),
+        "and names D7's cutover order: {help}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// emptiness counts every application table
+// ---------------------------------------------------------------------------
+
+/// A target that holds NO strategy rows but DOES hold a token is not empty:
+/// the install replaces the whole file, so importing over it without
+/// `--replace` would destroy the operator's tokens (and their audit trail)
+/// without a backup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_holding_only_token_rows_is_not_empty() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+    // The server's own layout: the token command opens (and migrates) the
+    // database in place, so its directory exists on a served host.
+    fs::create_dir_all(target_db.parent().unwrap()).unwrap();
+
+    // A real token in the target, through the real CLI (WAL permits the second
+    // writer): the state a served host is in before its first import.
+    let issued = run_pulse(
+        &s.home,
+        &[
+            "token",
+            "issue",
+            "--scope",
+            "agent",
+            "--label",
+            "laptop",
+            "--db",
+            target_db.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        issued.status.success(),
+        "token issue must succeed: {}",
+        combined(&issued)
+    );
+    let tgt = Db::with_path(&target_db).await.unwrap();
+    for table in ["strategy", "strategy_version", "backtest_run"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(tgt.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "{table} is empty, so only the token makes it used"
+        );
+    }
+
+    let refused = run_pulse(
+        &s.home,
+        &str_args(&import_args(&s, &target_db, &target_data, false)),
+    );
+    let text = combined(&refused);
+    assert!(
+        !refused.status.success(),
+        "a target holding token rows must be refused without --replace: {text}"
+    );
+    assert!(
+        text.contains("non-empty"),
+        "the refusal names the state: {text}"
+    );
+    assert!(
+        text.contains("client_token 1"),
+        "the refusal names the table that makes it non-empty: {text}"
+    );
+
+    // --replace still works, and backs the token row up with everything else.
+    let replaced = run_pulse(
+        &s.home,
+        &str_args(&import_args(&s, &target_db, &target_data, true)),
+    );
+    let text = combined(&replaced);
+    assert!(replaced.status.success(), "--replace must succeed: {text}");
+    assert!(
+        text.contains("backed up to"),
+        "the replace path names the backup: {text}"
+    );
+    assert_table_counts_equal(&s.from_db, &target_db).await;
+}
+
+// ---------------------------------------------------------------------------
+// the backup store's integrity
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // the restore --help precondition

@@ -16,6 +16,14 @@
 //!
 //! `pulse restore` (`cli/backup.rs`) reuses [`run_verified_copy`] with the
 //! backup as the source: same verification, same atomic install, no chmod.
+//!
+//! **Its precondition: the server must be stopped.** The install deletes the
+//! target's `-wal`/`-shm` and renames over `pulse.db`, so a running `pulse
+//! serve` would keep serving the unlinked old inode, the deleted WAL content is
+//! gone, and every write it commits after the swap is silently lost. Import
+//! does not check the process — the same posture restore documents: the CLI's
+//! `--help` states the precondition, and the operator's cutover order is D7's —
+//! quit the old Mac app, then import.
 
 use std::collections::HashMap;
 use std::fs;
@@ -39,6 +47,12 @@ const MAX_NAMED_MISMATCHES: usize = 20;
 
 /// `pulse import --from-db <mac.db> --from-data-dir <dir holding its
 /// candles/> [--db <target>] [--data-dir <target>] [--replace]`.
+///
+/// **Precondition: the server must be stopped.** Import does not check the
+/// process; the install renames over `pulse.db` and deletes its stale
+/// `-wal`/`-shm`, so a running `pulse serve` would keep serving the unlinked
+/// old file and lose every write it commits afterwards. D7's cutover order:
+/// quit the old Mac app, then import on the server host with the unit stopped.
 #[derive(Debug, Args)]
 pub struct ImportArgs {
     /// The Mac `pulse.db` copy to import. Read-only throughout; set a-w on
@@ -140,13 +154,25 @@ type Added = Vec<PathBuf>;
 
 /// How the steps ended: a counted summary, a hard failure, or mismatches.
 enum StepFailure {
-    /// An I/O or database failure (not a verification mismatch).
-    Fatal(anyhow::Error),
+    /// An I/O or database failure (not a verification mismatch). It carries
+    /// the snapshots this run had ALREADY added to the target — a step can fail
+    /// after `copy_snapshots` put files in place, and the cleanup must remove
+    /// them too, or the target is left dirty against the contract.
+    Fatal { error: anyhow::Error, added: Added },
     /// The verification found mismatches; the target must stay untouched.
     Mismatches {
         mismatches: Vec<Mismatch>,
         added: Added,
     },
+}
+
+/// A fatal step failure that carries the added-snapshot list to the cleanup —
+/// the shape EVERY fatal path in [`run_steps`] uses.
+fn fatal(error: anyhow::Error, added: &Added) -> StepFailure {
+    StepFailure::Fatal {
+        error,
+        added: added.clone(),
+    }
 }
 
 /// Resolve the `--db` override or the server's default.
@@ -196,22 +222,30 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     let label = job.source_label;
 
     // ---- Step 1: refuse a non-empty target; back it up first on --replace.
-    if let Some((strategies, versions, runs)) = ops::target_row_counts(job.db_target)
+    if let Some(contents) = ops::target_row_counts(job.db_target)
         .await
         .map_err(|e| anyhow!("{e}"))?
     {
         if !job.replace {
             anyhow::bail!(
-                "{label}: target {} is non-empty (strategies {strategies}, versions {versions}, \
-                 runs {runs}); without --replace a non-empty target is refused",
-                job.db_target.display()
+                "{label}: target {} is non-empty ({}); without --replace a non-empty target \
+                 is refused",
+                job.db_target.display(),
+                contents.named_counts()
             );
         }
         let out_dir = default_backup_out_dir()?;
-        let backup_path = super::backup::backup_database(job.db_target, &out_dir).await?;
+        // The SAME backup `pulse backup` makes of this target — its database
+        // AND the candle snapshots of its data dir, into the out-dir's one
+        // shared `candles/` store — so the backup named here can be restored
+        // with `pulse restore --backup-dir <out-dir>`. A database-only copy
+        // could not be.
+        let backup = super::backup::backup_target(job.db_target, job.data_target, &out_dir).await?;
         println!(
-            "{label}: previous target backed up to {}",
-            backup_path.display()
+            "{label}: previous target backed up to {} (database + {} snapshot(s) in {}/candles)",
+            backup.path.display(),
+            backup.snapshots_total,
+            out_dir.display()
         );
     }
 
@@ -241,9 +275,12 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     drop(opened); // close the pool before any file surgery on either path
 
     match steps {
-        Err(StepFailure::Fatal(e)) => {
+        Err(StepFailure::Fatal { error, added }) => {
+            // Every fatal path cleans up BOTH: the temporary database and any
+            // snapshot this run added before it failed.
             remove_tmp_db(&tmp_db);
-            Err(e)
+            remove_added_snapshots(&added);
+            Err(error)
         }
         Err(StepFailure::Mismatches { mismatches, added }) => {
             remove_tmp_db(&tmp_db);
@@ -254,11 +291,17 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
                  were deleted and the target is exactly as it was"
             );
         }
-        Ok(summary) => {
+        Ok((summary, added)) => {
             // ---- Step 7: atomic install. The target's stale -wal/-shm are
             // removed first so an old sidecar can never bleed into the
             // renamed file (the migration-protocol restore precedent).
-            install_tmp_db(&tmp_db, job.db_target)?;
+            if let Err(error) = install_tmp_db(&tmp_db, job.db_target) {
+                // The install is the last thing that can fail: it cleans up
+                // exactly as every earlier fatal path does.
+                remove_tmp_db(&tmp_db);
+                remove_added_snapshots(&added);
+                return Err(error);
+            }
             if job.chmod_source {
                 set_read_only(job.from_db)?;
                 println!("{label}: set read-only (a-w): {}", job.from_db.display());
@@ -270,7 +313,11 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
 }
 
 /// Steps 4–5 on the migrated copy: the snapshot copy and the five checks.
-async fn run_steps(job: &VerifiedCopy<'_>, copied: &Db) -> Result<Summary, StepFailure> {
+///
+/// Returns the summary AND the snapshots this run added, so the caller's
+/// success path can clean them up if the install itself fails. Every fatal path
+/// carries that list out with the error (see [`fatal`]).
+async fn run_steps(job: &VerifiedCopy<'_>, copied: &Db) -> Result<(Summary, Added), StepFailure> {
     let copy_pool = copied.pool();
     let mut mismatches: Vec<Mismatch> = Vec::new();
 
@@ -279,27 +326,32 @@ async fn run_steps(job: &VerifiedCopy<'_>, copied: &Db) -> Result<Summary, StepF
     let target_store = CandleStore::with_base_dir(job.data_target.to_path_buf());
     let (source_snapshots, scan_issues) = scan_snapshots(job.from_data_dir);
     mismatches.extend(scan_issues);
-    let added = copy_snapshots(&target_store, &source_snapshots, &mut mismatches)
-        .map_err(StepFailure::Fatal)?;
+    // `copy_snapshots` adds files as it goes and can fail part-way: the error
+    // carries whatever it had added by then.
+    let added = match copy_snapshots(&target_store, &source_snapshots, &mut mismatches) {
+        Ok(added) => added,
+        Err((error, added)) => return Err(fatal(error, &added)),
+    };
 
     // ---- Step 5: verify everything, and do not stop at the first failure
-    // within a check.
+    // within a check. Every step below can fail AFTER snapshots were added, so
+    // each fatal path hands the added list to the cleanup.
     let source = ops::open_read_only(job.from_db)
         .await
-        .map_err(|e| StepFailure::Fatal(anyhow!("{e}")))?;
+        .map_err(|e| fatal(anyhow!("{e}"), &added))?;
     let tables = step_table_counts(&source, copy_pool, &mut mismatches)
         .await
-        .map_err(StepFailure::Fatal)?;
+        .map_err(|e| fatal(e, &added))?;
     step_stored_hashes(&source, copy_pool, &mut mismatches)
         .await
-        .map_err(StepFailure::Fatal)?;
+        .map_err(|e| fatal(e, &added))?;
     let (versions_verified, runs_verified) = step_repository_reads(copy_pool, &mut mismatches)
         .await
-        .map_err(StepFailure::Fatal)?;
+        .map_err(|e| fatal(e, &added))?;
     let snapshots_verified = step_snapshot_reads(&target_store, &source_snapshots, &mut mismatches);
     step_referenced_snapshots(&target_store, copy_pool, &mut mismatches)
         .await
-        .map_err(StepFailure::Fatal)?;
+        .map_err(|e| fatal(e, &added))?;
     source.close().await;
 
     if !mismatches.is_empty() {
@@ -309,15 +361,18 @@ async fn run_steps(job: &VerifiedCopy<'_>, copied: &Db) -> Result<Summary, StepF
     for table in &tables {
         let count = ops::table_count(copy_pool, table)
             .await
-            .map_err(|e| StepFailure::Fatal(anyhow!("{e}")))?;
+            .map_err(|e| fatal(anyhow!("{e}"), &added))?;
         table_counts.push((table.clone(), count));
     }
-    Ok(Summary {
-        table_counts,
-        versions_verified,
-        runs_verified,
-        snapshots_verified,
-    })
+    Ok((
+        Summary {
+            table_counts,
+            versions_verified,
+            runs_verified,
+            snapshots_verified,
+        },
+        added,
+    ))
 }
 
 /// Step 5a: per-table row counts, copy versus source. The list is every table
@@ -671,47 +726,60 @@ fn timeframe_from_interval(name: &str) -> Option<Timeframe> {
 /// Copy every source snapshot into the target store; an existing same-named
 /// file must be byte-identical, or the mismatch refuses the import. Returns
 /// the files this run added (for the failure cleanup).
+///
+/// # Errors
+///
+/// A copy failure returns the files added SO FAR beside the error: a fatal
+/// failure part-way through must still leave the target exactly as it was.
 fn copy_snapshots(
     target_store: &CandleStore,
     source_snapshots: &[SourceSnapshot],
     mismatches: &mut Vec<Mismatch>,
-) -> Result<Added, anyhow::Error> {
+) -> Result<Added, (anyhow::Error, Added)> {
     let mut added: Added = Vec::new();
-    for snap in source_snapshots {
-        let dest = target_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
-        if dest.exists() {
-            if !bytes_equal(&snap.path, &dest) {
-                mismatches.push(Mismatch::new(
-                    "snapshot",
-                    dest.display().to_string(),
-                    "bytes",
-                    format!(
-                        "an existing target snapshot differs from the source snapshot {} \
-                         (equal names must mean equal bytes)",
-                        snap.path.display()
-                    ),
-                ));
+    let copied = (|| -> anyhow::Result<()> {
+        for snap in source_snapshots {
+            let dest = target_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
+            if dest.exists() {
+                if !bytes_equal(&snap.path, &dest) {
+                    mismatches.push(Mismatch::new(
+                        "snapshot",
+                        dest.display().to_string(),
+                        "bytes",
+                        format!(
+                            "an existing target snapshot differs from the source snapshot {} \
+                             (equal names must mean equal bytes)",
+                            snap.path.display()
+                        ),
+                    ));
+                }
+                continue;
             }
-            continue;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
+            }
+            fs::copy(&snap.path, &dest).map_err(|e| {
+                anyhow!(
+                    "copy snapshot {} -> {}: {e}",
+                    snap.path.display(),
+                    dest.display()
+                )
+            })?;
+            added.push(dest);
         }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
-        }
-        fs::copy(&snap.path, &dest).map_err(|e| {
-            anyhow!(
-                "copy snapshot {} -> {}: {e}",
-                snap.path.display(),
-                dest.display()
-            )
-        })?;
-        added.push(dest);
+        Ok(())
+    })();
+    match copied {
+        Ok(()) => Ok(added),
+        Err(error) => Err((error, added)),
     }
-    Ok(added)
 }
 
 /// Byte comparison of two files (a read failure counts as "not equal").
-fn bytes_equal(a: &Path, b: &Path) -> bool {
+/// Shared with `cli/backup.rs`, so the backup store's existing-snapshot check
+/// is the same comparison the import's copy makes.
+pub(crate) fn bytes_equal(a: &Path, b: &Path) -> bool {
     match (fs::read(a), fs::read(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,

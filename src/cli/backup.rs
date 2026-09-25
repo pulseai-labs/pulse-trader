@@ -17,6 +17,11 @@
 //! summary. Its precondition — the server must be stopped — is stated in
 //! `--help`; the `just restore` recipe stops the unit, restores, then starts
 //! it again.
+//!
+//! [`backup_target`] is the one full-backup body — database + the source data
+//! dir's snapshots — that `pulse backup` and BOTH `--replace` safety backups
+//! (import's and restore's) run, so a backup named by any of them restores with
+//! `pulse restore --backup-dir <out-dir>`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,8 +31,8 @@ use chrono::Utc;
 use clap::Args;
 
 use super::import::{
-    VerifiedCopy, default_backup_out_dir, resolve_target_data_dir, resolve_target_db,
-    run_verified_copy, scan_snapshots,
+    SourceSnapshot, VerifiedCopy, default_backup_out_dir, resolve_target_data_dir,
+    resolve_target_db, run_verified_copy, scan_snapshots,
 };
 use crate::adapters::db::ops;
 use crate::adapters::store::CandleStore;
@@ -90,9 +95,52 @@ pub(crate) async fn run_backup(args: &BackupArgs) -> anyhow::Result<()> {
         None => default_backup_out_dir()?,
     };
 
+    let outcome = backup_target(&db_path, &data_dir, &out_dir).await?;
+    let kept = prune_backups(&out_dir, args.keep)?;
+    let size = fs::metadata(&outcome.path)
+        .map(|m| m.len())
+        .map_err(|e| anyhow!("stat {}: {e}", outcome.path.display()))?;
+    println!(
+        "pulse backup: {} ({} bytes); snapshots copied {} (store {}); backups kept {kept}",
+        outcome.path.display(),
+        size,
+        outcome.snapshots_copied,
+        outcome.snapshots_total
+    );
+    Ok(())
+}
+
+/// What a full backup wrote.
+pub(crate) struct BackupOutcome {
+    /// The published `pulse-<stamp>.db`.
+    pub path: PathBuf,
+    /// How many snapshots this run ADDED to the out-dir's shared store.
+    pub snapshots_copied: usize,
+    /// How many snapshots the source store holds in total.
+    pub snapshots_total: usize,
+}
+
+/// The one full-backup body: the database copy plus every snapshot of
+/// `data_dir` into `out_dir`'s shared `candles/` store — the artifact set
+/// `pulse backup` makes, without its prune and its summary line.
+///
+/// Shared by `pulse backup` itself and the `--replace` safety backup of import
+/// and restore, so a backup named by any of them can be restored with
+/// `pulse restore --backup-dir <out-dir>`.
+///
+/// # Errors
+///
+/// A snapshot-layout problem in the source store (nothing is written at all),
+/// or a failed database/snapshot copy — the partial database file and the
+/// snapshots this call added are deleted.
+pub(crate) async fn backup_target(
+    db_path: &Path,
+    data_dir: &Path,
+    out_dir: &Path,
+) -> anyhow::Result<BackupOutcome> {
     // The snapshot scan comes FIRST: a broken store must leave no backup
     // files behind at all.
-    let (snapshots, scan_issues) = scan_snapshots(&data_dir);
+    let (snapshots, scan_issues) = scan_snapshots(data_dir);
     if !scan_issues.is_empty() {
         for issue in &scan_issues {
             eprintln!(
@@ -103,54 +151,66 @@ pub(crate) async fn run_backup(args: &BackupArgs) -> anyhow::Result<()> {
         anyhow::bail!("backup: the data dir has snapshot-layout problems; nothing was backed up");
     }
 
-    let backup_path = backup_database(&db_path, &out_dir).await?;
+    let out_store = CandleStore::with_base_dir(out_dir.to_path_buf());
 
-    // The snapshots: copy every snapshot not already present into
-    // `<out-dir>/candles/` (one shared store; snapshots are immutable).
-    let out_store = CandleStore::with_base_dir(out_dir.clone());
-    let mut copied = 0usize;
+    let backup_path = backup_database(db_path, out_dir).await?;
+    let copied = copy_missing_snapshots(&out_store, &snapshots, &backup_path)?;
+    Ok(BackupOutcome {
+        path: backup_path,
+        snapshots_copied: copied,
+        snapshots_total: snapshots.len(),
+    })
+}
+
+/// Copy every snapshot the store is missing into `<out-dir>/candles/` (one
+/// shared store), returning how many were added. A failure deletes the partial
+/// database file and every snapshot this call added, so no half backup
+/// survives.
+fn copy_missing_snapshots(
+    out_store: &CandleStore,
+    snapshots: &[SourceSnapshot],
+    backup_path: &Path,
+) -> anyhow::Result<usize> {
     let mut added: Vec<PathBuf> = Vec::new();
-    for snap in &snapshots {
-        let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
-        if dest.exists() {
-            continue;
+    let copied = (|| -> anyhow::Result<usize> {
+        let mut copied = 0usize;
+        for snap in snapshots {
+            let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
+            if dest.exists() {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
+            }
+            fs::copy(&snap.path, &dest).map_err(|e| {
+                anyhow!(
+                    "copy snapshot {} -> {}: {e}",
+                    snap.path.display(),
+                    dest.display()
+                )
+            })?;
+            added.push(dest);
+            copied += 1;
         }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
-        }
-        if let Err(e) = fs::copy(&snap.path, &dest) {
-            let _ = fs::remove_file(&backup_path);
+        Ok(copied)
+    })();
+    match copied {
+        Ok(copied) => Ok(copied),
+        Err(error) => {
+            let _ = fs::remove_file(backup_path);
             for path in &added {
                 let _ = fs::remove_file(path);
             }
-            return Err(anyhow!(
-                "copy snapshot {} -> {}: {e}",
-                snap.path.display(),
-                dest.display()
-            ));
+            Err(error)
         }
-        added.push(dest);
-        copied += 1;
     }
-
-    let kept = prune_backups(&out_dir, args.keep)?;
-    let size = fs::metadata(&backup_path)
-        .map(|m| m.len())
-        .map_err(|e| anyhow!("stat {}: {e}", backup_path.display()))?;
-    println!(
-        "pulse backup: {} ({} bytes); snapshots copied {copied} (store {}); backups kept {kept}",
-        backup_path.display(),
-        size,
-        snapshots.len()
-    );
-    Ok(())
 }
 
-/// The one online-copy primitive — shared by `pulse backup`, import's
-/// `--replace` safety backup and restore's `--replace` safety backup. Writes
-/// a `.partial` file, then renames it to its `pulse-<stamp>.db` name; on any
-/// error the partial file is deleted.
+/// The database-only online-copy primitive. Writes a `.partial` file, then
+/// renames it to its `pulse-<stamp>.db` name; on any error the partial file is
+/// deleted. Callers that need the FULL backup — the one restore can consume —
+/// use [`backup_target`], which adds the snapshot store to this copy.
 ///
 /// # Errors
 ///
