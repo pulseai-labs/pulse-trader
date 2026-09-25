@@ -1004,7 +1004,8 @@ async fn no_token_or_credential_material_appears_in_any_output() {
     let target_data = s.dir.path().join("server-data");
 
     let import = combined(&import_once(&s, &target_db, &target_data));
-    let backup = combined(&run_pulse(
+    let backups_dir = s.dir.path().join("backups");
+    let backup_out = run_pulse(
         &s.home,
         &[
             "backup",
@@ -1013,29 +1014,44 @@ async fn no_token_or_credential_material_appears_in_any_output() {
             "--data-dir",
             target_data.to_str().unwrap(),
             "--out-dir",
-            s.dir.path().join("backups").to_str().unwrap(),
+            backups_dir.to_str().unwrap(),
         ],
-    ));
+    );
+    let backup = combined(&backup_out);
+    assert!(
+        backup_out.status.success(),
+        "the backup must succeed: {backup}"
+    );
+    // The file the command ACTUALLY wrote: `pulse backup` names every backup
+    // `pulse-<stamp>.db` and never writes a `pulse-latest.db`. Restoring the
+    // written name is what makes the restore below run for real instead of
+    // failing on a missing file and asserting only that error text.
+    let written = backup_db_files(&backups_dir);
+    assert_eq!(
+        written.len(),
+        1,
+        "pulse backup wrote exactly one database: {written:?}"
+    );
     let target2 = s.dir.path().join("restored").join("pulse.db");
     let data2 = s.dir.path().join("restored-data");
-    let restore = combined(&run_pulse(
+    let restore_out = run_pulse(
         &s.home,
         &[
             "restore",
-            s.dir
-                .path()
-                .join("backups")
-                .join("pulse-latest.db")
-                .to_str()
-                .unwrap(),
+            written[0].to_str().unwrap(),
             "--backup-dir",
-            s.dir.path().join("backups").to_str().unwrap(),
+            backups_dir.to_str().unwrap(),
             "--db",
             target2.to_str().unwrap(),
             "--data-dir",
             data2.to_str().unwrap(),
         ],
-    ));
+    );
+    let restore = combined(&restore_out);
+    assert!(
+        restore_out.status.success(),
+        "the restore must SUCCEED — it is the path this test examines: {restore}"
+    );
 
     for (label, text) in [
         ("import", &import),
@@ -1063,6 +1079,19 @@ async fn no_token_or_credential_material_appears_in_any_output() {
         .await
         .unwrap();
     assert_eq!(tokens, 1, "the hashed client_token row was copied");
+
+    // And the restore that ran for real carried that row: the stored hash, never
+    // the plaintext (the three output assertions above cover the restored run's
+    // text; this covers the restored FILE).
+    let restored = Db::with_path(&target2).await.unwrap();
+    let restored_hash: String = sqlx::query_scalar("SELECT token_sha256 FROM client_token")
+        .fetch_one(restored.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_hash, s.token_hash,
+        "the restored database carries the stored hash"
+    );
 }
 
 // ---------------------------------------------------------------------------
