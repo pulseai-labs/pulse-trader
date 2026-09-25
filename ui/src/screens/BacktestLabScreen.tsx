@@ -201,6 +201,126 @@ function useWalkForward(operations: ActiveOperations, versionId: string | null) 
 }
 
 // ---------------------------------------------------------------------------
+// The persisted walk-forward run (#268) — the version's catalogue pointer
+// ---------------------------------------------------------------------------
+//
+// r3.s3's d29: a walk-forward run FINISHES on the server while the client is
+// away, and on relaunch its six fold rows and its verdict must still be on
+// screen — the run that was STARTED, not a restarted one. The server keeps the
+// run, the catalogue the Lab already reads carries the answer to "which run"
+// (`LibraryVersion.latestWalkForwardRunId`), and `getWalkForwardRun` reads that
+// run back in the SAME DTO `runWalkForwardVersion` answers with. So the Lab
+// renders a persisted run through the same `WalkForwardResult` the fresh path
+// uses, and starts nothing.
+
+/** The persisted read, in the pane's own four shapes. */
+type ReopenedState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "failed"; error: BusError }
+  | { kind: "done"; dto: WalkForwardRunDto };
+
+/** The read's own operational failure — the shape every other IPC failure uses. */
+function readFailure(): BusError {
+  return {
+    code: "internal",
+    message: "The walk-forward read failed.",
+    run_id: null, session_id: null, child_run_id: null,
+  };
+}
+
+/**
+ * Read the version's persisted walk-forward run, when this session holds no
+ * walk-forward operation for it.
+ *
+ * **The record wins (#268).** The record lookup in `target` is what keeps this
+ * read from ever standing in front of the run the trader asked for: a version
+ * that has walked forward this session — running or settled, success or failure
+ * — has a record, so it is never read for and never re-read. A version whose
+ * catalogue row carries no pointer is never read for either, and renders no
+ * pane at all.
+ *
+ * It is a READ: nothing here calls `runWalkForwardVersion`, so a reopened run
+ * can never restart the K engine runs behind it. `alive` drops a response for a
+ * version the trader has moved away from, so a late answer cannot land on the
+ * new selection's pane — the same rule `CompareWithParent` reads its parent by.
+ */
+function useReopenedWalkForward(
+  operations: ActiveOperations,
+  version: LibraryVersion | null,
+): ReopenedState {
+  const target =
+    version !== null && operations.lookup(walkForwardKey(version.id)) === undefined
+      ? version.latestWalkForwardRunId
+      : null;
+  const [state, setState] = useState<ReopenedState>({ kind: "idle" });
+
+  useEffect(() => {
+    if (target === null) {
+      setState({ kind: "idle" });
+      return;
+    }
+    let alive = true;
+    const settle = (next: ReopenedState) => {
+      if (alive) setState(next);
+    };
+    setState({ kind: "loading" });
+    try {
+      commands
+        .getWalkForwardRun({ walkForwardRunId: target })
+        .then((result) => {
+          settle(
+            result.status === "ok"
+              ? { kind: "done", dto: result.data }
+              : { kind: "failed", error: result.error },
+          );
+        })
+        .catch(() => {
+          // The IPC call itself failing — the honest error state, never a
+          // fabricated pane (the Library's read answers the same way).
+          settle({ kind: "failed", error: readFailure() });
+        });
+    } catch {
+      // A binding that is not wired throws BEFORE returning a promise, the same
+      // path the operation store guards.
+      settle({ kind: "failed", error: readFailure() });
+    }
+    return () => {
+      alive = false;
+    };
+    // `target` is the whole dependency: the same id is never read twice, and a
+    // focus refetch handing the screen a fresh version OBJECT does not re-read.
+  }, [target]);
+
+  return state;
+}
+
+/** The pane's state: this session's own operation, or the persisted read behind
+ * it. `reopened` marks the result as a run that was READ, not produced here. */
+type PaneState =
+  | { kind: "idle" }
+  | { kind: "running" }
+  | { kind: "reopening" }
+  | { kind: "failed"; error: BusError; reopened?: boolean }
+  | { kind: "done"; dto: WalkForwardRunDto; reopened?: boolean };
+
+/** The record wins wherever it exists; the persisted read answers only where no
+ * record does (#268). */
+function paneStateOf(record: WalkForwardState, reopened: ReopenedState): PaneState {
+  if (record.kind === "running") return { kind: "running" };
+  if (record.kind === "failed") return { kind: "failed", error: record.error };
+  if (record.kind === "done") return { kind: "done", dto: record.dto };
+  if (reopened.kind === "loading") return { kind: "reopening" };
+  if (reopened.kind === "failed") {
+    return { kind: "failed", error: reopened.error, reopened: true };
+  }
+  if (reopened.kind === "done") {
+    return { kind: "done", dto: reopened.dto, reopened: true };
+  }
+  return { kind: "idle" };
+}
+
+// ---------------------------------------------------------------------------
 // Coach rail state (r1.s4.w3) — opt-in, beneath the selected persisted run
 // ---------------------------------------------------------------------------
 
@@ -446,7 +566,7 @@ export default function BacktestLabScreen() {
    * a walk-forward is K engine runs, so it holds Run's latch discipline. */
   const busy = run.kind === "running" || wf.state.kind === "running";
 
-  /** The selected version's own record — the compare section needs its
+  /** This version's own record — the compare section needs its
    * `parentId` and `recentRuns`, which the selector's flattened options drop. */
   const selectedVersion =
     catalog.kind === "ready"
@@ -454,6 +574,11 @@ export default function BacktestLabScreen() {
           .flatMap((strategy) => strategy.versions)
           .find((version) => version.id === currentId) ?? null)
       : null;
+
+  /** #268: the version's persisted walk-forward run, read when this session has
+   * no record of its own — what makes a finished run openable after a relaunch. */
+  const reopened = useReopenedWalkForward(operations, selectedVersion);
+  const pane = paneStateOf(wf.state, reopened);
 
   /** Selecting a version shows THAT version's operation. Nothing is cleared and
    * nothing is cancelled: each version's record is its own, so a run still going
@@ -661,8 +786,10 @@ export default function BacktestLabScreen() {
         )}
 
       {/* r2.s3.w5: the walk-forward result pane sits ABOVE the run result —
-          a fold row's "open run" lands in the ordinary result view below it. */}
-      <WalkForwardPane state={wf.state} onOpenFold={wf.openFold} />
+          a fold row's "open run" lands in the ordinary result view below it.
+          #268: it renders this session's own run, or the version's persisted
+          one read back by id. */}
+      <WalkForwardPane state={pane} onOpenFold={wf.openFold} />
 
       {run.kind === "running" && (
         <div className="bt-state dim" role="status">
@@ -723,18 +850,27 @@ export default function BacktestLabScreen() {
 // numbers, and the verdict words are the recorded tallies. The pane computes
 // no verdict of its own.
 
-/** The pane's three visible states — idle renders nothing at all. */
+/** The pane's visible states — idle renders nothing at all. `reopening` is the
+ * persisted read's own in-flight state, never the run's. */
 function WalkForwardPane({
   state,
   onOpenFold,
 }: {
-  state: WalkForwardState;
+  state: PaneState;
   onOpenFold: (runId: string) => void;
 }) {
   if (state.kind === "running") {
     return (
       <div className="bt-state dim" role="status">
         Running the walk-forward…
+      </div>
+    );
+  }
+  if (state.kind === "reopening") {
+    // A read, not a run: the wording may not claim an engine is working.
+    return (
+      <div className="bt-state dim" role="status">
+        Opening the persisted walk-forward run…
       </div>
     );
   }
@@ -751,7 +887,19 @@ function WalkForwardPane({
     );
   }
   if (state.kind === "done") {
-    return <WalkForwardResult dto={state.dto} onOpenFold={onOpenFold} />;
+    return (
+      <>
+        {/* #268: a run READ off the server is provenance the fresh path cannot
+            have — say which it is, so no one reads this pane as work they just
+            started. The result below is the same component either way. */}
+        {state.reopened === true && (
+          <p className="bt-wf-origin dim">
+            Persisted run, reopened by id — nothing was re-run.
+          </p>
+        )}
+        <WalkForwardResult dto={state.dto} onOpenFold={onOpenFold} />
+      </>
+    );
   }
   return null;
 }

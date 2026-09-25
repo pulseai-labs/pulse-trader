@@ -31,6 +31,8 @@ vi.mock("../bindings", () => ({
     // r2.s3.w5: the walk-forward gate and the fold-run read, same terms.
     runWalkForwardVersion: vi.fn(),
     getBacktestRun: vi.fn(),
+    // #268: the persisted walk-forward run's own read, same terms again.
+    getWalkForwardRun: vi.fn(),
   },
 }));
 
@@ -46,6 +48,7 @@ import type {
   LibraryRunSummary,
   LibraryVersion,
   SummaryDto,
+  WalkForwardFoldDto,
   WalkForwardRunDto,
 } from "../bindings";
 import BacktestLabScreen from "./BacktestLabScreen";
@@ -57,6 +60,7 @@ const runMock = vi.mocked(commands.runBacktestVersion);
 const compareMock = vi.mocked(commands.compareChildRun);
 const walkForwardMock = vi.mocked(commands.runWalkForwardVersion);
 const getRunMock = vi.mocked(commands.getBacktestRun);
+const reopenMock = vi.mocked(commands.getWalkForwardRun);
 
 // ---------------------------------------------------------------------------
 // Fixtures — shaped exactly like the generated types, values chosen to be
@@ -283,6 +287,7 @@ beforeEach(() => {
   compareMock.mockReset();
   walkForwardMock.mockReset();
   getRunMock.mockReset();
+  reopenMock.mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -1423,6 +1428,13 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     };
     catalogMock.mockResolvedValue({ status: "ok", data: foldHeaded });
     compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
+    // #268: this version carries a walk-forward pointer, so selecting it ALSO
+    // reopens that persisted run. Answered here so the claim under test stays
+    // the compare read's own — which run id it names.
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, walkForwardRunId: "wf-1", versionId: "v-alpha-2" },
+    });
     render(<BacktestLabScreen />);
 
     fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
@@ -1782,5 +1794,258 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
 
     expect(container.querySelector(".bt-walkforward")).toBeNull();
     expect(screen.queryByText("wf-44aa19c2")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #268 — reopening a FINISHED walk-forward run (r3.s3 d29)
+// ---------------------------------------------------------------------------
+//
+// d29's outcome, verbatim: "the run finished on the server while the Mac slept:
+// all six fold rows and the verdict are shown on the run that was started, not
+// a restarted one". The server keeps the run, the version's catalogue row
+// carries `latestWalkForwardRunId`, and `getWalkForwardRun` reads that run back
+// in the SAME DTO `runWalkForwardVersion` answers with — so the Lab renders a
+// run it never started, through the same `WalkForwardResult`, and starts
+// nothing.
+//
+// These fixtures use the REAL pinned names (`rolling-oos/v1`, `wf-v1`) and the
+// backend's default six folds, because that is the shape d29's walk reads off
+// the screen. The verdict is a FAIL (`3/4` folds holding) — an uncertified run,
+// exactly the state #268 was walked in.
+
+/** One distinct window and tally per fold, so a row can only pass on its OWN
+ * fold's numbers. Fold 3 has no lower bound — the em-dash path. */
+const REOPENED_FOLDS: WalkForwardFoldDto[] = [
+  {
+    index: 0, windowFrom: "2026-07-01T00:00:00.000Z", windowTo: "2026-07-02T00:00:00.000Z",
+    backtestRunId: "run-fold-reopen-0", n: 3, meanR: "0.410", lowerBound: -0.4,
+    holds: true, trades: 3, expectancy: "0.410", winRate: "0.667",
+  },
+  {
+    index: 1, windowFrom: "2026-07-02T00:00:00.000Z", windowTo: "2026-07-03T00:00:00.000Z",
+    backtestRunId: "run-fold-reopen-1", n: 2, meanR: "-0.510", lowerBound: -0.72,
+    holds: false, trades: 2, expectancy: "-0.510", winRate: "0.500",
+  },
+  {
+    index: 2, windowFrom: "2026-07-03T00:00:00.000Z", windowTo: "2026-07-04T00:00:00.000Z",
+    backtestRunId: "run-fold-reopen-2", n: 4, meanR: "0.620", lowerBound: 0.16,
+    holds: true, trades: 4, expectancy: "0.620", winRate: "0.750",
+  },
+  {
+    index: 3, windowFrom: "2026-07-04T00:00:00.000Z", windowTo: "2026-07-05T00:00:00.000Z",
+    backtestRunId: "run-fold-reopen-3", n: 1, meanR: "-1.230", lowerBound: null,
+    holds: false, trades: 1, expectancy: "-1.230", winRate: "0.000",
+  },
+  {
+    index: 4, windowFrom: "2026-07-05T00:00:00.000Z", windowTo: "2026-07-06T00:00:00.000Z",
+    backtestRunId: "run-fold-reopen-4", n: 5, meanR: "0.330", lowerBound: 0.05,
+    holds: true, trades: 5, expectancy: "0.330", winRate: "0.600",
+  },
+  {
+    index: 5, windowFrom: "2026-07-06T00:00:00.000Z", windowTo: "2026-07-07T00:00:00.000Z",
+    backtestRunId: "run-fold-reopen-5", n: 6, meanR: "-0.070", lowerBound: -0.11,
+    holds: false, trades: 6, expectancy: "-0.070", winRate: "0.500",
+  },
+];
+
+/** The persisted run as the server answers it: six folds, a FAIL verdict. */
+const REOPENED_DTO: WalkForwardRunDto = {
+  walkForwardRunId: "wf-6c1d9f38",
+  versionId: "v-alpha-1",
+  scheme: "rolling-oos/v1",
+  k: 6,
+  rule: "wf-v1",
+  spanFrom: "2026-07-01T00:00:00.000Z",
+  spanTo: "2026-07-07T00:00:00.000Z",
+  fromDefaulted: true,
+  engineFingerprint: "sha256:reopened9",
+  verdict: {
+    pass: false,
+    foldsHolding: 3,
+    foldsRequired: 4,
+    pooled: { n: 21, meanR: "-0.120", lowerBound: -0.4321, holds: false },
+  },
+  folds: REOPENED_FOLDS,
+};
+
+/** A second version's own persisted run — the per-version keying's evidence. */
+const OTHER_WF_DTO: WalkForwardRunDto = {
+  ...REOPENED_DTO,
+  walkForwardRunId: "wf-9a8b7c6d",
+  versionId: "v-alpha-2",
+};
+
+/** The run a live Walk forward click answers with in the precedence test. */
+const FRESH_WF_DTO: WalkForwardRunDto = {
+  ...REOPENED_DTO,
+  walkForwardRunId: "wf-fresh-1a2b3c4d",
+};
+
+/** The d29 shape: a version whose catalogue row ALREADY points at a run the
+ * server finished while the client was away — `uncertified · <run id>`, exactly
+ * as the Library renders it. */
+function reopenableCatalog(
+  alphaLatest: string | null,
+  secondLatest: string | null,
+): LibraryOverview {
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          { ...catalogVersion("v-alpha-1", null), latestWalkForwardRunId: alphaLatest },
+          { ...catalogVersion("v-alpha-2", "v-alpha-1"), latestWalkForwardRunId: secondLatest },
+        ],
+      },
+      {
+        id: "strat-beta",
+        name: "Beta Break",
+        createdAt: "2026-08-10T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [catalogVersion("v-beta-1", null)],
+      },
+    ],
+  };
+}
+
+describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", () => {
+  it("reopens the version's persisted run by id: one getWalkForwardRun call, the whole view, nothing re-run", async () => {
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", null),
+    });
+    reopenMock.mockResolvedValue({ status: "ok", data: REOPENED_DTO });
+
+    const { container } = render(<BacktestLabScreen />);
+
+    // The run id is on screen — the d29 walker ties the view to the run that was
+    // STARTED, and this read is what put it there.
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    expect(reopenMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+    // A READ: neither the walk-forward command nor the backtest command runs.
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+
+    const pane = container.querySelector(".bt-walkforward") as HTMLElement;
+    expect(pane).not.toBeNull();
+    const text = pane.textContent ?? "";
+    // The naming scheme, the rule, the span and the verdict — the DTO's own.
+    expect(text).toContain("rolling-oos/v1");
+    expect(text).toContain("wf-v1");
+    expect(text).toContain("2026-07-01T00:00:00.000Z");
+    expect(text).toContain("2026-07-07T00:00:00.000Z");
+    expect(text).toContain("wf-6c1d9f38");
+    expect(text).toContain("FAIL");
+    expect(text).toContain("3/4");
+    expect(text).toContain("-0.4321");
+    // The pane says WHERE this run came from — and says it OUTSIDE the result
+    // section, which is the same component on both paths.
+    expect(container.querySelector(".bt-wf-origin")?.textContent).toContain("reopened by id");
+
+    // All SIX fold rows: window, trades, lower bound and holds, per row.
+    const region = within(container).getByRole("region", { name: /fold rows/i });
+    const rows = Array.from(region.querySelectorAll("tbody tr"));
+    expect(rows).toHaveLength(6);
+    REOPENED_FOLDS.forEach((fold, index) => {
+      const row = rows[index].textContent ?? "";
+      expect(row).toContain(fold.windowFrom);
+      expect(row).toContain(fold.windowTo);
+      expect(row).toContain(String(fold.trades));
+      expect(row).toContain(fold.holds ? "yes" : "no");
+      expect(row).toContain(fold.lowerBound === null ? "—" : String(fold.lowerBound));
+    });
+  });
+
+  it("lets this session's own run win: a fresh result stays, and the persisted read is never consulted again", async () => {
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", null),
+    });
+    reopenMock.mockResolvedValue({ status: "ok", data: REOPENED_DTO });
+
+    const { container } = render(<BacktestLabScreen />);
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+
+    // Now the trader runs it themselves: the fresh DTO is what the pane shows.
+    walkForwardMock.mockResolvedValue({ status: "ok", data: FRESH_WF_DTO });
+    fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
+    await screen.findByText("wf-fresh-1a2b3c4d");
+
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+    const pane = container.querySelector(".bt-walkforward") as HTMLElement;
+    expect(pane.textContent).toContain("wf-fresh-1a2b3c4d");
+    // A run this session produced carries no reopen marker, and the read behind
+    // it is not re-fired.
+    expect(container.querySelector(".bt-wf-origin")).toBeNull();
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("follows the selection: each version's own pointer is read, and a version with no persisted run shows no pane", async () => {
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", "wf-9a8b7c6d"),
+    });
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-6c1d9f38"
+        ? { status: "ok" as const, data: REOPENED_DTO }
+        : { status: "ok" as const, data: OTHER_WF_DTO },
+    );
+
+    const { container } = render(<BacktestLabScreen />);
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenLastCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+
+    // v-alpha-2 carries a DIFFERENT persisted run — the pane follows the
+    // selection, and the previous version's run id goes with it.
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await screen.findByText("wf-9a8b7c6d");
+    expect(reopenMock).toHaveBeenLastCalledWith({ walkForwardRunId: "wf-9a8b7c6d" });
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+
+    // v-beta-1 has no walk-forward run at all: no read, and no pane to fill.
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await waitFor(() => {
+      expect(container.querySelector(".bt-walkforward")).toBeNull();
+    });
+    expect(reopenMock).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText("wf-9a8b7c6d")).toBeNull();
+  });
+
+  it("renders a failed reopen as its own error state — never the previous version's pane", async () => {
+    const notFound: BusError = {
+      code: "not_found",
+      message: "no walk-forward run wf-gone-00000000",
+      run_id: null, session_id: null, child_run_id: null,
+    };
+    catalogMock.mockResolvedValue({
+      status: "ok",
+      data: reopenableCatalog("wf-6c1d9f38", "wf-gone-00000000"),
+    });
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-6c1d9f38"
+        ? { status: "ok" as const, data: REOPENED_DTO }
+        : { status: "error" as const, error: notFound },
+    );
+
+    const { container } = render(<BacktestLabScreen />);
+    await screen.findByText("wf-6c1d9f38");
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+
+    // The backend's own typed refusal, rendered like every other failure card.
+    const failure = (await screen.findAllByRole("alert")).find((alert) =>
+      alert.textContent?.includes(notFound.message),
+    );
+    expect(failure?.textContent).toContain("not_found");
+    // And the last good table is GONE: a failed read never wears the previous
+    // version's pane.
+    expect(container.querySelector(".bt-walkforward")).toBeNull();
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
   });
 });

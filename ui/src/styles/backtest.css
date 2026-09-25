@@ -171,6 +171,14 @@
   background: var(--bg-raised);
 }
 
+/* #268: the reopened-run marker. A read is not a run — the pane says which one
+   it is showing, above the result and outside it (the result view itself is the
+   same component on both paths). `.dim` carries the colour. */
+.bt-wf-origin {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-12);
+}
+
 .bt-wf-verdict {
   margin: 0;
   display: flex;
