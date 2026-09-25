@@ -141,8 +141,11 @@ deploy tag:
     (cd "$SRC" && cargo build --release --bin pulse)
     mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.config/systemd/user"
     install -m 0755 "$SRC/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
-    install -m 0644 deploy/pulse-serve.service deploy/pulse-backup.service \
-        deploy/pulse-backup.timer "$HOME/.config/systemd/user/"
+    # The THREE UNITS come from the tag too, like the binary above: installing
+    # the caller's working-tree units beside a tagged binary is a mixed release
+    # (and a rollback to an old tag would install new units).
+    install -m 0644 "$SRC/deploy/pulse-serve.service" "$SRC/deploy/pulse-backup.service" \
+        "$SRC/deploy/pulse-backup.timer" "$HOME/.config/systemd/user/"
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user daemon-reload
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable --now pulse-backup.timer
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable pulse-serve.service
