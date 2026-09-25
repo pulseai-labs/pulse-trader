@@ -95,11 +95,26 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// a timeout's.
 const SSE_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// The shared HTTP client: a bounded connect, and nothing client-wide (see
-/// [`REQUEST_TIMEOUT`] for why the request deadline is per request).
-fn http_client() -> reqwest::Client {
+/// The shared HTTP client: a bounded connect, NO system proxy, and nothing else
+/// client-wide (see [`REQUEST_TIMEOUT`] for why the request deadline is per
+/// request).
+///
+/// `no_proxy` is a SECURITY requirement, not a preference (r3.s3.w5 review round
+/// 6). The server's documented URLs are plain `http://` on the tailnet, and
+/// every request here carries `Authorization: Bearer <app token>`: with
+/// reqwest's default behaviour a configured `HTTP_PROXY`/`HTTPS_PROXY` receives
+/// those requests — and the bearer header with them — so the app token would
+/// leave the tailnet through whatever proxy the machine happens to have set.
+/// This client talks to ONE private server, so there is never a proxy to honour;
+/// every surface that reaches the server rides this ONE constructor — the app's
+/// [`ServerClient`], the `pulse mcp login` handshake AND its `/mcp` probe
+/// (`src/cli/mcp.rs`), and the MCP relay's own client (which has the same
+/// `no_proxy` builder in `src/mcp/relay.rs`, its module boundary keeping the
+/// SDK off this path).
+pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .no_proxy()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

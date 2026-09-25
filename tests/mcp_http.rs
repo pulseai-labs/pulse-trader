@@ -283,6 +283,113 @@ async fn login_verifies_the_token_and_writes_the_connection_file() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Fix B (round 6) — no system proxy on the private-server clients
+// ---------------------------------------------------------------------------
+
+/// Fix B (round 6): `pulse mcp login` must not honour a system proxy either.
+/// Both halves of it — the handshake and the `/mcp` probe — carry
+/// `Authorization: Bearer <agent token>` to a plain-`http://` tailnet address,
+/// so a machine with `HTTP_PROXY`/`HTTPS_PROXY` set would hand the token to
+/// whatever proxy they name. The proxy travels through the CHILD's own
+/// environment, so this assertion does not depend on this process's variables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_ignores_a_system_proxy() {
+    let server = spawn_server(support::server::ServerOptions::default()).await;
+    let proxy = RecordingProxy::start();
+    let config_dir = tempfile::TempDir::new().expect("tempdir");
+
+    let mut login = std::process::Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args(["mcp", "login", "--server", &server.base])
+        .env("PULSE_CONFIG_DIR", config_dir.path())
+        .env("HTTP_PROXY", &proxy.url)
+        .env("HTTPS_PROXY", &proxy.url)
+        // A `NO_PROXY` inherited from the caller would mask the leak this test
+        // exists to catch.
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn pulse mcp login");
+    login
+        .stdin
+        .take()
+        .expect("login stdin")
+        .write_all(format!("{}\n", server.agent_token).as_bytes())
+        .expect("write the token");
+    let out = login.wait_with_output().expect("login completes");
+
+    // The security assertion FIRST: a proxy-honouring client would have sent its
+    // request — `Authorization: Bearer …` and all — to this stub.
+    assert!(
+        proxy.requests().is_empty(),
+        "the proxy must never see a login request: {:?}",
+        proxy.requests()
+    );
+    assert!(
+        out.status.success(),
+        "login still succeeds with a proxy configured: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        config_dir.path().join("mcp-connection.toml").exists(),
+        "and the connection file still lands"
+    );
+}
+
+/// A loopback listener that records every request it is sent and answers `200`
+/// with an empty JSON body: a SYSTEM-PROXY stub. With reqwest's default
+/// behaviour a client that honours `HTTP_PROXY`/`HTTPS_PROXY` sends its request
+/// HERE, so a recorded request is the leak this suite asserts against.
+struct RecordingProxy {
+    url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingProxy {
+    fn start() -> Self {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy stub");
+        let url = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("proxy stub addr").port()
+        );
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let captured = std::sync::Arc::clone(&captured);
+                std::thread::spawn(move || {
+                    // The request LINE is what proves the proxy was reached, and
+                    // it arrives in the first packet.
+                    let mut chunk = [0u8; 4096];
+                    let Ok(read) = stream.read(&mut chunk) else {
+                        return;
+                    };
+                    captured
+                        .lock()
+                        .expect("proxy stub lock")
+                        .push(String::from_utf8_lossy(&chunk[..read]).into_owned());
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 2\r\nconnection: close\r\n\r\n{}",
+                    );
+                });
+            }
+        });
+        Self { url, seen }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.seen.lock().expect("proxy stub lock").clone()
+    }
+}
+
 /// With no login and no `--local`, the relay refuses with the spec's literal
 /// line on stderr (spec ~199) — the operator's next action, verbatim.
 #[tokio::test]

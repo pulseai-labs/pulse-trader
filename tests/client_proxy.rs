@@ -306,6 +306,62 @@ async fn an_operation_stream_forwards_events_into_a_real_channel_and_returns_the
 // (viii) — resume across a dropped SSE connection, over the raw wire
 // ---------------------------------------------------------------------------
 
+/// A recording stub for the PROXY tests: it accepts whatever is sent to it,
+/// records each request head and answers 200. A client that honours a system
+/// proxy sends its request HERE — and the head carries the target's absolute
+/// URI together with the `Authorization` header — so "the stub recorded
+/// nothing" is exactly the property being pinned.
+struct RecordingProxy {
+    url: String,
+    seen: Arc<Mutex<Vec<String>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingProxy {
+    fn start() -> Self {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        // Bound SYNCHRONOUSLY, so `start` can hand back a URL the caller can
+        // point `HTTP_PROXY` at without awaiting anything (a `blocking_recv`
+        // here would panic: the caller is a runtime thread).
+        let bound = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy stub");
+        let port = bound.local_addr().expect("proxy stub addr").port();
+        bound
+            .set_nonblocking(true)
+            .expect("the stub listener is non-blocking");
+        let task = tokio::spawn(async move {
+            let listener =
+                tokio::net::TcpListener::from_std(bound).expect("adopt the stub listener");
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let captured = Arc::clone(&captured);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt as _;
+                    let (head, _) = read_request(&mut stream).await;
+                    captured.lock().expect("proxy stub lock").push(head);
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                              content-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await;
+                });
+            }
+        });
+        Self {
+            url: format!("http://127.0.0.1:{port}"),
+            seen,
+            _task: task,
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.seen.lock().expect("proxy stub lock").clone()
+    }
+}
+
 /// Minimal HTTP plumbing for the wire stubs below: read one request
 /// (head + Content-Length body) off a fresh TCP stream.
 async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<String>) {
@@ -897,6 +953,64 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
     // SAFETY: see above — single-test process isolation.
     unsafe {
         std::env::remove_var("PULSE_CONFIG_DIR");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 6, Fix B — a configured system proxy must never see a bearer request
+// ---------------------------------------------------------------------------
+
+/// The server's documented URLs are plain `http://` on the tailnet and every
+/// request carries `Authorization: Bearer <app token>`: with reqwest's default
+/// behaviour a configured `HTTP_PROXY`/`HTTPS_PROXY` is handed those requests —
+/// and the token with them — so the app token would leave the tailnet. The
+/// client disables proxies explicitly; this is the test that says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configured_system_proxy_never_sees_a_bearer_request() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let proxy = RecordingProxy::start();
+    // SAFETY: nextest runs every test in its own process — no other thread
+    // reads the environment while this runs.
+    unsafe {
+        std::env::set_var("HTTP_PROXY", &proxy.url);
+        std::env::set_var("HTTPS_PROXY", &proxy.url);
+    }
+
+    // (1) A target only a proxy could answer: nothing routes to TEST-NET-1, so
+    // any answer at all would have come through the proxy.
+    let outcome = ServerClient::connect("http://192.0.2.1:9", "pt_never_sent_anywhere").await;
+    assert!(
+        outcome.is_err(),
+        "an unroutable target must fail rather than be answered by a proxy: {}",
+        match &outcome {
+            Ok(_) => "the request was ANSWERED".to_owned(),
+            Err(error) => format!("{error}"),
+        }
+    );
+    assert!(
+        proxy.requests().is_empty(),
+        "the proxy must never see a bearer request: {:?}",
+        proxy.requests()
+    );
+
+    // (2) And the documented path still works with the proxy configured.
+    let (_, outcome) = ServerClient::connect(&server.base, &server.app_token)
+        .await
+        .expect("the tailnet path still connects");
+    assert!(
+        matches!(outcome, ConnectOutcome::Connected { .. }),
+        "the tailnet path still connects: {outcome:?}"
+    );
+    assert!(
+        proxy.requests().is_empty(),
+        "and the proxy saw nothing of it either: {:?}",
+        proxy.requests()
+    );
+
+    // SAFETY: see above — single-test process isolation.
+    unsafe {
+        std::env::remove_var("HTTP_PROXY");
+        std::env::remove_var("HTTPS_PROXY");
     }
 }
 

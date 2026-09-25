@@ -191,7 +191,11 @@ async fn login(server: &str) -> anyhow::Result<()> {
 
     // The MCP probe: one real `initialize` against `/mcp` with THIS token, so
     // `login` proves the token is agent-scoped before it is persisted. The
-    // probe rides the streamable-HTTP shape the relay itself will speak.
+    // probe rides the streamable-HTTP shape the relay itself will speak — and
+    // the shared `no_proxy` constructor (`crate::client::http_client`), for the
+    // same reason the handshake does: this URL is plain `http://` on the
+    // tailnet, so a configured `HTTP_PROXY`/`HTTPS_PROXY` would receive the
+    // `Authorization: Bearer` header and carry the token off it.
     eprintln!("pulse mcp login: probing {base}/mcp…");
     let probe = serde_json::json!({
         "jsonrpc": "2.0",
@@ -203,7 +207,7 @@ async fn login(server: &str) -> anyhow::Result<()> {
             "clientInfo": { "name": "pulse-mcp-login", "version": env!("CARGO_PKG_VERSION") }
         }
     });
-    let response = reqwest::Client::new()
+    let response = crate::client::http_client()
         .post(format!("{base}/mcp"))
         .bearer_auth(&token)
         .header("content-type", "application/json")

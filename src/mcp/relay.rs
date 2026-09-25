@@ -146,12 +146,19 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// The relay's HTTP client: a bounded connect, and no client-wide request
-/// deadline (a POST carries [`POST_TIMEOUT`], the GET stream only its attach —
-/// see those constants for why).
+/// The relay's HTTP client: a bounded connect, NO system proxy, and no
+/// client-wide request deadline (a POST carries [`POST_TIMEOUT`], the GET stream
+/// only its attach — see those constants for why).
+///
+/// `no_proxy` is a SECURITY requirement (r3.s3.w5 review round 6): every relayed
+/// message carries `Authorization: Bearer <agent token>` to a plain-`http://`
+/// tailnet address, so a configured `HTTP_PROXY`/`HTTPS_PROXY` would receive the
+/// token itself. The bridge talks to ONE private server; there is never a proxy
+/// to honour.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .no_proxy()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -878,6 +885,81 @@ mod tests {
             vec!["{\"n\":1}\n".to_owned(), "{\"n\":2}\n".to_owned()],
             "two LF frames, in order"
         );
+    }
+
+    /// Fix B (round 6): the relay's client must not honour a system proxy
+    /// either — every relayed message carries the agent's bearer token to a
+    /// plain-`http://` tailnet address, so a proxy would receive the token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_client_ignores_a_system_proxy() {
+        // A recording PROXY: with reqwest's default behaviour this listener
+        // receives the relay's requests, `Authorization: Bearer …` and all.
+        let proxy = Sink::start(|_request, _index| Answer::Json {
+            session_id: None,
+            body: "{}".to_owned(),
+        });
+        // SAFETY: nextest runs every test in its own process — no other thread
+        // reads the environment while this runs.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", &proxy.base);
+            std::env::set_var("HTTPS_PROXY", &proxy.base);
+        }
+
+        // (1) TEST-NET-1: nothing routes there, so a proxy is the ONLY thing
+        // that could answer this at all.
+        let result = http_client().get("http://192.0.2.1:9/mcp").send().await;
+        assert!(result.is_err(), "no proxy, no answer: {result:?}");
+        assert!(
+            proxy.requests().is_empty(),
+            "the proxy must never see a relayed request: {:?}",
+            proxy.requests()
+        );
+
+        // (2) And the relay's documented path still works with the proxy
+        // configured. This stub is its SERVER — its GET answers the SSE stream
+        // the relay attaches to — while a proxy-honouring client would have
+        // landed on the recording stub above instead, which answers `{}`: no
+        // session id, no protocol version, so the initialize answer could not
+        // arrive.
+        let server = Sink::start(|request, _index| {
+            if request.method == "GET" {
+                Answer::Stream {
+                    frames: vec![
+                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"n\":1}}\n\n".to_owned(),
+                    ],
+                    gap_ms: 100,
+                }
+            } else {
+                Answer::Json {
+                    session_id: Some("s-1".to_owned()),
+                    body: INITIALIZE_RESULT.to_owned(),
+                }
+            }
+        });
+        let mut relay = Relay::start(&server.base);
+        relay.send(INITIALIZE_LINE).await;
+        let init = relay.frame().await;
+        assert_eq!(
+            init["result"]["protocolVersion"], "2025-06-18",
+            "the relay still reaches its server with a proxy configured: {init}"
+        );
+        assert!(
+            !server.requests().is_empty(),
+            "the relayed request went to its SERVER: {:?}",
+            server.requests()
+        );
+        relay.finish().await;
+        assert!(
+            proxy.requests().is_empty(),
+            "and the proxy never saw a byte of the session: {:?}",
+            proxy.requests()
+        );
+
+        // SAFETY: see above — single-test process isolation.
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("HTTPS_PROXY");
+        }
     }
 
     /// C1.3: a server-initiated frame reaches stdout while the session is LIVE —
