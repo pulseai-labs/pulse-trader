@@ -168,13 +168,16 @@ async fn login(server: &str) -> anyhow::Result<()> {
         anyhow::bail!("pulse mcp login: the token on stdin was empty");
     }
 
-    // The handshake the app's Connect screen performs — reuse the client core
-    // (version pin included) rather than a weaker re-derivation.
+    // The same handshake core the app's Connect screen uses (version pin
+    // included) rather than a weaker re-derivation — but requiring the AGENT
+    // scope, which is what `/mcp` (this connection's work) is mounted under: an
+    // app-scoped token is refused here by name instead of by the probe's 403.
     let base = server.trim_end_matches('/');
     eprintln!("pulse mcp login: probing {base}/api/v1/handshake…");
-    let (client, outcome) = crate::client::ServerClient::connect(base, &token)
-        .await
-        .map_err(|error| anyhow::anyhow!("pulse mcp login: {error}"))?;
+    let (client, outcome) =
+        crate::client::ServerClient::connect_for(base, &token, crate::client::TokenScope::Agent)
+            .await
+            .map_err(|error| anyhow::anyhow!("pulse mcp login: {error}"))?;
     if let crate::client::ConnectOutcome::Connected {
         binary_version,
         engine_fingerprint,

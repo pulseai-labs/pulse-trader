@@ -20,6 +20,12 @@
 //! dir (step 2), *credential resolution (step 3 — the w3 seam, marked below)*,
 //! `check_bind` (step 4), retrying bind (step 5), the one `listening on` line
 //! (step 6), serve until SIGTERM/SIGINT (step 7), then the shutdown line.
+//!
+//! **The drain is BOUNDED** ([`DRAIN_BOUND`]): after the signal, in-flight
+//! responses get a few seconds to finish and are then closed with the process,
+//! because an MCP client's long-lived GET SSE stream never ends on its own — it
+//! waits for the SERVER to close it — and an unbounded drain turns `systemctl
+//! stop` (and every deploy/restore recipe that stops the unit) into a hang.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -117,6 +123,19 @@ fn in_tailnet_range(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 100 && (TAILNET_FIRST..=TAILNET_LAST).contains(&octets[1])
 }
+
+/// How long the graceful drain may take after SIGTERM/SIGINT.
+///
+/// `axum::serve`'s graceful shutdown waits for every in-flight response, and an
+/// MCP client's long-lived GET SSE stream is waiting for the SERVER to close it
+/// — a wait that only ends when the process dies. Unbounded, SIGTERM never
+/// reaches the shutdown line, `systemctl stop` hangs, and the deploy/restore
+/// recipes that stop the unit hang with it, on a server whose whole point is
+/// being always on. Five seconds is longer than any ordinary request needs (the
+/// app client's own deadline is 15 s, and its operations are server-owned and
+/// resumable: a cut stream re-attaches) and short enough that a stop is never a
+/// hang.
+const DRAIN_BOUND: Duration = Duration::from_secs(5);
 
 /// The retry schedule (D6): retry every 5 seconds for up to 120 seconds.
 #[derive(Debug, Clone, Copy)]
@@ -284,17 +303,64 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     })?;
     sink.write(format!("pulse serve: listening on {bound}"));
 
-    // ---- Step 7: serve until SIGTERM/SIGINT, then say goodbye.
+    // ---- Step 7: serve until SIGTERM/SIGINT, then say goodbye — with a
+    // BOUNDED drain (see [`DRAIN_BOUND`]).
     let app = router(Arc::clone(&state));
-    axum::serve(
+    // The signal is observed twice: axum's graceful shutdown starts draining on
+    // it, and the deadline below is armed by it. A oneshot carries the signal
+    // from the shutdown future to the racer, so both see the SAME event.
+    let (signalled, armed) = tokio::sync::oneshot::channel::<()>();
+    let mut signalled = Some(signalled);
+    let graceful = async move {
+        shutdown_signal(bound).await;
+        if let Some(signalled) = signalled.take() {
+            let _ = signalled.send(());
+        }
+    };
+    let serving = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(bound))
-    .await
-    .map_err(ServeError::Serve)?;
-    sink.write(format!("pulse serve: shutdown complete ({bound})"));
+    .with_graceful_shutdown(graceful)
+    // `axum`'s serve future is `IntoFuture`, not `Future`: name the future so
+    // the racer can poll it.
+    .into_future();
+    tokio::pin!(serving);
+    let drain = async move {
+        // Nothing to bound until the signal arrives.
+        let _ = armed.await;
+        tokio::time::sleep(DRAIN_BOUND).await;
+    };
+    let outcome = tokio::select! {
+        result = &mut serving => Drain::Drained(result),
+        () = drain => Drain::Bounded,
+    };
+    match outcome {
+        // The normal path: every response finished inside the bound.
+        Drain::Drained(result) => {
+            result.map_err(ServeError::Serve)?;
+            sink.write(format!("pulse serve: shutdown complete ({bound})"));
+        }
+        // The bound was reached with streams still open: dropping the serve
+        // future closes the listener and every connection with it, so the
+        // process exits promptly — and the shutdown line still lands, naming
+        // the cut, because a stop must never look like a hang.
+        Drain::Bounded => {
+            sink.write(format!(
+                "pulse serve: shutdown complete ({bound}); drain cut after \
+                 {DRAIN_BOUND:?}, open streams closed"
+            ));
+        }
+    }
     Ok(())
+}
+
+/// How the serve loop ended (see the bounded drain in [`run_serve`]).
+enum Drain {
+    /// The graceful shutdown finished on its own.
+    Drained(Result<(), std::io::Error>),
+    /// [`DRAIN_BOUND`] elapsed with responses still in flight.
+    Bounded,
 }
 
 /// Resolve on SIGTERM (the service-manager case) or SIGINT (Ctrl-C).

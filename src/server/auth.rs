@@ -95,6 +95,17 @@ impl From<Scope> for RequiredScope {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedLabel(pub String);
 
+/// The accepted client's scope, inserted into the REQUEST extensions beside
+/// [`AuthenticatedLabel`].
+///
+/// The handshake reports it so a client can tell whether the token it just
+/// presented can do the work it is about to ask for: the handshake is mounted
+/// for [`RequiredScope::Any`] on purpose, while every `/api/v1` command route is
+/// `app`-only — without this, a client cannot know that the token it is about to
+/// save cannot exercise a single route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedScope(pub Scope);
+
 /// Mint one bearer token: `pt_` + unpadded base64url of 32 OS-CSPRNG bytes
 /// (46 characters total, 43 after the prefix).
 ///
@@ -246,6 +257,15 @@ pub(crate) async fn require_scope(
     let label = AuthenticatedLabel(row.label.clone());
     let mut req = req;
     req.extensions_mut().insert(label.clone());
+    // The scope the token actually holds. The column's CHECK keeps it to the
+    // two known spellings; an unknown one is not reported rather than guessed.
+    if let Some(scope) = match row.scope.as_str() {
+        "app" => Some(Scope::App),
+        "agent" => Some(Scope::Agent),
+        _ => None,
+    } {
+        req.extensions_mut().insert(AuthenticatedScope(scope));
+    }
     let mut resp = next.run(req).await;
     resp.extensions_mut().insert(label);
     resp

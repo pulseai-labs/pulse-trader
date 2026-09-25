@@ -6,11 +6,12 @@
 // connection state to refused, and this screen is where the UI lands) — derived
 // from the prop on every render, so a refusal that arrives after mount shows
 // too — and the `ConnectOutcome` a submit just produced, which wins while it
-// stands as the newer fact. The token field is a real
-// password input — the token is pasted from `pulse token issue` or the
-// `pulse mcp login` flow; nothing here stores it beyond the Connect command
-// itself, which persists it to the connection file server-side of this
-// component's concerns.
+// stands as the newer fact. The token field is a real password input — the
+// token is the APP-scoped one from `pulse token issue --scope app` (the token
+// this app's own routes need; an agent token, the kind `pulse mcp login`
+// stores for MCP clients, is refused at connect rather than saved); nothing
+// here stores it beyond the Connect command itself, which persists it to the
+// connection file server-side of this component's concerns.
 //
 // Design-system note: this screen composes the shell's existing token
 // classes (`pane`, `status-card`, `field`, `btn`) — no new colors, no scale
@@ -98,7 +99,10 @@ export default function ConnectScreen({
         <h2>Connect to the server</h2>
         <p className="status-card">
           PulseTrader runs against an always-on server. Paste the server URL
-          and the agent token the server operator issued you.
+          and the app token the server operator issued you — the app needs a
+          token issued with <code className="mono">--scope app</code>, not the
+          agent token an MCP client uses. A token that cannot do app work is
+          refused here rather than saved.
         </p>
         <form onSubmit={(event) => void connect(event)}>
           <label className="field" htmlFor="connect-url">

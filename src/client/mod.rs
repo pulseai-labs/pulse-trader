@@ -113,6 +113,36 @@ pub struct ServerClient {
     token: String,
     http: reqwest::Client,
     backoff: RetryBackoff,
+    /// The scope this connection's work needs; see [`TokenScope`]. The app's
+    /// constructors default to [`TokenScope::App`] — every surface they drive is
+    /// app-scoped — and [`ServerClient::connect_for`] states another one.
+    required_scope: TokenScope,
+}
+
+/// The scope a connection's WORK needs from its token.
+///
+/// The handshake is mounted for either scope on purpose (any live token may ask
+/// what is running), so the requirement belongs to the caller: the app's command
+/// surface is `app`-scoped, an MCP client's (`/mcp`) is `agent`-scoped, and a
+/// token holding the other scope is refused at connect — by name — instead of
+/// being saved and 403ing on the first real request. The server reports the
+/// caller's own scope in the handshake's additive `scope` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenScope {
+    /// Every `/api/v1` command route (the app's surface).
+    App,
+    /// `/mcp` (an MCP client's surface: `pulse mcp login`, the relay).
+    Agent,
+}
+
+impl TokenScope {
+    /// The wire spelling (`auth::Scope`'s own).
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Agent => "agent",
+        }
+    }
 }
 
 /// The handshake body the server answers `GET /api/v1/handshake` with (D4).
@@ -125,6 +155,13 @@ struct HandshakeDto {
     binary_version: String,
     engine_fingerprint: String,
     target_triple: String,
+    /// The scope of the token that asked, when the server reports it.
+    ///
+    /// ADDITIVE wire field: a server older than it omits the field, and an
+    /// absent scope behaves EXACTLY as this client behaved before the field
+    /// existed — connected, no refusal (see `handshake_body`).
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// What `server_connect` learned — the spec's named outcomes: `connected`,
@@ -261,40 +298,69 @@ pub struct RunOpOutcome<T> {
 }
 
 impl ServerClient {
-    /// Build a client. No I/O — see [`connect`](Self::connect).
+    /// Build a client for the APP's surface ([`TokenScope::App`]). No I/O — see
+    /// [`connect`](Self::connect).
     #[must_use]
     pub fn new(base_url: &str, token: &str) -> Self {
-        Self {
-            base: base_url.trim_end_matches('/').to_owned(),
-            token: token.to_owned(),
-            http: http_client(),
-            backoff: RetryBackoff::default(),
-        }
+        Self::with_scope(base_url, token, TokenScope::App, RetryBackoff::default())
     }
 
     /// [`new`](Self::new) with an explicit re-attach backoff (tests:
     /// milliseconds).
     #[must_use]
     pub fn with_backoff(base_url: &str, token: &str, backoff: RetryBackoff) -> Self {
+        Self::with_scope(base_url, token, TokenScope::App, backoff)
+    }
+
+    /// A client whose work needs `required_scope` from its token.
+    #[must_use]
+    pub fn with_scope(
+        base_url: &str,
+        token: &str,
+        required_scope: TokenScope,
+        backoff: RetryBackoff,
+    ) -> Self {
         Self {
             base: base_url.trim_end_matches('/').to_owned(),
             token: token.to_owned(),
             http: http_client(),
             backoff,
+            required_scope,
         }
     }
 
     /// Handshake, pin the API version, and return the live client plus what
-    /// the handshake taught.
+    /// the handshake taught — requiring [`TokenScope::App`], the scope every
+    /// surface this client drives is mounted under.
     ///
     /// # Errors
     ///
-    /// The three [`ClientError`] arms: unreachable, token refused, skew.
+    /// The three [`ClientError`] arms: unreachable, token refused, skew — plus
+    /// the refusal a token that does NOT hold the required scope earns here,
+    /// before anything is persisted (`handshake_body`), so a wrong-scope token
+    /// can never be saved as a working connection.
     pub async fn connect(
         base_url: &str,
         token: &str,
     ) -> Result<(Self, ConnectOutcome), ClientError> {
-        let client = Self::new(base_url, token);
+        Self::connect_for(base_url, token, TokenScope::App).await
+    }
+
+    /// [`connect`](Self::connect) for a caller whose work needs `required`:
+    /// `pulse mcp login` requires [`TokenScope::Agent`] — its connection drives
+    /// `/mcp` — while the app requires [`TokenScope::App`].
+    ///
+    /// # Errors
+    ///
+    /// The three [`ClientError`] arms (unreachable, token refused, skew) plus
+    /// the scope refusal: a token whose reported scope is not `required` is
+    /// refused by name, before anything is persisted.
+    pub async fn connect_for(
+        base_url: &str,
+        token: &str,
+        required: TokenScope,
+    ) -> Result<(Self, ConnectOutcome), ClientError> {
+        let client = Self::with_scope(base_url, token, required, RetryBackoff::default());
         let (binary_version, engine_fingerprint) = client.handshake().await?;
         Ok((
             client,
@@ -335,12 +401,35 @@ impl ServerClient {
                 reason: format!("handshake failed: HTTP {status}"),
             });
         }
-        response
-            .json()
-            .await
-            .map_err(|error| ClientError::Unreachable {
-                reason: format!("the handshake body was unreadable: {error}"),
-            })
+        let body: HandshakeDto =
+            response
+                .json()
+                .await
+                .map_err(|error| ClientError::Unreachable {
+                    reason: format!("the handshake body was unreadable: {error}"),
+                })?;
+        // A token that cannot do app work must not be saved as a connection.
+        // The handshake is mounted for EITHER scope on purpose (any live token
+        // may ask what is running), while every `/api/v1` command route is
+        // app-scoped: an agent token would handshake, persist, open the shell —
+        // and 403 on the very first request. The server names the caller's own
+        // scope, so the refusal lands HERE, before anything is stored.
+        //
+        // An absent scope is an older server: exactly today's behaviour, no
+        // refusal.
+        let required = self.required_scope.as_str();
+        if let Some(scope) = body.scope.as_deref()
+            && scope != required
+        {
+            return Err(ClientError::TokenRefused {
+                reason: format!(
+                    "the presented token is {scope}-scoped and this connection needs an \
+                     {required}-scoped token (ask the server operator for a token issued \
+                     with `--scope {required}`)"
+                ),
+            });
+        }
+        Ok(body)
     }
 
     fn url(&self, path: &str) -> String {

@@ -23,6 +23,7 @@ pub mod routes;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::Json;
 use axum::extract::Request;
 use axum::response::IntoResponse;
@@ -125,24 +126,39 @@ impl ServerState {
 }
 
 /// The handshake body (D4): which API version the server speaks, which binary
-/// is running and which engine fingerprint it carries.
+/// is running, which engine fingerprint it carries — and the SCOPE of the token
+/// that asked.
 #[derive(Serialize)]
 struct HandshakeBody {
     api_version: u32,
     binary_version: String,
     engine_fingerprint: String,
     target_triple: String,
+    /// The scope of the presented token: `app` or `agent`.
+    ///
+    /// ADDITIVE (r3.s3.w5 review, round 2): the four fields above keep their
+    /// names and their meaning, and a client talking to an OLDER server that
+    /// omits this field must behave exactly as it did before the field existed
+    /// (see `ServerClient::connect`'s refusal). It is here because the handshake
+    /// accepts either scope on purpose while every `/api/v1` command route is
+    /// `app`-only: without it a client cannot tell that the token it is about to
+    /// persist cannot exercise a single route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'static str>,
 }
 
 /// `GET /api/v1/handshake` — accepted for either scope (the auth middleware is
 /// mounted with [`RequiredScope::Any`]), so any live token can ask what is
-/// running before sending real work.
-async fn handshake() -> impl IntoResponse {
+/// running before sending real work. The answer carries the caller's own scope
+/// in `scope`, which is what lets a client refuse to save a token that cannot do
+/// its work.
+async fn handshake(scope: Option<Extension<auth::AuthenticatedScope>>) -> impl IntoResponse {
     Json(HandshakeBody {
         api_version: API_VERSION,
         binary_version: env!("CARGO_PKG_VERSION").to_owned(),
         engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
         target_triple: EngineFingerprint::target().to_owned(),
+        scope: scope.map(|Extension(scope)| scope.0.as_str()),
     })
 }
 

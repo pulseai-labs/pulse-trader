@@ -900,6 +900,128 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Round 2, Fix A — a token that cannot do app work must not become a connection
+// ---------------------------------------------------------------------------
+
+/// The handshake accepts EITHER scope on purpose (any live token may ask what is
+/// running) while every `/api/v1` command route is `app`-only, so an agent token
+/// used to connect, persist, open the shell — and 403 on the very first request.
+/// It is now refused at connect, by name, before anything is saved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_refuses_an_agent_scoped_token_and_writes_no_connection_file() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let config_dir = tempfile::TempDir::new().expect("tempdir");
+    // SAFETY: nextest runs every test in its own process — no other thread
+    // reads the environment while this runs.
+    unsafe {
+        std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
+    }
+
+    let state = ClientState::new();
+    let outcome = state.connect(&server.base, &server.agent_token).await;
+    let reason = match outcome {
+        ConnectOutcome::TokenRefused { reason } => reason,
+        other => panic!("an agent-scoped token must be refused at connect: {other:?}"),
+    };
+    assert!(
+        reason.contains("agent-scoped") && reason.contains("app-scoped"),
+        "the refusal names the scope it got and the scope the app needs: {reason}"
+    );
+
+    let app_file = config_dir.path().join("server-connection.toml");
+    assert!(
+        !app_file.exists(),
+        "a refused connect writes no connection file: {}",
+        app_file.display()
+    );
+    assert_eq!(
+        state.status().await.state,
+        ServerStatusState::Refused,
+        "and the refusal is the recorded state (the UI lands back on Connect)"
+    );
+
+    // The app-scoped token on the SAME server still connects and persists.
+    let outcome = state.connect(&server.base, &server.app_token).await;
+    assert!(
+        matches!(outcome, ConnectOutcome::Connected { .. }),
+        "an app-scoped token still connects: {outcome:?}"
+    );
+    assert!(
+        app_file.exists(),
+        "and now the connection file lands: {}",
+        app_file.display()
+    );
+
+    // SAFETY: see above — single-test process isolation.
+    unsafe {
+        std::env::remove_var("PULSE_CONFIG_DIR");
+    }
+}
+
+/// The `scope` field is ADDITIVE: a server older than it answers the handshake
+/// with the four original fields and nothing else, and that must behave exactly
+/// as it did before the field existed — connected, no refusal, persisted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_against_a_server_without_the_scope_field_still_connects() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub");
+    let base = format!("http://{}", listener.local_addr().expect("stub local"));
+    let handle = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut stream, _) = listener.accept().await.expect("accept the handshake");
+        let (request_line, _) = read_request(&mut stream).await;
+        assert!(
+            request_line.contains("GET /api/v1/handshake"),
+            "the stub answers the handshake: {request_line}"
+        );
+        // The OLDER body: the four original fields, no `scope`.
+        let body = json!({
+            "api_version": 1,
+            "binary_version": "0.0.1",
+            "engine_fingerprint": "sha256:legacy",
+            "target_triple": "aarch64-apple-darwin",
+        })
+        .to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     x-pulse-api-version: 1\r\nconnection: close\r\n\
+                     content-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("answer the handshake");
+    });
+
+    let config_dir = tempfile::TempDir::new().expect("tempdir");
+    // SAFETY: see above — single-test process isolation.
+    unsafe {
+        std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
+    }
+    let state = ClientState::new();
+    let outcome = state.connect(&base, "pt_legacy_server_token").await;
+    handle.await.expect("stub completes");
+
+    assert!(
+        matches!(outcome, ConnectOutcome::Connected { .. }),
+        "an absent scope behaves exactly as before the field existed: {outcome:?}"
+    );
+    assert!(
+        config_dir.path().join("server-connection.toml").exists(),
+        "and the connection is persisted"
+    );
+
+    // SAFETY: see above — single-test process isolation.
+    unsafe {
+        std::env::remove_var("PULSE_CONFIG_DIR");
+    }
+}
+
 /// AC-1 (vii): a loose (`0644`) connection file is refused on load with a
 /// named reason — the group/world-bit check `secrets.rs` applies, by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

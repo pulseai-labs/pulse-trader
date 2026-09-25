@@ -43,7 +43,10 @@ The access model:
   `pulse token issue|revoke|list` is the ONE sanctioned second writer to `pulse.db` beside a
   running server (WAL permits it; it exists so a first token can be created without a server).
 - **Handshake:** `GET /api/v1/handshake` — accepted for either scope — answers
-  `api_version`, `binary_version`, `engine_fingerprint`, `target_triple`; every response carries
+  `api_version`, `binary_version`, `engine_fingerprint`, `target_triple` (plus `scope`, the
+  caller's own token scope: an ADDITIVE field added at the r3.s3.w5 review round 2, so a client
+  can refuse to save a token that cannot do its work — a server that omits it is still
+  understood); every response carries
   `X-Pulse-Api-Version`, so a client can refuse a server it does not understand (D4).
 - **Operations are server-owned (R2):** backtests, LLM calls and MCP run inside the server
   process; routes and scopes are mounted per item (w2 the command routes, w5 the app and MCP

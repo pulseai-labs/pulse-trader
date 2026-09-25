@@ -699,6 +699,33 @@ async fn handshake_body_reports_the_running_versions() {
         EngineFingerprint::target(),
         "target_triple == compiled triple"
     );
+    // The ADDITIVE field (round 2): the four above keep their names and
+    // meaning, and the answer names the caller's OWN scope — that is what lets
+    // a client refuse to save a token that cannot do app work.
+    assert_eq!(
+        body["scope"], "app",
+        "the handshake reports the presented token's own scope"
+    );
+
+    // An agent token gets the same handshake (either scope is accepted on
+    // purpose) and is told plainly which scope it holds.
+    let agent = issue_token("handshake-agent", "agent", &server.db_path);
+    let resp = client
+        .get(format!("{}/api/v1/handshake", server.base))
+        .header("Authorization", format!("Bearer {agent}"))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), StatusCode::OK, "either scope may handshake");
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["scope"], "agent",
+        "an agent token is told it is agent-scoped: {body}"
+    );
+    assert!(
+        body["api_version"] == API_VERSION && body["target_triple"].is_string(),
+        "the older fields are unchanged for the agent scope too: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,4 +1172,119 @@ fn a_cwd_dotenv_alone_is_ignored_and_reports_no_credential() {
         !lines.iter().any(|line| line.contains(SERVE_CWD_KEY)),
         "the key value must appear nowhere in the server's output"
     );
+}
+
+/// Round 2, Fix B: the graceful drain is BOUNDED. An MCP client's long-lived
+/// GET SSE stream waits for the SERVER to close it, so an unbounded drain made
+/// SIGTERM wait forever — `systemctl stop` (and every deploy/restore recipe that
+/// stops the unit) hung on a server whose whole point is being always on.
+///
+/// The stream here is a real one: `initialize` over `POST /mcp` (agent scope),
+/// then the GET stream the server opens for that session and holds. With it
+/// open, SIGTERM must still finish inside the bound, exit 0, and say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigterm_closes_a_held_sse_stream_within_the_drain_bound() {
+    let layout = serve_layout();
+    let mut child = spawn_serve(&layout, false);
+    assert!(
+        child.wait_for_line("pulse serve: listening on", 30),
+        "the server must start; lines: {:?}",
+        child.snapshot()
+    );
+    let addr = child
+        .snapshot()
+        .iter()
+        .find_map(|line| line.split("listening on ").nth(1))
+        .expect("the listening line names the address")
+        .trim()
+        .to_owned();
+    let base = format!("http://{addr}");
+    let agent = issue_token("shutdown-agent", "agent", &layout.db);
+    let http = reqwest::Client::new();
+
+    // A live MCP session: initialize answers with the session id.
+    let init = http
+        .post(format!("{base}/mcp"))
+        .bearer_auth(&agent)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"shutdown-test","version":"0"}}}"#,
+        )
+        .send()
+        .await
+        .expect("POST /mcp initialize");
+    assert!(
+        init.status().is_success(),
+        "initialize must answer: HTTP {}",
+        init.status()
+    );
+    let session = init
+        .headers()
+        .get("mcp-session-id")
+        .expect("the server issues a session id")
+        .to_str()
+        .expect("ascii session id")
+        .to_owned();
+
+    // The GET stream the server holds open — the thing that used to wedge the
+    // drain. It is kept alive (the response is never read to completion).
+    let stream = http
+        .get(format!("{base}/mcp"))
+        .bearer_auth(&agent)
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", &session)
+        .send()
+        .await
+        .expect("open the GET stream");
+    assert!(
+        stream.status().is_success(),
+        "the GET stream must open: HTTP {}",
+        stream.status()
+    );
+    assert!(
+        stream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream")),
+        "the server is holding an SSE stream: {:?}",
+        stream.headers().get("content-type")
+    );
+
+    // Stop the unit with the stream still open.
+    let started = std::time::Instant::now();
+    let pid = child.child.id();
+    assert_eq!(
+        // SAFETY: a signal to our own child process.
+        unsafe { libc::kill(pid.cast_signed(), libc::SIGTERM) },
+        0,
+        "SIGTERM the serve child"
+    );
+    let status = child
+        .wait_for_exit(20)
+        .expect("the server must exit with the stream still open");
+    let elapsed = started.elapsed();
+
+    assert!(
+        status.success(),
+        "SIGTERM stays a clean exit: {status:?}; lines: {:?}",
+        child.snapshot()
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "the 5 s drain bound must hold with a stream open, took {elapsed:?}"
+    );
+    assert!(
+        child.wait_for_line("pulse serve: shutdown complete", 5),
+        "the shutdown line still lands: {:?}",
+        child.snapshot()
+    );
+    let lines = child.snapshot();
+    assert!(
+        lines.iter().any(|line| line.contains("drain cut")),
+        "the bounded path names the cut (the stream kept the drain from \
+         finishing on its own): {lines:?}"
+    );
+    drop(stream);
 }
