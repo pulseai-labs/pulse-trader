@@ -1610,6 +1610,77 @@ async fn a_backup_refuses_a_reference_the_store_does_not_hold() {
     );
 }
 
+/// Every source snapshot runs the store's integrity read before the backup
+/// reports success: bit rot — or a snapshot swapped in under an old name — must
+/// fail the backup rather than ride out under a success line that the restore
+/// would later contradict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_refuses_a_corrupt_source_snapshot() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+    assert!(import_once(&s, &target_db, &target_data).status.success());
+
+    let victim = target_data
+        .join("candles")
+        .join("BTCUSDT")
+        .join("15m")
+        .join(format!("{}.parquet", s.stems.0));
+    let intact = fs::read(&victim).expect("read the snapshot");
+    let mut flipped = intact.clone();
+    let middle = flipped.len() / 2;
+    flipped[middle] ^= 0xFF;
+    fs::write(&victim, &flipped).expect("write the flipped bytes");
+
+    let out_dir = s.dir.path().join("backups");
+    let backup_args = || -> Vec<String> {
+        vec![
+            "backup".to_owned(),
+            "--db".to_owned(),
+            target_db.display().to_string(),
+            "--data-dir".to_owned(),
+            target_data.display().to_string(),
+            "--out-dir".to_owned(),
+            out_dir.display().to_string(),
+        ]
+    };
+    let out = run_pulse(&s.home, &str_args(&backup_args()));
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a corrupt source snapshot must fail the backup: {text}"
+    );
+    assert!(
+        text.contains(&s.stems.0),
+        "the failure names the snapshot: {text}"
+    );
+    assert!(
+        text.contains("nothing was backed up"),
+        "and says nothing was published: {text}"
+    );
+    assert!(
+        backup_db_files(&out_dir).is_empty(),
+        "no backup database was published: {:?}",
+        backup_db_files(&out_dir)
+    );
+
+    // Control: the same store, healed, backs up — the refusal is about the
+    // bytes, not about the command.
+    fs::write(&victim, &intact).expect("restore the bytes");
+    let out = run_pulse(&s.home, &str_args(&backup_args()));
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "a healthy store still backs up: {text}"
+    );
+    assert_eq!(
+        backup_db_files(&out_dir).len(),
+        1,
+        "and the backup lands: {:?}",
+        backup_db_files(&out_dir)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // the restore --help precondition
 // ---------------------------------------------------------------------------

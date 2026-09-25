@@ -176,9 +176,11 @@ async fn publish_source_store(
     data_dir: &Path,
     backup_path: &Path,
 ) -> anyhow::Result<BackupOutcome> {
+    let source_store = CandleStore::with_base_dir(data_dir.to_path_buf());
     let mut added: Vec<PathBuf> = Vec::new();
 
-    let published = publish_store_files(out_store, data_dir, backup_path, &mut added).await;
+    let published =
+        publish_store_files(out_store, &source_store, data_dir, backup_path, &mut added).await;
     match published {
         Ok((copied, total)) => Ok(BackupOutcome {
             path: backup_path.to_path_buf(),
@@ -196,6 +198,7 @@ async fn publish_source_store(
 /// returning how many snapshots were added and how many the source holds.
 async fn publish_store_files(
     out_store: &CandleStore,
+    source_store: &CandleStore,
     data_dir: &Path,
     backup_path: &Path,
     added: &mut Vec<PathBuf>,
@@ -204,7 +207,9 @@ async fn publish_store_files(
     let references = frozen_references(backup_path).await?;
     // 2. What the source store holds (layout problems refuse: nothing written).
     let (snapshots, heads) = source_store_contents(data_dir)?;
-    // 3. Every reference must resolve to a source snapshot.
+    // 3. Every source snapshot must VERIFY before this backup reports success.
+    verify_source_snapshots(source_store, &snapshots)?;
+    // 4. Every reference must resolve to a source snapshot.
     let wanted = resolve_copy_set(&snapshots, &heads, &references)?;
     // 5. What the store already holds is verified, never skipped.
     verify_store_bytes(out_store, &snapshots, &wanted)?;
@@ -254,6 +259,25 @@ fn source_store_contents(
         );
     }
     Ok((snapshots, heads))
+}
+
+/// Every source snapshot must VERIFY before this backup reports success: bit
+/// rot, or a snapshot swapped in under an old name, would otherwise be
+/// published under a success line while `pulse restore` runs the same integrity
+/// step later and refuses the very artifact the backup named.
+fn verify_source_snapshots(
+    source_store: &CandleStore,
+    snapshots: &[SourceSnapshot],
+) -> anyhow::Result<()> {
+    for snap in snapshots {
+        if let Err(error) = source_store.read_snapshot(&snap.pair, snap.timeframe, &snap.version) {
+            anyhow::bail!(
+                "backup: the source snapshot {} does not verify ({error}); nothing was backed up",
+                snap.path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The snapshots the backup must publish, as indices into `snapshots`: every
