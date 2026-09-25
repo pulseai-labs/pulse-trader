@@ -105,6 +105,126 @@ prepare:
     DATABASE_URL=sqlite://pulse-prepare.db cargo sqlx prepare
     rm -f pulse-prepare.db pulse-prepare.db-wal pulse-prepare.db-shm
 
+# r3.s3.w1 (d30) — the LIVE bind-policy check on draco-desk: builds the debug
+# binary, then proves the server binds its tailnet address only, refuses the
+# LAN address, answers the authenticated handshake over the tailnet and exits
+# 0 on SIGTERM. Needs `tailscale` + one UP non-loopback interface. NEVER runs
+# under `set -x` and never prints the issued token.
+check-serve-bind:
+    cargo build
+    bash scripts/check-serve-bind.sh
+
+# --- deploy / backup / restore (r3.s3.w4, D6/D7/D12, ADR-0026) --------------
+
+# Build a tagged commit and install it as the always-on server: a fresh git
+# worktree of `tag` in ~/.cache/pulse-deploy/src (NEVER /tmp), `cargo build
+# --release --bin pulse` there, the binary into ~/.local/share/pulse-serve/bin
+# (not on PATH — it never shadows a developer's `pulse`), the three units into
+# ~/.config/systemd/user/, then reload / enable / restart. THE CUTOVER STEP
+# (D7): an operator action at the release walk — never run by an item. Refuses
+# without a tag argument and refuses a tag that does not exist.
+deploy tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{ tag }}" ]; then
+        echo "deploy: a tag argument is required (e.g. just deploy r2)" >&2
+        exit 1
+    fi
+    if ! git rev-parse -q --verify "refs/tags/{{ tag }}" >/dev/null; then
+        echo "deploy: tag '{{ tag }}' does not exist in this repository" >&2
+        exit 1
+    fi
+    SRC="$HOME/.cache/pulse-deploy/src"
+    rm -rf "$SRC"
+    git worktree prune
+    git worktree add --detach "$SRC" "refs/tags/{{ tag }}"
+    (cd "$SRC" && cargo build --release --bin pulse)
+    mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.config/systemd/user"
+    install -m 0755 "$SRC/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
+    # The THREE UNITS come from the tag too, like the binary above: installing
+    # the caller's working-tree units beside a tagged binary is a mixed release
+    # (and a rollback to an old tag would install new units).
+    install -m 0644 "$SRC/deploy/pulse-serve.service" "$SRC/deploy/pulse-backup.service" \
+        "$SRC/deploy/pulse-backup.timer" "$HOME/.config/systemd/user/"
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user daemon-reload
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable --now pulse-backup.timer
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable pulse-serve.service
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pulse-serve.service
+    "$HOME/.local/share/pulse-serve/bin/pulse" --version
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user is-active pulse-serve.service
+
+# The SAFE rehearsal for `deploy` (r3.s3.w4 AC-2): it installs nothing, starts
+# nothing and builds nothing. It verifies the three units with
+# `systemd-analyze --user verify`, rendered into a scratch dir under
+# ~/.cache/pulse-scratch/ with ONLY the ExecStart binary swapped to an
+# existing placeholder (the real binary must not exist yet — installing it is
+# deploy's job); every other byte of each unit is verbatim. Then it dry-runs
+# the deploy steps against a real tag and asserts the live systemd/user paths
+# are byte-for-byte untouched.
+deploy-check tag="r2":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! git rev-parse -q --verify "refs/tags/{{ tag }}" >/dev/null; then
+        echo "deploy-check: tag '{{ tag }}' does not exist in this repository" >&2
+        exit 1
+    fi
+    mkdir -p "$HOME/.cache/pulse-scratch"
+    SCRATCH="$(mktemp -d "$HOME/.cache/pulse-scratch/deploy-check.XXXXXX")"
+    trap 'rm -rf "$SCRATCH"' EXIT
+    mkdir -p "$SCRATCH/units"
+    list_live() {
+        {
+            ls -A "$HOME/.config/systemd/user" 2>/dev/null || true
+            echo "--"
+            ls -AR "$HOME/.local/share/pulse-serve" 2>/dev/null || true
+        } | sort
+    }
+    BEFORE="$(list_live)"
+    for unit in deploy/pulse-serve.service deploy/pulse-backup.service deploy/pulse-backup.timer; do
+        sed -E 's|^(ExecStart=).*pulse |ExecStart=/usr/bin/true |' "$unit" \
+            > "$SCRATCH/units/$(basename "$unit")"
+    done
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-analyze --user verify \
+        "$SCRATCH/units/pulse-serve.service" \
+        "$SCRATCH/units/pulse-backup.service" \
+        "$SCRATCH/units/pulse-backup.timer"
+    just --dry-run "deploy" "{{ tag }}" >/dev/null
+    AFTER="$(list_live)"
+    if [ "$BEFORE" != "$AFTER" ]; then
+        echo "deploy-check: live systemd/user paths changed during the rehearsal" >&2
+        diff <(printf '%s\n' "$BEFORE") <(printf '%s\n' "$AFTER") >&2 || true
+        exit 1
+    fi
+    echo "deploy-check: rehearsal passed — units verified, deploy dry-run only; nothing installed, nothing started"
+
+# Run one backup now, through the timer's service unit (D12).
+backup-now:
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start pulse-backup.service
+
+# Restore a backup (D12): stop the server, run the verified restore, start the
+# server again. If the restore FAILS, the server is still restarted — the old
+# target is untouched and keeps serving — and the failure is PROPAGATED: the
+# recipe exits with restore's exit code and says so.
+restore file:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f "{{ file }}" ]; then
+        echo "restore: no such backup file: {{ file }}" >&2
+        exit 1
+    fi
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user stop pulse-serve.service
+    set +e
+    "$HOME/.local/share/pulse-serve/bin/pulse" restore "{{ file }}" \
+        --backup-dir "$HOME/pulse-backups" --replace
+    RC=$?
+    set -e
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start pulse-serve.service
+    if [ "$RC" -ne 0 ]; then
+        echo "restore: RESTORE FAILED (rc=$RC) — pulse-serve restarted on the previous database" >&2
+        exit "$RC"
+    fi
+    echo "restore: ok — pulse-serve restarted on the restored database"
+
 # --- desktop bundle (r1.s1.w1) ----------------------------------------------
 
 # Build PulseTrader.app for a LOCAL dev run — this is what r1.s1.w5's AC-11 manual

@@ -46,11 +46,17 @@ export const commands = {
 	 *  a bare grep of convenience: `deny(warnings)` would not let the allow come off before
 	 *  a real caller existed.
 	 * 
-	 *  No `Result`: the read has no failure mode (an unresolvable credential reads as
-	 *  [`CredentialStatus::None`], not an error), so wrapping it in one would claim a
-	 *  failure mode this command does not have.
+	 *  The read now crosses the wire to the server (r3.s3.w5), which gives it a
+	 *  failure mode it never had as a local read: an unreachable server is a
+	 *  [`BusError`], never a silent "no credential" — the banner must not claim
+	 *  the key is missing when the truth is "cannot ask". This is the ONE place
+	 *  the spec's "keep their signatures" bends, and the report records it.
+	 * 
+	 *  # Errors
+	 * 
+	 *  A proxied-call failure — not-connected, refused, or the route's own error.
 	 */
-	credentialStatus: () => __TAURI_INVOKE<CredentialStatus>("credential_status"),
+	credentialStatus: () => typedError<CredentialStatus, BusError>(__TAURI_INVOKE("credential_status")),
 	/**
 	 *  The Strategy Library's one read: every strategy, its version tree, per-version
 	 *  stats where a persisted run exists, and each version's recent run catalog.
@@ -64,29 +70,6 @@ export const commands = {
 	 *  run row surfacing from the fail-closed `latest_run_for_version` (#39).
 	 */
 	libraryOverview: () => typedError<LibraryOverview, BusError>(__TAURI_INVOKE("library_overview")),
-	/**
-	 *  Compose a strategy from a natural-language target, streaming the composer's
-	 *  tool-call steps over a **per-invocation** channel (grill A2 — the channel is
-	 *  the correlation) until the run finalizes and a persisted, attributable
-	 *  `StrategyVersion` exists.
-	 * 
-	 *  **Nothing but the target crosses the boundary in, and no credential crosses
-	 *  it in any direction, ever** (ADR-0016, the risk gate's IPC half): the key
-	 *  resolves INSIDE the ring via [`resolve_llm_api_key`], `key.expose()` reaches
-	 *  exactly two consumers (the provider constructor and `Redactor::from_config`),
-	 *  and the credential-source LABEL is captured before either — the live arm's
-	 *  key discipline (`src/cli/compose.rs`), mirrored.
-	 * 
-	 *  An unresolvable credential is a [`BusError`] carrying the resolver's own
-	 *  message — it names every searched location and fails closed (`w2`); the
-	 *  screen renders it, and `w5`'s banner already states the condition globally.
-	 * 
-	 *  # Errors
-	 * 
-	 *  Returns a [`BusError`] on a config-load failure, an unresolvable credential,
-	 *  or a genuine compose/persist failure. A dropped channel is reported as
-	 *  `cancelled` in the [`ComposeResult`], not as an error.
-	 */
 	composeStrategy: (nlTarget: string, channel: Channel<BusEvent>) => typedError<ComposeResult, BusError>(__TAURI_INVOKE("compose_strategy", { nlTarget, channel })),
 	/**
 	 *  Cancel an in-flight compose run by id.
@@ -107,7 +90,9 @@ export const commands = {
 	 * 
 	 *  # Errors
 	 * 
-	 *  Never. The `Result` is the bus's uniform command shape.
+	 *  Never on an answered route; the proxied call itself can refuse
+	 *  (not-connected / unreachable), and that `Result` is the bus's uniform
+	 *  command shape.
 	 */
 	composeCancel: (runId: string) => typedError<boolean, BusError>(__TAURI_INVOKE("compose_cancel", { runId })),
 	/**
@@ -193,6 +178,41 @@ export const commands = {
 	 *  Returns a [`BusError`]; see [`get_backtest_run_core`].
 	 */
 	getBacktestRun: (request: GetBacktestRunRequest) => typedError<BacktestRunDto, BusError>(__TAURI_INVOKE("get_backtest_run", { request })),
+	/**
+	 *  Connect the app to the server: handshake first, then persist the
+	 *  connection file and swap the connection on success. The named outcome
+	 *  (`connected` / `unreachable` / `token_refused` / `skew`) is what the
+	 *  Connect screen renders; a `token_refused`/`skew` ALSO records the refusal
+	 *  as the connection state, so `server_status` repeats it.
+	 * 
+	 *  The token argument never appears in an error, a log line, or the
+	 *  connection file's directory listing — it is written `0600` to the
+	 *  connection file beside `server-connection.toml`, and nowhere else.
+	 * 
+	 *  The `Result` shell is tauri's rule for async commands taking managed state
+	 *  (a reference input); the outcome carries every failure, so the error arm is
+	 *  never produced.
+	 */
+	serverConnect: (url: string, token: string) => typedError<ConnectOutcome, BusError>(__TAURI_INVOKE("server_connect", { url, token })),
+	/**
+	 *  The status strip's read: `up`/`down` from a FRESH handshake against the
+	 *  stored connection (the 15 s poll; a server restart shows down, then up,
+	 *  without relaunching the app — d28), `not_connected` with nothing stored,
+	 *  `refused` with the last refusal's reason.
+	 * 
+	 *  The `Result` shell is tauri's rule for async commands taking managed
+	 *  state; the status carries every outcome, so the error arm is never
+	 *  produced.
+	 */
+	serverStatus: () => typedError<ServerStatus, BusError>(__TAURI_INVOKE("server_status")),
+	/**
+	 *  Disconnect: drop the live connection and delete the connection file.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Never — the `Result` is the bus's uniform command shape.
+	 */
+	serverDisconnect: () => typedError<null, BusError>(__TAURI_INVOKE("server_disconnect")),
 };
 
 /* Types */
@@ -740,6 +760,34 @@ export type ComposeStrategySummary = {
 };
 
 /**
+ *  What `server_connect` learned — the spec's named outcomes: `connected`,
+ *  `unreachable`, `token_refused` or `skew`.
+ * 
+ *  This is a plain outcome, not a `Result`: the Connect screen renders every
+ *  arm, and a refusal additionally flips the connection state (see
+ *  [`ClientState::connect`]).
+ */
+export type ConnectOutcome = 
+/**  The handshake succeeded; the server's identity for the status strip. */
+{ outcome: "connected"; 
+/**  The server binary's version. */
+binary_version: string; 
+/**  The engine fingerprint the server runs. */
+engine_fingerprint: string } | 
+/**  The server could not be reached (or answered unintelligibly). */
+{ outcome: "unreachable"; 
+/**  Human-readable reason. */
+reason: string } | 
+/**  The server refused this token. */
+{ outcome: "token_refused"; 
+/**  Human-readable reason. */
+reason: string } | 
+/**  The server speaks a different API generation than this app. */
+{ outcome: "skew"; 
+/**  The API version the server announced. */
+server_api_version: number };
+
+/**
  *  The value-free credential read for a UI banner (r1.s1.w2 step 6) — which source
  *  answered, or that none did.
  * 
@@ -1022,6 +1070,44 @@ export type RegimeCellDto = {
  *  compares it and never parses it.
  */
 export type RunId = string;
+
+/**
+ *  What the status strip renders (spec: `state: up | down | not_connected |
+ *  refused`, with the server's version and fingerprint when known).
+ */
+export type ServerStatus = {
+	/**  The connection state. */
+	state: ServerStatusState,
+	/**  The server binary's version, when a handshake answered. */
+	binary_version: string | null,
+	/**  The server's engine fingerprint, when a handshake answered. */
+	engine_fingerprint: string | null,
+	/**
+	 *  Why the last exchange refused, when it did — the Connect screen's
+	 *  "reason for the last refusal" comes from here.
+	 */
+	reason: string | null,
+};
+
+/**
+ *  The connection state the strip switches on. Wire tokens are the spec's own:
+ *  `up`, `down`, `not_connected`, `refused`.
+ */
+export type ServerStatusState = 
+/**  Connected, and a fresh handshake answered. */
+"up" | 
+/**
+ *  A connection is stored but the server is not answering (a restart, or a
+ *  version the app cannot speak).
+ */
+"down" | 
+/**  No connection is stored. */
+"not_connected" | 
+/**
+ *  The last exchange refused the token (or the connection file failed its
+ *  safety vetting).
+ */
+"refused";
 
 /**
  *  The metadata the placeholder page renders — the one round-trip command this work

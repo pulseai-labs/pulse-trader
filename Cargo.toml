@@ -32,10 +32,12 @@ anyhow = "1"
 # `http2` and `system-proxy` are declared EXPLICITLY: pulsehive-openai 2.0.2 used
 # to pull reqwest 0.12 with them unified on, and 3.0.0 no longer pulls reqwest at
 # all — without them the Binance client silently loses both (PR #169, F1).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "system-proxy", "json", "stream"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `signal` (r3.s3.w1): `pulse serve` shuts down gracefully on SIGTERM (the
+# service-manager case) as well as SIGINT.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 hex = "0.4"
 # WI-1.1.1.04 (parquet persistence).
 polars = { version = "0.53", default-features = false, features = ["parquet"] }
@@ -97,10 +99,34 @@ libc = "0.2"
 # pin — the MCP SDK is the delivery surface's wire contract; `transport-io` adds
 # `tokio/io-std` for `rmcp::transport::stdio()` (defaults stay server+macros+base64;
 # no http/auth/reqwest pulls). Do NOT relax to a caret.
-rmcp = { version = "=3.4.0", features = ["transport-io"] }
+rmcp = { version = "=3.4.0", features = ["transport-io", "transport-streamable-http-server"] }
 # `JsonSchema` derives on the DSL types feed the `pulse://dsl/schema` resource;
 # `rust_decimal1` gives `Decimal` its string/number wire schema.
 schemars = { version = "1", features = ["rust_decimal1"] }
+# ---------------------------------------------------------------------------
+# r3.s3.w1 (ADR-0026) — the `pulse serve` server ring.
+# ---------------------------------------------------------------------------
+# The HTTP surface. axum 0.8 rides the ALREADY-locked hyper 1 / tower 0.5 /
+# http 1 graph (survey 4.5 — no version bumps); only the features the server
+# needs: http1 + tokio (axum::serve, graceful shutdown) + json (bodies) — and,
+# since r3.s3.w2, sse-stream plumbing. axum's SSE itself is feature-free; the
+# per-operation stream is a hand-rolled Stream over an mpsc receiver, which
+# needs the `futures-core` trait name — ALREADY resolved in Cargo.lock as a
+# transitive dep of axum (a promotion, not a new edge, same as getrandom
+# below; no version bump, I/O not math).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+futures-core = "0.3"
+# r3.s3.w5 dispatch 2: the MCP identity reads the authenticated label through
+# the `http::request::Parts` rmcp nests in the message extensions — name the
+# SAME `http` crate rmcp inserts with (already locked at 1.4.1 via axum).
+http = "1"
+# D5: the CSPRNG behind token minting — 32 bytes straight from the OS source.
+# Already resolved in Cargo.lock as a transitive dep (a promotion, not a new
+# edge). I/O not math — not in any determinism fingerprint, so a caret is fine.
+getrandom = "0.3"
+# D5: the unpadded base64url token encoding (`pt_` + 43 chars). Also already in
+# the lock (0.22.1) — a promotion.
+base64 = "0.22"
 
 # ---------------------------------------------------------------------------
 # r1.s1.w1 (ADR-0020) — the desktop shell.

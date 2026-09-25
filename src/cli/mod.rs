@@ -11,17 +11,28 @@
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
 pub(crate) mod backtest;
+// r3.s3.w4 (D12, ADR-0026): `pulse backup` / `pulse restore` — the online
+// backup + the verified restore (restore reuses import's engine).
+pub(crate) mod backup;
 // r1.s2.w3: the coach composition root + the `pulse coach <run-id>` debug verb.
 pub(crate) mod coach;
 pub(crate) mod compose;
 pub(crate) mod fetch_data;
+// r3.s3.w4 (D7, ADR-0026): the verified one-way import of a Mac `pulse.db` +
+// its candle snapshots; the shared verified-copy engine lives here.
+pub(crate) mod import;
 pub(crate) mod indicators;
 pub(crate) mod llm;
 // r2.s1.w2: the `pulse mcp` composition root — validates `--agent-name`,
 // resolves the data dir, opens the migrated DB and hands stdout to `mcp::serve`.
 pub(crate) mod mcp;
 pub(crate) mod runs;
+// r3.s3.w1 (ADR-0026): the always-on server composition root.
+pub(crate) mod serve;
 pub(crate) mod strategy;
+// r3.s3.w1: the operator's local token administration (the one sanctioned
+// second writer beside a running server — ADR-0026).
+pub(crate) mod token;
 
 use clap::{Parser, Subcommand};
 
@@ -36,14 +47,18 @@ use crate::adapters::store::CandleStore;
 use crate::domain::{CandleSeriesRepository, Pair, Timeframe};
 
 use backtest::{BacktestArgs, run_backtest_cli};
+use backup::{BackupArgs, RestoreArgs, run_backup, run_restore};
 use coach::{CoachArgs, run_coach};
 use compose::{ComposeArgs, run_compose};
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
+use import::{ImportArgs, run_import};
 use indicators::{IndicatorsArgs, run_indicators};
 use llm::{LlmArgs, run_llm_check};
 use mcp::{McpArgs, run_mcp};
 use runs::{RunsArgs, run_runs};
+use serve::{ServeArgs, run_serve};
 use strategy::{StrategyArgs, run_strategy};
+use token::{TokenArgs, run_token};
 
 /// `pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI `PoC`).
 #[derive(Debug, Parser)]
@@ -85,6 +100,30 @@ pub enum Command {
     /// `pulse://dsl/schema` resource and file exports under the data dir.
     /// stdout is protocol traffic only — diagnostics go to stderr.
     Mcp(McpArgs),
+    /// Issue / revoke / list client tokens (r3.s3.w1, D5) — the operator's
+    /// local administration on the server host. `issue` prints the token once
+    /// on stdout; everything else goes to stderr.
+    Token(TokenArgs),
+    /// Run the always-on server (r3.s3.w1, ADR-0026): bind the tailnet
+    /// address (the D6 policy — or loopback under `--dev-loopback`), then
+    /// serve `/api/v1` until SIGTERM/SIGINT. One stderr line per request and
+    /// per startup step; stdout stays empty.
+    Serve(ServeArgs),
+    /// Move a Mac `pulse.db` + its candle snapshots onto this host with full
+    /// hash verification (r3.s3.w4, D7). A non-empty target is refused
+    /// without `--replace`; `--replace` backs the target up first.
+    /// Precondition: the server must be stopped — the install renames over
+    /// `pulse.db` and deletes its stale `-wal`/`-shm`, so a running `pulse
+    /// serve` would keep serving the unlinked old file and lose every write it
+    /// commits afterwards. Import does not check the process; D7's cutover
+    /// order is to quit the old Mac app, then import on the server host.
+    Import(ImportArgs),
+    /// Online-backup the local database + snapshots into `~/pulse-backups`
+    /// (r3.s3.w4, D12) — consistent while `pulse serve` holds the database.
+    Backup(BackupArgs),
+    /// Restore a verified backup over the local database (r3.s3.w4, D12).
+    /// Precondition: the server must be stopped.
+    Restore(RestoreArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -194,6 +233,20 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // FIRST (AC-10: invalid → non-zero before serving), then opens the
         // migrated db + resolves the data dir inside.
         Command::Mcp(args) => run_mcp(&args).await,
+        // r3.s3.w1: the token administration arm. The migrated-db open is the
+        // same migrate-then-open every other DB-using arm uses.
+        Command::Token(args) => run_token(&args).await,
+        // r3.s3.w1 (ADR-0026): the server arm — the D6 bind policy gates it,
+        // then the retrying bind, then serve until SIGTERM/SIGINT.
+        Command::Serve(args) => run_serve(&args).await,
+        // r3.s3.w4 (D7): the verified import — copy, migrate forward, verify
+        // everything, then install atomically; refusals leave the target
+        // exactly as it was.
+        Command::Import(args) => run_import(&args).await,
+        // r3.s3.w4 (D12): the online backup and the verified restore (the
+        // restore reuses import's verified-copy engine).
+        Command::Backup(args) => run_backup(&args).await,
+        Command::Restore(args) => run_restore(&args).await,
     }
 }
 

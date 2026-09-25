@@ -15,7 +15,12 @@ mod agent;
 // boundary, and the composition roots (`cli::mod`, `tauri::commands::DesktopState`)
 // choose the implementations it is generic over.
 mod application;
+// r3.s3.w5: the thin-client core — the HTTP seam between the desktop command
+// bus and the always-on server. Private like `adapters`; `tauri::commands` is
+// its composition root and the curated re-exports below are what the tests
+// (`tests/client_proxy.rs`) and the commands reach.
 mod cli;
+mod client;
 // r1.s1.w1 (ADR-0020): the argv dispatch that decides GUI vs CLI. Kept OUT of
 // `cli` on purpose -- it runs BEFORE any surface is chosen, so it cannot live
 // inside one of them.
@@ -24,6 +29,11 @@ mod entry;
 // may name `rmcp` (`scripts/check-mcp-boundary.sh` enforces it). Private like
 // `adapters`; `cli::mcp` is its composition root.
 mod mcp;
+// r3.s3.w1 (ADR-0026): the `pulse serve` server ring — the axum router, the
+// auth middleware, the request log and the bind policy. Private like
+// `adapters`; `cli::serve` is its composition root, and the curated re-exports
+// below are what the integration boundary (and the probe-route tests) reach.
+mod server;
 mod tauri;
 
 // The domain layer is the library's stable public API surface (the port traits
@@ -390,6 +400,41 @@ pub use adapters::memory::{InMemoryCoachAcceptanceRepo, MemoryAcceptedChild, Mem
 // not just the first. Append-only (keep-both with 1.03's re-exports at merge).
 pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
 
+// r3.s3.w4 (D7/D12): the copy/verify helpers the import/backup/restore verbs
+// compose (the raw-SQL tier beside the repositories). Re-exported ALL for the
+// same deny(warnings)/dead_code reason as the block above; `cli::import` and
+// `cli::backup` are the composition roots.
+pub use adapters::db::ops::{
+    SnapshotRef, all_run_ids, all_version_ids, open_read_only, referenced_snapshots,
+    stored_run_hashes, stored_version_hashes, table_count, table_names, target_row_counts,
+    vacuum_into_copy,
+};
+
+// r3.s3.w1 (ADR-0026): the server surface. `router` + `mount_scoped` build the
+// axum app (w2/w5 mount their routes through `mount_scoped`; the probe-route
+// tests do the same); `ServerState` carries pool + data dir + the log sink;
+// `RequestLog`/`CaptureLog` are the injectable sink; `API_VERSION`/`Scope` are
+// the D4/D5 vocabulary. `auth::mint_token`/`auth::hash_token` are re-exported
+// for the token CLI and its tests. `bind` is the D6 vocabulary: the pure
+// policy check, the injectable retry loop and the named startup errors. All of
+// it REQUIRED under `deny(warnings)` — a `pub` item unused outside `server` is
+// a `dead_code` build error otherwise.
+pub use server::auth::{Scope, hash_token, mint_token};
+pub use server::bind::{
+    BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, bind_with_retry,
+    check_bind,
+};
+pub use server::log::{CaptureLog, RequestLog};
+pub use server::{API_VERSION, ServerState, mount_scoped, router};
+// r3.s3.w2: the operation registry's public seam. `SweepConfig` is the
+// injectable retention the spec requires ("tests use milliseconds");
+// `ComposeRunner`/`ComposeRunCtx` are the spec's narrowest test seam (the
+// compose-run factory — `LlmProvider` is not object-safe, so the seam is the
+// run body whose DEFAULT is the Tauri wrapper's exact credential-resolving
+// body). Re-exported because `tests/server_stream.rs` drives both through the
+// lib boundary.
+pub use server::ops::{ComposeRunCtx, ComposeRunner, SweepConfig};
+
 // VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,
 // BACKLOG-4). The trade-record entities (`Trade`/`Fill`/`ExitReason`/
 // `TradeSource`), the run aggregate (`BacktestResult`), the error taxonomy
@@ -555,11 +600,20 @@ pub use adapters::secrets::glm_api_key;
 // adapter half the out-of-crate suites (`tests/credential_source.rs`,
 // `tests/credential_redaction.rs`) drive.
 //
-// The zero-arg `pub(crate)` wrappers (`resolve_llm_api_key` /
-// `llm_credential_status`) are deliberately NOT re-exported: they read the real
-// process environment. `ApiKey::expose()` also stays `pub(crate)`, so an
-// out-of-crate caller can pass a key on but can never read one (least privilege).
+// The zero-arg `resolve_llm_api_key` stays `pub(crate)` — it reads the real
+// process environment, and `ApiKey::expose()` is `pub(crate)` too, so an
+// out-of-crate caller can pass a key on but can never read one (least
+// privilege). `llm_credential_status` is `pub` since r3.s3.w3, on the
+// operator's ruling: it returns the VALUE-FREE `CredentialStatus` label enum
+// and nothing else, which is what the credential-profile suite and the
+// `server_auth` credential cases need to drive the real process path.
+//
+// r3.s3.w3: the server credential profile — `pulse serve` narrows this
+// process's resolution to the deliberate sources via the write-once cell
+// (`set_credential_profile`, read back through `credential_profile`).
+pub use adapters::secrets::CredentialProfile;
 pub use adapters::secrets::CredentialSearch;
+pub use adapters::secrets::{credential_profile, llm_credential_status, set_credential_profile};
 pub use adapters::secrets::{llm_credential_status_in, resolve_llm_api_key_in};
 pub use domain::{ApiKey, CredentialSource, CredentialStatus};
 
@@ -616,9 +670,16 @@ pub use crate::tauri::{
     ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EquityPointDto, EventSink,
     HistogramBinDto, HistogramDto, LibraryOverview, LibraryRunSummary, LibraryStrategy,
     LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
-    backtest_run_dto, compare_child_run_core, compose_strategy_core, demo_stream_core, dsl_summary,
-    export_bindings, library_overview_core, run_backtest_version_core, run_desktop,
-    shell_info_core, summarize_dsl,
+    backtest_run_dto, compare_child_run_core, compose_strategy_body, compose_strategy_core,
+    demo_stream_core, dsl_summary, export_bindings, library_overview_core,
+    run_backtest_version_core, run_desktop, shell_info_core, summarize_dsl,
+};
+// r3.s3.w5: the thin-client surface — `tests/client_proxy.rs` (AC-1) drives the
+// client against the in-process server, and the proxied command wrappers in
+// `src/tauri/commands.rs` speak through `ClientState`.
+pub use crate::client::{
+    ClientError, ClientState, ConnectOutcome, RetryBackoff, RunOpOutcome, ServerClient,
+    ServerStatus, ServerStatusState,
 };
 // r2.s3.w5: the walk-forward wire contract — the request/response DTOs plus
 // the three transport-free cores `tests/tauri_walk_forward.rs` (AC-2) drives.

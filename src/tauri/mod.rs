@@ -55,8 +55,8 @@ pub use coach::{
 pub use commands::{
     BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
     DesktopState, OperationGuard, OperationKey, ShellInfo, StreamOutcome, compare_child_run_core,
-    compose_strategy_core, demo_stream_core, library_overview_core, run_backtest_version_core,
-    shell_info_core, summarize_dsl,
+    compose_strategy_body, compose_strategy_core, demo_stream_core, library_overview_core,
+    run_backtest_version_core, shell_info_core, summarize_dsl,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -96,6 +96,10 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::run_walk_forward_version,
         commands::get_walk_forward_run,
         commands::get_backtest_run,
+        // r3.s3.w5: the connection trio — Connect's verbs.
+        commands::server_connect,
+        commands::server_status,
+        commands::server_disconnect,
     ])
 }
 
@@ -125,47 +129,24 @@ pub fn export_bindings(path: &std::path::Path) -> anyhow::Result<()> {
 
 /// The desktop entry point — what a Finder launch reaches (ADR-0020).
 ///
-/// Startup order, and why it is this order:
-///
-/// 1. **Open and migrate the database first.** `DesktopState::open_default` uses
-///    migrate-then-open, so a migration failure refuses to start rather than opening a
-///    window onto a half-migrated database. Failing here surfaces as a non-zero exit
-///    from `main`, which is the honest outcome — a window that renders an unusable app
-///    is worse than no window.
-/// 2. **Then build the app**, handing the state to Tauri's managed state so every
-///    command shares one pool.
+/// Startup order, and why it is this order (r3.s3.w5). First, load the
+/// connection file if one exists — no database opens here anymore. The thin
+/// client's state is the connection (server URL + token + the last
+/// handshake's outcome); every command speaks HTTP to the always-on server,
+/// which owns the database. A file that exists puts the app straight to
+/// `up`/`down` via the status poll; a file that fails its safety vetting
+/// starts the state `refused` with the reason, and the UI shows Connect.
+/// Only then is the app built, managing the [`crate::client::ClientState`].
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] if the database cannot be opened/migrated, if the tokio
-/// runtime cannot be built, or if the Tauri runtime fails to start.
+/// Returns an [`anyhow::Error`] if the Tauri runtime fails to start.
 pub fn run_desktop() -> anyhow::Result<()> {
-    // The same sync -> async bridge shape the CLI uses (audit C3): a thin sync entry
-    // that builds the runtime itself. Tauri's own event loop must own the main thread,
-    // so the runtime is entered only for startup work, not wrapped around the app.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("build tokio runtime: {e}"))?;
-
-    let state = runtime
-        .block_on(commands::DesktopState::open_default())
-        .map_err(|e| anyhow::anyhow!("open the desktop database: {e}"))?;
-
     let builder = specta_builder();
 
     tauri::Builder::default()
         .invoke_handler(builder.invoke_handler())
-        .manage(state)
-        // Keep the tokio runtime alive for the app's lifetime — and NOT for the
-        // reason it looks like. Tauri 2 runs async commands on `tauri::async_runtime`,
-        // not on this one; a `tokio::Runtime` only becomes the command executor if
-        // `tauri::async_runtime::set` is called, which nothing here does. What makes
-        // this load-bearing is the `SqlitePool`: it was created inside
-        // `runtime.block_on(DesktopState::open_default())` above and is bound to THIS
-        // runtime, so dropping it would take the pool's connections with it mid-session.
-        // Do not remove this on the reasoning that commands do not run on it.
-        .manage(runtime)
+        .manage(crate::client::ClientState::loaded())
         .run(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("run the desktop shell: {e}"))
 }

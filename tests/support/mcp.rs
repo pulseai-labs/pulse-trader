@@ -464,6 +464,7 @@ pub async fn spawn_client(
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulse"));
     command
         .arg("mcp")
+        .arg("--local")
         .arg("--db")
         .arg(db_path)
         .arg("--data-dir")

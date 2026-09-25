@@ -12,6 +12,11 @@
 // variable, never a filesystem path, so it cannot even hint at where a credential
 // file would need to sit.
 //
+// r3.s3.w5 moved the resolution SERVER-side (`src/adapters/secrets.rs` resolves it
+// for `pulse serve`), so the copy names the server host: telling a Mac-app user to
+// set the variable in the app's own environment would send them to a place the
+// server never reads.
+//
 // Non-blocking (G4's whole point): a user with no credential can still open and
 // navigate the shell. This component renders a dismissible-by-navigation notice, not
 // a gate -- nothing else in the frame is disabled while it is showing.
@@ -29,16 +34,25 @@ export function CredentialBanner() {
     commands
       .credentialStatus()
       .then((result) => {
-        if (!cancelled) {
-          setStatus(result);
+        if (cancelled) {
+          return;
+        }
+        // r3.s3.w5: the read crossed the wire and grew the bus's `Result`
+        // shell (`typedError`), so the answer is a discriminated union. `ok`
+        // carries the status; `error` is a REAL failure (the server could not
+        // be asked) -- the banner must not claim "no credential" for it, so it
+        // renders nothing, exactly like the unreachable case below.
+        if (result.status === "ok") {
+          setStatus(result.data);
+        } else {
+          setStatus(null);
         }
       })
       .catch(() => {
-        // The read itself has no failure mode (`credential_status` returns
-        // `CredentialStatus` directly, never a `Result`) -- a rejection here means
-        // the IPC call itself failed (e.g. no app handle in a non-Tauri preview).
-        // Staying silent is correct: a banner that cannot confirm there IS no
-        // credential must not claim there is one, and must not block the shell.
+        // A rejection here means the IPC call itself failed (e.g. no app
+        // handle in a non-Tauri preview). Staying silent is correct: a banner
+        // that cannot confirm there IS no credential must not claim there is
+        // one, and must not block the shell.
         if (!cancelled) {
           setStatus(null);
         }
@@ -54,9 +68,10 @@ export function CredentialBanner() {
 
   return (
     <div className="credential-banner" role="status">
-      No LLM credential found yet. Set the <code className="mono">OLLAMA_API_KEY</code>{" "}
-      environment variable to enable strategy composition — you can still browse the
-      shell without one.
+      No LLM credential found on the server yet. Set the{" "}
+      <code className="mono">OLLAMA_API_KEY</code> environment variable for the server —
+      on the host that runs <code className="mono">pulse serve</code>, then restart it —
+      to enable strategy composition. You can still browse the shell without one.
     </div>
   );
 }

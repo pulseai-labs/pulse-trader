@@ -64,6 +64,7 @@ fn assert_line_is_jsonrpc(line: &str, expected_id: i64) {
 fn spawn_mcp(db: &Path, store: &Path) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_pulse"))
         .arg("mcp")
+        .arg("--local")
         .arg("--db")
         .arg(db)
         .arg("--data-dir")
@@ -195,6 +196,7 @@ fn agent_identity_counts_characters_not_bytes() {
     let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
         .args([
             "mcp",
+            "--local",
             "--agent-name",
             &name,
             "--db",
@@ -227,6 +229,7 @@ fn agent_identity_too_long_name_exits_nonzero() {
     let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
         .args([
             "mcp",
+            "--local",
             "--agent-name",
             &name,
             "--db",
@@ -255,6 +258,7 @@ fn invalid_agent_name_exits_nonzero_with_reason_on_stderr() {
     let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
         .args([
             "mcp",
+            "--local",
             "--agent-name",
             "Bad Name!",
             "--db",

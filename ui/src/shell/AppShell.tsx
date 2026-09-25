@@ -36,6 +36,8 @@
 import { useEffect, useState } from "react";
 import type { HTMLAttributes, ReactNode } from "react";
 
+import type { ServerStatus } from "../bindings";
+
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { isNavBuilt } from "../routes";
@@ -427,9 +429,35 @@ function ThemeIcon({ mode }: { mode: ThemeMode }) {
 // Window chrome (`app-shell.jsx`'s `WindowChrome`)
 // ---------------------------------------------------------------------------
 
+/**
+ * The strip's exact words for a `ServerStatus` — the state word plus the
+ * server's version when a handshake answered (`up`), or the recorded reason
+ * when the last exchange was refused. No invented numbers.
+ */
+export function serverStatusText(status: ServerStatus): string {
+  switch (status.state) {
+    case "up":
+      return `server up · ${status.binary_version ?? "?"}`;
+    case "down":
+      return "server down";
+    case "not_connected":
+      return "not connected";
+    case "refused":
+      return status.reason ?? "connection refused";
+  }
+}
+
 interface WindowChromeProps {
   /** The open document's title, rendered after an em-dash. Omitted when nothing is open. */
   docTitle?: string;
+  /**
+   * The live server connection status (r3.s3.w5). The `.title-status` strip
+   * is ported ONLY now that a real read exists — r1.s1 deliberately shipped
+   * the chrome without it because the mock's pills were fabricated sample
+   * data; this one renders exactly what `server_status` answered and nothing
+   * else. Absent (undefined) renders no pill at all.
+   */
+  serverStatus?: ServerStatus;
   children?: ReactNode;
 }
 
@@ -438,7 +466,7 @@ interface WindowChromeProps {
  * `decorations: false` for exactly this reason) plus whatever `children` mounts
  * below it. `installFit()` is NOT ported — see this file's header comment.
  */
-export function WindowChrome({ docTitle, children }: WindowChromeProps) {
+export function WindowChrome({ docTitle, serverStatus, children }: WindowChromeProps) {
   const { mode, theme, cycle } = useTheme();
   return (
     <div className="window" data-theme={theme}>
@@ -495,6 +523,12 @@ export function WindowChrome({ docTitle, children }: WindowChromeProps) {
               <span className="title-sep">—</span>
               <span className="title-doc">{docTitle}</span>
             </>
+          )}
+          {serverStatus !== undefined && (
+            <span className="title-status">
+              <span className="dot" data-state={serverStatus.state} />
+              {serverStatusText(serverStatus)}
+            </span>
           )}
         </div>
 

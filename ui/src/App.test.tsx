@@ -14,7 +14,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./bindings", () => ({
   commands: {
-    credentialStatus: vi.fn().mockResolvedValue("none"),
+    // r3.s3.w5: `credentialStatus` answers through the bus's `Result` shell,
+    // so the mock carries the `typedError` union shape (as `libraryOverview`
+    // below already does).
+    credentialStatus: vi.fn().mockResolvedValue({ status: "ok", data: "none" }),
+    // r3.s3.w5: App polls the connection status (the Connect gate + the
+    // titlebar strip); an `up` answer keeps the shell navigation these tests
+    // assert exactly where it was.
+    serverStatus: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: { state: "up", binary_version: "0.0.0", engine_fingerprint: null, reason: null },
+    }),
     // r1.s1.w3: the default landing is now the Library screen, which reads
     // `libraryOverview` on mount — mocked to an empty payload so these shell
     // tests keep asserting the shell (the screen's own behaviour lives in
@@ -30,10 +40,27 @@ vi.mock("./bindings", () => ({
 }));
 
 import { App } from "./App";
-import { RouteContent } from "./App";
+import { GATE_AFTER_DROPPED_POLLS, RouteContent, gateDecision, rememberPoll } from "./App";
+import type { GateMemory } from "./App";
 import { commands } from "./bindings";
-import type { BacktestRunDto } from "./bindings";
+import type { BacktestRunDto, ServerStatus } from "./bindings";
 import type { Route } from "./routes";
+
+/** The poll cadence `useServerStatus` runs at (15 s), spelled out once here. */
+const POLL_MS = 15_000;
+
+function up(): ServerStatus {
+  return {
+    state: "up",
+    binary_version: "0.1.0",
+    engine_fingerprint: null,
+    reason: null,
+  };
+}
+
+function down(): ServerStatus {
+  return { state: "down", binary_version: null, engine_fingerprint: null, reason: null };
+}
 
 function setHash(hash: string) {
   window.location.hash = hash;
@@ -122,6 +149,103 @@ describe("RouteContent (given a resolved route, independent of which nav id is a
   it("renders the unbuilt pane when the route has no element", () => {
     render(<RouteContent route={undefined} />);
     expect(screen.getByText(/not built/i)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r3.s3.w5's gate, hardened: one dropped poll must not destroy live operations
+// ---------------------------------------------------------------------------
+
+describe("the connection gate's rule", () => {
+  it("opens on up, and gates immediately before the app has ever been open", () => {
+    const cold: GateMemory = { everOpen: false, dropped: 0 };
+    expect(gateDecision(up(), cold)).toBe("open");
+    // Nothing can be in flight yet, so the fresh-install path stays snappy.
+    expect(gateDecision(down(), cold)).toBe("gated");
+
+    const warm: GateMemory = { everOpen: true, dropped: 0 };
+    expect(gateDecision(up(), warm)).toBe("open");
+  });
+
+  it("holds an open app for fewer than the tolerance, then gates", () => {
+    let memory: GateMemory = { everOpen: true, dropped: 0 };
+    memory = rememberPoll(memory, down());
+    expect(memory).toEqual({ everOpen: true, dropped: 1 });
+    expect(gateDecision(down(), memory)).toBe("hold");
+
+    for (let poll = 2; poll < GATE_AFTER_DROPPED_POLLS; poll += 1) {
+      memory = rememberPoll(memory, down());
+      expect(gateDecision(down(), memory)).toBe("hold");
+    }
+    memory = rememberPoll(memory, down());
+    expect(memory.dropped).toBe(GATE_AFTER_DROPPED_POLLS);
+    expect(gateDecision(down(), memory)).toBe("gated");
+  });
+
+  it("forgets the streak on the next up poll, and never un-opens", () => {
+    let memory: GateMemory = rememberPoll({ everOpen: true, dropped: 0 }, down());
+    memory = rememberPoll(memory, up());
+    expect(memory).toEqual({ everOpen: true, dropped: 0 });
+    // The same object comes back when there is nothing to record, so a poll
+    // that changes nothing does not re-render the app.
+    expect(rememberPoll(memory, up())).toBe(memory);
+  });
+});
+
+describe("<App /> holds the shell through a dropped poll", () => {
+  afterEach(() => {
+    setHash("");
+  });
+
+  it("stays mounted on one non-up tick and gates after three", async () => {
+    // The FIRST call is the mount poll and answers `up`; the next three (one
+    // per advanced tick) answer `down`, each a FRESH object exactly as a
+    // deserialized IPC reply is. A call-counted implementation (rather than
+    // queued `...Once` values) keeps the mount poll out of the drop sequence.
+    let poll = 0;
+    vi.mocked(commands.serverStatus).mockImplementation(() => {
+      poll += 1;
+      const data = poll === 1 ? up() : down();
+      return Promise.resolve({ status: "ok", data });
+    });
+
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      await act(async () => {});
+      // Open: the shell is up.
+      expect(container.querySelector(".sidebar")).not.toBeNull();
+
+      // One dropped poll: the app — and with it the provider holding live
+      // operation channels — is still mounted, and the strip reports the
+      // status that actually arrived rather than claiming `up`.
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(container.querySelector(".sidebar")).not.toBeNull();
+      expect(screen.getByText(/server down/i)).toBeTruthy();
+
+      // A second: still holding.
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(container.querySelector(".sidebar")).not.toBeNull();
+
+      // The third consecutive drop reaches the tolerance: a genuinely down
+      // server still gates.
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(screen.getByRole("heading", { name: "Connect to the server" })).toBeTruthy();
+      expect(container.querySelector(".sidebar")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      // The file's module-level `up` default, restored for every test that
+      // renders the shell after this one.
+      vi.mocked(commands.serverStatus).mockImplementation(() =>
+        Promise.resolve({ status: "ok", data: up() }),
+      );
+    }
   });
 });
 

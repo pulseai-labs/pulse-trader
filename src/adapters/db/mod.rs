@@ -12,7 +12,10 @@
 //! real platform path; tests inject a `tempfile` path so the suite never touches
 //! the real `pulse.db`.
 
-mod paths;
+// r3.s3.w5: `pub(crate)` so the client-core's connection file resolves the
+// SAME platform data dir (`default_data_dir`) the database uses — one
+// location, never a second invented one.
+pub(crate) mod paths;
 pub mod strategy_repo;
 // VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter (FR-6 / FR-7).
 // `query!` macros for `backtest_run`/`trade` are confined here (the `.sqlx` cache
@@ -77,6 +80,22 @@ pub use coach_acceptance_repo::SqliteCoachAcceptanceRepo;
 // `backtest_run_repo`'s `insert_run_row`/`insert_trade_rows`, so `query!` stays
 // confined to this module tree (the `.sqlx` cache covers this file too).
 pub mod walk_forward_run_repo;
+
+// r3.s3.w1 (D5/D8, ADR-0026): the client-token store — `client_token` rows and
+// the append-only `token_audit` ledger. `query!` macros for these two tables are
+// confined here (the `.sqlx` cache is keyed to this file).
+pub mod client_token_repo;
+// `TokenStoreError` is deliberately NOT re-exported: nothing outside this
+// module tree names it (callers map it into their own error vocabulary).
+pub use client_token_repo::{ClientToken, SqliteClientTokenRepo};
+
+// r3.s3.w4 (D7/D12, ADR-0026): the small copy/verify helper set the data-ops
+// verbs compose — the read-only source open, the VACUUM INTO copy, count/hash/
+// id reads and the referenced-snapshot projection. Raw `query`/`query_scalar`
+// only: NO `query!` macros, so the committed `.sqlx` cache is untouched.
+// (`lib.rs` re-exports the items from `adapters::db::ops::` directly, which is
+// what keeps them alive under deny(warnings)/dead_code.)
+pub mod ops;
 
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
 // item — under `#![deny(warnings)]` a `pub` item unused outside its module is a
