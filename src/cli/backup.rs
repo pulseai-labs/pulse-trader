@@ -36,8 +36,8 @@ use clap::Args;
 use super::import::{
     HeadChange, HeadSource, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal,
     copy_snapshot_into, default_backup_out_dir, manifest_path, named_by_pointer,
-    resolve_target_data_dir, resolve_target_db, restore_heads, run_verified_copy, scan_heads,
-    scan_snapshots, stranded_pointers, write_head_manifest,
+    refuse_orphaned_quarantines, resolve_target_data_dir, resolve_target_db, restore_heads,
+    run_verified_copy, scan_heads, scan_snapshots, stranded_pointers, write_head_manifest,
 };
 use super::publish;
 use crate::adapters::db::ops;
@@ -146,6 +146,12 @@ pub(crate) async fn backup_target(
     data_dir: &Path,
     out_dir: &Path,
 ) -> anyhow::Result<BackupOutcome> {
+    // ---- Step 0: refuse a target whose committed rows are sitting in a
+    // quarantined `-wal` (fix round 5, P5). A backup READS the database, so an
+    // interrupted install's quarantine would make this run stamp a `pulse-<stamp>.db`
+    // as good while it is missing exactly those rows — the same fail-closed refusal
+    // the import makes, through the same helper, before anything is read.
+    refuse_orphaned_quarantines(db_path)?;
     let out_store = CandleStore::with_base_dir(out_dir.to_path_buf());
 
     // ---- Step 1: freeze the DATABASE first, and derive the snapshot set from
@@ -496,8 +502,9 @@ fn discard_all(staged: &StagedBackup, added: &[PathBuf]) -> anyhow::Result<()> {
 ///
 /// A file that is already gone is fine; any other failure is COLLECTED (fix round
 /// 4, Q2) — every path is attempted, and the caller reports the ones that could
-/// not be removed instead of discarding the error.
-fn unlink(path: &Path, removed: &mut Vec<PathBuf>, unremoved: &mut Vec<String>) {
+/// not be removed instead of discarding the error. Shared with the import's undo
+/// (fix round 5, P1), so both cleanups collect failures the same way.
+pub(crate) fn unlink(path: &Path, removed: &mut Vec<PathBuf>, unremoved: &mut Vec<String>) {
     #[cfg(test)]
     let injected = publish::probe::take_injected_remove_failure(path);
     #[cfg(not(test))]
@@ -521,8 +528,9 @@ fn unlink(path: &Path, removed: &mut Vec<PathBuf>, unremoved: &mut Vec<String>) 
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] naming every directory whose fsync failed; the
-/// removals themselves are best-effort (a file that is already gone is fine).
+/// Returns an [`anyhow::Error`] naming the entries that could not be removed and
+/// the removals whose directory fsync failed. A file that was already absent is
+/// fine: there is nothing to remove and nothing to sync.
 fn discard_keeping(
     staged: &StagedBackup,
     added: &[PathBuf],
@@ -539,8 +547,24 @@ fn discard_keeping(
         }
         unlink(path, &mut removed, &mut unremoved);
     }
+    finish_removals(&removed, &unremoved)
+}
+
+/// Make every removal durable and report the cleanup as a whole: the ONE report
+/// shape the backup's rollback and the import's undo share (fix round 4, Q2; fix
+/// round 5, P1), so neither can claim a cleanup that did not happen.
+///
+/// Every removal is followed by an fsync of the directory that held the entry —
+/// a rollback a power loss can undo is not a rollback (fix round 3, M2).
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] naming the entries that could not be removed and
+/// the removals whose directory fsync failed. An entry that was already absent is
+/// fine: there is nothing to remove and nothing to sync.
+pub(crate) fn finish_removals(removed: &[PathBuf], unremoved: &[String]) -> anyhow::Result<()> {
     let mut unsynced: Vec<String> = Vec::new();
-    for path in &removed {
+    for path in removed {
         #[cfg(test)]
         publish::probe::record_rollback(publish::probe::RollbackStep::Unlinked {
             path: path.clone(),
@@ -1114,6 +1138,55 @@ mod tests {
                 dest.display()
             );
         }
+    }
+
+    /// Fix round 5, P5: a backup READS the database, so a target whose committed
+    /// rows sit in a quarantined `-wal` must be refused BEFORE anything is read —
+    /// otherwise this run stamps a `pulse-<stamp>.db` as good while it is missing
+    /// exactly those rows. The same refusal the import makes, through the same
+    /// helper, and nothing is written to the out-dir.
+    #[tokio::test]
+    async fn a_backup_refuses_a_target_with_an_orphaned_quarantine() {
+        let (db_path, data_dir, out_dir, _out_store, _head) = backup_fixture().await;
+        let orphan = db_path
+            .parent()
+            .expect("the source's directory")
+            .join(".pulse.db-wal.quarantine-999999");
+        fs::write(&orphan, b"committed rows that are not in the database file")
+            .expect("the quarantine");
+
+        let Err(error) = super::backup_target(&db_path, &data_dir, &out_dir).await else {
+            panic!("an orphaned quarantine must refuse the backup");
+        };
+
+        assert!(
+            error
+                .downcast_ref::<crate::cli::import::OrphanedQuarantines>()
+                .is_some(),
+            "the refusal is the typed one the import uses: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&orphan.display().to_string()),
+            "and it names the quarantine: {message}"
+        );
+        assert!(
+            message.contains(
+                &crate::cli::import::sidecar_path(&db_path, "-wal")
+                    .display()
+                    .to_string()
+            ),
+            "and the name those rows have to go back to: {message}"
+        );
+        let published: Vec<String> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            published.is_empty(),
+            "nothing was published, not even the shared candles store: {published:?}"
+        );
     }
 
     /// Fix round 3, M2: the rollback's removals are made durable — each directory

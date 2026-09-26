@@ -33,6 +33,7 @@ use anyhow::anyhow;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
+use super::backup;
 use super::publish;
 #[cfg(test)]
 use super::publish::probe;
@@ -250,10 +251,32 @@ pub(crate) fn resolve_target_data_dir(over: Option<&PathBuf>) -> anyhow::Result<
 ///
 /// Returns an [`anyhow::Error`] when no home directory is resolvable.
 pub(crate) fn default_backup_out_dir() -> anyhow::Result<PathBuf> {
+    // A test that reaches a safety backup must never write the operator's real
+    // `~/pulse-backups` (fix round 5, P3): it points this at its own tempdir, the
+    // same way `publish::probe` injects sync failures.
+    #[cfg(test)]
+    if let Some(dir) = BACKUP_OUT_DIR_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Ok(dir);
+    }
     let home = directories::BaseDirs::new()
         .map(|d| d.home_dir().to_path_buf())
         .ok_or_else(|| anyhow!("cannot resolve the home directory for the default backup dir"))?;
     Ok(home.join("pulse-backups"))
+}
+
+// Where a test points [`default_backup_out_dir`] (fix round 5, P3), so no test
+// can read or write the operator's real backup directory. `cfg(test)`-only, in
+// the same spirit as `publish::probe`.
+#[cfg(test)]
+thread_local! {
+    static BACKUP_OUT_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point [`default_backup_out_dir`] at `dir` on this thread (fix round 5, P3).
+#[cfg(test)]
+fn override_backup_out_dir(dir: &Path) {
+    BACKUP_OUT_DIR_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(dir.to_path_buf()));
 }
 
 /// The shared verified-copy engine (import over the Mac source; restore over
@@ -314,15 +337,16 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     //
     // The deepest ancestor that exists BEFORE the target's directory is created:
     // every level below it is an entry this run makes, so the install's directory
-    // sync has to cover them (fix round 1, F6).
-    let created_root = job.db_target.parent().and_then(publish::existing_ancestor);
+    // sync has to cover them (fix round 1, F6). A bare relative target resolves
+    // to the current directory, which already exists (fix round 5, P4).
+    let created_root = publish::existing_ancestor(&target_dir(job.db_target));
     if let Some(parent) = job.db_target.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create target directory {}: {e}", parent.display()))?;
     }
-    let tmp_db = temp_db_path(job.db_target, label)?;
+    let tmp_db = temp_db_path(job.db_target, label);
     let source = ops::open_read_only(job.from_db)
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -382,14 +406,7 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
             remove_tmp_db(&tmp_db);
             let undone = undo(&writes);
             print_refusal(label, &mismatches);
-            Err(fold_undo(
-                anyhow!(
-                    "{label}: refused — the temporary database and every snapshot this run added \
-                     were deleted, every pointer it moved was put back, and the target is exactly \
-                     as it was"
-                ),
-                &undone,
-            ))
+            Err(refusal_error(label, &undone))
         }
         Ok((summary, writes)) => {
             // ---- Step 7: the install. Once its rename has landed the database
@@ -1209,8 +1226,34 @@ fn publish_heads(
     changes
 }
 
+/// The error a refused run reports: what happened to the target, plus whatever
+/// the undo could not put back ([`fold_undo`]).
+///
+/// Fix round 5, P1: the "every snapshot this run added were deleted … the target
+/// is exactly as it was" claim is made ONLY when the undo actually finished —
+/// otherwise the message says the target was NOT put back, and the undo below it
+/// names what is still in place.
+fn refusal_error(label: &str, undone: &anyhow::Result<()>) -> anyhow::Error {
+    fold_undo(
+        if undone.is_ok() {
+            anyhow!(
+                "{label}: refused — the temporary database and every snapshot this run added were \
+                 deleted, every pointer it moved was put back, and the target is exactly as it was"
+            )
+        } else {
+            anyhow!(
+                "{label}: refused — the target was NOT put back exactly as it was; see the undo \
+                 below for what is still in place"
+            )
+        },
+        undone,
+    )
+}
+
 /// The error an undone failure reports: the original failure, plus whatever the
-/// store could not put back (fix round 3, M1 — the undo no longer swallows it).
+/// store could not put back (fix round 3, M1 — the undo no longer swallows it) —
+/// a pointer that stayed rewound, or (fix round 5, P1) a snapshot that could not
+/// be deleted or whose removal could not be made durable.
 fn fold_undo(error: anyhow::Error, undone: &anyhow::Result<()>) -> anyhow::Error {
     match undone {
         Ok(()) => error,
@@ -1458,18 +1501,30 @@ pub(crate) fn bytes_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The directory a target lives in (fix round 5, P4).
+///
+/// A bare relative file name (`--db pulse.db`) has an EMPTY parent — `parent()`
+/// answers `Some("")`, not `None` — and `create_dir_all("")`/`File::open("")`
+/// both fail. Every place that needs the directory must therefore resolve that
+/// empty parent to the current directory (`.`) rather than refuse the whole run
+/// after the copy work is done.
+fn target_dir(target: &Path) -> PathBuf {
+    match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 /// The hidden temporary database path BESIDE the target (same directory ⇒ the
-/// install rename is atomic on the same filesystem; never `/tmp`).
-fn temp_db_path(target: &Path, label: &str) -> anyhow::Result<PathBuf> {
-    let dir = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| anyhow!("target {} has no parent directory", target.display()))?;
+/// install rename is atomic on the same filesystem; never `/tmp`). A bare
+/// relative target keeps its temporary in the current directory (fix round 5, P4).
+fn temp_db_path(target: &Path, label: &str) -> PathBuf {
+    let dir = target_dir(target);
     let stem = target
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("pulse");
-    Ok(dir.join(format!(".{stem}.{label}-tmp-{}.db", std::process::id())))
+    dir.join(format!(".{stem}.{label}-tmp-{}.db", std::process::id()))
 }
 
 /// Delete the temporary database and EVERY sidecar a copy can have (failure
@@ -1492,14 +1547,26 @@ fn remove_tmp_db(tmp_db: &Path) {
 ///
 /// # Errors
 ///
-/// Returns whatever [`restore_heads`] could not put back.
+/// Returns what [`restore_heads`] could not put back, and — since fix round 5, P1
+/// — what [`remove_added_snapshots_keeping`] could not remove or make durable.
+/// Both halves are reported: an undo that could not delete a snapshot must never
+/// read as if every snapshot were gone.
 fn unwind_store_writes(target_store: &CandleStore, writes: &StoreWrites) -> anyhow::Result<()> {
     let restored = restore_heads(target_store, &writes.heads);
     let stranded = stranded_pointers(&restored);
-    remove_added_snapshots_keeping(&writes.added, &|path| {
+    let removed = remove_added_snapshots_keeping(&writes.added, &|path| {
         named_by_pointer(target_store, &stranded, path)
     });
-    restored
+    match (restored, removed) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(restore_error), Ok(())) => Err(restore_error),
+        (Ok(()), Err(remove_error)) => Err(remove_error),
+        // Both halves failed: the restore failure is the typed one the caller may
+        // downcast, so it stays the outer error and the removal failure rides with it.
+        (Err(restore_error), Err(remove_error)) => {
+            Err(restore_error.context(format!("[undo] {remove_error}")))
+        }
+    }
 }
 
 /// Delete every snapshot this run added (failure path — the target keeps
@@ -1508,15 +1575,26 @@ fn unwind_store_writes(target_store: &CandleStore, writes: &StoreWrites) -> anyh
 ///
 /// The rollback ALWAYS runs with a keep predicate now: `remove_added_snapshots_keeping(added, &|_|
 /// false)` is the no-keep form the tests use.
-fn remove_added_snapshots_keeping(added: &[PathBuf], keep: &dyn Fn(&Path) -> bool) {
+///
+/// # Errors
+///
+/// Fix round 5, P1: a snapshot that could not be removed, and a removal whose
+/// directory fsync failed, are both reported (through [`backup::finish_removals`],
+/// the same report the backup's rollback uses) instead of being dropped by
+/// `let _ =`. An already-absent snapshot is fine.
+fn remove_added_snapshots_keeping(
+    added: &[PathBuf],
+    keep: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<()> {
+    let mut removed: Vec<PathBuf> = Vec::new();
+    let mut unremoved: Vec<String> = Vec::new();
     for path in added {
         if keep(path) {
             continue;
         }
-        let _ = fs::remove_file(path);
-        #[cfg(test)]
-        probe::record_rollback(probe::RollbackStep::Unlinked { path: path.clone() });
+        backup::unlink(path, &mut removed, &mut unremoved);
     }
+    backup::finish_removals(&removed, &unremoved)
 }
 
 /// The suffixes `SQLite` puts a database's own un-checkpointed state in: the
@@ -1534,8 +1612,9 @@ const COPY_SIDECAR_SUFFIXES: [&str; 4] = ["-wal", "-shm", "-journal", ".partial"
 
 /// Append a suffix to a path's FINAL component, through the raw `OsStr` — never
 /// `display()`, which is lossy for a name that is not valid UTF-8 (the migration
-/// protocol's own `sidecar_path` does the same; fix round 1, F7).
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+/// protocol's own `sidecar_path` does the same; fix round 1, F7). Shared with the
+/// backup's tests, which assert the name the refusal names (fix round 5, P5).
+pub(crate) fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
@@ -1597,14 +1676,14 @@ fn refuse_stranded_sidecar(tmp_db: &Path) -> anyhow::Result<()> {
 /// The quarantine name of one of the target's sidecars: a hidden sibling that no
 /// database name matches, unique to this process, and therefore inert even if a
 /// crash leaves one behind.
+///
+/// A bare relative target (`--db pulse.db`) quarantines into the current
+/// directory, which is where its sidecars are (fix round 5, P4).
 fn quarantine_path(target: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
     let name = target
         .file_name()
         .ok_or_else(|| anyhow!("unusable target path: {}", target.display()))?;
-    let dir = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| anyhow!("target {} has no parent directory", target.display()))?;
+    let dir = target_dir(target);
     // Built from the raw `OsStr` (fix round 2, N6): a target whose file name is
     // not valid UTF-8 must still get a usable quarantine name — going through
     // `to_str()`/`format!` refuses it outright, and `display()` would rewrite the
@@ -1836,8 +1915,9 @@ impl std::fmt::Display for OrphanedQuarantines {
 /// # Errors
 ///
 /// Returns [`OrphanedQuarantines`] when any quarantine of the target's own
-/// sidecars is still beside it.
-fn refuse_orphaned_quarantines(target: &Path) -> anyhow::Result<()> {
+/// sidecars is still beside it. Shared with `pulse backup` (fix round 5, P5),
+/// which must refuse for the same reason before it READS the database.
+pub(crate) fn refuse_orphaned_quarantines(target: &Path) -> anyhow::Result<()> {
     let stranded = orphaned_quarantines(target);
     if stranded.is_empty() {
         return Ok(());
@@ -1851,14 +1931,15 @@ fn refuse_orphaned_quarantines(target: &Path) -> anyhow::Result<()> {
 
 /// The quarantine files an interrupted install left beside `target`, each with
 /// the name it has to go back to. ANY pid counts: the run that made them is gone.
+///
+/// A bare relative target is scanned in the current directory, where its
+/// quarantine files would be (fix round 5, P4).
 fn orphaned_quarantines(target: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let Some(dir) = target.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Vec::new();
-    };
+    let dir = target_dir(target);
     let Some(name) = target.file_name() else {
         return Vec::new();
     };
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
     let mut stranded: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -1962,35 +2043,41 @@ async fn install_tmp_db(
             ),
         }));
     }
-    let installed = |unconfirmed: &str, error: anyhow::Error| InstallFailure::Installed {
+    let installed = |error: anyhow::Error| InstallFailure::Installed {
         target: target.to_path_buf(),
-        error: anyhow!("{unconfirmed}: {error}"),
+        error,
     };
     // 4. The database those sidecars belonged to is GONE, so they go NOW — before
     //    the directory sync and the WAL switch can fail (fix round 3, M3): no
     //    quarantine file may outlive a landed install on any path.
+    //
+    //    A cleanup that FAILS must not skip the two steps that make the install
+    //    durable (fix round 5, P2): a leftover quarantine is a mess, a database
+    //    that is neither durable nor in WAL is a data-loss risk. Every step runs,
+    //    and the error names all of it.
+    let mut failures: Vec<String> = Vec::new();
     if let Err(error) = quarantined.discard() {
-        return Err(installed(
-            "the replaced database's quarantined sidecars could not all be cleaned up",
-            error,
+        failures.push(format!(
+            "the replaced database's quarantined sidecars could not all be cleaned up: {error}"
         ));
     }
     // 5. The rename is durable only once the directory that received it is
     //    fsynced — including every level this run created (issue #259, F6).
     if let Err(error) = publish::sync_published(target, created) {
-        return Err(installed(
-            "its directory could not be fsynced, so the new name is not durable",
-            error,
+        failures.push(format!(
+            "its directory could not be fsynced, so the new name is not durable: {error}"
         ));
     }
     // 6. ADR-0019, deterministically (F4): the installed file is in WAL, read
     //    back, before this command reports success — never left to the next
     //    process to fix with a fire-and-forget pragma.
     if let Err(error) = put_in_wal(target).await {
-        return Err(installed(
-            "it could not be put back in WAL, so the production journal mode is not in place",
-            anyhow::Error::new(error),
+        failures.push(format!(
+            "it could not be put back in WAL, so the production journal mode is not in place: {error}"
         ));
+    }
+    if !failures.is_empty() {
+        return Err(installed(anyhow!("{}", failures.join("; and "))));
     }
     Ok(())
 }
@@ -2075,6 +2162,29 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A cwd guard for the bare-relative-target tests (fix round 5, P4): the test
+    /// moves the process cwd into a tempdir and puts it back on drop. Safe here for
+    /// the reason `tests/secrets_profile.rs` documents — nextest runs each test in
+    /// its own process — and it is what makes a bare `--db pulse.db` resolvable at
+    /// all, since such a target is by definition relative to the cwd.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let original = std::env::current_dir().expect("record the cwd");
+            std::env::set_current_dir(dir).expect("move the process cwd");
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
     /// A recursive copy (the fixture store is a directory tree).
     fn copy_tree(from: &Path, to: &Path) {
         fs::create_dir_all(to).expect("create the destination directory");
@@ -2092,7 +2202,7 @@ mod tests {
     /// Everything an in-process import needs: a migrated source database and the
     /// committed fixture store as the source data dir, plus fresh target paths.
     struct Flow {
-        _dir: TempDir,
+        dir: TempDir,
         source_db: PathBuf,
         source_data: PathBuf,
         target_db: PathBuf,
@@ -2114,7 +2224,7 @@ mod tests {
         let target_db = dir.path().join("server").join("pulse.db");
         let target_data = dir.path().join("server-data");
         Flow {
-            _dir: dir,
+            dir,
             source_db,
             source_data,
             target_db,
@@ -2733,7 +2843,19 @@ mod tests {
         let orphan = target_dir.join(".pulse.db-wal.quarantine-999999");
         fs::write(&orphan, b"the old target's un-checkpointed rows").expect("the quarantine");
         // `--replace` would back the non-empty target up first: the refusal must
-        // come before that, so no safety backup may be written.
+        // come before that, so no safety backup may be written. The out-dir is a
+        // tempdir (fix round 5, P3): no test reads or writes the operator's real
+        // `~/pulse-backups`.
+        let out_dir = flow.dir.path().join("pulse-backups");
+        super::override_backup_out_dir(&out_dir);
+        // The line that keeps this test off the operator's machine (fix round 5,
+        // P3): the out-dir a safety backup would use IS this tempdir — never the
+        // real `~/pulse-backups` the seam replaced.
+        assert_eq!(
+            super::default_backup_out_dir().expect("the out-dir resolves"),
+            out_dir,
+            "the test's safety-backup out-dir must be its own tempdir"
+        );
         let mut job = import_job(&flow);
         job.replace = true;
 
@@ -2762,8 +2884,7 @@ mod tests {
             orphan.exists(),
             "and the quarantine is still there to be moved back"
         );
-        let backup_dir = super::super::import::default_backup_out_dir().expect("the backup dir");
-        let backups: Vec<String> = fs::read_dir(&backup_dir)
+        let backups: Vec<String> = fs::read_dir(&out_dir)
             .map(|entries| {
                 entries
                     .flatten()
@@ -2840,6 +2961,306 @@ mod tests {
             !dest.exists(),
             "and the snapshot this run added is gone: {}",
             dest.display()
+        );
+    }
+
+    /// Fix round 5, P1: the undo must not DROP a snapshot-removal failure — an
+    /// undo that could not delete a snapshot cannot read as if every snapshot
+    /// were gone, so the failure is collected, named, and carried by the
+    /// caller's report (`fold_undo`).
+    #[tokio::test]
+    async fn the_imports_undo_reports_a_snapshot_it_cannot_remove() {
+        let flow = flow().await;
+        let target_store = CandleStore::with_base_dir(flow.target_data.clone());
+        let (source_snapshots, issues) = scan_snapshots(&flow.source_data);
+        assert!(issues.is_empty(), "the fixture store is well-formed");
+        let snapshot = &source_snapshots[0];
+        let dest =
+            target_store.snapshot_path(&snapshot.pair, snapshot.timeframe, &snapshot.version);
+        fs::create_dir_all(dest.parent().expect("the leaf's directory"))
+            .expect("create the leaf's directory");
+        fs::write(&dest, b"a copied snapshot").expect("write the copied snapshot");
+        let writes = super::StoreWrites {
+            added: vec![dest.clone()],
+            heads: Vec::new(),
+        };
+        publish::probe::fail_next_remove_of(&dest);
+
+        let undone = super::unwind_store_writes(&target_store, &writes)
+            .expect_err("the undo cannot remove the snapshot");
+        let message = format!("{undone:#}");
+        assert!(
+            message.contains(&dest.display().to_string()),
+            "the undo names the snapshot it could not remove: {message}"
+        );
+        assert!(
+            message.contains("could not be removed"),
+            "and says what could not be done with it: {message}"
+        );
+        assert!(
+            dest.exists(),
+            "the bytes are still there — the undo must not report them gone: {}",
+            dest.display()
+        );
+
+        // The run's own report carries the incomplete undo: it can no longer say
+        // that every snapshot this run added was deleted.
+        let folded = super::fold_undo(anyhow::anyhow!("the step failed"), &Err(undone));
+        let folded_message = format!("{folded:#}");
+        assert!(
+            folded_message.contains("the step failed") && folded_message.contains("[undo]"),
+            "the failure keeps the original error and the undo's: {folded_message}"
+        );
+        assert!(
+            folded_message.contains(&dest.display().to_string()),
+            "and the snapshot that is still there is named: {folded_message}"
+        );
+    }
+
+    /// Fix round 5, P1: the undo's removals are made durable too — every directory
+    /// that held a removed snapshot is fsynced after the unlink (the same rule the
+    /// backup's rollback follows, M2) — and a removal whose fsync fails is reported
+    /// rather than dropped.
+    #[tokio::test]
+    async fn the_imports_undo_makes_its_removals_durable() {
+        let flow = flow().await;
+        let target_store = CandleStore::with_base_dir(flow.target_data.clone());
+        let (source_snapshots, issues) = scan_snapshots(&flow.source_data);
+        assert!(issues.is_empty(), "the fixture store is well-formed");
+        let snapshot = &source_snapshots[0];
+        let dest =
+            target_store.snapshot_path(&snapshot.pair, snapshot.timeframe, &snapshot.version);
+        fs::create_dir_all(dest.parent().expect("the leaf's directory"))
+            .expect("create the leaf's directory");
+        fs::write(&dest, b"a copied snapshot").expect("write the copied snapshot");
+        let writes = super::StoreWrites {
+            added: vec![dest.clone()],
+            heads: Vec::new(),
+        };
+        let _ = publish::probe::take();
+
+        super::unwind_store_writes(&target_store, &writes).expect("the undo runs");
+
+        assert!(
+            !dest.exists(),
+            "the snapshot is removed: {}",
+            dest.display()
+        );
+        let syncs = publish::probe::take();
+        assert!(
+            syncs.iter().any(|event| {
+                event.kind == publish::probe::SyncKind::Dir
+                    && event.destination == dest
+                    && !event.destination_present
+            }),
+            "the removal of {} is made durable (a directory sync AFTER the unlink): {syncs:?}",
+            dest.display()
+        );
+
+        // And when that fsync fails, the undo says so instead of claiming a
+        // cleanup that a power loss can undo.
+        fs::create_dir_all(dest.parent().expect("the leaf's directory"))
+            .expect("re-create the leaf's directory");
+        fs::write(&dest, b"a copied snapshot").expect("write it again");
+        let _ = publish::probe::take();
+        publish::probe::fail_next_sync_of(dest.parent().expect("the leaf's directory"));
+
+        let undone = super::unwind_store_writes(&target_store, &writes)
+            .expect_err("the injected directory sync failure is reported");
+        let message = format!("{undone:#}");
+        assert!(
+            message.contains("could not be made durable"),
+            "the undo says the removal is not durable: {message}"
+        );
+        assert!(
+            message.contains(&dest.display().to_string()),
+            "and names it: {message}"
+        );
+    }
+
+    /// Fix round 5, P2: a quarantine cleanup that fails must NOT skip the two
+    /// steps that make the install durable. The leftover quarantine is named AND
+    /// the installed file is still fsynced and put back in WAL — asserted from the
+    /// file's own header, so this is the state on disk, not a code path.
+    #[tokio::test]
+    async fn a_failed_quarantine_cleanup_still_syncs_and_switches_to_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        fs::write(&target, b"the old target").expect("write the old target");
+        let sidecar = sidecar_path(&target, "-wal");
+        fs::write(&sidecar, b"the old target's rows").expect("write the -wal");
+        let quarantine = super::quarantine_path(&target, "-wal").expect("the quarantine name");
+        publish::probe::fail_next_remove_of(&quarantine);
+        let _ = publish::probe::take();
+
+        let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect_err("the quarantine cannot be cleaned up");
+
+        // The cleanup failure is reported — and the install is NOT left in the
+        // half-done state the early return used to leave it in.
+        let InstallFailure::Installed { error, .. } = failure else {
+            panic!("the rename landed, so the database IS installed: {failure:?}");
+        };
+        assert!(
+            error.to_string().contains("could not all be cleaned up"),
+            "the error reports the cleanup failure: {error}"
+        );
+        let syncs = publish::probe::take();
+        assert!(
+            syncs.iter().any(|event| {
+                event.kind == publish::probe::SyncKind::Dir
+                    && event.destination == target
+                    && event.destination_present
+            }),
+            "the directory sync still ran after the failed cleanup: {syncs:?}"
+        );
+        let header = fs::read(&target).expect("read the installed database");
+        assert_eq!(
+            (header.get(18), header.get(19)),
+            (Some(&2), Some(&2)),
+            "and the installed file's own header says WAL, cleanup failure or not"
+        );
+    }
+
+    /// Fix round 5, P4: the quarantine a bare relative target's sidecars need
+    /// resolves to the current directory — and the scan for an interrupted
+    /// install's leftovers looks there too. `parent()` on `pulse.db` is `Some("")`,
+    /// not `None`, so this is the exact case that used to answer "has no parent
+    /// directory" after the whole copy had run.
+    #[test]
+    fn a_bare_relative_targets_quarantine_lands_in_the_current_directory() {
+        let pid = std::process::id();
+        assert_eq!(
+            super::quarantine_path(Path::new("pulse.db"), "-wal")
+                .expect("a bare relative target has a usable directory"),
+            PathBuf::from(".").join(format!(".pulse.db-wal.quarantine-{pid}")),
+            "a sidecar's quarantine is a hidden sibling in the current directory"
+        );
+        assert_eq!(
+            super::orphaned_quarantines(&PathBuf::from("pulse.db")).len(),
+            0,
+            "the same directory is where the orphan scan looks (nothing is stranded here)"
+        );
+    }
+
+    /// Fix round 5, P4: `--db pulse.db` is a relative target whose parent is the
+    /// EMPTY path (not `None`). It must install into the current directory — the
+    /// same #258 contract, no temporary and no sidecar left beside it — instead of
+    /// failing with "has no parent directory" after the whole copy ran.
+    #[tokio::test]
+    async fn a_bare_relative_target_installs_into_the_current_directory() {
+        let flow = flow().await;
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let _guard = CwdGuard::enter(cwd.path());
+        let target = Path::new("pulse.db");
+        let data_target = Path::new("server-data");
+        let _ = publish::probe::take();
+
+        run_verified_copy(VerifiedCopy {
+            source_label: "import",
+            from_db: &flow.source_db,
+            from_data_dir: &flow.source_data,
+            db_target: target,
+            data_target,
+            head_source: HeadSource::SourceStore,
+            replace: false,
+            chmod_source: false,
+        })
+        .await
+        .expect("a bare relative target installs");
+
+        let installed = cwd.path().join("pulse.db");
+        assert!(
+            installed.is_file(),
+            "the database landed in the current directory: {}",
+            installed.display()
+        );
+        // The file's own header proves the post-rename steps ran — the WAL switch
+        // is the last step, and it is reached only when the directory sync ran.
+        let header = fs::read(&installed).expect("read the installed database");
+        assert_eq!(
+            (header.get(18), header.get(19)),
+            (Some(&2), Some(&2)),
+            "and it is in WAL when the run returns"
+        );
+        let syncs = publish::probe::take();
+        assert!(
+            syncs.iter().any(|event| {
+                event.kind == publish::probe::SyncKind::Dir
+                    && event.destination == target
+                    && event.destination_present
+            }),
+            "the install's directory sync covered the current directory: {syncs:?}"
+        );
+        // The #258 contract, on a path that never had a directory to work in: no
+        // sidecar that could hold state, no quarantine, and no temporary database.
+        // The migration protocol's own `.migrate.lock` marker is excluded on
+        // purpose: it is an empty lock, carries no rows, and is a separate
+        // pre-existing leftover (reported to the ledger, not widened into this
+        // round).
+        let left: Vec<String> = fs::read_dir(cwd.path())
+            .expect("read the current directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| {
+                let temporary = name.contains("import-tmp") && !name.ends_with(".migrate.lock");
+                temporary
+                    || name.contains(".quarantine-")
+                    || name.ends_with("-wal")
+                    || name.ends_with("-shm")
+                    || name.ends_with("-journal")
+            })
+            .collect();
+        assert!(left.is_empty(), "nothing is stranded beside it: {left:?}");
+    }
+
+    /// Fix round 5, P4: the orphan scan of a bare relative target looks in the
+    /// CURRENT directory — where its quarantine files are — so an interrupted
+    /// install's leftovers are refused rather than read past.
+    #[tokio::test]
+    async fn a_bare_relative_targets_orphaned_quarantine_refuses_the_run() {
+        let flow = flow().await;
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let _guard = CwdGuard::enter(cwd.path());
+        let orphan = cwd.path().join(".pulse.db-wal.quarantine-999999");
+        fs::write(&orphan, b"the target's un-checkpointed rows").expect("the quarantine");
+
+        let error = run_verified_copy(VerifiedCopy {
+            source_label: "import",
+            from_db: &flow.source_db,
+            from_data_dir: &flow.source_data,
+            db_target: Path::new("pulse.db"),
+            data_target: Path::new("server-data"),
+            head_source: HeadSource::SourceStore,
+            replace: false,
+            chmod_source: false,
+        })
+        .await
+        .expect_err("an orphaned quarantine refuses the run");
+
+        assert!(
+            error.downcast_ref::<super::OrphanedQuarantines>().is_some(),
+            "the refusal is typed: {error:?}"
+        );
+        // The scan resolved the bare target's EMPTY parent to the current
+        // directory: the quarantine it names is the one planted here (its path is
+        // relative — `./.pulse.db-wal.quarantine-…` — because the target is).
+        let message = error.to_string();
+        assert!(
+            message.contains(".pulse.db-wal.quarantine-999999"),
+            "and names the quarantine in the current directory: {message}"
+        );
+        assert!(
+            message.contains("pulse.db-wal"),
+            "and the name those rows have to go back to: {message}"
+        );
+        assert!(
+            orphan.exists() && !cwd.path().join("pulse.db").exists(),
+            "nothing was installed and the quarantine is still there to be moved back"
         );
     }
 
@@ -2935,7 +3356,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_copy_flush_removes_the_temporary() {
         let flow = flow().await;
-        let tmp_db = super::temp_db_path(&flow.target_db, "import").expect("the temporary name");
+        let tmp_db = super::temp_db_path(&flow.target_db, "import");
         publish::probe::fail_next_file_sync();
 
         let error = run_verified_copy(import_job(&flow))
@@ -3092,7 +3513,7 @@ mod tests {
             "the failure is the injected sync: {error}"
         );
 
-        remove_added_snapshots_keeping(&added, &|_| false);
+        remove_added_snapshots_keeping(&added, &|_| false).expect("the snapshot is removable");
         assert!(
             !dest.exists(),
             "the rollback removed the snapshot the failed copy published"

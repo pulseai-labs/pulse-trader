@@ -87,7 +87,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   snapshot (`candles/<PAIR>/<TF>/`, including the directory levels a copy
   creates), the installed database, the backup database and the backup's own
   manifest each fsync the directory they landed in, so a power loss cannot keep a
-  backup's database while losing a snapshot it references. Refs
+  backup's database while losing a snapshot it references. An install interrupted
+  between moving the replaced database's sidecars aside and landing its rename
+  leaves those files beside the target under quarantine names; the import and
+  `pulse backup` (including the `--replace` safety backup) now REFUSE such a
+  target — naming every file and the name its rows have to go back to — rather
+  than read past rows that are not in the database file. Refs
   [#258](https://github.com/pulseai-labs/pulse-trader/issues/258),
   [#259](https://github.com/pulseai-labs/pulse-trader/issues/259).
 
