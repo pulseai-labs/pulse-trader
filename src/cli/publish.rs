@@ -129,6 +129,13 @@ pub(crate) fn sync_dir(dir: &Path) -> anyhow::Result<()> {
 /// Returns an [`anyhow::Error`] naming the file when it cannot be opened or
 /// synced.
 pub(crate) fn sync_file(file: &Path, destination: &Path) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if probe::take_injected_file_failure() {
+        return Err(anyhow::anyhow!(
+            "fsync file {}: injected failure (cfg(test) seam)",
+            file.display()
+        ));
+    }
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -150,6 +157,14 @@ pub(crate) fn sync_file(file: &Path, destination: &Path) -> anyhow::Result<()> {
 /// Returns an [`anyhow::Error`] when any level cannot be opened or synced.
 pub(crate) fn sync_published(published: &Path, created: Option<&Path>) -> anyhow::Result<()> {
     for dir in levels_to_sync(published, created) {
+        #[cfg(test)]
+        if probe::take_injected_publish_failure(published) {
+            return Err(anyhow::anyhow!(
+                "fsync directory {}: injected failure for {} (cfg(test) seam)",
+                dir.display(),
+                published.display()
+            ));
+        }
         sync_dir(&dir)?;
         #[cfg(test)]
         probe::record(probe::SyncKind::Dir, &dir, published);
@@ -172,7 +187,7 @@ pub(crate) fn sync_published(published: &Path, created: Option<&Path>) -> anyhow
 /// in production.
 #[cfg(test)]
 pub(crate) mod probe {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
 
     /// Which kind of sync an event records.
@@ -243,6 +258,71 @@ pub(crate) mod probe {
     /// Take every quarantined path recorded on this thread so far.
     pub(crate) fn take_quarantine() -> Vec<PathBuf> {
         QUARANTINED.with(|quarantined| std::mem::take(&mut *quarantined.borrow_mut()))
+    }
+
+    thread_local! {
+        /// A one-shot: the next publish of a destination with this extension
+        /// fails its first directory sync.
+        static FAIL_NEXT_PUBLISH_EXTENSION: RefCell<Option<String>> = const { RefCell::new(None) };
+
+        /// A one-shot file-sync failure (the `sync_all` before a rename).
+        static FAIL_NEXT_FILE_SYNC: Cell<bool> = const { Cell::new(false) };
+
+        /// A one-shot rename failure, keyed on the rename's destination.
+        static FAIL_NEXT_RENAME_TO: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Make the next publish OF A DESTINATION WITH THIS EXTENSION fail its first
+    /// directory sync, one-shot.
+    ///
+    /// [`fail_next_sync_of`] keys on the directory, which every publish into that
+    /// directory shares; this keys on WHICH FILE is being published, so a test
+    /// can drive one publish in a sequence into its post-rename failure (the
+    /// backup's database publish, while its manifest publish succeeds).
+    pub(crate) fn fail_next_publish_with_extension(extension: &str) {
+        FAIL_NEXT_PUBLISH_EXTENSION
+            .with(|pending| *pending.borrow_mut() = Some(extension.to_owned()));
+    }
+
+    /// Consume the pending publish failure when it names `published`'s extension.
+    pub(crate) fn take_injected_publish_failure(published: &Path) -> bool {
+        FAIL_NEXT_PUBLISH_EXTENSION.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            let matches = pending.as_deref() == published.extension().and_then(|e| e.to_str());
+            if matches {
+                *pending = None;
+            }
+            matches
+        })
+    }
+
+    /// Make the next FILE sync fail, one-shot (the seam the copy-flush tests
+    /// need: `sync_all` is the step whose failure leaves a temporary behind).
+    pub(crate) fn fail_next_file_sync() {
+        FAIL_NEXT_FILE_SYNC.with(|pending| pending.set(true));
+    }
+
+    /// Consume the pending file-sync failure.
+    pub(crate) fn take_injected_file_failure() -> bool {
+        FAIL_NEXT_FILE_SYNC.with(|pending| pending.replace(false))
+    }
+
+    /// Make the next rename ONTO `destination` fail, one-shot (the seam the
+    /// quarantine-restore test needs).
+    pub(crate) fn fail_next_rename_to(destination: &Path) {
+        FAIL_NEXT_RENAME_TO.with(|pending| *pending.borrow_mut() = Some(destination.to_path_buf()));
+    }
+
+    /// Consume the pending rename failure when it targets `destination`.
+    pub(crate) fn take_injected_rename_failure(destination: &Path) -> bool {
+        FAIL_NEXT_RENAME_TO.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            let matches = pending.as_deref() == Some(destination);
+            if matches {
+                *pending = None;
+            }
+            matches
+        })
     }
 
     /// Make the NEXT sync of `dir` fail, one-shot.

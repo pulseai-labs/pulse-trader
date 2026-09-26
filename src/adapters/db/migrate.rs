@@ -305,13 +305,15 @@ pub(crate) async fn open_migrated_copy(db_path: &Path) -> Result<Db, DataError> 
 /// [`DataError::Db`] when the database cannot be opened, the mode cannot be
 /// read, or it reports anything but WAL.
 pub(crate) async fn put_in_wal(db_path: &Path) -> Result<(), DataError> {
-    // ONE connection, never a pool (review correction on F4): a pool's `close`
+    // ONE connection, never a pool — and it must STAY that way. A pool's `close`
     // can return with a connection still in flight, and the sidecars that close
-    // lands late are exactly #258's failure mode. `Connection::close` shuts this
-    // connection's worker thread down SYNCHRONOUSLY — the worker drops its
-    // `SQLite` handle (which checkpoints and unlinks the `-wal`/`-shm` this
-    // switch created) before it acknowledges — so when this returns, the file is
-    // released and the directory holds the database alone.
+    // lands late are exactly #258's failure mode; no test pins this reliably (the
+    // race did not fire in 80 loaded iterations — fix round 2, X1), so it is kept
+    // by construction. `Connection::close` shuts this connection's worker thread
+    // down SYNCHRONOUSLY — the worker drops its `SQLite` handle (which
+    // checkpoints and unlinks the `-wal`/`-shm` this switch created) before it
+    // acknowledges — so when this returns, the file is released and the directory
+    // holds the database alone.
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .journal_mode(SqliteJournalMode::Wal)
