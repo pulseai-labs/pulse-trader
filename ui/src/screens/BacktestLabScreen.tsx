@@ -17,7 +17,7 @@
 // default export, zero props — the shell mounts it from the route table and
 // all state is its own.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { commands } from "../bindings";
 import type {
@@ -198,6 +198,198 @@ function useWalkForward(operations: ActiveOperations, versionId: string | null) 
   );
 
   return { state, folds, setFolds, start, openFold };
+}
+
+// ---------------------------------------------------------------------------
+// The persisted walk-forward run (#268) — the version's catalogue pointer
+// ---------------------------------------------------------------------------
+//
+// r3.s3's d29: a walk-forward run FINISHES on the server while the client is
+// away, and on relaunch its six fold rows and its verdict must still be on
+// screen — the run that was STARTED, not a restarted one. The server keeps the
+// run, the catalogue the Lab already reads carries the answer to "which run"
+// (`LibraryVersion.latestWalkForwardRunId`), and `getWalkForwardRun` reads that
+// run back in the SAME DTO `runWalkForwardVersion` answers with. So the Lab
+// renders a persisted run through the same `WalkForwardResult` the fresh path
+// uses, and starts nothing.
+
+/** The persisted read, in the pane's own four shapes. */
+type ReopenedState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "failed"; error: BusError }
+  | { kind: "done"; dto: WalkForwardRunDto };
+
+/** A read's state TOGETHER WITH the run id it is the answer for. The tag is what
+ * keeps an answer off a version it was not read for (review F1). */
+type HeldReopened = {
+  /** The run id this state belongs to; `null` while nothing has been read. */
+  readonly id: string | null;
+  readonly state: ReopenedState;
+};
+
+/** The read's own operational failure — the shape every other IPC failure uses. */
+function readFailure(): BusError {
+  return {
+    code: "internal",
+    message: "The walk-forward read failed.",
+    run_id: null, session_id: null, child_run_id: null,
+  };
+}
+
+/** The read's state for THIS target. A state held for another run id is not this
+ * target's answer, so it reads as the in-flight state — never as a run or a
+ * failure belonging to a version the trader has already left (review F1). */
+function reopenedStateFor(held: HeldReopened, target: string | null): ReopenedState {
+  if (target === null) return { kind: "idle" };
+  return held.id === target ? held.state : { kind: "loading" };
+}
+
+/**
+ * Read the version's persisted walk-forward run, when this session holds no
+ * walk-forward operation for it.
+ *
+ * **The record wins (#268).** The record lookup in `target` is what keeps this
+ * read from ever standing in front of the run the trader asked for: a version
+ * that has walked forward this session — running or settled, success or failure
+ * — has a record, so it is never read for and never re-read. A version whose
+ * catalogue row carries no pointer is never read for either, and renders no
+ * pane at all.
+ *
+ * **An answer belongs to the id it was read for (review F1).** The state is held
+ * WITH its run id and handed out through `reopenedStateFor`, so the render that
+ * lands when the selection moves — before this hook's effect has re-armed — shows
+ * the NEW target's in-flight state rather than the run (or the failure) of the
+ * version the trader just left. There is no `alive` flag to lean on instead: a
+ * tag is strictly stronger, because a late answer arrives carrying its own id and
+ * is therefore ignored by a new target's render for as long as the ids differ.
+ *
+ * **A refetch re-reads (review F2).** The effect keys on the version OBJECT, not
+ * on its id — `CompareWithParent`'s rule — so the focus refetch's fresh payload
+ * re-reads the pointer, and a read that failed on a dead connection retries
+ * instead of leaving a permanent error card. React's StrictMode re-runs a mount's
+ * effects with the SAME props objects; `lastRead` deduplicates that, so one mount
+ * is one read.
+ *
+ * **Only the newest read writes (review N1/N2).** An id tag alone still let a
+ * slow answer for the version the trader left overwrite the live one — and since
+ * that stale id no longer matches the target, the pane then read as loading for
+ * good, with no further effect to run. So each started read takes a generation,
+ * and `settle` drops anything that is not the current one.
+ */
+function useReopenedWalkForward(
+  operations: ActiveOperations,
+  version: LibraryVersion | null,
+): ReopenedState {
+  const target =
+    version !== null && operations.lookup(walkForwardKey(version.id)) === undefined
+      ? version.latestWalkForwardRunId
+      : null;
+  const [held, setHeld] = useState<HeldReopened>({
+    id: null,
+    state: { kind: "idle" },
+  });
+  /** The inputs the last read was started for — see the StrictMode note above. */
+  const lastRead = useRef<{
+    version: LibraryVersion | null;
+    target: string | null;
+  } | null>(null);
+  /** Which read the pane is waiting for. Only the NEWEST one may write: a
+   * superseded read's answer is dropped whatever it says, the operation store's
+   * own rule ("a late result drops instead of speaking for an operation that is
+   * not it"). Without it, a slow answer for the version the trader left could
+   * overwrite the live one and strand the pane on "Opening…". */
+  const generation = useRef(0);
+
+  useEffect(() => {
+    if (target === null) {
+      generation.current += 1;
+      lastRead.current = null;
+      // Same-shaped state in, same object out: a refetch of a version with no
+      // pointer re-renders nothing.
+      setHeld((current) =>
+        current.id === null ? current : { id: null, state: { kind: "idle" } },
+      );
+      return;
+    }
+    if (lastRead.current?.version === version && lastRead.current.target === target) {
+      return;
+    }
+    // A read starts only where NOTHING is held for this id yet, or where the last
+    // one FAILED — F2's retry, and the only same-pointer re-read there is. A
+    // loaded run is immutable and is therefore never revalidated: the focus
+    // refetch cannot spend a second read on it, and a transient refresh failure
+    // cannot evict a run the trader is reading (review P2-B). A read already in
+    // flight is not restarted by a refetch either. `held` is read as the render
+    // that changed these deps saw it, and is deliberately NOT a dependency: the
+    // state this effect writes would otherwise re-run it.
+    if (held.id === target && (held.state.kind === "done" || held.state.kind === "loading")) {
+      return;
+    }
+    lastRead.current = { version, target };
+    // Claimed only where a read actually starts, so the StrictMode replay above
+    // cannot supersede the read it is deduplicating.
+    const mine = (generation.current += 1);
+    // A result already held for this id is kept while the re-read runs: a
+    // refetch may confirm it, and a flash of "Opening…" over a rendered table
+    // would be noise. A failure re-arm IS shown, because that is the retry.
+    setHeld((current) =>
+      current.id === target && current.state.kind === "done"
+        ? current
+        : { id: target, state: { kind: "loading" } },
+    );
+    const settle = (next: ReopenedState) => {
+      if (generation.current !== mine) return;
+      setHeld({ id: target, state: next });
+    };
+    try {
+      commands
+        .getWalkForwardRun({ walkForwardRunId: target })
+        .then((result) => {
+          settle(
+            result.status === "ok"
+              ? { kind: "done", dto: result.data }
+              : { kind: "failed", error: result.error },
+          );
+        })
+        .catch(() => {
+          // The IPC call itself failing — the honest error state, never a
+          // fabricated pane (the Library's read answers the same way).
+          settle({ kind: "failed", error: readFailure() });
+        });
+    } catch {
+      // A binding that is not wired throws BEFORE returning a promise, the same
+      // path the operation store guards.
+      settle({ kind: "failed", error: readFailure() });
+    }
+  }, [version, target]);
+
+  return reopenedStateFor(held, target);
+}
+
+/** The pane's state: this session's own operation, or the persisted read behind
+ * it. `reopened` marks the result as a run that was READ, not produced here. */
+type PaneState =
+  | { kind: "idle" }
+  | { kind: "running" }
+  | { kind: "reopening" }
+  | { kind: "failed"; error: BusError }
+  | { kind: "done"; dto: WalkForwardRunDto; reopened?: boolean };
+
+/** The record wins wherever it exists; the persisted read answers only where no
+ * record does (#268). */
+function paneStateOf(record: WalkForwardState, reopened: ReopenedState): PaneState {
+  if (record.kind === "running") return { kind: "running" };
+  if (record.kind === "failed") return { kind: "failed", error: record.error };
+  if (record.kind === "done") return { kind: "done", dto: record.dto };
+  if (reopened.kind === "loading") return { kind: "reopening" };
+  if (reopened.kind === "failed") {
+    return { kind: "failed", error: reopened.error };
+  }
+  if (reopened.kind === "done") {
+    return { kind: "done", dto: reopened.dto, reopened: true };
+  }
+  return { kind: "idle" };
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +638,7 @@ export default function BacktestLabScreen() {
    * a walk-forward is K engine runs, so it holds Run's latch discipline. */
   const busy = run.kind === "running" || wf.state.kind === "running";
 
-  /** The selected version's own record — the compare section needs its
+  /** This version's own record — the compare section needs its
    * `parentId` and `recentRuns`, which the selector's flattened options drop. */
   const selectedVersion =
     catalog.kind === "ready"
@@ -454,6 +646,11 @@ export default function BacktestLabScreen() {
           .flatMap((strategy) => strategy.versions)
           .find((version) => version.id === currentId) ?? null)
       : null;
+
+  /** #268: the version's persisted walk-forward run, read when this session has
+   * no record of its own — what makes a finished run openable after a relaunch. */
+  const reopened = useReopenedWalkForward(operations, selectedVersion);
+  const pane = paneStateOf(wf.state, reopened);
 
   /** Selecting a version shows THAT version's operation. Nothing is cleared and
    * nothing is cancelled: each version's record is its own, so a run still going
@@ -661,8 +858,10 @@ export default function BacktestLabScreen() {
         )}
 
       {/* r2.s3.w5: the walk-forward result pane sits ABOVE the run result —
-          a fold row's "open run" lands in the ordinary result view below it. */}
-      <WalkForwardPane state={wf.state} onOpenFold={wf.openFold} />
+          a fold row's "open run" lands in the ordinary result view below it.
+          #268: it renders this session's own run, or the version's persisted
+          one read back by id. */}
+      <WalkForwardPane state={pane} onOpenFold={wf.openFold} />
 
       {run.kind === "running" && (
         <div className="bt-state dim" role="status">
@@ -723,18 +922,27 @@ export default function BacktestLabScreen() {
 // numbers, and the verdict words are the recorded tallies. The pane computes
 // no verdict of its own.
 
-/** The pane's three visible states — idle renders nothing at all. */
+/** The pane's visible states — idle renders nothing at all. `reopening` is the
+ * persisted read's own in-flight state, never the run's. */
 function WalkForwardPane({
   state,
   onOpenFold,
 }: {
-  state: WalkForwardState;
+  state: PaneState;
   onOpenFold: (runId: string) => void;
 }) {
   if (state.kind === "running") {
     return (
       <div className="bt-state dim" role="status">
         Running the walk-forward…
+      </div>
+    );
+  }
+  if (state.kind === "reopening") {
+    // A read, not a run: the wording may not claim an engine is working.
+    return (
+      <div className="bt-state dim" role="status">
+        Opening the persisted walk-forward run…
       </div>
     );
   }
@@ -751,7 +959,19 @@ function WalkForwardPane({
     );
   }
   if (state.kind === "done") {
-    return <WalkForwardResult dto={state.dto} onOpenFold={onOpenFold} />;
+    return (
+      <>
+        {/* #268: a run READ off the server is provenance the fresh path cannot
+            have — say which it is, so no one reads this pane as work they just
+            started. The result below is the same component either way. */}
+        {state.reopened === true && (
+          <p className="bt-wf-origin dim">
+            Persisted run, reopened by id — nothing was re-run.
+          </p>
+        )}
+        <WalkForwardResult dto={state.dto} onOpenFold={onOpenFold} />
+      </>
+    );
   }
   return null;
 }
@@ -812,6 +1032,9 @@ function WalkForwardResult({
                 <td className="mono">{fold.index}</td>
                 <td className="mono">{fold.windowFrom}</td>
                 <td className="mono">{fold.windowTo}</td>
+                {/* The verdict's own count, not the fold run's (`fold.trades`):
+                    this is the per-fold VERDICT table, and bindings document `n`
+                    as "the trades the `wf-v1` verdict saw" (equal in production). */}
                 <td className="mono">{fold.n}</td>
                 <td className="mono">{fold.lowerBound ?? EM_DASH}</td>
                 <td>{fold.holds ? "yes" : "no"}</td>
