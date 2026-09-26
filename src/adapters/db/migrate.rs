@@ -321,16 +321,17 @@ pub(crate) async fn put_in_wal(db_path: &Path) -> Result<(), DataError> {
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|e| DataError::Db(format!("open {} in WAL: {e}", db_path.display())))?;
-    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+    let read: Result<String, sqlx::Error> = sqlx::query_scalar("PRAGMA journal_mode")
         .fetch_one(&mut connection)
-        .await
-        .map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
-    let outcome = require_journal_mode(&mode, SqliteJournalMode::Wal);
-    connection
-        .close()
-        .await
-        .map_err(|e| DataError::Db(format!("close {}: {e}", db_path.display())))?;
-    outcome
+        .await;
+    // The connection is closed on EVERY path after connect (fix round 4, Q3) —
+    // including a failed read-back, which used to return first and leave the file
+    // (and the `-wal` this switch created) to the connection's worker thread. The
+    // synchronous close is the whole point of keeping this ONE connection.
+    let closed = connection.close().await;
+    let mode = read.map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
+    closed.map_err(|e| DataError::Db(format!("close {}: {e}", db_path.display())))?;
+    require_journal_mode(&mode, SqliteJournalMode::Wal)
 }
 
 /// Read `PRAGMA journal_mode` back and refuse anything but `expected`.

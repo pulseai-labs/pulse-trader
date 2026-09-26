@@ -279,6 +279,8 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
         ),
     };
 
+    refuse_orphaned_quarantines(job.db_target)?;
+
     // ---- Step 1: refuse a non-empty target; back it up first on --replace.
     if let Some(contents) = ops::target_row_counts(job.db_target)
         .await
@@ -367,15 +369,7 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     // and the store pointers it changed (the target must be left exactly as it
     // was, whichever path failed).
     let target_store = CandleStore::with_base_dir(job.data_target.to_path_buf());
-    // NOTE (fix round 3, M1): the IMPORT's unwind still removes the added
-    // snapshots before it restores the pointers — the ordering hazard M1 found on
-    // the backup side applies here too, and it is reported for the ledger rather
-    // than changed under this round's scope. What it no longer does is SWALLOW a
-    // restore failure: that is returned to the caller and folded into its error.
-    let undo = |writes: &StoreWrites| -> anyhow::Result<()> {
-        remove_added_snapshots(&writes.added);
-        restore_heads(&target_store, &writes.heads)
-    };
+    let undo = |writes: &StoreWrites| unwind_store_writes(&target_store, writes);
     match steps {
         Err(StepFailure::Fatal { error, writes }) => {
             // Every fatal path cleans up BOTH: the temporary database and
@@ -1224,6 +1218,33 @@ fn fold_undo(error: anyhow::Error, undone: &anyhow::Result<()>) -> anyhow::Error
     }
 }
 
+/// The pointers a failed [`restore_heads`] left unrestored (fix round 3, M1 —
+/// shared by the backup's unwind and, since fix round 4 Q5, the import's undo).
+pub(crate) fn stranded_pointers(restored: &anyhow::Result<()>) -> Vec<(Pair, Timeframe)> {
+    restored
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<HeadRestoreFailure>())
+        .map(|failure| failure.stranded.clone())
+        .unwrap_or_default()
+}
+
+/// Does a pointer that could NOT be restored still name `path`? The snapshots an
+/// unrestored pointer names must stay: deleting them would leave the store
+/// advertising a snapshot that is gone.
+pub(crate) fn named_by_pointer(
+    store: &CandleStore,
+    stranded: &[(Pair, Timeframe)],
+    path: &Path,
+) -> bool {
+    stranded.iter().any(|(pair, timeframe)| {
+        store
+            .head_path(pair, *timeframe)
+            .parent()
+            .is_some_and(|dir| path.starts_with(dir))
+    })
+}
+
 /// Put back every pointer a publish step changed — the failure path: the store
 /// must be left exactly as it was.
 pub(crate) fn restore_heads(
@@ -1461,11 +1482,40 @@ fn remove_tmp_db(tmp_db: &Path) {
     }
 }
 
+/// The import's unwind of everything a run wrote to the target store.
+///
+/// Fix round 4, Q5: the SAME order the backup's unwind uses (M1) — the pointers
+/// go back FIRST, so no crash or error between the two steps can leave a pointer
+/// naming a snapshot that is gone — and a pointer that could not be restored KEEPS
+/// the snapshots it still names, because deleting them would leave the store in
+/// exactly that state.
+///
+/// # Errors
+///
+/// Returns whatever [`restore_heads`] could not put back.
+fn unwind_store_writes(target_store: &CandleStore, writes: &StoreWrites) -> anyhow::Result<()> {
+    let restored = restore_heads(target_store, &writes.heads);
+    let stranded = stranded_pointers(&restored);
+    remove_added_snapshots_keeping(&writes.added, &|path| {
+        named_by_pointer(target_store, &stranded, path)
+    });
+    restored
+}
+
 /// Delete every snapshot this run added (failure path — the target keeps
-/// exactly its previous contents).
-fn remove_added_snapshots(added: &[PathBuf]) {
+/// exactly its previous contents), holding back the snapshots an unrestored
+/// `HEAD` pointer still names (fix round 4, Q5).
+///
+/// The rollback ALWAYS runs with a keep predicate now: `remove_added_snapshots_keeping(added, &|_|
+/// false)` is the no-keep form the tests use.
+fn remove_added_snapshots_keeping(added: &[PathBuf], keep: &dyn Fn(&Path) -> bool) {
     for path in added {
+        if keep(path) {
+            continue;
+        }
         let _ = fs::remove_file(path);
+        #[cfg(test)]
+        probe::record_rollback(probe::RollbackStep::Unlinked { path: path.clone() });
     }
 }
 
@@ -1736,6 +1786,102 @@ fn move_aside(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::rename(from, to)
 }
 
+/// Quarantine files an earlier install left behind (fix round 4, Q1).
+///
+/// The install moves the target's own sidecars aside BEFORE it renames the copy
+/// over them; a crash between those two steps leaves them under their quarantine
+/// names, where the old sidecar no longer exists and the next run would never
+/// look. Recovering automatically is the wrong call — those bytes may be the
+/// target's only copy of its un-checkpointed rows — so the import REFUSES until
+/// an operator moves them back.
+#[derive(Debug, thiserror::Error)]
+pub(crate) struct OrphanedQuarantines {
+    /// The database whose sidecars are stranded.
+    target: PathBuf,
+    /// `(quarantine file, the name it has to go back to)`, sorted.
+    stranded: Vec<(PathBuf, PathBuf)>,
+}
+
+impl std::fmt::Display for OrphanedQuarantines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let listed: Vec<String> = self
+            .stranded
+            .iter()
+            .map(|(quarantine, original)| {
+                format!("{} -> {}", quarantine.display(), original.display())
+            })
+            .collect();
+        write!(
+            f,
+            "refusing to touch {}: an earlier install was interrupted after it moved the target's \
+             sidecars aside, so {} still holds them — move each one back before running this \
+             command ({})",
+            self.target.display(),
+            if self.stranded.len() == 1 {
+                "a quarantine file"
+            } else {
+                "quarantine files"
+            },
+            listed.join("; ")
+        )
+    }
+}
+
+/// Fail closed on an interrupted earlier install (fix round 4, Q1).
+///
+/// Its quarantine files hold the target's own un-checkpointed rows, so nothing
+/// may read (or back up, or replace) the target until an operator has put them
+/// back — the refusal names every file and the name it belongs under.
+///
+/// # Errors
+///
+/// Returns [`OrphanedQuarantines`] when any quarantine of the target's own
+/// sidecars is still beside it.
+fn refuse_orphaned_quarantines(target: &Path) -> anyhow::Result<()> {
+    let stranded = orphaned_quarantines(target);
+    if stranded.is_empty() {
+        return Ok(());
+    }
+    Err(OrphanedQuarantines {
+        target: target.to_path_buf(),
+        stranded,
+    }
+    .into())
+}
+
+/// The quarantine files an interrupted install left beside `target`, each with
+/// the name it has to go back to. ANY pid counts: the run that made them is gone.
+fn orphaned_quarantines(target: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let Some(dir) = target.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    let Some(name) = target.file_name() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut stranded: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        for suffix in DB_STATE_SUFFIXES {
+            let mut prefix = std::ffi::OsString::from(".");
+            prefix.push(name);
+            prefix.push(suffix);
+            prefix.push(".quarantine-");
+            if entry_name
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(prefix.as_encoded_bytes())
+            {
+                stranded.push((entry.path(), sidecar_path(target, suffix)));
+            }
+        }
+    }
+    stranded.sort();
+    stranded
+}
+
 /// The install's outcome when it fails: WHAT the target is left as, so the
 /// caller knows whether its pre-rename cleanup still applies (fix round 1, F1).
 #[derive(Debug)]
@@ -1903,9 +2049,9 @@ fn print_summary(label: &str, job: &VerifiedCopy<'_>, summary: &Summary) {
 mod tests {
     use super::{
         COPY_SIDECAR_SUFFIXES, HeadSource, InstallFailure, InstallRefusal, VerifiedCopy,
-        copy_snapshot_into, copy_snapshots, install_tmp_db, publish, remove_added_snapshots,
-        remove_tmp_db, run_verified_copy, scan_heads, scan_snapshots, sidecar_path,
-        write_head_manifest,
+        copy_snapshot_into, copy_snapshots, install_tmp_db, publish,
+        remove_added_snapshots_keeping, remove_tmp_db, run_verified_copy, scan_heads,
+        scan_snapshots, sidecar_path, write_head_manifest,
     };
     use crate::adapters::db::{open_migrated, open_migrated_copy};
     use crate::adapters::store::CandleStore;
@@ -2574,6 +2720,129 @@ mod tests {
         );
     }
 
+    /// Fix round 4, Q1: quarantine files an interrupted install left behind make
+    /// the next run REFUSE — before anything reads (or backs up, or replaces) the
+    /// target — because those bytes are the target's own un-checkpointed rows.
+    #[tokio::test]
+    async fn an_orphaned_quarantine_refuses_the_run_before_the_target_is_touched() {
+        let flow = flow().await;
+        // An earlier install's quarantine: any pid, the target's -wal name.
+        let target_dir = flow.target_db.parent().expect("the target's directory");
+        fs::create_dir_all(target_dir).expect("the target's directory");
+        fs::write(&flow.target_db, b"the old target, still holding rows").expect("the old target");
+        let orphan = target_dir.join(".pulse.db-wal.quarantine-999999");
+        fs::write(&orphan, b"the old target's un-checkpointed rows").expect("the quarantine");
+        // `--replace` would back the non-empty target up first: the refusal must
+        // come before that, so no safety backup may be written.
+        let mut job = import_job(&flow);
+        job.replace = true;
+
+        let error = run_verified_copy(job)
+            .await
+            .expect_err("an orphaned quarantine refuses the run");
+
+        let refusal = error
+            .downcast_ref::<super::OrphanedQuarantines>()
+            .unwrap_or_else(|| panic!("the refusal must be typed, got: {error:?}"));
+        let message = refusal.to_string();
+        assert!(
+            message.contains(&orphan.display().to_string()),
+            "the refusal names the quarantine file: {message}"
+        );
+        assert!(
+            message.contains(&sidecar_path(&flow.target_db, "-wal").display().to_string()),
+            "and the name it has to go back to: {message}"
+        );
+        assert_eq!(
+            fs::read(&flow.target_db).expect("read the target"),
+            b"the old target, still holding rows",
+            "the target was not touched"
+        );
+        assert!(
+            orphan.exists(),
+            "and the quarantine is still there to be moved back"
+        );
+        let backup_dir = super::super::import::default_backup_out_dir().expect("the backup dir");
+        let backups: Vec<String> = fs::read_dir(&backup_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "db")
+                            && entry.file_name().to_string_lossy().starts_with("pulse-")
+                    })
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            backups.is_empty(),
+            "no safety backup was written before the refusal: {backups:?}"
+        );
+    }
+
+    /// Fix round 4, Q5: the import's undo follows M1's order too — the pointers
+    /// go back BEFORE the added snapshots are removed, and a pointer that could
+    /// not be restored keeps the snapshots it still names.
+    #[tokio::test]
+    async fn the_imports_undo_restores_the_pointers_before_it_removes_snapshots() {
+        let flow = flow().await;
+        let target_store = CandleStore::with_base_dir(flow.target_data.clone());
+        let (source_snapshots, issues) = scan_snapshots(&flow.source_data);
+        assert!(issues.is_empty(), "the fixture store is well-formed");
+        let snapshot = &source_snapshots[0];
+        // A snapshot this run added, under the pointer this run moved.
+        let dest =
+            target_store.snapshot_path(&snapshot.pair, snapshot.timeframe, &snapshot.version);
+        fs::create_dir_all(dest.parent().expect("the leaf's directory"))
+            .expect("create the leaf's directory");
+        fs::write(&dest, b"a copied snapshot").expect("write the copied snapshot");
+        target_store
+            .write_head(&snapshot.pair, snapshot.timeframe, &snapshot.version)
+            .expect("the pointer this run published");
+        let prior = crate::domain::DataVersion::parse("0000000000000001").expect("a version tag");
+        let writes = super::StoreWrites {
+            added: vec![dest.clone()],
+            heads: vec![super::HeadChange::new(
+                snapshot.pair.clone(),
+                snapshot.timeframe,
+                Some(prior.clone()),
+            )],
+        };
+        let _ = publish::probe::take_rollback();
+
+        super::unwind_store_writes(&target_store, &writes).expect("the undo runs");
+
+        let steps = publish::probe::take_rollback();
+        let last_restore = steps
+            .iter()
+            .rposition(|step| matches!(step, publish::probe::RollbackStep::HeadRestored { .. }))
+            .unwrap_or_else(|| panic!("a pointer was restored: {steps:?}"));
+        let first_unlink = steps
+            .iter()
+            .position(|step| matches!(step, publish::probe::RollbackStep::Unlinked { .. }))
+            .unwrap_or_else(|| panic!("the added snapshots were removed: {steps:?}"));
+        assert!(
+            last_restore < first_unlink,
+            "the pointers go back BEFORE the first snapshot is deleted: {steps:?}"
+        );
+        assert_eq!(
+            target_store
+                .read_head(&snapshot.pair, snapshot.timeframe)
+                .expect("read the pointer"),
+            Some(prior),
+            "the pointer is back to what it was"
+        );
+        assert!(
+            !dest.exists(),
+            "and the snapshot this run added is gone: {}",
+            dest.display()
+        );
+    }
+
     /// Fix round 3, M3: once the install's rename has landed, NO quarantine file
     /// outlives the install on any path. The replaced database's sidecars are
     /// dropped immediately after the rename — before the directory sync and the
@@ -2823,7 +3092,7 @@ mod tests {
             "the failure is the injected sync: {error}"
         );
 
-        remove_added_snapshots(&added);
+        remove_added_snapshots_keeping(&added, &|_| false);
         assert!(
             !dest.exists(),
             "the rollback removed the snapshot the failed copy published"
