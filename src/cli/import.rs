@@ -367,27 +367,35 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     // and the store pointers it changed (the target must be left exactly as it
     // was, whichever path failed).
     let target_store = CandleStore::with_base_dir(job.data_target.to_path_buf());
-    let undo = |writes: &StoreWrites| {
+    // NOTE (fix round 3, M1): the IMPORT's unwind still removes the added
+    // snapshots before it restores the pointers — the ordering hazard M1 found on
+    // the backup side applies here too, and it is reported for the ledger rather
+    // than changed under this round's scope. What it no longer does is SWALLOW a
+    // restore failure: that is returned to the caller and folded into its error.
+    let undo = |writes: &StoreWrites| -> anyhow::Result<()> {
         remove_added_snapshots(&writes.added);
-        restore_heads(&target_store, &writes.heads);
+        restore_heads(&target_store, &writes.heads)
     };
     match steps {
         Err(StepFailure::Fatal { error, writes }) => {
             // Every fatal path cleans up BOTH: the temporary database and
             // everything this run wrote to the target store before it failed.
             remove_tmp_db(&tmp_db);
-            undo(&writes);
-            Err(error)
+            let undone = undo(&writes);
+            Err(fold_undo(error, &undone))
         }
         Err(StepFailure::Mismatches { mismatches, writes }) => {
             remove_tmp_db(&tmp_db);
-            undo(&writes);
+            let undone = undo(&writes);
             print_refusal(label, &mismatches);
-            anyhow::bail!(
-                "{label}: refused — the temporary database and every snapshot this run added \
-                 were deleted, every pointer it moved was put back, and the target is exactly \
-                 as it was"
-            );
+            Err(fold_undo(
+                anyhow!(
+                    "{label}: refused — the temporary database and every snapshot this run added \
+                     were deleted, every pointer it moved was put back, and the target is exactly \
+                     as it was"
+                ),
+                &undone,
+            ))
         }
         Ok((summary, writes)) => {
             // ---- Step 7: the install. Once its rename has landed the database
@@ -400,8 +408,8 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
                 Ok(()) => {}
                 Err(InstallFailure::Untouched(error)) => {
                     remove_tmp_db(&tmp_db);
-                    undo(&writes);
-                    return Err(error);
+                    let undone = undo(&writes);
+                    return Err(fold_undo(error, &undone));
                 }
                 Err(failure) => return Err(failure.into_error()),
             }
@@ -1207,19 +1215,85 @@ fn publish_heads(
     changes
 }
 
+/// The error an undone failure reports: the original failure, plus whatever the
+/// store could not put back (fix round 3, M1 — the undo no longer swallows it).
+fn fold_undo(error: anyhow::Error, undone: &anyhow::Result<()>) -> anyhow::Error {
+    match undone {
+        Ok(()) => error,
+        Err(undo_error) => error.context(format!("[undo] {undo_error}")),
+    }
+}
+
 /// Put back every pointer a publish step changed — the failure path: the store
 /// must be left exactly as it was.
-pub(crate) fn restore_heads(target_store: &CandleStore, changes: &[HeadChange]) {
+pub(crate) fn restore_heads(
+    target_store: &CandleStore,
+    changes: &[HeadChange],
+) -> anyhow::Result<()> {
+    let mut stranded: Vec<(Pair, Timeframe)> = Vec::new();
     for change in changes {
-        match &change.previous {
-            Some(version) => {
-                let _ = target_store.write_head(&change.pair, change.timeframe, version);
-            }
-            None => {
-                let _ = fs::remove_file(target_store.head_path(&change.pair, change.timeframe));
-            }
+        if restore_one_head(target_store, change).is_err() {
+            stranded.push((change.pair.clone(), change.timeframe));
+        } else {
+            #[cfg(test)]
+            probe::record_rollback(probe::RollbackStep::HeadRestored {
+                pair: change.pair.as_str().to_owned(),
+                timeframe: change.timeframe.binance_interval().to_owned(),
+            });
         }
     }
+    if stranded.is_empty() {
+        return Ok(());
+    }
+    Err(HeadRestoreFailure { stranded }.into())
+}
+
+/// The `HEAD` pointers [`restore_heads`] could not put back (fix round 3, M1).
+///
+/// A pointer left unrestored still names the snapshots this run published, so the
+/// caller must NOT delete those — the store would be left naming a snapshot that
+/// is gone.
+#[derive(Debug)]
+pub(crate) struct HeadRestoreFailure {
+    /// The `(pair, timeframe)` of every pointer that is NOT back where it was.
+    pub(crate) stranded: Vec<(Pair, Timeframe)>,
+}
+
+impl std::fmt::Display for HeadRestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let named: Vec<String> = self
+            .stranded
+            .iter()
+            .map(|(pair, timeframe)| format!("{} {}", pair.as_str(), timeframe.binance_interval()))
+            .collect();
+        write!(
+            f,
+            "the shared store's HEAD pointers could not be restored for {} — those pointers still \
+             name the snapshots this run published",
+            named.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for HeadRestoreFailure {}
+
+/// Put ONE pointer back to what it was.
+fn restore_one_head(target_store: &CandleStore, change: &HeadChange) -> anyhow::Result<()> {
+    let head = target_store.head_path(&change.pair, change.timeframe);
+    let Some(version) = &change.previous else {
+        return match fs::remove_file(&head) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(anyhow!("remove {}: {error}", head.display())),
+        };
+    };
+    #[cfg(test)]
+    if probe::take_injected_head_write_failure(&head) {
+        anyhow::bail!("injected HEAD write failure (cfg(test) seam)");
+    }
+    target_store
+        .write_head(&change.pair, change.timeframe, version)
+        .map_err(|error| anyhow!("write {}: {error}", head.display()))
 }
 
 /// Copy every source snapshot into the target store; an existing same-named
@@ -1597,19 +1671,25 @@ impl QuarantinedSidecars {
     /// caller reports this as an installed-but-unconfirmed state, and the
     /// leftovers are inert (no database name matches them).
     fn discard(&self) -> anyhow::Result<()> {
+        let mut failures: Vec<String> = Vec::new();
         for (quarantine, _) in &self.moved {
-            match fs::remove_file(quarantine) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(anyhow!("remove {}: {error}", quarantine.display()));
-                }
+            if let Err(error) = remove_quarantine(quarantine) {
+                failures.push(error);
             }
         }
         for dir in self.directories() {
-            publish::sync_dir(&dir)?;
+            if let Err(error) = publish::sync_dir(&dir) {
+                failures.push(format!("fsync {}: {error}", dir.display()));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "the replaced database's quarantined sidecars could not all be cleaned up — {} — the \
+             files are inert (no database name matches them), but they are still on disk",
+            failures.join("; ")
+        ))
     }
 
     /// The distinct directories the quarantined files live in.
@@ -1623,6 +1703,22 @@ impl QuarantinedSidecars {
             }
         }
         dirs
+    }
+}
+
+/// Unlink a quarantined sidecar, with the test seam at the raw `remove_file`.
+fn remove_quarantine(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if probe::take_injected_remove_failure(path) {
+        return Err(format!(
+            "remove {}: injected failure (cfg(test) seam)",
+            path.display()
+        ));
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove {}: {error}", path.display())),
     }
 }
 
@@ -1724,7 +1820,16 @@ async fn install_tmp_db(
         target: target.to_path_buf(),
         error: anyhow!("{unconfirmed}: {error}"),
     };
-    // 4. The rename is durable only once the directory that received it is
+    // 4. The database those sidecars belonged to is GONE, so they go NOW — before
+    //    the directory sync and the WAL switch can fail (fix round 3, M3): no
+    //    quarantine file may outlive a landed install on any path.
+    if let Err(error) = quarantined.discard() {
+        return Err(installed(
+            "the replaced database's quarantined sidecars could not all be cleaned up",
+            error,
+        ));
+    }
+    // 5. The rename is durable only once the directory that received it is
     //    fsynced — including every level this run created (issue #259, F6).
     if let Err(error) = publish::sync_published(target, created) {
         return Err(installed(
@@ -1732,22 +1837,13 @@ async fn install_tmp_db(
             error,
         ));
     }
-    // 5. ADR-0019, deterministically (F4): the installed file is in WAL, read
+    // 6. ADR-0019, deterministically (F4): the installed file is in WAL, read
     //    back, before this command reports success — never left to the next
     //    process to fix with a fire-and-forget pragma.
     if let Err(error) = put_in_wal(target).await {
         return Err(installed(
             "it could not be put back in WAL, so the production journal mode is not in place",
             anyhow::Error::new(error),
-        ));
-    }
-    // 6. What was moved aside belonged to the database that was just replaced:
-    //    drop it (the leftovers are inert — no database name matches them).
-    if let Err(error) = quarantined.discard() {
-        return Err(installed(
-            "the replaced database's quarantined sidecars could not be removed (they are inert: \
-             no database name matches them)",
-            error,
         ));
     }
     Ok(())
@@ -2475,6 +2571,91 @@ mod tests {
             fs::read(&sidecar).expect("read the restored sidecar"),
             b"the old target's rows",
             "with its bytes"
+        );
+    }
+
+    /// Fix round 3, M3: once the install's rename has landed, NO quarantine file
+    /// outlives the install on any path. The replaced database's sidecars are
+    /// dropped immediately after the rename — before the directory sync and the
+    /// WAL switch can fail — so a later failure cannot leave them behind.
+    #[tokio::test]
+    async fn a_failed_wal_conversion_leaves_no_quarantine_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        // A copy that is not a database at all: the rename lands and the WAL
+        // switch (the step after the quarantine cleanup) fails.
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        fs::write(&tmp_db, b"not a database").expect("write the copy");
+        fs::write(&target, b"the old target").expect("write the old target");
+        for suffix in super::DB_STATE_SUFFIXES {
+            fs::write(sidecar_path(&target, suffix), b"the old target's state")
+                .expect("write the old target's sidecar");
+        }
+
+        let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect_err("a copy that is not a database cannot be put back in WAL");
+        let InstallFailure::Installed { error, .. } = failure else {
+            panic!("the rename landed, so the database IS installed: {failure:?}");
+        };
+        assert!(
+            error.to_string().contains("put back in WAL"),
+            "the failure is the WAL switch: {error}"
+        );
+
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .expect("read the directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains(".quarantine-")),
+            "no quarantine outlives a landed install: {names:?}"
+        );
+        for suffix in super::DB_STATE_SUFFIXES {
+            assert!(
+                !sidecar_path(&target, suffix).exists(),
+                "and the old target's {suffix} is gone: {names:?}"
+            );
+        }
+    }
+
+    /// Fix round 3, M3: if the quarantine cleanup itself fails, the installed
+    /// error names the files still on disk — nothing of the replaced database may
+    /// be left behind silently.
+    #[tokio::test]
+    async fn a_quarantine_that_cannot_be_cleaned_up_is_named_in_the_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        fs::write(&target, b"the old target").expect("write the old target");
+        let sidecar = sidecar_path(&target, "-wal");
+        fs::write(&sidecar, b"the old target's rows").expect("write the -wal");
+        let quarantine = super::quarantine_path(&target, "-wal").expect("the quarantine name");
+        publish::probe::fail_next_remove_of(&quarantine);
+
+        let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect_err("the quarantine cannot be cleaned up");
+        let InstallFailure::Installed { error, .. } = failure else {
+            panic!("the rename landed, so the database IS installed: {failure:?}");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("could not all be cleaned up"),
+            "the error says the cleanup failed: {message}"
+        );
+        assert!(
+            message.contains(&quarantine.display().to_string()),
+            "and names the quarantine still on disk ({}): {message}",
+            quarantine.display()
+        );
+        assert!(
+            quarantine.exists(),
+            "the bytes are still there under the name the error gives"
         );
     }
 

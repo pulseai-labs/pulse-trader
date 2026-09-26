@@ -325,6 +325,78 @@ pub(crate) mod probe {
         })
     }
 
+    /// One step of a rollback, in the order it happened (fix round 3, M1/M2).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RollbackStep {
+        /// A shared-store `HEAD` pointer was put back (or removed).
+        HeadRestored {
+            /// The pair whose pointer was restored.
+            pair: String,
+            /// The timeframe whose pointer was restored.
+            timeframe: String,
+        },
+        /// A file the run had published was unlinked.
+        Unlinked {
+            /// The file that was removed.
+            path: PathBuf,
+        },
+    }
+
+    thread_local! {
+        /// Rollback steps, in order.
+        static ROLLBACK: RefCell<Vec<RollbackStep>> = const { RefCell::new(Vec::new()) };
+
+        /// A one-shot HEAD-pointer write failure, keyed on the head path.
+        static FAIL_NEXT_HEAD_WRITE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+
+        /// A one-shot unlink failure, keyed on the file.
+        static FAIL_NEXT_REMOVE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Record one rollback step.
+    pub(crate) fn record_rollback(step: RollbackStep) {
+        ROLLBACK.with(|steps| steps.borrow_mut().push(step));
+    }
+
+    /// Take every rollback step recorded on this thread so far (in order).
+    pub(crate) fn take_rollback() -> Vec<RollbackStep> {
+        ROLLBACK.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
+    }
+
+    /// Make the next write of the `HEAD` pointer at `path` fail, one-shot.
+    pub(crate) fn fail_next_head_write_to(path: &Path) {
+        FAIL_NEXT_HEAD_WRITE.with(|pending| *pending.borrow_mut() = Some(path.to_path_buf()));
+    }
+
+    /// Consume the pending HEAD-write failure when it targets `path`.
+    pub(crate) fn take_injected_head_write_failure(path: &Path) -> bool {
+        FAIL_NEXT_HEAD_WRITE.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            let matches = pending.as_deref() == Some(path);
+            if matches {
+                *pending = None;
+            }
+            matches
+        })
+    }
+
+    /// Make the next unlink of `path` fail, one-shot.
+    pub(crate) fn fail_next_remove_of(path: &Path) {
+        FAIL_NEXT_REMOVE.with(|pending| *pending.borrow_mut() = Some(path.to_path_buf()));
+    }
+
+    /// Consume the pending unlink failure when it targets `path`.
+    pub(crate) fn take_injected_remove_failure(path: &Path) -> bool {
+        FAIL_NEXT_REMOVE.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            let matches = pending.as_deref() == Some(path);
+            if matches {
+                *pending = None;
+            }
+            matches
+        })
+    }
+
     /// Make the NEXT sync of `dir` fail, one-shot.
     ///
     /// This is the post-rename failure the rollback tests need: a publish's
