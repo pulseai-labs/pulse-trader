@@ -245,7 +245,11 @@ async fn publish_store_files(
     let (changes, published) = match publish_heads(out_store, &heads) {
         Ok(changes) => (
             changes,
-            write_head_manifest(&staged.manifest_path(), &heads),
+            write_head_manifest(
+                &staged.manifest_path(),
+                &heads,
+                staged.created_root.as_deref(),
+            ),
         ),
         Err((error, changes)) => (changes, Err(error)),
     };
@@ -407,8 +411,13 @@ fn copy_wanted(
         if dest.exists() {
             continue;
         }
+        // Recorded BEFORE the copy (fix round 1, F8): the copy renames the file
+        // into place and then syncs its directory, so a failure AFTER the rename
+        // still leaves a snapshot behind — one this backup's rollback must
+        // remove. The name is known free (the check above), so recording it up
+        // front cannot delete anything this run did not write.
+        added.push(dest.clone());
         copy_snapshot_into(&snap.path, &dest)?;
-        added.push(dest);
         published += 1;
     }
     Ok(published)
@@ -417,8 +426,16 @@ fn copy_wanted(
 /// The failure path's one move: no half backup survives — not the staged
 /// database copy, not the manifest published beside it, and not a snapshot this
 /// run added.
+///
+/// The published name goes too (fix round 1, F2): a failure AFTER
+/// [`publish_staged_database`]'s rename leaves the database under
+/// `pulse-<stamp>.db`, and a database left without its manifest is one
+/// `pulse restore` can only refuse and `--keep` counts as a backup. Removing it
+/// is safe on the earlier failure paths — the name does not exist yet, and the
+/// removal is a no-op.
 fn discard(staged: &StagedBackup, added: &[PathBuf]) {
     let _ = fs::remove_file(&staged.partial);
+    let _ = fs::remove_file(&staged.final_path);
     let _ = fs::remove_file(staged.manifest_path());
     for path in added {
         let _ = fs::remove_file(path);
@@ -483,6 +500,12 @@ struct StagedBackup {
     partial: PathBuf,
     /// `<out-dir>/pulse-<stamp>.db` — the name it publishes under.
     final_path: PathBuf,
+    /// The deepest ancestor of the out-dir that existed BEFORE this backup
+    /// created it (`.` for a relative path whose first component was absent, and
+    /// `None` when nothing had to be created): every level below it is an entry
+    /// this run made, so each publish into the out-dir must sync the levels it
+    /// created up to and including this one (fix round 1, F6).
+    created_root: Option<PathBuf>,
 }
 
 impl StagedBackup {
@@ -503,6 +526,10 @@ impl StagedBackup {
 /// Returns an [`anyhow::Error`] when the source cannot be read or the copy
 /// cannot be written.
 async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<StagedBackup> {
+    // The deepest ancestor that exists BEFORE the out-dir is created: every level
+    // below it is an entry this backup makes, and each publish into it has to
+    // sync its parent (fix round 1, F6).
+    let created_root = publish::existing_ancestor(out_dir);
     fs::create_dir_all(out_dir)
         .map_err(|e| anyhow!("create backup dir {}: {e}", out_dir.display()))?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -526,9 +553,15 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
             db_path.display()
         ));
     }
+    // `VACUUM INTO` does not guarantee its output is on disk, and the publish
+    // renames this file: the bytes must land before the name that promises them
+    // (fix round 1, F5).
+    publish::sync_file(&partial, &final_path)
+        .map_err(|e| anyhow!("flush the staged backup copy {}: {e}", partial.display()))?;
     Ok(StagedBackup {
         partial,
         final_path,
+        created_root,
     })
 }
 
@@ -549,7 +582,7 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
 fn publish_staged_database(staged: &StagedBackup) -> anyhow::Result<()> {
     fs::rename(&staged.partial, &staged.final_path)
         .map_err(|e| anyhow!("publish {}: {e}", staged.final_path.display()))?;
-    publish::sync_published(&staged.final_path, None)
+    publish::sync_published(&staged.final_path, staged.created_root.as_deref())
 }
 
 /// `pulse-<UTC stamp>.db`, with a `-N` suffix probed on a same-second
@@ -636,22 +669,29 @@ pub(crate) async fn run_restore(args: &RestoreArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{StagedBackup, publish_staged_database};
+    use super::{StagedBackup, discard, publish_staged_database};
     use crate::cli::publish;
     use std::fs;
+    use std::path::PathBuf;
+
+    /// A staged backup rooted in `dir` (the fields a test may not care about are
+    /// the empty defaults).
+    fn staged(dir: &std::path::Path, created_root: Option<PathBuf>) -> StagedBackup {
+        StagedBackup {
+            partial: dir.join("pulse-20260101T000000Z.db.partial"),
+            final_path: dir.join("pulse-20260101T000000Z.db"),
+            created_root,
+        }
+    }
 
     /// Issue #259: the database is the LAST thing a backup makes visible, and
     /// the rename that publishes it is followed by an fsync of the out-dir it
     /// landed in — a backup may not be reported successful over a rename that is
-    /// not durable (a power loss could otherwise keep the newest snapshot's
-    /// entries while losing the database that names them, or the reverse).
+    /// not durable.
     #[test]
     fn the_published_backup_database_syncs_the_out_dir_after_the_rename() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let staged = StagedBackup {
-            partial: dir.path().join("pulse-20260101T000000Z.db.partial"),
-            final_path: dir.path().join("pulse-20260101T000000Z.db"),
-        };
+        let staged = staged(dir.path(), None);
         fs::write(&staged.partial, b"a complete copy").expect("stage the copy");
         let _ = publish::probe::take();
 
@@ -659,9 +699,9 @@ mod tests {
 
         let syncs = publish::probe::take();
         assert_eq!(syncs.len(), 1, "one publish, one directory sync: {syncs:?}");
-        assert_eq!(syncs[0].dir, dir.path(), "the out-dir it landed in");
+        assert_eq!(syncs[0].path, dir.path(), "the out-dir it landed in");
         assert!(
-            syncs[0].published_present,
+            syncs[0].destination_present,
             "the sync happens AFTER the rename, never before it: {syncs:?}"
         );
         assert!(
@@ -673,6 +713,148 @@ mod tests {
             fs::read(&staged.final_path).expect("read the published backup"),
             b"a complete copy",
             "and the backup holds the copy's bytes"
+        );
+    }
+
+    /// Fix round 1, F6: a FIRST backup into an out-dir that does not exist yet
+    /// creates it — and every level above it — so each publish syncs the levels
+    /// this run created in THEIR parents, up to and including the first ancestor
+    /// that already existed. Without that, the whole tree a nightly backup makes
+    /// is one power loss away from not existing.
+    #[tokio::test]
+    async fn a_first_backup_into_an_absent_out_dir_syncs_every_level_it_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source").join("pulse.db");
+        fs::create_dir_all(db_path.parent().expect("the source's directory"))
+            .expect("create the source's directory");
+        let db = crate::adapters::db::open_migrated(&db_path)
+            .await
+            .expect("migrate the source");
+        db.pool().close().await;
+        let data_dir = dir.path().join("source-data");
+        // TWO levels that do not exist yet; the tempdir is the first ancestor
+        // that does.
+        let out_dir = dir.path().join("backups").join("nightly");
+        let _ = publish::probe::take();
+
+        super::backup_target(&db_path, &data_dir, &out_dir)
+            .await
+            .expect("the first backup succeeds");
+
+        let synced: Vec<PathBuf> = publish::probe::take()
+            .into_iter()
+            .filter(|event| event.kind == publish::probe::SyncKind::Dir)
+            .map(|event| event.path)
+            .collect();
+        assert!(
+            synced.contains(&out_dir),
+            "the out-dir this run created is synced: {synced:?}"
+        );
+        assert!(
+            synced.contains(&dir.path().join("backups")),
+            "and so is the level that holds it: {synced:?}"
+        );
+        assert!(
+            synced.contains(&dir.path().to_path_buf()),
+            "and the first ancestor that already existed: {synced:?}"
+        );
+        let backups: Vec<PathBuf> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "db"))
+            .collect();
+        assert_eq!(backups.len(), 1, "the backup is published: {backups:?}");
+    }
+
+    /// Fix round 1, F2: a failure AFTER the publish rename is a FULL rollback. The
+    /// database is already under its final name by then, and leaving it there —
+    /// without the manifest published beside it — gives `pulse restore` an
+    /// artifact it can only refuse and `--keep` a backup it counts.
+    #[test]
+    fn a_publish_that_fails_after_its_rename_is_discarded_completely() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = staged(dir.path(), None);
+        fs::write(&staged.partial, b"a complete copy").expect("stage the copy");
+        let manifest = staged.manifest_path();
+        fs::write(&manifest, b"{}").expect("publish a manifest");
+        let added = dir
+            .path()
+            .join("candles")
+            .join("BTCUSDT")
+            .join("15m")
+            .join("dv.parquet");
+        fs::create_dir_all(added.parent().expect("the snapshot's directory"))
+            .expect("create the snapshot's directory");
+        fs::write(&added, b"a copied snapshot").expect("write the copied snapshot");
+        // The publish's directory sync fails: the rename has already landed.
+        publish::probe::fail_next_sync_of(dir.path());
+
+        publish_staged_database(&staged)
+            .expect_err("the injected directory sync fails after the rename");
+        assert!(
+            staged.final_path.exists(),
+            "the rename landed, so the database is under its final name"
+        );
+
+        discard(&staged, std::slice::from_ref(&added));
+
+        assert!(
+            !staged.final_path.exists(),
+            "the published database is removed too, not left manifest-less"
+        );
+        assert!(!manifest.exists(), "the manifest goes with it");
+        assert!(!added.exists(), "and the snapshot this run added");
+        assert!(
+            !staged.partial.exists(),
+            "and the staged name never survives"
+        );
+    }
+
+    /// Fix round 1, F8 (backup side): a snapshot whose rename landed is recorded
+    /// in `added` even when the directory sync after it fails, so this backup's
+    /// rollback removes it.
+    #[test]
+    fn a_snapshot_whose_directory_sync_fails_is_recorded_for_the_rollback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_data = dir.path().join("mac-data");
+        let leaf = source_data.join("candles").join("BTCUSDT").join("15m");
+        fs::create_dir_all(&leaf).expect("the source store");
+        fs::write(leaf.join("b51388284a3a4371.parquet"), b"snapshot bytes")
+            .expect("write the source snapshot");
+        let (snapshots, issues) = crate::cli::import::scan_snapshots(&source_data);
+        assert!(issues.is_empty(), "the source store is well-formed");
+        assert_eq!(snapshots.len(), 1, "one source snapshot");
+
+        let out_dir = dir.path().join("out");
+        let out_store = crate::adapters::store::CandleStore::with_base_dir(out_dir.clone());
+        let dest = out_store.snapshot_path(
+            &snapshots[0].pair,
+            snapshots[0].timeframe,
+            &snapshots[0].version,
+        );
+        publish::probe::fail_next_sync_of(dest.parent().expect("the leaf's directory"));
+        let mut added: Vec<PathBuf> = Vec::new();
+
+        super::copy_wanted(&out_store, &snapshots, &[0], &mut added)
+            .expect_err("the injected directory sync fails after the rename");
+
+        assert!(
+            dest.exists(),
+            "the rename landed before the sync failed: {}",
+            dest.display()
+        );
+        assert_eq!(
+            added,
+            vec![dest.clone()],
+            "and the copy is recorded so the rollback can remove it"
+        );
+
+        let staged = staged(&out_dir, None);
+        discard(&staged, &added);
+        assert!(
+            !dest.exists(),
+            "the rollback removed the published snapshot"
         );
     }
 }

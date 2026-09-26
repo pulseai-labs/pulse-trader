@@ -17,10 +17,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use chrono::Utc;
-use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
-use sqlx::sqlite::SqliteJournalMode;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 
 use super::{Db, MIGRATOR};
 use crate::domain::DataError;
@@ -112,8 +114,10 @@ async fn run_migrations_with_backup_using(
 /// the pool from a SPAWNED task, and the connection's `SQLite` handle is released
 /// by that connection's own worker thread, so a dropped pool can keep the
 /// database file open after its owner has moved on. `SQLite` checkpoints and
-/// unlinks a `-wal`/`-shm` only on the LAST close, which is exactly the timing a
-/// caller that renames the file cannot tolerate (#258).
+/// runs its final checkpoint and normally removes `-wal`/`-shm` when the LAST
+/// connection closes (it also checkpoints on its own at the WAL threshold), so
+/// which close removes the sidecars — and whether it has happened yet — is
+/// exactly the timing a caller that renames the file cannot tolerate (#258).
 ///
 /// Closing is not a total guarantee either — a connection still in flight when
 /// the close starts is closed by its own spawned return — so the import's copy
@@ -257,9 +261,11 @@ pub async fn open_migrated(db_path: &Path) -> Result<Db, DataError> {
 /// behind under a name the rename does not carry — with every row still
 /// committed in it — which is exactly the silent data loss 0857a92 meant to
 /// close. In rollback-journal mode there is no WAL to strand, and that is the
-/// only guarantee available: whether a WAL-mode copy's sidecars are gone by the
-/// time of a rename depends on when `SQLite`'s LAST close lands, and sqlx closes
-/// connections from spawned tasks and worker threads that nothing here awaits.
+/// only guarantee available: `SQLite` checkpoints on its own at the WAL
+/// threshold and a final checkpoint normally removes `-wal`/`-shm` when the LAST
+/// connection closes, so whether a WAL-mode copy's sidecars are gone by the time
+/// of a rename depends on when that close lands — and sqlx closes connections
+/// from spawned tasks and worker threads that nothing here awaits.
 ///
 /// The mode is READ BACK, not assumed: sqlx applies `PRAGMA journal_mode` when
 /// it connects and ignores the statement's result, so a database that stayed in
@@ -284,6 +290,47 @@ pub(crate) async fn open_migrated_copy(db_path: &Path) -> Result<Db, DataError> 
     }
 }
 
+/// Put `db_path` back in WAL and PROVE it, for a database that was just
+/// published (ADR-0019; issue #259 review, F4).
+///
+/// `journal_mode` is persisted IN the database file, and the import installs a
+/// copy that ran in rollback-journal mode (#258) — so without this the file a
+/// `pulse import` leaves behind is in DELETE mode until some later process
+/// happens to open it. The production posture is restored here, read back, and
+/// closed before the command reports success, exactly as
+/// [`open_migrated_copy`] proves the copy's mode on the way in.
+///
+/// # Errors
+///
+/// [`DataError::Db`] when the database cannot be opened, the mode cannot be
+/// read, or it reports anything but WAL.
+pub(crate) async fn put_in_wal(db_path: &Path) -> Result<(), DataError> {
+    // ONE connection, never a pool (review correction on F4): a pool's `close`
+    // can return with a connection still in flight, and the sidecars that close
+    // lands late are exactly #258's failure mode. `Connection::close` shuts this
+    // connection's worker thread down SYNCHRONOUSLY — the worker drops its
+    // `SQLite` handle (which checkpoints and unlinks the `-wal`/`-shm` this
+    // switch created) before it acknowledges — so when this returns, the file is
+    // released and the directory holds the database alone.
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(super::BUSY_TIMEOUT_SECS));
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| DataError::Db(format!("open {} in WAL: {e}", db_path.display())))?;
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
+    let outcome = require_journal_mode(&mode, SqliteJournalMode::Wal);
+    connection
+        .close()
+        .await
+        .map_err(|e| DataError::Db(format!("close {}: {e}", db_path.display())))?;
+    outcome
+}
+
 /// Read `PRAGMA journal_mode` back and refuse anything but `expected`.
 ///
 /// # Errors
@@ -299,15 +346,32 @@ async fn verified_journal_mode(
         .fetch_one(pool)
         .await
         .map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
+    require_journal_mode(&actual, expected).map_err(|error| {
+        DataError::Db(format!(
+            "{error}: it is opened as a copy that is renamed into place, and a sidecar it cannot \
+             carry would strand committed rows outside the installed database"
+        ))
+    })
+}
+
+/// Refuse a database that does not report `expected` as its journal mode.
+///
+/// sqlx applies `PRAGMA journal_mode` at connect and ignores the statement's
+/// result, so a mode is a property to READ BACK, not to assume — the seam both
+/// the copy's opener ([`open_migrated_copy`]) and the install's WAL switch
+/// ([`put_in_wal`]) go through.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] naming both modes.
+fn require_journal_mode(actual: &str, expected: SqliteJournalMode) -> Result<(), DataError> {
     let expected = journal_mode_name(expected);
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err(DataError::Db(format!(
-            "the database reports journal_mode `{actual}`, not `{expected}`: it is opened as a \
-             copy that will be renamed into place, and a sidecar it cannot carry would strand \
-             committed rows outside the installed database"
-        )));
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
     }
-    Ok(())
+    Err(DataError::Db(format!(
+        "the database reports journal_mode `{actual}`, not `{expected}`"
+    )))
 }
 
 /// The `PRAGMA journal_mode` spelling of a mode, for a read-back comparison

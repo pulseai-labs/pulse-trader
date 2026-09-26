@@ -108,6 +108,10 @@ pub use migrate::{MigrationOutcome, open_migrated, run_migrations_with_backup, u
 // migrate-then-open protocol in rollback-journal mode, so the file the import
 // is about to rename into place can never have a `-wal`/`-shm` beside it.
 pub(crate) use migrate::open_migrated_copy;
+// Issue #259 review F4: put a just-published database back in WAL and prove it,
+// so the file import leaves behind is in the production mode before the command
+// reports success.
+pub(crate) use migrate::put_in_wal;
 
 use std::path::Path;
 use std::time::Duration;
