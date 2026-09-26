@@ -104,6 +104,10 @@ pub mod ops;
 // the parallel R2 items (trivial keep-both with 1.03's `pub mod strategy_repo;`).
 pub mod migrate;
 pub use migrate::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
+// r3.s3 (issue #258): the data-ops opener for a temporary copy — the same
+// migrate-then-open protocol in rollback-journal mode, so the file the import
+// is about to rename into place can never have a `-wal`/`-shm` beside it.
+pub(crate) use migrate::open_migrated_copy;
 
 use std::path::Path;
 use std::time::Duration;
@@ -144,16 +148,36 @@ pub struct Db {
 impl Db {
     /// Open (creating if absent) a pool at an explicit path — the test seam.
     ///
-    /// Builds the connect options with WAL, `foreign_keys = ON`, and a 5s
-    /// busy-timeout so every pooled connection inherits them (set on the options
-    /// object, not via a stray `PRAGMA`), then connects via
-    /// `SqlitePoolOptions::connect_with`.
+    /// The production posture (ADR-0019): WAL, `foreign_keys = ON` and a 5s
+    /// busy-timeout, so every pooled connection inherits them. Delegates to
+    /// [`Self::with_path_journal`].
     ///
     /// # Errors
     ///
     /// Returns [`DataError::Db`] if the pool cannot be opened (the flattened
     /// `sqlx::Error` message).
     pub async fn with_path(path: &Path) -> Result<Self, DataError> {
+        Self::with_path_journal(path, SqliteJournalMode::Wal).await
+    }
+
+    /// [`Self::with_path`] with an explicit journal mode.
+    ///
+    /// WAL is the database's production posture and is persisted IN the database
+    /// file, so this is the seam that decides it: the import's temporary copy
+    /// asks for [`SqliteJournalMode::Delete`] instead, because the install
+    /// renames the database file and nothing else, and in WAL mode the rows a
+    /// commit left in the `-wal` cannot travel with it (issue #258). The
+    /// installed target is opened again through [`Self::with_path`], which is
+    /// what puts it back in WAL on first open (ADR-0019).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] if the pool cannot be opened (the flattened
+    /// `sqlx::Error` message).
+    pub async fn with_path_journal(
+        path: &Path,
+        journal_mode: SqliteJournalMode,
+    ) -> Result<Self, DataError> {
         // r1.s1.w2 / issue #42: create the parent directory BEFORE building the
         // connect options. sqlx's `create_if_missing` creates the database FILE but
         // not the directory holding it, so on a machine that has never run `pulse`
@@ -178,7 +202,7 @@ impl Db {
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
+            .journal_mode(journal_mode)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(BUSY_TIMEOUT_SECS));
         let pool = SqlitePoolOptions::new()

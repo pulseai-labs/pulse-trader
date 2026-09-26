@@ -39,6 +39,7 @@ use super::import::{
     resolve_target_db, restore_heads, run_verified_copy, scan_heads, scan_snapshots,
     write_head_manifest,
 };
+use super::publish;
 use crate::adapters::db::ops;
 use crate::adapters::store::CandleStore;
 
@@ -533,19 +534,22 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
 
 /// Publish the staged copy under its `pulse-<stamp>.db` name — the LAST step of
 /// a backup, run only once the snapshots it references, the shared store's
-/// pointers and its own manifest are all in place — and make the rename durable.
+/// pointers and its own manifest are all in place — and make the rename durable
+/// by fsyncing the out-dir it landed in (issue #259). The snapshots that live
+/// under `candles/<PAIR>/<TF>/` get the syncs of their own levels in
+/// [`copy_snapshot_into`], which is what makes the nested entries durable; the
+/// out-dir sync here makes the database's own name durable, and it is the same
+/// discipline `CandleStore::publish_atomically` applies.
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] when the rename fails.
+/// Returns an [`anyhow::Error`] when the rename fails, or when the out-dir
+/// cannot be fsynced — a backup may not be reported successful over a rename
+/// that is not durable.
 fn publish_staged_database(staged: &StagedBackup) -> anyhow::Result<()> {
     fs::rename(&staged.partial, &staged.final_path)
         .map_err(|e| anyhow!("publish {}: {e}", staged.final_path.display()))?;
-    let parent = staged.final_path.parent().unwrap_or(Path::new("."));
-    if let Ok(handle) = fs::File::open(parent) {
-        let _ = handle.sync_all();
-    }
-    Ok(())
+    publish::sync_published(&staged.final_path, None)
 }
 
 /// `pulse-<UTC stamp>.db`, with a `-N` suffix probed on a same-second
@@ -627,4 +631,48 @@ pub(crate) async fn run_restore(args: &RestoreArgs) -> anyhow::Result<()> {
         chmod_source: false,
     })
     .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{StagedBackup, publish_staged_database};
+    use crate::cli::publish;
+    use std::fs;
+
+    /// Issue #259: the database is the LAST thing a backup makes visible, and
+    /// the rename that publishes it is followed by an fsync of the out-dir it
+    /// landed in — a backup may not be reported successful over a rename that is
+    /// not durable (a power loss could otherwise keep the newest snapshot's
+    /// entries while losing the database that names them, or the reverse).
+    #[test]
+    fn the_published_backup_database_syncs_the_out_dir_after_the_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = StagedBackup {
+            partial: dir.path().join("pulse-20260101T000000Z.db.partial"),
+            final_path: dir.path().join("pulse-20260101T000000Z.db"),
+        };
+        fs::write(&staged.partial, b"a complete copy").expect("stage the copy");
+        let _ = publish::probe::take();
+
+        publish_staged_database(&staged).expect("publish");
+
+        let syncs = publish::probe::take();
+        assert_eq!(syncs.len(), 1, "one publish, one directory sync: {syncs:?}");
+        assert_eq!(syncs[0].dir, dir.path(), "the out-dir it landed in");
+        assert!(
+            syncs[0].published_present,
+            "the sync happens AFTER the rename, never before it: {syncs:?}"
+        );
+        assert!(
+            !staged.partial.exists(),
+            "the staged name is gone: {}",
+            staged.partial.display()
+        );
+        assert_eq!(
+            fs::read(&staged.final_path).expect("read the published backup"),
+            b"a complete copy",
+            "and the backup holds the copy's bytes"
+        );
+    }
 }
