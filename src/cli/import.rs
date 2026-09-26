@@ -33,9 +33,14 @@ use anyhow::anyhow;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
+use super::publish;
+#[cfg(test)]
+use super::publish::probe;
 use crate::adapters::db::default_db_path;
 use crate::adapters::db::ops;
-use crate::adapters::db::{Db, SqliteBacktestRunRepo, SqliteStrategyRepo, open_migrated};
+use crate::adapters::db::{
+    Db, SqliteBacktestRunRepo, SqliteStrategyRepo, open_migrated_copy, put_in_wal,
+};
 use crate::adapters::store::CandleStore;
 use crate::adapters::store::default_base_dir;
 use crate::domain::strategy::VersionId;
@@ -304,7 +309,14 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
 
     // ---- Step 2: a consistent copy of the source, beside the target (the
     // same filesystem, under the target's directory, never /tmp).
-    if let Some(parent) = job.db_target.parent() {
+    //
+    // The deepest ancestor that exists BEFORE the target's directory is created:
+    // every level below it is an entry this run makes, so the install's directory
+    // sync has to cover them (fix round 1, F6).
+    let created_root = job.db_target.parent().and_then(publish::existing_ancestor);
+    if let Some(parent) = job.db_target.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create target directory {}: {e}", parent.display()))?;
     }
@@ -315,9 +327,21 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     let copied = ops::vacuum_into_copy(&source, &tmp_db).await;
     source.close().await;
     copied.map_err(|e| anyhow!("copy the source database: {e}"))?;
+    // `VACUUM INTO` does not guarantee its output is on disk, and the install
+    // renames this file: the bytes must land before the name that promises them
+    // (fix round 1, F5).
+    publish::sync_file(&tmp_db, job.db_target)
+        .map_err(|error| anyhow!("flush the copied database: {error}"))?;
 
     // ---- Steps 3–5: migrate the copy forward, copy the snapshots, verify.
-    let opened = match open_migrated(&tmp_db).await {
+    // The copy is opened in ROLLBACK-JOURNAL mode (`open_migrated_copy`), never
+    // WAL: the install renames this file and only this file, so a `-wal`/`-shm`
+    // beside it would be left behind under a name the rename does not carry —
+    // taking every row still committed in it (#258). In rollback-journal mode
+    // there is no WAL to strand, and the mode is READ BACK when the copy is
+    // opened (sqlx applies `PRAGMA journal_mode` without checking its result),
+    // so it is a checked property rather than a request.
+    let opened = match open_migrated_copy(&tmp_db).await {
         Ok(db) => db,
         Err(e) => {
             remove_tmp_db(&tmp_db);
@@ -326,13 +350,13 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     };
     let steps = run_steps(&job, &opened, manifest_heads.as_deref()).await;
     // CLOSE the copy's pool — do not merely drop the handle — before any file
-    // surgery on either path. A dropped handle releases the pool without
-    // closing its connections, so committed rows could still sit in the
-    // temporary database's `-wal` when the install renames only the database
-    // file: the rename would publish a database whose writes live in a WAL left
-    // behind (and the target's own stale sidecars are removed on the way in), so
-    // a fresh reader would see a database missing its most recent commits.
-    // Closing checkpoints the WAL into the file and removes it.
+    // surgery on either path. A dropped handle releases the pool without closing
+    // its connections, and sqlx returns even a closed pool's in-flight
+    // connections from spawned tasks, so no close here can be relied on to have
+    // released the file by the time the rename runs. Closing is what the pool
+    // owes the file; NOT being in WAL (`open_migrated_copy`) is what makes the
+    // install safe when the close lands late, and `install_tmp_db` additionally
+    // REFUSES to rename while any sidecar is still beside the copy.
     opened.pool().close().await;
 
     // Undoing a step's writes is always the same two moves: the files it added
@@ -362,15 +386,20 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
             );
         }
         Ok((summary, writes)) => {
-            // ---- Step 7: atomic install. The target's stale -wal/-shm are
-            // removed first so an old sidecar can never bleed into the
-            // renamed file (the migration-protocol restore precedent).
-            if let Err(error) = install_tmp_db(&tmp_db, job.db_target) {
-                // The install is the last thing that can fail: it cleans up
-                // exactly as every earlier fatal path does.
-                remove_tmp_db(&tmp_db);
-                undo(&writes);
-                return Err(error);
+            // ---- Step 7: the install. Once its rename has landed the database
+            // IS in place, and a failure after that point is NOT the pre-rename
+            // failure the cleanup below handles (fix round 1, F1): deleting the
+            // snapshots this run copied or rewinding a HEAD pointer would leave
+            // the installed database pointing at rows that are gone. Only
+            // `Untouched` — nothing renamed — may run the undo.
+            match install_tmp_db(&tmp_db, job.db_target, created_root.as_deref()).await {
+                Ok(()) => {}
+                Err(InstallFailure::Untouched(error)) => {
+                    remove_tmp_db(&tmp_db);
+                    undo(&writes);
+                    return Err(error);
+                }
+                Err(failure) => return Err(failure.into_error()),
             }
             if job.chmod_source {
                 set_read_only(job.from_db)?;
@@ -901,8 +930,17 @@ pub(crate) fn manifest_path(backup_db: &Path) -> PathBuf {
 
 /// Publish `bytes` at `path` ATOMICALLY — the same temp→fsync→rename discipline
 /// the snapshot copies use, so a reader never sees a half-written file and a
-/// crash never leaves a partial one under the final name.
-fn write_file_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+/// crash never leaves a partial one under the final name — and fsync the
+/// directory it landed in, so the published name itself is durable (issue #259:
+/// a backup's database must not outlive the manifest and snapshots it
+/// references).
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] when the temporary cannot be written or
+/// flushed, when the rename fails (the temporary is removed), or when the
+/// directory cannot be fsynced.
+fn write_file_atomic(path: &Path, bytes: &[u8], created: Option<&Path>) -> anyhow::Result<()> {
     let temporary = temporary_sibling(path)?;
     let _ = fs::remove_file(&temporary);
     fs::write(&temporary, bytes).map_err(|e| anyhow!("write {}: {e}", temporary.display()))?;
@@ -922,12 +960,17 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             temporary.display(),
             path.display()
         )
-    })
+    })?;
+    publish::sync_published(path, created)
 }
 
 /// Write one backup's pointer manifest beside it (atomically: the same
 /// discipline the rest of the surface uses).
-pub(crate) fn write_head_manifest(path: &Path, heads: &[SourceHead]) -> anyhow::Result<()> {
+pub(crate) fn write_head_manifest(
+    path: &Path,
+    heads: &[SourceHead],
+    created: Option<&Path>,
+) -> anyhow::Result<()> {
     let manifest = HeadManifest {
         version: MANIFEST_VERSION,
         heads: heads
@@ -941,7 +984,7 @@ pub(crate) fn write_head_manifest(path: &Path, heads: &[SourceHead]) -> anyhow::
     };
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| anyhow!("serialize the HEAD manifest: {e}"))?;
-    write_file_atomic(path, &bytes)
+    write_file_atomic(path, &bytes, created)
 }
 
 /// Read one backup's pointer manifest — the ONLY pointer source a restore uses.
@@ -1207,8 +1250,14 @@ fn copy_snapshots(
                 }
                 continue;
             }
+            // Recorded BEFORE the copy (fix round 1, F8): `copy_snapshot_into`
+            // renames the file into place and then syncs its directory, so a
+            // failure AFTER the rename still leaves a snapshot behind — one the
+            // rollback must remove. The name is known free (the `exists` check
+            // above), so recording it up front cannot delete anything this run
+            // did not write.
+            added.push(dest.clone());
             copy_snapshot_into(&snap.path, &dest)?;
-            added.push(dest);
         }
         Ok(())
     })();
@@ -1232,16 +1281,31 @@ fn copy_snapshots(
 /// file and a failure removes the temporary, leaving the destination exactly as
 /// it was (absent, or whatever was there).
 ///
+/// The rename is then made durable by fsyncing the directory it landed in — and
+/// every level the copy's `create_dir_all` created below the deepest ancestor
+/// that already existed, because the nested `<PAIR>/<TF>/` directories are
+/// entries in THEIR parents too (issue #259: a backup must not keep a database
+/// while losing a snapshot it references).
+///
 /// Shared with `cli/backup.rs`, so the backup store's copy is the same copy the
 /// import makes.
 ///
 /// # Errors
 ///
-/// Any I/O failure — creating the destination's directory, copying, flushing or
-/// renaming — with the temporary removed. A temporary left by an earlier
-/// crashed run is deleted first: its bytes are not this run's.
+/// Any I/O failure — creating the destination's directory, copying, flushing,
+/// renaming or fsyncing the directory it landed in — with the temporary removed.
+/// A temporary left by an earlier crashed run is deleted first: its bytes are
+/// not this run's. A failure AFTER the rename (the directory fsync) leaves the
+/// published file in place and reports the error: the bytes are complete and
+/// content-addressed, so the next run adopts them byte-for-byte, but this run
+/// must not be reported as durable.
 pub(crate) fn copy_snapshot_into(source: &Path, dest: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = dest.parent() {
+    // The deepest ancestor that exists BEFORE the copy creates anything: the
+    // levels below it are this copy's own directory entries (issue #259).
+    let created = dest.parent().and_then(publish::existing_ancestor);
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create snapshot directory {}: {e}", parent.display()))?;
     }
@@ -1259,12 +1323,7 @@ pub(crate) fn copy_snapshot_into(source: &Path, dest: &Path) -> anyhow::Result<(
     // rename publishes them, and a crash must not leave a durable name over
     // bytes that never landed. (Opened read+write so the flush is legal on every
     // platform, not just where `fsync` accepts a read-only handle.)
-    let flushed = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&temporary)
-        .and_then(|handle| handle.sync_all());
-    if let Err(error) = flushed {
+    if let Err(error) = publish::sync_file(&temporary, dest) {
         let _ = fs::remove_file(&temporary);
         return Err(anyhow!("flush {}: {error}", temporary.display()));
     }
@@ -1275,7 +1334,8 @@ pub(crate) fn copy_snapshot_into(source: &Path, dest: &Path) -> anyhow::Result<(
             temporary.display(),
             dest.display()
         )
-    })
+    })?;
+    publish::sync_published(dest, created.as_deref())
 }
 
 /// The temporary sibling of one content-addressed destination: its own name
@@ -1313,10 +1373,13 @@ fn temp_db_path(target: &Path, label: &str) -> anyhow::Result<PathBuf> {
     Ok(dir.join(format!(".{stem}.{label}-tmp-{}.db", std::process::id())))
 }
 
-/// Delete the temporary database and its sidecars (failure path).
+/// Delete the temporary database and EVERY sidecar a copy can have (failure
+/// path) — the same suffix set the refusal checks, from the one constant, so a
+/// sidecar can never be refused and then left behind (fix round 1, F7).
 fn remove_tmp_db(tmp_db: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = fs::remove_file(format!("{}{suffix}", tmp_db.display()));
+    let _ = fs::remove_file(tmp_db);
+    for suffix in COPY_SIDECAR_SUFFIXES {
+        let _ = fs::remove_file(sidecar_path(tmp_db, suffix));
     }
 }
 
@@ -1328,24 +1391,298 @@ fn remove_added_snapshots(added: &[PathBuf]) {
     }
 }
 
-/// Remove a target's stale `-wal`/`-shm` sidecars so they can never bleed
-/// into the freshly renamed file.
-fn remove_stale_sidecars(db: &Path) {
-    let _ = fs::remove_file(format!("{}-wal", db.display()));
-    let _ = fs::remove_file(format!("{}-shm", db.display()));
+/// The suffixes `SQLite` puts a database's own un-checkpointed state in: the
+/// files the install moves aside beside the TARGET, so an old hot journal cannot
+/// be replayed into the freshly installed file (fix round 1, F3).
+const DB_STATE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// [`DB_STATE_SUFFIXES`] plus this crate's own copy temporary (`.partial`):
+/// every suffix a file beside the temporary COPY can hold state in.
+///
+/// ONE source of truth (fix round 1, F7): the refusal checks these suffixes and
+/// the cleanup removes these suffixes, so a suffix can never be checked but left
+/// behind.
+const COPY_SIDECAR_SUFFIXES: [&str; 4] = ["-wal", "-shm", "-journal", ".partial"];
+
+/// Append a suffix to a path's FINAL component, through the raw `OsStr` — never
+/// `display()`, which is lossy for a name that is not valid UTF-8 (the migration
+/// protocol's own `sidecar_path` does the same; fix round 1, F7).
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
-/// Atomically rename the temporary database into place, then fsync the
-/// directory so the rename is durable (the store's temp→fsync→rename
-/// discipline).
-fn install_tmp_db(tmp_db: &Path, target: &Path) -> anyhow::Result<()> {
-    remove_stale_sidecars(target);
-    fs::rename(tmp_db, target)
-        .map_err(|e| anyhow!("install {} -> {}: {e}", tmp_db.display(), target.display()))?;
-    if let Some(dir) = target.parent()
-        && let Ok(handle) = fs::File::open(dir)
-    {
-        let _ = handle.sync_all();
+/// Why an install refused a temporary database (#258).
+///
+/// A database's committed rows can live OUTSIDE its file: SQLite keeps them in
+/// a `-wal` (write-ahead log) or, mid-transaction, in a `-journal`, and the
+/// install renames the database file and nothing else. A sidecar left beside
+/// the copy therefore has no way to travel with it — the rename strands the
+/// rows under a name no database owns any more — so the install refuses rather
+/// than publishing a database missing its most recent commits.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InstallRefusal {
+    /// A sidecar that holds (or may hold) commits the renamed file would not
+    /// carry.
+    #[error(
+        "refusing to install {db}: the temporary database still has its {suffix} sidecar \
+         {sidecar} beside it, and a rename carries the database file only — committed rows \
+         would be stranded outside the installed database",
+        db = .db.display(),
+        sidecar = .sidecar.display()
+    )]
+    Sidecar {
+        /// The temporary database that was not installed.
+        db: PathBuf,
+        /// The sidecar's suffix (`-wal`, `-shm`, `-journal`, `.partial`).
+        suffix: &'static str,
+        /// The sidecar itself.
+        sidecar: PathBuf,
+    },
+}
+
+/// Refuse the install when any sidecar still sits beside the copy (#258).
+///
+/// Fail closed: the check deletes nothing and renames nothing, so the target is
+/// left exactly as it was and the caller's failure path removes the temporary
+/// (with its sidecars) for a clean retry.
+///
+/// # Errors
+///
+/// Returns [`InstallRefusal::Sidecar`] for the first sidecar found.
+fn refuse_stranded_sidecar(tmp_db: &Path) -> anyhow::Result<()> {
+    for suffix in COPY_SIDECAR_SUFFIXES {
+        let sidecar = sidecar_path(tmp_db, suffix);
+        if sidecar.exists() {
+            return Err(InstallRefusal::Sidecar {
+                db: tmp_db.to_path_buf(),
+                suffix,
+                sidecar,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// The quarantine name of one of the target's sidecars: a hidden sibling that no
+/// database name matches, unique to this process, and therefore inert even if a
+/// crash leaves one behind.
+fn quarantine_path(target: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("unusable target path: {}", target.display()))?;
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow!("target {} has no parent directory", target.display()))?;
+    Ok(dir.join(format!(".{name}{suffix}.quarantine-{}", std::process::id())))
+}
+
+/// The target's own sidecars, MOVED ASIDE for the duration of the install
+/// (fix round 1, F3: findings L3 and L10).
+///
+/// The install replaces the whole database file, so the old target's `-wal`,
+/// `-shm` and `-journal` must never be replayed into the new one — and a rename
+/// that FAILS must not have stripped the old target of the commits they hold.
+/// Renaming them aside answers both: the copy is renamed into a directory where
+/// no sidecar of the old name can be replayed onto it, and a failed install puts
+/// them straight back.
+struct QuarantinedSidecars {
+    /// `(quarantine, original)` for each sidecar that was moved.
+    moved: Vec<(PathBuf, PathBuf)>,
+}
+
+impl QuarantinedSidecars {
+    /// Move the target's existing sidecars aside (paths built from the raw
+    /// `OsStr`, never through `display()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`anyhow::Error`] when a sidecar cannot be moved — the install
+    /// has not renamed anything yet, so the caller reports it as untouched.
+    fn take(target: &Path) -> anyhow::Result<Self> {
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for suffix in DB_STATE_SUFFIXES {
+            // (the test seam records what was moved, below)
+            let original = sidecar_path(target, suffix);
+            if !original.exists() {
+                continue;
+            }
+            let quarantine = quarantine_path(target, suffix)?;
+            // Never reuse a quarantine a crashed run left: those bytes are not
+            // this run's.
+            let _ = fs::remove_file(&quarantine);
+            fs::rename(&original, &quarantine).map_err(|error| {
+                anyhow!(
+                    "quarantine the target's {suffix} sidecar {} -> {}: {error}",
+                    original.display(),
+                    quarantine.display()
+                )
+            })?;
+            moved.push((quarantine, original));
+        }
+        #[cfg(test)]
+        probe::record_quarantine(
+            &moved
+                .iter()
+                .map(|(_, original)| original.clone())
+                .collect::<Vec<PathBuf>>(),
+        );
+        Ok(Self { moved })
+    }
+
+    /// Put every quarantined sidecar back: a failed install leaves the old
+    /// target exactly as it was, un-checkpointed commits included.
+    fn restore(&self) {
+        for (quarantine, original) in &self.moved {
+            let _ = fs::rename(quarantine, original);
+        }
+    }
+
+    /// Remove the quarantined sidecars — the install landed, so their bytes
+    /// belong to the database that was replaced — and fsync each directory so
+    /// the removals are durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`anyhow::Error`] when a quarantined file cannot be removed or
+    /// its directory cannot be synced. The install has already landed; the
+    /// caller reports this as an installed-but-unconfirmed state, and the
+    /// leftovers are inert (no database name matches them).
+    fn discard(&self) -> anyhow::Result<()> {
+        for (quarantine, _) in &self.moved {
+            match fs::remove_file(quarantine) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(anyhow!("remove {}: {error}", quarantine.display()));
+                }
+            }
+        }
+        for dir in self.directories() {
+            publish::sync_dir(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// The distinct directories the quarantined files live in.
+    fn directories(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for (quarantine, _) in &self.moved {
+            if let Some(dir) = quarantine.parent()
+                && !dirs.iter().any(|seen| seen == dir)
+            {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        dirs
+    }
+}
+
+/// The install's outcome when it fails: WHAT the target is left as, so the
+/// caller knows whether its pre-rename cleanup still applies (fix round 1, F1).
+#[derive(Debug)]
+pub(crate) enum InstallFailure {
+    /// Nothing was renamed: the target is exactly as it was (its own sidecars
+    /// put back), so the caller's pre-rename cleanup — delete the temporary,
+    /// undo the store writes — still applies.
+    Untouched(anyhow::Error),
+    /// The rename LANDED: the target IS this run's database. A step after the
+    /// rename failed, so the pre-rename cleanup must NOT run — it would delete
+    /// the snapshots this run copied and rewind HEAD pointers the installed
+    /// database now depends on.
+    Installed {
+        /// The database that IS in place.
+        target: PathBuf,
+        /// The failure, naming the installed state and what is unconfirmed.
+        error: anyhow::Error,
+    },
+}
+
+impl InstallFailure {
+    /// The error the caller reports. An [`Self::Installed`] failure names the
+    /// database that IS in place first, so the operator reads the state before
+    /// the detail and never has to guess whether the target was replaced.
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Untouched(error) => error,
+            Self::Installed { target, error } => anyhow!(
+                "the database IS installed at {} but its publish is not confirmed: {error}",
+                target.display()
+            ),
+        }
+    }
+}
+
+/// Install the temporary database: refuse a copy with a sidecar left to strand,
+/// move the target's own sidecars aside, rename the copy into place, make the
+/// rename durable, put the installed file back in WAL, and drop what was moved
+/// aside.
+///
+/// # Errors
+///
+/// [`InstallFailure::Untouched`] when nothing was renamed (the refusal, the
+/// quarantine, or the rename itself failed — the target's sidecars are put
+/// back), and [`InstallFailure::Installed`] when the rename landed and a later
+/// step failed, so the caller must not run its pre-rename cleanup.
+async fn install_tmp_db(
+    tmp_db: &Path,
+    target: &Path,
+    created: Option<&Path>,
+) -> Result<(), InstallFailure> {
+    // 1. The copy must have nothing left beside it that the rename cannot carry.
+    if let Err(error) = refuse_stranded_sidecar(tmp_db) {
+        return Err(InstallFailure::Untouched(error));
+    }
+    // 2. The old target's sidecars move aside: a stale hot `-journal`/`-wal` must
+    //    never be replayed into the freshly installed file (L3), and a rename
+    //    that fails must not have stripped the old target of the commits they
+    //    hold (L10).
+    let quarantined = match QuarantinedSidecars::take(target) {
+        Ok(quarantined) => quarantined,
+        Err(error) => return Err(InstallFailure::Untouched(error)),
+    };
+    // 3. The rename itself. Past this point the database IS installed.
+    if let Err(error) = fs::rename(tmp_db, target) {
+        quarantined.restore();
+        return Err(InstallFailure::Untouched(anyhow!(
+            "install {} -> {}: {error}",
+            tmp_db.display(),
+            target.display()
+        )));
+    }
+    let installed = |unconfirmed: &str, error: anyhow::Error| InstallFailure::Installed {
+        target: target.to_path_buf(),
+        error: anyhow!("{unconfirmed}: {error}"),
+    };
+    // 4. The rename is durable only once the directory that received it is
+    //    fsynced — including every level this run created (issue #259, F6).
+    if let Err(error) = publish::sync_published(target, created) {
+        return Err(installed(
+            "its directory could not be fsynced, so the new name is not durable",
+            error,
+        ));
+    }
+    // 5. ADR-0019, deterministically (F4): the installed file is in WAL, read
+    //    back, before this command reports success — never left to the next
+    //    process to fix with a fire-and-forget pragma.
+    if let Err(error) = put_in_wal(target).await {
+        return Err(installed(
+            "it could not be put back in WAL, so the production journal mode is not in place",
+            anyhow::Error::new(error),
+        ));
+    }
+    // 6. What was moved aside belonged to the database that was just replaced:
+    //    drop it (the leftovers are inert — no database name matches them).
+    if let Err(error) = quarantined.discard() {
+        return Err(installed(
+            "the replaced database's quarantined sidecars could not be removed (they are inert: \
+             no database name matches them)",
+            error,
+        ));
     }
     Ok(())
 }
@@ -1402,9 +1739,17 @@ fn print_summary(label: &str, job: &VerifiedCopy<'_>, summary: &Summary) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::copy_snapshot_into;
+    use super::{
+        COPY_SIDECAR_SUFFIXES, HeadSource, InstallFailure, InstallRefusal, VerifiedCopy,
+        copy_snapshot_into, copy_snapshots, install_tmp_db, publish, remove_added_snapshots,
+        remove_tmp_db, run_verified_copy, scan_heads, scan_snapshots, sidecar_path,
+        write_head_manifest,
+    };
+    use crate::adapters::db::{open_migrated, open_migrated_copy};
+    use crate::adapters::store::CandleStore;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     /// Every `*.partial` file beside one destination.
     fn partial_files(dest: &Path) -> Vec<PathBuf> {
@@ -1422,8 +1767,78 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Fix 2: a copy publishes through a temporary sibling, so a failure can
-    /// never leave a truncated file under a final content-addressed name — and
+    /// A recursive copy (the fixture store is a directory tree).
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).expect("create the destination directory");
+        for entry in fs::read_dir(from).expect("read the source directory") {
+            let entry = entry.expect("directory entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).expect("copy the file");
+            }
+        }
+    }
+
+    /// Everything an in-process import needs: a migrated source database and the
+    /// committed fixture store as the source data dir, plus fresh target paths.
+    struct Flow {
+        _dir: TempDir,
+        source_db: PathBuf,
+        source_data: PathBuf,
+        target_db: PathBuf,
+        target_data: PathBuf,
+    }
+
+    async fn flow() -> Flow {
+        let dir = TempDir::new().expect("tempdir");
+        let source_data = dir.path().join("mac-data");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/btcusdt-1m-store"),
+            &source_data,
+        );
+        let source_db = dir.path().join("mac").join("pulse.db");
+        fs::create_dir_all(source_db.parent().expect("the source's directory"))
+            .expect("create the source directory");
+        let db = open_migrated(&source_db).await.expect("migrate the source");
+        db.pool().close().await;
+        let target_db = dir.path().join("server").join("pulse.db");
+        let target_data = dir.path().join("server-data");
+        Flow {
+            _dir: dir,
+            source_db,
+            source_data,
+            target_db,
+            target_data,
+        }
+    }
+
+    /// The job an import hands [`run_verified_copy`].
+    fn import_job(flow: &Flow) -> VerifiedCopy<'_> {
+        VerifiedCopy {
+            source_label: "import",
+            from_db: &flow.source_db,
+            from_data_dir: &flow.source_data,
+            db_target: &flow.target_db,
+            data_target: &flow.target_data,
+            head_source: HeadSource::SourceStore,
+            replace: false,
+            chmod_source: false,
+        }
+    }
+
+    /// The store's `HEAD` pointer for a `(pair, timeframe)`.
+    fn head_of(
+        flow: &Flow,
+        pair: &crate::domain::Pair,
+        timeframe: crate::domain::Timeframe,
+    ) -> PathBuf {
+        CandleStore::with_base_dir(flow.target_data.clone()).head_path(pair, timeframe)
+    }
+
+    /// Fix 2 (round 4): a copy publishes through a temporary sibling, so a failure
+    /// can never leave a truncated file under a final content-addressed name — and
     /// a successful one leaves no temporary behind.
     #[test]
     fn a_failed_copy_leaves_nothing_under_the_final_name() {
@@ -1486,5 +1901,533 @@ mod tests {
             !temporary.exists(),
             "and the stray temporary is gone, not left beside it"
         );
+    }
+
+    /// Issue #258 (fail closed): a sidecar left beside the copy is REFUSED with
+    /// a named, typed reason — never renamed over — and a target that was
+    /// already there is left exactly as it was. A rename carries the database
+    /// file and nothing else, so renaming over this would publish a database
+    /// whose committed rows were left behind under a name no database owns.
+    #[tokio::test]
+    async fn the_install_refuses_a_leftover_sidecar_and_leaves_the_target_untouched() {
+        for suffix in COPY_SIDECAR_SUFFIXES {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("pulse.db");
+            let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+            fs::write(&target, b"the previous target").expect("write the target");
+            fs::write(&tmp_db, b"the copy").expect("write the copy");
+            let sidecar = sidecar_path(&tmp_db, suffix);
+            fs::write(&sidecar, b"rows that only live here").expect("write the sidecar");
+
+            let failure = install_tmp_db(&tmp_db, &target, None)
+                .await
+                .expect_err("an install with a leftover sidecar must be refused");
+
+            let InstallFailure::Untouched(error) = failure else {
+                panic!("nothing was renamed, so the target is untouched: {failure:?}");
+            };
+            let refusal = error
+                .downcast_ref::<InstallRefusal>()
+                .unwrap_or_else(|| panic!("the refusal must be typed, got: {error:?}"));
+            match refusal {
+                InstallRefusal::Sidecar {
+                    db,
+                    suffix: named_suffix,
+                    sidecar: named_sidecar,
+                } => {
+                    assert_eq!(db, &tmp_db, "the refusal names the temporary database");
+                    assert_eq!(*named_suffix, suffix);
+                    assert_eq!(named_sidecar, &sidecar, "and the sidecar it found");
+                }
+            }
+            assert!(
+                error.to_string().contains("refusing to install"),
+                "the reason is named for the operator ({suffix}): {error}"
+            );
+            assert_eq!(
+                fs::read(&target).expect("read the target"),
+                b"the previous target",
+                "the target that was already there is untouched ({suffix})"
+            );
+            assert!(tmp_db.exists(), "the copy was not renamed away ({suffix})");
+            assert_eq!(
+                fs::read(&sidecar).expect("read the sidecar"),
+                b"rows that only live here",
+                "the sidecar is neither renamed nor deleted ({suffix})"
+            );
+        }
+    }
+
+    /// Fix round 1, F7: the cleanup and the refusal are ONE list. Every suffix
+    /// the refusal rejects is a suffix `remove_tmp_db` removes — so a refused
+    /// install's failure path cannot leave a sidecar behind (the round-1 code
+    /// checked four suffixes and removed two).
+    #[test]
+    fn the_temporarys_cleanup_removes_every_sidecar_the_refusal_checks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        fs::write(&tmp_db, b"the copy").expect("write the copy");
+        for suffix in COPY_SIDECAR_SUFFIXES {
+            fs::write(sidecar_path(&tmp_db, suffix), b"state").expect("write the sidecar");
+        }
+        assert!(
+            super::refuse_stranded_sidecar(&tmp_db).is_err(),
+            "the refusal rejects the copy while a sidecar is beside it"
+        );
+
+        remove_tmp_db(&tmp_db);
+
+        assert!(!tmp_db.exists(), "the copy is gone");
+        let left: Vec<PathBuf> = COPY_SIDECAR_SUFFIXES
+            .iter()
+            .map(|suffix| sidecar_path(&tmp_db, suffix))
+            .filter(|sidecar| sidecar.exists())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "and so is every sidecar the refusal checks: {left:?}"
+        );
+    }
+
+    /// Fix round 1, F7 (L5/L9): sidecar paths are built from the raw `OsStr`, so
+    /// a directory name that is not valid UTF-8 still matches — a `display()`
+    /// round-trip rewrites those bytes and would look for a file that is not
+    /// there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_utf8_directory_still_detects_a_planted_sidecar() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join(OsStr::from_bytes(b"host-\xff\xfe"));
+        fs::create_dir_all(&raw).expect("create the non-UTF-8 directory");
+        let target = raw.join("pulse.db");
+        let tmp_db = raw.join(".pulse.db.import-tmp-1.db");
+        fs::write(&tmp_db, b"the copy").expect("write the copy");
+        let sidecar = sidecar_path(&tmp_db, "-wal");
+        fs::write(&sidecar, b"rows that only live here").expect("write the sidecar");
+
+        let failure = install_tmp_db(&tmp_db, &target, None)
+            .await
+            .expect_err("the planted -wal must be detected");
+        let InstallFailure::Untouched(error) = failure else {
+            panic!("nothing was renamed: {failure:?}");
+        };
+        assert!(
+            error.downcast_ref::<InstallRefusal>().is_some(),
+            "the refusal is typed even for a non-UTF-8 path: {error:?}"
+        );
+        assert!(
+            sidecar.exists() && !target.exists(),
+            "nothing was renamed and the sidecar is still there"
+        );
+    }
+
+    /// Issue #259: the install's rename is followed by an fsync of the directory
+    /// that received the database (the store's own
+    /// temp→fsync→rename→fsync-dir discipline), so the target's new name is
+    /// durable before the import reports success.
+    #[tokio::test]
+    async fn the_install_syncs_the_target_directory_after_the_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        let _ = publish::probe::take();
+
+        install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect("install");
+
+        let syncs = publish::probe::take();
+        assert!(
+            syncs.iter().any(|sync| sync.path == *dir.path()
+                && sync.destination == target
+                && sync.destination_present),
+            "the target's own directory is synced AFTER the rename: {syncs:?}"
+        );
+        assert!(target.exists(), "and the database is there");
+    }
+
+    /// Fix round 1, F4 (ADR-0019): the file the import leaves behind is in WAL
+    /// before the command reports success. The install's copy runs in
+    /// rollback-journal mode (#258), and `journal_mode` is persisted IN the file,
+    /// so the install puts it back itself — read back, not left to whatever opens
+    /// the database next.
+    #[tokio::test]
+    async fn the_install_puts_the_target_back_in_wal_before_it_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+
+        install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect("install");
+
+        // The file itself declares WAL (header bytes 18/19 are the format
+        // versions: 2 = WAL) the moment the install returns.
+        let header = fs::read(&target).expect("read the installed database");
+        assert_eq!(
+            (header.get(18), header.get(19)),
+            (Some(&2), Some(&2)),
+            "the installed database's own header says WAL when the install returns"
+        );
+
+        // The single connection the switch used closed synchronously, so the
+        // directory holds the database alone — asserted BEFORE anything else
+        // opens it (a pool's close could leave a connection in flight, and the
+        // strays it strands are #258's failure mode, not this test's subject).
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .expect("read the target's directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with("-wal") || name.ends_with("-shm"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "no sidecar survives the install: {strays:?}"
+        );
+
+        // And the normal opener still reads WAL back out of it.
+        let installed = crate::adapters::db::Db::with_path(&target)
+            .await
+            .expect("open the installed database");
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(installed.pool())
+            .await
+            .expect("read journal_mode");
+        installed.pool().close().await;
+        assert_eq!(mode.to_ascii_lowercase(), "wal", "and it stays WAL");
+    }
+
+    /// Fix round 1, F3 (L3): the OLD target's sidecars never survive the install.
+    /// A stale hot `-journal`/`-wal` beside the target belongs to the database
+    /// being replaced, and replaying it into the freshly installed file would be
+    /// exactly the corruption this PR is about — so the install quarantines them
+    /// and drops them once the new file is in place.
+    #[tokio::test]
+    async fn an_install_does_not_leave_the_old_targets_sidecars_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        fs::write(&target, b"the old target").expect("write the old target");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            fs::write(sidecar_path(&target, suffix), b"the old target's state")
+                .expect("write the old target's sidecar");
+        }
+
+        let _ = publish::probe::take_quarantine();
+        install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect("install");
+
+        // The MECHANISM, not just the end state: the old sidecars were taken out
+        // of the way before the copy was renamed in. (The WAL switch that follows
+        // reopens the database and cleans a stale sidecar up on its own, so the
+        // end state alone cannot tell the quarantine from leaving them there.)
+        let quarantined = publish::probe::take_quarantine();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                quarantined.contains(&sidecar_path(&target, suffix)),
+                "the old target's {suffix} was moved aside before the rename: {quarantined:?}"
+            );
+        }
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .expect("read the directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !sidecar_path(&target, suffix).exists(),
+                "the old target's {suffix} is gone after a successful install: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().all(|name| !name.contains(".quarantine-")),
+            "and no quarantine is left behind: {names:?}"
+        );
+        assert!(target.exists(), "the new database is in place");
+    }
+
+    /// Fix round 1, F3 (L10): a FAILED install must not strip the old target of
+    /// its un-checkpointed commits. The sidecars it moved aside go straight back.
+    #[tokio::test]
+    async fn a_failed_install_puts_the_old_targets_sidecars_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        // The copy is ABSENT, so the rename itself fails — the one step between
+        // the quarantine and the target becoming the new database.
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        fs::write(&target, b"the old target").expect("write the old target");
+        let sidecar = sidecar_path(&target, "-wal");
+        fs::write(&sidecar, b"the old target's un-checkpointed rows")
+            .expect("write the old target's -wal");
+
+        let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect_err("the rename fails: the copy does not exist");
+        let InstallFailure::Untouched(error) = failure else {
+            panic!("nothing was renamed: {failure:?}");
+        };
+        assert!(
+            error.to_string().contains("install"),
+            "the failure names the rename: {error}"
+        );
+        assert_eq!(
+            fs::read(&sidecar).expect("read the restored sidecar"),
+            b"the old target's un-checkpointed rows",
+            "the old target's -wal is still beside it, with its bytes"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read the old target"),
+            b"the old target",
+            "and the old database is untouched"
+        );
+    }
+
+    /// Issue #259: a snapshot's rename is followed by an fsync of the directory
+    /// it landed in AND of every level the copy created below the deepest
+    /// ancestor that already existed — the nested `candles/<PAIR>/<TF>/` entries
+    /// are what a backup would otherwise lose while keeping the database that
+    /// references them.
+    #[test]
+    fn a_snapshot_copy_syncs_every_directory_it_created_after_the_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.parquet");
+        fs::write(&source, b"snapshot bytes").expect("write the source");
+
+        // The store root exists; the pair and timeframe directories do not, so
+        // the copy creates two levels and each is an entry in its own parent.
+        let candles = dir.path().join("candles");
+        fs::create_dir_all(&candles).expect("the store root");
+        let pair = candles.join("BTCUSDT");
+        let timeframe = pair.join("15m");
+        let dest = timeframe.join("dv1.parquet");
+        let _ = publish::probe::take();
+
+        copy_snapshot_into(&source, &dest).expect("copy");
+
+        let events = publish::probe::take();
+        let synced: Vec<PathBuf> = events
+            .iter()
+            .filter(|event| event.kind == publish::probe::SyncKind::Dir)
+            .map(|event| event.path.clone())
+            .collect();
+        assert_eq!(
+            synced,
+            vec![timeframe.clone(), pair.clone(), candles.clone()],
+            "the leaf's directory, the level it was created in, and the store root"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == publish::probe::SyncKind::File
+                    && event.path == dest.with_extension("parquet.partial")
+                    && !event.destination_present),
+            "and the temporary's bytes were fsynced BEFORE the rename: {events:?}"
+        );
+
+        // A copy into a directory that ALREADY exists creates nothing, so only
+        // the leaf's own directory is synced — no walk up the store.
+        let second = timeframe.join("dv2.parquet");
+        let _ = publish::probe::take();
+        copy_snapshot_into(&source, &second).expect("copy into an existing directory");
+        let second_syncs: Vec<PathBuf> = publish::probe::take()
+            .into_iter()
+            .filter(|event| event.kind == publish::probe::SyncKind::Dir)
+            .map(|event| event.path)
+            .collect();
+        assert_eq!(
+            second_syncs,
+            vec![timeframe.clone()],
+            "nothing was created, so nothing above the leaf is synced"
+        );
+    }
+
+    /// Fix round 1, F5: `VACUUM INTO` does not guarantee its output is on disk,
+    /// and the install renames that file — so the copy's bytes are fsynced before
+    /// the name that promises them exists. The seam records both, which is what
+    /// proves the ORDER: the file sync sees no destination, the directory sync
+    /// sees it.
+    #[tokio::test]
+    async fn the_copied_database_is_flushed_before_its_rename() {
+        let flow = flow().await;
+        let _ = publish::probe::take();
+
+        run_verified_copy(import_job(&flow))
+            .await
+            .expect("the import succeeds");
+
+        let events = publish::probe::take();
+        let database_file = events
+            .iter()
+            .find(|event| {
+                event.kind == publish::probe::SyncKind::File && event.destination == flow.target_db
+            })
+            .unwrap_or_else(|| panic!("the copied database is fsynced: {events:?}"));
+        assert!(
+            !database_file.destination_present,
+            "the file sync runs BEFORE the rename: {database_file:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.kind == publish::probe::SyncKind::Dir
+                    && event.destination == flow.target_db
+                    && event.destination_present
+            }),
+            "and the directory sync runs AFTER it: {events:?}"
+        );
+    }
+
+    /// Fix round 1, F1: once the install's rename has landed the database IS in
+    /// place, so a failure AFTER it must not run the pre-rename undo — deleting
+    /// the snapshots this run copied or rewinding a HEAD pointer would leave the
+    /// installed database pointing at rows that are gone.
+    #[tokio::test]
+    async fn a_post_install_failure_leaves_the_snapshots_and_heads_it_wrote_in_place() {
+        let flow = flow().await;
+        let (source_snapshots, _) = scan_snapshots(&flow.source_data);
+        let (source_heads, _) = scan_heads(&flow.source_data);
+        assert!(
+            !source_snapshots.is_empty(),
+            "the fixture store has snapshots"
+        );
+        assert!(!source_heads.is_empty(), "and HEAD pointers");
+        // The install's own directory sync is injected to fail: the rename has
+        // already landed when the error comes back.
+        publish::probe::fail_next_sync_of(flow.target_db.parent().expect("the target's directory"));
+
+        let error = run_verified_copy(import_job(&flow))
+            .await
+            .expect_err("the injected post-rename failure ends the run");
+
+        assert!(
+            error.to_string().contains("IS installed"),
+            "the error names the installed state: {error}"
+        );
+        assert!(flow.target_db.exists(), "the database IS installed");
+        let target_store = CandleStore::with_base_dir(flow.target_data.clone());
+        for snapshot in &source_snapshots {
+            let dest =
+                target_store.snapshot_path(&snapshot.pair, snapshot.timeframe, &snapshot.version);
+            assert!(
+                dest.exists(),
+                "the snapshot this run copied was NOT undone: {}",
+                dest.display()
+            );
+        }
+        for head in &source_heads {
+            assert_eq!(
+                target_store
+                    .read_head(&head.pair, head.timeframe)
+                    .expect("read the target's HEAD pointer"),
+                Some(head.version.clone()),
+                "the HEAD pointer this run published was NOT rewound ({})",
+                head_of(&flow, &head.pair, head.timeframe).display()
+            );
+        }
+    }
+
+    /// Fix round 1, F8: a snapshot whose RENAME landed is recorded as added even
+    /// when the directory sync after it fails, so the rollback removes it — a
+    /// snapshot left behind under a valid name is one every later run refuses as
+    /// a byte mismatch.
+    #[test]
+    fn a_snapshot_whose_directory_sync_fails_is_still_rolled_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_data = dir.path().join("mac-data");
+        let leaf = source_data.join("candles").join("BTCUSDT").join("15m");
+        fs::create_dir_all(&leaf).expect("the source store");
+        fs::write(leaf.join("b51388284a3a4371.parquet"), b"snapshot bytes")
+            .expect("write the source snapshot");
+        let (snapshots, issues) = scan_snapshots(&source_data);
+        assert!(issues.is_empty(), "the source store is well-formed");
+        assert_eq!(snapshots.len(), 1, "one source snapshot");
+
+        let target_store = CandleStore::with_base_dir(dir.path().join("server-data"));
+        let dest = target_store.snapshot_path(
+            &snapshots[0].pair,
+            snapshots[0].timeframe,
+            &snapshots[0].version,
+        );
+        publish::probe::fail_next_sync_of(dest.parent().expect("the leaf's directory"));
+        let mut mismatches = Vec::new();
+
+        let (error, added) = copy_snapshots(&target_store, &snapshots, &mut mismatches)
+            .expect_err("the injected directory sync fails after the rename");
+
+        assert!(
+            dest.exists(),
+            "the rename landed before the sync failed: {}",
+            dest.display()
+        );
+        assert_eq!(
+            added,
+            vec![dest.clone()],
+            "and the copy is recorded so the rollback can remove it"
+        );
+        assert!(
+            error.to_string().contains("fsync directory"),
+            "the failure is the injected sync: {error}"
+        );
+
+        remove_added_snapshots(&added);
+        assert!(
+            !dest.exists(),
+            "the rollback removed the snapshot the failed copy published"
+        );
+    }
+
+    /// Fix round 1, F6: a relative path whose first component does not exist
+    /// resolves its ancestor to the CURRENT DIRECTORY (never `None`) — the entry
+    /// that component creates lands there, so that is what has to be synced.
+    #[test]
+    fn a_relative_path_with_no_existing_component_syncs_the_current_directory() {
+        let relative = Path::new("no-such-directory-3f7a/pulse.db");
+        assert_eq!(
+            super::publish::existing_ancestor(relative.parent().expect("a parent")),
+            Some(PathBuf::from(".")),
+            "the walk ends at the current directory, never at nothing"
+        );
+        assert_eq!(
+            super::publish::levels_to_sync(relative, Some(Path::new("."))),
+            vec![PathBuf::from("no-such-directory-3f7a"), PathBuf::from(".")],
+            "the created level, then the directory that holds it"
+        );
+    }
+
+    /// Issue #259: a backup's OWN `HEAD` manifest is published before the
+    /// database that references it, so the directory the manifest landed in is
+    /// fsynced too — a database must not outlive its manifest.
+    #[test]
+    fn a_published_manifest_syncs_its_directory_after_the_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("pulse-20260101T000000Z.db.heads.json");
+        let _ = publish::probe::take();
+
+        write_head_manifest(&manifest, &[], Some(dir.path())).expect("write the manifest");
+
+        let syncs = publish::probe::take();
+        assert_eq!(
+            syncs
+                .iter()
+                .filter(|event| event.kind == publish::probe::SyncKind::Dir)
+                .count(),
+            1,
+            "one publish, one directory sync: {syncs:?}"
+        );
+        assert_eq!(syncs[0].path, dir.path(), "the out-dir it landed in");
+        assert!(
+            syncs[0].destination_present,
+            "the sync happens AFTER the rename, never before it: {syncs:?}"
+        );
+        assert!(manifest.exists(), "the manifest is published");
     }
 }

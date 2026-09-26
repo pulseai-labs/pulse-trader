@@ -17,9 +17,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use chrono::Utc;
-use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 
 use super::{Db, MIGRATOR};
 use crate::domain::DataError;
@@ -95,6 +98,37 @@ async fn run_migrations_with_backup_using(
     db_path: &Path,
     migrator: &Migrator,
 ) -> Result<MigrationOutcome, DataError> {
+    run_migrations_with_backup_using_journal(db_path, migrator, SqliteJournalMode::Wal).await
+}
+
+/// [`run_migrations_with_backup_using`] with an explicit journal mode for the
+/// pool it opens on `db_path`.
+///
+/// Issue #258: the import's temporary copy is opened through
+/// [`open_migrated_copy`], which asks for rollback-journal mode — the file is
+/// about to be RENAMED into place, and a `-wal` beside it cannot travel with the
+/// rename.
+///
+/// The pool is CLOSED — never merely dropped — before this returns, on every
+/// path. Dropping a pool is not a close: sqlx returns a dropped connection to
+/// the pool from a SPAWNED task, and the connection's `SQLite` handle is released
+/// by that connection's own worker thread, so a dropped pool can keep the
+/// database file open after its owner has moved on. `SQLite` checkpoints and
+/// runs its final checkpoint and normally removes `-wal`/`-shm` when the LAST
+/// connection closes (it also checkpoints on its own at the WAL threshold), so
+/// which close removes the sidecars — and whether it has happened yet — is
+/// exactly the timing a caller that renames the file cannot tolerate (#258).
+///
+/// Closing is not a total guarantee either — a connection still in flight when
+/// the close starts is closed by its own spawned return — so the import's copy
+/// does not rely on close timing at all: it is opened with no WAL to strand
+/// ([`open_migrated_copy`]), and the install refuses rather than rename while
+/// any sidecar is still beside it.
+async fn run_migrations_with_backup_using_journal(
+    db_path: &Path,
+    migrator: &Migrator,
+    journal_mode: SqliteJournalMode,
+) -> Result<MigrationOutcome, DataError> {
     // Serialize the whole protocol — detect → backup → migrate → verify →
     // restore-on-failure — across processes. The second migrator parks here
     // until the first drops its lock, then derives `applied` from the
@@ -102,9 +136,21 @@ async fn run_migrations_with_backup_using(
     // restored file it must not trust).
     let _migration_lock = acquire_migration_lock(db_path).await?;
 
-    let db = Db::with_path(db_path).await?;
+    let db = Db::with_path_journal(db_path, journal_mode).await?;
     let pool = db.pool();
 
+    let outcome = migration_protocol(db_path, migrator, pool).await;
+    // CLOSE, don't merely drop (#258) — see this function's doc.
+    pool.close().await;
+    outcome
+}
+
+/// The protocol body, on a pool the caller owns (and closes on every path).
+async fn migration_protocol(
+    db_path: &Path,
+    migrator: &Migrator,
+    pool: &SqlitePool,
+) -> Result<MigrationOutcome, DataError> {
     // SETS, not maxima. This project allocates migration numbers at release planning
     // and ships them out of order — `r1.s1` shipped `0007` while `0005`/`0006` stayed
     // reserved for `r1.s2`/`r1.s3` — so "applied" and "current" are not the same
@@ -179,8 +225,11 @@ async fn run_migrations_with_backup_using(
             backup,
         }),
         Err(e) => {
-            // Drop the pool before restoring so no open handle holds the file.
-            drop(db);
+            // CLOSE the pool before restoring — not merely drop it — so no open
+            // handle holds the file the restore's rename is about to replace
+            // (issue #258: a dropped pool's connection is released later, by a
+            // worker thread nothing joins).
+            pool.close().await;
             restore_from_backup(db_path, &backup)?;
             Err(e)
         }
@@ -201,6 +250,141 @@ async fn run_migrations_with_backup_using(
 pub async fn open_migrated(db_path: &Path) -> Result<Db, DataError> {
     run_migrations_with_backup(db_path).await?;
     Db::with_path(db_path).await
+}
+
+/// [`open_migrated`] on a **copy that is about to be renamed into place** (the
+/// import's temporary database, issue #258).
+///
+/// Same protocol, same verification, one difference that matters: the file is
+/// opened in [`SqliteJournalMode::Delete`], never WAL. The install renames the
+/// database file and nothing else, so a `-wal`/`-shm` beside it would be left
+/// behind under a name the rename does not carry — with every row still
+/// committed in it — which is exactly the silent data loss 0857a92 meant to
+/// close. In rollback-journal mode there is no WAL to strand, and that is the
+/// only guarantee available: `SQLite` checkpoints on its own at the WAL
+/// threshold and a final checkpoint normally removes `-wal`/`-shm` when the LAST
+/// connection closes, so whether a WAL-mode copy's sidecars are gone by the time
+/// of a rename depends on when that close lands — and sqlx closes connections
+/// from spawned tasks and worker threads that nothing here awaits.
+///
+/// The mode is READ BACK, not assumed: sqlx applies `PRAGMA journal_mode` when
+/// it connects and ignores the statement's result, so a database that stayed in
+/// WAL (another connection holding the file, a locked file) would otherwise
+/// pass unnoticed and hand the install exactly the sidecars this prevents.
+///
+/// # Errors
+///
+/// As [`open_migrated`], plus [`DataError::Db`] when the copy is not in
+/// rollback-journal mode after opening.
+pub(crate) async fn open_migrated_copy(db_path: &Path) -> Result<Db, DataError> {
+    let journal_mode = SqliteJournalMode::Delete;
+    run_migrations_with_backup_using_journal(db_path, &MIGRATOR, journal_mode).await?;
+    let db = Db::with_path_journal(db_path, journal_mode).await?;
+    match verified_journal_mode(db.pool(), journal_mode).await {
+        Ok(()) => Ok(db),
+        Err(error) => {
+            // Never hand a copy in the wrong mode to a rename.
+            db.pool().close().await;
+            Err(error)
+        }
+    }
+}
+
+/// Put `db_path` back in WAL and PROVE it, for a database that was just
+/// published (ADR-0019; issue #259 review, F4).
+///
+/// `journal_mode` is persisted IN the database file, and the import installs a
+/// copy that ran in rollback-journal mode (#258) — so without this the file a
+/// `pulse import` leaves behind is in DELETE mode until some later process
+/// happens to open it. The production posture is restored here, read back, and
+/// closed before the command reports success, exactly as
+/// [`open_migrated_copy`] proves the copy's mode on the way in.
+///
+/// # Errors
+///
+/// [`DataError::Db`] when the database cannot be opened, the mode cannot be
+/// read, or it reports anything but WAL.
+pub(crate) async fn put_in_wal(db_path: &Path) -> Result<(), DataError> {
+    // ONE connection, never a pool (review correction on F4): a pool's `close`
+    // can return with a connection still in flight, and the sidecars that close
+    // lands late are exactly #258's failure mode. `Connection::close` shuts this
+    // connection's worker thread down SYNCHRONOUSLY — the worker drops its
+    // `SQLite` handle (which checkpoints and unlinks the `-wal`/`-shm` this
+    // switch created) before it acknowledges — so when this returns, the file is
+    // released and the directory holds the database alone.
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(super::BUSY_TIMEOUT_SECS));
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| DataError::Db(format!("open {} in WAL: {e}", db_path.display())))?;
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
+    let outcome = require_journal_mode(&mode, SqliteJournalMode::Wal);
+    connection
+        .close()
+        .await
+        .map_err(|e| DataError::Db(format!("close {}: {e}", db_path.display())))?;
+    outcome
+}
+
+/// Read `PRAGMA journal_mode` back and refuse anything but `expected`.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] when the pragma cannot be read, or when the
+/// database reports a different mode — the copy would be renamed with sidecars
+/// it cannot carry (issue #258).
+async fn verified_journal_mode(
+    pool: &SqlitePool,
+    expected: SqliteJournalMode,
+) -> Result<(), DataError> {
+    let actual: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
+    require_journal_mode(&actual, expected).map_err(|error| {
+        DataError::Db(format!(
+            "{error}: it is opened as a copy that is renamed into place, and a sidecar it cannot \
+             carry would strand committed rows outside the installed database"
+        ))
+    })
+}
+
+/// Refuse a database that does not report `expected` as its journal mode.
+///
+/// sqlx applies `PRAGMA journal_mode` at connect and ignores the statement's
+/// result, so a mode is a property to READ BACK, not to assume — the seam both
+/// the copy's opener ([`open_migrated_copy`]) and the install's WAL switch
+/// ([`put_in_wal`]) go through.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] naming both modes.
+fn require_journal_mode(actual: &str, expected: SqliteJournalMode) -> Result<(), DataError> {
+    let expected = journal_mode_name(expected);
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    Err(DataError::Db(format!(
+        "the database reports journal_mode `{actual}`, not `{expected}`"
+    )))
+}
+
+/// The `PRAGMA journal_mode` spelling of a mode, for a read-back comparison
+/// (sqlx's own `as_str` is crate-private).
+fn journal_mode_name(mode: SqliteJournalMode) -> &'static str {
+    match mode {
+        SqliteJournalMode::Delete => "delete",
+        SqliteJournalMode::Truncate => "truncate",
+        SqliteJournalMode::Persist => "persist",
+        SqliteJournalMode::Memory => "memory",
+        SqliteJournalMode::Wal => "wal",
+        SqliteJournalMode::Off => "off",
+    }
 }
 
 /// Revert the schema down to `target_version` (in-process, no CLI).
@@ -1292,5 +1476,117 @@ mod reserved_number_tests {
         );
 
         restore(&dir, &withheld);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// issue #258 — the copy the install renames, and the sidecars it can strand
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod install_copy_tests {
+    use super::{open_migrated, open_migrated_copy};
+    use crate::adapters::db::Db;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// Every `-wal`/`-shm`/`-journal`/`.partial` sidecar beside a database —
+    /// the files a rename of the database alone cannot carry. `migrate.lock` is
+    /// deliberately NOT one of them: the protocol creates and keeps it by
+    /// design (it holds no committed rows).
+    fn sidecars(db: &Path) -> Vec<PathBuf> {
+        ["-wal", "-shm", "-journal", ".partial"]
+            .iter()
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", db.display())))
+            .filter(|sidecar| sidecar.exists())
+            .collect()
+    }
+
+    /// `PRAGMA journal_mode` as this connection sees it.
+    async fn journal_mode(db: &Db) -> String {
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        mode.to_ascii_lowercase()
+    }
+
+    /// WAL is PERSISTED IN the database file, not just in the connection: header
+    /// bytes 18/19 are the file format's write/read versions (2 = WAL, 1 =
+    /// legacy rollback journal). Reading them is the file-level check that
+    /// [`journal_mode`] alone cannot make.
+    fn file_declares_wal(db: &Path) -> bool {
+        let header = std::fs::read(db).unwrap();
+        header.get(18) == Some(&2) && header.get(19) == Some(&2)
+    }
+
+    /// Issue #258 (AC-1): the copy the install renames into place runs in
+    /// ROLLBACK-JOURNAL mode, so no `-wal`/`-shm` can exist beside it at any
+    /// moment — the structural half of the fix. The mode is read back, not
+    /// assumed: sqlx applies `PRAGMA journal_mode` and ignores its result.
+    #[tokio::test]
+    async fn a_copy_opened_for_the_install_runs_in_rollback_journal_mode() {
+        let tmp = TempDir::new().unwrap();
+        let copy_path = tmp.path().join(".pulse.db.import-tmp-1.db");
+
+        let copy = open_migrated_copy(&copy_path).await.unwrap();
+        assert_eq!(
+            journal_mode(&copy).await,
+            "delete",
+            "the copy the install renames must not be in WAL"
+        );
+        copy.pool().close().await;
+
+        assert!(
+            !file_declares_wal(&copy_path),
+            "and the file itself does not declare WAL: a rename carries the file only"
+        );
+        assert!(
+            sidecars(&copy_path).is_empty(),
+            "so nothing is left beside it to strand: {:?}",
+            sidecars(&copy_path)
+        );
+    }
+
+    /// ADR-0019's WAL posture is a property OF THE FILE the install publishes:
+    /// the copy arrives in rollback-journal mode (#258), so the app's NEXT normal
+    /// open ([`open_migrated`], which opens through `Db::with_path`) must put the
+    /// database back in WAL — otherwise a production database would run in
+    /// DELETE mode after every import or restore.
+    #[tokio::test]
+    async fn an_installed_copy_returns_to_wal_on_the_next_normal_open() {
+        let tmp = TempDir::new().unwrap();
+        let copy_path = tmp.path().join(".pulse.db.import-tmp-1.db");
+        let target = tmp.path().join("pulse.db");
+
+        let copy = open_migrated_copy(&copy_path).await.unwrap();
+        copy.pool().close().await;
+        // The install: the copy takes the target's name (what `install_tmp_db`
+        // does with the file).
+        std::fs::rename(&copy_path, &target).unwrap();
+        assert!(!file_declares_wal(&target), "installed in rollback mode");
+
+        let installed = open_migrated(&target).await.unwrap();
+        assert_eq!(
+            journal_mode(&installed).await,
+            "wal",
+            "the first normal open puts the installed database back in WAL"
+        );
+        installed.pool().close().await;
+
+        // And it stays that way across restarts: a fresh open reads the same
+        // mode back, and the file itself now declares WAL.
+        let reopened = open_migrated(&target).await.unwrap();
+        assert_eq!(
+            journal_mode(&reopened).await,
+            "wal",
+            "WAL survives a restart"
+        );
+        reopened.pool().close().await;
+        assert!(
+            file_declares_wal(&target),
+            "the installed database's own header says WAL"
+        );
     }
 }

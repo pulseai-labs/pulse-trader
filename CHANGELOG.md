@@ -62,6 +62,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   application calling the API directly, by usage shape rather than by user count.
   Preserved unmerged as [PR #123](https://github.com/pulseai-labs/pulse-trader/pull/123).
 
+### Fixed
+
+- **`pulse import` can no longer publish a database whose committed rows were
+  left behind outside it, and every rename that publishes a snapshot, a backup
+  database or a backup's `HEAD` manifest is now made durable.** The import's
+  temporary copy ran in WAL mode, and the migration protocol opened a second pool
+  on it that was never closed — only *dropped*, which leaves the SQLite handle to
+  the connection's own background worker thread. SQLite checkpoints on its own at
+  the WAL threshold, and its final checkpoint normally removes `-wal`/`-shm` when
+  the LAST connection to the database closes — so which close removes them, and
+  whether it has happened yet, is nothing the import awaited. The install could
+  therefore rename the database file while its `-wal` — holding every row
+  committed to it — was still beside it under the temporary's name, with nothing
+  to carry it: silent data loss, and the intermittent flake the round-4
+  regression test caught. The copy now runs in rollback-journal mode (read back,
+  never assumed), its bytes are fsynced before the rename, the protocol closes
+  its pool on every path, and the install REFUSES with a named, typed reason if
+  any sidecar is still beside the copy. The old target's own sidecars are moved
+  aside rather than deleted, so a stale hot journal can never be replayed into
+  the freshly installed file (and a failed rename cannot strip the old database
+  of its un-checkpointed rows), and the installed file is put back in WAL and
+  read back before the command reports success. The renames that publish a
+  snapshot (`candles/<PAIR>/<TF>/`, including the directory levels a copy
+  creates), the installed database, the backup database and the backup's own
+  manifest each fsync the directory they landed in, so a power loss cannot keep a
+  backup's database while losing a snapshot it references. Refs
+  [#258](https://github.com/pulseai-labs/pulse-trader/issues/258),
+  [#259](https://github.com/pulseai-labs/pulse-trader/issues/259).
+
 ### Security
 
 - Added repository security hardening, non-commercial license, and supply-chain checks (VS-1.2.3).

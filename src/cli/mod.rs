@@ -26,6 +26,10 @@ pub(crate) mod llm;
 // r2.s1.w2: the `pulse mcp` composition root — validates `--agent-name`,
 // resolves the data dir, opens the migrated DB and hands stdout to `mcp::serve`.
 pub(crate) mod mcp;
+// r3.s3 (issue #259): the one publish step the import and backup share — a
+// rename that makes a file visible is followed by an fsync of the directory it
+// landed in.
+pub(crate) mod publish;
 pub(crate) mod runs;
 // r3.s3.w1 (ADR-0026): the always-on server composition root.
 pub(crate) mod serve;

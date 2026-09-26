@@ -1179,6 +1179,79 @@ async fn an_install_leaves_no_sidecars_and_every_row_reads_back() {
 }
 
 // ---------------------------------------------------------------------------
+// issue #258 / ADR-0019 — the installed database is WAL again on first open
+// ---------------------------------------------------------------------------
+
+/// The import publishes a copy that was opened in rollback-journal mode (#258 —
+/// the install renames the file and nothing else, so a `-wal` beside it cannot
+/// travel with the rename), and `journal_mode` is persisted IN the database file.
+/// The install therefore puts the file back in WAL itself, before the command
+/// returns (fix round 1, F4): this asserts the installed file's OWN header —
+/// bytes 18/19 are the format versions, 2 = WAL — so the production posture is
+/// not left to whatever opens the database next. The normal pool still reads WAL
+/// back, as the app's first open does (ADR-0019).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_installed_target_opens_in_wal_through_the_normal_pool() {
+    let s = seed_mac_source(false).await;
+    let target_db = s.dir.path().join("server").join("pulse.db");
+    let target_data = s.dir.path().join("server-data");
+
+    let out = run_pulse(
+        &s.home,
+        &str_args(&import_args(&s, &target_db, &target_data, false)),
+    );
+    assert!(
+        out.status.success(),
+        "the import must succeed: {}",
+        combined(&out)
+    );
+
+    // The command has returned, and the file ALREADY declares WAL: no later
+    // process had to open it for the mode to be right.
+    let header = fs::read(&target_db).expect("read the installed database");
+    assert_eq!(
+        (header.get(18), header.get(19)),
+        (Some(&2), Some(&2)),
+        "the installed database's own header says WAL when the command returns"
+    );
+    // And the install left nothing of its own beside the target.
+    let strays: Vec<String> = fs::read_dir(target_db.parent().expect("the target's directory"))
+        .expect("read the target's directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| {
+            name.ends_with("-wal")
+                || name.ends_with("-shm")
+                || name.ends_with("-journal")
+                || name.ends_with(".partial")
+                || name.contains(".quarantine-")
+        })
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "no sidecar survives the install: {strays:?}"
+    );
+
+    let installed = Db::with_path(&target_db)
+        .await
+        .expect("open the installed target through the normal pool");
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(installed.pool())
+        .await
+        .expect("read PRAGMA journal_mode");
+    installed.pool().close().await;
+    assert_eq!(
+        journal_mode.to_ascii_lowercase(),
+        "wal",
+        "ADR-0019: an installed target is in WAL the first time the app opens it"
+    );
+
+    // The rows are still there through that open — the mode is the app's, not a
+    // side effect of the check.
+    assert_table_counts_equal(&s.from_db, &target_db).await;
+}
+
+// ---------------------------------------------------------------------------
 // the offline precondition, on import
 // ---------------------------------------------------------------------------
 
