@@ -1726,15 +1726,15 @@ pub(crate) enum InstallRefusal {
 /// `Path::exists()` answers `false` for every stat error, so a probe that decides
 /// whether bytes would be stranded — or whether this run may RECORD a path as its
 /// own to delete later — must not use it: an unreadable file is not an absent one.
-/// Only a definite "not there" is `Ok(false)`. Two callers: the sidecar probes
-/// that decide whether a rename would strand a `-wal` (K2), and the snapshot-copy
-/// dedup that decides whether the rollback may delete a destination (fix round
-/// 11, R2).
+/// Only a definite "not there" is `Ok(false)`. `pub(crate)` because both sides of
+/// the store need it: the import's sidecar probes and snapshot dedup (K2, R2), and
+/// the backup's `copy_wanted` (fix round 12, S1 — the same dedup against the
+/// SHARED store, where a wrongly recorded path costs a previous backup's snapshot).
 ///
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] naming the path when its metadata cannot be read.
-fn path_present(path: &Path) -> anyhow::Result<bool> {
+pub(crate) fn path_present(path: &Path) -> anyhow::Result<bool> {
     #[cfg(test)]
     if probe::take_injected_stat_failure(path) {
         return Err(anyhow!(

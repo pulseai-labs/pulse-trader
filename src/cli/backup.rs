@@ -36,8 +36,9 @@ use clap::Args;
 use super::import::{
     HeadChange, HeadSource, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal,
     copy_snapshot_into, default_backup_out_dir, fold_cleanup, manifest_path, named_by_pointer,
-    refuse_orphaned_quarantines, resolve_target_data_dir, resolve_target_db, restore_heads,
-    run_verified_copy, scan_heads, scan_snapshots, stranded_pointers, write_head_manifest,
+    path_present, refuse_orphaned_quarantines, resolve_target_data_dir, resolve_target_db,
+    restore_heads, run_verified_copy, scan_heads, scan_snapshots, stranded_pointers,
+    write_head_manifest,
 };
 use super::publish;
 use crate::adapters::db::ops;
@@ -430,13 +431,18 @@ fn copy_wanted(
     for index in wanted {
         let snap = &snapshots[*index];
         let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
-        if dest.exists() {
+        // Fail closed (fix round 12, S1 — the import twin's R2): `exists()` would
+        // read a stat failure as "absent", and this run would then record a
+        // snapshot the SHARED store already holds as one it wrote — so the
+        // rollback would unlink a previous backup's snapshot, which is not this
+        // run's to delete at any point. An unreadable destination refuses.
+        if path_present(&dest)? {
             continue;
         }
         // Recorded BEFORE the copy (fix round 1, F8): the copy renames the file
         // into place and then syncs its directory, so a failure AFTER the rename
         // still leaves a snapshot behind — one this backup's rollback must
-        // remove. The name is known free (the check above), so recording it up
+        // remove. The name is known free (the probe above), so recording it up
         // front cannot delete anything this run did not write.
         added.push(dest.clone());
         copy_snapshot_into(&snap.path, &dest)?;
@@ -1600,6 +1606,58 @@ mod tests {
         assert!(
             !dest.exists(),
             "the rollback removed the published snapshot"
+        );
+    }
+
+    /// Fix round 12, S1: the dedup that decides whether a destination is this
+    /// run's to record — and therefore to DELETE on a rollback — must not read a
+    /// stat failure as "absent". The store here is the SHARED one, so recording a
+    /// snapshot a previous backup put there would make this run's rollback unlink
+    /// it. An unreadable destination refuses, and records nothing.
+    #[test]
+    fn a_pre_existing_snapshot_whose_presence_cannot_be_checked_is_never_rolled_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_data = dir.path().join("mac-data");
+        let leaf = source_data.join("candles").join("BTCUSDT").join("15m");
+        fs::create_dir_all(&leaf).expect("the source store");
+        fs::write(leaf.join("b51388284a3a4371.parquet"), b"snapshot bytes")
+            .expect("write the source snapshot");
+        let (snapshots, issues) = crate::cli::import::scan_snapshots(&source_data);
+        assert!(issues.is_empty(), "the source store is well-formed");
+        assert_eq!(snapshots.len(), 1, "one source snapshot");
+
+        let out_dir = dir.path().join("out");
+        let out_store = crate::adapters::store::CandleStore::with_base_dir(out_dir.clone());
+        let dest = out_store.snapshot_path(
+            &snapshots[0].pair,
+            snapshots[0].timeframe,
+            &snapshots[0].version,
+        );
+        // A previous backup's copy of this very snapshot is already there.
+        fs::create_dir_all(dest.parent().expect("the leaf's directory")).expect("create the leaf");
+        fs::write(&dest, b"snapshot bytes").expect("write the pre-existing snapshot");
+        publish::probe::fail_next_stat_of(&dest);
+        let mut added: Vec<PathBuf> = Vec::new();
+
+        let error = super::copy_wanted(&out_store, &snapshots, &[0], &mut added)
+            .expect_err("an unreadable destination refuses the backup copy");
+
+        assert!(
+            error.to_string().contains(&dest.display().to_string()),
+            "the refusal names the path it could not stat: {error}"
+        );
+        assert!(
+            added.is_empty(),
+            "and nothing is recorded for the rollback to delete: {added:?}"
+        );
+
+        // Whatever this run's rollback does, it cannot touch that snapshot.
+        let staged = staged(&out_dir, None);
+        discard_all(&staged, &added).expect("the rollback runs");
+        assert_eq!(
+            fs::read(&dest).expect("the pre-existing snapshot is still there"),
+            b"snapshot bytes",
+            "the snapshot a previous backup put in the shared store is untouched"
         );
     }
 }
