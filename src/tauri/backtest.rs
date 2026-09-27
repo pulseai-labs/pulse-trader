@@ -159,6 +159,23 @@ pub struct TradeRowDto {
     pub stop_price: Option<String>,
 }
 
+/// The four exchange symbol filters one run's sizer ran under (r3.s1.w4,
+/// #142) — exact decimal strings, rendered as recorded. `BacktestRunDto::
+/// symbol_filters` is `None` (rendered "not recorded") exactly for a
+/// pre-`0015` run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolFiltersDto {
+    /// Quantity granularity (`LOT_SIZE.stepSize`), exact decimal string.
+    pub lot_step: String,
+    /// Minimum order quantity (`LOT_SIZE.minQty`), exact decimal string.
+    pub min_qty: String,
+    /// Minimum order notional (`MIN_NOTIONAL`), exact decimal string.
+    pub min_notional: String,
+    /// Exchange hard max-leverage cap, exact decimal string.
+    pub max_leverage: String,
+}
+
 /// The complete Backtest Lab response.
 ///
 /// `PartialEq` but not `Eq` — `sharpe`/`sortino` are `f64`, the same reason
@@ -199,6 +216,10 @@ pub struct BacktestRunDto {
     pub slippage_bps: String,
     /// How funding was sourced (`snapshot_rates`).
     pub funding: String,
+    /// The exchange symbol filters the sizer ran under (r3.s1.w4, #142), exact
+    /// decimal strings as recorded. `null` for a pre-`0015` run — the filters
+    /// are **not recorded**, never guessed.
+    pub symbol_filters: Option<SymbolFiltersDto>,
     /// The `open_time` of the first candle the engines consumed — the lead-in
     /// start (r2.s3.w2), RFC 3339 like `created_at`. `null` for an unwindowed
     /// run and for every row persisted before migration `0012`, whose lead-in
@@ -569,6 +590,14 @@ pub fn backtest_run_dto(outcome: &BacktestOutcome) -> Result<BacktestRunDto, Bac
         taker_fee_bps: dec(inputs.taker_fee_bps),
         slippage_bps: dec(inputs.slippage_bps),
         funding: funding_label(inputs.funding).to_owned(),
+        // r3.s1.w4 (#142): the recorded filters, exact decimal strings as
+        // persisted — `None` renders "not recorded" at the Lab.
+        symbol_filters: inputs.symbol_filters.as_ref().map(|f| SymbolFiltersDto {
+            lot_step: dec(f.lot_step),
+            min_qty: dec(f.min_qty),
+            min_notional: dec(f.min_notional),
+            max_leverage: dec(f.max_leverage),
+        }),
         // Same RFC 3339 millisecond shape `BacktestInputs::lead_in_from` puts
         // on the MCP wire — one timestamp spelling across the surfaces.
         lead_in_from: inputs.lead_in_from_ms.and_then(|ms| {

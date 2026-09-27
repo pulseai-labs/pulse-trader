@@ -100,6 +100,20 @@ pub struct BacktestInputs {
     pub slippage_bps: Decimal,
     /// How funding rates were sourced.
     pub funding: FundingConfig,
+    /// The exchange symbol filters the sizer ran under, exactly as the
+    /// `ExchangeAdapter` port resolved them for this run (r3.s1.w4, #142): the
+    /// lot step, minimum quantity, minimum notional and maximum leverage that
+    /// shaped every entry. Persisted through migration `0015`'s four columns
+    /// and written on every new run — standalone and each walk-forward fold —
+    /// because two runs are only comparable when the engine was given the same
+    /// symbol constraints.
+    ///
+    /// `None` for every pre-`0015` row: the filters are **not recorded**, never
+    /// guessed (ADR-0018 forbids rewriting immutable records with invented
+    /// facts). The four columns are a GROUP on read — a partially-populated row
+    /// is corrupt, never partially-trusted.
+    #[serde(default)]
+    pub symbol_filters: Option<crate::domain::sizing::SymbolFilters>,
     /// The candle slice of the snapshots the run consumed, when it was windowed
     /// (r2.s1.w1). `None` is the whole snapshot — every pre-`0009` row, and
     /// every run saved before windowing existed or without one.
@@ -355,6 +369,25 @@ pub struct PersistedRun {
     /// are set together or not at all (the `0013` pair trigger).
     #[serde(default)]
     pub walk_forward: Option<super::walk_forward::WalkForwardMembership>,
+}
+
+/// The outcome of a latest-READABLE lookup (r3.s1.w4, #198): the newest
+/// readable non-fold run for a version, plus the rows skipped to reach it.
+///
+/// The read-side answer to "one bad row must never wedge a read path": a
+/// caller that only needs "the newest run we can trust" takes `run`, and a
+/// caller that must account for what it could NOT read takes `skipped` — the
+/// FR-7 note says "no comparable prior" and names the failure, rather than
+/// failing the whole run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatestReadableRun {
+    /// The newest readable run, or `None` when the version has no non-fold
+    /// run rows at all — or every one of them is unreadable.
+    pub run: Option<PersistedRun>,
+    /// The rows skipped to reach it, newest-first: `(run id, error)`. The
+    /// same rows the repository's walk warned about on the shared log
+    /// channel, surfaced so the caller can say precisely what it passed over.
+    pub skipped: Vec<(BacktestRunId, String)>,
 }
 
 /// The typed list projection of one run for the catalog

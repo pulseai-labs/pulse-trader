@@ -31,8 +31,8 @@ use std::future::Future;
 
 use crate::domain::backtest::SummaryStats;
 use crate::domain::backtest::{
-    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade, WalkForwardRun,
-    WalkForwardRunDraft, WalkForwardRunId,
+    BacktestInputs, BacktestResult, BacktestRunId, LatestReadableRun, PersistedRun, RunSummary,
+    Trade, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
 };
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{
@@ -514,6 +514,36 @@ pub trait BacktestRunRepository {
         &self,
         strategy_version_id: &VersionId,
     ) -> impl Future<Output = Result<Vec<RunSummary>, DataError>> + Send;
+
+    /// The most-recent READABLE run for a version, plus what was skipped to
+    /// find it (r3.s1.w4, #198) — the D5 skip-with-warning policy
+    /// [`list_runs_for_version`](Self::list_runs_for_version) applies, lifted
+    /// to the latest-run lookup.
+    ///
+    /// One unreadable row never wedges a read path that only needs "the
+    /// newest run we can trust": the walk starts at the same newest-first
+    /// candidate order [`latest_run_for_version`](Self::latest_run_for_version)
+    /// uses (fold rows excluded, N1), tries each through
+    /// [`get_run`](Self::get_run)'s fail-closed fetch-trades-and-validate
+    /// path, skips a row that errors — warning on the same channel the list
+    /// walk uses — and answers the first readable one with the skipped rows'
+    /// ids and errors. The FR-7 prior-run check, the default-request
+    /// inheritance and the Library KPIs read through this; the coach accept
+    /// deliberately does NOT (it needs THE run the session claims, and stays
+    /// fail-closed).
+    ///
+    /// `run: None` means the version has no readable non-fold run at all —
+    /// no rows, or every one of them unreadable; `skipped` says which.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] only on a store-level failure (the
+    /// candidate query itself failing), never for a single unreadable row
+    /// (that is skipped and reported in [`LatestReadableRun::skipped`]).
+    fn latest_readable_run_for_version(
+        &self,
+        strategy_version_id: &VersionId,
+    ) -> impl Future<Output = Result<LatestReadableRun, DataError>> + Send;
 
     /// Fetch a run's full trade log (`ORDER BY seq`, #40 stable). **Fail-closed**
     /// (audit C9): a trade log feeds P&L/equity/hash reconstruction, so a
@@ -1456,8 +1486,8 @@ mod repository_tests {
 mod backtest_run_repository_tests {
     use super::BacktestRunRepository;
     use crate::domain::backtest::{
-        BacktestInputs, BacktestResult, BacktestRunId, FundingConfig, PersistedRun, RunSummary,
-        SnapshotSelection, SummaryStats, Trade,
+        BacktestInputs, BacktestResult, BacktestRunId, FundingConfig, LatestReadableRun,
+        PersistedRun, RunSummary, SnapshotSelection, SummaryStats, Trade,
     };
     use crate::domain::error::DataError;
     use crate::domain::pair::Pair;
@@ -1556,6 +1586,25 @@ mod backtest_run_repository_tests {
                 .last()))
         }
 
+        fn latest_readable_run_for_version(
+            &self,
+            strategy_version_id: &VersionId,
+        ) -> impl Future<Output = Result<LatestReadableRun, DataError>> {
+            // The in-memory fake holds only well-formed rows, so nothing is
+            // ever skipped: the newest matching row is the answer.
+            std::future::ready(Ok(LatestReadableRun {
+                run: self
+                    .runs
+                    .lock()
+                    .expect("runs lock")
+                    .values()
+                    .filter(|(run, _)| &run.strategy_version_id == strategy_version_id)
+                    .map(|(run, _)| run.clone())
+                    .last(),
+                skipped: Vec::new(),
+            }))
+        }
+
         fn list_runs_for_version(
             &self,
             strategy_version_id: &VersionId,
@@ -1625,6 +1674,7 @@ mod backtest_run_repository_tests {
             taker_fee_bps: Decimal::new(4, 0),
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,
+            symbol_filters: None,
             window: None,
             lead_in_from_ms: None,
         };

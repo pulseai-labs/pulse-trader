@@ -52,7 +52,7 @@ import type {
   WalkForwardFoldDto,
   WalkForwardRunDto,
 } from "../bindings";
-import BacktestLabScreen from "./BacktestLabScreen";
+import BacktestLabScreen, { parseFoldCount } from "./BacktestLabScreen";
 import { RouteContent } from "../App";
 import { resolveRoute } from "../routes";
 
@@ -144,6 +144,14 @@ const SEEDED_RUN: BacktestRunDto = {
   takerFeeBps: "4.0000",
   slippageBps: "2.0000",
   funding: "snapshot_rates",
+  // r3.s1.w4 (#142): the recorded symbol filters, exact decimal strings as
+  // persisted. The not-recorded case overrides this to null below.
+  symbolFilters: {
+    lotStep: "0.001",
+    minQty: "0.005",
+    minNotional: "100",
+    maxLeverage: "20",
+  },
   // Unwindowed run — no recorded lead-in (r2.s3.w2).
   leadInFrom: null,
   engineFingerprint: "sha256:abc123def456",
@@ -496,6 +504,11 @@ describe("BacktestLabScreen (fresh result render)", () => {
       "4.0000",
       "2.0000",
       "snapshot_rates",
+      // r3.s1.w4 (#142): the recorded filters render their four values.
+      "lot_step 0.001",
+      "min_qty 0.005",
+      "min_notional 100",
+      "max_leverage 20",
       "sha256:abc123def456",
       "aarch64-apple-darwin",
       "sha256:9876fedcba",
@@ -509,6 +522,14 @@ describe("BacktestLabScreen (fresh result render)", () => {
     // The null fingerprintWarning renders no warning UI and no warning text.
     expect(container.querySelector(".bt-fp-warning")).toBeNull();
     expect(text).not.toContain("fingerprint changed");
+  });
+
+  it("renders 'not recorded' for a pre-0015 run whose filters the DTO lacks (r3.s1.w4)", async () => {
+    const container = await renderRun({ ...SEEDED_RUN, symbolFilters: null });
+    const band = container.querySelector(".bt-provenance") as HTMLElement;
+    const text = band.textContent ?? "";
+    expect(text).toContain("not recorded");
+    expect(text).not.toContain("lot_step");
   });
 
   it("renders every KPI tile from the DTO, with an em dash for null ratio fields", async () => {
@@ -1675,6 +1696,71 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
 
     await screen.findByText("wf-44aa19c2");
     expect(walkForwardMock).toHaveBeenLastCalledWith({ versionId: "v-alpha-1", k: 3 });
+  });
+
+  // #212 — the fold-count guard: a count the backend would refuse (or silently
+  // truncate) never starts an operation; the refusal renders on the pane's
+  // error surface naming the allowed range.
+  it("refuses a fractional fold count (6.9) with the range message and starts no operation", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    walkForwardMock.mockResolvedValue({ status: "ok", data: WF_DTO });
+    render(<BacktestLabScreen />);
+
+    const folds = await screen.findByLabelText(/folds/i);
+    fireEvent.change(folds, { target: { value: "6.9" } });
+    fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
+
+    expect(
+      await screen.findByText("Folds must be a whole number from 2 to 12."),
+    ).not.toBeNull();
+    expect(walkForwardMock).not.toHaveBeenCalled();
+
+    // A valid count after a refusal starts normally — the refusal cleared.
+    fireEvent.change(folds, { target: { value: "6" } });
+    fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
+    await screen.findByText("wf-44aa19c2");
+    expect(walkForwardMock).toHaveBeenLastCalledWith({ versionId: "v-alpha-1", k: 6 });
+  });
+
+  it("refuses out-of-range fold counts (1 and 13) with the range message and starts no operation", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    walkForwardMock.mockResolvedValue({ status: "ok", data: WF_DTO });
+    render(<BacktestLabScreen />);
+
+    const folds = await screen.findByLabelText(/folds/i);
+    for (const bad of ["1", "13"]) {
+      fireEvent.change(folds, { target: { value: bad } });
+      fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
+      expect(
+        await screen.findByText("Folds must be a whole number from 2 to 12."),
+      ).not.toBeNull();
+      expect(walkForwardMock).not.toHaveBeenCalled();
+    }
+  });
+
+  it("refuses a non-numeric fold count at the parser, which the number input cannot carry", () => {
+    // The folds input is `type="number"`: the browser's value sanitization
+    // turns a non-numeric string into "" before React ever sees it, so "abc"
+    // is unreachable through the DOM. The guard refuses it at the parser
+    // anyway — defence in depth, and the honest way to pin the case.
+    expect(parseFoldCount("abc")).toEqual({
+      kind: "refused",
+      message: "Folds must be a whole number from 2 to 12.",
+    });
+    // The truncation trap the parser exists for: parseInt would say 6.
+    expect(parseFoldCount("6.9").kind).toBe("refused");
+  });
+
+  it("keeps today's meaning for an emptied folds field — the backend default k", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    walkForwardMock.mockResolvedValue({ status: "ok", data: WF_DTO });
+    render(<BacktestLabScreen />);
+
+    fireEvent.change(await screen.findByLabelText(/folds/i), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
+
+    await screen.findByText("wf-44aa19c2");
+    expect(walkForwardMock).toHaveBeenLastCalledWith({ versionId: "v-alpha-1", k: undefined });
   });
 
   it("renders the scheme and rule as the DTO names them, the span, and the verdict line", async () => {

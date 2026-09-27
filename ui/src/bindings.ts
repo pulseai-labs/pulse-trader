@@ -287,6 +287,12 @@ export type BacktestRunDto = {
 	/**  How funding was sourced (`snapshot_rates`). */
 	funding: string,
 	/**
+	 *  The exchange symbol filters the sizer ran under (r3.s1.w4, #142), exact
+	 *  decimal strings as recorded. `null` for a pre-`0015` run — the filters
+	 *  are **not recorded**, never guessed.
+	 */
+	symbolFilters: SymbolFiltersDto | null,
+	/**
 	 *  The `open_time` of the first candle the engines consumed — the lead-in
 	 *  start (r2.s3.w2), RFC 3339 like `created_at`. `null` for an unwindowed
 	 *  run and for every row persisted before migration `0012`, whose lead-in
@@ -1183,6 +1189,23 @@ export type SummaryDto = {
 	sharpe: number | null,
 	/**  Sortino ratio; `null` when undefined for this run. */
 	sortino: number | null,
+};
+
+/**
+ *  The four exchange symbol filters one run's sizer ran under (r3.s1.w4,
+ *  #142) — exact decimal strings, rendered as recorded. `BacktestRunDto::
+ *  symbol_filters` is `None` (rendered "not recorded") exactly for a
+ *  pre-`0015` run.
+ */
+export type SymbolFiltersDto = {
+	/**  Quantity granularity (`LOT_SIZE.stepSize`), exact decimal string. */
+	lotStep: string,
+	/**  Minimum order quantity (`LOT_SIZE.minQty`), exact decimal string. */
+	minQty: string,
+	/**  Minimum order notional (`MIN_NOTIONAL`), exact decimal string. */
+	minNotional: string,
+	/**  Exchange hard max-leverage cap, exact decimal string. */
+	maxLeverage: string,
 };
 
 /**  One persisted trade, exactly as stored. */

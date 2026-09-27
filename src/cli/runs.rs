@@ -225,6 +225,10 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
 /// NOT print empty fields: a blank `data_version` reads like a value, and the whole
 /// point of #110 is that a run either names the snapshot it used or admits it
 /// cannot.
+///
+/// r3.s1.w4 (#142): the symbol filters render as four values when recorded;
+/// `filters=not recorded` for a pre-`0015` run — the honest read, never a
+/// guessed constant.
 fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
     let Some(i) = inputs else {
         return "inputs\tunavailable (legacy run, predates migration 0006)".to_owned();
@@ -236,6 +240,18 @@ fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
                 "htf={}\thtf_data_version={}",
                 htf.timeframe.binance_interval(),
                 htf.data_version
+            )
+        },
+    );
+    let filters = i.symbol_filters.as_ref().map_or_else(
+        || "filters=not recorded".to_owned(),
+        |f| {
+            format!(
+                "filters=lot_step {}\tmin_qty {}\tmin_notional {}\tmax_leverage {}",
+                dec(f.lot_step),
+                dec(f.min_qty),
+                dec(f.min_notional),
+                dec(f.max_leverage),
             )
         },
     );
@@ -260,7 +276,7 @@ fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
         )
     });
     format!(
-        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}\tfee_bps={}\tslippage_bps={}\tfunding={}{windowed}",
+        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}\tfee_bps={}\tslippage_bps={}\tfunding={}\t{filters}{windowed}",
         i.pair,
         i.primary.timeframe.binance_interval(),
         i.primary.data_version,
@@ -334,7 +350,8 @@ mod tests {
     #[test]
     fn render_inputs_separates_every_field_with_a_tab() {
         use crate::domain::{
-            BacktestInputs, DataVersion, FundingConfig, Pair, SnapshotSelection, Timeframe,
+            BacktestInputs, DataVersion, FundingConfig, Pair, SnapshotSelection, SymbolFilters,
+            Timeframe,
         };
         use rust_decimal::Decimal;
 
@@ -351,6 +368,13 @@ mod tests {
             taker_fee_bps: Decimal::new(5, 2),
             slippage_bps: Decimal::new(2, 2),
             funding: FundingConfig::SnapshotRates,
+            // r3.s1.w4 (#142): the recorded filters render as four values.
+            symbol_filters: Some(SymbolFilters {
+                lot_step: Decimal::new(1, 3),       // 0.001
+                min_qty: Decimal::new(5, 4),        // 0.0005
+                min_notional: Decimal::new(100, 0), // 100
+                max_leverage: Decimal::new(20, 0),  // 20
+            }),
             window: None,
             lead_in_from_ms: None,
         };
@@ -359,7 +383,8 @@ mod tests {
             super::render_inputs(Some(&inputs)),
             "inputs\tpair=BTCUSDT\tprimary=15m\tprimary_data_version=primarytag\
              \thtf=4h\thtf_data_version=htftag\tfee_bps=0.05\tslippage_bps=0.02\
-             \tfunding=snapshot_rates"
+             \tfunding=snapshot_rates\tfilters=lot_step 0.001\tmin_qty 0.0005\
+             \tmin_notional 100\tmax_leverage 20"
         );
 
         // The htf=none contrast: same tab discipline, no second snapshot field.
@@ -368,7 +393,18 @@ mod tests {
         assert_eq!(
             super::render_inputs(Some(&single)),
             "inputs\tpair=BTCUSDT\tprimary=15m\tprimary_data_version=primarytag\thtf=none\
-             \tfee_bps=0.05\tslippage_bps=0.02\tfunding=snapshot_rates"
+             \tfee_bps=0.05\tslippage_bps=0.02\tfunding=snapshot_rates\
+             \tfilters=lot_step 0.001\tmin_qty 0.0005\tmin_notional 100\tmax_leverage 20"
+        );
+
+        // r3.s1.w4 (#142): a pre-`0015` run's filters read `not recorded` — the
+        // honest statement, never a guessed constant.
+        single.symbol_filters = None;
+        assert_eq!(
+            super::render_inputs(Some(&single)),
+            "inputs\tpair=BTCUSDT\tprimary=15m\tprimary_data_version=primarytag\thtf=none\
+             \tfee_bps=0.05\tslippage_bps=0.02\tfunding=snapshot_rates\
+             \tfilters=not recorded"
         );
     }
 }

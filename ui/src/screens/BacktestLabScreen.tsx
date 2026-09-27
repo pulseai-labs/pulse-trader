@@ -155,6 +155,39 @@ function walkForwardStateOf(record: OperationRecord | undefined): WalkForwardSta
     : { kind: "failed", error: outcome.error };
 }
 
+/** The backend's own walk-forward fold bounds (`K_DEFAULT = 6`, range
+ * `2..=12` in `FoldScheme::rolling_oos`) — the guard enforces the same range
+ * client-side so a bad count never starts an operation (#212). */
+const K_MIN = 2;
+const K_MAX = 12;
+
+/**
+ * Parse the folds draft the way #212 requires. An empty (or whitespace-only)
+ * field keeps today's meaning — "use the backend default" (the input's own
+ * contract, and what the pre-#212 behaviour already did) — an exact integer in
+ * `[K_MIN, K_MAX]` goes through as `k`, and ANYTHING else is refused without
+ * starting an operation. [`Number.parseInt`] is deliberately not used alone:
+ * it silently truncates (`"6.9"` → `6`) and accepts prefixes (`"12x"` → `12`),
+ * and both would start a walk the trader did not ask for.
+ */
+export function parseFoldCount(
+  raw: string,
+): { kind: "default" } | { kind: "ok"; k: number } | { kind: "refused"; message: string } {
+  const message = `Folds must be a whole number from ${K_MIN} to ${K_MAX}.`;
+  const text = raw.trim();
+  if (text === "") {
+    return { kind: "default" };
+  }
+  if (!/^\d+$/.test(text)) {
+    return { kind: "refused", message };
+  }
+  const k = Number(text);
+  if (!Number.isSafeInteger(k) || k < K_MIN || k > K_MAX) {
+    return { kind: "refused", message };
+  }
+  return { kind: "ok", k };
+}
+
 /**
  * The selected version's walk-forward operation: its record (keyed by version,
  * so a remount reattaches and a selection change stops attributing the old
@@ -166,25 +199,43 @@ function walkForwardStateOf(record: OperationRecord | undefined): WalkForwardSta
  * a fold run is an ordinary persisted run, so opening one is the existing
  * result view answering with it — and the store's own in-flight refusal on
  * that key is the only locking the open needs.
+ *
+ * #212: `start` guards the fold count FIRST — a non-integer or out-of-range
+ * value refuses on the pane's error surface and starts no operation at all.
  */
 function useWalkForward(operations: ActiveOperations, versionId: string | null) {
   // The input mirrors the backend's default (K_DEFAULT = 6); an emptied input
   // sends no `k` and the backend applies the same default itself.
   const [folds, setFolds] = useState("6");
+  // The #212 refusal message, or null. A refusal is not a bus failure — no
+  // operation record exists — so it rides its own state and renders on the
+  // same `bt-run-error` surface the failed states use.
+  const [refusal, setRefusal] = useState<string | null>(null);
   const state = walkForwardStateOf(
     versionId === null ? undefined : operations.lookup(walkForwardKey(versionId)),
   );
+
+  const setFoldsDraft = useCallback((value: string) => {
+    setFolds(value);
+    // Editing the draft clears the stale refusal — it described the old draft.
+    setRefusal(null);
+  }, []);
 
   const start = useCallback(() => {
     if (versionId === null) return;
     // The toolbar's `busy` lock is rendered state; this is the structural half —
     // a click that beats the re-render still meets a live backtest record here.
     if (operations.lookup(backtestKey(versionId))?.running === true) return;
-    const parsed = Number.parseInt(folds, 10);
+    const parsed = parseFoldCount(folds);
+    if (parsed.kind === "refused") {
+      setRefusal(parsed.message);
+      return;
+    }
+    setRefusal(null);
     operations.start(walkForwardKey(versionId), () =>
       commands.runWalkForwardVersion({
         versionId,
-        k: Number.isNaN(parsed) ? undefined : parsed,
+        k: parsed.kind === "ok" ? parsed.k : undefined,
       }),
     );
   }, [operations, versionId, folds]);
@@ -197,7 +248,7 @@ function useWalkForward(operations: ActiveOperations, versionId: string | null) 
     [operations, versionId],
   );
 
-  return { state, folds, setFolds, start, openFold };
+  return { state, folds, setFolds: setFoldsDraft, start, openFold, refusal };
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +914,15 @@ export default function BacktestLabScreen() {
           one read back by id. */}
       <WalkForwardPane state={pane} onOpenFold={wf.openFold} />
 
+      {/* #212: a refused fold count starts no operation — the refusal renders on
+          the same error surface the failed states use, naming the allowed
+          range. It clears on the next draft edit or a valid start. */}
+      {wf.refusal !== null && (
+        <div className="bt-run-error" role="alert">
+          <div>{wf.refusal}</div>
+        </div>
+      )}
+
       {run.kind === "running" && (
         <div className="bt-state dim" role="status">
           Running the backtest…
@@ -1089,6 +1149,15 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
       <Field label="taker fee">{dto.takerFeeBps} bps</Field>
       <Field label="slippage">{dto.slippageBps} bps</Field>
       <Field label="funding">{dto.funding}</Field>
+      {/* r3.s1.w4 (#142): the recorded symbol filters, or the honest "not
+          recorded" for a pre-0015 run — never a guessed constant. The guard
+          reads loose (`!= null`) so a fixture or cached payload that predates
+          the field degrades to "not recorded" instead of a TypeError. */}
+      <Field label="filters">
+        {dto.symbolFilters != null
+          ? `lot_step ${dto.symbolFilters.lotStep} · min_qty ${dto.symbolFilters.minQty} · min_notional ${dto.symbolFilters.minNotional} · max_leverage ${dto.symbolFilters.maxLeverage}`
+          : "not recorded"}
+      </Field>
       <Field label="engine">
         {dto.engineFingerprint} · {dto.engineTarget}
       </Field>

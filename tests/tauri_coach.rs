@@ -884,13 +884,18 @@ async fn a_run_without_input_provenance_is_recorded_as_missing_inputs_with_no_ca
     let world = world().await;
     let state = world.state().await;
 
-    // Strip the parent run's recorded provenance — the all-NULL shape a row
-    // written before migration `0006` has, which `decode_inputs` reads as legacy.
+    // Strip the parent run's recorded provenance AND the `0015` symbol-filter
+    // group — the all-NULL shape a row written before migration `0006` (and so
+    // also before `0015`) has, which `decode_inputs` reads as legacy. The save
+    // path has written filters since r3.s1.w4, so leaving them in place would
+    // build "filters without provenance" — a corrupt row `decode_inputs`
+    // refuses — not a legacy one.
     let db = world.db().await;
     let blank = format!(
         "UPDATE backtest_run SET pair = NULL, primary_timeframe = NULL, \
          primary_data_version = NULL, htf_timeframe = NULL, htf_data_version = NULL, \
-         taker_fee_bps = NULL, slippage_bps = NULL, funding_config = NULL \
+         taker_fee_bps = NULL, slippage_bps = NULL, funding_config = NULL, \
+         lot_step = NULL, min_qty = NULL, min_notional = NULL, max_leverage = NULL \
          WHERE id = '{}'",
         world.parent_run_id.as_str()
     );

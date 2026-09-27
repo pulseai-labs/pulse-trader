@@ -1772,8 +1772,8 @@ mod reserved_number_tests {
         // reserved gap and `0007` had already shipped. Withhold the real 0005 —
         // and, since r1.s4.w4 the real 0008, since r2.s1.w1 the real 0009 and
         // 0010, since r2.s2.w2 the real 0011, since r2.s3.w2 the real 0012,
-        // since r2.s3.w3 the real 0013, since r2.s3.w4 the real 0014, and
-        // since r3.s3.w1 the real 0016.
+        // since r2.s3.w3 the real 0013, since r2.s3.w4 the real 0014,
+        // since r3.s1.w4 the real 0015, and since r3.s3.w1 the real 0016.
         //
         // `0008` REBUILDS the two tables `0005` creates, so a set holding `0008`
         // without `0005` is not an older binary, it is an impossible one ("no such
@@ -1781,14 +1781,15 @@ mod reserved_number_tests {
         // `0010` alters `backtest_run`, `0011` alters `trade`, and `0012` alters
         // `backtest_run` for the same reason, `0013` builds on
         // `backtest_run` plus `strategy_version`, `0014` builds on
-        // `walk_forward_run` plus `coaching_proposals`, and `0016` is simply
-        // newer. Withholding all nine is
+        // `walk_forward_run` plus `coaching_proposals`, `0015` alters
+        // `backtest_run`, and `0016` is simply newer. Withholding all ten is
         // also what keeps this test testing what it says: the property under
         // test is that filling a reserved gap runs a migration WITHOUT moving
-        // the maximum, and letting `0008`–`0014` or `0016` ride
+        // the maximum, and letting `0008`–`0015` or `0016` ride
         // along in the same run would move it past 7 and make the
         // `from: 7, to: 7` assertion below meaningless.
         let withheld_0016 = withhold(&dir, "0016_");
+        let withheld_0015 = withhold(&dir, "0015_");
         let withheld_0014 = withhold(&dir, "0014_");
         let withheld_0013 = withhold(&dir, "0013_");
         let withheld_0012 = withhold(&dir, "0012_");
@@ -1843,7 +1844,7 @@ mod reserved_number_tests {
             "0005 is recorded at its own version, not appended after 0007"
         );
 
-        // Put 0008-0014 and 0016 back so the scratch directory is the shipped
+        // Put 0008-0016 back so the scratch directory is the shipped
         // set again.
         restore(&dir, &withheld_0008);
         restore(&dir, &withheld_0009);
@@ -1852,6 +1853,7 @@ mod reserved_number_tests {
         restore(&dir, &withheld_0012);
         restore(&dir, &withheld_0013);
         restore(&dir, &withheld_0014);
+        restore(&dir, &withheld_0015);
         restore(&dir, &withheld_0016);
     }
 

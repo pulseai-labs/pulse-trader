@@ -546,7 +546,9 @@ async fn library_strategy(
     let mut wire_versions = Vec::with_capacity(versions.len());
 
     for version in versions {
-        let latest = runs.latest_run_for_version(&version.id).await?;
+        // r3.s1.w4 (#198): the card shows the newest READABLE run's stats —
+        // one corrupt row never blanks a strategy's Library entry.
+        let latest = runs.latest_readable_run_for_version(&version.id).await?.run;
         let recent = runs.list_runs_for_version(&version.id).await?;
         let stats = latest.as_ref().map(|run| version_stats(&run.summary));
 
@@ -1868,6 +1870,7 @@ mod tests {
             taker_fee_bps: Decimal::new(4, 0),
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,
+            symbol_filters: None,
             window: Some(CandleWindow::new(1_700_000_000_000, 1_700_086_400_000).unwrap()),
             lead_in_from_ms: Some(1_699_999_000_000),
         };

@@ -53,10 +53,11 @@ use uuid::Uuid;
 use crate::adapters::clock::SystemClock;
 use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, CandleWindow, EquityCurve, ExitReason, Fill,
-    FundingConfig, OpenPositionMark, PersistedRun, Regime, RegimeBreakdown, RunSummary,
-    SnapshotSelection, SummaryStats, Trade, TradeSource, WalkForwardMembership, WalkForwardRunId,
+    FundingConfig, LatestReadableRun, OpenPositionMark, PersistedRun, Regime, RegimeBreakdown,
+    RunSummary, SnapshotSelection, SummaryStats, Trade, TradeSource, WalkForwardMembership,
+    WalkForwardRunId,
 };
-use crate::domain::sizing::SkippedEntryCounts;
+use crate::domain::sizing::{SkippedEntryCounts, SymbolFilters};
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestRunRepository, Clock, DataError, DataVersion, Direction, EngineFingerprint, Pair,
@@ -364,6 +365,10 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                  taker_fee_bps           AS "taker_fee_bps?: String",
                  slippage_bps            AS "slippage_bps?: String",
                  funding_config          AS "funding_config?: String",
+                 lot_step                AS "lot_step?: String",
+                 min_qty                 AS "min_qty?: String",
+                 min_notional            AS "min_notional?: String",
+                 max_leverage            AS "max_leverage?: String",
                  window_from_ms          AS "window_from_ms?: i64",
                  window_to_ms            AS "window_to_ms?: i64",
                  window_lead_in_from_ms  AS "window_lead_in_from_ms?: i64",
@@ -475,7 +480,8 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
         // r1.s3.w2 (#110): rehydrate the input provenance under the four-shape rule
         // (all-NULL legacy, complete-without-HTF, complete-with-HTF, anything else
         // is an error). Decoded AFTER the tamper guard so a corrupt row fails on the
-        // hash first, which is the more specific diagnosis.
+        // hash first, which is the more specific diagnosis. r3.s1.w4 (#142): the
+        // `0015` symbol-filter group rides the same all-or-nothing discipline.
         let inputs = decode_inputs(
             &r.id,
             r.pair.as_deref(),
@@ -486,6 +492,10 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             r.taker_fee_bps.as_deref(),
             r.slippage_bps.as_deref(),
             r.funding_config.as_deref(),
+            r.lot_step.as_deref(),
+            r.min_qty.as_deref(),
+            r.min_notional.as_deref(),
+            r.max_leverage.as_deref(),
             r.window_from_ms,
             r.window_to_ms,
             r.window_lead_in_from_ms,
@@ -557,6 +567,64 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             None => Ok(None),
             Some(r) => self.get_run(&BacktestRunId::new(r.id)).await,
         }
+    }
+
+    async fn latest_readable_run_for_version(
+        &self,
+        strategy_version_id: &VersionId,
+    ) -> Result<LatestReadableRun, DataError> {
+        let sid = strategy_version_id.as_str();
+        // The same candidate order as `latest_run_for_version` (newest first,
+        // fold rows excluded — N1), but the walk keeps going past a row
+        // `get_run` rejects: D5's skip-with-warning, lifted to the
+        // latest-run lookup (#198). One corrupt row costs its own warning,
+        // never the whole read path.
+        let rows = sqlx::query!(
+            r#"SELECT id AS "id!: String"
+               FROM backtest_run
+               WHERE strategy_version_id = ?1
+                 AND walk_forward_run_id IS NULL
+               ORDER BY created_at DESC, id DESC"#,
+            sid,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        let mut skipped = Vec::new();
+        for row in rows {
+            match self.get_run(&BacktestRunId::new(row.id.clone())).await {
+                Ok(Some(run)) => {
+                    return Ok(LatestReadableRun {
+                        run: Some(run),
+                        skipped,
+                    });
+                }
+                Ok(None) => {
+                    // The row vanished between the candidate query and the
+                    // read — the same treatment as an unreadable one, not a
+                    // silent hole in the walk.
+                    eprintln!(
+                        "latest_readable_run_for_version: run `{}` of version `{sid}` no longer \
+                         exists; skipping",
+                        row.id
+                    );
+                    skipped.push((
+                        BacktestRunId::new(row.id),
+                        "the run row no longer exists".to_owned(),
+                    ));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "latest_readable_run_for_version: skipping unreadable run `{}` of version \
+                         `{sid}`: {e}",
+                        row.id
+                    );
+                    skipped.push((BacktestRunId::new(row.id), e.to_string()));
+                }
+            }
+        }
+        Ok(LatestReadableRun { run: None, skipped })
     }
 
     async fn list_runs_for_version(
@@ -780,21 +848,27 @@ struct ListRunRow {
 
 /// Convert an `Option<i64>` count column to `usize`, fail-closed on NULL or a
 /// negative value (a count column should never be NULL/negative — a corrupt row).
-/// Rehydrate [`BacktestInputs`] from the eight migration-`0006` columns, fail-closed
-/// (r1.s3.w2, #110).
+/// Rehydrate [`BacktestInputs`] from the eight migration-`0006` columns plus the
+/// four migration-`0015` symbol-filter columns, fail-closed (r1.s3.w2, #110;
+/// r3.s1.w4, #142).
 ///
-/// Exactly four shapes are legal and every other combination is an error:
+/// Exactly six shapes are legal and every other combination is an error:
 ///
-/// 1. **all eight NULL** → `Ok(None)`. A row written before `0006`. It cannot be
-///    backfilled truthfully (nothing stored recovers the snapshot identity) and
-///    ADR-0018 forbids inventing facts on immutable records, so it reads as an
-///    explicit "provenance unavailable".
+/// 1. **all eight `0006` columns NULL** → `Ok(None)`. A row written before
+///    `0006`. It cannot be backfilled truthfully (nothing stored recovers the
+///    snapshot identity) and ADR-0018 forbids inventing facts on immutable
+///    records, so it reads as an explicit "provenance unavailable". A stray
+///    filter value on such a row is corrupt, not legacy — provenance cannot be
+///    half-absent.
 /// 2. **six required present, both HTF NULL** → `Some`, `htf: None` — a genuine
 ///    single-timeframe run.
 /// 3. **six required present, both HTF present** → `Some`, `htf: Some`.
-/// 4. **anything else** → [`DataError::Db`].
+/// 4. **all four `0015` filter columns NULL** → `symbol_filters: None` — a
+///    pre-`0015` run whose filters are **not recorded**, never guessed.
+/// 5. **all four filter columns present** → `symbol_filters: Some`.
+/// 6. **anything else** → [`DataError::Db`].
 ///
-/// Shape 4 is the point. A half-populated row is not a run with some provenance; it
+/// Shape 6 is the point. A half-populated row is not a run with some provenance; it
 /// is a row whose provenance cannot be trusted, and a partial projection would let
 /// a caller replay against the wrong snapshot while believing it had the right one.
 /// The same applies to an unknown timeframe or funding discriminant, an invalid
@@ -814,6 +888,10 @@ fn decode_inputs(
     taker_fee_bps: Option<&str>,
     slippage_bps: Option<&str>,
     funding_config: Option<&str>,
+    lot_step: Option<&str>,
+    min_qty: Option<&str>,
+    min_notional: Option<&str>,
+    max_leverage: Option<&str>,
     window_from_ms: Option<i64>,
     window_to_ms: Option<i64>,
     window_lead_in_from_ms: Option<i64>,
@@ -831,12 +909,25 @@ fn decode_inputs(
         .iter()
         .filter(|v| v.is_some())
         .count();
+    let filters_present = [lot_step, min_qty, min_notional, max_leverage]
+        .iter()
+        .filter(|v| v.is_some())
+        .count();
 
     // Shape 1: the legacy row. ALL eight must be NULL — a row with no required
     // provenance but a stray HTF value is corrupt, not legacy. The `0009` window
     // pair is NULL there too, and is decoded with it rather than counted among
-    // the `0006` shapes (a legacy row has no inputs at all).
+    // the `0006` shapes (a legacy row has no inputs at all). r3.s1.w4: a stray
+    // filter value is equally corrupt — filters without the provenance they
+    // belong to cannot be trusted.
     if present == 0 && htf_present == 0 {
+        if filters_present > 0 {
+            return Err(DataError::Db(format!(
+                "run `{run_id}` carries symbol filters but no input provenance: \
+                 filters without the provenance they belong to cannot be trusted \
+                 (r3.s1.w4)"
+            )));
+        }
         if window_from_ms.is_some() || window_to_ms.is_some() || window_lead_in_from_ms.is_some() {
             return Err(DataError::Db(format!(
                 "run `{run_id}` carries window bounds but no input provenance: \
@@ -879,6 +970,24 @@ fn decode_inputs(
         _ => None,
     };
 
+    // r3.s1.w4 (#142): the `0015` filter group — all four or none, the same
+    // all-or-nothing discipline the `0006` shapes enforce above.
+    let symbol_filters = match (lot_step, min_qty, min_notional, max_leverage) {
+        (None, None, None, None) => None,
+        (Some(step), Some(qty), Some(notional), Some(leverage)) => Some(SymbolFilters {
+            lot_step: parse_decimal("backtest_run.lot_step", step)?,
+            min_qty: parse_decimal("backtest_run.min_qty", qty)?,
+            min_notional: parse_decimal("backtest_run.min_notional", notional)?,
+            max_leverage: parse_decimal("backtest_run.max_leverage", leverage)?,
+        }),
+        _ => {
+            return Err(DataError::Db(format!(
+                "run `{run_id}` has a partially-present symbol filter group: lot_step, min_qty, \
+                 min_notional and max_leverage must all be present or all absent (r3.s1.w4)"
+            )));
+        }
+    };
+
     Ok(Some(BacktestInputs {
         // `Pair::parse` (not `Pair::new`): the stored symbol is joined verbatim into
         // candle-store paths on replay, so a corrupt value must refuse here.
@@ -891,6 +1000,7 @@ fn decode_inputs(
         taker_fee_bps: parse_decimal("backtest_run.taker_fee_bps", taker_fee_bps)?,
         slippage_bps: parse_decimal("backtest_run.slippage_bps", slippage_bps)?,
         funding: parse_funding("backtest_run.funding_config", funding_config)?,
+        symbol_filters,
         window,
         lead_in_from_ms: window_lead_in_from_ms,
     }))
@@ -1163,6 +1273,26 @@ pub(crate) async fn insert_run_row(
     // `save_walk_forward_run`).
     let walk_forward_run_id = membership.map(|m| m.run_id.as_str().to_owned());
     let fold_index = membership.map(|m| i64::from(m.fold_index));
+    // r3.s1.w4 (#142) — the symbol-filter group, written all-or-nothing: the
+    // domain type is `Option<SymbolFilters>`, so "half a group" is
+    // unrepresentable here (and the read-side decoder refuses one regardless).
+    // Same `.normalize()`d Decimal-as-TEXT as every other money column (NFR-2).
+    let lot_step_text = inputs
+        .symbol_filters
+        .as_ref()
+        .map(|f| decimal_text(f.lot_step));
+    let min_qty_text = inputs
+        .symbol_filters
+        .as_ref()
+        .map(|f| decimal_text(f.min_qty));
+    let min_notional_text = inputs
+        .symbol_filters
+        .as_ref()
+        .map(|f| decimal_text(f.min_notional));
+    let max_leverage_text = inputs
+        .symbol_filters
+        .as_ref()
+        .map(|f| decimal_text(f.max_leverage));
     // r2.s1 G1(b): the window-edge open-position mark is one JSON column (the
     // `regime_breakdown`/`fills` precedent) — NULL for a run that ended flat
     // or at the snapshot's real last bar. Never a trade row, so the
@@ -1183,10 +1313,12 @@ pub(crate) async fn insert_run_row(
           regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
           taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms, \
-          window_lead_in_from_ms, open_position, walk_forward_run_id, fold_index) \
+          window_lead_in_from_ms, open_position, walk_forward_run_id, fold_index, \
+          lot_step, min_qty, min_notional, max_leverage) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
-                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
+                 ?47, ?48, ?49, ?50)",
         run_id,
         version_id_str,
         schema_version,
@@ -1233,6 +1365,10 @@ pub(crate) async fn insert_run_row(
         open_position_json,
         walk_forward_run_id,
         fold_index,
+        lot_step_text,
+        min_qty_text,
+        min_notional_text,
+        max_leverage_text,
     )
     .execute(&mut **tx)
     .await
@@ -1418,6 +1554,7 @@ mod tests {
             taker_fee_bps: d(4, 0),
             slippage_bps: d(1, 0),
             funding: FundingConfig::SnapshotRates,
+            symbol_filters: None,
             window: None,
             lead_in_from_ms: None,
         }
