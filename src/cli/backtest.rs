@@ -578,6 +578,8 @@ fn exit_reason_label(reason: ExitReason) -> &'static str {
         ExitReason::TakeProfit => "take_profit",
         ExitReason::Signal => "signal",
         ExitReason::EndOfData => "end_of_data",
+        ExitReason::TrailingStop => "trailing_stop",
+        ExitReason::TimeStop => "time_stop",
     }
 }
 

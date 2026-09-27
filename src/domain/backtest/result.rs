@@ -311,6 +311,11 @@ fn exit_reason_tag(reason: super::ExitReason) -> u8 {
         super::ExitReason::TakeProfit => 1,
         super::ExitReason::Signal => 2,
         super::ExitReason::EndOfData => 3,
+        // r3.s1.w1 (G1): new tags append — stored hashes never change, because
+        // no pre-existing run can carry a trailing or time stop (both were
+        // refused before the engine ran them).
+        super::ExitReason::TrailingStop => 4,
+        super::ExitReason::TimeStop => 5,
     }
 }
 
