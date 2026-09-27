@@ -23,7 +23,8 @@
 
 use crate::adapters::backtest::{BacktestConfig, first_fully_warm_bar_ms};
 use crate::application::backtest::{
-    BacktestAppError, PreSaveStage, SnapshotPins, load_series, prepare_over_loaded_series,
+    BacktestAppError, PreSaveStage, SnapshotPins, check_request_shape, load_series,
+    prepare_over_loaded_series,
 };
 use crate::domain::backtest::{
     CandleWindow, FoldScheme, FoldVerdict, K_DEFAULT, RunSummary, RunVerdict, VerdictRule,
@@ -554,22 +555,10 @@ where
     let validated = validate(&version.dsl).map_err(BacktestAppError::DslInvalid)?;
     let compiled =
         compile(&validated).map_err(|e| BacktestAppError::CompileFailed(e.to_string()))?;
-    if compiled.needs_htf() && request.htf_timeframe.is_none() {
-        return Err(BacktestAppError::HtfRequired {
-            field: "inputs.htf",
-        }
-        .into());
-    }
-    if let Some(htf_tf) = request.htf_timeframe
-        && htf_tf.duration_ms() <= request.primary_timeframe.duration_ms()
-    {
-        return Err(BacktestAppError::HtfNotHigher {
-            field: "inputs.htf",
-            primary: request.primary_timeframe,
-            htf: htf_tf,
-        }
-        .into());
-    }
+    // r3.s1.w5 (B5): the same shared request-shape guard `run_version_backtest`
+    // and the `--dsl` CLI route run, BEFORE any candle I/O — this module's
+    // former private copy of the two checks is gone.
+    check_request_shape(&compiled, request.primary_timeframe, request.htf_timeframe)?;
     let scheme = FoldScheme::rolling_oos(request.k.map_or(i64::from(K_DEFAULT), i64::from))?;
 
     // ONE blocking task for the snapshot loads, the warm-bar probe, the span

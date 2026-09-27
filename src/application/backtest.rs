@@ -45,6 +45,7 @@
 use rust_decimal::Decimal;
 
 use crate::domain::backtest::EquityCurve;
+use crate::domain::dsl::CompiledStrategy;
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
@@ -640,6 +641,48 @@ struct EngineOutput {
     prepared: PreparedBacktest,
 }
 
+/// The one pre-dispatch request-shape guard (r3.s1.w5, register B5, #172's
+/// `--dsl` recurrence): an `htf`-operand strategy whose request supplies no
+/// `inputs.htf`, or supplies one that is not strictly higher than the primary
+/// timeframe, is refused with the typed error BEFORE any candle I/O — the
+/// run can never use the snapshots, and loading (and possibly failing on)
+/// them first turned an impossible request into a missing-snapshot error.
+///
+/// Both backtest entry points run it: `run_version_backtest`, and the `--dsl`
+/// CLI route (`src/cli/backtest.rs`) before its `load_series` calls — one
+/// guard, one home. `run_walk_forward` runs it too, replacing its former
+/// private copy. Validation and compile stay with the caller; the engine-side
+/// `check_htf_inputs` remains the last line of defence for callers that skip
+/// this ring.
+///
+/// # Errors
+///
+/// [`BacktestAppError::HtfRequired`] when the strategy needs a
+/// higher-timeframe series the request does not supply;
+/// [`BacktestAppError::HtfNotHigher`] when the supplied selection is not
+/// strictly higher than the primary timeframe.
+pub fn check_request_shape(
+    compiled: &CompiledStrategy,
+    primary_tf: Timeframe,
+    htf_tf: Option<Timeframe>,
+) -> Result<(), BacktestAppError> {
+    if compiled.needs_htf() && htf_tf.is_none() {
+        return Err(BacktestAppError::HtfRequired {
+            field: "inputs.htf",
+        });
+    }
+    if let Some(htf_tf) = htf_tf
+        && htf_tf.duration_ms() <= primary_tf.duration_ms()
+    {
+        return Err(BacktestAppError::HtfNotHigher {
+            field: "inputs.htf",
+            primary: primary_tf,
+            htf: htf_tf,
+        });
+    }
+    Ok(())
+}
+
 /// Run one persisted strategy version and answer from the saved row.
 ///
 /// # Errors
@@ -672,29 +715,17 @@ where
     let validated = validate(&version.dsl)?;
 
     // r2.s2 round-1 fixes F1/F6: the request-level guards run BEFORE any
-    // candle I/O. `compile` is pure, so an `htf`-operand strategy missing
-    // `inputs.htf` — or an `inputs.htf` selection that is not strictly higher
-    // than the primary timeframe — is refused here rather than surfacing as a
+    // candle I/O — refused here rather than surfacing as a
     // `PreSaveRead`/`SnapshotMissing` after loading (and possibly failing on)
-    // candle data the run can never use. `prepare_backtest` keeps the same
-    // `needs_htf` guard and `run_backtest` the same pair check as the last
-    // line of defence for callers that skip this ring.
+    // candle data the run can never use. r3.s1.w5 (B5): the two checks are
+    // now the SHARED `check_request_shape`, also run by the `--dsl` CLI route
+    // and `run_walk_forward` — one guard for every backtest entry point.
+    // `prepare_backtest` keeps the same `needs_htf` guard and `run_backtest`
+    // the same pair check as the last line of defence for callers that skip
+    // this ring.
     let compiled =
         compile(&validated).map_err(|e| BacktestAppError::CompileFailed(e.to_string()))?;
-    if compiled.needs_htf() && request.htf_timeframe.is_none() {
-        return Err(BacktestAppError::HtfRequired {
-            field: "inputs.htf",
-        });
-    }
-    if let Some(htf_tf) = request.htf_timeframe
-        && htf_tf.duration_ms() <= request.primary_timeframe.duration_ms()
-    {
-        return Err(BacktestAppError::HtfNotHigher {
-            field: "inputs.htf",
-            primary: request.primary_timeframe,
-            htf: htf_tf,
-        });
-    }
+    check_request_shape(&compiled, request.primary_timeframe, request.htf_timeframe)?;
 
     // 3. Everything synchronous — Parquet decode and the CPU engine — happens on a
     //    blocking thread. Both are hundreds of milliseconds on the real fixture, and

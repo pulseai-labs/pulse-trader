@@ -630,7 +630,10 @@ pub use domain::{ApiKey, CredentialSource, CredentialStatus};
 // crossed inward so the application ring keeps ADR-0015's ONE adapters import. The
 // crate surface is unchanged: `pulse::Redactor` still resolves, to the same type.
 pub use adapters::llm::redacting_logging::RedactingLoggingProvider;
-pub use domain::Redactor;
+// r3.s1.w5 (#172): the scrub-then-bound seam and its one bound ride the same
+// surface, so the integration tests and any persisting caller reach them as
+// `pulse::scrub_then_bound` / `pulse::TRANSPORT_DETAIL_MAX_BYTES`.
+pub use domain::{Redactor, TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 
 // VS-1.3.2 work-2.04: the composer agent loop surface (FR-3 / FR-4, README C7). The
 // `Composer<P>` orchestrator + `compose()` + the `ComposeOutcome` value it RETURNS +

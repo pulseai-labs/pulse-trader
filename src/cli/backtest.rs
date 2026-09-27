@@ -181,6 +181,14 @@ where
 
     let compiled = load_dsl_strategy(args)?;
 
+    // r3.s1.w5 (B5, #172's `--dsl` recurrence): this route runs the SAME
+    // shared request-shape guard the versioned route runs, BEFORE any
+    // snapshot I/O — an impossible HTF request is refused with the shape
+    // error, not a missing-snapshot error. The engine-side check stays as the
+    // last line of defence.
+    crate::application::backtest::check_request_shape(&compiled, tf, htf)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let primary = load_series(repo, &pair, tf)?;
     let htf_series = match htf {
         Some(htf_tf) => Some(load_series(repo, &pair, htf_tf)?),
