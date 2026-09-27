@@ -202,6 +202,12 @@ pub(crate) mod probe {
         /// the two — "the quarantine's directory sync ran before the install's
         /// rename" is not expressible from two separate streams.
         Rename,
+        /// A removal that published an ABSENCE (fix round 11, R1). It shares the
+        /// stream for the same reason a rename does: the order that has to be
+        /// provable is "the fsync making the install's rename durable ran BEFORE
+        /// the quarantine unlinks", and that is an order between a sync and a
+        /// removal.
+        Remove,
     }
 
     /// One recorded publish step.

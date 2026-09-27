@@ -1397,7 +1397,11 @@ fn copy_snapshots(
     let copied = (|| -> anyhow::Result<()> {
         for snap in source_snapshots {
             let dest = target_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
-            if dest.exists() {
+            // Fail closed (fix round 11, R2): `exists()` would read a stat failure
+            // as "absent", and this run would then RECORD the destination — which
+            // the rollback deletes. A snapshot this run did not write must never be
+            // in `added`, so an unreadable destination refuses the import instead.
+            if path_present(&dest)? {
                 if !bytes_equal(&snap.path, &dest) {
                     mismatches.push(Mismatch::new(
                         "snapshot",
@@ -1415,9 +1419,8 @@ fn copy_snapshots(
             // Recorded BEFORE the copy (fix round 1, F8): `copy_snapshot_into`
             // renames the file into place and then syncs its directory, so a
             // failure AFTER the rename still leaves a snapshot behind — one the
-            // rollback must remove. The name is known free (the `exists` check
-            // above), so recording it up front cannot delete anything this run
-            // did not write.
+            // rollback must remove. The name is known free (the probe above), so
+            // recording it up front cannot delete anything this run did not write.
             added.push(dest.clone());
             copy_snapshot_into(&snap.path, &dest)?;
         }
@@ -1701,7 +1704,7 @@ pub(crate) enum InstallRefusal {
     /// failed for a reason other than "not there", so whether the copy carries a
     /// sidecar is unknown — and an unreadable sidecar is not an absent one.
     #[error(
-        "refusing to install {db}: cannot tell whether its {suffix} sidecar {sidecar} is there          ({error}) — a sidecar that exists would be stranded by the rename",
+        "refusing to install {db}: cannot tell whether its {suffix} sidecar {sidecar} is there ({error}) — a sidecar that exists would be stranded by the rename",
         db = .db.display(),
         sidecar = .sidecar.display()
     )]
@@ -1721,13 +1724,17 @@ pub(crate) enum InstallRefusal {
 /// round 9, K2)?
 ///
 /// `Path::exists()` answers `false` for every stat error, so a probe that decides
-/// whether bytes would be stranded must not use it: an unreadable sidecar is not
-/// an absent one. Only a definite "not there" is `Ok(false)`.
+/// whether bytes would be stranded — or whether this run may RECORD a path as its
+/// own to delete later — must not use it: an unreadable file is not an absent one.
+/// Only a definite "not there" is `Ok(false)`. Two callers: the sidecar probes
+/// that decide whether a rename would strand a `-wal` (K2), and the snapshot-copy
+/// dedup that decides whether the rollback may delete a destination (fix round
+/// 11, R2).
 ///
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] naming the path when its metadata cannot be read.
-fn sidecar_present(path: &Path) -> anyhow::Result<bool> {
+fn path_present(path: &Path) -> anyhow::Result<bool> {
     #[cfg(test)]
     if probe::take_injected_stat_failure(path) {
         return Err(anyhow!(
@@ -1754,7 +1761,7 @@ fn sidecar_present(path: &Path) -> anyhow::Result<bool> {
 fn refuse_stranded_sidecar(tmp_db: &Path) -> anyhow::Result<()> {
     for suffix in COPY_SIDECAR_SUFFIXES {
         let sidecar = sidecar_path(tmp_db, suffix);
-        match sidecar_present(&sidecar) {
+        match path_present(&sidecar) {
             Ok(false) => {}
             Ok(true) => {
                 return Err(InstallRefusal::Sidecar {
@@ -1829,7 +1836,7 @@ impl QuarantinedSidecars {
         for suffix in DB_STATE_SUFFIXES {
             // (the test seam records what was moved, below)
             let original = sidecar_path(target, suffix);
-            match sidecar_present(&original) {
+            match path_present(&original) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 // Fail closed (fix round 9, K2): a sidecar that cannot be stat'ed
@@ -1982,6 +1989,24 @@ impl QuarantinedSidecars {
         ))
     }
 
+    /// Name every quarantine this take is still holding, with the name each one's
+    /// bytes belong back at — for the one error that has to say what is still on
+    /// disk (fix round 11, R1: the quarantines kept because the install's rename
+    /// is not confirmed durable).
+    fn left_in_place(&self) -> String {
+        self.moved
+            .iter()
+            .map(|(quarantine, original)| {
+                format!(
+                    "{} (its bytes belong back at {})",
+                    quarantine.display(),
+                    original.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// The distinct directories the quarantined files live in.
     fn directories(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -2006,7 +2031,14 @@ fn remove_quarantine(path: &Path) -> Result<(), String> {
         ));
     }
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Recorded (fix round 11, R1) so a test can assert WHERE this unlink
+            // sits relative to the syncs: the install's rename has to be durable
+            // before the old sidecars go.
+            #[cfg(test)]
+            probe::record(publish::probe::SyncKind::Remove, path, path);
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("remove {}: {error}", path.display())),
     }
@@ -2091,15 +2123,20 @@ impl InstallFailure {
 
 /// Install the temporary database: refuse a copy with a sidecar left to strand,
 /// move the target's own sidecars aside, rename the copy into place, make the
-/// rename durable, put the installed file back in WAL, and drop what was moved
-/// aside.
+/// rename durable, drop what was moved aside, and put the installed file back in
+/// WAL.
+///
+/// The durability step precedes the drop (fix round 11, R1): the old sidecars may
+/// only be unlinked once the rename that replaced their database is on disk.
 ///
 /// # Errors
 ///
 /// [`InstallFailure::Untouched`] when nothing was renamed (the refusal, the
 /// quarantine, or the rename itself failed — the target's sidecars are put
 /// back), and [`InstallFailure::Installed`] when the rename landed and a later
-/// step failed, so the caller must not run its pre-rename cleanup.
+/// step failed, so the caller must not run its pre-rename cleanup. A rename whose
+/// durability could not be confirmed reports `Installed` and leaves the
+/// quarantined sidecars in place, named in the error.
 async fn install_tmp_db(
     tmp_db: &Path,
     target: &Path,
@@ -2160,26 +2197,42 @@ async fn install_tmp_db(
         target: target.to_path_buf(),
         error,
     };
-    // 5. The database those sidecars belonged to is GONE, so they go NOW — before
-    //    the directory sync and the WAL switch can fail (fix round 3, M3): no
-    //    quarantine file may outlive a landed install on any path.
-    //
-    //    A cleanup that FAILS must not skip the two steps that make the install
-    //    durable (fix round 5, P2): a leftover quarantine is a mess, a database
-    //    that is neither durable nor in WAL is a data-loss risk. Every step runs,
-    //    and the error names all of it.
-    let mut failures: Vec<String> = Vec::new();
-    if let Err(error) = quarantined.discard() {
-        failures.push(format!(
-            "the replaced database's quarantined sidecars could not all be cleaned up: {error}"
-        ));
-    }
-    // 6. The rename is durable only once the directory that received it is
+    // 5. The rename is durable only once the directory that received it is
     //    fsynced — including every level this run created (issue #259, F6).
-    if let Err(error) = publish::sync_published(target, created) {
-        failures.push(format!(
-            "its directory could not be fsynced, so the new name is not durable: {error}"
-        ));
+    //
+    //    This runs BEFORE the quarantine is discarded (fix round 11, R1). Round
+    //    3's M3 had the discard first — "the database those sidecars belonged to
+    //    is gone, so they go" — which is right about OWNERSHIP and wrong about
+    //    ORDER: a crash can persist the unlinks without the rename, and the
+    //    target would then still be the OLD database with its committed `-wal`
+    //    rows already unlinked. The rename's own durability lands first, so the
+    //    unlinks can only ever follow a rename that is already on disk.
+    let mut failures: Vec<String> = Vec::new();
+    match publish::sync_published(target, created) {
+        Ok(()) => {
+            // 6. That durability is in place, so the old sidecars go — with their
+            //    own directory fsync as before. A cleanup that FAILS must not skip
+            //    the WAL switch (fix round 5, P2): a leftover quarantine is a mess,
+            //    a database that is neither durable nor in WAL is a data-loss
+            //    risk. Every step runs, and the error names all of it.
+            if let Err(error) = quarantined.discard() {
+                failures.push(format!(
+                    "the replaced database's quarantined sidecars could not all be cleaned up: \
+                     {error}"
+                ));
+            }
+        }
+        // The rename is NOT confirmed durable, so those quarantined files are the
+        // only copy of the old database's un-checkpointed rows. Discarding them
+        // here is exactly the data loss R1 is about: they stay, and the error
+        // names them so the operator can put them back if the rename turns out to
+        // have been lost.
+        Err(error) => failures.push(format!(
+            "its directory could not be fsynced, so the new name is not durable: {error}; the \
+             replaced database's sidecars were NOT discarded — {} — because their removal could \
+             be persisted without the rename",
+            quarantined.left_in_place()
+        )),
     }
     // 7. ADR-0019, deterministically (F4): the installed file is in WAL, read
     //    back, before this command reports success — never left to the next
@@ -2598,6 +2651,131 @@ mod tests {
             "the target's own directory is synced AFTER the rename: {syncs:?}"
         );
         assert!(target.exists(), "and the database is there");
+    }
+
+    /// Fix round 11, R1: the fsync that makes the install's rename durable runs
+    /// BEFORE the old sidecars are unlinked. Round 3's M3 had it the other way
+    /// round — the discard first — so a crash could persist the unlinks without
+    /// the rename, leaving the OLD database at the target with the `-wal` holding
+    /// its committed rows already gone.
+    #[tokio::test]
+    async fn the_install_syncs_the_rename_before_it_discards_the_quarantine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        fs::write(&target, b"the old target").expect("write the old target");
+        for suffix in super::DB_STATE_SUFFIXES {
+            fs::write(sidecar_path(&target, suffix), b"the old target's state")
+                .expect("write the old target's sidecar");
+        }
+        let _ = publish::probe::take();
+
+        install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect("install");
+
+        let events = publish::probe::take();
+        let rename = events
+            .iter()
+            .position(|step| {
+                step.kind == publish::probe::SyncKind::Rename && step.destination == target
+            })
+            .unwrap_or_else(|| panic!("the install's rename is recorded: {events:?}"));
+        let durable = events
+            .iter()
+            .enumerate()
+            .position(|(index, step)| {
+                index > rename
+                    && step.kind == publish::probe::SyncKind::Dir
+                    && step.path == *dir.path()
+                    && step.destination == target
+            })
+            .unwrap_or_else(|| panic!("the rename's directory sync is recorded: {events:?}"));
+        let unlink = events
+            .iter()
+            .position(|step| step.kind == publish::probe::SyncKind::Remove)
+            .unwrap_or_else(|| panic!("the quarantine unlinks are recorded: {events:?}"));
+        assert!(
+            durable < unlink,
+            "the rename is durable BEFORE the old sidecars go: {events:?}"
+        );
+        for suffix in super::DB_STATE_SUFFIXES {
+            assert!(
+                !sidecar_path(&target, suffix).exists(),
+                "and the quarantine WAS discarded once that was true ({suffix})"
+            );
+        }
+    }
+
+    /// Fix round 11, R1: when that sync fails, the quarantined sidecars are NOT
+    /// discarded — while the rename is unconfirmed they are the only copy of the
+    /// old database's un-checkpointed rows — and the error names every one of
+    /// them, with the name its bytes belong back at.
+    #[tokio::test]
+    async fn a_failed_sync_keeps_the_quarantine_and_names_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        fs::write(&target, b"the old target").expect("write the old target");
+        // The quarantine names are keyed on the OLD target's identity, so they are
+        // computed while it is still the file at that path.
+        let quarantines: Vec<PathBuf> = super::DB_STATE_SUFFIXES
+            .iter()
+            .map(|suffix| {
+                let sidecar = sidecar_path(&target, suffix);
+                fs::write(&sidecar, b"the old target's state").expect("write the sidecar");
+                super::quarantine_path(&target, suffix, super::inode_of(&target))
+                    .expect("the quarantine name is built from the target's own name")
+            })
+            .collect();
+        let _ = publish::probe::take();
+        // Keyed on the published file, not the directory: the C1 quarantine sync
+        // runs in the same directory and would eat a directory-keyed injection.
+        publish::probe::fail_next_publish_with_extension("db");
+
+        let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect_err("the injected directory sync fails after the rename");
+        let InstallFailure::Installed {
+            target: installed,
+            error,
+        } = failure
+        else {
+            panic!("the rename landed, so the database IS installed: {failure:?}");
+        };
+        assert_eq!(installed, target, "and it names the installed database");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("not durable"),
+            "the failure names the unconfirmed rename: {message}"
+        );
+        assert!(
+            message.contains("were NOT discarded"),
+            "and says the quarantine was kept: {message}"
+        );
+        for quarantine in &quarantines {
+            assert!(
+                quarantine.exists(),
+                "the quarantine is still on disk: {}",
+                quarantine.display()
+            );
+            assert!(
+                message.contains(&quarantine.display().to_string()),
+                "and the error names it: {message}"
+            );
+        }
+        let events = publish::probe::take();
+        assert!(
+            !events
+                .iter()
+                .any(|step| step.kind == publish::probe::SyncKind::Remove),
+            "nothing was unlinked: {events:?}"
+        );
     }
 
     /// Fix round 1, F4 (ADR-0019): the file the import leaves behind is in WAL
@@ -4156,6 +4334,53 @@ mod tests {
         assert!(
             !dest.exists(),
             "the rollback removed the snapshot the failed copy published"
+        );
+    }
+
+    /// Fix round 11, R2: the dedup that decides whether the destination is this
+    /// run's to record — and therefore to DELETE on a rollback — must not read a
+    /// stat failure as "absent". An unreadable destination refuses the copy, and
+    /// records nothing.
+    #[test]
+    fn a_snapshot_whose_presence_cannot_be_checked_refuses_the_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_data = dir.path().join("mac-data");
+        let leaf = source_data.join("candles").join("BTCUSDT").join("15m");
+        fs::create_dir_all(&leaf).expect("the source store");
+        fs::write(leaf.join("b51388284a3a4371.parquet"), b"snapshot bytes")
+            .expect("write the source snapshot");
+        let (snapshots, issues) = scan_snapshots(&source_data);
+        assert!(issues.is_empty(), "the source store is well-formed");
+
+        let target_store = CandleStore::with_base_dir(dir.path().join("server-data"));
+        let dest = target_store.snapshot_path(
+            &snapshots[0].pair,
+            snapshots[0].timeframe,
+            &snapshots[0].version,
+        );
+        publish::probe::fail_next_stat_of(&dest);
+        let mut mismatches = Vec::new();
+
+        let (error, added) = copy_snapshots(&target_store, &snapshots, &mut mismatches)
+            .expect_err("an unreadable destination refuses the copy");
+
+        assert!(
+            error.to_string().contains(&dest.display().to_string()),
+            "the refusal names the path it could not stat: {error}"
+        );
+        assert!(
+            added.is_empty(),
+            "and nothing is recorded for the rollback to delete: {added:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "no snapshot was written either: {}",
+            dest.display()
+        );
+        assert!(
+            mismatches.is_empty(),
+            "an unreadable destination is a refusal, not a byte mismatch ({} recorded)",
+            mismatches.len()
         );
     }
 
