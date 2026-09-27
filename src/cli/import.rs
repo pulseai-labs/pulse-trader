@@ -41,12 +41,14 @@ use super::publish;
 use super::publish::probe;
 use crate::adapters::db::default_db_path;
 use crate::adapters::db::ops;
-pub(crate) use crate::adapters::db::{DB_STATE_SUFFIXES, refuse_orphaned_quarantines, target_dir};
+pub(crate) use crate::adapters::db::{
+    DB_STATE_SUFFIXES, inode_of, quarantine_name, refuse_orphaned_quarantines, target_dir,
+};
 use crate::adapters::db::{
     Db, SqliteBacktestRunRepo, SqliteStrategyRepo, open_migrated_copy, put_in_wal,
 };
 #[cfg(test)]
-pub(crate) use crate::adapters::db::{OrphanedQuarantines, orphaned_quarantines};
+pub(crate) use crate::adapters::db::{InterruptedInstall, QuarantineOwner, orphaned_quarantines};
 use crate::adapters::store::CandleStore;
 use crate::adapters::store::default_base_dir;
 use crate::domain::strategy::VersionId;
@@ -1668,21 +1670,14 @@ fn refuse_stranded_sidecar(tmp_db: &Path) -> anyhow::Result<()> {
 /// crash leaves one behind.
 ///
 /// A bare relative target (`--db pulse.db`) quarantines into the current
-/// directory, which is where its sidecars are (fix round 5, P4).
-fn quarantine_path(target: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
+/// directory, which is where its sidecars are (fix round 5, P4). `inode` is the
+/// identity the name records so a later run can tell whose bytes these are
+/// (fix round 7, E3).
+fn quarantine_path(target: &Path, suffix: &str, inode: Option<u64>) -> anyhow::Result<PathBuf> {
     let name = target
         .file_name()
         .ok_or_else(|| anyhow!("unusable target path: {}", target.display()))?;
-    let dir = target_dir(target);
-    // Built from the raw `OsStr` (fix round 2, N6): a target whose file name is
-    // not valid UTF-8 must still get a usable quarantine name — going through
-    // `to_str()`/`format!` refuses it outright, and `display()` would rewrite the
-    // bytes into a name that cannot be renamed back.
-    let mut quarantine = std::ffi::OsString::from(".");
-    quarantine.push(name);
-    quarantine.push(suffix);
-    quarantine.push(format!(".quarantine-{}", std::process::id()));
-    Ok(dir.join(quarantine))
+    Ok(target_dir(target).join(quarantine_name(name, suffix, inode)))
 }
 
 /// The target's own sidecars, MOVED ASIDE for the duration of the install
@@ -1709,13 +1704,18 @@ impl QuarantinedSidecars {
     /// has not renamed anything yet, so the caller reports it as untouched.
     fn take(target: &Path) -> anyhow::Result<Self> {
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        // The identity a later run needs to tell whether these bytes belong to the
+        // database that ends up at the target path (fix round 7, E3): the rename
+        // preserves the inode, so a quarantine taken now matches only the database
+        // that is there NOW.
+        let inode = inode_of(target);
         for suffix in DB_STATE_SUFFIXES {
             // (the test seam records what was moved, below)
             let original = sidecar_path(target, suffix);
             if !original.exists() {
                 continue;
             }
-            let quarantine = quarantine_path(target, suffix)?;
+            let quarantine = quarantine_path(target, suffix, inode)?;
             // Never reuse a quarantine a crashed run left: those bytes are not
             // this run's.
             let _ = fs::remove_file(&quarantine);
@@ -1730,7 +1730,7 @@ impl QuarantinedSidecars {
                     original.display(),
                     quarantine.display()
                 );
-                return Err(match already.restore() {
+                return Err(match already.restore(target) {
                     Ok(()) => failure,
                     Err(restore_error) => anyhow!(
                         "{failure}; and sidecars this attempt had already moved could not be put \
@@ -1758,7 +1758,7 @@ impl QuarantinedSidecars {
     /// moved back (fix round 2, N5) — a sidecar left under its quarantine name is
     /// bytes the target no longer has, and the operator has to move them back by
     /// hand.
-    fn restore(&self) -> anyhow::Result<()> {
+    fn restore(&self, target: &Path) -> anyhow::Result<()> {
         let mut stranded: Vec<String> = Vec::new();
         for (quarantine, original) in &self.moved {
             if let Err(error) = move_aside(quarantine, original) {
@@ -1769,14 +1769,29 @@ impl QuarantinedSidecars {
                 ));
             }
         }
-        if stranded.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        if !stranded.is_empty() {
+            parts.push(format!(
+                "the replaced database's sidecars could not be put back — {} — those files still \
+                 hold the bytes; move them back by hand",
+                stranded.join("; ")
+            ));
+        }
+        // Fix round 7, G1: a move-back that a power loss can undo is not a move-back.
+        // The caller reports "the target is exactly as it was" on Ok, so the renames
+        // are fsynced first — and a failure is reported, never swallowed.
+        if !self.moved.is_empty()
+            && let Err(error) = sync_quarantine_dir(target)
+        {
+            parts.push(format!(
+                "the sidecars were moved back but their directory could not be fsynced, so the \
+                 move-backs are not confirmed durable: {error}"
+            ));
+        }
+        if parts.is_empty() {
             return Ok(());
         }
-        Err(anyhow!(
-            "the replaced database's sidecars could not be put back — {} — those files still \
-             hold the bytes; move them back by hand",
-            stranded.join("; ")
-        ))
+        Err(anyhow!("{}", parts.join("; ")))
     }
 
     /// Remove the quarantined sidecars — the install landed, so their bytes
@@ -1956,13 +1971,15 @@ async fn install_tmp_db(
             "the replaced database's sidecars were moved aside but their directory could not be \
              fsynced, so those renames are not durable: {error}"
         );
-        return Err(InstallFailure::Untouched(match quarantined.restore() {
-            Ok(()) => failure,
-            Err(restore_error) => anyhow!(
-                "{failure}; and putting the replaced database's sidecars back failed too: \
+        return Err(InstallFailure::Untouched(
+            match quarantined.restore(target) {
+                Ok(()) => failure,
+                Err(restore_error) => anyhow!(
+                    "{failure}; and putting the replaced database's sidecars back failed too: \
                  {restore_error}"
-            ),
-        }));
+                ),
+            },
+        ));
     }
     // 4. The rename itself. Past this point the database IS installed.
     if let Err(error) = move_aside(tmp_db, target) {
@@ -1973,13 +1990,15 @@ async fn install_tmp_db(
             tmp_db.display(),
             target.display()
         );
-        return Err(InstallFailure::Untouched(match quarantined.restore() {
-            Ok(()) => failure,
-            Err(restore_error) => anyhow!(
-                "{failure}; and putting the replaced database's sidecars back failed too: \
+        return Err(InstallFailure::Untouched(
+            match quarantined.restore(target) {
+                Ok(()) => failure,
+                Err(restore_error) => anyhow!(
+                    "{failure}; and putting the replaced database's sidecars back failed too: \
                  {restore_error}"
-            ),
-        }));
+                ),
+            },
+        ));
     }
     let installed = |error: anyhow::Error| InstallFailure::Installed {
         target: target.to_path_buf(),
@@ -2663,7 +2682,8 @@ mod tests {
         // The SECOND move fails: a directory already occupies its quarantine
         // name (a rename onto a directory cannot succeed, and `take`'s own
         // "never reuse a stale quarantine" removal cannot delete a directory).
-        let blocked = super::quarantine_path(&target, "-shm").expect("the quarantine name");
+        let blocked = super::quarantine_path(&target, "-shm", super::inode_of(&target))
+            .expect("the quarantine name");
         fs::create_dir_all(&blocked).expect("block the second quarantine name");
 
         let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
@@ -2712,7 +2732,8 @@ mod tests {
             panic!("nothing was renamed: {failure:?}");
         };
 
-        let quarantine = super::quarantine_path(&target, "-wal").expect("the quarantine name");
+        let quarantine = super::quarantine_path(&target, "-wal", super::inode_of(&target))
+            .expect("the quarantine name");
         let message = error.to_string();
         assert!(
             message.contains("put back"),
@@ -2762,7 +2783,7 @@ mod tests {
             "the old target's sidecar was moved aside: {}",
             sidecar.display()
         );
-        let quarantine = super::quarantine_path(&target, "-wal")
+        let quarantine = super::quarantine_path(&target, "-wal", super::inode_of(&target))
             .expect("the quarantine name is built from the raw OsStr, never through display()");
         assert!(
             quarantine.exists(),
@@ -2770,7 +2791,7 @@ mod tests {
             quarantine.display()
         );
         quarantined
-            .restore()
+            .restore(&target)
             .expect("the quarantined sidecar goes back");
         assert_eq!(
             fs::read(&sidecar).expect("read the restored sidecar"),
@@ -2813,7 +2834,7 @@ mod tests {
             .expect_err("an orphaned quarantine refuses the run");
 
         let refusal = error
-            .downcast_ref::<super::OrphanedQuarantines>()
+            .downcast_ref::<super::InterruptedInstall>()
             .unwrap_or_else(|| panic!("the refusal must be typed, got: {error:?}"));
         let message = refusal.to_string();
         assert!(
@@ -3041,7 +3062,8 @@ mod tests {
         fs::write(&target, b"the old target").expect("write the old target");
         let sidecar = sidecar_path(&target, "-wal");
         fs::write(&sidecar, b"the old target's rows").expect("write the -wal");
-        let quarantine = super::quarantine_path(&target, "-wal").expect("the quarantine name");
+        let quarantine = super::quarantine_path(&target, "-wal", super::inode_of(&target))
+            .expect("the quarantine name");
         publish::probe::fail_next_remove_of(&quarantine);
         let _ = publish::probe::take();
 
@@ -3084,13 +3106,19 @@ mod tests {
     fn a_bare_relative_targets_quarantine_lands_in_the_current_directory() {
         let pid = std::process::id();
         assert_eq!(
-            super::quarantine_path(Path::new("pulse.db"), "-wal")
-                .expect("a bare relative target has a usable directory"),
+            super::quarantine_path(
+                Path::new("pulse.db"),
+                "-wal",
+                super::inode_of(Path::new("pulse.db"))
+            )
+            .expect("a bare relative target has a usable directory"),
             PathBuf::from(".").join(format!(".pulse.db-wal.quarantine-{pid}")),
             "a sidecar's quarantine is a hidden sibling in the current directory"
         );
         assert_eq!(
-            super::orphaned_quarantines(&PathBuf::from("pulse.db")).len(),
+            super::orphaned_quarantines(&PathBuf::from("pulse.db"))
+                .expect("a readable directory")
+                .len(),
             0,
             "the same directory is where the orphan scan looks (nothing is stranded here)"
         );
@@ -3192,7 +3220,7 @@ mod tests {
         .expect_err("an orphaned quarantine refuses the run");
 
         assert!(
-            error.downcast_ref::<super::OrphanedQuarantines>().is_some(),
+            error.downcast_ref::<super::InterruptedInstall>().is_some(),
             "the refusal is typed: {error:?}"
         );
         // The scan resolved the bare target's EMPTY parent to the current
@@ -3385,6 +3413,130 @@ mod tests {
         );
     }
 
+    /// Fix round 7, E3: the quarantine name records the identity of the database
+    /// those bytes belong to — the inode, which a rename preserves — so a later
+    /// run can tell whether moving them back is safe.
+    #[tokio::test]
+    async fn the_quarantine_records_the_identity_of_the_database_it_belongs_to() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        fs::write(&target, b"the old target").expect("write the old target");
+        fs::write(sidecar_path(&target, "-wal"), b"its rows").expect("write the -wal");
+        let inode = super::inode_of(&target).expect("the target has an inode");
+
+        let quarantined =
+            super::QuarantinedSidecars::take(&target).expect("the sidecar moves aside");
+
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .expect("read the directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".quarantine-"))
+            .collect();
+        assert_eq!(names.len(), 1, "one quarantine: {names:?}");
+        assert!(
+            names[0].ends_with(&format!("-{inode}")),
+            "and its name ends in the target's inode ({inode}): {names:?}"
+        );
+        // The recorded identity is what the scan reads back: the database at the
+        // target path still IS that file, so the bytes are its own.
+        let stranded = super::orphaned_quarantines(&target).expect("the scan reads the directory");
+        assert_eq!(
+            stranded.first().map(|item| item.owner),
+            Some(super::QuarantineOwner::Current),
+            "the scan reads the name back as this database's own quarantine: {stranded:?}"
+        );
+        drop(quarantined);
+    }
+
+    /// Fix round 7, G1: the restore's move-backs are durable BEFORE the caller
+    /// reports the target untouched — the directory sync follows the renames, so a
+    /// power loss cannot keep the target as it was while losing the sidecars it
+    /// was supposed to have back.
+    #[tokio::test]
+    async fn the_restores_move_backs_are_durable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        fs::write(&target, b"the old target").expect("write the old target");
+        for suffix in super::DB_STATE_SUFFIXES {
+            fs::write(sidecar_path(&target, suffix), b"the old target's state")
+                .expect("write the old target's sidecar");
+        }
+        let quarantined =
+            super::QuarantinedSidecars::take(&target).expect("the sidecars move aside");
+        let _ = publish::probe::take();
+
+        quarantined.restore(&target).expect("the sidecars go back");
+
+        let events = publish::probe::take();
+        let last_move_back = events
+            .iter()
+            .rposition(|step| {
+                step.kind == publish::probe::SyncKind::Rename && step.destination != target
+            })
+            .unwrap_or_else(|| panic!("the move-backs are recorded: {events:?}"));
+        let sync = events
+            .iter()
+            .position(|step| {
+                step.kind == publish::probe::SyncKind::Dir && step.destination == target
+            })
+            .unwrap_or_else(|| panic!("their directory is fsynced: {events:?}"));
+        assert!(
+            last_move_back < sync,
+            "the move-backs are durable only after they happened: {events:?}"
+        );
+        for suffix in super::DB_STATE_SUFFIXES {
+            assert!(
+                sidecar_path(&target, suffix).exists(),
+                "and the {suffix} is back under its own name"
+            );
+        }
+    }
+
+    /// Fix round 7, G1: a restore that cannot be made durable is REPORTED — the
+    /// install's `Untouched` error says the target is not confirmed as it was.
+    #[tokio::test]
+    async fn a_restore_that_cannot_be_made_durable_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        fs::write(&target, b"the old target").expect("write the old target");
+        for suffix in super::DB_STATE_SUFFIXES {
+            fs::write(sidecar_path(&target, suffix), b"the old target's state")
+                .expect("write the old target's sidecar");
+        }
+        // The SECOND sidecar's move fails, so `take` puts the first one back — and
+        // that restore is the one whose directory sync is injected to fail.
+        let second = super::quarantine_path(&target, "-shm", super::inode_of(&target))
+            .expect("the quarantine name");
+        publish::probe::fail_next_rename_to(&second);
+        publish::probe::fail_next_sync_of(dir.path());
+
+        let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect_err("the failed quarantine ends the install");
+        let InstallFailure::Untouched(error) = failure else {
+            panic!("nothing was renamed, so the target is untouched: {failure:?}");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be put back"),
+            "the error names what the restore could not put back: {message}"
+        );
+        assert!(
+            message.contains("not confirmed durable"),
+            "and that the move-backs are not confirmed durable: {message}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read the target"),
+            b"the old target",
+            "the target still holds the OLD database"
+        );
+    }
+
     /// Fix round 3, M3: once the install's rename has landed, NO quarantine file
     /// outlives the install on any path. The replaced database's sidecars are
     /// dropped immediately after the rename — before the directory sync and the
@@ -3444,7 +3596,8 @@ mod tests {
         fs::write(&target, b"the old target").expect("write the old target");
         let sidecar = sidecar_path(&target, "-wal");
         fs::write(&sidecar, b"the old target's rows").expect("write the -wal");
-        let quarantine = super::quarantine_path(&target, "-wal").expect("the quarantine name");
+        let quarantine = super::quarantine_path(&target, "-wal", super::inode_of(&target))
+            .expect("the quarantine name");
         publish::probe::fail_next_remove_of(&quarantine);
 
         let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))

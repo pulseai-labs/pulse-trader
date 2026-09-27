@@ -1200,7 +1200,7 @@ mod tests {
 
         assert!(
             error
-                .downcast_ref::<crate::cli::import::OrphanedQuarantines>()
+                .downcast_ref::<crate::cli::import::InterruptedInstall>()
                 .is_some(),
             "the refusal is the typed one the import uses: {error:?}"
         );

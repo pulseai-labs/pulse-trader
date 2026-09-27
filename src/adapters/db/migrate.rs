@@ -254,54 +254,132 @@ pub(crate) fn target_dir(target: &Path) -> PathBuf {
     }
 }
 
-/// Quarantine files an interrupted install left behind (fix round 4, Q1).
-///
-/// The install moves the target's own sidecars aside BEFORE it renames the copy
-/// over them; a crash between those two steps leaves them under their quarantine
-/// names, where the old sidecar no longer exists and the next run would never
-/// look. Recovering automatically is the wrong call — those bytes may be the
-/// target's only copy of its un-checkpointed rows — so everything that reads,
-/// backs up, replaces or migrates the database REFUSES until an operator moves
-/// them back.
-#[derive(Debug, thiserror::Error)]
-pub(crate) struct OrphanedQuarantines {
-    /// The database whose sidecars are stranded.
-    target: PathBuf,
-    /// `(quarantine file, the name it has to go back to)`, sorted.
-    stranded: Vec<(PathBuf, PathBuf)>,
+/// The marker every quarantine name carries (fix round 7, E3): the scan and the
+/// name builder share it, so the two cannot drift.
+pub(crate) const QUARANTINE_MARKER: &str = ".quarantine-";
+
+/// What an operator has to do with ONE stranded quarantine (fix round 7, E3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuarantineOwner {
+    /// The same database that is at the target path now: those bytes are its own
+    /// un-checkpointed rows, so they must be MOVED BACK.
+    Current,
+    /// The database it belongs to was REPLACED — the install's copy took the name,
+    /// and a rename preserves the inode, so the file there now is a different one.
+    /// Moving it back would replay the old database's pages into the new file: it
+    /// is STALE and must be DELETED, never moved back.
+    Replaced,
+    /// The name carries no inode (an older run's naming): whose bytes these are is
+    /// UNKNOWN, so they must not be moved back either — the safety backup is the
+    /// way to those rows.
+    Unknown,
 }
 
-impl std::fmt::Display for OrphanedQuarantines {
+/// One stranded quarantine: the file, the name it belongs under, and whose bytes
+/// it holds (fix round 7, E3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stranded {
+    /// The quarantine file itself.
+    pub(crate) quarantine: PathBuf,
+    /// The name it has to go back to (the target's own sidecar).
+    pub(crate) original: PathBuf,
+    /// Whose bytes it holds — what the operator must do with it.
+    pub(crate) owner: QuarantineOwner,
+}
+
+/// Why nothing may touch this database until an operator acts (fix round 4, Q1;
+/// round 7, E1 + E3).
+///
+/// The install moves the target's own sidecars aside BEFORE it renames the copy
+/// over them; a crash inside that window leaves them under their quarantine names,
+/// where the old sidecar no longer exists and the next run would never look.
+/// Recovering automatically is the wrong call — those bytes may be the target's
+/// only copy of its un-checkpointed rows — so everything that reads, backs up,
+/// replaces or migrates the database REFUSES, and says what to do with each file.
+#[derive(Debug)]
+pub(crate) enum InterruptedInstall {
+    /// An earlier install was interrupted after it moved the target's sidecars
+    /// aside; every stranded file is named with what to do about it.
+    Quarantined {
+        /// The database the quarantines are beside.
+        target: PathBuf,
+        /// Every stranded file, sorted by name.
+        stranded: Vec<Stranded>,
+    },
+    /// The target's directory could not be enumerated, so whether it holds a
+    /// quarantine is UNKNOWN (fix round 7, E1). Fail closed: a scan that cannot
+    /// finish is not an empty scan, and the rows a quarantine would hold are not
+    /// in the database file.
+    Unreadable {
+        /// The directory that could not be read.
+        dir: PathBuf,
+        /// Why it could not be read.
+        error: String,
+    },
+}
+
+impl std::error::Error for InterruptedInstall {}
+
+impl std::fmt::Display for InterruptedInstall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let listed: Vec<String> = self
-            .stranded
-            .iter()
-            .map(|(quarantine, original)| {
-                format!("{} -> {}", quarantine.display(), original.display())
-            })
-            .collect();
-        write!(
-            f,
-            "refusing to touch {}: an earlier install was interrupted after it moved the target's \
-             sidecars aside, so {} still holds them — move each one back before running this \
-             command ({})",
-            self.target.display(),
-            if self.stranded.len() == 1 {
-                "a quarantine file"
-            } else {
-                "quarantine files"
-            },
-            listed.join("; ")
-        )
+        match self {
+            Self::Quarantined { target, stranded } => {
+                write!(
+                    f,
+                    "refusing to touch {}: an earlier install was interrupted after it moved the \
+                     target's sidecars aside",
+                    target.display()
+                )?;
+                let groups = [
+                    (
+                        QuarantineOwner::Current,
+                        "move each of these back before running this command — they belong to the \
+                         database that is there now, and hold its own un-checkpointed rows",
+                    ),
+                    (
+                        QuarantineOwner::Replaced,
+                        "do NOT move these back: the database they belong to was REPLACED, so \
+                         replaying them would push the old database's pages into the new file — \
+                         they are stale and must be deleted",
+                    ),
+                    (
+                        QuarantineOwner::Unknown,
+                        "do NOT move these back either: their names carry no record of which \
+                         database they belong to — restore the target from the safety backup if \
+                         you need those rows",
+                    ),
+                ];
+                for (owner, advice) in groups {
+                    let listed: Vec<String> = stranded
+                        .iter()
+                        .filter(|item| item.owner == owner)
+                        .map(|item| {
+                            format!(
+                                "{} -> {}",
+                                item.quarantine.display(),
+                                item.original.display()
+                            )
+                        })
+                        .collect();
+                    if listed.is_empty() {
+                        continue;
+                    }
+                    write!(f, ". {advice} ({})", listed.join("; "))?;
+                }
+                Ok(())
+            }
+            Self::Unreadable { dir, error } => write!(
+                f,
+                "cannot check {} for an interrupted install's quarantine files: {error} — \
+                 refusing to touch the database while whether it is missing rows is unknown",
+                dir.display()
+            ),
+        }
     }
 }
 
 /// Fail closed on an interrupted earlier install (fix round 4, Q1; fix round 6,
-/// D1).
-///
-/// Its quarantine files hold the target's own un-checkpointed rows, so nothing
-/// may read (or back up, replace or migrate) the target until an operator has put
-/// them back — the refusal names every file and the name it belongs under.
+/// D1; fix round 7, E1).
 ///
 /// ONE implementation, three callers: the import's verified copy, `pulse backup`
 /// and the production open ([`open_migrated`], so the app and `pulse serve`
@@ -310,51 +388,187 @@ impl std::fmt::Display for OrphanedQuarantines {
 ///
 /// # Errors
 ///
-/// Returns [`OrphanedQuarantines`] when any quarantine of the target's own
-/// sidecars is still beside it.
-pub(crate) fn refuse_orphaned_quarantines(target: &Path) -> Result<(), OrphanedQuarantines> {
-    let stranded = orphaned_quarantines(target);
+/// [`InterruptedInstall::Quarantined`] when any quarantine of the target's own
+/// sidecars is still beside it, and [`InterruptedInstall::Unreadable`] when the
+/// directory could not be enumerated at all.
+pub(crate) fn refuse_orphaned_quarantines(target: &Path) -> Result<(), InterruptedInstall> {
+    let stranded = orphaned_quarantines(target)?;
     if stranded.is_empty() {
         return Ok(());
     }
-    Err(OrphanedQuarantines {
+    Err(InterruptedInstall::Quarantined {
         target: target.to_path_buf(),
         stranded,
     })
 }
 
 /// The quarantine files an interrupted install left beside `target`, each with
-/// the name it has to go back to. ANY pid counts: the run that made them is gone.
+/// the name it has to go back to and whose bytes it holds. ANY pid counts: the run
+/// that made them is gone.
 ///
 /// A bare relative target is scanned in the current directory, where its
 /// quarantine files would be (fix round 5, P4).
-pub(crate) fn orphaned_quarantines(target: &Path) -> Vec<(PathBuf, PathBuf)> {
+///
+/// # Errors
+///
+/// [`InterruptedInstall::Unreadable`] when the directory cannot be read or an
+/// entry cannot be taken from it. Only a directory that is genuinely ABSENT is
+/// "no quarantines" (fix round 7, E1): a scan that could not finish must never
+/// read as an empty one.
+pub(crate) fn orphaned_quarantines(target: &Path) -> Result<Vec<Stranded>, InterruptedInstall> {
     let dir = target_dir(target);
     let Some(name) = target.file_name() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
+    #[cfg(test)]
+    if probe::take_injected_read_dir_failure(&dir) {
+        return Err(InterruptedInstall::Unreadable {
+            dir,
+            error: "injected enumeration failure (cfg(test) seam)".to_owned(),
+        });
+    }
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(InterruptedInstall::Unreadable {
+                dir,
+                error: error.to_string(),
+            });
+        }
     };
-    let mut stranded: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
+    let current = inode_of(target);
+    let mut stranded: Vec<Stranded> = Vec::new();
+    for entry in entries {
+        // A per-entry failure is an error too (fix round 7, E1): `flatten()` used to
+        // hide it, and a hidden entry reads as "nothing here".
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Err(InterruptedInstall::Unreadable {
+                    dir,
+                    error: error.to_string(),
+                });
+            }
+        };
         let entry_name = entry.file_name();
         for suffix in DB_STATE_SUFFIXES {
             let mut prefix = std::ffi::OsString::from(".");
             prefix.push(name);
             prefix.push(suffix);
-            prefix.push(".quarantine-");
-            if entry_name
-                .as_os_str()
-                .as_encoded_bytes()
-                .starts_with(prefix.as_encoded_bytes())
-            {
-                stranded.push((entry.path(), sidecar_path(target, suffix)));
+            prefix.push(QUARANTINE_MARKER);
+            let bytes = entry_name.as_os_str().as_encoded_bytes();
+            if let Some(tail) = bytes.strip_prefix(prefix.as_encoded_bytes()) {
+                stranded.push(Stranded {
+                    quarantine: entry.path(),
+                    original: sidecar_path(target, suffix),
+                    owner: ownership(tail, current),
+                });
             }
         }
     }
-    stranded.sort();
-    stranded
+    stranded.sort_by(|left, right| left.quarantine.cmp(&right.quarantine));
+    Ok(stranded)
+}
+
+/// Whose bytes a quarantine holds, from the tail of its name (fix round 7, E3).
+///
+/// The tail is `<pid>` — an older run, ownership unknown — or `<pid>-<inode>`.
+/// The inode is the identity a RENAME PRESERVES, so a quarantine taken from a
+/// database that is still at the target path matches the file there now, and one
+/// taken from a database the install replaced does not.
+fn ownership(tail: &[u8], current: Option<u64>) -> QuarantineOwner {
+    let Some(dash) = tail.iter().rposition(|byte| *byte == b'-') else {
+        return QuarantineOwner::Unknown;
+    };
+    let Some(recorded) = parse_inode(&tail[dash + 1..]) else {
+        return QuarantineOwner::Unknown;
+    };
+    match current {
+        Some(inode) if inode == recorded => QuarantineOwner::Current,
+        // A different inode — or no file at the target path at all — means the
+        // database those bytes belong to is not there any more.
+        _ => QuarantineOwner::Replaced,
+    }
+}
+
+/// The inode a quarantine name records, if it records one: ASCII digits and
+/// nothing else (an older run's name carries none).
+fn parse_inode(digits: &[u8]) -> Option<u64> {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// The inode of `target`, when there is one (fix round 7, E3).
+///
+/// A RENAME PRESERVES THE INODE, so this is the identity a quarantine can record
+/// to say which database its bytes belong to: the install's copy takes the
+/// target's NAME but keeps its own inode, so a quarantine taken before that rename
+/// no longer matches the file at the target path afterwards. (An inode number can
+/// be recycled — but only once the old file is gone, and the copy is created while
+/// it still exists, so a recycled number cannot be mistaken for it here.)
+pub(crate) fn inode_of(target: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    fs::metadata(target).ok().map(|meta| meta.ino())
+}
+
+/// The quarantine name of one of the target's sidecars (fix round 7, E3).
+///
+/// `.<target><suffix>.quarantine-<pid>`, or `…-<pid>-<inode>` when the target's
+/// identity is known — which is what lets a later run tell whether the bytes
+/// belong to the database at the target path now ([`ownership`] reads it back).
+/// Built through the raw `OsStr` (fix round 2, N6): a target whose name is not
+/// valid UTF-8 must still get a usable quarantine name.
+pub(crate) fn quarantine_name(
+    target_name: &std::ffi::OsStr,
+    suffix: &str,
+    inode: Option<u64>,
+) -> std::ffi::OsString {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(target_name);
+    name.push(suffix);
+    name.push(QUARANTINE_MARKER);
+    name.push(std::process::id().to_string());
+    if let Some(inode) = inode {
+        name.push(format!("-{inode}"));
+    }
+    name
+}
+
+/// `cfg(test)`-only: make the NEXT enumeration of a directory fail (fix round 7,
+/// E1). The scan must then refuse — a scan that cannot finish is not an empty one.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        /// The directory whose next enumeration fails, one-shot.
+        static FAIL_NEXT_READ_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Make the next `read_dir` of `dir` fail, one-shot.
+    pub(crate) fn fail_next_read_dir_of(dir: &Path) {
+        FAIL_NEXT_READ_DIR.with(|pending| *pending.borrow_mut() = Some(dir.to_path_buf()));
+    }
+
+    /// Consume the pending enumeration failure when it names `dir`.
+    ///
+    /// Keyed on `Some(dir)` — never on `None`, which would match every directory
+    /// (the `None == None` trap the publish probe fell into in round 6).
+    pub(crate) fn take_injected_read_dir_failure(dir: &Path) -> bool {
+        FAIL_NEXT_READ_DIR.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if pending.as_deref() == Some(dir) {
+                *pending = None;
+                return true;
+            }
+            false
+        })
+    }
 }
 
 /// Run the backup-before-migrate protocol on `db_path`, THEN open the working pool.
@@ -372,8 +586,15 @@ pub(crate) fn orphaned_quarantines(target: &Path) -> Vec<(PathBuf, PathBuf)> {
 /// own sidecar bytes beside it (fix round 6, D1) — checked BEFORE any connection
 /// is opened, because opening one would migrate a database that is missing rows.
 pub async fn open_migrated(db_path: &Path) -> Result<Db, DataError> {
-    refuse_orphaned_quarantines(db_path)
-        .map_err(|refusal| DataError::OrphanedQuarantines(refusal.to_string()))?;
+    refuse_orphaned_quarantines(db_path).map_err(|refusal| {
+        let message = refusal.to_string();
+        match refusal {
+            InterruptedInstall::Quarantined { .. } => DataError::OrphanedQuarantines(message),
+            // The precondition itself could not be checked (fix round 7, E1): the
+            // open refuses as a migration-protocol failure, not as a quarantine.
+            InterruptedInstall::Unreadable { .. } => DataError::Migration(message),
+        }
+    })?;
     run_migrations_with_backup(db_path).await?;
     Db::with_path(db_path).await
 }
@@ -1789,5 +2010,124 @@ mod install_copy_tests {
             orphan.exists(),
             "and its bytes are still the operator's to move"
         );
+    }
+
+    /// Fix round 7, E1: a scan that cannot finish REFUSES — it is not an empty
+    /// scan. A database may be missing exactly the rows a quarantine holds, so
+    /// "could not check" must never read as "nothing there"; the one case that is
+    /// still "none" is a directory that does not exist at all.
+    #[tokio::test]
+    async fn an_unreadable_directory_refuses_instead_of_reporting_no_quarantines() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+
+        // The scan itself fails closed...
+        super::probe::fail_next_read_dir_of(tmp.path());
+        let scan = super::orphaned_quarantines(&db_path).expect_err("the scan fails closed");
+        let super::InterruptedInstall::Unreadable { dir, error } = &scan else {
+            panic!("an enumeration failure is not a quarantine refusal: {scan:?}");
+        };
+        assert_eq!(
+            dir,
+            tmp.path(),
+            "the refusal names the directory it could not read"
+        );
+        assert!(
+            error.contains("injected enumeration failure"),
+            "and why: {error}"
+        );
+
+        // ...and so does the production open, which refuses as a protocol failure.
+        super::probe::fail_next_read_dir_of(tmp.path());
+        let error = open_migrated(&db_path)
+            .await
+            .expect_err("an unreadable directory refuses the open");
+        let DataError::Migration(message) = &error else {
+            panic!("the open reports the precondition it could not check: {error:?}");
+        };
+        assert!(
+            message.contains("cannot check") && message.contains("unknown"),
+            "the message says the state is unknown, not that there is nothing: {message}"
+        );
+
+        // A directory that is genuinely ABSENT is the one case that is "none".
+        let absent = tmp.path().join("nowhere").join("pulse.db");
+        assert!(
+            super::orphaned_quarantines(&absent)
+                .expect("an absent directory is not an error")
+                .is_empty(),
+            "a database with no directory has no quarantines beside it"
+        );
+    }
+
+    /// Fix round 7, E3: the refusal knows WHICH database each quarantine belongs
+    /// to — the name records the inode a rename preserves — so it can say "move
+    /// it back", "delete it as stale" or "restore from the safety backup" instead
+    /// of one instruction for three different situations.
+    #[tokio::test]
+    async fn the_refusal_knows_which_database_each_quarantine_belongs_to() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+        let inode = super::inode_of(&db_path).expect("the database has an inode");
+
+        // Three quarantines beside it: this database's own (same inode), one the
+        // install REPLACED (the copy took the name, its inode is its own), and an
+        // older run's name, which records no identity at all.
+        let current = super::quarantine_name("pulse.db".as_ref(), "-wal", Some(inode));
+        let replaced = super::quarantine_name("pulse.db".as_ref(), "-journal", Some(inode + 1));
+        let unknown = std::ffi::OsString::from(".pulse.db-shm.quarantine-999999");
+        for name in [&current, &replaced, &unknown] {
+            std::fs::write(tmp.path().join(name), b"bytes").unwrap();
+        }
+
+        let stranded = super::orphaned_quarantines(&db_path).expect("the scan reads the directory");
+        let owner_of = |name: &std::ffi::OsString| {
+            stranded
+                .iter()
+                .find(|item| item.quarantine.file_name() == Some(name.as_os_str()))
+                .map(|item| item.owner)
+        };
+        assert_eq!(
+            owner_of(&current),
+            Some(super::QuarantineOwner::Current),
+            "the database that is there now owns its own quarantine"
+        );
+        assert_eq!(
+            owner_of(&replaced),
+            Some(super::QuarantineOwner::Replaced),
+            "a different inode means the database it belonged to was replaced"
+        );
+        assert_eq!(
+            owner_of(&unknown),
+            Some(super::QuarantineOwner::Unknown),
+            "a name without an inode records no identity"
+        );
+
+        // And the operator is told what to do with each of the three.
+        let message = super::refuse_orphaned_quarantines(&db_path)
+            .expect_err("the quarantines refuse the run")
+            .to_string();
+        assert!(
+            message.contains("move each of these back before running this command"),
+            "the current one says move it back: {message}"
+        );
+        assert!(
+            message.contains("they are stale and must be deleted"),
+            "the replaced one says delete it, never move it back: {message}"
+        );
+        assert!(
+            message.contains("restore the target from the safety backup"),
+            "the unknown one says restore from the backup: {message}"
+        );
+        for name in [&current, &replaced, &unknown] {
+            assert!(
+                message.contains(&name.to_string_lossy().to_string()),
+                "and every file is named: {message}"
+            );
+        }
     }
 }

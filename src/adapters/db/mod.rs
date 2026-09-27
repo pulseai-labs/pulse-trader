@@ -115,12 +115,14 @@ pub(crate) use migrate::put_in_wal;
 // Fix round 6, D1: the interrupted-install refusal lives with the protocol that
 // needs it at startup — `pulse backup` and the import reach it through here, so
 // one scan and one message cover the app's own open, the backup and the install.
-pub(crate) use migrate::{DB_STATE_SUFFIXES, refuse_orphaned_quarantines, target_dir};
-// Only the tests name these two: production reaches the scan through
-// `refuse_orphaned_quarantines`, and an unused re-export is a `dead_code` build
-// error under `#![deny(warnings)]`.
+pub(crate) use migrate::{
+    DB_STATE_SUFFIXES, inode_of, quarantine_name, refuse_orphaned_quarantines, target_dir,
+};
+// Only the tests name these: production reaches the scan through
+// `refuse_orphaned_quarantines` and the refusal through `Display`, and an unused
+// re-export is a `dead_code` build error under `#![deny(warnings)]`.
 #[cfg(test)]
-pub(crate) use migrate::{OrphanedQuarantines, orphaned_quarantines};
+pub(crate) use migrate::{InterruptedInstall, QuarantineOwner, orphaned_quarantines};
 
 use std::path::Path;
 use std::time::Duration;

@@ -92,8 +92,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   leaves those files beside the target under quarantine names; the import,
   `pulse backup` (including the `--replace` safety backup) and the app's own open
   (`pulse serve`, the desktop app — checked before any connection is made) now
-  REFUSE such a target — naming every file and the name its rows have to go back
-  to — rather than read past rows that are not in the database file. Refs
+  REFUSE such a target — naming every file and what to do with it: the database's
+  own sidecars move back, while the stale ones a REPLACED database left are to be
+  deleted (never moved back, which would replay the old database's pages into the
+  new file) and the ones whose ownership the name does not record are to be
+  recovered from the safety backup. Refs
   [#258](https://github.com/pulseai-labs/pulse-trader/issues/258),
   [#259](https://github.com/pulseai-labs/pulse-trader/issues/259).
 
