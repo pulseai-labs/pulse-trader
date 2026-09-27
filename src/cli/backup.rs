@@ -550,6 +550,19 @@ fn discard_keeping(
     finish_removals(&removed, &unremoved)
 }
 
+/// What a removal reported by [`finish_removals`] IS, for the one ordered log the
+/// tests read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A file this run ADDED — a snapshot, a staged or published artifact.
+    Artifact,
+    /// The `HEAD` pointer this run CREATED, put back by removing it (fix round 6,
+    /// C3). Removing it IS its restoration, and `restore_heads` records that as
+    /// `HeadRestored`, so nothing is recorded here: one log, in which M1's "the
+    /// pointers go back BEFORE the first deletion" stays readable.
+    Pointer,
+}
+
 /// Make every removal durable and report the cleanup as a whole: the ONE report
 /// shape the backup's rollback and the import's undo share (fix round 4, Q2; fix
 /// round 5, P1), so neither can claim a cleanup that did not happen.
@@ -563,12 +576,38 @@ fn discard_keeping(
 /// the removals whose directory fsync failed. An entry that was already absent is
 /// fine: there is nothing to remove and nothing to sync.
 pub(crate) fn finish_removals(removed: &[PathBuf], unremoved: &[String]) -> anyhow::Result<()> {
+    finish_removals_as(Removal::Artifact, removed, unremoved)
+}
+
+/// [`finish_removals`] for the `HEAD` pointer a run created (fix round 6, C3).
+///
+/// # Errors
+///
+/// As [`finish_removals`].
+pub(crate) fn finish_head_removal(removed: &[PathBuf], unremoved: &[String]) -> anyhow::Result<()> {
+    finish_removals_as(Removal::Pointer, removed, unremoved)
+}
+
+/// The one body of both: collect what could not be removed or made durable, and
+/// record the removal the way the ordered log wants it.
+fn finish_removals_as(
+    what: Removal,
+    removed: &[PathBuf],
+    unremoved: &[String],
+) -> anyhow::Result<()> {
     let mut unsynced: Vec<String> = Vec::new();
     for path in removed {
         #[cfg(test)]
-        publish::probe::record_rollback(publish::probe::RollbackStep::Unlinked {
-            path: path.clone(),
-        });
+        match what {
+            Removal::Artifact => {
+                publish::probe::record_rollback(publish::probe::RollbackStep::Unlinked {
+                    path: path.clone(),
+                });
+            }
+            Removal::Pointer => {}
+        }
+        #[cfg(not(test))]
+        let _ = what;
         if let Err(error) = publish::sync_published(path, None) {
             unsynced.push(format!("fsync {}: {error}", path.display()));
         }

@@ -190,25 +190,30 @@ pub(crate) mod probe {
     use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
 
-    /// Which kind of sync an event records.
+    /// Which kind of publish step an event records.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum SyncKind {
         /// The published file's own bytes, before its rename.
         File,
         /// A directory the publish landed in (or created), after the rename.
         Dir,
+        /// A rename that published a path (fix round 6, C1). Not a sync, but it
+        /// shares this ONE ordered stream so a test can assert an order BETWEEN
+        /// the two — "the quarantine's directory sync ran before the install's
+        /// rename" is not expressible from two separate streams.
+        Rename,
     }
 
-    /// One recorded sync.
+    /// One recorded publish step.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct SyncEvent {
-        /// File sync or directory sync.
+        /// File sync, directory sync, or rename.
         pub(crate) kind: SyncKind,
-        /// The file or directory the fsync ran on.
+        /// The file or directory the fsync ran on (the source of a rename).
         pub(crate) path: PathBuf,
-        /// The published destination this sync belongs to.
+        /// The published destination this step belongs to (a rename's target).
         pub(crate) destination: PathBuf,
-        /// `destination.exists()` at the moment of the sync.
+        /// `destination.exists()` at the moment of the step.
         pub(crate) destination_present: bool,
     }
 
@@ -237,6 +242,16 @@ pub(crate) mod probe {
     /// Take every event recorded on this thread so far (leaving it empty).
     pub(crate) fn take() -> Vec<SyncEvent> {
         SYNCS.with(|syncs| std::mem::take(&mut *syncs.borrow_mut()))
+    }
+
+    /// Record one rename that published `to` from `from` (fix round 6, C1).
+    ///
+    /// A rename is not a sync, but it goes into the SAME ordered stream: the one
+    /// thing C1 has to prove is an order — that the directory sync which makes the
+    /// quarantine moves durable ran BEFORE the install's rename — and an order
+    /// between two steps cannot be read off two separate streams.
+    pub(crate) fn record_rename(from: &Path, to: &Path) {
+        record(SyncKind::Rename, from, to);
     }
 
     thread_local! {
@@ -285,10 +300,21 @@ pub(crate) mod probe {
     }
 
     /// Consume the pending publish failure when it names `published`'s extension.
+    ///
+    /// A path with NO extension (`HEAD`, the store's pointer file) can only be
+    /// matched by an injection that named... nothing, and there is no such call:
+    /// with nothing pending, `None == None` matched EVERY extension-less publish
+    /// (fix round 6, C3 — the import's undo is the first publisher of one).
     pub(crate) fn take_injected_publish_failure(published: &Path) -> bool {
         FAIL_NEXT_PUBLISH_EXTENSION.with(|pending| {
             let mut pending = pending.borrow_mut();
-            let matches = pending.as_deref() == published.extension().and_then(|e| e.to_str());
+            let matches = match (
+                pending.as_deref(),
+                published.extension().and_then(|e| e.to_str()),
+            ) {
+                (Some(wanted), Some(extension)) => wanted == extension,
+                _ => false,
+            };
             if matches {
                 *pending = None;
             }

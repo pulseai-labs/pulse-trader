@@ -15,6 +15,7 @@
 //! imported — per the audit-C5 re-derive convention).
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use std::time::Duration;
@@ -236,6 +237,126 @@ async fn migration_protocol(
     }
 }
 
+/// The suffixes `SQLite` puts a database's own un-checkpointed state in: the files
+/// an install moves aside beside the TARGET, so the old database's hot journal
+/// cannot be replayed into a freshly installed file (fix round 1, F3).
+pub(crate) const DB_STATE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// The directory a database target lives in (fix round 5, P4).
+///
+/// A bare relative file name (`--db pulse.db`) has an EMPTY parent — `parent()`
+/// answers `Some("")`, not `None` — and `create_dir_all("")`/`File::open("")`
+/// both fail, so the empty parent resolves to the current directory.
+pub(crate) fn target_dir(target: &Path) -> PathBuf {
+    match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Quarantine files an interrupted install left behind (fix round 4, Q1).
+///
+/// The install moves the target's own sidecars aside BEFORE it renames the copy
+/// over them; a crash between those two steps leaves them under their quarantine
+/// names, where the old sidecar no longer exists and the next run would never
+/// look. Recovering automatically is the wrong call — those bytes may be the
+/// target's only copy of its un-checkpointed rows — so everything that reads,
+/// backs up, replaces or migrates the database REFUSES until an operator moves
+/// them back.
+#[derive(Debug, thiserror::Error)]
+pub(crate) struct OrphanedQuarantines {
+    /// The database whose sidecars are stranded.
+    target: PathBuf,
+    /// `(quarantine file, the name it has to go back to)`, sorted.
+    stranded: Vec<(PathBuf, PathBuf)>,
+}
+
+impl std::fmt::Display for OrphanedQuarantines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let listed: Vec<String> = self
+            .stranded
+            .iter()
+            .map(|(quarantine, original)| {
+                format!("{} -> {}", quarantine.display(), original.display())
+            })
+            .collect();
+        write!(
+            f,
+            "refusing to touch {}: an earlier install was interrupted after it moved the target's \
+             sidecars aside, so {} still holds them — move each one back before running this \
+             command ({})",
+            self.target.display(),
+            if self.stranded.len() == 1 {
+                "a quarantine file"
+            } else {
+                "quarantine files"
+            },
+            listed.join("; ")
+        )
+    }
+}
+
+/// Fail closed on an interrupted earlier install (fix round 4, Q1; fix round 6,
+/// D1).
+///
+/// Its quarantine files hold the target's own un-checkpointed rows, so nothing
+/// may read (or back up, replace or migrate) the target until an operator has put
+/// them back — the refusal names every file and the name it belongs under.
+///
+/// ONE implementation, three callers: the import's verified copy, `pulse backup`
+/// and the production open ([`open_migrated`], so the app and `pulse serve`
+/// surface a crash inside the quarantine window at startup instead of reading a
+/// database that is missing those rows).
+///
+/// # Errors
+///
+/// Returns [`OrphanedQuarantines`] when any quarantine of the target's own
+/// sidecars is still beside it.
+pub(crate) fn refuse_orphaned_quarantines(target: &Path) -> Result<(), OrphanedQuarantines> {
+    let stranded = orphaned_quarantines(target);
+    if stranded.is_empty() {
+        return Ok(());
+    }
+    Err(OrphanedQuarantines {
+        target: target.to_path_buf(),
+        stranded,
+    })
+}
+
+/// The quarantine files an interrupted install left beside `target`, each with
+/// the name it has to go back to. ANY pid counts: the run that made them is gone.
+///
+/// A bare relative target is scanned in the current directory, where its
+/// quarantine files would be (fix round 5, P4).
+pub(crate) fn orphaned_quarantines(target: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let dir = target_dir(target);
+    let Some(name) = target.file_name() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut stranded: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        for suffix in DB_STATE_SUFFIXES {
+            let mut prefix = std::ffi::OsString::from(".");
+            prefix.push(name);
+            prefix.push(suffix);
+            prefix.push(".quarantine-");
+            if entry_name
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(prefix.as_encoded_bytes())
+            {
+                stranded.push((entry.path(), sidecar_path(target, suffix)));
+            }
+        }
+    }
+    stranded.sort();
+    stranded
+}
+
 /// Run the backup-before-migrate protocol on `db_path`, THEN open the working pool.
 ///
 /// The single startup entry point (migrate-then-open) — keeps 1.01's
@@ -246,8 +367,13 @@ async fn migration_protocol(
 /// # Errors
 /// [`DataError::Migration`] if the migration step fails (the db is already
 /// restored — the caller MUST NOT start); [`DataError::Db`] if the pool cannot be
-/// opened after a successful migrate.
+/// opened after a successful migrate;
+/// [`DataError::OrphanedQuarantines`] if an interrupted install left the target's
+/// own sidecar bytes beside it (fix round 6, D1) — checked BEFORE any connection
+/// is opened, because opening one would migrate a database that is missing rows.
 pub async fn open_migrated(db_path: &Path) -> Result<Db, DataError> {
+    refuse_orphaned_quarantines(db_path)
+        .map_err(|refusal| DataError::OrphanedQuarantines(refusal.to_string()))?;
     run_migrations_with_backup(db_path).await?;
     Db::with_path(db_path).await
 }
@@ -1491,6 +1617,7 @@ mod reserved_number_tests {
 mod install_copy_tests {
     use super::{open_migrated, open_migrated_copy};
     use crate::adapters::db::Db;
+    use crate::domain::DataError;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -1590,6 +1717,77 @@ mod install_copy_tests {
         assert!(
             file_declares_wal(&target),
             "the installed database's own header says WAL"
+        );
+    }
+
+    /// Fix round 6, D1: the app's own open refuses a target with an interrupted
+    /// install's quarantine files beside it, BEFORE any connection is opened — so a
+    /// crash inside the quarantine window surfaces at app/`serve` startup exactly as
+    /// it does at import/backup, instead of migrating a database that is missing the
+    /// rows those files hold.
+    #[tokio::test]
+    async fn opening_a_database_with_an_orphaned_quarantine_refuses_before_it_connects() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        // Part 1: a file that is NOT a database at all. If the open reached the
+        // protocol first, the error would be a `Db` one — so the TYPED refusal is
+        // itself the proof that the check runs before anything is opened.
+        std::fs::write(&db_path, b"not a database").unwrap();
+        let orphan = tmp.path().join(".pulse.db-wal.quarantine-999999");
+        std::fs::write(&orphan, b"the target's un-checkpointed rows").unwrap();
+
+        let error = open_migrated(&db_path)
+            .await
+            .expect_err("an orphaned quarantine refuses the open");
+        let DataError::OrphanedQuarantines(message) = &error else {
+            panic!("the refusal is typed, not a generic db error: {error:?}");
+        };
+        assert!(
+            message.contains(".pulse.db-wal.quarantine-999999"),
+            "the refusal names the quarantine: {message}"
+        );
+        assert!(
+            message.contains("pulse.db-wal"),
+            "and the name those rows have to go back to: {message}"
+        );
+        assert!(
+            orphan.exists(),
+            "nothing was moved, deleted or recovered automatically"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            b"not a database",
+            "and the target was not touched"
+        );
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            left.len(),
+            2,
+            "no connection was made (a connect would leave a `-shm`/`-wal` behind): {left:?}"
+        );
+
+        // Part 2: the realistic case — a migrated database with an interrupted
+        // install's leftovers beside it. The orphan moves out of the way first, so
+        // this half starts from a database that opens normally.
+        std::fs::remove_file(&orphan).unwrap();
+        std::fs::remove_file(&db_path).unwrap();
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+        std::fs::write(&orphan, b"the target's un-checkpointed rows").unwrap();
+        let error = open_migrated(&db_path)
+            .await
+            .expect_err("the quarantine is still there, so this open refuses too");
+        assert!(
+            matches!(error, DataError::OrphanedQuarantines(_)),
+            "a migrated target is refused the same way: {error:?}"
+        );
+        assert!(
+            orphan.exists(),
+            "and its bytes are still the operator's to move"
         );
     }
 }
