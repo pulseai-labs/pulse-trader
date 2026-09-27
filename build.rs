@@ -123,8 +123,12 @@ fn main() {
 
     // rerun-if-changed hygiene: recompute only when the lock graph, the schema
     // const or the engine source set changes (the fingerprint stays correct
-    // without over-rebuilding). The resolved rustc / target are picked up on
-    // every build invocation anyway.
+    // without over-rebuilding). The resolved rustc / target are NOT picked up
+    // implicitly: `rerun-if-*` directives REPLACE cargo's default rebuild
+    // triggers, so without an explicit watch a toolchain switch (rustup
+    // update, a new pinned toolchain, a different target) would reuse the
+    // previous build's fingerprint (r3.s1.w4). `RUSTC` is the resolver's
+    // input (b); `TARGET` is input (e).
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src/domain/dsl/schema_version_const.rs");
     // a2 (r2.s3.w1), corrected in review: EVERY directory the enumeration walks
@@ -142,6 +146,10 @@ fn main() {
         println!("cargo:rerun-if-changed={}", rel.display());
     }
     println!("cargo:rerun-if-env-changed=PULSE_ALLOW_PLACEHOLDER_DIST");
+    // r3.s1.w4: the two fingerprint inputs cargo would otherwise stop tracking
+    // once any `rerun-if-*` directive is present (see the comment above).
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-env-changed=TARGET");
 
     // r1.s1.w1 (ADR-0020): the desktop half. Order matters -- the dist directory must
     // exist before `tauri_build::build()` reads the config that points at it.

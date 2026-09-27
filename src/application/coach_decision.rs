@@ -811,6 +811,11 @@ where
                     message: format!("the symbol filters the engine needs are unavailable: {e}"),
                     subject: Some(inputs.pair.as_str().to_owned()),
                 })?;
+        // r3.s1.w4 (#142): the child's recorded filters are the ones the engine
+        // was GIVEN on this replay — the freshly resolved value — not the
+        // parent's possibly-unrecorded ones. Same recomputed-over-inherited
+        // rule as the lead-in above.
+        inputs.symbol_filters = Some(filters.clone());
 
         prepare_backtest(
             &validated,

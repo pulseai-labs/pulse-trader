@@ -93,7 +93,7 @@ pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 // `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{
     BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig,
-    OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
 };
 // r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025).
 // Re-exported so `lib.rs` can curate the crate surface — an un-re-exported

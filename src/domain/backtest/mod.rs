@@ -46,7 +46,7 @@ pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, class
 pub use result::BacktestResult;
 pub use run::{
     BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig,
-    OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
 };
 pub use stats::{EquityCurve, EquityPoint, SummaryStats};
 pub use trade::{ExitReason, Fill, Trade, TradeSource};

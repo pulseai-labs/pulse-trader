@@ -1359,6 +1359,7 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
                 taker_fee_bps: Decimal::new(4, 0),
                 slippage_bps: Decimal::new(1, 0),
                 funding: pulse::FundingConfig::SnapshotRates,
+                symbol_filters: None,
                 window: None,
                 lead_in_from_ms: None,
             },

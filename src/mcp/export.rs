@@ -17,6 +17,20 @@ use crate::application::mcp_read::IndicatorColumn;
 use crate::domain::{Candle, DataError, Trade};
 use rust_decimal::Decimal;
 
+/// The export-path seam for tool results (r3.s1.w4, #199): a non-UTF-8 path
+/// refuses as a tool-level error message instead of reaching `serde_json` —
+/// the `json!` macro's `unwrap` would panic the tool handler and take the
+/// session down. The message names the problem, lossy-rendered path included.
+pub(crate) fn path_json(path: &Path) -> Result<serde_json::Value, String> {
+    let Some(text) = path.to_str() else {
+        return Err(format!(
+            "the export path is not valid UTF-8 ({}): refusing to emit it in the tool result",
+            path.display()
+        ));
+    };
+    Ok(serde_json::Value::String(text.to_owned()))
+}
+
 /// The per-process exports directory: `<data_dir>/exports/<pid>-<start>/`.
 ///
 /// `seq` makes each export's filename unique and deterministic within the

@@ -512,10 +512,12 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // r1.s3.w2 (#110): the durable INPUT provenance value types ride the same
 // re-export (an un-re-exported public domain type is a `dead_code` BUILD error
 // under `deny(warnings)`), so `tests/backtest_provenance.rs` and W3's DTO can
-// name them.
+// name them. r3.s1.w4 (#198): `LatestReadableRun` is the latest-readable
+// lookup's answer, beside the port method it belongs to.
 pub use domain::{
     BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, CandleWindowError,
-    FundingConfig, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    FundingConfig, LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd,
+    SnapshotSelection,
 };
 
 // r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025) —

@@ -193,6 +193,15 @@ impl<R: BacktestRunRepository + Send + Sync> BacktestRunRepository for ReadBackF
         self.inner.latest_run_for_version(strategy_version_id).await
     }
 
+    async fn latest_readable_run_for_version(
+        &self,
+        strategy_version_id: &VersionId,
+    ) -> Result<pulse::LatestReadableRun, DataError> {
+        self.inner
+            .latest_readable_run_for_version(strategy_version_id)
+            .await
+    }
+
     async fn list_runs_for_version(
         &self,
         strategy_version_id: &VersionId,
@@ -1471,14 +1480,18 @@ async fn an_absent_session_and_a_failed_turn_are_typed_refusals() {
 // Raw-SQL surgery on the immutable parent run
 // ---------------------------------------------------------------------------
 
-/// Blank the parent run's `0006` provenance columns — the pre-`0006` legacy shape.
+/// Blank the parent run's `0006` provenance columns and the `0015` symbol-filter
+/// group — the pre-`0006` legacy shape. (The save path has written filters since
+/// r3.s1.w4, so leaving them would build "filters without provenance" — a corrupt
+/// row `decode_inputs` refuses — not a legacy one.)
 async fn make_parent_legacy(pool: &SqlitePool, run_id: &BacktestRunId) {
     coach_support::with_run_immutability_lifted(
         pool,
         &[&format!(
             "UPDATE backtest_run SET pair = NULL, primary_timeframe = NULL, \
              primary_data_version = NULL, htf_timeframe = NULL, htf_data_version = NULL, \
-             taker_fee_bps = NULL, slippage_bps = NULL, funding_config = NULL \
+             taker_fee_bps = NULL, slippage_bps = NULL, funding_config = NULL, \
+             lot_step = NULL, min_qty = NULL, min_notional = NULL, max_leverage = NULL \
              WHERE id = '{}'",
             run_id.as_str()
         )],
