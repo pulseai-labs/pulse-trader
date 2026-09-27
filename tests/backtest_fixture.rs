@@ -86,9 +86,10 @@ const GOLDEN_TRADE_COUNT: usize = 6;
 const GOLDEN_NET_PNL: &str = "142.29083294950040454";
 
 /// The RSI lookback period the canonical fixture uses. The streaming indicator
-/// engine warms RSI(period) at candle index `period + 1` (the first index where
-/// `is_warm()` becomes true; matches the CLI `rsi:14_first_row=15` readout), so
-/// the first entry CANNOT fill before then (G6 real-data readiness gate).
+/// engine has a current RSI value from candle index `period` and — since #36 —
+/// is fully `is_warm()` one bar later, at `period + 1` (the first index where
+/// the warm gate opens; matches the CLI `rsi:14_first_row=15` readout), so the
+/// first entry CANNOT fill before `period + 2` (G6 real-data readiness gate).
 const RSI_PERIOD: usize = 14;
 
 /// The BTCUSDT `LOT_SIZE.stepSize` the golden quantizes to (the pinned
@@ -252,8 +253,9 @@ fn golden_run_is_non_vacuous_at_least_three_trades_and_funding_applied() {
 
 /// G6 real-data readiness: the first trade's entry index must be at or beyond the
 /// RSI warmup (no pre-warmup / bar-0 entry on real data). RSI(period) is not
-/// `is_warm()` until candle index `period + 1`, and the loop additionally
-/// requires `bar.index > 0`, so the earliest possible fill is `period + 1`.
+/// `is_warm()` until candle index `period + 1` (a previous value is required
+/// since #36), and the loop additionally requires `bar.index > 0`, so the
+/// earliest possible signal is `period + 1` and the earliest fill `period + 2`.
 #[test]
 fn first_entry_respects_rsi_warmup() {
     let primary = load_primary();

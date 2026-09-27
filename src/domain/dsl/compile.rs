@@ -203,6 +203,13 @@ impl CompiledCondition {
             }
             CompiledCondition::And(conditions) => conditions.iter().all(|c| c.eval(ctx)),
             CompiledCondition::Or(conditions) => conditions.iter().any(|c| c.eval(ctx)),
+            // `Not` over an unavailable operand composes the `false` into
+            // `true` (#16, closed as covered by spine ruling a1 — no tri-state
+            // `eval`). That is safe ONLY behind the engine's entry gate
+            // (`bar.index > 0 && is_warm()`, `adapters/backtest/engine.rs`),
+            // which — since #36 — also guarantees a previous value for every
+            // slot, so a `Not`/`Or` over a previous-reading leaf cannot fire on
+            // the first warm bar. Proofs: tests/condition_semantics.rs (iv)/(v).
             CompiledCondition::Not(condition) => !condition.eval(ctx),
         }
     }

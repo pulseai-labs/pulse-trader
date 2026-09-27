@@ -95,12 +95,20 @@ impl IndicatorEngine {
         self.indicators.len()
     }
 
-    /// Whether every owned indicator has a current value available.
+    /// Whether every owned indicator is fully warm: it has a **current** value,
+    /// a **previous** value, and its readiness window is satisfied.
+    ///
+    /// A driver must not evaluate or fire strategy entry while
+    /// [`IndicatorEngine::is_warm`] is false. Since #36 the guarantee includes
+    /// a previous value: on the bar right after an indicator's first value,
+    /// `previous` is still `None`, and a `CrossesAbove`/`CrossesBelow` leaf
+    /// evaluates `false` there — which a `Not`/`Or` composition would otherwise
+    /// turn into an entry on the first warm bar (#16, spine ruling a1).
     #[must_use]
     pub fn is_warm(&self) -> bool {
-        self.indicators
-            .iter()
-            .all(|slot| slot.current.is_some() && slot.indicator.is_ready())
+        self.indicators.iter().all(|slot| {
+            slot.current.is_some() && slot.previous.is_some() && slot.indicator.is_ready()
+        })
     }
 
     /// Advance every owned indicator by one contiguous candle.
@@ -446,6 +454,10 @@ mod tests {
         }
         engine.step(&candle(3, "97"));
         assert!(engine.current(&value).is_some());
+        // #36: warm ALSO requires a previous value — on the bar right after
+        // the first value exists, `previous` is still `None`.
+        assert!(!engine.is_warm());
+        engine.step(&candle(4, "96"));
         assert!(engine.is_warm());
     }
 
@@ -473,6 +485,14 @@ mod tests {
         }
 
         engine.step(&candle(3, "97"));
+        // #36: the gate holds one bar longer now — `previous` is `None` on the
+        // bar right after the first value, so the entry still cannot fire.
+        assert!(!engine.is_warm());
+        assert!(
+            !engine.is_warm() && strategy.entry().eval(&engine),
+            "the readiness gate suppresses the first-warm-bar entry"
+        );
+        engine.step(&candle(4, "96"));
         assert!(engine.is_warm());
         assert!(strategy.entry().eval(&engine));
     }
