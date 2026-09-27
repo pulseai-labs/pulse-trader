@@ -1834,15 +1834,28 @@ impl QuarantinedSidecars {
                 Ok(false) => continue,
                 // Fail closed (fix round 9, K2): a sidecar that cannot be stat'ed
                 // might be holding rows, and this install would strip the target of
-                // it — refuse instead of guessing that it is not there.
+                // it — refuse instead of guessing that it is not there. And put
+                // back what an EARLIER iteration already moved (fix round 10, L1):
+                // this arm used to return here and leave those under their
+                // quarantine names, which is the state N2 exists to prevent.
                 Err(error) => {
-                    return Err(anyhow!(
-                        "cannot tell whether the target's {suffix} sidecar {} is there: {error:#}",
-                        original.display()
+                    return Err(Self { moved }.fail_after_move(
+                        target,
+                        anyhow!(
+                            "cannot tell whether the target's {suffix} sidecar {} is there: \
+                             {error:#}",
+                            original.display()
+                        ),
                     ));
                 }
             }
-            let quarantine = quarantine_path(target, suffix, identity)?;
+            let quarantine = match quarantine_path(target, suffix, identity) {
+                Ok(quarantine) => quarantine,
+                // The one other error between the move and the push, folded through
+                // the same restore (fix round 10, L1): "any error after a move" is
+                // the invariant, not "the two arms we happened to think of".
+                Err(error) => return Err(Self { moved }.fail_after_move(target, error)),
+            };
             // Never reuse a quarantine a crashed run left: those bytes are not
             // this run's.
             let _ = fs::remove_file(&quarantine);
@@ -1851,19 +1864,12 @@ impl QuarantinedSidecars {
                 // round 2, N2): the install has not renamed the database, so the
                 // target must be left exactly as it was — and whatever cannot be
                 // put back is named for the operator (N5).
-                let already = Self { moved };
                 let failure = anyhow!(
                     "quarantine the target's {suffix} sidecar {} -> {}: {error}",
                     original.display(),
                     quarantine.display()
                 );
-                return Err(match already.restore(target) {
-                    Ok(()) => failure,
-                    Err(restore_error) => anyhow!(
-                        "{failure}; and sidecars this attempt had already moved could not be put \
-                         back either: {restore_error}"
-                    ),
-                });
+                return Err(Self { moved }.fail_after_move(target, failure));
             }
             moved.push((quarantine, original));
         }
@@ -1875,6 +1881,29 @@ impl QuarantinedSidecars {
                 .collect::<Vec<PathBuf>>(),
         );
         Ok(Self { moved })
+    }
+
+    /// Fail a `take` that may already have moved sidecars: put back what it moved
+    /// — through [`Self::restore`], so the move-backs are fsynced (G1) — and fold a
+    /// restore failure into `failure`, naming what could not be put back (N5).
+    ///
+    /// Every error between the first move and the last `moved.push` goes through
+    /// here (fix round 10, L1). The invariant is the point: the caller reports an
+    /// [`InstallFailure::Untouched`] — "the target is exactly as it was" — so a
+    /// sidecar left under its quarantine name would make that report a lie, and
+    /// the operator would have no reason to look for it.
+    ///
+    /// An empty `moved` needs no restore: [`Self::restore`] returns `Ok` without
+    /// touching the filesystem or the directory sync, so a failure before the
+    /// first move is reported exactly as it is.
+    fn fail_after_move(self, target: &Path, failure: anyhow::Error) -> anyhow::Error {
+        match self.restore(target) {
+            Ok(()) => failure,
+            Err(restore_error) => anyhow!(
+                "{failure}; and sidecars this attempt had already moved could not be put back \
+                 either: {restore_error}"
+            ),
+        }
     }
 
     /// Put every quarantined sidecar back: a failed install leaves the old
@@ -3730,6 +3759,76 @@ mod tests {
         assert!(
             target.exists() && !sidecar_path(&target, "-wal").exists(),
             "and nothing was moved aside"
+        );
+    }
+
+    /// Fix round 10, L1: that same probe returned on its error WITHOUT putting back
+    /// the sidecars `take` had already moved — the target was left stripped of its
+    /// `-wal`, sitting under a quarantine name, while the caller reported the
+    /// install as untouched. ANY error after a move now runs N2's restore first
+    /// (fsynced per G1), so `Untouched` is reported only when the target really is
+    /// as it was.
+    #[tokio::test]
+    async fn a_take_that_fails_after_a_move_puts_what_it_moved_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        fs::write(&target, b"the old target").expect("write the old target");
+        fs::write(&tmp_db, b"the copy").expect("write the copy");
+        // The FIRST suffix is moved aside; the SECOND's probe is made to fail.
+        let moved_suffix = super::DB_STATE_SUFFIXES[0];
+        let moved = sidecar_path(&target, moved_suffix);
+        fs::write(&moved, b"the old target's un-checkpointed rows").expect("write the -wal");
+        let unreadable = sidecar_path(&target, super::DB_STATE_SUFFIXES[1]);
+        publish::probe::fail_next_stat_of(&unreadable);
+        let _ = publish::probe::take();
+
+        let failure = install_tmp_db(&tmp_db, &target, None)
+            .await
+            .expect_err("an unreadable sidecar refuses the install");
+        let InstallFailure::Untouched(error) = failure else {
+            panic!("nothing was renamed, so the target is untouched: {failure:?}");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&unreadable.display().to_string()),
+            "the failure names the sidecar it could not check: {message}"
+        );
+        assert!(
+            !message.contains("could not be put back"),
+            "and the sidecar it HAD moved went back cleanly, so there is no restore failure to \
+             report: {message}"
+        );
+        assert_eq!(
+            fs::read(&moved).expect("the moved sidecar is back under its own name"),
+            b"the old target's un-checkpointed rows",
+            "with its own bytes"
+        );
+        let quarantine = super::quarantine_path(&target, moved_suffix, super::inode_of(&target))
+            .expect("the quarantine name is built from the target's own name");
+        assert!(
+            !quarantine.exists(),
+            "and nothing is left under the quarantine name {}",
+            quarantine.display()
+        );
+        // The move-back is durable before the failure is reported (G1).
+        let events = publish::probe::take();
+        let last_move_back = events
+            .iter()
+            .rposition(|step| {
+                step.kind == publish::probe::SyncKind::Rename && step.destination != target
+            })
+            .unwrap_or_else(|| panic!("the move-backs are recorded: {events:?}"));
+        let sync = events
+            .iter()
+            .position(|step| {
+                step.kind == publish::probe::SyncKind::Dir && step.destination == target
+            })
+            .unwrap_or_else(|| panic!("their directory is fsynced: {events:?}"));
+        assert!(
+            last_move_back < sync,
+            "the move-backs are durable only after they happened: {events:?}"
         );
     }
 
