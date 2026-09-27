@@ -377,6 +377,11 @@ pub(crate) mod probe {
 
         /// A one-shot unlink failure, keyed on the file.
         static FAIL_NEXT_REMOVE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+
+        /// A one-shot unlink failure that ignores the path (fix round 9, K3): the
+        /// staged partial's name is stamped INSIDE `stage_database`, so a test
+        /// cannot key on it before the call.
+        static FAIL_ANY_REMOVE: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Record one rollback step.
@@ -406,6 +411,11 @@ pub(crate) mod probe {
         })
     }
 
+    /// Make the NEXT unlink fail, whatever its path, one-shot.
+    pub(crate) fn fail_next_remove() {
+        FAIL_ANY_REMOVE.with(|pending| pending.set(true));
+    }
+
     /// Make the next unlink of `path` fail, one-shot.
     pub(crate) fn fail_next_remove_of(path: &Path) {
         FAIL_NEXT_REMOVE.with(|pending| *pending.borrow_mut() = Some(path.to_path_buf()));
@@ -413,6 +423,9 @@ pub(crate) mod probe {
 
     /// Consume the pending unlink failure when it targets `path`.
     pub(crate) fn take_injected_remove_failure(path: &Path) -> bool {
+        if FAIL_ANY_REMOVE.with(|pending| pending.replace(false)) {
+            return true;
+        }
         FAIL_NEXT_REMOVE.with(|pending| {
             let mut pending = pending.borrow_mut();
             let matches = pending.as_deref() == Some(path);
@@ -420,6 +433,30 @@ pub(crate) mod probe {
                 *pending = None;
             }
             matches
+        })
+    }
+
+    thread_local! {
+        /// The path whose next existence probe fails, one-shot (fix round 9, K2).
+        static FAIL_NEXT_STAT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Make the next presence probe of `path` fail, one-shot — the stat error
+    /// `Path::exists()` would swallow into `false`.
+    pub(crate) fn fail_next_stat_of(path: &Path) {
+        FAIL_NEXT_STAT.with(|pending| *pending.borrow_mut() = Some(path.to_path_buf()));
+    }
+
+    /// Consume the pending stat failure when it names `path` (keyed on `Some(path)`,
+    /// so an unset seam never matches).
+    pub(crate) fn take_injected_stat_failure(path: &Path) -> bool {
+        FAIL_NEXT_STAT.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if pending.as_deref() == Some(path) {
+                *pending = None;
+                return true;
+            }
+            false
         })
     }
 

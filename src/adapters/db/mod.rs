@@ -116,7 +116,8 @@ pub(crate) use migrate::put_in_wal;
 // needs it at startup — `pulse backup` and the import reach it through here, so
 // one scan and one message cover the app's own open, the backup and the install.
 pub(crate) use migrate::{
-    DB_STATE_SUFFIXES, inode_of, quarantine_name, refuse_orphaned_quarantines, target_dir,
+    DB_STATE_SUFFIXES, TargetIdentity, inode_of, quarantine_name, refuse_orphaned_quarantines,
+    target_dir,
 };
 // Only the tests name these: production reaches the scan through
 // `refuse_orphaned_quarantines` and the refusal through `Display`, and an unused

@@ -462,7 +462,7 @@ pub(crate) fn orphaned_quarantines(target: &Path) -> Result<Vec<Stranded>, Inter
                 stranded.push(Stranded {
                     quarantine: entry.path(),
                     original: sidecar_path(target, suffix),
-                    owner: ownership(tail, current),
+                    owner: ownership(tail, &current),
                 });
             }
         }
@@ -477,7 +477,7 @@ pub(crate) fn orphaned_quarantines(target: &Path) -> Result<Vec<Stranded>, Inter
 /// The inode is the identity a RENAME PRESERVES, so a quarantine taken from a
 /// database that is still at the target path matches the file there now, and one
 /// taken from a database the install replaced does not.
-fn ownership(tail: &[u8], current: Option<u64>) -> QuarantineOwner {
+fn ownership(tail: &[u8], current: &TargetIdentity) -> QuarantineOwner {
     let Some(dash) = tail.iter().rposition(|byte| *byte == b'-') else {
         return QuarantineOwner::Unknown;
     };
@@ -485,10 +485,13 @@ fn ownership(tail: &[u8], current: Option<u64>) -> QuarantineOwner {
         return QuarantineOwner::Unknown;
     };
     match current {
-        Some(inode) if inode == recorded => QuarantineOwner::Current,
+        TargetIdentity::Inode(inode) if *inode == recorded => QuarantineOwner::Current,
         // A different inode — or no file at the target path at all — means the
         // database those bytes belong to is not there any more.
-        _ => QuarantineOwner::Replaced,
+        TargetIdentity::Inode(_) | TargetIdentity::Absent => QuarantineOwner::Replaced,
+        // The target could not be identified (fix round 9, K1): unknown ownership,
+        // never "stale, delete it".
+        TargetIdentity::Unknown => QuarantineOwner::Unknown,
     }
 }
 
@@ -501,6 +504,40 @@ fn parse_inode(digits: &[u8]) -> Option<u64> {
     std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
+/// The identity of the database at a target path (fix round 7, E3; round 9, K1).
+///
+/// The three outcomes are NOT interchangeable, which is why this is not an
+/// `Option`:
+///
+/// - [`Self::Inode`] — the file is there and its inode is known, so a quarantine's
+///   recorded inode can be compared with it;
+/// - [`Self::Absent`] — there is NO file at that path (`NotFound`): the database a
+///   quarantine belonged to is gone, so it is stale;
+/// - [`Self::Unknown`] — the metadata could not be read for any other reason (or
+///   this platform has no inode to read): whose bytes those are is NOT known, so
+///   the quarantine is neither moved back nor deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetIdentity {
+    /// The target file exists: this is its inode.
+    Inode(u64),
+    /// No file at the target path.
+    Absent,
+    /// The target's identity could not be established.
+    Unknown,
+}
+
+impl TargetIdentity {
+    /// The inode this identity carries, when it carries one — what a quarantine
+    /// NAME records (fix round 7, E3). [`Self::Absent`] and [`Self::Unknown`]
+    /// record nothing, which the scan reads back as [`QuarantineOwner::Unknown`].
+    pub(crate) fn inode(self) -> Option<u64> {
+        match self {
+            Self::Inode(inode) => Some(inode),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+}
+
 /// The inode of `target`, when there is one (fix round 7, E3).
 ///
 /// A RENAME PRESERVES THE INODE, so this is the identity a quarantine can record
@@ -509,11 +546,23 @@ fn parse_inode(digits: &[u8]) -> Option<u64> {
 /// no longer matches the file at the target path afterwards. (An inode number can
 /// be recycled — but only once the old file is gone, and the copy is created while
 /// it still exists, so a recycled number cannot be mistaken for it here.)
+///
+/// Fix round 9, K1: a metadata error that is NOT `NotFound` is
+/// [`TargetIdentity::Unknown`], never "no target" — an unreadable target must not
+/// turn a quarantine into "stale, delete it".
 #[cfg(unix)]
-pub(crate) fn inode_of(target: &Path) -> Option<u64> {
+pub(crate) fn inode_of(target: &Path) -> TargetIdentity {
     use std::os::unix::fs::MetadataExt;
 
-    fs::metadata(target).ok().map(|meta| meta.ino())
+    #[cfg(test)]
+    if probe::take_injected_metadata_failure(target) {
+        return TargetIdentity::Unknown;
+    }
+    match fs::metadata(target) {
+        Ok(meta) => TargetIdentity::Inode(meta.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TargetIdentity::Absent,
+        Err(_) => TargetIdentity::Unknown,
+    }
 }
 
 /// No inode on platforms without `MetadataExt` — the same gate
@@ -523,8 +572,8 @@ pub(crate) fn inode_of(target: &Path) -> Option<u64> {
 /// [`QuarantineOwner::Unknown`] and the refusal says to restore from the safety
 /// backup rather than move it back: unknown ownership is never moved back.
 #[cfg(not(unix))]
-pub(crate) fn inode_of(_target: &Path) -> Option<u64> {
-    None
+pub(crate) fn inode_of(_target: &Path) -> TargetIdentity {
+    TargetIdentity::Unknown
 }
 
 /// The quarantine name of one of the target's sidecars (fix round 7, E3).
@@ -565,6 +614,30 @@ pub(crate) mod probe {
     /// Make the next `read_dir` of `dir` fail, one-shot.
     pub(crate) fn fail_next_read_dir_of(dir: &Path) {
         FAIL_NEXT_READ_DIR.with(|pending| *pending.borrow_mut() = Some(dir.to_path_buf()));
+    }
+
+    thread_local! {
+        /// The target whose next metadata probe fails, one-shot (fix round 9, K1).
+        static FAIL_NEXT_METADATA: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Make the next metadata probe of `path` fail, one-shot. The target's
+    /// identity is then UNKNOWN — never "no target".
+    pub(crate) fn fail_next_metadata_of(path: &Path) {
+        FAIL_NEXT_METADATA.with(|pending| *pending.borrow_mut() = Some(path.to_path_buf()));
+    }
+
+    /// Consume the pending metadata failure when it names `path` (keyed on
+    /// `Some(path)`, so an unset seam never matches).
+    pub(crate) fn take_injected_metadata_failure(path: &Path) -> bool {
+        FAIL_NEXT_METADATA.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if pending.as_deref() == Some(path) {
+                *pending = None;
+                return true;
+            }
+            false
+        })
     }
 
     /// Consume the pending enumeration failure when it names `dir`.
@@ -2084,7 +2157,9 @@ mod install_copy_tests {
         let db_path = tmp.path().join("pulse.db");
         let db = open_migrated(&db_path).await.unwrap();
         db.pool().close().await;
-        let inode = super::inode_of(&db_path).expect("the database has an inode");
+        let super::TargetIdentity::Inode(inode) = super::inode_of(&db_path) else {
+            panic!("the database has an inode");
+        };
 
         // Three quarantines beside it: this database's own (same inode), one the
         // install REPLACED (the copy took the name, its inode is its own), and an
@@ -2141,5 +2216,50 @@ mod install_copy_tests {
                 "and every file is named: {message}"
             );
         }
+    }
+
+    /// Fix round 9, K1: a target whose metadata cannot be read is UNKNOWN
+    /// ownership — never "no target". An unreadable database must not turn its
+    /// quarantine into "stale, delete it", and must not invite a move-back either.
+    #[tokio::test]
+    async fn an_unreadable_target_classifies_its_quarantine_as_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+        let super::TargetIdentity::Inode(inode) = super::inode_of(&db_path) else {
+            panic!("the database has an inode");
+        };
+        // A quarantine naming a DIFFERENT inode: with a readable target it is
+        // `Replaced` — stale, delete it.
+        let stale = super::quarantine_name("pulse.db".as_ref(), "-wal", Some(inode + 1));
+        std::fs::write(tmp.path().join(&stale), b"bytes").unwrap();
+        assert_eq!(
+            super::orphaned_quarantines(&db_path).expect("the scan reads")[0].owner,
+            super::QuarantineOwner::Replaced,
+            "with the target readable, a different inode means replaced"
+        );
+
+        // ...but when the target's metadata cannot be read, ownership is UNKNOWN.
+        super::probe::fail_next_metadata_of(&db_path);
+        let stranded = super::orphaned_quarantines(&db_path).expect("the scan reads");
+        assert_eq!(
+            stranded[0].owner,
+            super::QuarantineOwner::Unknown,
+            "an unreadable target is unknown ownership, never stale: {stranded:?}"
+        );
+        // The seam is one-shot, so the refusal's own scan gets its own injection.
+        super::probe::fail_next_metadata_of(&db_path);
+        let message = super::refuse_orphaned_quarantines(&db_path)
+            .expect_err("the quarantine refuses")
+            .to_string();
+        assert!(
+            message.contains("restore the target from the safety backup"),
+            "and the advice is the backup: {message}"
+        );
+        assert!(
+            !message.contains("they are stale and must be deleted"),
+            "never 'delete it as stale' for an unreadable target: {message}"
+        );
     }
 }

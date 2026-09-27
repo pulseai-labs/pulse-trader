@@ -35,7 +35,7 @@ use clap::Args;
 
 use super::import::{
     HeadChange, HeadSource, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal,
-    copy_snapshot_into, default_backup_out_dir, manifest_path, named_by_pointer,
+    copy_snapshot_into, default_backup_out_dir, fold_cleanup, manifest_path, named_by_pointer,
     refuse_orphaned_quarantines, resolve_target_data_dir, resolve_target_db, restore_heads,
     run_verified_copy, scan_heads, scan_snapshots, stranded_pointers, write_head_manifest,
 };
@@ -521,6 +521,30 @@ pub(crate) fn unlink(path: &Path, removed: &mut Vec<PathBuf>, unremoved: &mut Ve
     }
 }
 
+/// Remove one staged file, treating "already gone" as fine and REPORTING anything
+/// else (fix round 9, K3).
+///
+/// The staged partial is the only copy of a failed backup's bytes, so a removal
+/// that failed must not be discarded silently — the operator has to know the file
+/// is still there. Consumes the same injection seam `unlink` does, so a test can
+/// drive the failure.
+fn remove_reported(path: &Path) -> anyhow::Result<()> {
+    #[cfg(test)]
+    let injected = publish::probe::take_injected_remove_failure(path);
+    #[cfg(not(test))]
+    let injected = false;
+    let outcome = if injected {
+        Err(std::io::Error::other("injected failure (cfg(test) seam)"))
+    } else {
+        fs::remove_file(path)
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!("remove {}: {error}", path.display())),
+    }
+}
+
 /// [`discard`] with `keep` holding back the snapshots a pointer that could not be
 /// restored still names (fix round 3, M1), and every removal made durable by
 /// fsyncing the directory that held the entry (fix round 3, M2 — a rollback a
@@ -742,10 +766,12 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
     let copied = ops::vacuum_into_copy(&source, &partial).await;
     source.close().await;
     if let Err(e) = copied {
-        let _ = fs::remove_file(&partial); // a partial file is deleted
-        return Err(anyhow!(
-            "the backup copy of {} failed: {e}",
-            db_path.display()
+        // A failed copy must not leave its partial behind — and a removal that
+        // fails is REPORTED (fix round 9, K3).
+        let cleanup = remove_reported(&partial);
+        return Err(fold_cleanup(
+            anyhow!("the backup copy of {} failed: {e}", db_path.display()),
+            cleanup,
         ));
     }
     // `VACUUM INTO` does not guarantee its output is on disk, and the publish
@@ -754,11 +780,15 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
     if let Err(error) = publish::sync_file(&partial, &final_path) {
         // The staged copy's bytes are not confirmed on disk, and this error
         // returns before a `StagedBackup` exists — so `discard` cannot remove it
-        // and this is the only place that can (fix round 2, N3).
-        let _ = fs::remove_file(&partial);
-        return Err(anyhow!(
-            "flush the staged backup copy {}: {error}",
-            partial.display()
+        // and this is the only place that can (fix round 2, N3). A removal that
+        // fails is reported (fix round 9, K3).
+        let cleanup = remove_reported(&partial);
+        return Err(fold_cleanup(
+            anyhow!(
+                "flush the staged backup copy {}: {error}",
+                partial.display()
+            ),
+            cleanup,
         ));
     }
     Ok(StagedBackup {
@@ -1276,6 +1306,55 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// Fix round 9, K3: when the staged copy's flush fails AND its partial cannot
+    /// be removed either, the REMOVAL failure is reported — that file is the only
+    /// copy of the failed backup's bytes, and it is still on disk.
+    #[tokio::test]
+    async fn a_staged_partial_that_cannot_be_removed_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source").join("pulse.db");
+        fs::create_dir_all(db_path.parent().expect("the source's directory"))
+            .expect("create the source's directory");
+        let db = crate::adapters::db::open_migrated(&db_path)
+            .await
+            .expect("migrate the source");
+        db.pool().close().await;
+        let out_dir = dir.path().join("out");
+        publish::probe::fail_next_file_sync();
+        // The staged partial's name is stamped INSIDE `stage_database`, so this
+        // injection is not keyed on a path.
+        publish::probe::fail_next_remove();
+
+        let Err(error) = super::stage_database(&db_path, &out_dir).await else {
+            panic!("the injected file sync failure must end staging");
+        };
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("flush the staged backup copy"),
+            "the flush failure is there: {message}"
+        );
+        assert!(
+            message.contains("[cleanup]"),
+            "and the removal failure rides with it: {message}"
+        );
+        let left: Vec<String> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert_eq!(
+            left.len(),
+            1,
+            "the partial is still there — which is what the error has to say: {left:?}"
+        );
+        assert!(
+            message.contains(&left[0]),
+            "and the error names it: {message}"
+        );
     }
 
     /// Fix round 2, N3: when the staged copy's own flush fails, the partial is

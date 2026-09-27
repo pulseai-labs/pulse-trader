@@ -42,7 +42,8 @@ use super::publish::probe;
 use crate::adapters::db::default_db_path;
 use crate::adapters::db::ops;
 pub(crate) use crate::adapters::db::{
-    DB_STATE_SUFFIXES, inode_of, quarantine_name, refuse_orphaned_quarantines, target_dir,
+    DB_STATE_SUFFIXES, TargetIdentity, inode_of, quarantine_name, refuse_orphaned_quarantines,
+    target_dir,
 };
 use crate::adapters::db::{
     Db, SqliteBacktestRunRepo, SqliteStrategyRepo, open_migrated_copy, put_in_wal,
@@ -359,15 +360,20 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
         .map_err(|e| anyhow!("{e}"))?;
     let copied = ops::vacuum_into_copy(&source, &tmp_db).await;
     source.close().await;
-    copied.map_err(|e| anyhow!("copy the source database: {e}"))?;
+    if let Err(error) = copied {
+        return Err(copy_failure(error, &tmp_db));
+    }
     // `VACUUM INTO` does not guarantee its output is on disk, and the install
     // renames this file: the bytes must land before the name that promises them
     // (fix round 1, F5).
     if let Err(error) = publish::sync_file(&tmp_db, job.db_target) {
         // The temporary's bytes are not confirmed on disk, so it must not survive
         // this run (fix round 2, N4): nothing has been installed yet.
-        remove_tmp_db(&tmp_db);
-        return Err(anyhow!("flush the copied database: {error}"));
+        let cleanup = remove_tmp_db(&tmp_db);
+        return Err(fold_cleanup(
+            anyhow!("flush the copied database: {error}"),
+            cleanup,
+        ));
     }
 
     // ---- Steps 3–5: migrate the copy forward, copy the snapshots, verify.
@@ -381,8 +387,11 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     let opened = match open_migrated_copy(&tmp_db).await {
         Ok(db) => db,
         Err(e) => {
-            remove_tmp_db(&tmp_db);
-            return Err(anyhow!("migrate the copy forward: {e}"));
+            let cleanup = remove_tmp_db(&tmp_db);
+            return Err(fold_cleanup(
+                anyhow!("migrate the copy forward: {e}"),
+                cleanup,
+            ));
         }
     };
     let steps = run_steps(&job, &opened, manifest_heads.as_deref()).await;
@@ -405,15 +414,15 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
         Err(StepFailure::Fatal { error, writes }) => {
             // Every fatal path cleans up BOTH: the temporary database and
             // everything this run wrote to the target store before it failed.
-            remove_tmp_db(&tmp_db);
+            let cleanup = remove_tmp_db(&tmp_db);
             let undone = undo(&writes);
-            Err(fold_undo(error, &undone))
+            Err(fold_cleanup(fold_undo(error, &undone), cleanup))
         }
         Err(StepFailure::Mismatches { mismatches, writes }) => {
-            remove_tmp_db(&tmp_db);
+            let cleanup = remove_tmp_db(&tmp_db);
             let undone = undo(&writes);
             print_refusal(label, &mismatches);
-            Err(refusal_error(label, &undone))
+            Err(fold_cleanup(refusal_error(label, &undone), cleanup))
         }
         Ok((summary, writes)) => {
             // ---- Step 7: the install. Once its rename has landed the database
@@ -425,9 +434,9 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
             match install_tmp_db(&tmp_db, job.db_target, created_root.as_deref()).await {
                 Ok(()) => {}
                 Err(InstallFailure::Untouched(error)) => {
-                    remove_tmp_db(&tmp_db);
+                    let cleanup = remove_tmp_db(&tmp_db);
                     let undone = undo(&writes);
-                    return Err(fold_undo(error, &undone));
+                    return Err(fold_cleanup(fold_undo(error, &undone), cleanup));
                 }
                 Err(failure) => return Err(failure.into_error()),
             }
@@ -1527,10 +1536,59 @@ fn temp_db_path(target: &Path, label: &str) -> PathBuf {
 /// Delete the temporary database and EVERY sidecar a copy can have (failure
 /// path) — the same suffix set the refusal checks, from the one constant, so a
 /// sidecar can never be refused and then left behind (fix round 1, F7).
-fn remove_tmp_db(tmp_db: &Path) {
-    let _ = fs::remove_file(tmp_db);
-    for suffix in COPY_SIDECAR_SUFFIXES {
-        let _ = fs::remove_file(sidecar_path(tmp_db, suffix));
+///
+/// # Errors
+///
+/// Fix round 9, K4: every path is attempted and a removal that failed for any
+/// reason but "already gone" is REPORTED — a temporary left under the copy's name
+/// is what makes a same-pid retry hit an existing file.
+fn remove_tmp_db(tmp_db: &Path) -> anyhow::Result<()> {
+    let mut failures: Vec<String> = Vec::new();
+    for path in std::iter::once(tmp_db.to_path_buf())
+        .chain(COPY_SIDECAR_SUFFIXES.map(|suffix| sidecar_path(tmp_db, suffix)))
+    {
+        #[cfg(test)]
+        let injected = probe::take_injected_remove_failure(&path);
+        #[cfg(not(test))]
+        let injected = false;
+        let outcome = if injected {
+            Err(std::io::Error::other("injected failure (cfg(test) seam)"))
+        } else {
+            fs::remove_file(&path)
+        };
+        match outcome {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "the temporary database could not be fully removed — {}",
+        failures.join("; ")
+    ))
+}
+
+/// The failure of the copy step (fix round 9, K4): whatever `VACUUM INTO` wrote
+/// before it failed is removed — under the temporary's own name, so a same-pid
+/// retry would otherwise meet an existing file — and a cleanup that fails is
+/// reported with it, never discarded.
+fn copy_failure(error: impl std::fmt::Display, tmp_db: &Path) -> anyhow::Error {
+    fold_cleanup(
+        anyhow!("copy the source database: {error}"),
+        remove_tmp_db(tmp_db),
+    )
+}
+
+/// Fold a failed cleanup into the failure that caused it (fix round 9, K4), the
+/// way [`fold_undo`] folds a failed undo: the report carries both, so "the
+/// temporary is gone" is never claimed over a removal that failed.
+pub(crate) fn fold_cleanup(error: anyhow::Error, cleanup: anyhow::Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => error.context(format!("[cleanup] {cleanup_error}")),
     }
 }
 
@@ -1639,27 +1697,82 @@ pub(crate) enum InstallRefusal {
         /// The sidecar itself.
         sidecar: PathBuf,
     },
+    /// A sidecar's presence could not be ESTABLISHED (fix round 9, K2). The stat
+    /// failed for a reason other than "not there", so whether the copy carries a
+    /// sidecar is unknown — and an unreadable sidecar is not an absent one.
+    #[error(
+        "refusing to install {db}: cannot tell whether its {suffix} sidecar {sidecar} is there          ({error}) — a sidecar that exists would be stranded by the rename",
+        db = .db.display(),
+        sidecar = .sidecar.display()
+    )]
+    Unreadable {
+        /// The temporary database that was not installed.
+        db: PathBuf,
+        /// The sidecar's suffix (`-wal`, `-shm`, `-journal`, `.partial`).
+        suffix: &'static str,
+        /// The sidecar whose presence could not be checked.
+        sidecar: PathBuf,
+        /// Why the probe failed.
+        error: String,
+    },
+}
+
+/// Is `path` there — with a stat FAILURE distinguished from "not there" (fix
+/// round 9, K2)?
+///
+/// `Path::exists()` answers `false` for every stat error, so a probe that decides
+/// whether bytes would be stranded must not use it: an unreadable sidecar is not
+/// an absent one. Only a definite "not there" is `Ok(false)`.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] naming the path when its metadata cannot be read.
+fn sidecar_present(path: &Path) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    if probe::take_injected_stat_failure(path) {
+        return Err(anyhow!(
+            "cannot stat {}: injected failure (cfg(test) seam)",
+            path.display()
+        ));
+    }
+    path.try_exists()
+        .map_err(|error| anyhow!("cannot stat {}: {error}", path.display()))
 }
 
 /// Refuse the install when any sidecar still sits beside the copy (#258).
 ///
 /// Fail closed: the check deletes nothing and renames nothing, so the target is
 /// left exactly as it was and the caller's failure path removes the temporary
-/// (with its sidecars) for a clean retry.
+/// (with its sidecars) for a clean retry. A sidecar whose presence cannot be
+/// established refuses too (fix round 9, K2): an unreadable one is not an absent
+/// one, and the rename would strand it.
 ///
 /// # Errors
 ///
-/// Returns [`InstallRefusal::Sidecar`] for the first sidecar found.
+/// Returns [`InstallRefusal::Sidecar`] for the first sidecar found, and
+/// [`InstallRefusal::Unreadable`] when one cannot be stat'ed.
 fn refuse_stranded_sidecar(tmp_db: &Path) -> anyhow::Result<()> {
     for suffix in COPY_SIDECAR_SUFFIXES {
         let sidecar = sidecar_path(tmp_db, suffix);
-        if sidecar.exists() {
-            return Err(InstallRefusal::Sidecar {
-                db: tmp_db.to_path_buf(),
-                suffix,
-                sidecar,
+        match sidecar_present(&sidecar) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(InstallRefusal::Sidecar {
+                    db: tmp_db.to_path_buf(),
+                    suffix,
+                    sidecar,
+                }
+                .into());
             }
-            .into());
+            Err(error) => {
+                return Err(InstallRefusal::Unreadable {
+                    db: tmp_db.to_path_buf(),
+                    suffix,
+                    sidecar,
+                    error: format!("{error:#}"),
+                }
+                .into());
+            }
         }
     }
     Ok(())
@@ -1673,11 +1786,15 @@ fn refuse_stranded_sidecar(tmp_db: &Path) -> anyhow::Result<()> {
 /// directory, which is where its sidecars are (fix round 5, P4). `inode` is the
 /// identity the name records so a later run can tell whose bytes these are
 /// (fix round 7, E3).
-fn quarantine_path(target: &Path, suffix: &str, inode: Option<u64>) -> anyhow::Result<PathBuf> {
+fn quarantine_path(
+    target: &Path,
+    suffix: &str,
+    identity: TargetIdentity,
+) -> anyhow::Result<PathBuf> {
     let name = target
         .file_name()
         .ok_or_else(|| anyhow!("unusable target path: {}", target.display()))?;
-    Ok(target_dir(target).join(quarantine_name(name, suffix, inode)))
+    Ok(target_dir(target).join(quarantine_name(name, suffix, identity.inode())))
 }
 
 /// The target's own sidecars, MOVED ASIDE for the duration of the install
@@ -1708,14 +1825,24 @@ impl QuarantinedSidecars {
         // database that ends up at the target path (fix round 7, E3): the rename
         // preserves the inode, so a quarantine taken now matches only the database
         // that is there NOW.
-        let inode = inode_of(target);
+        let identity = inode_of(target);
         for suffix in DB_STATE_SUFFIXES {
             // (the test seam records what was moved, below)
             let original = sidecar_path(target, suffix);
-            if !original.exists() {
-                continue;
+            match sidecar_present(&original) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                // Fail closed (fix round 9, K2): a sidecar that cannot be stat'ed
+                // might be holding rows, and this install would strip the target of
+                // it — refuse instead of guessing that it is not there.
+                Err(error) => {
+                    return Err(anyhow!(
+                        "cannot tell whether the target's {suffix} sidecar {} is there: {error:#}",
+                        original.display()
+                    ));
+                }
             }
-            let quarantine = quarantine_path(target, suffix, inode)?;
+            let quarantine = quarantine_path(target, suffix, identity)?;
             // Never reuse a quarantine a crashed run left: those bytes are not
             // this run's.
             let _ = fs::remove_file(&quarantine);
@@ -2314,6 +2441,9 @@ mod tests {
                     assert_eq!(*named_suffix, suffix);
                     assert_eq!(named_sidecar, &sidecar, "and the sidecar it found");
                 }
+                InstallRefusal::Unreadable { .. } => {
+                    panic!("a sidecar that IS there is the `Sidecar` refusal: {refusal:?}");
+                }
             }
             assert!(
                 error.to_string().contains("refusing to install"),
@@ -2350,7 +2480,7 @@ mod tests {
             "the refusal rejects the copy while a sidecar is beside it"
         );
 
-        remove_tmp_db(&tmp_db);
+        remove_tmp_db(&tmp_db).expect("the temporary is removable");
 
         assert!(!tmp_db.exists(), "the copy is gone");
         let left: Vec<PathBuf> = COPY_SIDECAR_SUFFIXES
@@ -3422,7 +3552,9 @@ mod tests {
         let target = dir.path().join("pulse.db");
         fs::write(&target, b"the old target").expect("write the old target");
         fs::write(sidecar_path(&target, "-wal"), b"its rows").expect("write the -wal");
-        let inode = super::inode_of(&target).expect("the target has an inode");
+        let super::TargetIdentity::Inode(inode) = super::inode_of(&target) else {
+            panic!("the target has an inode");
+        };
 
         let quarantined =
             super::QuarantinedSidecars::take(&target).expect("the sidecar moves aside");
@@ -3535,6 +3667,138 @@ mod tests {
             b"the old target",
             "the target still holds the OLD database"
         );
+    }
+
+    /// Fix round 9, K2: a sidecar whose presence cannot be ESTABLISHED refuses the
+    /// install. `Path::exists()` would call that "not there" and let the rename
+    /// strand whatever the sidecar holds.
+    #[tokio::test]
+    async fn a_sidecar_whose_presence_cannot_be_checked_refuses_the_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        let tmp_db = dir.path().join(".pulse.db.import-tmp-1.db");
+        let copy = open_migrated_copy(&tmp_db).await.expect("the copy");
+        copy.pool().close().await;
+        let sidecar = sidecar_path(&tmp_db, "-wal");
+        publish::probe::fail_next_stat_of(&sidecar);
+
+        let failure = install_tmp_db(&tmp_db, &target, Some(dir.path()))
+            .await
+            .expect_err("an unreadable sidecar refuses the install");
+        let InstallFailure::Untouched(error) = failure else {
+            panic!("nothing was renamed, so the target is untouched: {failure:?}");
+        };
+
+        let refusal = error
+            .downcast_ref::<super::InstallRefusal>()
+            .unwrap_or_else(|| panic!("the refusal is typed: {error:?}"));
+        let super::InstallRefusal::Unreadable { sidecar: named, .. } = refusal else {
+            panic!("an unreadable sidecar is its own refusal: {refusal:?}");
+        };
+        assert_eq!(
+            named, &sidecar,
+            "and it names the sidecar it could not check"
+        );
+        assert!(!target.exists(), "the target was not touched");
+        assert!(tmp_db.exists(), "and the copy is still there");
+    }
+
+    /// Fix round 9, K2: the same for the TARGET's own sidecars — a sidecar that
+    /// cannot be stat'ed might be holding rows, so the install must not strip the
+    /// target of it by guessing that it is not there.
+    #[tokio::test]
+    async fn a_target_sidecar_whose_presence_cannot_be_checked_refuses_the_take() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("pulse.db");
+        fs::write(&target, b"the old target").expect("write the old target");
+        let sidecar = sidecar_path(&target, "-shm");
+        publish::probe::fail_next_stat_of(&sidecar);
+
+        let Err(error) = super::QuarantinedSidecars::take(&target) else {
+            panic!("an unreadable sidecar refuses the take");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&sidecar.display().to_string()),
+            "the refusal names the sidecar: {message}"
+        );
+        assert!(
+            message.contains("cannot tell whether"),
+            "and says why: {message}"
+        );
+        assert!(
+            target.exists() && !sidecar_path(&target, "-wal").exists(),
+            "and nothing was moved aside"
+        );
+    }
+
+    /// Fix round 9, K4: a failed `VACUUM INTO` copy removes the partial temporary
+    /// (and every sidecar a copy can have) before returning, so a same-pid retry
+    /// does not meet an existing file — the same cleanup N4 gave the flush failure.
+    #[tokio::test]
+    async fn a_failed_copy_removes_the_partial_temporary() {
+        let flow = flow().await;
+        let tmp_db = super::temp_db_path(&flow.target_db, "import");
+        fs::create_dir_all(tmp_db.parent().expect("the temporary's directory"))
+            .expect("create the target's directory");
+        // `VACUUM INTO` refuses a target that already exists — exactly the leftover
+        // this cleanup is about.
+        fs::write(&tmp_db, b"a leftover from a failed run").expect("plant the leftover");
+        for suffix in super::COPY_SIDECAR_SUFFIXES {
+            fs::write(sidecar_path(&tmp_db, suffix), b"its state").expect("plant the sidecar");
+        }
+
+        let error = run_verified_copy(import_job(&flow))
+            .await
+            .expect_err("the copy cannot overwrite an existing file");
+
+        assert!(
+            error.to_string().contains("copy the source database"),
+            "the failure is the copy: {error}"
+        );
+        assert!(
+            !tmp_db.exists(),
+            "and the leftover is removed: {}",
+            tmp_db.display()
+        );
+        for suffix in super::COPY_SIDECAR_SUFFIXES {
+            assert!(
+                !sidecar_path(&tmp_db, suffix).exists(),
+                "including its {suffix}"
+            );
+        }
+    }
+
+    /// Fix round 9, K4: when that cleanup cannot remove the temporary, the failure
+    /// is REPORTED — the file is still there, and the operator has to know.
+    #[tokio::test]
+    async fn a_cleanup_that_cannot_remove_the_temporary_is_reported() {
+        let flow = flow().await;
+        let tmp_db = super::temp_db_path(&flow.target_db, "import");
+        fs::create_dir_all(tmp_db.parent().expect("the temporary's directory"))
+            .expect("create the target's directory");
+        fs::write(&tmp_db, b"a leftover from a failed run").expect("plant the leftover");
+        publish::probe::fail_next_remove_of(&tmp_db);
+
+        let error = run_verified_copy(import_job(&flow))
+            .await
+            .expect_err("the copy cannot overwrite an existing file");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("copy the source database"),
+            "the copy failure is there: {message}"
+        );
+        assert!(
+            message.contains("[cleanup]"),
+            "and the cleanup failure rides with it: {message}"
+        );
+        assert!(
+            message.contains(&tmp_db.display().to_string()),
+            "naming the file it could not remove: {message}"
+        );
+        assert!(tmp_db.exists(), "which is still there");
     }
 
     /// Fix round 3, M3: once the install's rename has landed, NO quarantine file
