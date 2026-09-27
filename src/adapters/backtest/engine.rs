@@ -192,6 +192,15 @@ pub fn run_backtest(
                 update_excursion(position, bar.primary);
             }
             close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
+            // G1 (r3.s1.w1): the bar just closed folds into the position's
+            // trailing state only while the position survived it — a bar that
+            // closed the position is the exit bar, and its own extreme must
+            // never join the level it was just checked against. The fold
+            // counts the held bar, extends the closed-bar extreme and
+            // recomputes the effective stop for the NEXT bar's checks.
+            if let Some(position) = state.position.as_mut() {
+                position.hold_closed_bar(bar.primary);
+            }
         }
 
         engine.step(bar.primary);
@@ -238,6 +247,25 @@ pub fn run_backtest(
             state.pending_exit = Some(PendingExit {
                 signal_time: bar.primary.close_time,
                 reason: ExitReason::Signal,
+            });
+        }
+
+        // G1 (r3.s1.w1): the time stop triggers at the close of the
+        // `max_bars`-th held bar and fills at the next bar's open, exactly as
+        // a signal exit does (the same open-gap relabelling applies at that
+        // fill). Evaluated AFTER the signal block so a same-close tie keeps
+        // the `Signal` label.
+        if counted
+            && state.pending_exit.is_none()
+            && let Some(max_bars) = exit_plan.max_bars
+            && state
+                .position
+                .as_ref()
+                .is_some_and(|position| position.bars_held == max_bars)
+        {
+            state.pending_exit = Some(PendingExit {
+                signal_time: bar.primary.close_time,
+                reason: ExitReason::TimeStop,
             });
         }
 
@@ -591,6 +619,15 @@ impl EvalContext for DualSeriesContext<'_> {
 #[derive(Debug, Clone)]
 struct ExitPlan<'a> {
     stop: StopRule,
+    /// The declared trailing distance, when a `TrailingStop` exit exists (G1,
+    /// r3.s1.w1).
+    trail_pct: Option<Decimal>,
+    /// True when no `StopLoss`/`AtrStop` family exists and the trailing stop
+    /// stands in for it (G1, r3.s1.w1): the initial stop and the sizing basis
+    /// derive from `trail_pct`, and every stop hit is labelled `TrailingStop`.
+    trail_only: bool,
+    /// The declared `TimeStop` bar count, when one exists (G1, r3.s1.w1).
+    max_bars: Option<u32>,
     take_profit_target_r: Option<Decimal>,
     signal_exits: Vec<&'a CompiledCondition>,
     risk_per_trade_pct: Decimal,
@@ -599,13 +636,26 @@ struct ExitPlan<'a> {
 
 impl<'a> ExitPlan<'a> {
     fn from_strategy(compiled: &'a CompiledStrategy) -> Result<Self, BacktestError> {
-        // Unsupported kinds gate FIRST: a `TrailingStop`/`TimeStop` is
-        // structurally valid but unmodelled here, so it must surface the typed
-        // `UnsupportedExit` — not `NoStopLoss`.
-        reject_unsupported(compiled.exits())?;
-        let Some(stop) = stop_rule(compiled.exits()) else {
-            return Err(BacktestError::NoStopLoss);
-        };
+        let trail_pct = compiled.exits().iter().find_map(|exit| match exit {
+            CompiledExit::TrailingStop { trail_pct } => Some(*trail_pct),
+            _ => None,
+        });
+        let max_bars = compiled.exits().iter().find_map(|exit| match exit {
+            CompiledExit::TimeStop { max_bars } => Some(*max_bars),
+            _ => None,
+        });
+        let family_stop = stop_rule(compiled.exits());
+        // G1 (r3.s1.w1): with a `StopLoss`/`AtrStop` declared, sizing and the
+        // initial stop come from it, as before. With ONLY a `TrailingStop`, it
+        // stands in for the stop loss — its initial level
+        // (`entry × (1 ∓ trail_pct)`) is known at fill, sizes the position
+        // exactly as a `Pct` stop does, and is covered by the same plan-time
+        // short-TP impossibility check below. A `TimeStop` alone (or with only
+        // signal exits) is still `NoStopLoss` — a time stop is no stop.
+        let stop = family_stop
+            .or_else(|| trail_pct.map(StopRule::Pct))
+            .ok_or(BacktestError::NoStopLoss)?;
+        let trail_only = family_stop.is_none();
         let take_profit_target_r = take_profit_target(compiled.exits());
         // The short-TP impossibility check is plan-time only for the
         // fixed-fraction stop (its distance is known before any bar). For an
@@ -620,6 +670,9 @@ impl<'a> ExitPlan<'a> {
         }
         Ok(Self {
             stop,
+            trail_pct,
+            trail_only,
+            max_bars,
             take_profit_target_r,
             signal_exits: signal_exits(compiled.exits()),
             risk_per_trade_pct: compiled.risk().risk_per_trade_pct,
@@ -733,7 +786,28 @@ struct OpenPosition {
     direction: Direction,
     qty: Decimal,
     entry_price: Decimal,
+    /// The INITIAL stop — the sizing basis (G1, r3.s1.w1), fixed at fill.
+    /// R, MFE R and MAE R stay denominated by its distance, and the trade
+    /// records it, for the whole life of the position.
+    initial_stop: Decimal,
+    /// The CURRENT EFFECTIVE stop every price check sees (`price_exit`,
+    /// `stop_only_exit`, `resolve_intra_bar_exit`, `open_gap_reason`). A
+    /// trailing stop tightens it bar by bar (`hold_closed_bar`); nothing
+    /// else ever moves it.
     stop_price: Decimal,
+    /// The declared trailing distance, when a `TrailingStop` exit exists.
+    trail_pct: Option<Decimal>,
+    /// True when the trailing stop stands in for the stop family (G1) —
+    /// every stop hit is then a `TrailingStop`, even at the initial level.
+    trail_only: bool,
+    /// The favourable extreme of CLOSED held bars, seeded with the entry
+    /// fill price (G1). The level for bar *t* derives from the extreme of
+    /// bars up to *t − 1*; bar *t*'s own extreme folds in only after its
+    /// close check. `None` when no trailing stop is declared.
+    trail_extreme: Option<Decimal>,
+    /// Held-bar count (G1): the entry bar counts as 1; incremented after
+    /// each bar's close check while the position stays open.
+    bars_held: u32,
     take_profit_price: Option<Decimal>,
     entry_signal_time: i64,
     entry_fill_time: i64,
@@ -748,6 +822,59 @@ struct OpenPosition {
     /// The market regime in effect at the entry-fill bar (FR-6), carried to the
     /// `Trade` at close so `RegimeBreakdown` can aggregate it.
     regime: Regime,
+}
+
+impl OpenPosition {
+    /// The label for a stop hit on this position (G1, r3.s1.w1):
+    /// `TrailingStop` when a trailing stop is declared and has stood in for
+    /// the stop family (trail-only) or tightened strictly past the initial
+    /// stop; `StopLoss` otherwise — including every position with no
+    /// trailing stop at all.
+    fn stop_hit_reason(&self) -> ExitReason {
+        if self.trail_pct.is_none() {
+            return ExitReason::StopLoss;
+        }
+        if self.trail_only {
+            return ExitReason::TrailingStop;
+        }
+        let tightened = match self.direction {
+            Direction::Long => self.stop_price > self.initial_stop,
+            Direction::Short => self.stop_price < self.initial_stop,
+        };
+        if tightened {
+            ExitReason::TrailingStop
+        } else {
+            ExitReason::StopLoss
+        }
+    }
+
+    /// Fold one CLOSED held bar into the position's trailing state (G1,
+    /// r3.s1.w1). Called in the `run_backtest` loop AFTER
+    /// `close_on_bar_open_or_price` and only while the position survived the
+    /// bar — so a bar's own extreme is never in its own check, and a bar
+    /// that closed the position folds nothing. The bar counts toward
+    /// `bars_held` (the entry bar is held bar 1), the favourable extreme
+    /// joins `trail_extreme`, and the effective stop recomputes for the
+    /// NEXT bar as the tighter of the initial stop and the closed-bar
+    /// trailing level.
+    fn hold_closed_bar(&mut self, candle: &Candle) {
+        self.bars_held += 1;
+        let Some(trail_pct) = self.trail_pct else {
+            return;
+        };
+        let extreme = match (self.direction, self.trail_extreme) {
+            (Direction::Long, Some(extreme)) => extreme.max(candle.high),
+            (Direction::Long, None) => candle.high,
+            (Direction::Short, Some(extreme)) => extreme.min(candle.low),
+            (Direction::Short, None) => candle.low,
+        };
+        self.trail_extreme = Some(extreme);
+        let level = stop_price(extreme, trail_pct, self.direction);
+        self.stop_price = match self.direction {
+            Direction::Long => self.initial_stop.max(level),
+            Direction::Short => self.initial_stop.min(level),
+        };
+    }
 }
 
 fn fill_pending_entry(
@@ -768,10 +895,13 @@ fn fill_pending_entry(
 
     let raw_entry = candle.open;
     let entry_price = apply_slippage(raw_entry, config.slippage_bps, direction, Side::Entry);
-    // The stop is derived once at the fill and FROZEN on the position — neither
-    // stop kind ever recomputes or trails afterwards (r2.s2.w2). For `AtrStop`
-    // the distance is `multiple × ATR` where the ATR was frozen into the
-    // pending entry at the signal bar.
+    // The stop is derived once at the fill and FROZEN on the position as the
+    // sizing basis (`initial_stop`); the effective `stop_price` starts there.
+    // A `Pct` distance comes from the `StopLoss` family, or from a trailing
+    // stop standing in for one (G1, r3.s1.w1). For `AtrStop` the distance is
+    // `multiple × ATR` where the ATR was frozen into the pending entry at the
+    // signal bar. Only a declared trailing stop moves `stop_price` afterwards,
+    // bar by bar (`hold_closed_bar`); `initial_stop` never moves.
     let stop = match plan.stop {
         StopRule::Pct(distance_pct) => stop_price(entry_price, distance_pct, direction),
         // `atr_at_signal` is guaranteed `Some` by the entry gate; a `None`
@@ -844,7 +974,12 @@ fn fill_pending_entry(
         direction,
         qty,
         entry_price,
+        initial_stop: stop,
         stop_price: stop,
+        trail_pct: plan.trail_pct,
+        trail_only: plan.trail_only,
+        trail_extreme: plan.trail_pct.map(|_| entry_price),
+        bars_held: 0,
         take_profit_price,
         entry_signal_time: pending.signal_time,
         entry_fill_time: candle.open_time,
@@ -872,7 +1007,9 @@ fn fill_pending_entry(
 /// path reconstruction), so `mfe_r >= realized_r >= mae_r` is NOT guaranteed.
 fn update_excursion(position: &mut OpenPosition, candle: &Candle) {
     let entry = position.entry_price;
-    let stop_distance = (entry - position.stop_price).abs();
+    // R stays denominated by the INITIAL stop distance (G1, r3.s1.w1) — a
+    // trailing stop tightens `stop_price` but never re-scales the excursion.
+    let stop_distance = (entry - position.initial_stop).abs();
     if stop_distance.is_zero() {
         // The sizer refuses a zero stop distance, so this is unreachable in a
         // real run; guard anyway to avoid a divide-by-zero on a degenerate path.
@@ -951,10 +1088,13 @@ fn close_on_bar_open_or_price(
 /// high/low are deliberately ignored, because the position is already closed at
 /// the open.
 fn open_gap_reason(open: Decimal, position: &OpenPosition) -> Option<ExitReason> {
+    // The stop arm labels through the position's G1 label (r3.s1.w1): an open
+    // through a trailed level is a `TrailingStop` hit; through the untouched
+    // initial stop, a `StopLoss` hit. The TP arm is unchanged.
     match position.direction {
         Direction::Long => {
             if open <= position.stop_price {
-                Some(ExitReason::StopLoss)
+                Some(position.stop_hit_reason())
             } else if position.take_profit_price.is_some_and(|tp| open >= tp) {
                 Some(ExitReason::TakeProfit)
             } else {
@@ -963,7 +1103,7 @@ fn open_gap_reason(open: Decimal, position: &OpenPosition) -> Option<ExitReason>
         }
         Direction::Short => {
             if open >= position.stop_price {
-                Some(ExitReason::StopLoss)
+                Some(position.stop_hit_reason())
             } else if position.take_profit_price.is_some_and(|tp| open <= tp) {
                 Some(ExitReason::TakeProfit)
             } else {
@@ -1011,7 +1151,17 @@ fn price_exit(candle: &Candle, position: &OpenPosition) -> Option<ExitFill> {
             position.stop_price,
             tp,
             position.direction,
-        ),
+        )
+        .map(|exit| IntraBarExit {
+            // A stop resolution re-labels through the position's G1 label
+            // (r3.s1.w1); a take-profit resolution keeps its own label.
+            reason: if exit.reason == ExitReason::StopLoss {
+                position.stop_hit_reason()
+            } else {
+                exit.reason
+            },
+            price: exit.price,
+        }),
         None => stop_only_exit(candle, position),
     }?;
     Some(ExitFill {
@@ -1023,21 +1173,25 @@ fn price_exit(candle: &Candle, position: &OpenPosition) -> Option<ExitFill> {
 }
 
 fn stop_only_exit(candle: &Candle, position: &OpenPosition) -> Option<IntraBarExit> {
+    // The hit's label is the position's G1 label (r3.s1.w1): `TrailingStop`
+    // when the trail stands in or has tightened, `StopLoss` otherwise. The
+    // fill prices and the level checks are unchanged.
+    let reason = position.stop_hit_reason();
     match position.direction {
         Direction::Long if candle.open <= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: candle.open,
         }),
         Direction::Long if candle.low <= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: position.stop_price,
         }),
         Direction::Short if candle.open >= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: candle.open,
         }),
         Direction::Short if candle.high >= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: position.stop_price,
         }),
         _ => None,
@@ -1077,7 +1231,9 @@ fn close_position(
     let realized_r = realized_r(
         position.entry_price,
         exit_price,
-        position.stop_price,
+        // G1 (r3.s1.w1): realized R keeps its sizing basis — the INITIAL stop
+        // distance — even when a trailing stop moved the effective level.
+        position.initial_stop,
         position.direction,
     )?;
 
@@ -1120,9 +1276,12 @@ fn close_position(
         // The market regime captured at the entry-fill bar (FR-6), carried
         // through to the trade record for `RegimeBreakdown` aggregation.
         regime: position.regime,
-        // The frozen stop level the position carried (r2.s2.w2) — recorded
-        // verbatim so the trade log shows the risk the entry was sized against.
-        stop_price: Some(position.stop_price),
+        // The INITIAL stop the position was sized against (G1, r3.s1.w1) —
+        // recorded verbatim so the trade log shows the risk the entry was
+        // sized against and realized R keeps its denominator, even when a
+        // trailing stop moved the effective level (`exit_price` shows where
+        // the trail was).
+        stop_price: Some(position.initial_stop),
     });
     Ok(())
 }
@@ -1314,21 +1473,6 @@ fn reject_impossible_short_tp(
             "short take-profit at {target_r}R × stop {stop_distance_pct} \
              resolves to a non-positive price"
         )));
-    }
-    Ok(())
-}
-
-fn reject_unsupported(exits: &[CompiledExit]) -> Result<(), BacktestError> {
-    for exit in exits {
-        match exit {
-            CompiledExit::TrailingStop { .. } => {
-                return Err(BacktestError::UnsupportedExit("TrailingStop".to_owned()));
-            }
-            CompiledExit::TimeStop { .. } => {
-                return Err(BacktestError::UnsupportedExit("TimeStop".to_owned()));
-            }
-            _ => {}
-        }
     }
     Ok(())
 }
@@ -1741,7 +1885,12 @@ mod tests {
             direction,
             qty: d(3),
             entry_price: d(100),
+            initial_stop: d(95),
             stop_price: d(95),
+            trail_pct: None,
+            trail_only: false,
+            trail_extreme: None,
+            bars_held: 0,
             take_profit_price: None,
             entry_signal_time: 0,
             entry_fill_time,
@@ -1859,8 +2008,11 @@ mod tests {
     }
 
     #[test]
-    fn trailing_and_time_exits_are_rejected() {
-        let primary = series(vec![candle(0, 100, 101, 99, 100)]);
+    fn trailing_runs_and_time_only_refuses_no_stop_loss() {
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 102, 99, 101),
+        ]);
         let trailing = compiled(
             price_entry(),
             vec![
@@ -1870,19 +2022,32 @@ mod tests {
                 },
             ],
         );
-        let time = compiled(
+        let time_only = compiled(
             price_entry(),
-            vec![
-                stop(),
-                ExitRule::TimeStop {
-                    max_bars: SweepableValue::Fixed(5),
-                },
-            ],
+            vec![ExitRule::TimeStop {
+                max_bars: SweepableValue::Fixed(5),
+            }],
         );
 
+        // r3.s1.w1 (G1): a `TrailingStop` runs, standalone or beside a stop
+        // family — the run no longer refuses it (its full semantics are pinned
+        // by `tests/exit_kinds.rs`).
+        run_backtest(
+            &trailing,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+            None,
+        )
+        .expect("a trailing stop is modelled since r3.s1.w1");
+
+        // A `TimeStop` alone is still no stop: the typed refusal stays
+        // `NoStopLoss` (G1) — the old unmodelled-kind refusal is retired.
         assert!(matches!(
             run_backtest(
-                &trailing,
+                &time_only,
                 &primary,
                 None,
                 &config(),
@@ -1891,20 +2056,7 @@ mod tests {
                 None,
             )
             .unwrap_err(),
-            BacktestError::UnsupportedExit(_)
-        ));
-        assert!(matches!(
-            run_backtest(
-                &time,
-                &primary,
-                None,
-                &config(),
-                &SymbolFilters::unconstrained(),
-                SeriesEnd::SnapshotEnd,
-                None,
-            )
-            .unwrap_err(),
-            BacktestError::UnsupportedExit(_)
+            BacktestError::NoStopLoss
         ));
     }
 
@@ -2374,7 +2526,12 @@ mod tests {
                 direction,
                 qty: Decimal::ONE,
                 entry_price: entry,
+                initial_stop: stop,
                 stop_price: stop,
+                trail_pct: None,
+                trail_only: false,
+                trail_extreme: None,
+                bars_held: 0,
                 take_profit_price: None,
                 entry_signal_time: 0,
                 entry_fill_time: 0,

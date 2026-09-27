@@ -206,33 +206,39 @@ pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutc
 
 /// `set_exit_rules { stop_loss_pct?, atr_stop_period?, atr_stop_multiple?,
 /// take_profit_r?, trailing_pct?, time_bars? }` — build a `Vec<ExitRule>`
-/// (replacing). Exactly ONE stop family: `stop_loss_pct` alone (a percent
+/// (replacing). The stop family is `stop_loss_pct` alone (a percent
 /// [`ExitRule::StopLoss`], defines 1R) or `atr_stop_period` +
-/// `atr_stop_multiple` together (an [`ExitRule::AtrStop`], defines 1R). Both
-/// families, one ATR half without the other, or neither are a correctable
-/// `FieldError` localized at `stop_loss_pct` — the tool refuses FIRST rather
-/// than letting a duplicated `StopLoss` + `AtrStop` pair reach
-/// `finalize_strategy`'s `DuplicateExit` rule (whose error would not name the
-/// field to fix). The ATR bounds (`period ≥ 1`, `multiple ∈ (0, 10]`) stay
-/// `validate()`'s at finalize — not re-implemented here. No duplicate exclusive
-/// kinds are possible (each field appears at most once).
+/// `atr_stop_multiple` together (an [`ExitRule::AtrStop`], defines 1R). Since
+/// r3.s1.w1 (G1) a `trailing_pct` given WITHOUT a family lets the trailing
+/// stop stand in for the stop loss; `time_bars` (and trailing beside a
+/// family) run in the engine. Both families at once, one ATR half without the
+/// other, neither family without a trailing stand-in, and a take-profit
+/// without a real family (a trailing stand-in does not define R — validate
+/// rule 3 refuses it at finalize) are each a correctable `FieldError`
+/// localized at `stop_loss_pct` — the tool refuses FIRST rather than letting
+/// a duplicated `StopLoss` + `AtrStop` pair reach `finalize_strategy`'s
+/// `DuplicateExit` rule (whose error would not name the field to fix). The
+/// ATR bounds (`period ≥ 1`, `multiple ∈ (0, 10]`) stay `validate()`'s at
+/// finalize — not re-implemented here. No duplicate exclusive kinds are
+/// possible (each field appears at most once).
 pub(crate) fn set_exit_rules(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
     let args: ExitArgs = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(error) => return err(error),
     };
-    let stop = match (
+    let stop_family = match (
         args.stop_loss_pct,
         args.atr_stop_period,
         args.atr_stop_multiple,
     ) {
-        (Some(stop_loss_pct), None, None) => ExitRule::StopLoss {
+        (Some(stop_loss_pct), None, None) => Some(ExitRule::StopLoss {
             distance_pct: SweepableValue::Fixed(stop_loss_pct),
-        },
-        (None, Some(period), Some(multiple)) => ExitRule::AtrStop {
+        }),
+        (None, Some(period), Some(multiple)) => Some(ExitRule::AtrStop {
             period: SweepableValue::Fixed(period),
             multiple: SweepableValue::Fixed(multiple),
-        },
+        }),
+        (None, None, None) => None,
         _ => {
             return err(field_error(
                 "stop_loss_pct",
@@ -242,7 +248,34 @@ pub(crate) fn set_exit_rules(builder: &mut StrategyBuilder, args: Value) -> Tool
             ));
         }
     };
-    let mut exits = vec![stop];
+    let mut exits = Vec::new();
+    match stop_family {
+        Some(stop) => exits.push(stop),
+        // A take-profit still needs a stop family: a trailing stand-in does
+        // not define the R the take-profit is measured in (G1; validate rule
+        // 3). Same named error, same field.
+        None if args.take_profit_r.is_some() => {
+            return err(field_error(
+                "stop_loss_pct",
+                ValidationCode::FieldRange,
+                "a take-profit requires a stop family: give stop_loss_pct, or \
+                 atr_stop_period with atr_stop_multiple — trailing_pct does not \
+                 define R",
+            ));
+        }
+        // No family and no trailing stand-in: no stop at all.
+        None if args.trailing_pct.is_none() => {
+            return err(field_error(
+                "stop_loss_pct",
+                ValidationCode::FieldRange,
+                "exactly one stop family is required: give stop_loss_pct, or \
+                 atr_stop_period with atr_stop_multiple — or give trailing_pct \
+                 alone to let the trailing stop stand in for one",
+            ));
+        }
+        // Trailing-only: the trailing stop stands in for the stop loss (G1).
+        None => {}
+    }
     if let Some(target_r) = args.take_profit_r {
         exits.push(ExitRule::TakeProfit {
             target_r: SweepableValue::Fixed(target_r),
@@ -774,11 +807,14 @@ fn def_add_filter() -> ToolDefinition {
 fn def_set_exit_rules() -> ToolDefinition {
     ToolDefinition {
         name: "set_exit_rules".to_owned(),
-        description: "Set the exit rules (replacing). Exactly one stop family is required: \
-                      `stop_loss_pct`, or `atr_stop_period` with `atr_stop_multiple` — either \
-                      defines 1R. Decimal fields are JSON strings (e.g. \"0.05\"); \
-                      `take_profit_r` is a plain R-multiple string; `time_bars` and \
-                      `atr_stop_period` are integers."
+        description: "Set the exit rules (replacing). Exactly one stop family defines 1R: \
+                      `stop_loss_pct`, or `atr_stop_period` with `atr_stop_multiple`. \
+                      `trailing_pct` may be given INSTEAD of a stop family — the trailing \
+                      stop stands in for it and defines 1R — or alongside one; `time_bars` \
+                      exits after that many held bars. Both run in the engine. A \
+                      `take_profit_r` still requires a real stop family. Decimal fields \
+                      are JSON strings (e.g. \"0.05\"); `take_profit_r` is a plain \
+                      R-multiple string; `time_bars` and `atr_stop_period` are integers."
             .to_owned(),
         parameters: json!({
             "type": "object",
@@ -787,8 +823,8 @@ fn def_set_exit_rules() -> ToolDefinition {
                 "atr_stop_period": { "type": "integer", "minimum": 1, "description": "ATR lookback period, e.g. 14" },
                 "atr_stop_multiple": { "type": "string", "description": "ATR multiple as a decimal string, e.g. \"2\"" },
                 "take_profit_r": { "type": "string", "description": "take-profit R-multiple, e.g. \"2\"" },
-                "trailing_pct": { "type": "string", "description": "trailing distance fraction" },
-                "time_bars": { "type": "integer", "minimum": 1 }
+                "trailing_pct": { "type": "string", "description": "trailing distance fraction; alone it stands in for the stop family" },
+                "time_bars": { "type": "integer", "minimum": 1, "description": "exit at the open after this many held bars" }
             }
         }),
     }
