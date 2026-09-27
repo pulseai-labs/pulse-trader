@@ -509,10 +509,22 @@ fn parse_inode(digits: &[u8]) -> Option<u64> {
 /// no longer matches the file at the target path afterwards. (An inode number can
 /// be recycled — but only once the old file is gone, and the copy is created while
 /// it still exists, so a recycled number cannot be mistaken for it here.)
+#[cfg(unix)]
 pub(crate) fn inode_of(target: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
 
     fs::metadata(target).ok().map(|meta| meta.ino())
+}
+
+/// No inode on platforms without `MetadataExt` — the same gate
+/// [`acquire_migration_lock`] carries (fix round 8, H1).
+///
+/// The quarantine then records no identity, so the scan classifies it as
+/// [`QuarantineOwner::Unknown`] and the refusal says to restore from the safety
+/// backup rather than move it back: unknown ownership is never moved back.
+#[cfg(not(unix))]
+pub(crate) fn inode_of(_target: &Path) -> Option<u64> {
+    None
 }
 
 /// The quarantine name of one of the target's sidecars (fix round 7, E3).

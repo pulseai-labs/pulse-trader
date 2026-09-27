@@ -689,11 +689,17 @@ struct StagedBackup {
     partial: PathBuf,
     /// `<out-dir>/pulse-<stamp>.db` — the name it publishes under.
     final_path: PathBuf,
-    /// The deepest ancestor of the out-dir that existed BEFORE this backup
-    /// created it (`.` for a relative path whose first component was absent, and
-    /// `None` when nothing had to be created): every level below it is an entry
-    /// this run made, so each publish into the out-dir must sync the levels it
-    /// created up to and including this one (fix round 1, F6).
+    /// The deepest ancestor of the out-dir (**inclusive**) that already existed
+    /// when this backup started: the out-dir ITSELF when it was already there, or
+    /// the nearest existing parent when it was not (`.` for a relative path whose
+    /// first component was absent — that component's entry lands in the current
+    /// directory). Everything strictly below it is an entry this run made, so each
+    /// publish into the out-dir must sync the levels it created up to and
+    /// including this one (fix round 1, F6).
+    ///
+    /// `None` only when the walk resolves no existing directory at all — the
+    /// filesystem root — which is what `existing_ancestor` reports then (fix round
+    /// 8, H2: it is NOT "nothing had to be created").
     created_root: Option<PathBuf>,
 }
 
