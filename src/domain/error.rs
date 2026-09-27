@@ -82,6 +82,15 @@ pub enum DataError {
     /// work-1.01 so the shared error file never needs a later rewrite (NFR-12).
     #[error("migration error: {0}")]
     Migration(String),
+
+    /// A database target has an interrupted install's quarantine files beside it
+    /// (issue #258; fix round 6, D1). Those files hold the target's own
+    /// un-checkpointed rows, so the open REFUSES before any connection is made —
+    /// the message is the shared refusal's, naming every file and the name it has
+    /// to go back to. Typed (not `Db`) so a caller can tell "these bytes are not
+    /// lost yet, move them back" from "the database is unreadable".
+    #[error("{0}")]
+    OrphanedQuarantines(String),
 }
 
 /// The specific kinds of structural corruption a `CandleSeries` can exhibit.

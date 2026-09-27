@@ -35,10 +35,12 @@ use clap::Args;
 
 use super::import::{
     HeadChange, HeadSource, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal,
-    copy_snapshot_into, default_backup_out_dir, manifest_path, resolve_target_data_dir,
-    resolve_target_db, restore_heads, run_verified_copy, scan_heads, scan_snapshots,
+    copy_snapshot_into, default_backup_out_dir, fold_cleanup, manifest_path, named_by_pointer,
+    path_present, refuse_orphaned_quarantines, resolve_target_data_dir, resolve_target_db,
+    restore_heads, run_verified_copy, scan_heads, scan_snapshots, stranded_pointers,
     write_head_manifest,
 };
+use super::publish;
 use crate::adapters::db::ops;
 use crate::adapters::store::CandleStore;
 
@@ -145,6 +147,12 @@ pub(crate) async fn backup_target(
     data_dir: &Path,
     out_dir: &Path,
 ) -> anyhow::Result<BackupOutcome> {
+    // ---- Step 0: refuse a target whose committed rows are sitting in a
+    // quarantined `-wal` (fix round 5, P5). A backup READS the database, so an
+    // interrupted install's quarantine would make this run stamp a `pulse-<stamp>.db`
+    // as good while it is missing exactly those rows — the same fail-closed refusal
+    // the import makes, through the same helper, before anything is read.
+    refuse_orphaned_quarantines(db_path)?;
     let out_store = CandleStore::with_base_dir(out_dir.to_path_buf());
 
     // ---- Step 1: freeze the DATABASE first, and derive the snapshot set from
@@ -161,18 +169,30 @@ pub(crate) async fn backup_target(
     // the backup's OWN pointer manifest — all in place BEFORE the database
     // becomes visible, so a `pulse-<stamp>.db` never appears without the
     // manifest a restore reads (round 6, Fix A).
-    let outcome = match publish_source_store(&out_store, data_dir, &staged, &mut added).await {
+    let mut head_changes: Vec<HeadChange> = Vec::new();
+    let published =
+        publish_source_store(&out_store, data_dir, &staged, &mut added, &mut head_changes).await;
+    let outcome = match published {
         Ok(outcome) => outcome,
         Err(error) => {
-            discard(&staged, &added);
-            return Err(error);
+            // Fix round 4, Q4: the manifest arm follows M1's rule too, through the
+            // SAME unwind as the database arm below.
+            let (restored, rollback) = unwind_backup(&out_store, &staged, &added, &head_changes);
+            return Err(fold_rollback(error, Some(&restored), &rollback));
         }
     };
 
     // ---- Step 3: only now the database itself.
     if let Err(error) = publish_staged_database(&staged) {
-        discard(&staged, &added);
-        return Err(error);
+        // The whole backup unwinds, in the order that keeps the store consistent
+        // (fix round 3, M1): the shared store's HEAD pointers go back FIRST, so no
+        // crash or error between the two steps can leave a pointer naming a
+        // snapshot that is gone — and a pointer that could not be restored keeps
+        // the snapshots it still names, because deleting them would leave the
+        // store in exactly that state. Only then do this run's files go, each
+        // removal made durable (M2).
+        let (restored, rollback) = unwind_backup(&out_store, &staged, &added, &head_changes);
+        return Err(fold_rollback(error, Some(&restored), &rollback));
     }
     Ok(outcome)
 }
@@ -205,11 +225,14 @@ async fn publish_source_store(
     data_dir: &Path,
     staged: &StagedBackup,
     added: &mut Vec<PathBuf>,
+    changes: &mut Vec<HeadChange>,
 ) -> anyhow::Result<BackupOutcome> {
     let source_store = CandleStore::with_base_dir(data_dir.to_path_buf());
 
     let (copied, total) =
-        publish_store_files(out_store, &source_store, data_dir, staged, added).await?;
+        publish_store_files(out_store, &source_store, data_dir, staged, added, changes).await?;
+    // The shared store's pointers this run moved are in the caller's `changes`
+    // (fix rounds 2 N1 and 4 Q4): a caller whose publish fails owns the unwind.
     Ok(BackupOutcome {
         path: staged.final_path.clone(),
         snapshots_copied: copied,
@@ -225,6 +248,7 @@ async fn publish_store_files(
     data_dir: &Path,
     staged: &StagedBackup,
     added: &mut Vec<PathBuf>,
+    changes: &mut Vec<HeadChange>,
 ) -> anyhow::Result<(usize, usize)> {
     // 1. What the FROZEN COPY needs: the snapshots its runs name.
     let references = frozen_references(&staged.partial).await?;
@@ -241,20 +265,24 @@ async fn publish_store_files(
     // 7. And the backup's OWN manifest beside the database it is being published
     // with — the shared store's pointers are for a store read directly, while a
     // RESTORE takes the pointers of the backup it was handed (round 6, Fix A).
-    let (changes, published) = match publish_heads(out_store, &heads) {
-        Ok(changes) => (
-            changes,
-            write_head_manifest(&staged.manifest_path(), &heads),
-        ),
-        Err((error, changes)) => (changes, Err(error)),
-    };
-    match published {
-        Ok(()) => Ok((copied, snapshots.len())),
-        Err(error) => {
-            restore_heads(out_store, &changes);
-            Err(error)
+    // The pointers this run moves are collected into the CALLER's vec: when the
+    // manifest publish below fails, the unwind belongs to the caller (fix round
+    // 4, Q4) and it needs them — it holds the staged backup and the added
+    // snapshots, and M1's order (restore first, then delete keeping what the
+    // unrestored pointers name) applies to this arm exactly as to the database's.
+    match publish_heads(out_store, &heads) {
+        Ok(moved) => changes.extend(moved),
+        Err((error, moved)) => {
+            changes.extend(moved);
+            return Err(error);
         }
     }
+    write_head_manifest(
+        &staged.manifest_path(),
+        &heads,
+        staged.created_root.as_deref(),
+    )?;
+    Ok((copied, snapshots.len()))
 }
 
 /// The snapshots the FROZEN COPY references — read from the copy itself, never
@@ -403,25 +431,234 @@ fn copy_wanted(
     for index in wanted {
         let snap = &snapshots[*index];
         let dest = out_store.snapshot_path(&snap.pair, snap.timeframe, &snap.version);
-        if dest.exists() {
+        // Fail closed (fix round 12, S1 — the import twin's R2): `exists()` would
+        // read a stat failure as "absent", and this run would then record a
+        // snapshot the SHARED store already holds as one it wrote — so the
+        // rollback would unlink a previous backup's snapshot, which is not this
+        // run's to delete at any point. An unreadable destination refuses.
+        if path_present(&dest)? {
             continue;
         }
+        // Recorded BEFORE the copy (fix round 1, F8): the copy renames the file
+        // into place and then syncs its directory, so a failure AFTER the rename
+        // still leaves a snapshot behind — one this backup's rollback must
+        // remove. The name is known free (the probe above), so recording it up
+        // front cannot delete anything this run did not write.
+        added.push(dest.clone());
         copy_snapshot_into(&snap.path, &dest)?;
-        added.push(dest);
         published += 1;
     }
     Ok(published)
 }
 
-/// The failure path's one move: no half backup survives — not the staged
-/// database copy, not the manifest published beside it, and not a snapshot this
-/// run added.
-fn discard(staged: &StagedBackup, added: &[PathBuf]) {
-    let _ = fs::remove_file(&staged.partial);
-    let _ = fs::remove_file(staged.manifest_path());
-    for path in added {
-        let _ = fs::remove_file(path);
+/// The whole unwind of a failed backup (fix round 3 M1/M2, fix round 4 Q4): the
+/// shared store's pointers go back FIRST, a pointer that could not be restored
+/// keeps the snapshots it still names, and every removal is fsynced.
+///
+/// Returns the restore outcome and the rollback outcome, so the caller reports
+/// each failure it has to.
+fn unwind_backup(
+    out_store: &CandleStore,
+    staged: &StagedBackup,
+    added: &[PathBuf],
+    head_changes: &[HeadChange],
+) -> (anyhow::Result<()>, anyhow::Result<()>) {
+    let restored = restore_heads(out_store, head_changes);
+    let stranded = stranded_pointers(&restored);
+    let rollback = discard_keeping(staged, added, &|path| {
+        named_by_pointer(out_store, &stranded, path)
+    });
+    (restored, rollback)
+}
+
+/// The error a failed backup reports: the original failure, plus whatever the
+/// rollback could not do (fix round 3, M1/M2).
+fn fold_rollback(
+    error: anyhow::Error,
+    restored: Option<&anyhow::Result<()>>,
+    rollback: &anyhow::Result<()>,
+) -> anyhow::Error {
+    let mut error = error;
+    if let Some(Err(restore_error)) = restored {
+        error = error.context(format!("[backup unwind] {restore_error}"));
     }
+    if let Err(rollback_error) = rollback {
+        error = error.context(format!("[backup unwind] {rollback_error}"));
+    }
+    error
+}
+
+/// The failure path's one move, with NO `keep`: no half backup survives — not the
+/// staged database copy, not the manifest published beside it, and not a snapshot
+/// this run added. (The production unwind always passes a keep predicate through
+/// [`unwind_backup`]; this is the shape the rollback tests exercise on its own.)
+///
+/// The published name goes too (fix round 1, F2): a failure AFTER
+/// [`publish_staged_database`]'s rename leaves the database under
+/// `pulse-<stamp>.db`, and a database left without its manifest is one
+/// `pulse restore` can only refuse and `--keep` counts as a backup. Removing it
+/// is safe on the earlier failure paths — the name does not exist yet, and the
+/// removal is a no-op.
+#[cfg(test)]
+fn discard_all(staged: &StagedBackup, added: &[PathBuf]) -> anyhow::Result<()> {
+    discard_keeping(staged, added, &|_| false)
+}
+
+/// Unlink one entry of a rollback, recording it for the durability sync below.
+///
+/// A file that is already gone is fine; any other failure is COLLECTED (fix round
+/// 4, Q2) — every path is attempted, and the caller reports the ones that could
+/// not be removed instead of discarding the error. Shared with the import's undo
+/// (fix round 5, P1), so both cleanups collect failures the same way.
+pub(crate) fn unlink(path: &Path, removed: &mut Vec<PathBuf>, unremoved: &mut Vec<String>) {
+    #[cfg(test)]
+    let injected = publish::probe::take_injected_remove_failure(path);
+    #[cfg(not(test))]
+    let injected = false;
+    let outcome = if injected {
+        Err(std::io::Error::other("injected failure (cfg(test) seam)"))
+    } else {
+        fs::remove_file(path)
+    };
+    match outcome {
+        Ok(()) => removed.push(path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => unremoved.push(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Remove one staged file, treating "already gone" as fine and REPORTING anything
+/// else (fix round 9, K3).
+///
+/// The staged partial is the only copy of a failed backup's bytes, so a removal
+/// that failed must not be discarded silently — the operator has to know the file
+/// is still there. Consumes the same injection seam `unlink` does, so a test can
+/// drive the failure.
+fn remove_reported(path: &Path) -> anyhow::Result<()> {
+    #[cfg(test)]
+    let injected = publish::probe::take_injected_remove_failure(path);
+    #[cfg(not(test))]
+    let injected = false;
+    let outcome = if injected {
+        Err(std::io::Error::other("injected failure (cfg(test) seam)"))
+    } else {
+        fs::remove_file(path)
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!("remove {}: {error}", path.display())),
+    }
+}
+
+/// [`discard`] with `keep` holding back the snapshots a pointer that could not be
+/// restored still names (fix round 3, M1), and every removal made durable by
+/// fsyncing the directory that held the entry (fix round 3, M2 — a rollback a
+/// power loss can undo is not a rollback).
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] naming the entries that could not be removed and
+/// the removals whose directory fsync failed. A file that was already absent is
+/// fine: there is nothing to remove and nothing to sync.
+fn discard_keeping(
+    staged: &StagedBackup,
+    added: &[PathBuf],
+    keep: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<()> {
+    let mut removed: Vec<PathBuf> = Vec::new();
+    let mut unremoved: Vec<String> = Vec::new();
+    for path in [&staged.partial, &staged.final_path, &staged.manifest_path()] {
+        unlink(path, &mut removed, &mut unremoved);
+    }
+    for path in added {
+        if keep(path) {
+            continue;
+        }
+        unlink(path, &mut removed, &mut unremoved);
+    }
+    finish_removals(&removed, &unremoved)
+}
+
+/// What a removal reported by [`finish_removals`] IS, for the one ordered log the
+/// tests read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A file this run ADDED — a snapshot, a staged or published artifact.
+    Artifact,
+    /// The `HEAD` pointer this run CREATED, put back by removing it (fix round 6,
+    /// C3). Removing it IS its restoration, and `restore_heads` records that as
+    /// `HeadRestored`, so nothing is recorded here: one log, in which M1's "the
+    /// pointers go back BEFORE the first deletion" stays readable.
+    Pointer,
+}
+
+/// Make every removal durable and report the cleanup as a whole: the ONE report
+/// shape the backup's rollback and the import's undo share (fix round 4, Q2; fix
+/// round 5, P1), so neither can claim a cleanup that did not happen.
+///
+/// Every removal is followed by an fsync of the directory that held the entry —
+/// a rollback a power loss can undo is not a rollback (fix round 3, M2).
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] naming the entries that could not be removed and
+/// the removals whose directory fsync failed. An entry that was already absent is
+/// fine: there is nothing to remove and nothing to sync.
+pub(crate) fn finish_removals(removed: &[PathBuf], unremoved: &[String]) -> anyhow::Result<()> {
+    finish_removals_as(Removal::Artifact, removed, unremoved)
+}
+
+/// [`finish_removals`] for the `HEAD` pointer a run created (fix round 6, C3).
+///
+/// # Errors
+///
+/// As [`finish_removals`].
+pub(crate) fn finish_head_removal(removed: &[PathBuf], unremoved: &[String]) -> anyhow::Result<()> {
+    finish_removals_as(Removal::Pointer, removed, unremoved)
+}
+
+/// The one body of both: collect what could not be removed or made durable, and
+/// record the removal the way the ordered log wants it.
+fn finish_removals_as(
+    what: Removal,
+    removed: &[PathBuf],
+    unremoved: &[String],
+) -> anyhow::Result<()> {
+    let mut unsynced: Vec<String> = Vec::new();
+    for path in removed {
+        #[cfg(test)]
+        match what {
+            Removal::Artifact => {
+                publish::probe::record_rollback(publish::probe::RollbackStep::Unlinked {
+                    path: path.clone(),
+                });
+            }
+            Removal::Pointer => {}
+        }
+        #[cfg(not(test))]
+        let _ = what;
+        if let Err(error) = publish::sync_published(path, None) {
+            unsynced.push(format!("fsync {}: {error}", path.display()));
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !unremoved.is_empty() {
+        parts.push(format!(
+            "these entries could not be removed: {}",
+            unremoved.join("; ")
+        ));
+    }
+    if !unsynced.is_empty() {
+        parts.push(format!(
+            "these removals could not be made durable: {} (they may come back after a power loss)",
+            unsynced.join("; ")
+        ));
+    }
+    if parts.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!("the rollback is incomplete — {}", parts.join("; ")))
 }
 
 /// Write the source's `HEAD` pointers into the out-dir's store, each one only
@@ -482,6 +719,18 @@ struct StagedBackup {
     partial: PathBuf,
     /// `<out-dir>/pulse-<stamp>.db` — the name it publishes under.
     final_path: PathBuf,
+    /// The deepest ancestor of the out-dir (**inclusive**) that already existed
+    /// when this backup started: the out-dir ITSELF when it was already there, or
+    /// the nearest existing parent when it was not (`.` for a relative path whose
+    /// first component was absent — that component's entry lands in the current
+    /// directory). Everything strictly below it is an entry this run made, so each
+    /// publish into the out-dir must sync the levels it created up to and
+    /// including this one (fix round 1, F6).
+    ///
+    /// `None` only when the walk resolves no existing directory at all — the
+    /// filesystem root — which is what `existing_ancestor` reports then (fix round
+    /// 8, H2: it is NOT "nothing had to be created").
+    created_root: Option<PathBuf>,
 }
 
 impl StagedBackup {
@@ -502,6 +751,10 @@ impl StagedBackup {
 /// Returns an [`anyhow::Error`] when the source cannot be read or the copy
 /// cannot be written.
 async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<StagedBackup> {
+    // The deepest ancestor that exists BEFORE the out-dir is created: every level
+    // below it is an entry this backup makes, and each publish into it has to
+    // sync its parent (fix round 1, F6).
+    let created_root = publish::existing_ancestor(out_dir);
     fs::create_dir_all(out_dir)
         .map_err(|e| anyhow!("create backup dir {}: {e}", out_dir.display()))?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -519,33 +772,56 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
     let copied = ops::vacuum_into_copy(&source, &partial).await;
     source.close().await;
     if let Err(e) = copied {
-        let _ = fs::remove_file(&partial); // a partial file is deleted
-        return Err(anyhow!(
-            "the backup copy of {} failed: {e}",
-            db_path.display()
+        // A failed copy must not leave its partial behind — and a removal that
+        // fails is REPORTED (fix round 9, K3).
+        let cleanup = remove_reported(&partial);
+        return Err(fold_cleanup(
+            anyhow!("the backup copy of {} failed: {e}", db_path.display()),
+            cleanup,
+        ));
+    }
+    // `VACUUM INTO` does not guarantee its output is on disk, and the publish
+    // renames this file: the bytes must land before the name that promises them
+    // (fix round 1, F5).
+    if let Err(error) = publish::sync_file(&partial, &final_path) {
+        // The staged copy's bytes are not confirmed on disk, and this error
+        // returns before a `StagedBackup` exists — so `discard` cannot remove it
+        // and this is the only place that can (fix round 2, N3). A removal that
+        // fails is reported (fix round 9, K3).
+        let cleanup = remove_reported(&partial);
+        return Err(fold_cleanup(
+            anyhow!(
+                "flush the staged backup copy {}: {error}",
+                partial.display()
+            ),
+            cleanup,
         ));
     }
     Ok(StagedBackup {
         partial,
         final_path,
+        created_root,
     })
 }
 
 /// Publish the staged copy under its `pulse-<stamp>.db` name — the LAST step of
 /// a backup, run only once the snapshots it references, the shared store's
-/// pointers and its own manifest are all in place — and make the rename durable.
+/// pointers and its own manifest are all in place — and make the rename durable
+/// by fsyncing the out-dir it landed in (issue #259). The snapshots that live
+/// under `candles/<PAIR>/<TF>/` get the syncs of their own levels in
+/// [`copy_snapshot_into`], which is what makes the nested entries durable; the
+/// out-dir sync here makes the database's own name durable, and it is the same
+/// discipline `CandleStore::publish_atomically` applies.
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] when the rename fails.
+/// Returns an [`anyhow::Error`] when the rename fails, or when the out-dir
+/// cannot be fsynced — a backup may not be reported successful over a rename
+/// that is not durable.
 fn publish_staged_database(staged: &StagedBackup) -> anyhow::Result<()> {
     fs::rename(&staged.partial, &staged.final_path)
         .map_err(|e| anyhow!("publish {}: {e}", staged.final_path.display()))?;
-    let parent = staged.final_path.parent().unwrap_or(Path::new("."));
-    if let Ok(handle) = fs::File::open(parent) {
-        let _ = handle.sync_all();
-    }
-    Ok(())
+    publish::sync_published(&staged.final_path, staged.created_root.as_deref())
 }
 
 /// `pulse-<UTC stamp>.db`, with a `-N` suffix probed on a same-second
@@ -627,4 +903,761 @@ pub(crate) async fn run_restore(args: &RestoreArgs) -> anyhow::Result<()> {
         chmod_source: false,
     })
     .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{StagedBackup, discard_all, publish_staged_database};
+    use crate::cli::import::SourceHead;
+    use crate::cli::publish;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// A migrated source database, the committed fixture store as its data dir, a
+    /// fresh out-dir with its store, and the first HEAD pointer the fixture names.
+    async fn backup_fixture() -> (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        crate::adapters::store::CandleStore,
+        SourceHead,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source").join("pulse.db");
+        fs::create_dir_all(db_path.parent().expect("the source's directory"))
+            .expect("create the source's directory");
+        let db = crate::adapters::db::open_migrated(&db_path)
+            .await
+            .expect("migrate the source");
+        db.pool().close().await;
+        let data_dir = dir.path().join("source-data");
+        copy_tree(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/btcusdt-1m-store"),
+            &data_dir,
+        );
+        let out_dir = dir.path().join("out");
+        fs::create_dir_all(&out_dir).expect("the out-dir");
+        let out_store = crate::adapters::store::CandleStore::with_base_dir(out_dir.clone());
+        let (heads, _) = crate::cli::import::scan_heads(&data_dir);
+        let head = heads
+            .into_iter()
+            .next()
+            .expect("the fixture store has HEAD pointers");
+        // The tempdir is dropped with the returned paths, so leak it deliberately:
+        // each test owns its tree for the length of the test.
+        std::mem::forget(dir);
+        (db_path, data_dir, out_dir, out_store, head)
+    }
+
+    /// A recursive copy (the fixture store is a directory tree).
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).expect("create the destination directory");
+        for entry in fs::read_dir(from).expect("read the source directory") {
+            let entry = entry.expect("directory entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).expect("copy the file");
+            }
+        }
+    }
+
+    /// A staged backup rooted in `dir` (the fields a test may not care about are
+    /// the empty defaults).
+    fn staged(dir: &std::path::Path, created_root: Option<PathBuf>) -> StagedBackup {
+        StagedBackup {
+            partial: dir.join("pulse-20260101T000000Z.db.partial"),
+            final_path: dir.join("pulse-20260101T000000Z.db"),
+            created_root,
+        }
+    }
+
+    /// Issue #259: the database is the LAST thing a backup makes visible, and
+    /// the rename that publishes it is followed by an fsync of the out-dir it
+    /// landed in — a backup may not be reported successful over a rename that is
+    /// not durable.
+    #[test]
+    fn the_published_backup_database_syncs_the_out_dir_after_the_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = staged(dir.path(), None);
+        fs::write(&staged.partial, b"a complete copy").expect("stage the copy");
+        let _ = publish::probe::take();
+
+        publish_staged_database(&staged).expect("publish");
+
+        let syncs = publish::probe::take();
+        assert_eq!(syncs.len(), 1, "one publish, one directory sync: {syncs:?}");
+        assert_eq!(syncs[0].path, dir.path(), "the out-dir it landed in");
+        assert!(
+            syncs[0].destination_present,
+            "the sync happens AFTER the rename, never before it: {syncs:?}"
+        );
+        assert!(
+            !staged.partial.exists(),
+            "the staged name is gone: {}",
+            staged.partial.display()
+        );
+        assert_eq!(
+            fs::read(&staged.final_path).expect("read the published backup"),
+            b"a complete copy",
+            "and the backup holds the copy's bytes"
+        );
+    }
+
+    /// Fix round 4, Q2: a rollback that cannot REMOVE a file must say so — every
+    /// path is attempted, and the failures are named (the round-3 code discarded
+    /// the error whenever the unlink failed).
+    #[test]
+    fn a_rollback_that_cannot_remove_a_file_names_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = staged(dir.path(), None);
+        fs::write(&staged.partial, b"staged").expect("stage");
+        fs::write(&staged.final_path, b"published").expect("publish");
+        fs::write(staged.manifest_path(), b"{}").expect("manifest");
+        // The published database cannot be unlinked.
+        publish::probe::fail_next_remove_of(&staged.final_path);
+
+        let error = discard_all(&staged, &[]).expect_err("the failed unlink is reported");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be removed"),
+            "the error says an entry could not be removed: {message}"
+        );
+        assert!(
+            message.contains("the rollback is incomplete"),
+            "and frames the whole rollback: {message}"
+        );
+        assert!(
+            message.contains(&staged.final_path.display().to_string()),
+            "and names it: {message}"
+        );
+        assert!(
+            staged.final_path.exists(),
+            "the file is still there, as reported"
+        );
+        assert!(
+            !staged.partial.exists(),
+            "and every OTHER path was still attempted"
+        );
+        assert!(!staged.manifest_path().exists(), "including the manifest");
+    }
+
+    /// Fix round 4, Q4: the manifest-publish failure arm follows M1's rule too —
+    /// the pointers go back first, and a pointer that could not be restored keeps
+    /// the snapshots it still names. Exercised through the injected manifest
+    /// failure PLUS a pointer-restore failure.
+    #[tokio::test]
+    async fn a_failed_manifest_publish_unwinds_like_the_database_one() {
+        let (db_path, data_dir, out_dir, out_store, head) = backup_fixture().await;
+        let prior = crate::domain::DataVersion::parse("0000000000000001").expect("a version tag");
+        out_store
+            .write_head(&head.pair, head.timeframe, &prior)
+            .expect("seed the store's prior pointer");
+        let (source_snapshots, _) = crate::cli::import::scan_snapshots(&data_dir);
+        // The HEAD pointer cannot go back...
+        publish::probe::fail_next_head_write_to(&out_store.head_path(&head.pair, head.timeframe));
+        // ...and the manifest publish (extension `json`) fails: the FIRST publish
+        // step, so the database publish never runs.
+        publish::probe::fail_next_publish_with_extension("json");
+
+        let Err(error) = super::backup_target(&db_path, &data_dir, &out_dir).await else {
+            panic!("the injected manifest failure must end the backup");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be restored for"),
+            "the unwind restored (and reported) the pointers first: {message}"
+        );
+        assert!(
+            message.contains(head.pair.as_str()),
+            "and names the pointer that is not back: {message}"
+        );
+        let kept_dir = out_store
+            .head_path(&head.pair, head.timeframe)
+            .parent()
+            .expect("the timeframe directory")
+            .to_path_buf();
+        let kept: Vec<String> = fs::read_dir(&kept_dir)
+            .expect("read the timeframe directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".parquet"))
+            .collect();
+        assert!(
+            !kept.is_empty(),
+            "the snapshot the unrestored pointer names is KEPT: {kept:?}"
+        );
+        for snapshot in &source_snapshots {
+            if snapshot.pair == head.pair && snapshot.timeframe == head.timeframe {
+                continue;
+            }
+            let dest =
+                out_store.snapshot_path(&snapshot.pair, snapshot.timeframe, &snapshot.version);
+            assert!(
+                !dest.exists(),
+                "the snapshot no unrestored pointer names is removed: {}",
+                dest.display()
+            );
+        }
+        // And the database itself was never published (the manifest step failed).
+        let published: Vec<String> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "db")
+            })
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            published.is_empty(),
+            "no database was published: {published:?}"
+        );
+    }
+
+    /// Fix round 3, M1: on a failed final publish the shared store's pointers go
+    /// back BEFORE anything is deleted — a crash or error between the two steps
+    /// must never leave a HEAD pointer naming a snapshot that is gone.
+    #[tokio::test]
+    async fn a_failed_final_publish_restores_the_pointers_before_it_deletes_anything() {
+        let (db_path, data_dir, out_dir, out_store, head) = backup_fixture().await;
+        out_store
+            .write_head(
+                &head.pair,
+                head.timeframe,
+                &crate::domain::DataVersion::parse("0000000000000001").expect("a version tag"),
+            )
+            .expect("seed the store's prior pointer");
+        publish::probe::fail_next_publish_with_extension("db");
+        let _ = publish::probe::take_rollback();
+
+        let Err(_) = super::backup_target(&db_path, &data_dir, &out_dir).await else {
+            panic!("the injected publish failure must end the backup");
+        };
+
+        let steps = publish::probe::take_rollback();
+        let last_restore = steps
+            .iter()
+            .rposition(|step| matches!(step, publish::probe::RollbackStep::HeadRestored { .. }))
+            .unwrap_or_else(|| panic!("a pointer was restored: {steps:?}"));
+        let first_unlink = steps
+            .iter()
+            .position(|step| matches!(step, publish::probe::RollbackStep::Unlinked { .. }))
+            .unwrap_or_else(|| panic!("this run's files were removed: {steps:?}"));
+        assert!(
+            last_restore < first_unlink,
+            "every pointer is restored BEFORE the first deletion: {steps:?}"
+        );
+    }
+
+    /// Fix round 3, M1: a pointer that could NOT be restored keeps the snapshots
+    /// it still names — deleting them would leave the store advertising a
+    /// snapshot that is gone — and the error names the pointer.
+    #[tokio::test]
+    async fn a_pointer_that_cannot_be_restored_keeps_the_snapshot_it_names() {
+        let (db_path, data_dir, out_dir, out_store, head) = backup_fixture().await;
+        let prior = crate::domain::DataVersion::parse("0000000000000001").expect("a version tag");
+        out_store
+            .write_head(&head.pair, head.timeframe, &prior)
+            .expect("seed the store's prior pointer");
+        let (source_snapshots, _) = crate::cli::import::scan_snapshots(&data_dir);
+        let (source_heads, _) = crate::cli::import::scan_heads(&data_dir);
+        publish::probe::fail_next_publish_with_extension("db");
+        // The restore of THIS pointer is injected to fail.
+        publish::probe::fail_next_head_write_to(&out_store.head_path(&head.pair, head.timeframe));
+
+        let Err(error) = super::backup_target(&db_path, &data_dir, &out_dir).await else {
+            panic!("the injected publish failure must end the backup");
+        };
+
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be restored for"),
+            "the error says the pointers could not be restored: {message}"
+        );
+        assert!(
+            message.contains(head.pair.as_str()),
+            "and names the pointer that is not back: {message}"
+        );
+        // The named pair's snapshot stays; the other pair's goes.
+        let kept_dir = out_store
+            .head_path(&head.pair, head.timeframe)
+            .parent()
+            .expect("the timeframe directory")
+            .to_path_buf();
+        let kept: Vec<String> = fs::read_dir(&kept_dir)
+            .expect("read the timeframe directory")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".parquet"))
+            .collect();
+        assert!(
+            !kept.is_empty(),
+            "the snapshot the unrestored pointer names is kept: {kept:?}"
+        );
+        for snapshot in &source_snapshots {
+            if snapshot.pair == head.pair
+                && source_heads.iter().any(|other| {
+                    other.pair == snapshot.pair && other.timeframe == snapshot.timeframe
+                })
+                && snapshot.timeframe == head.timeframe
+            {
+                continue;
+            }
+            let dest =
+                out_store.snapshot_path(&snapshot.pair, snapshot.timeframe, &snapshot.version);
+            assert!(
+                !dest.exists(),
+                "the snapshot no unrestored pointer names is removed: {}",
+                dest.display()
+            );
+        }
+    }
+
+    /// Fix round 5, P5: a backup READS the database, so a target whose committed
+    /// rows sit in a quarantined `-wal` must be refused BEFORE anything is read —
+    /// otherwise this run stamps a `pulse-<stamp>.db` as good while it is missing
+    /// exactly those rows. The same refusal the import makes, through the same
+    /// helper, and nothing is written to the out-dir.
+    #[tokio::test]
+    async fn a_backup_refuses_a_target_with_an_orphaned_quarantine() {
+        let (db_path, data_dir, out_dir, _out_store, _head) = backup_fixture().await;
+        let orphan = db_path
+            .parent()
+            .expect("the source's directory")
+            .join(".pulse.db-wal.quarantine-999999");
+        fs::write(&orphan, b"committed rows that are not in the database file")
+            .expect("the quarantine");
+
+        let Err(error) = super::backup_target(&db_path, &data_dir, &out_dir).await else {
+            panic!("an orphaned quarantine must refuse the backup");
+        };
+
+        assert!(
+            error
+                .downcast_ref::<crate::cli::import::InterruptedInstall>()
+                .is_some(),
+            "the refusal is the typed one the import uses: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&orphan.display().to_string()),
+            "and it names the quarantine: {message}"
+        );
+        assert!(
+            message.contains(
+                &crate::cli::import::sidecar_path(&db_path, "-wal")
+                    .display()
+                    .to_string()
+            ),
+            "and the name those rows have to go back to: {message}"
+        );
+        let published: Vec<String> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            published.is_empty(),
+            "nothing was published, not even the shared candles store: {published:?}"
+        );
+    }
+
+    /// Fix round 3, M2: the rollback's removals are made durable — each directory
+    /// that held a removed entry is fsynced after the unlink, so a power loss
+    /// cannot resurrect a half-rolled-back backup.
+    #[test]
+    fn the_rollbacks_removals_are_synced_after_they_are_unlinked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = staged(dir.path(), None);
+        fs::write(&staged.partial, b"staged").expect("stage");
+        fs::write(&staged.final_path, b"published").expect("publish");
+        fs::write(staged.manifest_path(), b"{}").expect("manifest");
+        let added = dir
+            .path()
+            .join("candles")
+            .join("BTCUSDT")
+            .join("15m")
+            .join("dv.parquet");
+        fs::create_dir_all(added.parent().expect("the snapshot's directory"))
+            .expect("create the snapshot's directory");
+        fs::write(&added, b"a copied snapshot").expect("write the copied snapshot");
+        let _ = publish::probe::take();
+
+        discard_all(&staged, std::slice::from_ref(&added))
+            .expect("the rollback's removals are durable");
+
+        let syncs = publish::probe::take();
+        for path in [
+            staged.partial.clone(),
+            staged.final_path.clone(),
+            staged.manifest_path(),
+            added.clone(),
+        ] {
+            assert!(!path.exists(), "{} is removed", path.display());
+            assert!(
+                syncs.iter().any(|event| {
+                    event.kind == publish::probe::SyncKind::Dir
+                        && event.destination == path
+                        && !event.destination_present
+                }),
+                "the removal of {} is made durable (a directory sync AFTER the unlink): {syncs:?}",
+                path.display()
+            );
+        }
+    }
+
+    /// Fix round 9, K3: when the staged copy's flush fails AND its partial cannot
+    /// be removed either, the REMOVAL failure is reported — that file is the only
+    /// copy of the failed backup's bytes, and it is still on disk.
+    #[tokio::test]
+    async fn a_staged_partial_that_cannot_be_removed_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source").join("pulse.db");
+        fs::create_dir_all(db_path.parent().expect("the source's directory"))
+            .expect("create the source's directory");
+        let db = crate::adapters::db::open_migrated(&db_path)
+            .await
+            .expect("migrate the source");
+        db.pool().close().await;
+        let out_dir = dir.path().join("out");
+        publish::probe::fail_next_file_sync();
+        // The staged partial's name is stamped INSIDE `stage_database`, so this
+        // injection is not keyed on a path.
+        publish::probe::fail_next_remove();
+
+        let Err(error) = super::stage_database(&db_path, &out_dir).await else {
+            panic!("the injected file sync failure must end staging");
+        };
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("flush the staged backup copy"),
+            "the flush failure is there: {message}"
+        );
+        assert!(
+            message.contains("[cleanup]"),
+            "and the removal failure rides with it: {message}"
+        );
+        let left: Vec<String> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".partial"))
+            .collect();
+        assert_eq!(
+            left.len(),
+            1,
+            "the partial is still there — which is what the error has to say: {left:?}"
+        );
+        assert!(
+            message.contains(&left[0]),
+            "and the error names it: {message}"
+        );
+    }
+
+    /// Fix round 2, N3: when the staged copy's own flush fails, the partial is
+    /// removed — the error returns before a `StagedBackup` exists, so `discard`
+    /// cannot do it and nothing else would.
+    #[tokio::test]
+    async fn a_failed_staged_flush_removes_the_partial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source").join("pulse.db");
+        fs::create_dir_all(db_path.parent().expect("the source's directory"))
+            .expect("create the source's directory");
+        let db = crate::adapters::db::open_migrated(&db_path)
+            .await
+            .expect("migrate the source");
+        db.pool().close().await;
+        let out_dir = dir.path().join("out");
+        publish::probe::fail_next_file_sync();
+
+        // (`StagedBackup` deliberately carries no `Debug`, so the failure is
+        // destructured rather than `expect_err`ed.)
+        let Err(error) = super::stage_database(&db_path, &out_dir).await else {
+            panic!("the injected file sync failure must end staging");
+        };
+
+        assert!(
+            error.to_string().contains("flush the staged backup copy"),
+            "the failure names the flush: {error}"
+        );
+        let left: Vec<String> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "no staged copy survives the failed flush: {left:?}"
+        );
+    }
+
+    /// Fix round 2, N1: when the LAST publish fails, the backup unwinds
+    /// completely — F2's removals AND the shared store's HEAD pointers this run
+    /// moved. They were published before the database, so without this the store
+    /// keeps advertising snapshots (and versions) the failed backup never
+    /// published.
+    #[tokio::test]
+    async fn a_failed_final_publish_also_restores_the_shared_store_pointers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The source: a migrated database and the committed fixture store.
+        let db_path = dir.path().join("source").join("pulse.db");
+        fs::create_dir_all(db_path.parent().expect("the source's directory"))
+            .expect("create the source's directory");
+        let db = crate::adapters::db::open_migrated(&db_path)
+            .await
+            .expect("migrate the source");
+        db.pool().close().await;
+        let data_dir = dir.path().join("source-data");
+        copy_tree(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/btcusdt-1m-store"),
+            &data_dir,
+        );
+
+        // The out store already points at ANOTHER version for one of the pairs:
+        // that is the value the failed backup has to put back.
+        let out_dir = dir.path().join("out");
+        fs::create_dir_all(&out_dir).expect("the out-dir");
+        let out_store = crate::adapters::store::CandleStore::with_base_dir(out_dir.clone());
+        let (source_heads, _) = crate::cli::import::scan_heads(&data_dir);
+        assert!(
+            !source_heads.is_empty(),
+            "the fixture store has HEAD pointers"
+        );
+        let head = &source_heads[0];
+        let prior = crate::domain::DataVersion::parse("0000000000000001").expect("a version tag");
+        out_store
+            .write_head(&head.pair, head.timeframe, &prior)
+            .expect("seed the store's prior pointer");
+
+        // The database publish (extension `db`) fails after its rename; the
+        // manifest publish beside it (extension `json`) succeeds.
+        publish::probe::fail_next_publish_with_extension("db");
+        let Err(_) = super::backup_target(&db_path, &data_dir, &out_dir).await else {
+            panic!("the injected publish failure must end the backup");
+        };
+
+        assert_eq!(
+            out_store
+                .read_head(&head.pair, head.timeframe)
+                .expect("read the restored pointer"),
+            Some(prior),
+            "the shared store's HEAD pointer is back to the value this backup found"
+        );
+        // And F2's removals still hold: no published database, no manifest, no
+        // snapshot this run added.
+        let left: Vec<String> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("pulse-"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "nothing of the failed backup is left: {left:?}"
+        );
+    }
+
+    /// Fix round 1, F6: a FIRST backup into an out-dir that does not exist yet
+    /// creates it — and every level above it — so each publish syncs the levels
+    /// this run created in THEIR parents, up to and including the first ancestor
+    /// that already existed. Without that, the whole tree a nightly backup makes
+    /// is one power loss away from not existing.
+    #[tokio::test]
+    async fn a_first_backup_into_an_absent_out_dir_syncs_every_level_it_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("source").join("pulse.db");
+        fs::create_dir_all(db_path.parent().expect("the source's directory"))
+            .expect("create the source's directory");
+        let db = crate::adapters::db::open_migrated(&db_path)
+            .await
+            .expect("migrate the source");
+        db.pool().close().await;
+        let data_dir = dir.path().join("source-data");
+        // TWO levels that do not exist yet; the tempdir is the first ancestor
+        // that does.
+        let out_dir = dir.path().join("backups").join("nightly");
+        let _ = publish::probe::take();
+
+        super::backup_target(&db_path, &data_dir, &out_dir)
+            .await
+            .expect("the first backup succeeds");
+
+        let synced: Vec<PathBuf> = publish::probe::take()
+            .into_iter()
+            .filter(|event| event.kind == publish::probe::SyncKind::Dir)
+            .map(|event| event.path)
+            .collect();
+        assert!(
+            synced.contains(&out_dir),
+            "the out-dir this run created is synced: {synced:?}"
+        );
+        assert!(
+            synced.contains(&dir.path().join("backups")),
+            "and so is the level that holds it: {synced:?}"
+        );
+        assert!(
+            synced.contains(&dir.path().to_path_buf()),
+            "and the first ancestor that already existed: {synced:?}"
+        );
+        let backups: Vec<PathBuf> = fs::read_dir(&out_dir)
+            .expect("read the out-dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "db"))
+            .collect();
+        assert_eq!(backups.len(), 1, "the backup is published: {backups:?}");
+    }
+
+    /// Fix round 1, F2: a failure AFTER the publish rename is a FULL rollback. The
+    /// database is already under its final name by then, and leaving it there —
+    /// without the manifest published beside it — gives `pulse restore` an
+    /// artifact it can only refuse and `--keep` a backup it counts.
+    #[test]
+    fn a_publish_that_fails_after_its_rename_is_discarded_completely() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = staged(dir.path(), None);
+        fs::write(&staged.partial, b"a complete copy").expect("stage the copy");
+        let manifest = staged.manifest_path();
+        fs::write(&manifest, b"{}").expect("publish a manifest");
+        let added = dir
+            .path()
+            .join("candles")
+            .join("BTCUSDT")
+            .join("15m")
+            .join("dv.parquet");
+        fs::create_dir_all(added.parent().expect("the snapshot's directory"))
+            .expect("create the snapshot's directory");
+        fs::write(&added, b"a copied snapshot").expect("write the copied snapshot");
+        // The publish's directory sync fails: the rename has already landed.
+        publish::probe::fail_next_sync_of(dir.path());
+
+        publish_staged_database(&staged)
+            .expect_err("the injected directory sync fails after the rename");
+        assert!(
+            staged.final_path.exists(),
+            "the rename landed, so the database is under its final name"
+        );
+
+        discard_all(&staged, std::slice::from_ref(&added)).expect("the rollback runs");
+
+        assert!(
+            !staged.final_path.exists(),
+            "the published database is removed too, not left manifest-less"
+        );
+        assert!(!manifest.exists(), "the manifest goes with it");
+        assert!(!added.exists(), "and the snapshot this run added");
+        assert!(
+            !staged.partial.exists(),
+            "and the staged name never survives"
+        );
+    }
+
+    /// Fix round 1, F8 (backup side): a snapshot whose rename landed is recorded
+    /// in `added` even when the directory sync after it fails, so this backup's
+    /// rollback removes it.
+    #[test]
+    fn a_snapshot_whose_directory_sync_fails_is_recorded_for_the_rollback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_data = dir.path().join("mac-data");
+        let leaf = source_data.join("candles").join("BTCUSDT").join("15m");
+        fs::create_dir_all(&leaf).expect("the source store");
+        fs::write(leaf.join("b51388284a3a4371.parquet"), b"snapshot bytes")
+            .expect("write the source snapshot");
+        let (snapshots, issues) = crate::cli::import::scan_snapshots(&source_data);
+        assert!(issues.is_empty(), "the source store is well-formed");
+        assert_eq!(snapshots.len(), 1, "one source snapshot");
+
+        let out_dir = dir.path().join("out");
+        let out_store = crate::adapters::store::CandleStore::with_base_dir(out_dir.clone());
+        let dest = out_store.snapshot_path(
+            &snapshots[0].pair,
+            snapshots[0].timeframe,
+            &snapshots[0].version,
+        );
+        publish::probe::fail_next_sync_of(dest.parent().expect("the leaf's directory"));
+        let mut added: Vec<PathBuf> = Vec::new();
+
+        super::copy_wanted(&out_store, &snapshots, &[0], &mut added)
+            .expect_err("the injected directory sync fails after the rename");
+
+        assert!(
+            dest.exists(),
+            "the rename landed before the sync failed: {}",
+            dest.display()
+        );
+        assert_eq!(
+            added,
+            vec![dest.clone()],
+            "and the copy is recorded so the rollback can remove it"
+        );
+
+        let staged = staged(&out_dir, None);
+        discard_all(&staged, &added).expect("the rollback runs");
+        assert!(
+            !dest.exists(),
+            "the rollback removed the published snapshot"
+        );
+    }
+
+    /// Fix round 12, S1: the dedup that decides whether a destination is this
+    /// run's to record — and therefore to DELETE on a rollback — must not read a
+    /// stat failure as "absent". The store here is the SHARED one, so recording a
+    /// snapshot a previous backup put there would make this run's rollback unlink
+    /// it. An unreadable destination refuses, and records nothing.
+    #[test]
+    fn a_pre_existing_snapshot_whose_presence_cannot_be_checked_is_never_rolled_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_data = dir.path().join("mac-data");
+        let leaf = source_data.join("candles").join("BTCUSDT").join("15m");
+        fs::create_dir_all(&leaf).expect("the source store");
+        fs::write(leaf.join("b51388284a3a4371.parquet"), b"snapshot bytes")
+            .expect("write the source snapshot");
+        let (snapshots, issues) = crate::cli::import::scan_snapshots(&source_data);
+        assert!(issues.is_empty(), "the source store is well-formed");
+        assert_eq!(snapshots.len(), 1, "one source snapshot");
+
+        let out_dir = dir.path().join("out");
+        let out_store = crate::adapters::store::CandleStore::with_base_dir(out_dir.clone());
+        let dest = out_store.snapshot_path(
+            &snapshots[0].pair,
+            snapshots[0].timeframe,
+            &snapshots[0].version,
+        );
+        // A previous backup's copy of this very snapshot is already there.
+        fs::create_dir_all(dest.parent().expect("the leaf's directory")).expect("create the leaf");
+        fs::write(&dest, b"snapshot bytes").expect("write the pre-existing snapshot");
+        publish::probe::fail_next_stat_of(&dest);
+        let mut added: Vec<PathBuf> = Vec::new();
+
+        let error = super::copy_wanted(&out_store, &snapshots, &[0], &mut added)
+            .expect_err("an unreadable destination refuses the backup copy");
+
+        assert!(
+            error.to_string().contains(&dest.display().to_string()),
+            "the refusal names the path it could not stat: {error}"
+        );
+        assert!(
+            added.is_empty(),
+            "and nothing is recorded for the rollback to delete: {added:?}"
+        );
+
+        // Whatever this run's rollback does, it cannot touch that snapshot.
+        let staged = staged(&out_dir, None);
+        discard_all(&staged, &added).expect("the rollback runs");
+        assert_eq!(
+            fs::read(&dest).expect("the pre-existing snapshot is still there"),
+            b"snapshot bytes",
+            "the snapshot a previous backup put in the shared store is untouched"
+        );
+    }
 }

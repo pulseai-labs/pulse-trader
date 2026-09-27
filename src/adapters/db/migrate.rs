@@ -15,11 +15,15 @@
 //! imported — per the audit-C5 re-derive convention).
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use chrono::Utc;
-use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 
 use super::{Db, MIGRATOR};
 use crate::domain::DataError;
@@ -95,6 +99,37 @@ async fn run_migrations_with_backup_using(
     db_path: &Path,
     migrator: &Migrator,
 ) -> Result<MigrationOutcome, DataError> {
+    run_migrations_with_backup_using_journal(db_path, migrator, SqliteJournalMode::Wal).await
+}
+
+/// [`run_migrations_with_backup_using`] with an explicit journal mode for the
+/// pool it opens on `db_path`.
+///
+/// Issue #258: the import's temporary copy is opened through
+/// [`open_migrated_copy`], which asks for rollback-journal mode — the file is
+/// about to be RENAMED into place, and a `-wal` beside it cannot travel with the
+/// rename.
+///
+/// The pool is CLOSED — never merely dropped — before this returns, on every
+/// path. Dropping a pool is not a close: sqlx returns a dropped connection to
+/// the pool from a SPAWNED task, and the connection's `SQLite` handle is released
+/// by that connection's own worker thread, so a dropped pool can keep the
+/// database file open after its owner has moved on. `SQLite` checkpoints and
+/// runs its final checkpoint and normally removes `-wal`/`-shm` when the LAST
+/// connection closes (it also checkpoints on its own at the WAL threshold), so
+/// which close removes the sidecars — and whether it has happened yet — is
+/// exactly the timing a caller that renames the file cannot tolerate (#258).
+///
+/// Closing is not a total guarantee either — a connection still in flight when
+/// the close starts is closed by its own spawned return — so the import's copy
+/// does not rely on close timing at all: it is opened with no WAL to strand
+/// ([`open_migrated_copy`]), and the install refuses rather than rename while
+/// any sidecar is still beside it.
+async fn run_migrations_with_backup_using_journal(
+    db_path: &Path,
+    migrator: &Migrator,
+    journal_mode: SqliteJournalMode,
+) -> Result<MigrationOutcome, DataError> {
     // Serialize the whole protocol — detect → backup → migrate → verify →
     // restore-on-failure — across processes. The second migrator parks here
     // until the first drops its lock, then derives `applied` from the
@@ -102,9 +137,21 @@ async fn run_migrations_with_backup_using(
     // restored file it must not trust).
     let _migration_lock = acquire_migration_lock(db_path).await?;
 
-    let db = Db::with_path(db_path).await?;
+    let db = Db::with_path_journal(db_path, journal_mode).await?;
     let pool = db.pool();
 
+    let outcome = migration_protocol(db_path, migrator, pool).await;
+    // CLOSE, don't merely drop (#258) — see this function's doc.
+    pool.close().await;
+    outcome
+}
+
+/// The protocol body, on a pool the caller owns (and closes on every path).
+async fn migration_protocol(
+    db_path: &Path,
+    migrator: &Migrator,
+    pool: &SqlitePool,
+) -> Result<MigrationOutcome, DataError> {
     // SETS, not maxima. This project allocates migration numbers at release planning
     // and ships them out of order — `r1.s1` shipped `0007` while `0005`/`0006` stayed
     // reserved for `r1.s2`/`r1.s3` — so "applied" and "current" are not the same
@@ -179,11 +226,433 @@ async fn run_migrations_with_backup_using(
             backup,
         }),
         Err(e) => {
-            // Drop the pool before restoring so no open handle holds the file.
-            drop(db);
+            // CLOSE the pool before restoring — not merely drop it — so no open
+            // handle holds the file the restore's rename is about to replace
+            // (issue #258: a dropped pool's connection is released later, by a
+            // worker thread nothing joins).
+            pool.close().await;
             restore_from_backup(db_path, &backup)?;
             Err(e)
         }
+    }
+}
+
+/// The suffixes `SQLite` puts a database's own un-checkpointed state in: the files
+/// an install moves aside beside the TARGET, so the old database's hot journal
+/// cannot be replayed into a freshly installed file (fix round 1, F3).
+pub(crate) const DB_STATE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// The directory a database target lives in (fix round 5, P4).
+///
+/// A bare relative file name (`--db pulse.db`) has an EMPTY parent — `parent()`
+/// answers `Some("")`, not `None` — and `create_dir_all("")`/`File::open("")`
+/// both fail, so the empty parent resolves to the current directory.
+pub(crate) fn target_dir(target: &Path) -> PathBuf {
+    match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// The marker every quarantine name carries (fix round 7, E3): the scan and the
+/// name builder share it, so the two cannot drift.
+pub(crate) const QUARANTINE_MARKER: &str = ".quarantine-";
+
+/// What an operator has to do with ONE stranded quarantine (fix round 7, E3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuarantineOwner {
+    /// The same database that is at the target path now: those bytes are its own
+    /// un-checkpointed rows, so they must be MOVED BACK.
+    Current,
+    /// The database it belongs to was REPLACED — the install's copy took the name,
+    /// and a rename preserves the inode, so the file there now is a different one.
+    /// Moving it back would replay the old database's pages into the new file: it
+    /// is STALE and must be DELETED, never moved back.
+    Replaced,
+    /// The name carries no inode (an older run's naming): whose bytes these are is
+    /// UNKNOWN, so they must not be moved back either — the safety backup is the
+    /// way to those rows.
+    Unknown,
+}
+
+/// One stranded quarantine: the file, the name it belongs under, and whose bytes
+/// it holds (fix round 7, E3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stranded {
+    /// The quarantine file itself.
+    pub(crate) quarantine: PathBuf,
+    /// The name it has to go back to (the target's own sidecar).
+    pub(crate) original: PathBuf,
+    /// Whose bytes it holds — what the operator must do with it.
+    pub(crate) owner: QuarantineOwner,
+}
+
+/// Why nothing may touch this database until an operator acts (fix round 4, Q1;
+/// round 7, E1 + E3).
+///
+/// The install moves the target's own sidecars aside BEFORE it renames the copy
+/// over them; a crash inside that window leaves them under their quarantine names,
+/// where the old sidecar no longer exists and the next run would never look.
+/// Recovering automatically is the wrong call — those bytes may be the target's
+/// only copy of its un-checkpointed rows — so everything that reads, backs up,
+/// replaces or migrates the database REFUSES, and says what to do with each file.
+#[derive(Debug)]
+pub(crate) enum InterruptedInstall {
+    /// An earlier install was interrupted after it moved the target's sidecars
+    /// aside; every stranded file is named with what to do about it.
+    Quarantined {
+        /// The database the quarantines are beside.
+        target: PathBuf,
+        /// Every stranded file, sorted by name.
+        stranded: Vec<Stranded>,
+    },
+    /// The target's directory could not be enumerated, so whether it holds a
+    /// quarantine is UNKNOWN (fix round 7, E1). Fail closed: a scan that cannot
+    /// finish is not an empty scan, and the rows a quarantine would hold are not
+    /// in the database file.
+    Unreadable {
+        /// The directory that could not be read.
+        dir: PathBuf,
+        /// Why it could not be read.
+        error: String,
+    },
+}
+
+impl std::error::Error for InterruptedInstall {}
+
+impl std::fmt::Display for InterruptedInstall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quarantined { target, stranded } => {
+                write!(
+                    f,
+                    "refusing to touch {}: an earlier install was interrupted after it moved the \
+                     target's sidecars aside",
+                    target.display()
+                )?;
+                let groups = [
+                    (
+                        QuarantineOwner::Current,
+                        "move each of these back before running this command — they belong to the \
+                         database that is there now, and hold its own un-checkpointed rows",
+                    ),
+                    (
+                        QuarantineOwner::Replaced,
+                        "do NOT move these back: the database they belong to was REPLACED, so \
+                         replaying them would push the old database's pages into the new file — \
+                         they are stale and must be deleted",
+                    ),
+                    (
+                        QuarantineOwner::Unknown,
+                        "do NOT move these back either: their names carry no record of which \
+                         database they belong to — restore the target from the safety backup if \
+                         you need those rows",
+                    ),
+                ];
+                for (owner, advice) in groups {
+                    let listed: Vec<String> = stranded
+                        .iter()
+                        .filter(|item| item.owner == owner)
+                        .map(|item| {
+                            format!(
+                                "{} -> {}",
+                                item.quarantine.display(),
+                                item.original.display()
+                            )
+                        })
+                        .collect();
+                    if listed.is_empty() {
+                        continue;
+                    }
+                    write!(f, ". {advice} ({})", listed.join("; "))?;
+                }
+                Ok(())
+            }
+            Self::Unreadable { dir, error } => write!(
+                f,
+                "cannot check {} for an interrupted install's quarantine files: {error} — \
+                 refusing to touch the database while whether it is missing rows is unknown",
+                dir.display()
+            ),
+        }
+    }
+}
+
+/// Fail closed on an interrupted earlier install (fix round 4, Q1; fix round 6,
+/// D1; fix round 7, E1).
+///
+/// ONE implementation, three callers: the import's verified copy, `pulse backup`
+/// and the production open ([`open_migrated`], so the app and `pulse serve`
+/// surface a crash inside the quarantine window at startup instead of reading a
+/// database that is missing those rows).
+///
+/// # Errors
+///
+/// [`InterruptedInstall::Quarantined`] when any quarantine of the target's own
+/// sidecars is still beside it, and [`InterruptedInstall::Unreadable`] when the
+/// directory could not be enumerated at all.
+pub(crate) fn refuse_orphaned_quarantines(target: &Path) -> Result<(), InterruptedInstall> {
+    let stranded = orphaned_quarantines(target)?;
+    if stranded.is_empty() {
+        return Ok(());
+    }
+    Err(InterruptedInstall::Quarantined {
+        target: target.to_path_buf(),
+        stranded,
+    })
+}
+
+/// The quarantine files an interrupted install left beside `target`, each with
+/// the name it has to go back to and whose bytes it holds. ANY pid counts: the run
+/// that made them is gone.
+///
+/// A bare relative target is scanned in the current directory, where its
+/// quarantine files would be (fix round 5, P4).
+///
+/// # Errors
+///
+/// [`InterruptedInstall::Unreadable`] when the directory cannot be read or an
+/// entry cannot be taken from it. Only a directory that is genuinely ABSENT is
+/// "no quarantines" (fix round 7, E1): a scan that could not finish must never
+/// read as an empty one.
+pub(crate) fn orphaned_quarantines(target: &Path) -> Result<Vec<Stranded>, InterruptedInstall> {
+    let dir = target_dir(target);
+    let Some(name) = target.file_name() else {
+        return Ok(Vec::new());
+    };
+    #[cfg(test)]
+    if probe::take_injected_read_dir_failure(&dir) {
+        return Err(InterruptedInstall::Unreadable {
+            dir,
+            error: "injected enumeration failure (cfg(test) seam)".to_owned(),
+        });
+    }
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(InterruptedInstall::Unreadable {
+                dir,
+                error: error.to_string(),
+            });
+        }
+    };
+    let current = inode_of(target);
+    let mut stranded: Vec<Stranded> = Vec::new();
+    for entry in entries {
+        // A per-entry failure is an error too (fix round 7, E1): `flatten()` used to
+        // hide it, and a hidden entry reads as "nothing here".
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Err(InterruptedInstall::Unreadable {
+                    dir,
+                    error: error.to_string(),
+                });
+            }
+        };
+        let entry_name = entry.file_name();
+        for suffix in DB_STATE_SUFFIXES {
+            let mut prefix = std::ffi::OsString::from(".");
+            prefix.push(name);
+            prefix.push(suffix);
+            prefix.push(QUARANTINE_MARKER);
+            let bytes = entry_name.as_os_str().as_encoded_bytes();
+            if let Some(tail) = bytes.strip_prefix(prefix.as_encoded_bytes()) {
+                stranded.push(Stranded {
+                    quarantine: entry.path(),
+                    original: sidecar_path(target, suffix),
+                    owner: ownership(tail, &current),
+                });
+            }
+        }
+    }
+    stranded.sort_by(|left, right| left.quarantine.cmp(&right.quarantine));
+    Ok(stranded)
+}
+
+/// Whose bytes a quarantine holds, from the tail of its name (fix round 7, E3).
+///
+/// The tail is `<pid>` — an older run, ownership unknown — or `<pid>-<inode>`.
+/// The inode is the identity a RENAME PRESERVES, so a quarantine taken from a
+/// database that is still at the target path matches the file there now, and one
+/// taken from a database the install replaced does not.
+fn ownership(tail: &[u8], current: &TargetIdentity) -> QuarantineOwner {
+    let Some(dash) = tail.iter().rposition(|byte| *byte == b'-') else {
+        return QuarantineOwner::Unknown;
+    };
+    let Some(recorded) = parse_inode(&tail[dash + 1..]) else {
+        return QuarantineOwner::Unknown;
+    };
+    match current {
+        TargetIdentity::Inode(inode) if *inode == recorded => QuarantineOwner::Current,
+        // A different inode — or no file at the target path at all — means the
+        // database those bytes belong to is not there any more.
+        TargetIdentity::Inode(_) | TargetIdentity::Absent => QuarantineOwner::Replaced,
+        // The target could not be identified (fix round 9, K1): unknown ownership,
+        // never "stale, delete it".
+        TargetIdentity::Unknown => QuarantineOwner::Unknown,
+    }
+}
+
+/// The inode a quarantine name records, if it records one: ASCII digits and
+/// nothing else (an older run's name carries none).
+fn parse_inode(digits: &[u8]) -> Option<u64> {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// The identity of the database at a target path (fix round 7, E3; round 9, K1).
+///
+/// The three outcomes are NOT interchangeable, which is why this is not an
+/// `Option`:
+///
+/// - [`Self::Inode`] — the file is there and its inode is known, so a quarantine's
+///   recorded inode can be compared with it;
+/// - [`Self::Absent`] — there is NO file at that path (`NotFound`): the database a
+///   quarantine belonged to is gone, so it is stale;
+/// - [`Self::Unknown`] — the metadata could not be read for any other reason (or
+///   this platform has no inode to read): whose bytes those are is NOT known, so
+///   the quarantine is neither moved back nor deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetIdentity {
+    /// The target file exists: this is its inode.
+    Inode(u64),
+    /// No file at the target path.
+    Absent,
+    /// The target's identity could not be established.
+    Unknown,
+}
+
+impl TargetIdentity {
+    /// The inode this identity carries, when it carries one — what a quarantine
+    /// NAME records (fix round 7, E3). [`Self::Absent`] and [`Self::Unknown`]
+    /// record nothing, which the scan reads back as [`QuarantineOwner::Unknown`].
+    pub(crate) fn inode(self) -> Option<u64> {
+        match self {
+            Self::Inode(inode) => Some(inode),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+}
+
+/// The inode of `target`, when there is one (fix round 7, E3).
+///
+/// A RENAME PRESERVES THE INODE, so this is the identity a quarantine can record
+/// to say which database its bytes belong to: the install's copy takes the
+/// target's NAME but keeps its own inode, so a quarantine taken before that rename
+/// no longer matches the file at the target path afterwards. (An inode number can
+/// be recycled — but only once the old file is gone, and the copy is created while
+/// it still exists, so a recycled number cannot be mistaken for it here.)
+///
+/// Fix round 9, K1: a metadata error that is NOT `NotFound` is
+/// [`TargetIdentity::Unknown`], never "no target" — an unreadable target must not
+/// turn a quarantine into "stale, delete it".
+#[cfg(unix)]
+pub(crate) fn inode_of(target: &Path) -> TargetIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(test)]
+    if probe::take_injected_metadata_failure(target) {
+        return TargetIdentity::Unknown;
+    }
+    match fs::metadata(target) {
+        Ok(meta) => TargetIdentity::Inode(meta.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TargetIdentity::Absent,
+        Err(_) => TargetIdentity::Unknown,
+    }
+}
+
+/// No inode on platforms without `MetadataExt` — the same gate
+/// [`acquire_migration_lock`] carries (fix round 8, H1).
+///
+/// The quarantine then records no identity, so the scan classifies it as
+/// [`QuarantineOwner::Unknown`] and the refusal says to restore from the safety
+/// backup rather than move it back: unknown ownership is never moved back.
+#[cfg(not(unix))]
+pub(crate) fn inode_of(_target: &Path) -> TargetIdentity {
+    TargetIdentity::Unknown
+}
+
+/// The quarantine name of one of the target's sidecars (fix round 7, E3).
+///
+/// `.<target><suffix>.quarantine-<pid>`, or `…-<pid>-<inode>` when the target's
+/// identity is known — which is what lets a later run tell whether the bytes
+/// belong to the database at the target path now ([`ownership`] reads it back).
+/// Built through the raw `OsStr` (fix round 2, N6): a target whose name is not
+/// valid UTF-8 must still get a usable quarantine name.
+pub(crate) fn quarantine_name(
+    target_name: &std::ffi::OsStr,
+    suffix: &str,
+    inode: Option<u64>,
+) -> std::ffi::OsString {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(target_name);
+    name.push(suffix);
+    name.push(QUARANTINE_MARKER);
+    name.push(std::process::id().to_string());
+    if let Some(inode) = inode {
+        name.push(format!("-{inode}"));
+    }
+    name
+}
+
+/// `cfg(test)`-only: make the NEXT enumeration of a directory fail (fix round 7,
+/// E1). The scan must then refuse — a scan that cannot finish is not an empty one.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        /// The directory whose next enumeration fails, one-shot.
+        static FAIL_NEXT_READ_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Make the next `read_dir` of `dir` fail, one-shot.
+    pub(crate) fn fail_next_read_dir_of(dir: &Path) {
+        FAIL_NEXT_READ_DIR.with(|pending| *pending.borrow_mut() = Some(dir.to_path_buf()));
+    }
+
+    thread_local! {
+        /// The target whose next metadata probe fails, one-shot (fix round 9, K1).
+        static FAIL_NEXT_METADATA: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Make the next metadata probe of `path` fail, one-shot. The target's
+    /// identity is then UNKNOWN — never "no target".
+    pub(crate) fn fail_next_metadata_of(path: &Path) {
+        FAIL_NEXT_METADATA.with(|pending| *pending.borrow_mut() = Some(path.to_path_buf()));
+    }
+
+    /// Consume the pending metadata failure when it names `path` (keyed on
+    /// `Some(path)`, so an unset seam never matches).
+    pub(crate) fn take_injected_metadata_failure(path: &Path) -> bool {
+        FAIL_NEXT_METADATA.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if pending.as_deref() == Some(path) {
+                *pending = None;
+                return true;
+            }
+            false
+        })
+    }
+
+    /// Consume the pending enumeration failure when it names `dir`.
+    ///
+    /// Keyed on `Some(dir)` — never on `None`, which would match every directory
+    /// (the `None == None` trap the publish probe fell into in round 6).
+    pub(crate) fn take_injected_read_dir_failure(dir: &Path) -> bool {
+        FAIL_NEXT_READ_DIR.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if pending.as_deref() == Some(dir) {
+                *pending = None;
+                return true;
+            }
+            false
+        })
     }
 }
 
@@ -197,10 +666,160 @@ async fn run_migrations_with_backup_using(
 /// # Errors
 /// [`DataError::Migration`] if the migration step fails (the db is already
 /// restored — the caller MUST NOT start); [`DataError::Db`] if the pool cannot be
-/// opened after a successful migrate.
+/// opened after a successful migrate;
+/// [`DataError::OrphanedQuarantines`] if an interrupted install left the target's
+/// own sidecar bytes beside it (fix round 6, D1) — checked BEFORE any connection
+/// is opened, because opening one would migrate a database that is missing rows.
 pub async fn open_migrated(db_path: &Path) -> Result<Db, DataError> {
+    refuse_orphaned_quarantines(db_path).map_err(|refusal| {
+        let message = refusal.to_string();
+        match refusal {
+            InterruptedInstall::Quarantined { .. } => DataError::OrphanedQuarantines(message),
+            // The precondition itself could not be checked (fix round 7, E1): the
+            // open refuses as a migration-protocol failure, not as a quarantine.
+            InterruptedInstall::Unreadable { .. } => DataError::Migration(message),
+        }
+    })?;
     run_migrations_with_backup(db_path).await?;
     Db::with_path(db_path).await
+}
+
+/// [`open_migrated`] on a **copy that is about to be renamed into place** (the
+/// import's temporary database, issue #258).
+///
+/// Same protocol, same verification, one difference that matters: the file is
+/// opened in [`SqliteJournalMode::Delete`], never WAL. The install renames the
+/// database file and nothing else, so a `-wal`/`-shm` beside it would be left
+/// behind under a name the rename does not carry — with every row still
+/// committed in it — which is exactly the silent data loss 0857a92 meant to
+/// close. In rollback-journal mode there is no WAL to strand, and that is the
+/// only guarantee available: `SQLite` checkpoints on its own at the WAL
+/// threshold and a final checkpoint normally removes `-wal`/`-shm` when the LAST
+/// connection closes, so whether a WAL-mode copy's sidecars are gone by the time
+/// of a rename depends on when that close lands — and sqlx closes connections
+/// from spawned tasks and worker threads that nothing here awaits.
+///
+/// The mode is READ BACK, not assumed: sqlx applies `PRAGMA journal_mode` when
+/// it connects and ignores the statement's result, so a database that stayed in
+/// WAL (another connection holding the file, a locked file) would otherwise
+/// pass unnoticed and hand the install exactly the sidecars this prevents.
+///
+/// # Errors
+///
+/// As [`open_migrated`], plus [`DataError::Db`] when the copy is not in
+/// rollback-journal mode after opening.
+pub(crate) async fn open_migrated_copy(db_path: &Path) -> Result<Db, DataError> {
+    let journal_mode = SqliteJournalMode::Delete;
+    run_migrations_with_backup_using_journal(db_path, &MIGRATOR, journal_mode).await?;
+    let db = Db::with_path_journal(db_path, journal_mode).await?;
+    match verified_journal_mode(db.pool(), journal_mode).await {
+        Ok(()) => Ok(db),
+        Err(error) => {
+            // Never hand a copy in the wrong mode to a rename.
+            db.pool().close().await;
+            Err(error)
+        }
+    }
+}
+
+/// Put `db_path` back in WAL and PROVE it, for a database that was just
+/// published (ADR-0019; issue #259 review, F4).
+///
+/// `journal_mode` is persisted IN the database file, and the import installs a
+/// copy that ran in rollback-journal mode (#258) — so without this the file a
+/// `pulse import` leaves behind is in DELETE mode until some later process
+/// happens to open it. The production posture is restored here, read back, and
+/// closed before the command reports success, exactly as
+/// [`open_migrated_copy`] proves the copy's mode on the way in.
+///
+/// # Errors
+///
+/// [`DataError::Db`] when the database cannot be opened, the mode cannot be
+/// read, or it reports anything but WAL.
+pub(crate) async fn put_in_wal(db_path: &Path) -> Result<(), DataError> {
+    // ONE connection, never a pool — and it must STAY that way. A pool's `close`
+    // can return with a connection still in flight, and the sidecars that close
+    // lands late are exactly #258's failure mode; no test pins this reliably (the
+    // race did not fire in 80 loaded iterations — fix round 2, X1), so it is kept
+    // by construction. `Connection::close` shuts this connection's worker thread
+    // down SYNCHRONOUSLY — the worker drops its `SQLite` handle (which
+    // checkpoints and unlinks the `-wal`/`-shm` this switch created) before it
+    // acknowledges — so when this returns, the file is released and the directory
+    // holds the database alone.
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(super::BUSY_TIMEOUT_SECS));
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| DataError::Db(format!("open {} in WAL: {e}", db_path.display())))?;
+    let read: Result<String, sqlx::Error> = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut connection)
+        .await;
+    // The connection is closed on EVERY path after connect (fix round 4, Q3) —
+    // including a failed read-back, which used to return first and leave the file
+    // (and the `-wal` this switch created) to the connection's worker thread. The
+    // synchronous close is the whole point of keeping this ONE connection.
+    let closed = connection.close().await;
+    let mode = read.map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
+    closed.map_err(|e| DataError::Db(format!("close {}: {e}", db_path.display())))?;
+    require_journal_mode(&mode, SqliteJournalMode::Wal)
+}
+
+/// Read `PRAGMA journal_mode` back and refuse anything but `expected`.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] when the pragma cannot be read, or when the
+/// database reports a different mode — the copy would be renamed with sidecars
+/// it cannot carry (issue #258).
+async fn verified_journal_mode(
+    pool: &SqlitePool,
+    expected: SqliteJournalMode,
+) -> Result<(), DataError> {
+    let actual: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| DataError::Db(format!("read PRAGMA journal_mode: {e}")))?;
+    require_journal_mode(&actual, expected).map_err(|error| {
+        DataError::Db(format!(
+            "{error}: it is opened as a copy that is renamed into place, and a sidecar it cannot \
+             carry would strand committed rows outside the installed database"
+        ))
+    })
+}
+
+/// Refuse a database that does not report `expected` as its journal mode.
+///
+/// sqlx applies `PRAGMA journal_mode` at connect and ignores the statement's
+/// result, so a mode is a property to READ BACK, not to assume — the seam both
+/// the copy's opener ([`open_migrated_copy`]) and the install's WAL switch
+/// ([`put_in_wal`]) go through.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] naming both modes.
+fn require_journal_mode(actual: &str, expected: SqliteJournalMode) -> Result<(), DataError> {
+    let expected = journal_mode_name(expected);
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    Err(DataError::Db(format!(
+        "the database reports journal_mode `{actual}`, not `{expected}`"
+    )))
+}
+
+/// The `PRAGMA journal_mode` spelling of a mode, for a read-back comparison
+/// (sqlx's own `as_str` is crate-private).
+fn journal_mode_name(mode: SqliteJournalMode) -> &'static str {
+    match mode {
+        SqliteJournalMode::Delete => "delete",
+        SqliteJournalMode::Truncate => "truncate",
+        SqliteJournalMode::Persist => "persist",
+        SqliteJournalMode::Memory => "memory",
+        SqliteJournalMode::Wal => "wal",
+        SqliteJournalMode::Off => "off",
+    }
 }
 
 /// Revert the schema down to `target_version` (in-process, no CLI).
@@ -1292,5 +1911,355 @@ mod reserved_number_tests {
         );
 
         restore(&dir, &withheld);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// issue #258 — the copy the install renames, and the sidecars it can strand
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod install_copy_tests {
+    use super::{open_migrated, open_migrated_copy};
+    use crate::adapters::db::Db;
+    use crate::domain::DataError;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// Every `-wal`/`-shm`/`-journal`/`.partial` sidecar beside a database —
+    /// the files a rename of the database alone cannot carry. `migrate.lock` is
+    /// deliberately NOT one of them: the protocol creates and keeps it by
+    /// design (it holds no committed rows).
+    fn sidecars(db: &Path) -> Vec<PathBuf> {
+        ["-wal", "-shm", "-journal", ".partial"]
+            .iter()
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", db.display())))
+            .filter(|sidecar| sidecar.exists())
+            .collect()
+    }
+
+    /// `PRAGMA journal_mode` as this connection sees it.
+    async fn journal_mode(db: &Db) -> String {
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        mode.to_ascii_lowercase()
+    }
+
+    /// WAL is PERSISTED IN the database file, not just in the connection: header
+    /// bytes 18/19 are the file format's write/read versions (2 = WAL, 1 =
+    /// legacy rollback journal). Reading them is the file-level check that
+    /// [`journal_mode`] alone cannot make.
+    fn file_declares_wal(db: &Path) -> bool {
+        let header = std::fs::read(db).unwrap();
+        header.get(18) == Some(&2) && header.get(19) == Some(&2)
+    }
+
+    /// Issue #258 (AC-1): the copy the install renames into place runs in
+    /// ROLLBACK-JOURNAL mode, so no `-wal`/`-shm` can exist beside it at any
+    /// moment — the structural half of the fix. The mode is read back, not
+    /// assumed: sqlx applies `PRAGMA journal_mode` and ignores its result.
+    #[tokio::test]
+    async fn a_copy_opened_for_the_install_runs_in_rollback_journal_mode() {
+        let tmp = TempDir::new().unwrap();
+        let copy_path = tmp.path().join(".pulse.db.import-tmp-1.db");
+
+        let copy = open_migrated_copy(&copy_path).await.unwrap();
+        assert_eq!(
+            journal_mode(&copy).await,
+            "delete",
+            "the copy the install renames must not be in WAL"
+        );
+        copy.pool().close().await;
+
+        assert!(
+            !file_declares_wal(&copy_path),
+            "and the file itself does not declare WAL: a rename carries the file only"
+        );
+        assert!(
+            sidecars(&copy_path).is_empty(),
+            "so nothing is left beside it to strand: {:?}",
+            sidecars(&copy_path)
+        );
+    }
+
+    /// ADR-0019's WAL posture is a property OF THE FILE the install publishes:
+    /// the copy arrives in rollback-journal mode (#258), so the app's NEXT normal
+    /// open ([`open_migrated`], which opens through `Db::with_path`) must put the
+    /// database back in WAL — otherwise a production database would run in
+    /// DELETE mode after every import or restore.
+    #[tokio::test]
+    async fn an_installed_copy_returns_to_wal_on_the_next_normal_open() {
+        let tmp = TempDir::new().unwrap();
+        let copy_path = tmp.path().join(".pulse.db.import-tmp-1.db");
+        let target = tmp.path().join("pulse.db");
+
+        let copy = open_migrated_copy(&copy_path).await.unwrap();
+        copy.pool().close().await;
+        // The install: the copy takes the target's name (what `install_tmp_db`
+        // does with the file).
+        std::fs::rename(&copy_path, &target).unwrap();
+        assert!(!file_declares_wal(&target), "installed in rollback mode");
+
+        let installed = open_migrated(&target).await.unwrap();
+        assert_eq!(
+            journal_mode(&installed).await,
+            "wal",
+            "the first normal open puts the installed database back in WAL"
+        );
+        installed.pool().close().await;
+
+        // And it stays that way across restarts: a fresh open reads the same
+        // mode back, and the file itself now declares WAL.
+        let reopened = open_migrated(&target).await.unwrap();
+        assert_eq!(
+            journal_mode(&reopened).await,
+            "wal",
+            "WAL survives a restart"
+        );
+        reopened.pool().close().await;
+        assert!(
+            file_declares_wal(&target),
+            "the installed database's own header says WAL"
+        );
+    }
+
+    /// Fix round 6, D1: the app's own open refuses a target with an interrupted
+    /// install's quarantine files beside it, BEFORE any connection is opened — so a
+    /// crash inside the quarantine window surfaces at app/`serve` startup exactly as
+    /// it does at import/backup, instead of migrating a database that is missing the
+    /// rows those files hold.
+    #[tokio::test]
+    async fn opening_a_database_with_an_orphaned_quarantine_refuses_before_it_connects() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        // Part 1: a file that is NOT a database at all. If the open reached the
+        // protocol first, the error would be a `Db` one — so the TYPED refusal is
+        // itself the proof that the check runs before anything is opened.
+        std::fs::write(&db_path, b"not a database").unwrap();
+        let orphan = tmp.path().join(".pulse.db-wal.quarantine-999999");
+        std::fs::write(&orphan, b"the target's un-checkpointed rows").unwrap();
+
+        let error = open_migrated(&db_path)
+            .await
+            .expect_err("an orphaned quarantine refuses the open");
+        let DataError::OrphanedQuarantines(message) = &error else {
+            panic!("the refusal is typed, not a generic db error: {error:?}");
+        };
+        assert!(
+            message.contains(".pulse.db-wal.quarantine-999999"),
+            "the refusal names the quarantine: {message}"
+        );
+        assert!(
+            message.contains("pulse.db-wal"),
+            "and the name those rows have to go back to: {message}"
+        );
+        assert!(
+            orphan.exists(),
+            "nothing was moved, deleted or recovered automatically"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            b"not a database",
+            "and the target was not touched"
+        );
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            left.len(),
+            2,
+            "no connection was made (a connect would leave a `-shm`/`-wal` behind): {left:?}"
+        );
+
+        // Part 2: the realistic case — a migrated database with an interrupted
+        // install's leftovers beside it. The orphan moves out of the way first, so
+        // this half starts from a database that opens normally.
+        std::fs::remove_file(&orphan).unwrap();
+        std::fs::remove_file(&db_path).unwrap();
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+        std::fs::write(&orphan, b"the target's un-checkpointed rows").unwrap();
+        let error = open_migrated(&db_path)
+            .await
+            .expect_err("the quarantine is still there, so this open refuses too");
+        assert!(
+            matches!(error, DataError::OrphanedQuarantines(_)),
+            "a migrated target is refused the same way: {error:?}"
+        );
+        assert!(
+            orphan.exists(),
+            "and its bytes are still the operator's to move"
+        );
+    }
+
+    /// Fix round 7, E1: a scan that cannot finish REFUSES — it is not an empty
+    /// scan. A database may be missing exactly the rows a quarantine holds, so
+    /// "could not check" must never read as "nothing there"; the one case that is
+    /// still "none" is a directory that does not exist at all.
+    #[tokio::test]
+    async fn an_unreadable_directory_refuses_instead_of_reporting_no_quarantines() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+
+        // The scan itself fails closed...
+        super::probe::fail_next_read_dir_of(tmp.path());
+        let scan = super::orphaned_quarantines(&db_path).expect_err("the scan fails closed");
+        let super::InterruptedInstall::Unreadable { dir, error } = &scan else {
+            panic!("an enumeration failure is not a quarantine refusal: {scan:?}");
+        };
+        assert_eq!(
+            dir,
+            tmp.path(),
+            "the refusal names the directory it could not read"
+        );
+        assert!(
+            error.contains("injected enumeration failure"),
+            "and why: {error}"
+        );
+
+        // ...and so does the production open, which refuses as a protocol failure.
+        super::probe::fail_next_read_dir_of(tmp.path());
+        let error = open_migrated(&db_path)
+            .await
+            .expect_err("an unreadable directory refuses the open");
+        let DataError::Migration(message) = &error else {
+            panic!("the open reports the precondition it could not check: {error:?}");
+        };
+        assert!(
+            message.contains("cannot check") && message.contains("unknown"),
+            "the message says the state is unknown, not that there is nothing: {message}"
+        );
+
+        // A directory that is genuinely ABSENT is the one case that is "none".
+        let absent = tmp.path().join("nowhere").join("pulse.db");
+        assert!(
+            super::orphaned_quarantines(&absent)
+                .expect("an absent directory is not an error")
+                .is_empty(),
+            "a database with no directory has no quarantines beside it"
+        );
+    }
+
+    /// Fix round 7, E3: the refusal knows WHICH database each quarantine belongs
+    /// to — the name records the inode a rename preserves — so it can say "move
+    /// it back", "delete it as stale" or "restore from the safety backup" instead
+    /// of one instruction for three different situations.
+    #[tokio::test]
+    async fn the_refusal_knows_which_database_each_quarantine_belongs_to() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+        let super::TargetIdentity::Inode(inode) = super::inode_of(&db_path) else {
+            panic!("the database has an inode");
+        };
+
+        // Three quarantines beside it: this database's own (same inode), one the
+        // install REPLACED (the copy took the name, its inode is its own), and an
+        // older run's name, which records no identity at all.
+        let current = super::quarantine_name("pulse.db".as_ref(), "-wal", Some(inode));
+        let replaced = super::quarantine_name("pulse.db".as_ref(), "-journal", Some(inode + 1));
+        let unknown = std::ffi::OsString::from(".pulse.db-shm.quarantine-999999");
+        for name in [&current, &replaced, &unknown] {
+            std::fs::write(tmp.path().join(name), b"bytes").unwrap();
+        }
+
+        let stranded = super::orphaned_quarantines(&db_path).expect("the scan reads the directory");
+        let owner_of = |name: &std::ffi::OsString| {
+            stranded
+                .iter()
+                .find(|item| item.quarantine.file_name() == Some(name.as_os_str()))
+                .map(|item| item.owner)
+        };
+        assert_eq!(
+            owner_of(&current),
+            Some(super::QuarantineOwner::Current),
+            "the database that is there now owns its own quarantine"
+        );
+        assert_eq!(
+            owner_of(&replaced),
+            Some(super::QuarantineOwner::Replaced),
+            "a different inode means the database it belonged to was replaced"
+        );
+        assert_eq!(
+            owner_of(&unknown),
+            Some(super::QuarantineOwner::Unknown),
+            "a name without an inode records no identity"
+        );
+
+        // And the operator is told what to do with each of the three.
+        let message = super::refuse_orphaned_quarantines(&db_path)
+            .expect_err("the quarantines refuse the run")
+            .to_string();
+        assert!(
+            message.contains("move each of these back before running this command"),
+            "the current one says move it back: {message}"
+        );
+        assert!(
+            message.contains("they are stale and must be deleted"),
+            "the replaced one says delete it, never move it back: {message}"
+        );
+        assert!(
+            message.contains("restore the target from the safety backup"),
+            "the unknown one says restore from the backup: {message}"
+        );
+        for name in [&current, &replaced, &unknown] {
+            assert!(
+                message.contains(&name.to_string_lossy().to_string()),
+                "and every file is named: {message}"
+            );
+        }
+    }
+
+    /// Fix round 9, K1: a target whose metadata cannot be read is UNKNOWN
+    /// ownership — never "no target". An unreadable database must not turn its
+    /// quarantine into "stale, delete it", and must not invite a move-back either.
+    #[tokio::test]
+    async fn an_unreadable_target_classifies_its_quarantine_as_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("pulse.db");
+        let db = open_migrated(&db_path).await.unwrap();
+        db.pool().close().await;
+        let super::TargetIdentity::Inode(inode) = super::inode_of(&db_path) else {
+            panic!("the database has an inode");
+        };
+        // A quarantine naming a DIFFERENT inode: with a readable target it is
+        // `Replaced` — stale, delete it.
+        let stale = super::quarantine_name("pulse.db".as_ref(), "-wal", Some(inode + 1));
+        std::fs::write(tmp.path().join(&stale), b"bytes").unwrap();
+        assert_eq!(
+            super::orphaned_quarantines(&db_path).expect("the scan reads")[0].owner,
+            super::QuarantineOwner::Replaced,
+            "with the target readable, a different inode means replaced"
+        );
+
+        // ...but when the target's metadata cannot be read, ownership is UNKNOWN.
+        super::probe::fail_next_metadata_of(&db_path);
+        let stranded = super::orphaned_quarantines(&db_path).expect("the scan reads");
+        assert_eq!(
+            stranded[0].owner,
+            super::QuarantineOwner::Unknown,
+            "an unreadable target is unknown ownership, never stale: {stranded:?}"
+        );
+        // The seam is one-shot, so the refusal's own scan gets its own injection.
+        super::probe::fail_next_metadata_of(&db_path);
+        let message = super::refuse_orphaned_quarantines(&db_path)
+            .expect_err("the quarantine refuses")
+            .to_string();
+        assert!(
+            message.contains("restore the target from the safety backup"),
+            "and the advice is the backup: {message}"
+        );
+        assert!(
+            !message.contains("they are stale and must be deleted"),
+            "never 'delete it as stale' for an unreadable target: {message}"
+        );
     }
 }
