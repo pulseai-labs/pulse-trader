@@ -116,6 +116,12 @@ fn flat_m15(n: i64) -> Vec<Candle> {
 
 /// [`flat_m15`] whose first bar is absolute M15 index `start` — so the series
 /// can begin mid-stream while the H4 fixture keeps its own `h4(j)` indexing.
+///
+/// Every bar whose half-open span contains an 8h boundary (00:00/08:00/16:00
+/// UTC — absolute M15 indices divisible by 32) carries the default zero-rate
+/// funding stamp: the engine's funding-order precondition expects stamps on
+/// real-shaped series, and a zero rate pays zero, so no scenario's expected
+/// values move. Tests that assert funding place their own non-zero stamps.
 fn flat_m15_from(start: i64, n: i64) -> Vec<Candle> {
     (start..start + n)
         .map(|i| {
@@ -128,7 +134,11 @@ fn flat_m15_from(start: i64, n: i64) -> Vec<Candle> {
                 low: dec(995, 1),   // 99.5
                 close: dec(100, 0),
                 volume: dec(1, 0),
-                funding_rate: None,
+                funding_rate: if open_time % 28_800_000 == 0 {
+                    Some(Decimal::ZERO)
+                } else {
+                    None
+                },
             }
         })
         .collect()

@@ -53,6 +53,32 @@ impl BinanceAdapter {
         Decimal::new(125, 0)
     }
 
+    /// Binance USD-M perpetual futures funding interval = 8 hours. Events land
+    /// at 00:00 / 08:00 / 16:00 UTC (epoch multiples of 28 800 000 ms), so a
+    /// candle whose half-open `[open_time, close_time)` span contains one of
+    /// those instants is the funding bar the engine's ordering precondition
+    /// checks for (r3.s1.w3). Pinned here like the filters above — never
+    /// fetched — for golden-fixture reproducibility.
+    const FUNDING_INTERVAL_MS: i64 = 28_800_000;
+
+    /// The pair's pinned funding interval in milliseconds.
+    ///
+    /// Any non-`BTCUSDT` pair yields [`ExchangeError::UnknownSymbol`] — the
+    /// engine turns that into a typed refusal rather than defaulting an
+    /// interval it does not know (#45).
+    ///
+    /// # Errors
+    ///
+    /// [`ExchangeError::UnknownSymbol`] when the adapter has no funding
+    /// interval pinned for `pair`.
+    pub fn funding_interval_ms(&self, pair: &Pair) -> Result<i64, ExchangeError> {
+        if pair.as_str() == Self::BTCUSDT {
+            Ok(Self::FUNDING_INTERVAL_MS)
+        } else {
+            Err(ExchangeError::UnknownSymbol(pair.as_str().to_owned()))
+        }
+    }
+
     /// Construct a new adapter. Stateless.
     #[must_use]
     pub fn new() -> Self {
@@ -105,6 +131,24 @@ mod tests {
         let err = adapter
             .symbol_filters(&Pair::new("ETHUSDT"))
             .expect_err("non-BTCUSDT pair is unknown");
+        assert_eq!(err, ExchangeError::UnknownSymbol("ETHUSDT".to_owned()));
+    }
+
+    #[test]
+    fn btcusdt_funding_interval_is_pinned_at_eight_hours() {
+        let adapter = BinanceAdapter::new();
+        let interval = adapter
+            .funding_interval_ms(&Pair::new("BTCUSDT"))
+            .expect("BTCUSDT funding interval");
+        assert_eq!(interval, 28_800_000, "USD-M perpetuals fund every 8h");
+    }
+
+    #[test]
+    fn unknown_pair_funding_interval_errors_unknown_symbol() {
+        let adapter = BinanceAdapter::new();
+        let err = adapter
+            .funding_interval_ms(&Pair::new("ETHUSDT"))
+            .expect_err("non-BTCUSDT pair has no pinned funding interval");
         assert_eq!(err, ExchangeError::UnknownSymbol("ETHUSDT".to_owned()));
     }
 }

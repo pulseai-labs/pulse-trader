@@ -355,7 +355,9 @@ pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 // VS-1.2.1 work-1.03: deterministic, sequential backtest engine. The adapter
 // owns the concrete indicator engine while composing the pure domain backtest
 // types and money-math primitives.
-pub use adapters::backtest::{BacktestConfig, first_fully_warm_bar_ms, run_backtest};
+pub use adapters::backtest::{
+    BacktestConfig, FundingGapWindow, first_fully_warm_bar_ms, funding_gaps, run_backtest,
+};
 
 // VS-1.1.4 work-1.01: the SQLite persistence foundation. `Db` is the WAL pool
 // wrapper (`with_path`/`open_default`/`pool`); `MIGRATOR` is the embedded
@@ -464,8 +466,9 @@ pub use server::ops::{ComposeRunCtx, ComposeRunner, SweepConfig};
 // type is a `dead_code` build error, not a warning. Kept additive (work-1.02's
 // MTF feed extends the same `backtest` tree at the R1→R2 merge).
 pub use domain::{
-    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
-    apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, taker_fee,
+    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, Side, Trade,
+    TradeSource, apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
+    taker_fee,
 };
 
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
