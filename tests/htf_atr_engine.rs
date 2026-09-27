@@ -83,6 +83,14 @@ fn dec(mantissa: i64, scale: u32) -> Decimal {
 // ---------------------------------------------------------------------------
 
 /// One H4 candle: `open_time = j × 4h`, `close_time = open + 4h − 1`.
+/// One H4 bar at absolute index `j`, carrying the same boundary-stamp policy as
+/// [`flat_m15_from`]: every bar whose half-open span contains an 8h boundary
+/// (00:00/08:00/16:00 UTC) carries the default zero-rate funding stamp, because
+/// the engine's funding-order precondition expects stamps on real-shaped series
+/// (r3.s1.w3's boundary rule refuses a span that crosses an unstamped event).
+/// A zero rate pays zero, so no scenario's expected values move — and a fixture
+/// that is invalid on two axes at once can no longer hide the refusal under test
+/// behind a funding gap.
 fn h4(j: i64, open: i64, high: i64, low: i64, close: i64) -> Candle {
     let open_time = j * Timeframe::H4.duration_ms();
     Candle {
@@ -93,7 +101,11 @@ fn h4(j: i64, open: i64, high: i64, low: i64, close: i64) -> Candle {
         low: dec(low, 0),
         close: dec(close, 0),
         volume: dec(1, 0),
-        funding_rate: None,
+        funding_rate: if open_time % 28_800_000 == 0 {
+            Some(Decimal::ZERO)
+        } else {
+            None
+        },
     }
 }
 

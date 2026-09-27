@@ -318,10 +318,237 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
         Ok(BacktestRunId::new(run_id))
     }
 
+    /// The classified core lives in the inherent impl below; this trait method
+    /// keeps the port's single error type.
+    async fn get_run(&self, id: &BacktestRunId) -> Result<Option<PersistedRun>, DataError> {
+        self.get_run_classified(id)
+            .await
+            .map_err(RunReadFailure::into_data_error)
+    }
+
+    async fn latest_run_for_version(
+        &self,
+        strategy_version_id: &VersionId,
+    ) -> Result<Option<PersistedRun>, DataError> {
+        let sid = strategy_version_id.as_str();
+        // #40 stable ordering: most-recent first, deterministic id tie-break.
+        //
+        // FOLD RUNS ARE NOT THE VERSION'S LATEST RUN (N1). A walk-forward's K
+        // folds are `backtest_run` rows of this version that share ONE
+        // `created_at` (the save's single injected-clock instant), so the
+        // `id DESC` tie-break would hand an arbitrary fold — a UUIDv4, not a
+        // clock — the title of "the version's latest run", and with it the
+        // Library KPIs, the parent expectancy delta, and the pins a later run
+        // inherits by default. A fold is a measurement of one sub-window, never
+        // the version's latest full-span result, so rows carrying
+        // `walk_forward_run_id` are excluded here. `list_runs_for_version` still
+        // lists them: they ARE runs, and the Lab's fold table reads them as such.
+        let row = sqlx::query!(
+            r#"SELECT id AS "id!: String"
+               FROM backtest_run
+               WHERE strategy_version_id = ?1
+                 AND walk_forward_run_id IS NULL
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1"#,
+            sid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        // Reuse get_run's fetch-trades-and-validate path (fail-closed + tamper-check).
+        match row {
+            None => Ok(None),
+            Some(r) => self.get_run(&BacktestRunId::new(r.id)).await,
+        }
+    }
+
+    async fn latest_readable_run_for_version(
+        &self,
+        strategy_version_id: &VersionId,
+    ) -> Result<LatestReadableRun, DataError> {
+        let sid = strategy_version_id.as_str();
+        // The same candidate order as `latest_run_for_version` (newest first,
+        // fold rows excluded — N1), but the walk keeps going past a row whose
+        // READ fails on the row itself: D5's skip-with-warning, lifted to the
+        // latest-run lookup (#198). One corrupt row costs its own warning,
+        // never the whole read path.
+        //
+        // The skip is for a corrupt ROW only (r3.s1's round-1 review): a STORE
+        // failure — the query, its connection, its I/O — is returned, never
+        // skipped. Swallowing it would read an outage as "this version has no
+        // prior run" and hand the next run default inputs behind a warning log.
+        let rows = sqlx::query!(
+            r#"SELECT id AS "id!: String"
+               FROM backtest_run
+               WHERE strategy_version_id = ?1
+                 AND walk_forward_run_id IS NULL
+               ORDER BY created_at DESC, id DESC"#,
+            sid,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        let mut skipped = Vec::new();
+        for row in rows {
+            match self
+                .get_run_classified(&BacktestRunId::new(row.id.clone()))
+                .await
+            {
+                Ok(Some(run)) => {
+                    return Ok(LatestReadableRun {
+                        run: Some(run),
+                        skipped,
+                    });
+                }
+                Ok(None) => {
+                    // The row vanished between the candidate query and the
+                    // read — the same treatment as an unreadable one, not a
+                    // silent hole in the walk.
+                    eprintln!(
+                        "latest_readable_run_for_version: run `{}` of version `{sid}` no longer \
+                         exists; skipping",
+                        row.id
+                    );
+                    skipped.push((
+                        BacktestRunId::new(row.id),
+                        "the run row no longer exists".to_owned(),
+                    ));
+                }
+                Err(RunReadFailure::Corrupt(reason)) => {
+                    eprintln!(
+                        "latest_readable_run_for_version: skipping unreadable run `{}` of version \
+                         `{sid}`: {reason}",
+                        row.id
+                    );
+                    skipped.push((BacktestRunId::new(row.id), reason));
+                }
+                Err(RunReadFailure::Store(reason)) => return Err(DataError::Db(reason)),
+            }
+        }
+        Ok(LatestReadableRun { run: None, skipped })
+    }
+
+    async fn list_runs_for_version(
+        &self,
+        strategy_version_id: &VersionId,
+    ) -> Result<Vec<RunSummary>, DataError> {
+        let sid = strategy_version_id.as_str();
+        // #40 stable ordering for the catalog.
+        let rows = sqlx::query!(
+            r#"SELECT
+                 id                  AS "id!: String",
+                 strategy_version_id AS "strategy_version_id!: String",
+                 schema_version      AS "schema_version!: i64",
+                 created_at          AS "created_at!: String",
+                 engine_fingerprint  AS "engine_fingerprint!: String",
+                 engine_target       AS "engine_target!: String",
+                 result_content_hash AS "result_content_hash!: String",
+                 net_pnl             AS "net_pnl!: String",
+                 expectancy          AS "expectancy?: String",
+                 trade_count         AS "trade_count?: i64"
+               FROM backtest_run
+               WHERE strategy_version_id = ?1
+               ORDER BY created_at, id"#,
+            sid,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        // #39 per-row corrupt-isolation — the ONLY method that skips-with-warning
+        // (D5): a corrupt summary row is dropped + `tracing::warn`ed, not a
+        // whole-list failure (a run catalog is best-effort UX).
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let list_row = ListRunRow {
+                id: r.id,
+                strategy_version_id: r.strategy_version_id,
+                schema_version: r.schema_version,
+                created_at: r.created_at,
+                engine_fingerprint: r.engine_fingerprint,
+                engine_target: r.engine_target,
+                result_content_hash: r.result_content_hash,
+                net_pnl: r.net_pnl,
+                expectancy: r.expectancy,
+                trade_count: r.trade_count,
+            };
+            match row_to_run_summary(&list_row) {
+                Ok(summary) => out.push(summary),
+                Err(e) => {
+                    // Skip-with-warning corrupt-isolation (D5): a corrupt summary row
+                    // is dropped + warned, never a whole-list failure (best-effort
+                    // catalog UX). The codebase has no `tracing`/`log` dependency (the
+                    // spec names `tracing::warn` aspirationally); `eprintln!` is the
+                    // established CLI-surface warning channel here (`main.rs:13`,
+                    // `cli/mod.rs:267`) and avoids the #41 MSRV/dependency risk. See
+                    // report §5.
+                    eprintln!(
+                        "warning: skipping corrupt backtest_run summary row `{}` in \
+                         list_runs_for_version (#39 best-effort catalog): {e}",
+                        list_row.id
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The classified core lives in the inherent impl below; this trait method
+    /// keeps the port's single error type.
+    async fn get_trades(&self, id: &BacktestRunId) -> Result<Vec<Trade>, DataError> {
+        self.get_trades_classified(id)
+            .await
+            .map_err(RunReadFailure::into_data_error)
+    }
+}
+
+/// Why one run's classified read failed (#198/#74; r3.s1's round-1 review).
+///
+/// The port's single [`DataError::Db`] cannot carry the difference, and the
+/// skip-tolerant walks must not confuse the two: a corrupt ROW costs its own
+/// warning and the walk moves on, while a failing STORE is never swallowed —
+/// reading an outage as "no prior run" would silently hand the next run default
+/// inputs, blank the Library's stats and hide a broken database behind a
+/// best-effort skip. `get_run`'s contract is unchanged: both classes still
+/// surface as [`DataError::Db`].
+pub(crate) enum RunReadFailure {
+    /// The row itself is corrupt, un-parseable, unsupported or fails its tamper
+    /// guard. Skippable by the walks.
+    Corrupt(String),
+    /// The store — the query, its connection, its I/O — failed. Never skippable.
+    Store(String),
+}
+
+impl RunReadFailure {
+    /// The port's single error type, unchanged by this distinction.
+    fn into_data_error(self) -> DataError {
+        match self {
+            Self::Corrupt(message) | Self::Store(message) => DataError::Db(message),
+        }
+    }
+}
+
+impl From<DataError> for RunReadFailure {
+    /// Inside the classified reads, every [`DataError`] that is not the store's
+    /// own failure comes from DECODING a row that did arrive — so the default is
+    /// [`RunReadFailure::Corrupt`] and the query sites name `Store` explicitly.
+    fn from(error: DataError) -> Self {
+        Self::Corrupt(error.to_string())
+    }
+}
+
+impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
+    /// [`BacktestRunRepository::get_run`] with the failure CLASS preserved (see
+    /// [`RunReadFailure`]). Same queries, same decode, same tamper guard.
     // The read reconstructs the full typed projection (32 columns) + re-derives the
     // trade-dependent hash; the line count is intrinsic to the explicit mapping (D4).
     #[allow(clippy::too_many_lines)]
-    async fn get_run(&self, id: &BacktestRunId) -> Result<Option<PersistedRun>, DataError> {
+    pub(crate) async fn get_run_classified(
+        &self,
+        id: &BacktestRunId,
+    ) -> Result<Option<PersistedRun>, RunReadFailure> {
         let id_str = id.as_str();
         let row = sqlx::query!(
             r#"SELECT
@@ -380,14 +607,14 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
+        .map_err(|e| RunReadFailure::Store(e.to_string()))?;
 
         let Some(r) = row else { return Ok(None) };
 
         // D1b: the stored schema_version is load-bearing — reject an unsupported tag
         // hard (a single-row read fails-closed; only the list-read rides D5 skip).
         if r.schema_version != RUN_SCHEMA_VERSION {
-            return Err(DataError::Db(format!(
+            return Err(RunReadFailure::Corrupt(format!(
                 "unsupported backtest_run schema version {}",
                 r.schema_version
             )));
@@ -395,7 +622,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
 
         // Fetch this run's trades (seq-ordered) INTERNALLY — fail-closed (D5):
         // get_trades returns Err on any corrupt trade row, never a partial log.
-        let trades = self.get_trades(id).await?;
+        let trades = self.get_trades_classified(id).await?;
 
         // Parse the run-row money totals + the regime breakdown + skipped counts
         // (fail-closed on any malformed column, D5).
@@ -532,181 +759,25 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
         }))
     }
 
-    async fn latest_run_for_version(
+    /// [`BacktestRunRepository::get_trades`] with the failure class preserved.
+    async fn get_trades_classified(
         &self,
-        strategy_version_id: &VersionId,
-    ) -> Result<Option<PersistedRun>, DataError> {
-        let sid = strategy_version_id.as_str();
-        // #40 stable ordering: most-recent first, deterministic id tie-break.
-        //
-        // FOLD RUNS ARE NOT THE VERSION'S LATEST RUN (N1). A walk-forward's K
-        // folds are `backtest_run` rows of this version that share ONE
-        // `created_at` (the save's single injected-clock instant), so the
-        // `id DESC` tie-break would hand an arbitrary fold — a UUIDv4, not a
-        // clock — the title of "the version's latest run", and with it the
-        // Library KPIs, the parent expectancy delta, and the pins a later run
-        // inherits by default. A fold is a measurement of one sub-window, never
-        // the version's latest full-span result, so rows carrying
-        // `walk_forward_run_id` are excluded here. `list_runs_for_version` still
-        // lists them: they ARE runs, and the Lab's fold table reads them as such.
-        let row = sqlx::query!(
-            r#"SELECT id AS "id!: String"
-               FROM backtest_run
-               WHERE strategy_version_id = ?1
-                 AND walk_forward_run_id IS NULL
-               ORDER BY created_at DESC, id DESC
-               LIMIT 1"#,
-            sid,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        // Reuse get_run's fetch-trades-and-validate path (fail-closed + tamper-check).
-        match row {
-            None => Ok(None),
-            Some(r) => self.get_run(&BacktestRunId::new(r.id)).await,
-        }
-    }
-
-    async fn latest_readable_run_for_version(
-        &self,
-        strategy_version_id: &VersionId,
-    ) -> Result<LatestReadableRun, DataError> {
-        let sid = strategy_version_id.as_str();
-        // The same candidate order as `latest_run_for_version` (newest first,
-        // fold rows excluded — N1), but the walk keeps going past a row
-        // `get_run` rejects: D5's skip-with-warning, lifted to the
-        // latest-run lookup (#198). One corrupt row costs its own warning,
-        // never the whole read path.
-        let rows = sqlx::query!(
-            r#"SELECT id AS "id!: String"
-               FROM backtest_run
-               WHERE strategy_version_id = ?1
-                 AND walk_forward_run_id IS NULL
-               ORDER BY created_at DESC, id DESC"#,
-            sid,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        let mut skipped = Vec::new();
-        for row in rows {
-            match self.get_run(&BacktestRunId::new(row.id.clone())).await {
-                Ok(Some(run)) => {
-                    return Ok(LatestReadableRun {
-                        run: Some(run),
-                        skipped,
-                    });
-                }
-                Ok(None) => {
-                    // The row vanished between the candidate query and the
-                    // read — the same treatment as an unreadable one, not a
-                    // silent hole in the walk.
-                    eprintln!(
-                        "latest_readable_run_for_version: run `{}` of version `{sid}` no longer \
-                         exists; skipping",
-                        row.id
-                    );
-                    skipped.push((
-                        BacktestRunId::new(row.id),
-                        "the run row no longer exists".to_owned(),
-                    ));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "latest_readable_run_for_version: skipping unreadable run `{}` of version \
-                         `{sid}`: {e}",
-                        row.id
-                    );
-                    skipped.push((BacktestRunId::new(row.id), e.to_string()));
-                }
-            }
-        }
-        Ok(LatestReadableRun { run: None, skipped })
-    }
-
-    async fn list_runs_for_version(
-        &self,
-        strategy_version_id: &VersionId,
-    ) -> Result<Vec<RunSummary>, DataError> {
-        let sid = strategy_version_id.as_str();
-        // #40 stable ordering for the catalog.
-        let rows = sqlx::query!(
-            r#"SELECT
-                 id                  AS "id!: String",
-                 strategy_version_id AS "strategy_version_id!: String",
-                 schema_version      AS "schema_version!: i64",
-                 created_at          AS "created_at!: String",
-                 engine_fingerprint  AS "engine_fingerprint!: String",
-                 engine_target       AS "engine_target!: String",
-                 result_content_hash AS "result_content_hash!: String",
-                 net_pnl             AS "net_pnl!: String",
-                 expectancy          AS "expectancy?: String",
-                 trade_count         AS "trade_count?: i64"
-               FROM backtest_run
-               WHERE strategy_version_id = ?1
-               ORDER BY created_at, id"#,
-            sid,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        // #39 per-row corrupt-isolation — the ONLY method that skips-with-warning
-        // (D5): a corrupt summary row is dropped + `tracing::warn`ed, not a
-        // whole-list failure (a run catalog is best-effort UX).
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let list_row = ListRunRow {
-                id: r.id,
-                strategy_version_id: r.strategy_version_id,
-                schema_version: r.schema_version,
-                created_at: r.created_at,
-                engine_fingerprint: r.engine_fingerprint,
-                engine_target: r.engine_target,
-                result_content_hash: r.result_content_hash,
-                net_pnl: r.net_pnl,
-                expectancy: r.expectancy,
-                trade_count: r.trade_count,
-            };
-            match row_to_run_summary(&list_row) {
-                Ok(summary) => out.push(summary),
-                Err(e) => {
-                    // Skip-with-warning corrupt-isolation (D5): a corrupt summary row
-                    // is dropped + warned, never a whole-list failure (best-effort
-                    // catalog UX). The codebase has no `tracing`/`log` dependency (the
-                    // spec names `tracing::warn` aspirationally); `eprintln!` is the
-                    // established CLI-surface warning channel here (`main.rs:13`,
-                    // `cli/mod.rs:267`) and avoids the #41 MSRV/dependency risk. See
-                    // report §5.
-                    eprintln!(
-                        "warning: skipping corrupt backtest_run summary row `{}` in \
-                         list_runs_for_version (#39 best-effort catalog): {e}",
-                        list_row.id
-                    );
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    async fn get_trades(&self, id: &BacktestRunId) -> Result<Vec<Trade>, DataError> {
+        id: &BacktestRunId,
+    ) -> Result<Vec<Trade>, RunReadFailure> {
         let id_str = id.as_str();
         // Assert the run's schema_version is supported (D1b) — fail-closed even when
-        // called directly (e.g. get_run delegates here). A missing run → empty log.
+        // called directly (e.g. get_run_classified delegates here). A missing run → empty log.
         let schema = sqlx::query!(
             r#"SELECT schema_version AS "schema_version!: i64" FROM backtest_run WHERE id = ?1"#,
             id_str,
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
+        .map_err(|e| RunReadFailure::Store(e.to_string()))?;
         if let Some(s) = schema
             && s.schema_version != RUN_SCHEMA_VERSION
         {
-            return Err(DataError::Db(format!(
+            return Err(RunReadFailure::Corrupt(format!(
                 "unsupported backtest_run schema version {}",
                 s.schema_version
             )));
@@ -739,7 +810,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
+        .map_err(|e| RunReadFailure::Store(e.to_string()))?;
 
         // Fail-closed (D5 / audit C9): a trade log feeds P&L/equity/hash
         // reconstruction, so ANY corrupt/un-parseable trade row is an Err — never a
@@ -1486,7 +1557,8 @@ mod tests {
     use crate::domain::sizing::SkippedEntryCounts;
     use crate::domain::strategy::VersionId;
     use crate::domain::{
-        BacktestRunRepository, DataVersion, Direction, EngineFingerprint, Pair, Timeframe,
+        BacktestRunRepository, DataError, DataVersion, Direction, EngineFingerprint, Pair,
+        Timeframe,
     };
     use rust_decimal::Decimal;
     use sqlx::SqlitePool;
@@ -2178,6 +2250,78 @@ mod tests {
         assert!(
             repo.get_run(&id).await.is_err(),
             "get_run is fail-closed too"
+        );
+    }
+
+    // ---- r3.s1 round-1 review: the walk's skip arm is for a corrupt ROW, never
+    // ---- for a failing STORE -------------------------------------------------
+
+    /// `latest_readable_run_for_version` keeps D5's skip-with-warning for a row
+    /// that cannot be DECODED, and returns the failure for a store that cannot
+    /// ANSWER. The second half matters most: an outage reported as "no prior
+    /// run" would hand the next run default inputs behind a warning log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn latest_readable_run_skips_a_corrupt_row_but_not_a_failing_store() {
+        let (repo, pool, _tmp) = repo_at(1_700_000_000_000).await;
+        let (result, summary) = result_from(
+            vec![simple_trade()],
+            RegimeBreakdown::new(),
+            SkippedEntryCounts::new(),
+        );
+        let id = repo
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
+            .await
+            .expect("save_run");
+
+        // Damage the ONLY run at the TRADE level: a row that does not DECODE.
+        sqlx::query(
+            "INSERT INTO trade \
+             (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, \
+              entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, \
+              fees_total, funding_total, slippage_total, realized_pnl, realized_r, \
+              mfe_r, mae_r, exit_reason, source, regime, fills) \
+             VALUES ('trade-corrupt', ?1, 1, 'long', '1', '1', '1', 0,0,0,0, '0','0','0', \
+                     'NOT_A_DECIMAL', '0', '0', '0', 'take_profit', 'backtest', 'ranging', '[]')",
+        )
+        .bind(id.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed corrupt trade");
+
+        let walked = repo
+            .latest_readable_run_for_version(&VersionId::new("ver-1"))
+            .await
+            .expect("a corrupt row is skipped, not returned");
+        assert!(
+            walked.run.is_none(),
+            "the only row is undecodable → no readable prior run"
+        );
+        assert_eq!(
+            walked.skipped.len(),
+            1,
+            "and the skip is REPORTED, not silent"
+        );
+
+        // Now fail the STORE: the table the full read needs is gone. The walk
+        // must return the failure — a store failure is not a corrupt row.
+        sqlx::query("DROP TABLE trade")
+            .execute(&pool)
+            .await
+            .expect("drop the trades table to simulate a failing store");
+
+        let err = repo
+            .latest_readable_run_for_version(&VersionId::new("ver-1"))
+            .await
+            .expect_err("a store failure is never skipped");
+        assert!(
+            matches!(&err, DataError::Db(message) if message.contains("trade")),
+            "the store failure comes back as the port's DataError::Db; got {err:?}"
         );
     }
 

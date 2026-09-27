@@ -376,6 +376,50 @@ fn windowed_counted_span_ignores_unstamped_lead_in_but_refuses_its_own_gaps() {
     );
 }
 
+/// A counted span whose EDGES are closer together than one interval still needs
+/// its own funding boundary stamped. The distance rule alone excused it — the
+/// span looks continuous — yet the 08:00 event sits inside it unstamped and the
+/// accrual would quietly charge zero for it (#45's r3.s1 review).
+#[test]
+fn short_counted_span_still_refuses_an_unstamped_boundary_inside_it() {
+    // Bars 1..=32 (00:15 .. 08:15): an 8h00m counted span, inside the 8h15m
+    // distance tolerance, with the 08:00 boundary inside it and no stamp.
+    let unstamped = m15_series((1..=32).map(raw_m15).collect());
+    let err = run(&unstamped, None, None).expect_err(
+        "an 8h boundary inside the counted span must be stamped even when the span \
+         itself is only one interval long",
+    );
+    assert!(
+        matches!(
+            err,
+            BacktestError::FundingGap {
+                from: 27_900_000, // one M15 bar before the 08:00 boundary
+                to: 29_699_999,   // the counted span's end (the last bar's close)
+            }
+        ),
+        "the refusal must name the uncovered segment; got {err:?}"
+    );
+
+    // The same span with the boundary's own candle stamped runs.
+    let stamped = m15_series(
+        (1..=32)
+            .map(|i| {
+                if i == 32 {
+                    stamped_m15(i, dec(1, 3))
+                } else {
+                    raw_m15(i)
+                }
+            })
+            .collect(),
+    );
+    let result = run(&stamped, None, None).expect("a stamped boundary must run");
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "the flat-100 fixture still enters once"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Unknown funding interval
 // ---------------------------------------------------------------------------

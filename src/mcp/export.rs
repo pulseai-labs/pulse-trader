@@ -238,3 +238,45 @@ fn set_owner_only(path: &Path) -> Result<(), DataError> {
 fn set_owner_only(_path: &Path) -> Result<(), DataError> {
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::path_json;
+    use std::path::PathBuf;
+
+    /// r3.s1.w4 (#199): a path that is not valid UTF-8 refuses as the tool-level
+    /// message instead of reaching `serde_json` — whose `json!` unwrap would
+    /// panic the tool handler and take the MCP session down with it.
+    ///
+    /// Platform-independent on purpose: the path is CONSTRUCTED from invalid
+    /// UTF-8 bytes and never created on disk. The end-to-end case
+    /// (`tests/run_comparability.rs`) needs a real directory named with invalid
+    /// UTF-8 and is therefore Linux-only — APFS refuses such a name at
+    /// `create_dir_all` with `EILSEQ` — so this unit test is what pins the
+    /// refusal on the macOS CI leg.
+    #[cfg(unix)]
+    #[test]
+    fn path_json_refuses_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/exports-\xff-dir/export_trades-run-1-0.csv",
+        ));
+        let message = path_json(&path).expect_err("a non-UTF-8 path must refuse");
+        assert!(
+            message.contains("not valid UTF-8"),
+            "the refusal names the problem: {message}"
+        );
+    }
+
+    /// The other half of the seam: a UTF-8 path rides out verbatim, as a JSON
+    /// string (not a lossy rendering, not an object).
+    #[test]
+    fn path_json_keeps_a_utf8_path_verbatim() {
+        let path = PathBuf::from("/exports-dir/export_trades-run-1-0.csv");
+        assert_eq!(
+            path_json(&path).expect("a UTF-8 path renders"),
+            serde_json::json!("/exports-dir/export_trades-run-1-0.csv")
+        );
+    }
+}

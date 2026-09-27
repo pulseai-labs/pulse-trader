@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{SqliteBacktestRunRepo, SqliteStrategyRepo};
+use crate::adapters::db::{RunReadFailure, SqliteBacktestRunRepo, SqliteStrategyRepo};
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
     BacktestAppError, resolve_default_request, run_version_backtest,
@@ -561,7 +561,7 @@ impl PulseMcp {
         };
         let mut entries = Vec::with_capacity(summaries.len());
         for summary in &summaries {
-            match repo.get_run(&summary.id).await {
+            match repo.get_run_classified(&summary.id).await {
                 Ok(Some(run)) => entries.push(run_list_entry(&run)),
                 Ok(None) => {
                     // r3.s1.w4 (#198): one unreadable row is skipped with a
@@ -574,12 +574,18 @@ impl PulseMcp {
                         version.id.as_str()
                     );
                 }
-                Err(e) => {
+                Err(RunReadFailure::Corrupt(reason)) => {
                     eprintln!(
-                        "list_runs: skipping unreadable run `{}` of version `{}`: {e}",
+                        "list_runs: skipping unreadable run `{}` of version `{}`: {reason}",
                         summary.id.as_str(),
                         version.id.as_str()
                     );
+                }
+                Err(RunReadFailure::Store(reason)) => {
+                    // r3.s1's round-1 review: the skip is for a corrupt ROW only.
+                    // A STORE failure is the catalog's, not one row's — reporting
+                    // it as an empty/short list would be a false success.
+                    return Ok(tool_error(DataError::Db(reason)));
                 }
             }
         }

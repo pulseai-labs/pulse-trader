@@ -502,9 +502,11 @@ pub trait BacktestRunRepository {
 
     /// List the run catalog for a version (`ORDER BY created_at, id`, #40 stable).
     ///
-    /// **The ONLY method with #39 per-row corrupt-isolation** — a corrupt summary
-    /// row is skipped-with-warning (`tracing::warn`), not a whole-list failure,
-    /// because a run catalog is best-effort UX.
+    /// Carries #39 per-row corrupt-isolation — a corrupt summary row is
+    /// skipped-with-warning (`tracing::warn`), not a whole-list failure, because
+    /// a run catalog is best-effort UX.
+    /// [`latest_readable_run_for_version`](Self::latest_readable_run_for_version)
+    /// (r3.s1.w4) lifts the same policy to the latest-run lookup.
     ///
     /// # Errors
     ///
@@ -525,9 +527,9 @@ pub trait BacktestRunRepository {
     /// candidate order [`latest_run_for_version`](Self::latest_run_for_version)
     /// uses (fold rows excluded, N1), tries each through
     /// [`get_run`](Self::get_run)'s fail-closed fetch-trades-and-validate
-    /// path, skips a row that errors — warning on the same channel the list
-    /// walk uses — and answers the first readable one with the skipped rows'
-    /// ids and errors. The FR-7 prior-run check, the default-request
+    /// path, skips a row that cannot be DECODED — warning on the same channel
+    /// the list walk uses — and answers the first readable one with the skipped
+    /// rows' ids and errors. The FR-7 prior-run check, the default-request
     /// inheritance and the Library KPIs read through this; the coach accept
     /// deliberately does NOT (it needs THE run the session claims, and stays
     /// fail-closed).
@@ -537,9 +539,12 @@ pub trait BacktestRunRepository {
     ///
     /// # Errors
     ///
-    /// Returns [`DataError::Db`] only on a store-level failure (the
-    /// candidate query itself failing), never for a single unreadable row
-    /// (that is skipped and reported in [`LatestReadableRun::skipped`]).
+    /// Returns [`DataError::Db`] on a store-level failure — the candidate query,
+    /// the row's own query, its connection or its I/O failing — and never for a
+    /// single unreadable row (that is skipped and reported in
+    /// [`LatestReadableRun::skipped`]). The distinction is the point: an outage
+    /// read as "no prior run" would hand the next run default inputs behind a
+    /// warning log.
     fn latest_readable_run_for_version(
         &self,
         strategy_version_id: &VersionId,

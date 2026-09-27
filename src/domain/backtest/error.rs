@@ -11,9 +11,11 @@
 //!   (`entry == stop`) has no risk denominator, so sizing refuses rather than
 //!   dividing by zero or inventing a fallback. The loop (1.03) also raises it as
 //!   a precondition when a compiled strategy carries no `StopLoss` exit.
-//! - [`BacktestError::UnsupportedExit`] (C4) — `TrailingStop` / `TimeStop` exits
-//!   are not modelled this slice; 1.03 fail-fast rejects them with this variant
-//!   rather than silently mis-pricing them.
+//! - [`BacktestError::UnsupportedExit`] (C4) — the fail-fast refusal for an exit
+//!   kind the backtester does not model. `TrailingStop` / `TimeStop` were the
+//!   examples when this variant landed (1.01); r3.s1.w1 made both REAL exits
+//!   (G1/G2), so nothing constructs this variant any more. It stays because the
+//!   enum serde round-trips across the `Tauri` boundary.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -42,9 +44,12 @@ pub enum BacktestError {
     #[error("cannot size a position without a stop-loss (zero stop distance)")]
     NoStopLoss,
 
-    /// A compiled exit kind this slice does not model was encountered —
-    /// `TrailingStop` or `TimeStop`. 1.03 rejects it fail-fast rather than
-    /// mis-pricing it (C4).
+    /// A compiled exit kind this backtester does not model. **No exit kind
+    /// constructs this any more**: `TrailingStop` and `TimeStop` were the
+    /// examples when it landed (1.01, C4), and r3.s1.w1 made both real exits
+    /// (G1/G2). The variant is retained because the enum serde round-trips
+    /// across the `Tauri` boundary — a payload written by an older build must
+    /// still deserialize.
     #[error("unsupported exit kind for this backtester: {0}")]
     UnsupportedExit(String),
 

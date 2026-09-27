@@ -31,7 +31,6 @@ mod support;
 use rmcp::model::CallToolRequestParams;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use std::os::unix::ffi::OsStrExt as _;
 use std::time::Duration;
 use support::mcp::{FIXTURE_STORE, copy_tree, manifest, spawn_client};
 use tempfile::TempDir;
@@ -1108,6 +1107,86 @@ async fn list_runs_skips_an_unreadable_row_and_returns_the_readable_ones() {
     bounded_cancel(client).await;
 }
 
+/// The other half of that skip (#198's follow-up, r3.s1's round-1 review): a
+/// STORE failure is not a corrupt ROW. The catalog call must REPORT the failure
+/// — `is_error` naming it — instead of answering with a short list that reads
+/// like a version with fewer runs.
+#[tokio::test]
+async fn list_runs_reports_a_store_failure_instead_of_a_short_catalog() {
+    let world = world().await;
+    let run = run_version_backtest(
+        &world.strategies(),
+        &world.store,
+        &BinanceAdapter::new(),
+        &world.runs(),
+        &backtest_request(&world.version_id),
+    )
+    .await
+    .expect("the run executes");
+    assert!(
+        !run.run.id.as_str().is_empty(),
+        "the catalog has a readable row to lose"
+    );
+
+    // The store fails while the catalog's own candidate query still answers:
+    // the table every FULL read needs is gone, which is the shape that used to
+    // be swallowed as "no readable rows".
+    sqlx::query("DROP TABLE trade")
+        .execute(world.pool())
+        .await
+        .expect("drop the trades table to simulate a failing store");
+
+    let client = tokio::time::timeout(
+        CHILD_BOUND,
+        spawn_client(&world.db_path(), &world.store_path()),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "pulse mcp never finished its handshake within {CHILD_BOUND:?} — \
+             failing on the stall instead of hanging the suite"
+        )
+    });
+
+    let result = tokio::time::timeout(
+        CHILD_BOUND,
+        client.call_tool(
+            CallToolRequestParams::new("list_runs".to_owned()).with_arguments(
+                support::mcp::arguments(&serde_json::json!({
+                    "version_id": world.version_id.as_str(),
+                })),
+            ),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "list_runs never answered within {CHILD_BOUND:?} — the reply stalled; \
+             failing on the stall instead of hanging the suite"
+        )
+    })
+    .expect("the tools/call answers");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a failing store is the catalog's error, never a short list"
+    );
+    let message = result
+        .structured_content
+        .as_ref()
+        .and_then(|structured| structured.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        message.contains("trade"),
+        "the refusal names the store failure that caused it: {message}"
+    );
+
+    bounded_cancel(client).await;
+}
+
 // ---------------------------------------------------------------------------
 // AC-1 (vi): an export tool call refuses a non-UTF-8 path with a tool error
 // ---------------------------------------------------------------------------
@@ -1143,12 +1222,23 @@ async fn bounded_cancel(client: rmcp::service::RunningService<rmcp::RoleClient, 
 }
 
 /// `export_trades` with a server exports dir whose absolute path carries
-/// invalid UTF-8 bytes (built with `OsStr::from_bytes`, Linux): the tool call
+/// invalid UTF-8 bytes (built with `OsStr::from_bytes`): the tool call
 /// RETURNS a result — `is_error` with a message naming the problem — instead
 /// of panicking inside serialization and killing the session (r3.s1.w4,
 /// #199). The follow-up call proves the server lived.
+///
+/// Linux-only by necessity, not by preference: the case needs a directory
+/// whose NAME carries invalid UTF-8, and the `macos-latest` leg's APFS (the
+/// only nextest leg in CI) refuses such a name at `create_dir_all` with
+/// `EILSEQ`. Every export path derives from that canonicalized directory, so
+/// the scenario cannot be constructed on macOS at all. The refusal itself —
+/// `path_json` turning the path into the tool error — is pinned on EVERY
+/// platform by `src/mcp/export.rs`'s unit test, which builds the path without
+/// touching a filesystem.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_trades_refuses_a_non_utf8_path_with_a_tool_error() {
+    use std::os::unix::ffi::OsStrExt as _;
     let world = world().await;
     let data_dir = world
         .tmp

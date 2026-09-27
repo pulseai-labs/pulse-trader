@@ -1341,11 +1341,11 @@ fn funding_between(
 
 /// One uncovered segment of a run's counted span, in epoch ms.
 ///
-/// The funding-order precondition requires a funding stamp within one funding
-/// interval (plus one primary candle, the placement slack of a boundary stamp)
-/// of every point in the span. `from`/`to` are the segment's two anchors: the
-/// previous stamp (or the counted span's first counted `open_time`) and the
-/// next stamp (or the last primary candle's `close_time`).
+/// An uncovered segment has two anchors. In the distance walk they are the
+/// previous stamp (or the counted span's first counted `open_time`) and the next
+/// stamp (or the last primary candle's `close_time`). In the boundary sweep
+/// (rule 2 below) they are the missing funding boundary itself, one primary
+/// candle either side of it, clamped to the counted span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FundingGapWindow {
     /// The segment's earlier anchor: the previous stamp's `open_time`, or the
@@ -1356,13 +1356,24 @@ pub struct FundingGapWindow {
     pub to: i64,
 }
 
-/// Check the funding-order precondition (#45) over the run's counted span:
-/// from the span start to the first funding stamp, between consecutive stamps,
-/// and from the last stamp to the span end, each distance must be at most the
-/// pair's funding interval plus one primary candle duration — a stamp sits on
-/// the candle containing the event, up to one candle early, and a counted span
-/// no longer than one interval needs no stamp at all. Returns the uncovered
-/// segments in ascending order; an empty return means the precondition holds.
+/// Check the funding-order precondition (#45) over the run's counted span. Two
+/// rules, because either one alone leaves a hole (#45's r3.s1 review):
+///
+/// 1. **Distance.** From the span start to the first funding stamp, between
+///    consecutive stamps, and from the last stamp to the span end, each distance
+///    must be at most the pair's funding interval plus one primary candle
+///    duration — a stamp sits on the candle containing the event, up to one
+///    candle early.
+/// 2. **Boundaries.** Every funding boundary strictly inside the span must be
+///    covered by a stamp within one primary candle of it. Rule 1 is
+///    distance-only, so it excuses a span whose edges happen to be close
+///    together: a one-interval counted span starting mid-interval (00:15..08:15
+///    on M15) crosses the 08:00 event with nothing stamped, and the accrual
+///    would then charge zero for it without a word. A span with no boundary
+///    inside it still needs no stamp.
+///
+/// The uncovered segments come back in ascending order, merged where they
+/// overlap; an empty return means the precondition holds.
 ///
 /// Only the COUNTED span is checked: when `count_from_ms` is `Some`, bars
 /// before it are lead-in (r2.s3.w2) — no funding accrues on them, so their
@@ -1399,7 +1410,11 @@ pub fn funding_gaps(
     if span_end <= span_start {
         return Vec::new();
     }
-    let tolerance = interval_ms + series.timeframe.duration_ms();
+    let candle_ms = series.timeframe.duration_ms();
+    let tolerance = interval_ms + candle_ms;
+    let mut uncovered: Vec<FundingGapWindow> = Vec::new();
+
+    // Rule 1 — the distance walk over span start → in-span stamps → span end.
     let mut anchors: Vec<i64> = Vec::with_capacity(series.candles.len() + 2);
     anchors.push(span_start);
     anchors.extend(
@@ -1410,16 +1425,52 @@ pub fn funding_gaps(
             .map(|candle| candle.open_time),
     );
     anchors.push(span_end);
-    let mut gaps = Vec::new();
     for window in anchors.windows(2) {
         if window[1] - window[0] > tolerance {
-            gaps.push(FundingGapWindow {
+            uncovered.push(FundingGapWindow {
                 from: window[0],
                 to: window[1],
             });
         }
     }
-    gaps
+
+    // Rule 2 — every funding boundary strictly inside the counted span must be
+    // stamped. The boundaries are the pair's interval on the epoch grid
+    // (`funding.rs`: 00:00/08:00/16:00 UTC for the pinned 8h BTCUSDT interval).
+    let mut boundary = span_start.div_euclid(interval_ms) * interval_ms + interval_ms;
+    while boundary < span_end {
+        // A stamp covers the boundary when it sits on a candle within one
+        // primary candle of it — the candle CONTAINING the event, or (the
+        // defensive placement slack rule 1 already allowed) one either side.
+        let covered = series.candles.iter().any(|candle| {
+            candle.funding_rate.is_some() && (candle.open_time - boundary).abs() <= candle_ms
+        });
+        if !covered {
+            uncovered.push(FundingGapWindow {
+                from: span_start.max(boundary - candle_ms),
+                to: span_end.min(boundary + candle_ms),
+            });
+        }
+        boundary += interval_ms;
+    }
+
+    merged_windows(uncovered)
+}
+
+/// Sort the uncovered segments ascending and merge the ones that overlap or
+/// touch: a boundary's narrow window sits inside the wide distance window that
+/// already covers the same segment, so the caller reports one segment, not two
+/// views of it.
+fn merged_windows(mut windows: Vec<FundingGapWindow>) -> Vec<FundingGapWindow> {
+    windows.sort_by_key(|window| (window.from, window.to));
+    let mut merged: Vec<FundingGapWindow> = Vec::with_capacity(windows.len());
+    for window in windows {
+        match merged.last_mut() {
+            Some(last) if window.from <= last.to => last.to = last.to.max(window.to),
+            _ => merged.push(window),
+        }
+    }
+    merged
 }
 
 fn stop_rule(exits: &[CompiledExit]) -> Option<StopRule> {
@@ -2779,11 +2830,12 @@ mod tests {
 
     #[test]
     fn funding_gaps_allows_a_short_unstamped_span_but_flags_a_long_one() {
-        // 30 bars = 7.5h <= one interval: no stamps needed.
+        // 30 bars = 7.5h: no funding boundary lies INSIDE the counted span
+        // (the first one is the 8h mark, past its end), so no stamp is needed.
         let short = series((0..30).map(raw_candle).collect());
         assert!(
             funding_gaps(&short, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
-            "a counted span no longer than one interval needs no stamp"
+            "a counted span with no funding boundary inside it needs no stamp"
         );
         // 34 bars = 8.5h > one interval: unstamped, so uncovered.
         let long = series((0..34).map(raw_candle).collect());
@@ -2832,6 +2884,61 @@ mod tests {
         assert!(
             funding_gaps(&primary, Some(999 * 900_000), FUNDING_INTERVAL_TEST_MS).is_empty(),
             "a window with no counted bars has no span to check"
+        );
+    }
+
+    /// The distance walk alone excused a span whose edges are close enough: a
+    /// one-interval counted span starting mid-interval crosses a real funding
+    /// event with nothing stamped, and the accrual would then charge zero for it
+    /// (#45's r3.s1 review). The boundary sweep is what refuses it.
+    #[test]
+    fn funding_gaps_flags_an_unstamped_boundary_inside_a_short_span() {
+        // Bars 1..=32 (00:15 .. 08:15): a counted span of 8h00m — inside the
+        // 8h15m distance tolerance — whose 08:00 boundary (index 32) has no
+        // stamp anywhere near it.
+        let short = series((1..=32).map(raw_candle).collect());
+        assert_eq!(
+            funding_gaps(&short, None, FUNDING_INTERVAL_TEST_MS),
+            vec![FundingGapWindow {
+                from: 31 * 900_000,
+                to: 32 * 900_000 + 899_999,
+            }],
+            "the unstamped 8h boundary inside the span is one uncovered segment"
+        );
+
+        // The same span with the boundary's own candle stamped is clean.
+        let stamped = series(
+            (1..=32)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 32 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        assert!(
+            funding_gaps(&stamped, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a stamped boundary inside a short span leaves no uncovered segment"
+        );
+
+        // And a boundary a candle early still covers it — the placement slack
+        // the distance walk already granted.
+        let early = series(
+            (1..=32)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 31 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        assert!(
+            funding_gaps(&early, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a stamp one candle early still covers the boundary"
         );
     }
 }

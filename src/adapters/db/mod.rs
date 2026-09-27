@@ -49,6 +49,11 @@ pub use strategy_repo::SqliteStrategyRepo;
 // `db/mod.rs` re-export is necessary but not sufficient; lib.rs mirrors it).
 // Append-only (keep-both with strategy_repo's re-export at merge).
 pub use backtest_run_repo::SqliteBacktestRunRepo;
+// r3.s1's round-1 review (#198/#74 follow-up): the classified single-run read
+// failure. REQUIRED under `deny(warnings)` — a `pub(crate)` type unused outside
+// its module is a `dead_code` error; the MCP `list_runs` walk is the crate-side
+// consumer that tells a corrupt ROW (skip) from a failing STORE (fail closed).
+pub(crate) use backtest_run_repo::RunReadFailure;
 // VS-1.3.1 work-1.02: the SQLite `LlmCallRepository` adapter type. REQUIRED under
 // `deny(warnings)` — a `pub` type unused outside its module is a `dead_code` BUILD
 // error (the `db/mod.rs` re-export is necessary but not sufficient; lib.rs mirrors
