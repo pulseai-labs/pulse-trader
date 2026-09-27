@@ -375,9 +375,10 @@ fn previous_on_htf_is_relative_to_the_prior_h4_bar() {
 // ---------------------------------------------------------------------------
 
 /// Every TR is `1.0` through the warmup so `Atr(14)` is `1.0` at the signal bar
-/// (index 14). The **fill** bar (index 15) is given a `TR = 6` spike so its
-/// ATR would update — but the recorded stop uses the *signal-bar* `1.0`, frozen.
-/// Asserting `stop_price == entry − 2·1.0` (not `entry − 2·ATR(15)`) proves the
+/// (index 15 — one bar later since #36: warm also requires a previous value).
+/// The **fill** bar (index 16) is given a `TR = 6` spike so its ATR would
+/// update — but the recorded stop uses the *signal-bar* `1.0`, frozen.
+/// Asserting `stop_price == entry − 2·1.0` (not `entry − 2·ATR(16)`) proves the
 /// stop is pinned to the signal bar, not the fill bar.
 #[test]
 fn atr_stop_is_frozen_at_the_signal_bar_long() {
@@ -385,9 +386,9 @@ fn atr_stop_is_frozen_at_the_signal_bar_long() {
     // re-signal at that bar never fills (no bar 21 exists) — one trade total.
     let mut candles = flat_m15(21);
     // TR = 6 spike at the FILL bar (still above the 98 stop, so no intra-bar
-    // breach there) — enough to move ATR(15) off 1.0 and prove the freeze.
-    candles[15].high = dec(105, 0);
-    candles[15].low = dec(99, 0);
+    // breach there) — enough to move ATR(16) off 1.0 and prove the freeze.
+    candles[16].high = dec(105, 0);
+    candles[16].low = dec(99, 0);
     // The last bar dips through the 98 stop so the trade closes by StopLoss.
     candles[20].low = dec(97, 0);
     let primary = series(Timeframe::M15, candles);
@@ -404,7 +405,7 @@ fn atr_stop_is_frozen_at_the_signal_bar_long() {
 
     assert_eq!(result.trades.len(), 1);
     let trade = &result.trades[0];
-    let entry = trade.entry_price; // = candles[15].open = 100 (zero slippage)
+    let entry = trade.entry_price; // = candles[16].open = 100 (zero slippage)
     assert_eq!(entry, dec(100, 0));
     // Frozen at the SIGNAL bar's ATR(14)=1.0: stop = 100 − 2·1.0 = 98. The
     // fill-bar ATR would be ≈1.36 (the TR spike) — 98 proves the freeze.
@@ -425,10 +426,10 @@ fn atr_stop_is_frozen_at_the_signal_bar_long() {
 fn atr_stop_is_frozen_at_the_signal_bar_short() {
     // Same last-bar trick: the stop-out bar is the series end. The fill-bar
     // spike goes DOWN not up — a short stops on the high, so high=101 stays
-    // under the 102 stop while TR = max(6, 1, 5) = 6 still moves ATR(15).
+    // under the 102 stop while TR = max(6, 1, 5) = 6 still moves ATR(16).
     let mut candles = flat_m15(21);
-    candles[15].high = dec(101, 0);
-    candles[15].low = dec(95, 0);
+    candles[16].high = dec(101, 0);
+    candles[16].low = dec(95, 0);
     candles[20].high = dec(103, 0); // breaches the 102 stop
     let primary = series(Timeframe::M15, candles);
     let strategy = dsl(
@@ -485,15 +486,17 @@ fn unwarm_atr_produces_no_entry() {
     let result = run(&compiled(&strategy), &primary, None, SeriesEnd::SnapshotEnd);
 
     assert_eq!(result.trades.len(), 1);
-    // The earliest possible signal is the first index where ATR(5) is Some —
-    // index 5 (TRs at bars 1..=5 seed it). No earlier entry is possible.
+    // The earliest possible signal is the first bar where ATR(5) has a current
+    // value AND a previous one — index 6 since #36 (TRs at bars 1..=5 seed the
+    // first value at index 5; the previous value exists from index 6). No
+    // earlier entry is possible.
     assert_eq!(
-        result.trades[0].entry_signal_time, primary.candles[5].close_time,
+        result.trades[0].entry_signal_time, primary.candles[6].close_time,
         "an unwarm ATR at signal time produces no entry — the first signal is at the first warm bar"
     );
     assert_eq!(
         result.trades[0].entry_fill_time,
-        primary.candles[6].open_time
+        primary.candles[7].open_time
     );
 }
 

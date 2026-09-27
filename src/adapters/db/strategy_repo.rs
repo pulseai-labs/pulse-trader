@@ -149,10 +149,13 @@ fn feed_str(hasher: &mut Sha256, s: &str) {
 /// this is an integrity field). Scope is position-scoped (strategy + parent), not
 /// pure-content (gate-7 C6).
 ///
-/// `pub(crate)` since r1.s4.w4: the coach's accept transaction mints a child
-/// version and must key it with the SAME hash this file computes, or the two
-/// creation paths would disagree about a version's content identity.
-pub(crate) fn version_hash(
+/// `pub` since r3.s1.w2 (re-exported from `lib.rs`): the coach's accept
+/// transaction mints a child version and must key it with the SAME hash this
+/// file computes, or the two creation paths would disagree about a version's
+/// content identity — and the persisted-impossible suite mints an out-of-band
+/// pre-rule row whose hash the read path must verify.
+#[must_use]
+pub fn version_hash(
     strategy_id: &str,
     parent: Option<&str>,
     schema_version: &str,

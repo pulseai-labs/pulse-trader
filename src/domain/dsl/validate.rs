@@ -32,11 +32,11 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::condition::Condition;
+use super::condition::{Comparator, Condition};
 use super::exit::ExitRule;
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
-use super::value::{IndicatorSpec, ValueSource};
+use super::value::{IndicatorSpec, PriceField, ValueSource};
 
 /// A machine-actionable classification of a single semantic violation.
 ///
@@ -63,6 +63,14 @@ pub enum ValidationCode {
     EmptyName,
     /// An empty `And`/`Or` conjunction (vacuously true/false) (rule 8).
     EmptyConjunction,
+    /// A leaf condition that can never evaluate true on any bar (rule 9, G2).
+    ///
+    /// Judged per leaf: a same-series price pair the OHLC invariant rules out,
+    /// a same-operand strict comparison or cross, or a both-`Constant`
+    /// comparison that is false. Never judged under `Not` (a negation of an
+    /// impossible leaf is satisfiable), across `Series::Primary`/`Series::Htf`
+    /// (different bars), or on non-invariant fields (`Volume`, indicators).
+    ImpossibleCondition,
 }
 
 /// A single field-level, correctable validation error.
@@ -156,10 +164,10 @@ pub fn validate(dsl: &StrategyDsl) -> Result<ValidatedDsl, ValidationErrors> {
         });
     }
 
-    // Rules 1/2/6 over the condition tree: entry + every filter.
-    check_condition(&dsl.entry, "entry", &mut errors);
+    // Rules 1/2/6/9 over the condition tree: entry + every filter.
+    check_condition(&dsl.entry, "entry", &mut errors, true);
     for (i, filter) in dsl.filters.iter().enumerate() {
-        check_condition(filter, &format!("filters[{i}]"), &mut errors);
+        check_condition(filter, &format!("filters[{i}]"), &mut errors, true);
     }
 
     // Rules 1/3/4/5/6 over the exits.
@@ -176,14 +184,28 @@ pub fn validate(dsl: &StrategyDsl) -> Result<ValidatedDsl, ValidationErrors> {
 }
 
 /// Recursively validate a `Condition` subtree, threading the nesting-aware path.
-fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>) {
+///
+/// `judge` carries rule 9's reach (G2): a leaf is judged where it sits under
+/// the entry, a filter, a signal exit, or an `And` chain; under an `Or` the
+/// children are NOT judged (the `Or` is judged as a whole), and under a `Not`
+/// nothing is judged at all.
+fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>, judge: bool) {
     match cond {
         Condition::Compare { lhs, op: _, rhs } => {
             check_value_source(lhs, &format!("{path}.lhs"), errors);
             check_value_source(rhs, &format!("{path}.rhs"), errors);
+            if judge && let Some(message) = impossibility(cond) {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::ImpossibleCondition,
+                    message,
+                });
+            }
         }
         Condition::CrossesAbove { lhs, rhs } | Condition::CrossesBelow { lhs, rhs } => {
-            // Rule 2: a cross needs ≥1 series operand (Price/Indicator).
+            // Rule 2: a cross needs ≥1 series operand (Price/Indicator). The
+            // both-Constant cross reports ONLY DegenerateCross — never also
+            // rule 9 (no double report).
             if is_constant(lhs) && is_constant(rhs) {
                 errors.push(FieldError {
                     path: cross_path(cond, path),
@@ -191,6 +213,12 @@ fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>) {
                     message: "a cross comparison needs at least one Price or Indicator operand; \
                               both operands are Constant"
                         .to_owned(),
+                });
+            } else if judge && let Some(message) = impossibility(cond) {
+                errors.push(FieldError {
+                    path: cross_path(cond, path),
+                    code: ValidationCode::ImpossibleCondition,
+                    message,
                 });
             }
             check_value_source(lhs, &format!("{path}.lhs"), errors);
@@ -208,7 +236,7 @@ fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>) {
                 });
             }
             for (i, sub) in conditions.iter().enumerate() {
-                check_condition(sub, &format!("{path}.and[{i}]"), errors);
+                check_condition(sub, &format!("{path}.and[{i}]"), errors, judge);
             }
         }
         Condition::Or { conditions } => {
@@ -222,13 +250,206 @@ fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>) {
                         .to_owned(),
                 });
             }
+            // An impossible child of an Or is legal on its own — never report
+            // one per branch; the Or is refused once, at its own node, when
+            // EVERY branch is impossible (G2).
             for (i, sub) in conditions.iter().enumerate() {
-                check_condition(sub, &format!("{path}.or[{i}]"), errors);
+                check_condition(sub, &format!("{path}.or[{i}]"), errors, false);
+            }
+            if judge && let Some(message) = impossibility(cond) {
+                errors.push(FieldError {
+                    path: format!("{path}.or"),
+                    code: ValidationCode::ImpossibleCondition,
+                    message,
+                });
             }
         }
         Condition::Not { condition } => {
-            check_condition(condition, &format!("{path}.not"), errors);
+            // G2: a leaf under a `Not` is never judged — the negation of an
+            // impossible leaf is trivially satisfiable.
+            check_condition(condition, &format!("{path}.not"), errors, false);
         }
+    }
+}
+
+/// Rule 9 (G2): why a [`Condition`] subtree can never evaluate true, if it can
+/// never. `None` — possible, or not judged.
+///
+/// A leaf is judged per the impossibility table (same-series OHLC invariant,
+/// same-operand strict comparisons and crosses, false both-`Constant`
+/// comparisons). An `And` is impossible when any child is; an `Or` only when
+/// every child is; a `Not` is never descended into.
+fn impossibility(cond: &Condition) -> Option<String> {
+    match cond {
+        Condition::Compare { lhs, op, rhs } => impossible_compare(lhs, *op, rhs),
+        Condition::CrossesAbove { lhs, rhs } => impossible_cross(lhs, rhs, true),
+        Condition::CrossesBelow { lhs, rhs } => impossible_cross(lhs, rhs, false),
+        Condition::And { conditions } => conditions.iter().find_map(impossibility),
+        Condition::Or { conditions } => {
+            let reasons: Option<Vec<String>> = conditions.iter().map(impossibility).collect();
+            reasons.map(|reasons| {
+                format!(
+                    "every branch of this Or can never be true ({})",
+                    reasons.join("; ")
+                )
+            })
+        }
+        Condition::Not { .. } => None,
+    }
+}
+
+/// The impossibility table for one `Compare` leaf (rule 9).
+fn impossible_compare(lhs: &ValueSource, op: Comparator, rhs: &ValueSource) -> Option<String> {
+    let a = describe(lhs);
+    let b = describe(rhs);
+    // The same operand on both sides of a STRICT comparison: the two sides are
+    // equal on every bar, so `>`/`<` can never hold — for any operand variant,
+    // including two identical `Indicator`s.
+    if matches!(op, Comparator::Gt | Comparator::Lt) && lhs == rhs {
+        let word = if op == Comparator::Gt {
+            "above"
+        } else {
+            "below"
+        };
+        return Some(format!("{a} can never be {word} itself"));
+    }
+    // Same-series price pairs the OHLC invariant rules out:
+    // low ≤ open, low ≤ close, low ≤ high, open ≤ high, close ≤ high.
+    if let (
+        ValueSource::Price {
+            series: s1,
+            field: f1,
+        },
+        ValueSource::Price {
+            series: s2,
+            field: f2,
+        },
+    ) = (lhs, rhs)
+        && s1 == s2
+    {
+        if op == Comparator::Gt && provably_le(*f1, *f2) {
+            return Some(format!("{a} can never be above {b} on the same bar"));
+        }
+        if op == Comparator::Lt && provably_le(*f2, *f1) {
+            return Some(format!("{a} can never be below {b} on the same bar"));
+        }
+        // Gte/Lte/Eq over prices stay unjudged: a flat bar makes `low >= high`
+        // and `high == low` possible.
+        return None;
+    }
+    // Two constants: the literal comparison is decidable — refused when false.
+    if let (ValueSource::Constant { value: l }, ValueSource::Constant { value: r }) = (lhs, rhs) {
+        let holds = match op {
+            Comparator::Gt => l > r,
+            Comparator::Gte => l >= r,
+            Comparator::Lt => l < r,
+            Comparator::Lte => l <= r,
+            Comparator::Eq => l == r,
+        };
+        if !holds {
+            return Some(format!(
+                "the constant comparison {a} {} {b} is never true",
+                op_text(op)
+            ));
+        }
+    }
+    None
+}
+
+/// The impossibility table for one `CrossesAbove`/`CrossesBelow` leaf (rule 9):
+/// a cross needs `lhs` strictly beyond `rhs` on some bar, so a same-operand
+/// cross — or one where the same-series invariant pins `lhs` on the wrong side
+/// of `rhs` on every bar — can never fire.
+fn impossible_cross(lhs: &ValueSource, rhs: &ValueSource, above: bool) -> Option<String> {
+    let a = describe(lhs);
+    let b = describe(rhs);
+    let word = if above { "above" } else { "below" };
+    if lhs == rhs {
+        return Some(format!("{a} can never cross {word} itself"));
+    }
+    if let (
+        ValueSource::Price {
+            series: s1,
+            field: f1,
+        },
+        ValueSource::Price {
+            series: s2,
+            field: f2,
+        },
+    ) = (lhs, rhs)
+        && s1 == s2
+    {
+        let wrong_side = if above {
+            provably_le(*f1, *f2)
+        } else {
+            provably_le(*f2, *f1)
+        };
+        if wrong_side {
+            return Some(format!(
+                "{a} can never cross {word} {b}: it is never {word} {b} on any bar"
+            ));
+        }
+    }
+    None
+}
+
+/// Whether the OHLC invariant (`low ≤ open ≤ high`, `low ≤ close ≤ high`) puts
+/// `a` at or below `b` on every bar of the same series. Exactly the five
+/// ordered pairs it licenses — nothing else (not `open` vs `close`: a flat bar
+/// is possible; not `Volume`; never a price against an indicator, and never
+/// across `Series::Primary` and `Series::Htf` — different bars).
+fn provably_le(a: PriceField, b: PriceField) -> bool {
+    use PriceField::{Close, High, Low, Open};
+    matches!((a, b), (Low, Open | Close | High) | (Open | Close, High))
+}
+
+/// A trader-terms name for a [`ValueSource`] leaf, used in refusal messages.
+fn describe(v: &ValueSource) -> String {
+    match v {
+        ValueSource::Constant { value } => format!("the constant {value}"),
+        ValueSource::Price { field, .. } => field_name(*field).to_owned(),
+        ValueSource::Indicator { spec, .. } => format!("the {} value", spec_name(spec)),
+    }
+}
+
+/// The wire-independent lowercase name of a [`PriceField`].
+fn field_name(field: PriceField) -> &'static str {
+    match field {
+        PriceField::Open => "open",
+        PriceField::High => "high",
+        PriceField::Low => "low",
+        PriceField::Close => "close",
+        PriceField::Volume => "volume",
+    }
+}
+
+/// A short trader-terms name for an [`IndicatorSpec`].
+fn spec_name(spec: &IndicatorSpec) -> String {
+    match spec {
+        IndicatorSpec::Rsi { period } => format!("RSI({})", period_value(period)),
+        IndicatorSpec::Ema { period } => format!("EMA({})", period_value(period)),
+        IndicatorSpec::Adx { period } => format!("ADX({})", period_value(period)),
+        IndicatorSpec::Macd { .. } => "MACD".to_owned(),
+        IndicatorSpec::Atr { period } => format!("ATR({})", period_value(period)),
+    }
+}
+
+/// The rendered period of a sweepable indicator period.
+fn period_value(period: &SweepableValue<u32>) -> String {
+    match period {
+        SweepableValue::Fixed(n) => n.to_string(),
+        SweepableValue::Sweep { .. } => "sweep".to_owned(),
+    }
+}
+
+/// The symbol for a [`Comparator`], as a trader would write it.
+fn op_text(op: Comparator) -> &'static str {
+    match op {
+        Comparator::Gt => ">",
+        Comparator::Gte => ">=",
+        Comparator::Lt => "<",
+        Comparator::Lte => "<=",
+        Comparator::Eq => "==",
     }
 }
 
@@ -383,7 +604,7 @@ fn check_exits(exits: &[ExitRule], errors: &mut Vec<FieldError>) {
                 );
             }
             ExitRule::SignalExit { condition } => {
-                check_condition(condition, &format!("{base}.condition"), errors);
+                check_condition(condition, &format!("{base}.condition"), errors, true);
             }
             ExitRule::AtrStop { period, multiple } => {
                 // The ATR-multiple stop shares StopLoss's exclusive family
@@ -894,6 +1115,251 @@ mod tests {
             message: "RSI period must be greater than 0".to_owned(),
         };
         let json = serde_json::to_string(&e).expect("serialize FieldError");
+        let back: FieldError = serde_json::from_str(&json).expect("deserialize FieldError");
+        assert_eq!(back, e);
+    }
+
+    // -- rule 9 (ImpossibleCondition): the judgment helper's corners ----------
+
+    use crate::domain::dsl::value::PriceField;
+
+    fn price(field: PriceField) -> ValueSource {
+        ValueSource::Price {
+            series: Series::Primary,
+            field,
+        }
+    }
+
+    fn htf_price(field: PriceField) -> ValueSource {
+        ValueSource::Price {
+            series: Series::Htf,
+            field,
+        }
+    }
+
+    fn rsi(period: u32) -> ValueSource {
+        ValueSource::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Rsi {
+                period: SweepableValue::Fixed(period),
+            },
+        }
+    }
+
+    fn const_(mantissa: i64) -> ValueSource {
+        ValueSource::Constant {
+            value: Decimal::new(mantissa, 0),
+        }
+    }
+
+    fn cmp(lhs: ValueSource, op: Comparator, rhs: ValueSource) -> Condition {
+        Condition::Compare { lhs, op, rhs }
+    }
+
+    fn crosses(kind: CrossKind, lhs: ValueSource, rhs: ValueSource) -> Condition {
+        match kind {
+            CrossKind::Above => Condition::CrossesAbove { lhs, rhs },
+            CrossKind::Below => Condition::CrossesBelow { lhs, rhs },
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CrossKind {
+        Above,
+        Below,
+    }
+
+    fn entry_dsl(entry: Condition) -> StrategyDsl {
+        let mut s = valid_base();
+        s.entry = entry;
+        s
+    }
+
+    fn impossible_errs(s: &StrategyDsl) -> Vec<FieldError> {
+        validate(s)
+            .expect_err("refused")
+            .into_errors()
+            .into_iter()
+            .filter(|e| e.code == ValidationCode::ImpossibleCondition)
+            .collect()
+    }
+
+    /// A same-operand strict comparison is impossible for ANY operand variant,
+    /// including an `Indicator` — the two sides are equal on every bar, so
+    /// `>`/`<` can never hold (G2).
+    #[test]
+    fn same_operand_indicator_strict_compare_is_impossible() {
+        let s = entry_dsl(cmp(rsi(14), Comparator::Gt, rsi(14)));
+        let errs = impossible_errs(&s);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].path, "entry");
+    }
+
+    /// `Gte`/`Lte`/`Eq` are only judged on two constants: a same-operand or
+    /// same-series non-strict comparison stays possible (a flat bar makes
+    /// `low >= high` true), and an always-true leaf is out of scope (G2).
+    #[test]
+    fn non_strict_comparisons_are_only_judged_on_two_constants() {
+        for op in [Comparator::Gte, Comparator::Lte, Comparator::Eq] {
+            // Same operand, same-series prices, indicator pairs: accepted.
+            for entry in [
+                cmp(rsi(14), op, rsi(14)),
+                cmp(price(PriceField::Low), op, price(PriceField::High)),
+                cmp(price(PriceField::High), op, price(PriceField::Low)),
+            ] {
+                validate(&entry_dsl(entry))
+                    .unwrap_or_else(|e| panic!("{op:?} over non-constants must be judged: {e:?}"));
+            }
+            // Two constants: refused only when the comparison is false.
+            let false_pair = if op == Comparator::Lte {
+                cmp(const_(2), op, const_(1))
+            } else {
+                // Gt, Gte, Eq over (1, 2) are all false.
+                cmp(const_(1), op, const_(2))
+            };
+            let errs = impossible_errs(&entry_dsl(false_pair));
+            assert_eq!(errs.len(), 1, "{op:?} over a false constant pair: {errs:?}");
+            assert_eq!(errs[0].path, "entry");
+
+            let true_pair = if op == Comparator::Eq {
+                cmp(const_(1), op, const_(1))
+            } else if op == Comparator::Lte {
+                cmp(const_(1), op, const_(2))
+            } else {
+                // Gt, Gte over (2, 1) are both true.
+                cmp(const_(2), op, const_(1))
+            };
+            validate(&entry_dsl(true_pair))
+                .unwrap_or_else(|e| panic!("{op:?} over a true constant pair must pass: {e:?}"));
+        }
+    }
+
+    /// Operands on different series are different bars: never judged (G2),
+    /// in either direction.
+    #[test]
+    fn cross_series_price_operands_are_never_judged() {
+        for entry in [
+            cmp(
+                price(PriceField::Close),
+                Comparator::Gt,
+                htf_price(PriceField::High),
+            ),
+            cmp(
+                htf_price(PriceField::High),
+                Comparator::Gt,
+                price(PriceField::Close),
+            ),
+            cmp(
+                price(PriceField::Close),
+                Comparator::Lt,
+                htf_price(PriceField::Low),
+            ),
+        ] {
+            validate(&entry_dsl(entry)).expect("cross-series leaves are never judged");
+        }
+    }
+
+    /// `Volume` sits in no OHLC invariant: a strict comparison against a price
+    /// field is never judged.
+    #[test]
+    fn volume_is_never_judged() {
+        let s = entry_dsl(cmp(
+            price(PriceField::Volume),
+            Comparator::Gt,
+            price(PriceField::High),
+        ));
+        validate(&s).expect("volume against a price field is not judged");
+    }
+
+    /// `Not` blocks judgment at any depth — a negation of an impossible leaf
+    /// is satisfiable (G2) — including through `And`/`Or` inside the `Not`.
+    #[test]
+    fn not_blocks_judgment_at_depth() {
+        for entry in [
+            Condition::Not {
+                condition: Box::new(cmp(
+                    price(PriceField::Close),
+                    Comparator::Gt,
+                    price(PriceField::High),
+                )),
+            },
+            Condition::Not {
+                condition: Box::new(Condition::Or {
+                    conditions: vec![
+                        cmp(
+                            price(PriceField::Close),
+                            Comparator::Gt,
+                            price(PriceField::High),
+                        ),
+                        cmp(
+                            price(PriceField::Low),
+                            Comparator::Gt,
+                            price(PriceField::High),
+                        ),
+                    ],
+                }),
+            },
+        ] {
+            validate(&entry_dsl(entry)).expect("nothing under Not is judged");
+        }
+    }
+
+    /// An `Or` whose branch is an `And` with one impossible leaf: the branch is
+    /// impossible, so an all-impossible `Or` is refused at the `Or`'s node.
+    #[test]
+    fn or_branch_may_be_an_and_with_one_impossible_leaf() {
+        let s = entry_dsl(Condition::Or {
+            conditions: vec![
+                Condition::And {
+                    conditions: vec![
+                        cmp(rsi(14), Comparator::Lt, const_(30)),
+                        cmp(
+                            price(PriceField::Close),
+                            Comparator::Gt,
+                            price(PriceField::High),
+                        ),
+                    ],
+                },
+                cmp(
+                    price(PriceField::Low),
+                    Comparator::Gt,
+                    price(PriceField::High),
+                ),
+            ],
+        });
+        let errs = impossible_errs(&s);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].path, "entry.or");
+    }
+
+    /// The both-`Constant` cross stays `DegenerateCross` and emits NO
+    /// `ImpossibleCondition` — the no-double-report guarantee (G2).
+    #[test]
+    fn both_constant_cross_is_degenerate_only() {
+        for entry in [
+            crosses(CrossKind::Above, const_(1), const_(2)),
+            crosses(CrossKind::Below, const_(2), const_(1)),
+        ] {
+            let errs = validate(&entry_dsl(entry))
+                .expect_err("the both-Constant cross is refused")
+                .into_errors();
+            assert_eq!(errs.len(), 1, "exactly one error: {errs:?}");
+            assert_eq!(errs[0].code, ValidationCode::DegenerateCross);
+            assert!(!has_code(&errs, ValidationCode::ImpossibleCondition));
+        }
+    }
+
+    /// The new code serializes under its variant name, like the existing
+    /// variants (the wire shape is unchanged — no rename).
+    #[test]
+    fn impossible_condition_code_serializes_by_variant_name() {
+        let e = FieldError {
+            path: "entry".to_owned(),
+            code: ValidationCode::ImpossibleCondition,
+            message: "close can never be above high on the same bar".to_owned(),
+        };
+        let json = serde_json::to_string(&e).expect("serialize FieldError");
+        assert!(json.contains("ImpossibleCondition"), "{json}");
         let back: FieldError = serde_json::from_str(&json).expect("deserialize FieldError");
         assert_eq!(back, e);
     }

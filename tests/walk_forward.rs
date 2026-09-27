@@ -64,9 +64,12 @@ use tempfile::TempDir;
 /// M7b pin (verifier correction): the oracle's first fully-warm bar as a
 /// hard-coded golden — measured once by stepping the fixture (see report §6),
 /// never recomputed by the function under test. `rsi-oversold-long` is RSI(14)
-/// on primary M15: the entry gate warms on the first bar whose RSI value
-/// exists — the 15th candle (index 14) of the 2976-candle snapshot.
-const ORACLE_FIRST_WARM_MS: i64 = 1_735_702_200_000;
+/// on primary M15: the entry gate warms on the first bar where an RSI value
+/// exists AND a previous one does — the 16th candle (index 15) of the
+/// 2976-candle snapshot, one bar later since #36 (the previous-value
+/// requirement moved the golden from index 14 to 15; was
+/// `1_735_702_200_000`).
+const ORACLE_FIRST_WARM_MS: i64 = 1_735_703_100_000;
 
 /// The canonical oracle: `tests/fixtures/strategies/rsi-oversold-long.json` —
 /// RSI(14) on M15, warm after ~15 primary bars, ~6 trades over the month.
@@ -420,8 +423,8 @@ fn first_warm_bar_is_the_pinned_fixture_golden() {
         .position(|c| c.open_time == ORACLE_FIRST_WARM_MS)
         .expect("the golden is a real fixture bar");
     assert_eq!(
-        golden_idx, 14,
-        "RSI(14) first computes on the 15th candle of the fixture"
+        golden_idx, 15,
+        "RSI(14) first fully warms on the 16th candle of the fixture (one bar later since #36)"
     );
 
     let before =

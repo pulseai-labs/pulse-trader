@@ -298,6 +298,23 @@ pub use application::coach_decision::{
     CoachDecisionRequest, run_coach_decision,
 };
 
+// r3.s1.w2: the MCP submit use case — the write edge every agent-authored
+// strategy version crosses. Re-exported on the `run_version_backtest` precedent
+// (the module stays `pub(crate)` and `lib.rs` curates what crosses): the
+// offline submit suite drives the REAL application function over the REAL
+// SQLite repositories, and an integration-test binary is a separate crate that
+// cannot reach a `pub(crate)` item. The refusal shape (ADR-0017) is the point:
+// `SubmitError::Validation` carries the typed, field-pathed `FieldError`s.
+pub use application::mcp_write::{
+    SubmitError, SubmitOutcome, SubmitRequest, SubmitTarget, submit_agent_version,
+};
+
+// r3.s1.w2: the version-content hash, re-exported so the persisted-impossible
+// suite can mint an OUT-OF-BAND version row (a pre-r3 database's shape, held
+// before this item's refusal rule existed) whose hash the read path verifies.
+// Same curated-surface precedent as the submit seam above.
+pub use adapters::db::strategy_repo::version_hash;
+
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
 // are the `Decimal↔f64` conversion seam (the ONLY place floats are allowed).
