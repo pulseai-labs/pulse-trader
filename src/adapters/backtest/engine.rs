@@ -3,15 +3,16 @@
 use rust_decimal::Decimal;
 
 use crate::adapters::backtest::regime::RegimeDetector;
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, CompiledValue, Direction, EngineFingerprint, EquityCurve, EvalContext,
-    ExitReason, Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime, RegimeBreakdown,
-    Series, SeriesEnd, Side, SizingOutcome, SkippedEntryCounts, SummaryStats, SweepableValue,
-    SymbolFilters, Trade, TradeSource, align, apply_slippage, atr_stop_price,
-    compute_position_size, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
-    stop_price, take_profit_price, taker_fee,
+    CompiledStrategy, CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve,
+    EvalContext, ExitReason, Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime,
+    RegimeBreakdown, Series, SeriesEnd, SeriesRole, Side, SizingOutcome, SkippedEntryCounts,
+    SummaryStats, SweepableValue, SymbolFilters, Trade, TradeSource, ValidationError, align,
+    apply_slippage, atr_stop_price, compute_position_size, funding_payment, realized_pnl,
+    realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -100,6 +101,28 @@ pub fn run_backtest(
     count_from_ms: Option<i64>,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
+    // Input guards (r3.s1.w3): structural soundness of the primary and — when
+    // handed — the htf series, then the funding-order precondition over the
+    // primary's counted span, all before any strategy precondition or
+    // computation.
+    validate_series(primary, SeriesRole::Primary)?;
+    if let Some(htf_series) = htf {
+        validate_series(htf_series, SeriesRole::Htf)?;
+    }
+    let interval = BinanceAdapter::new()
+        .funding_interval_ms(&primary.pair)
+        .map_err(|_| BacktestError::FundingIntervalUnknown {
+            pair: primary.pair.clone(),
+        })?;
+    if let Some(gap) = funding_gaps(primary, count_from_ms, interval)
+        .into_iter()
+        .next()
+    {
+        return Err(BacktestError::FundingGap {
+            from: gap.from,
+            to: gap.to,
+        });
+    }
     let exit_plan = ExitPlan::from_strategy(compiled)?;
     check_htf_inputs(compiled, primary, htf)?;
     let mut engine =
@@ -303,6 +326,42 @@ pub fn run_backtest(
 /// refusal also lives at the request boundary; the missing-HTF and pair checks
 /// are defence-in-depth (the request carries no second pair), for callers that
 /// construct the series directly.
+/// Validate one input series' structural soundness (r3.s1.w3): strictly
+/// ascending `open_time`, no repeated `open_time`, and no missing candle
+/// (adjacent spacing beyond one timeframe duration). `Unsorted`/`Duplicate`
+/// map to [`BacktestError::SeriesUnsorted`] naming the offending `open_time`;
+/// the first reported spacing gap maps to [`BacktestError::SeriesGap`] naming
+/// the expected and the found stamp. The engine refuses corrupt input before
+/// any computation — alignment, signaling and funding indexing all assume
+/// ordered, contiguous bars.
+fn validate_series(series: &CandleSeries, role: SeriesRole) -> Result<(), BacktestError> {
+    let gaps = series.validate().map_err(|err| match err {
+        DataError::Validation(ValidationError::Unsorted { later, .. }) => {
+            BacktestError::SeriesUnsorted {
+                series: role,
+                at: later,
+            }
+        }
+        DataError::Validation(ValidationError::Duplicate(at)) => {
+            BacktestError::SeriesUnsorted { series: role, at }
+        }
+        // `CandleSeries::validate` constructs only `Validation` errors today;
+        // a future `DataError` variant must not silently pass the input guard.
+        other => BacktestError::SeriesUnreadable {
+            series: role,
+            message: other.to_string(),
+        },
+    })?;
+    if let Some(gap) = gaps.first() {
+        return Err(BacktestError::SeriesGap {
+            series: role,
+            expected: gap.expected,
+            found: gap.found,
+        });
+    }
+    Ok(())
+}
+
 fn check_htf_inputs(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -1121,6 +1180,89 @@ fn funding_between(
         .sum()
 }
 
+/// One uncovered segment of a run's counted span, in epoch ms.
+///
+/// The funding-order precondition requires a funding stamp within one funding
+/// interval (plus one primary candle, the placement slack of a boundary stamp)
+/// of every point in the span. `from`/`to` are the segment's two anchors: the
+/// previous stamp (or the counted span's first counted `open_time`) and the
+/// next stamp (or the last primary candle's `close_time`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingGapWindow {
+    /// The segment's earlier anchor: the previous stamp's `open_time`, or the
+    /// counted span's first counted `open_time` when no stamp precedes it.
+    pub from: i64,
+    /// The segment's later anchor: the next stamp's `open_time`, or the last
+    /// primary candle's `close_time` when no stamp follows.
+    pub to: i64,
+}
+
+/// Check the funding-order precondition (#45) over the run's counted span:
+/// from the span start to the first funding stamp, between consecutive stamps,
+/// and from the last stamp to the span end, each distance must be at most the
+/// pair's funding interval plus one primary candle duration — a stamp sits on
+/// the candle containing the event, up to one candle early, and a counted span
+/// no longer than one interval needs no stamp at all. Returns the uncovered
+/// segments in ascending order; an empty return means the precondition holds.
+///
+/// Only the COUNTED span is checked: when `count_from_ms` is `Some`, bars
+/// before it are lead-in (r2.s3.w2) — no funding accrues on them, so their
+/// stamps (or absence) are not this run's business. A zero-candle series or a
+/// `count_from_ms` past the series' end has no counted span and no gaps.
+///
+/// Precondition: `series.candles` is strictly ascending by `open_time` — the
+/// engine validates that before calling this; the real-snapshot scan runs
+/// `CandleSeries::validate` first for the same reason.
+#[must_use]
+pub fn funding_gaps(
+    series: &CandleSeries,
+    count_from_ms: Option<i64>,
+    interval_ms: i64,
+) -> Vec<FundingGapWindow> {
+    let Some(first) = series.candles.first() else {
+        return Vec::new();
+    };
+    let span_start = match count_from_ms {
+        Some(from) => match series
+            .candles
+            .iter()
+            .find(|candle| candle.open_time >= from)
+        {
+            Some(candle) => candle.open_time,
+            None => return Vec::new(),
+        },
+        None => first.open_time,
+    };
+    let span_end = series
+        .candles
+        .last()
+        .map_or(first.close_time, |last| last.close_time);
+    if span_end <= span_start {
+        return Vec::new();
+    }
+    let tolerance = interval_ms + series.timeframe.duration_ms();
+    let mut anchors: Vec<i64> = Vec::with_capacity(series.candles.len() + 2);
+    anchors.push(span_start);
+    anchors.extend(
+        series
+            .candles
+            .iter()
+            .filter(|candle| candle.open_time > span_start && candle.funding_rate.is_some())
+            .map(|candle| candle.open_time),
+    );
+    anchors.push(span_end);
+    let mut gaps = Vec::new();
+    for window in anchors.windows(2) {
+        if window[1] - window[0] > tolerance {
+            gaps.push(FundingGapWindow {
+                from: window[0],
+                to: window[1],
+            });
+        }
+    }
+    gaps
+}
+
 fn stop_rule(exits: &[CompiledExit]) -> Option<StopRule> {
     exits.iter().find_map(|exit| match exit {
         CompiledExit::StopLoss { distance_pct } => Some(StopRule::Pct(*distance_pct)),
@@ -1220,8 +1362,8 @@ fn atr_take_profit_price(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        BacktestConfig, OpenPosition, build_funding_index, first_fully_warm_bar_ms,
-        funding_between, run_backtest, update_excursion,
+        BacktestConfig, FundingGapWindow, OpenPosition, build_funding_index,
+        first_fully_warm_bar_ms, funding_between, funding_gaps, run_backtest, update_excursion,
     };
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
@@ -1248,31 +1390,48 @@ mod tests {
         }
     }
 
+    /// A candle at absolute M15 index `idx` — true 900 000 ms spacing with
+    /// epoch-aligned boundaries (index 0 is 00:00 UTC, and every 32nd bar's
+    /// half-open span contains an 8h boundary), carrying the default zero-rate
+    /// funding stamp the engine's funding-order precondition expects on real
+    /// data. Tests that assert funding place their own non-zero stamps on top
+    /// (`funding_candle`, `funding_candle_rate`); a zero-rate stamp pays zero,
+    /// so no existing expected value moves.
     fn candle(idx: i64, open: i64, high: i64, low: i64, close: i64) -> Candle {
+        let open_time = idx * 900_000;
         Candle {
-            open_time: idx * 60_000,
-            close_time: idx * 60_000 + 59_999,
+            open_time,
+            close_time: open_time + 899_999,
             open: d(open),
             high: d(high),
             low: d(low),
             close: d(close),
             volume: Decimal::ONE,
-            funding_rate: None,
+            funding_rate: if open_time % 28_800_000 == 0 {
+                Some(Decimal::ZERO)
+            } else {
+                None
+            },
         }
     }
 
     /// `candle` with `Decimal` OHLC (for the excursion proptest, which builds bars
     /// at sub-integer offsets from the entry price).
     fn candle_dec(idx: i64, open: Decimal, high: Decimal, low: Decimal, close: Decimal) -> Candle {
+        let open_time = idx * 900_000;
         Candle {
-            open_time: idx * 60_000,
-            close_time: idx * 60_000 + 59_999,
+            open_time,
+            close_time: open_time + 899_999,
             open,
             high,
             low,
             close,
             volume: Decimal::ONE,
-            funding_rate: None,
+            funding_rate: if open_time % 28_800_000 == 0 {
+                Some(Decimal::ZERO)
+            } else {
+                None
+            },
         }
     }
 
@@ -1603,8 +1762,9 @@ mod tests {
     /// proof that the perf refactor is byte-identical (NFR-2).
     #[test]
     fn funding_index_contents_and_windowed_fold_match_full_rescan() {
-        // open_time = idx * 60_000 (see `candle`). Funding on bars 1, 3, 4, 6;
-        // plain bars at 0, 2, 5 must be excluded from the index. Distinct rates
+        // open_time = idx * 900_000 (see `candle`). The default zero-rate stamp
+        // sits on index 0 (an 8h boundary); explicit rates on bars 1, 3, 4, 6;
+        // plain bars at 2, 5 must be excluded from the index. Distinct rates
         // (including a negative one) make order + per-event arithmetic load-bearing.
         let r1 = rate(1, 3); // 0.001
         let r3 = rate(2, 3); // 0.002
@@ -1620,15 +1780,17 @@ mod tests {
             funding_candle_rate(6, r6),
         ]);
 
-        // (a) index = exactly the funding-bearing candles, in ascending open_time.
+        // (a) index = exactly the funding-bearing candles, in ascending open_time
+        //     — including the zero-rate default stamp on index 0.
         let index = build_funding_index(&primary);
         assert_eq!(
             index,
             vec![
-                (60_000, r1),
-                (3 * 60_000, r3),
-                (4 * 60_000, r4),
-                (6 * 60_000, r6),
+                (0, Decimal::ZERO),
+                (900_000, r1),
+                (3 * 900_000, r3),
+                (4 * 900_000, r4),
+                (6 * 900_000, r6),
             ],
             "index must hold exactly the funding-bearing candles, in source (ascending) order"
         );
@@ -1638,14 +1800,16 @@ mod tests {
         );
 
         // (b) windowed fold == full-rescan fold, over representative windows and
-        // both directions. Each window is `(entry_fill_time, exit_fill_time]`.
+        // both directions. Each window is `(entry_fill_time, exit_fill_time]` —
+        // so the zero-rate stamp at open_time 0 sits OUTSIDE every window below
+        // (entry boundary excluded) and only the four explicit events ever pay.
         let windows = [
-            (0, 6 * 60_000),          // whole series: all four events
-            (60_000, 4 * 60_000), // entry ON a funding bar (1 EXCLUDED), exit ON one (4 INCLUDED): {3,4}
-            (3 * 60_000, 6 * 60_000), // {4,6}
-            (4 * 60_000, 5 * 60_000), // exit between events, after the last in-range one: {}
-            (6 * 60_000, 9 * 60_000), // entry at/after the last event: {} (empty upper tail)
-            (0, 0),               // degenerate empty window
+            (0, 6 * 900_000), // whole series: all four explicit events (the 0-time zero-rate stamp is outside the entry edge)
+            (900_000, 4 * 900_000), // entry ON a funding bar (1 EXCLUDED), exit ON one (4 INCLUDED): {3,4}
+            (3 * 900_000, 6 * 900_000), // {4,6}
+            (4 * 900_000, 5 * 900_000), // exit between events, after the last in-range one: {}
+            (6 * 900_000, 9 * 900_000), // entry at/after the last event: {} (empty upper tail)
+            (0, 0),                 // degenerate empty window
         ];
         for direction in [Direction::Long, Direction::Short] {
             for &(entry_fill_time, exit_fill_time) in &windows {
@@ -1662,7 +1826,7 @@ mod tests {
 
         // Spot-check a concrete value so the test is not purely self-referential:
         // long over the whole series folds -(r1+r3+r4+r6) * notional per event.
-        let long_whole = funding_between(&index, &position_at(0, Direction::Long), 6 * 60_000);
+        let long_whole = funding_between(&index, &position_at(0, Direction::Long), 6 * 900_000);
         let notional = d(3) * d(100);
         let expected = -(r1 * notional) - (r3 * notional) - (r4 * notional) - (r6 * notional);
         assert_eq!(
@@ -1832,9 +1996,9 @@ mod tests {
         assert_eq!(mark.direction, Direction::Long);
         assert_eq!(mark.qty, d(20), "1% of 10_000 at a 5% stop on 100");
         assert_eq!(mark.entry_price, d(100), "filled at bar 2's open");
-        assert_eq!(mark.entry_signal_time, 119_999, "bar 1's close_time");
-        assert_eq!(mark.entry_fill_time, 120_000, "bar 2's open_time");
-        assert_eq!(mark.mark_time, 179_999, "bar 2's close_time");
+        assert_eq!(mark.entry_signal_time, 1_799_999, "bar 1's close_time");
+        assert_eq!(mark.entry_fill_time, 1_800_000, "bar 2's open_time");
+        assert_eq!(mark.mark_time, 2_699_999, "bar 2's close_time");
         assert_eq!(mark.mark_price, d(103), "bar 2's close");
     }
 
@@ -2394,6 +2558,123 @@ mod tests {
             trade.realized_pnl,
             gross + trade.funding_total - trade.fees_total,
             "net P&L must embed slippage via the fills only, not subtract it twice"
+        );
+    }
+
+    // --- funding_gaps: the funding-order precondition check (r3.s1.w3). ---
+
+    /// The pinned 8h BTCUSDT funding interval, mirrored here for hand-built
+    /// scenarios (the engine resolves it through `BinanceAdapter`).
+    const FUNDING_INTERVAL_TEST_MS: i64 = 28_800_000;
+
+    /// `candle` without the default zero-rate stamp — for the scenarios below
+    /// that pin their stamp pattern exactly.
+    fn raw_candle(idx: i64) -> Candle {
+        let mut candle = candle(idx, 100, 101, 99, 100);
+        candle.funding_rate = None;
+        candle
+    }
+
+    #[test]
+    fn funding_gaps_flags_a_whole_missing_event_between_two_stamps() {
+        // 65 M15 bars (0..=64) span 16h+; boundaries at indices 0, 32, 64.
+        // Stamps at 0 and 64 only — the index-32 event has no stamp.
+        let primary = series(
+            (0..=64)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 0 || i == 64 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        let gaps = funding_gaps(&primary, None, FUNDING_INTERVAL_TEST_MS);
+        assert_eq!(
+            gaps,
+            vec![FundingGapWindow {
+                from: 0,
+                to: 64 * 900_000,
+            }],
+            "the segment from the span start to the last stamp is one uncovered gap"
+        );
+    }
+
+    #[test]
+    fn funding_gaps_accepts_stamps_one_interval_apart() {
+        let primary = series(
+            (0..=64)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 0 || i == 32 || i == 64 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        assert!(
+            funding_gaps(&primary, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "stamps one interval apart leave no uncovered segment"
+        );
+    }
+
+    #[test]
+    fn funding_gaps_allows_a_short_unstamped_span_but_flags_a_long_one() {
+        // 30 bars = 7.5h <= one interval: no stamps needed.
+        let short = series((0..30).map(raw_candle).collect());
+        assert!(
+            funding_gaps(&short, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a counted span no longer than one interval needs no stamp"
+        );
+        // 34 bars = 8.5h > one interval: unstamped, so uncovered.
+        let long = series((0..34).map(raw_candle).collect());
+        let gaps = funding_gaps(&long, None, FUNDING_INTERVAL_TEST_MS);
+        assert_eq!(
+            gaps,
+            vec![FundingGapWindow {
+                from: 0,
+                to: long.candles.last().expect("non-empty").close_time,
+            }],
+            "an unstamped span longer than one interval is one gap"
+        );
+    }
+
+    #[test]
+    fn funding_gaps_counts_only_the_windowed_counted_span() {
+        // Stamps only at index 64.
+        let primary = series(
+            (0..=64)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 64 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        // Counted from index 32: the counted span is one interval long, closed
+        // by the index-64 stamp — the unstamped lead-in does not count.
+        assert!(
+            funding_gaps(&primary, Some(32 * 900_000), FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "an unstamped lead-in must not refuse a windowed run"
+        );
+        // Counted from index 8: the counted span's start sits 14h before the
+        // only stamp — uncovered.
+        assert_eq!(
+            funding_gaps(&primary, Some(8 * 900_000), FUNDING_INTERVAL_TEST_MS),
+            vec![FundingGapWindow {
+                from: 8 * 900_000,
+                to: 64 * 900_000,
+            }],
+            "the counted span's own uncovered segment is what the check reports"
+        );
+        // Counted past the end: no counted bars, nothing to check.
+        assert!(
+            funding_gaps(&primary, Some(999 * 900_000), FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a window with no counted bars has no span to check"
         );
     }
 }
