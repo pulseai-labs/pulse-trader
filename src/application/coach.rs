@@ -52,6 +52,10 @@ use crate::agent::{
     DEFAULT_MAX_TURN_BYTES, TurnAnswer, check_turn_budget, classify, coach_tool_definitions,
 };
 use crate::domain::Redactor;
+// r3.s1.w5 (#172): the recorded failure detail goes through the ONE
+// scrub-then-bound seam — the adapter no longer bounds provider detail, so the
+// bound is applied here, after the scrub.
+use crate::domain::redaction::{TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 // The two coach-turn ports live in the DOMAIN ring beside every other port
 // (ADR-0015, one home for ports); this module is one of their consumers, not their
 // owner.
@@ -644,11 +648,15 @@ where
             error: LlmError::Provider(detail) | LlmError::MalformedToolCall(detail),
             llm_call_id,
         })) => {
-            // r1.s2.w4: a TRANSPORT fault is a RECORDED outcome. The error text is
-            // scrubbed on the way in — an error body can echo the request that
-            // produced it.
+            // r1.s2.w4: a TRANSPORT fault is a RECORDED outcome. The error text
+            // is scrubbed on the way in — an error body can echo the request
+            // that produced it — and bounded by the ONE seam (r3.s1.w5):
+            // scrub the whole string first, THEN bound. The adapter no longer
+            // bounds provider detail, and bounding before the scrub would cut
+            // a straddling credential into a fragment the redaction rules
+            // cannot recognize, persisted in the failure record.
             let failure = CoachFailure::TransportFailure {
-                detail: settings.redactor.redact(&detail),
+                detail: scrub_then_bound(&settings.redactor, &detail, TRANSPORT_DETAIL_MAX_BYTES),
             };
             return settle_failure(sessions, session_id, llm_call_id, failure).await;
         }

@@ -199,6 +199,10 @@ pub use llm::ToolDefinition;
 // not an API change.
 pub use llm_call::{LlmCall, LlmCallId};
 pub use redaction::Redactor;
+// r3.s1.w5 (#172): the scrub-then-bound seam and its one bound join the same
+// public surface — every persisting caller of provider-derived detail names
+// them, from the adapters ring and the application ring alike.
+pub use redaction::{TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 // r1.s4.w1: the attributed-call pair the sealed coach turn's provider port
 // returns. `pub(crate)`: a crate-internal use case's vocabulary (ADR-0015).
 pub(crate) use llm_call::{AttributedCall, AttributedCallError};
