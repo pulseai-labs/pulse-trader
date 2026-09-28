@@ -161,15 +161,17 @@ pub async fn all_run_ids(pool: &SqlitePool) -> Result<Vec<String>, DataError> {
 pub struct SnapshotRef {
     /// The run's canonical pair string.
     pub pair: String,
-    /// The referenced snapshot's timeframe interval (`15m` / `4h`).
+    /// The referenced snapshot's timeframe interval (`15m` / `4h` / `1d`).
     pub timeframe: String,
     /// The referenced snapshot's content-hash identity.
     pub data_version: String,
 }
 
 /// The distinct snapshot references across every run: the primary snapshot of
-/// each run, plus its HTF snapshot where present. Pre-`0006` rows (no stored
-/// provenance) carry no reference and are skipped.
+/// each run, plus its HTF snapshot where present, plus its daily-series snapshot
+/// where present (r3.s2.w4 — a run's `d1` operands read real candles, so D7
+/// check (e) must demand that snapshot in the target too). Pre-`0006` rows (no
+/// stored provenance) carry no reference and are skipped.
 ///
 /// # Errors
 ///
@@ -182,7 +184,10 @@ pub async fn referenced_snapshots(pool: &SqlitePool) -> Result<Vec<SnapshotRef>,
          UNION \
          SELECT DISTINCT pair, htf_timeframe, htf_data_version FROM backtest_run \
          WHERE pair IS NOT NULL AND htf_timeframe IS NOT NULL \
-           AND htf_data_version IS NOT NULL",
+           AND htf_data_version IS NOT NULL \
+         UNION \
+         SELECT DISTINCT pair, '1d', d1_data_version FROM backtest_run \
+         WHERE pair IS NOT NULL AND d1_data_version IS NOT NULL",
     )
     .fetch_all(pool)
     .await

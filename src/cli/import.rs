@@ -1123,11 +1123,17 @@ pub(crate) fn scan_heads(data_dir: &Path) -> (Vec<SourceHead>, Vec<Mismatch>) {
     (out, issues)
 }
 
-/// The timeframe directory name (`15m` / `4h`) a snapshot lives under.
+/// The timeframe directory name (`15m` / `4h` / `1d`) a snapshot lives under.
+///
+/// r3.s2.w4: a backup taken from a store the daily series landed in carries
+/// `candles/<PAIR>/1d/`, and `0017`'s runs reference those snapshots — so the
+/// name must resolve here or a restore would report the daily snapshot as an
+/// unknown-timeframe issue it must skip.
 fn timeframe_from_interval(name: &str) -> Option<Timeframe> {
     match name {
         "15m" => Some(Timeframe::M15),
         "4h" => Some(Timeframe::H4),
+        "1d" => Some(Timeframe::D1),
         _ => None,
     }
 }

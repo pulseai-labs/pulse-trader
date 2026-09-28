@@ -232,11 +232,12 @@ fn resolve_counted_span(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
+    d1: Option<&CandleSeries>,
     from_ms: Option<i64>,
     to_ms: Option<i64>,
 ) -> Result<(CandleWindow, bool), WalkForwardAppError> {
-    let first_warm =
-        first_fully_warm_bar_ms(compiled, primary, htf).ok_or(WalkForwardAppError::NeverWarm)?;
+    let first_warm = first_fully_warm_bar_ms(compiled, primary, htf, d1)
+        .ok_or(WalkForwardAppError::NeverWarm)?;
     // The snapshot's real end: the last candle's close, or the first warm bar on
     // a snapshot too short to have one.
     let snapshot_end = primary.candles.last().map_or(first_warm, |c| c.close_time);
@@ -302,6 +303,7 @@ fn execute_folds<E>(
     folds: &[CandleWindow],
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
+    d1: Option<&CandleSeries>,
 ) -> Result<(String, Vec<WalkForwardFoldDraft>, RunVerdict), WalkForwardAppError>
 where
     E: ExchangeAdapter,
@@ -314,6 +316,7 @@ where
         let fold_index = u8::try_from(i).unwrap_or(u8::MAX);
         let mut fold_primary = primary.clone();
         let mut fold_htf = htf.cloned();
+        let mut fold_d1 = d1.cloned();
         let prepared: PreparedBacktest = prepare_over_loaded_series(
             validated,
             exchange,
@@ -323,6 +326,7 @@ where
             Some(w.clone()),
             &mut fold_primary,
             &mut fold_htf,
+            &mut fold_d1,
         )?;
         let run_fp = prepared.result.engine_fingerprint.as_str().to_owned();
         match &fingerprint {
@@ -401,11 +405,43 @@ where
         )?),
         None => None,
     };
+    // r3.s2.w4: the fixed daily series loads ONLY when the strategy carries a
+    // `d1` operand — a fold must not require a D1 snapshot a strategy never
+    // reads. A missing HEAD D1 snapshot refuses `D1Required` naming the fetch
+    // command, the same mapping the standalone path makes.
+    let d1 = if compiled.needs_d1() {
+        Some(
+            load_series(
+                candles,
+                pair,
+                Timeframe::D1,
+                pins.and_then(|p| p.d1.as_ref()),
+                PreSaveStage::D1Snapshot,
+            )
+            .map_err(|err| match err {
+                BacktestAppError::SnapshotMissing { pair: missing, .. } => {
+                    BacktestAppError::D1Required {
+                        field: "inputs.d1",
+                        pair: missing,
+                    }
+                }
+                other => other,
+            })?,
+        )
+    } else {
+        None
+    };
 
     // The counted span: `to` defaults to the snapshot's last candle's
     // close_time (L3); `from` defaults to the first fully-warm bar.
-    let (span, from_defaulted) =
-        resolve_counted_span(compiled, &primary, htf.as_ref(), from_ms, to_ms)?;
+    let (span, from_defaulted) = resolve_counted_span(
+        compiled,
+        &primary,
+        htf.as_ref(),
+        d1.as_ref(),
+        from_ms,
+        to_ms,
+    )?;
     let folds = fold_windows(&span, scheme.k());
     // Refuse an empty fold BEFORE any fold runs (a6): the counted slice is
     // `open_time ∈ [from, to)` on the whole primary series.
@@ -432,6 +468,7 @@ where
         &folds,
         &primary,
         htf.as_ref(),
+        d1.as_ref(),
     )?;
     Ok(WalkForwardBlockingOutput {
         draft: WalkForwardRunDraft {

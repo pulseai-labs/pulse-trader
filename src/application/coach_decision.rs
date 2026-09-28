@@ -571,6 +571,7 @@ where
             snapshots: Some(SnapshotPins {
                 primary: prepared.inputs.primary.data_version.clone(),
                 htf: prepared.inputs.htf.as_ref().map(|s| s.data_version.clone()),
+                d1: prepared.inputs.d1.as_ref().map(|s| s.data_version.clone()),
             }),
             from_ms: Some(certifying.span.from_ms),
             to_ms: Some(certifying.span.to_ms),
@@ -756,6 +757,10 @@ where
     C: CandleSeriesRepository + Send + 'static,
     E: ExchangeAdapter + Send + 'static,
 {
+    // r3.s2.w4: whether the child consumes the fixed daily series decides the
+    // D1 load. The compile here mirrors `prepare_backtest`'s — a document that
+    // will not compile reports that failure there; it never reaches a load.
+    let needs_d1 = child_needs_d1(&validated);
     let joined = tokio::task::spawn_blocking(move || -> Result<PreparedBacktest, StagedFailure> {
         let mut primary = load_named_snapshot(
             &candles,
@@ -772,6 +777,10 @@ where
             )?),
             None => None,
         };
+        // r3.s2.w4: the parent's persisted `inputs.d1` names the exact daily
+        // snapshot the child replays — loaded only when the child reads it
+        // (see `load_d1_for_replay`).
+        let mut d1 = load_d1_for_replay(&candles, &inputs, needs_d1)?;
         // r2.s1 G1: "the parent's exact persisted inputs" INCLUDES the window —
         // a windowed parent's child must replay the same counted slice, or the
         // re-run silently computes over the full snapshot while the inputs
@@ -786,6 +795,7 @@ where
             inputs.window.as_ref(),
             &mut primary,
             &mut htf,
+            &mut d1,
             &inputs.pair,
             inputs.primary.timeframe,
         )
@@ -817,11 +827,16 @@ where
         // rule as the lead-in above.
         inputs.symbol_filters = Some(filters.clone());
 
+        // The refusal message names the pair, and `inputs` moves into
+        // `prepare_backtest` below — keep the pair for the `d1` arm.
+        let pair_for_message = inputs.pair.clone();
+
         prepare_backtest(
             &validated,
             inputs,
             &primary,
             htf.as_ref(),
+            d1.as_ref(),
             &filters,
             starting_equity,
             series_end,
@@ -843,6 +858,18 @@ where
                 .to_string(),
                 subject: None,
             },
+            // r3.s2.w4: the `d1` mirror — the child carries a `D1` operand but
+            // the parent's persisted inputs name no daily snapshot, so the
+            // replay cannot reproduce the run it would be compared against.
+            PrepareError::D1Required => StagedFailure {
+                stage: AcceptFailureStage::Backtest,
+                message: BacktestAppError::D1Required {
+                    field: "inputs.d1",
+                    pair: pair_for_message.clone(),
+                }
+                .to_string(),
+                subject: None,
+            },
             PrepareError::Engine(source) => StagedFailure {
                 stage: AcceptFailureStage::Backtest,
                 message: source.to_string(),
@@ -859,6 +886,44 @@ where
             subject: None,
         })
     })
+}
+
+/// Whether the child's stored DSL compiles to a strategy that consumes the
+/// fixed daily series (r3.s2.w4). Best-effort, on `version_needs_htf`'s rule: a
+/// document that will not compile reports that failure inside
+/// `prepare_backtest`, never here.
+fn child_needs_d1(validated: &ValidatedDsl) -> bool {
+    compile(validated).is_ok_and(|compiled| compiled.needs_d1())
+}
+
+/// The daily snapshot the child's replay loads (r3.s2.w4), or `None` — the
+/// mirror of the HTF load above.
+///
+/// Loaded ONLY when the child reads D1: a strategy with no `d1` operand must
+/// never require a snapshot it cannot use. When it does read D1, the parent's
+/// persisted `inputs.d1` names the exact version to replay — and a parent that
+/// records none leaves this `None`, which `prepare_backtest` then refuses as
+/// `D1Required` on `inputs.d1`.
+fn load_d1_for_replay<C>(
+    candles: &C,
+    inputs: &crate::domain::BacktestInputs,
+    needs_d1: bool,
+) -> Result<Option<CandleSeries>, StagedFailure>
+where
+    C: CandleSeriesRepository,
+{
+    if !needs_d1 {
+        return Ok(None);
+    }
+    match inputs.d1.as_ref() {
+        Some(selection) => Ok(Some(load_named_snapshot(
+            candles,
+            &inputs.pair,
+            selection.timeframe,
+            &selection.data_version,
+        )?)),
+        None => Ok(None),
+    }
 }
 
 /// The reason this child cannot be compared to this parent, when there is one.

@@ -10,8 +10,8 @@ use crate::domain::{
     CompiledStrategy, CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve,
     EvalContext, ExitReason, Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime,
     RegimeBreakdown, Series, SeriesEnd, SeriesRole, Side, SizingOutcome, SkippedEntryCounts,
-    SummaryStats, SweepableValue, SymbolFilters, Trade, TradeSource, ValidationError, align,
-    apply_slippage, atr_stop_price, compute_position_size, funding_payment, realized_pnl,
+    SummaryStats, SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource, ValidationError,
+    align, apply_slippage, atr_stop_price, compute_position_size, funding_payment, realized_pnl,
     realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
@@ -90,11 +90,16 @@ impl BacktestConfig {
 /// # Errors
 ///
 /// Returns [`BacktestError`] for strategy preconditions or sizing failures.
-#[allow(clippy::too_many_lines)]
+// The series set is the contract here (`primary`, the optional `htf`, the fixed
+// optional `d1`) plus the run's own knobs — r3.s2.w4 pushed it to eight, one
+// past the pedantic cap. A struct would hide the one thing every caller must
+// get right: which series is which, positionally, on the call.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn run_backtest(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
+    d1: Option<&CandleSeries>,
     config: &BacktestConfig,
     filters: &SymbolFilters,
     series_end: SeriesEnd,
@@ -102,12 +107,15 @@ pub fn run_backtest(
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     // Input guards (r3.s1.w3): structural soundness of the primary and — when
-    // handed — the htf series, then the funding-order precondition over the
-    // primary's counted span, all before any strategy precondition or
+    // handed — the htf and d1 series, then the funding-order precondition over
+    // the primary's counted span, all before any strategy precondition or
     // computation.
     validate_series(primary, SeriesRole::Primary)?;
     if let Some(htf_series) = htf {
         validate_series(htf_series, SeriesRole::Htf)?;
+    }
+    if let Some(d1_series) = d1 {
+        validate_series(d1_series, SeriesRole::D1)?;
     }
     let interval = BinanceAdapter::new()
         .funding_interval_ms(&primary.pair)
@@ -125,6 +133,7 @@ pub fn run_backtest(
     }
     let exit_plan = ExitPlan::from_strategy(compiled)?;
     check_htf_inputs(compiled, primary, htf)?;
+    check_d1_inputs(compiled, primary, d1)?;
     let mut engine =
         IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
     // The higher-timeframe engine is built only when the strategy carries an
@@ -136,6 +145,19 @@ pub fn run_backtest(
         // rule falls out of the construction, no special case.
         Some(
             IndicatorEngine::for_series(compiled, Series::Htf)
+                .map_err(|err| BacktestError::EngineInit(err.to_string()))?,
+        )
+    } else {
+        None
+    };
+    // The daily-series engine (r3.s2.w4): built only when the strategy carries
+    // a `D1` operand (the guard above guarantees `d1` is `Some` then), stepped
+    // once per closed UTC-midnight candle through the same cursor machinery.
+    // **Loaded only when needed** is the application ring's job (`needs_d1`
+    // gates the load); here the guard only refuses an engine-less `D1` leaf.
+    let mut d1_engine = if compiled.needs_d1() {
+        Some(
+            IndicatorEngine::for_series(compiled, Series::D1)
                 .map_err(|err| BacktestError::EngineInit(err.to_string()))?,
         )
     } else {
@@ -154,6 +176,10 @@ pub fn run_backtest(
     // when several H4 closes precede the first primary bar.
     let mut htf_cursor = 0_usize;
     let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
+    // The D1 mirror of the HTF cursor (r3.s2.w4): every closed daily candle
+    // steps the daily engine exactly once, lead-in history included.
+    let mut d1_cursor = 0_usize;
+    let d1_candles: &[Candle] = d1.map_or(&[][..], |series| series.candles.as_slice());
 
     // D6 (NFR-1): build the funding-event index ONCE, before the trade loop, so
     // funding accrual is O(trades × (log E + k)) over the ~1095 funding events
@@ -165,7 +191,7 @@ pub fn run_backtest(
     // built here, never per close.
     let funding_index = build_funding_index(primary);
 
-    for bar in align(primary, htf) {
+    for bar in align(primary, htf, d1) {
         // r2.s3.w2: a lead-in bar (`open_time < count_from_ms`) warms both
         // indicator engines and the regime detector but counts for NOTHING —
         // no fill, no exit, no funding, no equity mark, no excursion, no
@@ -221,6 +247,19 @@ pub fn run_backtest(
                 bar.primary.close_time,
             );
         }
+        // The D1 mirror (r3.s2.w4): every daily candle closed at or before
+        // this primary bar's close steps the daily engine exactly once — the
+        // aligned `bar.d1` stays the last of them, so `current()`/`previous()`
+        // are daily-bar-relative, and lead-in days already closed before the
+        // run's first primary bar still feed the engine.
+        if let Some(engine_d1) = d1_engine.as_mut() {
+            step_closed_htf_candles(
+                engine_d1,
+                d1_candles,
+                &mut d1_cursor,
+                bar.primary.close_time,
+            );
+        }
         // Advance the regime detector in lock-step with the indicator engine, once
         // per primary bar (README C7). The order vs. `engine.step` is irrelevant
         // (independent state); both step after fill/close so the next bar reads
@@ -228,12 +267,15 @@ pub fn run_backtest(
         detector.step(bar.primary);
 
         // The series-routed evaluation context (r2.s2.w2): `Primary` leaves
-        // read the primary engine, `Htf` leaves read the HTF engine — a missing
-        // HTF engine can only pair with an `Htf`-free strategy (the guard above
-        // enforced that), so a `None` here is unreachable for an `Htf` leaf.
+        // read the primary engine, `Htf` leaves read the HTF engine and `D1`
+        // leaves the daily engine (r3.s2.w4) — a missing series engine can
+        // only pair with a strategy free of that series' operands (the guard
+        // above enforced that), so a `None` here is unreachable for such a
+        // leaf.
         let ctx = DualSeriesContext {
             primary: &engine,
             htf: htf_engine.as_ref(),
+            d1: d1_engine.as_ref(),
         };
 
         if counted
@@ -245,6 +287,9 @@ pub fn run_backtest(
             // operand otherwise reads `true` and exits against a bar that
             // does not exist yet.
             && (htf_engine.is_none() || bar.htf.is_some())
+            // r3.s2.w4: the D1 mirror of F3 for signal exits — a `D1` leaf
+            // must not evaluate against a day that has not closed.
+            && (d1_engine.is_none() || bar.d1.is_some())
             && exit_plan.signal_triggered(&ctx)
         {
             state.pending_exit = Some(PendingExit {
@@ -281,12 +326,18 @@ pub fn run_backtest(
             // HTF engine must be warm too — an `Htf` EMA still seeding must not
             // fire an entry (the same warmup discipline the primary gate has).
             && htf_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
+            // r3.s2.w4: the D1 mirror — a daily EMA still seeding must not
+            // fire an entry.
+            && d1_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
             // r2.s2 round-1 fix F3: `is_warm` is vacuous when the strategy's
             // only `Htf` operand is a Price leaf (no HTF indicator exists to
             // warm), so a paired closed HTF bar must exist before the entry
             // may evaluate — a `Not(...)` over an absent `Htf` operand
             // otherwise reads `true` and fires before any H4 bar exists.
             && (htf_engine.is_none() || bar.htf.is_some())
+            // r3.s2.w4: the D1 mirror of F3 — a `D1` price leaf needs a
+            // closed daily bar paired before the entry may evaluate.
+            && (d1_engine.is_none() || bar.d1.is_some())
             && compiled.entry().eval(&ctx)
         {
             // ATR-stop entries additionally require the primary ATR(period)
@@ -454,6 +505,49 @@ fn check_htf_inputs(
     Ok(())
 }
 
+/// The D1 mirror of [`check_htf_inputs`] (r3.s2.w4): a strategy carrying a
+/// `series: "d1"` operand must never evaluate that operand without a daily
+/// series; a supplied daily series for a DIFFERENT pair would feed `D1`
+/// operands another symbol's bars; and — only when the strategy actually
+/// consumes the series — a daily series ending more than one D1 interval before
+/// the primary's end would leave `D1` operands reading a frozen final bar.
+/// There is no cadence arm: the daily series is always D1, fixed by the
+/// engine's construction, and a D1-as-HTF selection is refused at the request
+/// boundary (`HtfIsD1`) before any series is loaded.
+fn check_d1_inputs(
+    compiled: &CompiledStrategy,
+    primary: &CandleSeries,
+    d1: Option<&CandleSeries>,
+) -> Result<(), BacktestError> {
+    if compiled.needs_d1() && d1.is_none() {
+        return Err(BacktestError::D1Required);
+    }
+    if let Some(d1_series) = d1 {
+        if d1_series.pair != primary.pair {
+            return Err(BacktestError::D1PairMismatch {
+                primary: primary.pair.clone(),
+                d1: d1_series.pair.clone(),
+            });
+        }
+        // One interval of slack, exactly like the HTF check: at most one
+        // not-yet-closed daily bar may be pending, the normal live shape. An
+        // empty daily series is legal (r2.s1.w3) and skipped. The arm is
+        // gated on `needs_d1` like its HTF counterpart: coverage freshness
+        // only matters when the strategy reads the series.
+        if compiled.needs_d1()
+            && let (Some(primary_last), Some(d1_last)) =
+                (primary.candles.last(), d1_series.candles.last())
+            && primary_last.close_time - d1_last.close_time > Timeframe::D1.duration_ms()
+        {
+            return Err(BacktestError::D1CoverageShort {
+                primary_end: primary_last.close_time,
+                d1_end: d1_last.close_time,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Advance the HTF indicator engine over every HTF candle that has closed at
 /// or before `primary_close` (r2.s2 round-1 fix F2), in chronological order,
 /// each exactly once. `cursor` indexes `htf_candles` at the next bar not yet
@@ -476,21 +570,23 @@ fn step_closed_htf_candles(
 /// The first primary bar at which the entry warm gate holds (r2.s3.w3, L3 —
 /// "computed by stepping", never estimated from a period count): builds the
 /// same indicator engines [`run_backtest`] builds, steps every primary candle
-/// (and the HTF engine on each closed HTF bar exactly as `run_backtest` does,
-/// cursor semantics included), and returns the `open_time` of the first bar
-/// whose entry warm gate is satisfied: `engine.is_warm()`, the HTF engine warm
-/// when the strategy uses `Htf` indicators, and a paired closed HTF bar when an
-/// `Htf` price leaf needs one (the F3 clause — `is_warm` is vacuous when no HTF
-/// indicator exists). `None` when no bar is ever warm — or when the engines
-/// cannot be built (a compiled strategy that fails `IndicatorEngine::new` can
-/// never warm; the actual run still refuses honestly at `prepare_backtest`).
-/// Trading state is never constructed: no fills, no pending entries, no
-/// positions.
+/// (and the HTF/D1 engines on each closed higher-timeframe bar exactly as
+/// `run_backtest` does, cursor semantics included), and returns the `open_time`
+/// of the first bar whose entry warm gate is satisfied: `engine.is_warm()`, the
+/// HTF engine warm when the strategy uses `Htf` indicators, the D1 engine warm
+/// when it uses `D1` indicators (r3.s2.w4), and a paired closed bar when an
+/// `Htf`/`D1` price leaf needs one (the F3 clauses — `is_warm` is vacuous when
+/// no series indicator exists). `None` when no bar is ever warm — or when the
+/// engines cannot be built (a compiled strategy that fails
+/// `IndicatorEngine::new` can never warm; the actual run still refuses honestly
+/// at `prepare_backtest`). Trading state is never constructed: no fills, no
+/// pending entries, no positions.
 #[must_use]
 pub fn first_fully_warm_bar_ms(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
+    d1: Option<&CandleSeries>,
 ) -> Option<i64> {
     let mut engine = IndicatorEngine::new(compiled).ok()?;
     let mut htf_engine = if compiled.needs_htf() {
@@ -498,16 +594,31 @@ pub fn first_fully_warm_bar_ms(
     } else {
         None
     };
+    let mut d1_engine = if compiled.needs_d1() {
+        Some(IndicatorEngine::for_series(compiled, Series::D1).ok()?)
+    } else {
+        None
+    };
     let mut htf_cursor = 0_usize;
     let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
+    let mut d1_cursor = 0_usize;
+    let d1_candles: &[Candle] = d1.map_or(&[][..], |series| series.candles.as_slice());
 
-    for bar in align(primary, htf) {
+    for bar in align(primary, htf, d1) {
         engine.step(bar.primary);
         if let Some(engine_htf) = htf_engine.as_mut() {
             step_closed_htf_candles(
                 engine_htf,
                 htf_candles,
                 &mut htf_cursor,
+                bar.primary.close_time,
+            );
+        }
+        if let Some(engine_d1) = d1_engine.as_mut() {
+            step_closed_htf_candles(
+                engine_d1,
+                d1_candles,
+                &mut d1_cursor,
                 bar.primary.close_time,
             );
         }
@@ -520,7 +631,9 @@ pub fn first_fully_warm_bar_ms(
         if bar.index > 0
             && engine.is_warm()
             && htf_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
+            && d1_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
             && (htf_engine.is_none() || bar.htf.is_some())
+            && (d1_engine.is_none() || bar.d1.is_some())
         {
             return Some(bar.primary.open_time);
         }
@@ -565,13 +678,15 @@ enum StopRule {
 
 /// The series-routed evaluation context (r2.s2.w2): every [`CompiledValue`]
 /// leaf carries its [`Series`] tag, so `current`/`previous` forward `Primary`
-/// leaves to the primary engine and `Htf` leaves to the higher-timeframe one.
-/// `htf` is `None` only for a strategy with no `Htf` operand — the
-/// [`BacktestError::HtfRequired`] guard in [`run_backtest`] makes the
-/// alternative unreachable.
+/// leaves to the primary engine, `Htf` leaves to the higher-timeframe one and
+/// `D1` leaves to the fixed daily one (r3.s2.w4). `htf` is `None` only for a
+/// strategy with no `Htf` operand and `d1` only for one with no `D1` operand —
+/// the [`BacktestError::HtfRequired`]/[`BacktestError::D1Required`] guards in
+/// [`run_backtest`] make the alternatives unreachable.
 struct DualSeriesContext<'a> {
     primary: &'a IndicatorEngine,
     htf: Option<&'a IndicatorEngine>,
+    d1: Option<&'a IndicatorEngine>,
 }
 
 impl EvalContext for DualSeriesContext<'_> {
@@ -597,6 +712,12 @@ impl EvalContext for DualSeriesContext<'_> {
                 series: Series::Htf,
                 ..
             } => self.htf.and_then(|engine| engine.current(value)),
+            CompiledValue::Price {
+                series: Series::D1, ..
+            }
+            | CompiledValue::Indicator {
+                series: Series::D1, ..
+            } => self.d1.and_then(|engine| engine.current(value)),
         }
     }
 
@@ -620,6 +741,12 @@ impl EvalContext for DualSeriesContext<'_> {
                 series: Series::Htf,
                 ..
             } => self.htf.and_then(|engine| engine.previous(value)),
+            CompiledValue::Price {
+                series: Series::D1, ..
+            }
+            | CompiledValue::Indicator {
+                series: Series::D1, ..
+            } => self.d1.and_then(|engine| engine.previous(value)),
         }
     }
 }
@@ -1742,6 +1869,7 @@ mod tests {
             &base_strategy(),
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -1765,6 +1893,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -1794,7 +1923,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            first_fully_warm_bar_ms(&base_strategy(), &primary, None),
+            first_fully_warm_bar_ms(&base_strategy(), &primary, None, None),
             Some(primary.candles[1].open_time),
             "bar 0 is warm but unenterable; the probe reports bar 1"
         );
@@ -1802,6 +1931,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -1827,6 +1957,7 @@ mod tests {
             &base_strategy(),
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -1851,6 +1982,7 @@ mod tests {
             &base_strategy(),
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -1874,6 +2006,7 @@ mod tests {
             &base_strategy(),
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -1896,6 +2029,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2057,6 +2191,7 @@ mod tests {
             &strategy,
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -2095,6 +2230,7 @@ mod tests {
             &trailing,
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -2108,6 +2244,7 @@ mod tests {
             run_backtest(
                 &time_only,
                 &primary,
+                None,
                 None,
                 &config(),
                 &SymbolFilters::unconstrained(),
@@ -2137,6 +2274,7 @@ mod tests {
             &strategy,
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -2156,6 +2294,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2187,6 +2326,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2225,6 +2365,7 @@ mod tests {
             &compiled(never_signal(), vec![stop()]),
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::WindowEdge,
@@ -2244,6 +2385,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2276,6 +2418,7 @@ mod tests {
         let result = run_backtest(
             &strategy,
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2331,6 +2474,7 @@ mod tests {
         let result = run_backtest(
             &strategy,
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2388,6 +2532,7 @@ mod tests {
             &strategy,
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -2429,6 +2574,7 @@ mod tests {
             &strategy,
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -2462,6 +2608,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2502,6 +2649,7 @@ mod tests {
             &base_strategy(),
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::WindowEdge,
@@ -2518,6 +2666,7 @@ mod tests {
         let closed = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2542,6 +2691,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &config(),
             &SymbolFilters::unconstrained(),
@@ -2668,6 +2818,7 @@ mod tests {
             &base_strategy(),
             &primary,
             None,
+            None,
             &bad,
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -2700,6 +2851,7 @@ mod tests {
             &strategy,
             &primary,
             None,
+            None,
             &config(),
             &SymbolFilters::unconstrained(),
             SeriesEnd::SnapshotEnd,
@@ -2722,6 +2874,7 @@ mod tests {
             run_backtest(
                 &strategy,
                 &primary,
+                None,
                 None,
                 &config(),
                 &SymbolFilters::unconstrained(),
@@ -2751,6 +2904,7 @@ mod tests {
         let result = run_backtest(
             &base_strategy(),
             &primary,
+            None,
             None,
             &cfg,
             &SymbolFilters::unconstrained(),

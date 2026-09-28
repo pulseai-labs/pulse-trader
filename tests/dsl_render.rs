@@ -194,6 +194,84 @@ fn values_render_constants_prices_and_series_tags() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// r3.s2.w4 (#191) — the series prefix is the run's HTF, and `d1` is fixed
+// ---------------------------------------------------------------------------
+//
+// The `h4:` text used to be a literal inside the renderer. It is now the run's
+// own HTF timeframe, defaulting to H4, so every existing caller's output stays
+// byte-identical while a strategy's daily operand renders its own, fixed `d1:`
+// prefix. These lock both halves: the default is unchanged, and the two series
+// cannot be confused for one another.
+
+#[test]
+fn the_htf_prefix_is_a_parameter_whose_default_is_byte_identical() {
+    let htf_close = price(Series::Htf, PriceField::Close);
+    let htf_ema = indicator(
+        Series::Htf,
+        IndicatorSpec::Ema {
+            period: fixed_u32(200),
+        },
+    );
+    for source in [
+        htf_close,
+        htf_ema,
+        ValueSource::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Rsi {
+                period: fixed_u32(14),
+            },
+        },
+    ] {
+        assert_eq!(
+            render::value_with_prefix(&source, "h4"),
+            render::value(&source),
+            "the H4 default must reproduce today's output exactly"
+        );
+    }
+    // A different selected HTF renders its own token on the same operand shape.
+    assert_eq!(
+        render::value_with_prefix(&price(Series::Htf, PriceField::Close), "1h"),
+        "1h:close"
+    );
+}
+
+#[test]
+fn daily_operands_render_the_fixed_d1_prefix_whatever_the_htf_is() {
+    assert_eq!(
+        render::value(&price(Series::D1, PriceField::Close)),
+        "d1:close"
+    );
+    assert_eq!(
+        render::value(&indicator(
+            Series::D1,
+            IndicatorSpec::Ema {
+                period: fixed_u32(50)
+            }
+        )),
+        "d1:ema(50)"
+    );
+    // The `d1` prefix is fixed — the run's HTF selection never retags it.
+    assert_eq!(
+        render::value_with_prefix(&price(Series::D1, PriceField::Close), "1h"),
+        "d1:close"
+    );
+    // Two series in one condition keep their own tags, HTF first as written.
+    assert_eq!(
+        render::condition(&Condition::Compare {
+            lhs: price(Series::D1, PriceField::Close),
+            op: Comparator::Gt,
+            rhs: indicator(
+                Series::D1,
+                IndicatorSpec::Ema {
+                    period: fixed_u32(50)
+                }
+            ),
+        }),
+        "d1:close > d1:ema(50)"
+    );
+}
+
 #[test]
 fn comparators_render_their_symbols() {
     assert_eq!(render::comparator(Comparator::Lt), "<");

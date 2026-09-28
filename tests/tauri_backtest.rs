@@ -977,11 +977,12 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
         trades: trades.clone(),
         primary: primary.clone(),
         htf: None,
+        d1: None,
         fingerprint_warning: None,
         mfe: project_histogram(std::iter::empty()),
         mae: project_histogram(std::iter::empty()),
     };
-    let err = pulse::backtest_run_dto(&outcome)
+    let err = pulse::backtest_run_dto(&outcome, true)
         .expect_err("a count that does not fit the wire must refuse, never clamp");
     let BacktestAppError::SavedButReadBackFailed {
         run_id,
@@ -1010,12 +1011,13 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
         trades,
         primary,
         htf: None,
+        d1: None,
         fingerprint_warning: None,
         mfe: project_histogram(std::iter::empty()),
         mae: project_histogram(std::iter::empty()),
     };
     assert!(
-        pulse::backtest_run_dto(&good).is_ok(),
+        pulse::backtest_run_dto(&good, true).is_ok(),
         "positive control: an uncorrupted outcome projects"
     );
 }
@@ -1686,6 +1688,7 @@ fn seed_inputs() -> BacktestInputs {
             data_version: DataVersion::new("v-primary"),
         },
         htf: None,
+        d1: None,
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,

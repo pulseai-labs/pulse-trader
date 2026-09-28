@@ -204,6 +204,18 @@ pub struct BacktestRunDto {
     pub htf_timeframe: Option<String>,
     /// The exact immutable HTF snapshot identity.
     pub htf_data_version: Option<String>,
+    /// The exact immutable D1 snapshot identity, when the run read one
+    /// (r3.s2.w4) — `None` for a strategy with no `d1` operand and for every
+    /// row persisted before migration `0017`, whose daily snapshot is not
+    /// recorded and is therefore never guessed.
+    pub d1_data_version: Option<String>,
+    /// Whether the run's strategy actually read the HTF (r3.s2.w4, #219).
+    ///
+    /// NOT derivable from the two fields above: every run records an H4
+    /// snapshot even when its DSL has no `htf` operand (`resolve_default_request`
+    /// supplies the application default), so the Lab gates its HTF row on this
+    /// flag and renders the D1 row on `d1_data_version` alone.
+    pub uses_htf: bool,
     /// First candle `open_time` of the **reloaded** primary snapshot, epoch ms.
     pub first_open_time_ms: String,
     /// Last candle `close_time` of the **reloaded** primary snapshot, epoch ms.
@@ -541,7 +553,9 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
 ///
 /// Pure: it reads the outcome and nothing else. Every provenance and analytical
 /// value below traces to a persisted column or to the reloaded snapshot the
-/// persisted inputs name.
+/// persisted inputs name — except `uses_htf`, which no column carries and which
+/// the caller therefore passes in, read from the run's own strategy
+/// ([`run_uses_htf`](crate::application::backtest::run_uses_htf)).
 ///
 /// # Errors
 ///
@@ -550,7 +564,10 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
 /// wire's `u32`. The run is saved, so the error still names it — refusing is the
 /// point: a clamped count would render a plausible false number for a row that
 /// should not be reported at all.
-pub fn backtest_run_dto(outcome: &BacktestOutcome) -> Result<BacktestRunDto, BacktestAppError> {
+pub fn backtest_run_dto(
+    outcome: &BacktestOutcome,
+    uses_htf: bool,
+) -> Result<BacktestRunDto, BacktestAppError> {
     let run: &PersistedRun = &outcome.run;
     let summary = &run.summary;
     // Proven `Some` by the use case, which refuses a fresh read-back without inputs
@@ -576,6 +593,11 @@ pub fn backtest_run_dto(outcome: &BacktestOutcome) -> Result<BacktestRunDto, Bac
             .htf
             .as_ref()
             .map(|htf| htf.data_version.as_str().to_owned()),
+        d1_data_version: inputs
+            .d1
+            .as_ref()
+            .map(|d1| d1.data_version.as_str().to_owned()),
+        uses_htf,
         // From the RELOADED snapshot: the truthful range of the data this run
         // consumed, which survives HEAD moving afterwards.
         first_open_time_ms: ms(outcome

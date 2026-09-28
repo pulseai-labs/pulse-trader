@@ -137,6 +137,7 @@ fn run_golden(primary: &CandleSeries) -> BacktestResult {
         &compiled,
         primary,
         None,
+        None,
         &BacktestConfig::default(),
         &filters,
         SeriesEnd::SnapshotEnd,

@@ -347,13 +347,14 @@ fn check_expression_condition(
                 .to_owned(),
         });
     }
-    if shape.mixed_series() {
+    if let Some(pair) = shape.series_conflict() {
         errors.push(FieldError {
             path: format!("{path}.{node}.value"),
             code: ValidationCode::InvalidExpression,
-            message: "a rising/falling compares a value with its own past on one series; \
-                      its leaves sit on both primary and htf"
-                .to_owned(),
+            message: format!(
+                "a rising/falling compares a value with its own past on one series; \
+                 its leaves sit on {pair}"
+            ),
         });
     }
 }
@@ -369,30 +370,54 @@ const MAX_EXPRESSION_DEPTH: u32 = 4;
 /// number of enclosing `Arith`/`Lag` nodes, whether the walk is inside a `Lag`
 /// (a lag under a lag is refused), and which series the leaves seen so far sit
 /// on (`Constant` is series-neutral — it never sets a flag).
+///
+/// One flag per series, not a set: the walk is `Copy`, allocation-free and
+/// branch-predictable, and `Series` has exactly three variants — so the struct
+/// is at most three bits of state, spelled so the mixed-series refusal can name
+/// what it found in a fixed order (`primary`, `htf`, `d1`).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default, Clone, Copy)]
 struct ExprContext {
     depth: u32,
     under_lag: bool,
     has_primary: bool,
     has_htf: bool,
+    has_d1: bool,
 }
 
 impl ExprContext {
-    /// Whether the leaves seen so far sit on both series.
-    fn mixed_series(self) -> bool {
-        self.has_primary && self.has_htf
+    /// Which series the leaves seen so far span, when that is more than one
+    /// (r3.s2.w4: the mixed-series rule generalises from "primary and htf" to
+    /// any two of the three series), named for the refusal message.
+    fn series_conflict(self) -> Option<String> {
+        let present: Vec<&str> = [
+            self.has_primary.then_some("primary"),
+            self.has_htf.then_some("htf"),
+            self.has_d1.then_some("d1"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if present.len() > 1 {
+            Some(present.join(" and "))
+        } else {
+            None
+        }
     }
 }
 
 /// The recursive scan [`Condition::Rising`]/[`Condition::Falling`] use to refuse
-/// a value that carries a `Lag` or spans both series. Depth is unbounded here —
-/// [`check_value_source`] already enforced the depth cap on the same walk.
+/// a value that carries a `Lag` or spans more than one series. Depth is
+/// unbounded here — [`check_value_source`] already enforced the depth cap on
+/// the same walk.
 fn value_shape(v: &ValueSource) -> ExprContext {
+    use crate::domain::dsl::value::Series;
     match v {
         ValueSource::Constant { .. } => ExprContext::default(),
         ValueSource::Price { series, .. } | ValueSource::Indicator { series, .. } => ExprContext {
-            has_primary: *series == crate::domain::dsl::value::Series::Primary,
-            has_htf: *series == crate::domain::dsl::value::Series::Htf,
+            has_primary: *series == Series::Primary,
+            has_htf: *series == Series::Htf,
+            has_d1: *series == Series::D1,
             ..ExprContext::default()
         },
         ValueSource::Arith { lhs, rhs, .. } => {
@@ -400,6 +425,7 @@ fn value_shape(v: &ValueSource) -> ExprContext {
             let rhs = value_shape(rhs);
             shape.has_primary |= rhs.has_primary;
             shape.has_htf |= rhs.has_htf;
+            shape.has_d1 |= rhs.has_d1;
             shape
         }
         ValueSource::Lag { value, .. } => ExprContext {
@@ -643,11 +669,13 @@ fn check_value_source(
         ValueSource::Price { series, .. } => match series {
             crate::domain::dsl::value::Series::Primary => ctx.has_primary = true,
             crate::domain::dsl::value::Series::Htf => ctx.has_htf = true,
+            crate::domain::dsl::value::Series::D1 => ctx.has_d1 = true,
         },
         ValueSource::Indicator { spec, series } => {
             match series {
                 crate::domain::dsl::value::Series::Primary => ctx.has_primary = true,
                 crate::domain::dsl::value::Series::Htf => ctx.has_htf = true,
+                crate::domain::dsl::value::Series::D1 => ctx.has_d1 = true,
             }
             check_indicator(spec, &format!("{path}.indicator"), errors);
         }
@@ -701,25 +729,27 @@ fn check_value_source(
                 });
             }
             // A lag must cover one series: a fresh accumulator walks the
-            // lagged value, and both-series leaves refuse at THIS node.
+            // lagged value, and multi-series leaves refuse at THIS node.
             let mut inner = ExprContext {
                 depth: ctx.depth + 1,
                 under_lag: true,
                 has_primary: false,
                 has_htf: false,
+                has_d1: false,
             };
             check_value_source(value, &format!("{path}.lag.value"), errors, &mut inner);
-            if inner.mixed_series() {
+            if let Some(pair) = inner.series_conflict() {
                 errors.push(FieldError {
                     path: format!("{path}.lag"),
                     code: ValidationCode::InvalidExpression,
-                    message: "a lag reads its value on one series; its leaves sit on both \
-                              primary and htf"
-                        .to_owned(),
+                    message: format!(
+                        "a lag reads its value on one series; its leaves sit on {pair}"
+                    ),
                 });
             }
             ctx.has_primary |= inner.has_primary;
             ctx.has_htf |= inner.has_htf;
+            ctx.has_d1 |= inner.has_d1;
         }
     }
 }

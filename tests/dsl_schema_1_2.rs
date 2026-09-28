@@ -239,6 +239,7 @@ fn frozen_run(primary: &CandleSeries, doc: &str) -> (String, String) {
         &compiled,
         primary,
         None,
+        None,
         &BacktestConfig::default(),
         &filters,
         SeriesEnd::SnapshotEnd,
@@ -1222,6 +1223,7 @@ async fn unknown_fields_in_a_raw_row_load_list_and_backtest() {
     let result = run_backtest(
         &compiled,
         &primary,
+        None,
         None,
         &BacktestConfig::default(),
         &filters,

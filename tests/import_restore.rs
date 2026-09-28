@@ -285,6 +285,7 @@ async fn seed_mac_source(with_missing_ref_run: bool) -> Seeded {
         pair: Pair::new("BTCUSDT"),
         primary,
         htf,
+        d1: None,
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
