@@ -204,7 +204,7 @@ mod tests {
 mod prop_tests {
     use super::{Comparator, Condition};
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, PriceField, Series, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
     use proptest::prelude::*;
     use rust_decimal::Decimal;
 
@@ -231,12 +231,18 @@ mod prop_tests {
             (
                 arb_sweepable_u32(),
                 arb_sweepable_u32(),
-                arb_sweepable_u32()
+                arb_sweepable_u32(),
+                prop_oneof![
+                    Just(MacdOutput::Line),
+                    Just(MacdOutput::Signal),
+                    Just(MacdOutput::Histogram)
+                ],
             )
-                .prop_map(|(fast, slow, signal)| IndicatorSpec::Macd {
+                .prop_map(|(fast, slow, signal, output)| IndicatorSpec::Macd {
                     fast,
                     slow,
-                    signal
+                    signal,
+                    output
                 }),
         ]
     }

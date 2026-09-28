@@ -182,7 +182,12 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
                 .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
                 .ok_or_else(|| invalid_period(spec, format!("ADX period {period} is invalid")))
         }
-        IndicatorSpec::Macd { fast, slow, signal } => {
+        IndicatorSpec::Macd {
+            fast,
+            slow,
+            signal,
+            output,
+        } => {
             let fast = fixed_u32(fast, "macd.fast")?;
             let slow = fixed_u32(slow, "macd.slow")?;
             let signal = fixed_u32(signal, "macd.signal")?;
@@ -192,7 +197,7 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
                     format!("MACD fast period {fast} must be less than slow period {slow}"),
                 ));
             }
-            Macd::new(fast, slow, signal)
+            Macd::new(fast, slow, signal, *output)
                 .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
                 .ok_or_else(|| {
                     invalid_period(

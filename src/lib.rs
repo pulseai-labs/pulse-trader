@@ -109,7 +109,8 @@ pub use domain::strategy::Hypothesis as AgentHypothesis;
 // (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
 // same curated-surface pattern as the domain types above.
 pub use domain::{
-    Comparator, Condition, IndicatorSpec, PriceField, Series, SweepableValue, ValueSource,
+    Comparator, Condition, IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue,
+    ValueSource,
 };
 
 // VS-1.1.2 work-2.02: the whole-strategy document layer. `StrategyDsl` is the

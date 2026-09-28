@@ -18,14 +18,15 @@
 //! (VS-1.1.4 / agent layer) composes `load → validate → compile`.
 //!
 //! **The production registry.** [`Migrator::v1`] registers the real steps —
-//! currently one: the `1.0.0 → 1.1.0` identity step (schema 1.1.0 is additive —
-//! a new defaulted field and new enum variants — so the step rewrites only the
-//! `schema_version` string; every `1.0.0` document deserializes identically at
-//! `1.1.0`). Chaining + error paths are additionally proven by synthetic test
-//! migrations (see the test module).
+//! currently two: the `1.0.0 → 1.1.0` and `1.1.0 → 1.2.0` identity steps
+//! (schema 1.1.0 is additive — a new defaulted field and new enum variants;
+//! schema 1.2.0 is additive too — MACD's defaulted `output` field — so each
+//! step rewrites only the `schema_version` string; every pre-bump document
+//! deserializes identically at `CURRENT`). Chaining + error paths are
+//! additionally proven by synthetic test migrations (see the test module).
 //!
 //! **No forward-compatibility** (architect-critic): every `schema_version >
-//! CURRENT` — including a same-major future minor like `1.2.0` vs `1.1.0` — is
+//! CURRENT` — including a same-major future minor like `1.3.0` vs `1.2.0` — is
 //! rejected as [`LoadError::FutureVersion`]. A newer minor may carry semantics
 //! this engine cannot honor, and silently ignoring unknown fields could
 //! mis-execute a real-money strategy.
@@ -167,7 +168,7 @@ impl SchemaVersion {
 ///
 /// A **value** (not a global) so tests can build a custom registry with
 /// synthetic migrations. [`Migrator::v1`] is the production registry — it
-/// carries the real `1.0.0 → 1.1.0` identity step.
+/// carries the real `1.0.0 → 1.1.0` and `1.1.0 → 1.2.0` identity steps.
 #[derive(Clone, Default)]
 pub struct Migrator {
     migrations: Vec<Migration>,
@@ -190,30 +191,64 @@ fn identity_1_0_0_to_1_1_0(mut value: Value) -> Result<Value, MigrationError> {
     Ok(value)
 }
 
+/// The `1.1.0 → 1.2.0` step: **identity**. Schema 1.2.0 is purely additive
+/// (r3.s2 ADR-0024 amendment — MACD's `output` field defaults to `line`, the
+/// historical behaviour), so the document's meaning is unchanged; `apply`
+/// rewrites only the `schema_version` string and leaves every other byte
+/// alone. `dsl_original` is preserved verbatim by [`Loaded`] regardless — the
+/// migration never touches it.
+fn identity_1_1_0_to_1_2_0(mut value: Value) -> Result<Value, MigrationError> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| MigrationError("document is not a JSON object".to_owned()))?;
+    obj.insert(
+        "schema_version".to_owned(),
+        serde_json::Value::String("1.2.0".to_owned()),
+    );
+    Ok(value)
+}
+
 impl Migrator {
-    /// The production registry: the one real step, `1.0.0 → 1.1.0` (identity).
+    /// The production registry: the two real steps, `1.0.0 → 1.1.0` and
+    /// `1.1.0 → 1.2.0` (both identity).
     ///
-    /// `to` is pinned to the literal `1.1.0` the step's `apply` stamps —
+    /// Each `to` is pinned to the literal the step's `apply` stamps —
     /// NOT `SchemaVersion::CURRENT` (r2.s2 round-1 fix F8): a future `CURRENT`
-    /// bump must not silently desync the registration from the version the
-    /// step actually produces. A test below pins the two to the same literal.
+    /// bump must not silently desync a registration from the version its step
+    /// actually produces. Tests below pin each pair to the same literal.
     #[must_use]
     pub fn v1() -> Self {
         Migrator {
-            migrations: vec![Migration {
-                from: SchemaVersion {
-                    major: 1,
-                    minor: 0,
-                    patch: 0,
+            migrations: vec![
+                Migration {
+                    from: SchemaVersion {
+                        major: 1,
+                        minor: 0,
+                        patch: 0,
+                    },
+                    to: SchemaVersion {
+                        major: 1,
+                        minor: 1,
+                        patch: 0,
+                    },
+                    kind: MigrationKind::Minor,
+                    apply: identity_1_0_0_to_1_1_0,
                 },
-                to: SchemaVersion {
-                    major: 1,
-                    minor: 1,
-                    patch: 0,
+                Migration {
+                    from: SchemaVersion {
+                        major: 1,
+                        minor: 1,
+                        patch: 0,
+                    },
+                    to: SchemaVersion {
+                        major: 1,
+                        minor: 2,
+                        patch: 0,
+                    },
+                    kind: MigrationKind::Minor,
+                    apply: identity_1_1_0_to_1_2_0,
                 },
-                kind: MigrationKind::Minor,
-                apply: identity_1_0_0_to_1_1_0,
-            }],
+            ],
         }
     }
 
@@ -277,8 +312,38 @@ impl Migrator {
         })
     }
 
-    /// Walk the migration chain from `start` up to `CURRENT`, applying each step.
+    /// The MIGRATED raw form of a document: version-detect → walk the chain →
+    /// return the migrated `serde_json::Value` WITHOUT deserializing it.
     ///
+    /// The write-path strictness check compares raw keys against the
+    /// re-serialized parsed value at the same path; per ADR-0024's amendment
+    /// the walk must compare AFTER migration, so a renaming migration's
+    /// consumed keys (e.g. a synthetic `strat_name` → `name` step) are not
+    /// flagged as unknown. For identity migrations the returned value's keys
+    /// equal the input's keys.
+    ///
+    /// # Errors
+    ///
+    /// See [`LoadError`] — the same version-detection and chain cases
+    /// `load_value` raises, minus `Deserialize` (nothing is deserialized
+    /// here).
+    pub fn migrated_value(&self, value: Value) -> Result<Value, LoadError> {
+        let from = read_version(&value)?;
+        let current = SchemaVersion::CURRENT;
+        if from > current {
+            return Err(LoadError::FutureVersion {
+                found: from,
+                current,
+            });
+        }
+        if from < current {
+            self.resolve_and_apply(value, from)
+        } else {
+            Ok(value)
+        }
+    }
+
+    /// Walk the migration chain from `start` up to `CURRENT`, applying each step.
     /// Guards (architect-critic): the loop is bounded by the registry length and
     /// tracks visited versions; a step that does not advance the version or
     /// revisits a seen one (cycle / mis-registration) raises
@@ -457,7 +522,7 @@ mod tests {
     #[test]
     fn rejects_same_major_future_minor() {
         let mut value: Value = serde_json::from_str(&canonical_current_json()).unwrap();
-        value["schema_version"] = json!("1.2.0");
+        value["schema_version"] = json!("1.3.0");
         let json = value.to_string();
 
         let err = Migrator::v1()
@@ -465,7 +530,7 @@ mod tests {
             .expect_err("same-major future minor must reject");
         assert!(
             matches!(err, LoadError::FutureVersion { .. }),
-            "expected FutureVersion for 1.2.0 vs 1.1.0, got {err:?}"
+            "expected FutureVersion for 1.3.0 vs 1.2.0, got {err:?}"
         );
     }
 
@@ -624,35 +689,39 @@ mod tests {
         );
     }
 
-    /// r2.s2 round-1 fix F8: the identity step's registered `to` is the literal
-    /// `1.1.0` its `apply` stamps — pinned, not `SchemaVersion::CURRENT` — so a
-    /// future `CURRENT` bump cannot silently desync the chain: this test fails
-    /// if the registration and the stamped literal ever diverge.
+    /// r2.s2 round-1 fix F8 (extended r3.s2.w1 to both registered steps): each
+    /// identity step's registered `to` is the literal its `apply` stamps —
+    /// pinned, not `SchemaVersion::CURRENT` — so a future `CURRENT` bump
+    /// cannot silently desync the chain: this test fails if any registration
+    /// and its stamped literal ever diverge.
     #[test]
     fn v1_terminal_version_matches_the_literal_its_apply_stamps() {
         let migrator = Migrator::v1();
-        let step = migrator
-            .migrations
-            .iter()
-            .find(|m| m.from == v(1, 0, 0))
-            .expect("v1 registers the 1.0.0 -> 1.1.0 step");
+        for (from, expected_to) in [(v(1, 0, 0), v(1, 1, 0)), (v(1, 1, 0), v(1, 2, 0))] {
+            let step = migrator
+                .migrations
+                .iter()
+                .find(|m| m.from == from)
+                .unwrap_or_else(|| panic!("v1 registers the {from} -> {expected_to} step"));
 
-        // The registration pins the literal, not CURRENT.
-        assert_eq!(step.to, v(1, 1, 0));
+            // The registration pins the literal, not CURRENT.
+            assert_eq!(step.to, expected_to, "step from {from} pins its literal");
 
-        // And the literal equals what `apply` stamps on a real 1.0.0 document.
-        let mut doc: Value =
-            serde_json::from_str(&canonical_current_json()).expect("canonical parses");
-        doc["schema_version"] = json!("1.0.0");
-        let migrated = (step.apply)(doc).expect("identity step applies");
-        let stamped: SchemaVersion = migrated["schema_version"]
-            .as_str()
-            .expect("schema_version stays a string")
-            .parse()
-            .expect("the stamped version parses");
-        assert_eq!(
-            stamped, step.to,
-            "the registry's terminal `to` must equal the literal `apply` stamps"
-        );
+            // And the literal equals what `apply` stamps on a real document
+            // authored at `from`.
+            let mut doc: Value =
+                serde_json::from_str(&canonical_current_json()).expect("canonical parses");
+            doc["schema_version"] = serde_json::json!(from.to_string());
+            let migrated = (step.apply)(doc).expect("identity step applies");
+            let stamped: SchemaVersion = migrated["schema_version"]
+                .as_str()
+                .expect("schema_version stays a string")
+                .parse()
+                .expect("the stamped version parses");
+            assert_eq!(
+                stamped, step.to,
+                "the step from {from} must stamp exactly its registered `to` literal"
+            );
+        }
     }
 }

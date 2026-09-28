@@ -40,6 +40,16 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "series_htf",
         "an `htf` operand is evaluated on the last closed H4 bar; an ATR stop uses the signal bar's ATR",
     ),
+    // r3.s2.w1 (b2): schema 1.2.0 — MACD's output selector.
+    (
+        "macd_output",
+        "a MACD operand's `output` selects `line`, `signal` or `histogram`; omitting it is the historical line — signal and histogram warm up over max(fast,slow)+signal−1 bars",
+    ),
+    // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
+    (
+        "schema_version",
+        "this engine writes and serves schema 1.2.0 and also loads 1.0.0 and 1.1.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.2.0",
+    ),
 ];
 
 /// Build the `pulse://dsl/schema` document body (a compact JSON string).
@@ -86,12 +96,12 @@ mod tests {
             assert!(properties.contains_key(field), "missing property {field}");
         }
         // F6: `schema_version` publishes the ACCEPTED values, not an
-        // unconstrained string — `Migrator::v1()` loads `1.0.0` (identity-
-        // migrated) and `CURRENT`, so the schema a validating agent reads must
-        // pin exactly that enum.
+        // unconstrained string — `Migrator::v1()` loads `1.0.0` and `1.1.0`
+        // (identity-migrated) and `CURRENT`, so the schema a validating agent
+        // reads must pin exactly that enum.
         assert_eq!(
             properties["schema_version"]["enum"],
-            serde_json::json!(["1.0.0", DSL_SCHEMA_VERSION]),
+            serde_json::json!(["1.0.0", "1.1.0", DSL_SCHEMA_VERSION]),
             "schema_version property must publish the accepted enum"
         );
         let conventions = doc["conventions"].as_object().expect("conventions object");

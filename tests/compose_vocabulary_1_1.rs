@@ -308,8 +308,8 @@ async fn htf_filter_and_atr_stop_compose_with_no_substitution() {
     // migrator into the same typed document (already-current, no migration).
     assert_eq!(
         version.dsl_schema_version.to_string(),
-        "1.1.0",
-        "the persisted version is stamped schema 1.1.0"
+        "1.2.0",
+        "the persisted version is stamped schema 1.2.0"
     );
     assert_eq!(version.dsl.schema_version, SchemaVersion::CURRENT);
     let loaded = Migrator::v1()

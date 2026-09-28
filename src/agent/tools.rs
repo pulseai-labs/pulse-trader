@@ -430,8 +430,8 @@ mod mapping {
     use serde::Deserialize;
 
     use crate::domain::{
-        Comparator, Condition, FieldError, IndicatorSpec, PriceField, Series, SweepableValue,
-        ValidationCode, ValueSource,
+        Comparator, Condition, FieldError, IndicatorSpec, MacdOutput, PriceField, Series,
+        SweepableValue, ValidationCode, ValueSource,
     };
 
     use super::field_error;
@@ -466,6 +466,10 @@ mod mapping {
         slow: Option<u32>,
         #[serde(default)]
         signal: Option<u32>,
+        // MACD-only output selector (schema 1.2.0, r3.s2 — b2): `"line"`,
+        // `"signal"` or `"histogram"`; absent → the historical line.
+        #[serde(default)]
+        output: Option<String>,
         #[serde(default)]
         price_field: Option<String>,
         // A constant operand's `value` is a JSON STRING (`"30"`) per the advertised
@@ -663,6 +667,7 @@ mod mapping {
                 fast: fixed_u32(operand.fast, &format!("{path}.fast"))?,
                 slow: fixed_u32(operand.slow, &format!("{path}.slow"))?,
                 signal: fixed_u32(operand.signal, &format!("{path}.signal"))?,
+                output: macd_output(operand, path)?,
             }),
             "atr" => Ok(IndicatorSpec::Atr {
                 period: fixed_period(operand, path)?,
@@ -678,6 +683,21 @@ mod mapping {
     /// A single-period indicator's `period` field as a `SweepableValue::Fixed`.
     fn fixed_period(operand: &Operand, path: &str) -> Result<SweepableValue<u32>, FieldError> {
         fixed_u32(operand.period, &format!("{path}.period"))
+    }
+
+    /// The MACD `output` selector: `"line"` (absent), `"signal"` or
+    /// `"histogram"` — anything else is a correctable `{path}.output` error.
+    fn macd_output(operand: &Operand, path: &str) -> Result<MacdOutput, FieldError> {
+        match operand.output.as_deref() {
+            None | Some("line") => Ok(MacdOutput::Line),
+            Some("signal") => Ok(MacdOutput::Signal),
+            Some("histogram") => Ok(MacdOutput::Histogram),
+            Some(other) => Err(field_error(
+                format!("{path}.output"),
+                ValidationCode::FieldRange,
+                format!("unknown macd output {other:?}; expected line|signal|histogram"),
+            )),
+        }
     }
 
     /// Wrap a required `u32` field into `SweepableValue::Fixed`, or a correctable
@@ -741,6 +761,11 @@ fn operand_schema() -> Value {
             "fast": { "type": "integer", "minimum": 1 },
             "slow": { "type": "integer", "minimum": 1 },
             "signal": { "type": "integer", "minimum": 1 },
+            "output": {
+                "type": "string",
+                "enum": ["line", "signal", "histogram"],
+                "description": "macd only: which output the operand reads; omit for the line"
+            },
             "price_field": {
                 "type": "string",
                 "enum": ["open", "high", "low", "close", "volume"]

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use pulse::render::{self, Rendered};
 use pulse::{
-    Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, RiskParams,
+    Comparator, Condition, Direction, ExitRule, IndicatorSpec, MacdOutput, PriceField, RiskParams,
     SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource, dsl_summary, summarize_dsl,
 };
 use rust_decimal::Decimal;
@@ -134,7 +134,8 @@ fn indicators_render_name_params_without_spaces() {
         render::indicator(&IndicatorSpec::Macd {
             fast: fixed_u32(12),
             slow: fixed_u32(26),
-            signal: fixed_u32(9)
+            signal: fixed_u32(9),
+            output: MacdOutput::Line,
         }),
         "macd(12,26,9)"
     );

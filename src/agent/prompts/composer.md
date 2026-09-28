@@ -12,7 +12,7 @@ expected_inputs: >
 expected_outputs: >
   A sequence of builder-tool calls (one visible step each) that compose and
   finalize a schema-valid strategy; never raw DSL JSON.
-dsl_schema_version: "1.1.0"
+dsl_schema_version: "1.2.0"
 ---
 
 # Composer system prompt
@@ -62,7 +62,7 @@ Both take `{ "left": <operand>, "op": <comparator>, "right": <operand> }`.
 
 **Every operand — left AND right — MUST include a `source`.** Pick one shape:
 
-- `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx"|"atr", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number> }`
+- `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx"|"atr", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number>, "output": "line"|"signal"|"histogram" }` (the optional `output` picks which MACD series the operand reads; omit it for the line)
 - `{ "source": "price", "price_field": "open"|"high"|"low"|"close"|"volume" }`
 - `{ "source": "constant", "value": "<decimal string>" }`  ← a bare threshold like 30 is a **constant**: `{ "source": "constant", "value": "30" }`
 

@@ -468,7 +468,11 @@ fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlF
             IndicatorSpec::Adx { period } => {
                 f(&format!("{base}.adx.period"), LeafMut::Period(period))?;
             }
-            IndicatorSpec::Macd { fast, slow, signal } => {
+            IndicatorSpec::Macd {
+                fast, slow, signal, ..
+            } => {
+                // `output` is not a numeric leaf — mutation targets periods
+                // only (schema 1.2.0: the selector is structural, not sweepable).
                 f(&format!("{base}.macd.fast"), LeafMut::Period(fast))?;
                 f(&format!("{base}.macd.slow"), LeafMut::Period(slow))?;
                 f(&format!("{base}.macd.signal"), LeafMut::Period(signal))?;
