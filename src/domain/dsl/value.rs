@@ -121,6 +121,39 @@ pub enum IndicatorSpec {
         /// Lookback period.
         period: SweepableValue<u32>,
     },
+    /// The highest `source` value of the **N closed bars before the current
+    /// bar**, excluding it (schema 1.2.0, r3.s2 — Q1, the Donchian prior-N
+    /// convention). `source` is any price field, defaulting to `High`; writes
+    /// always emit it (the `series`/`output` precedent). Warm-up is N+1 bars:
+    /// the first value lands on candle index N.
+    Highest {
+        /// Lookback period (the window size N).
+        period: SweepableValue<u32>,
+        /// Which price field the window aggregates; absent → `High`.
+        #[serde(default = "default_highest_source")]
+        source: PriceField,
+    },
+    /// The lowest `source` value of the **N closed bars before the current
+    /// bar**, excluding it (schema 1.2.0, r3.s2 — Q1). `source` defaults to
+    /// `Low`; warm-up is N+1 bars, like [`IndicatorSpec::Highest`].
+    Lowest {
+        /// Lookback period (the window size N).
+        period: SweepableValue<u32>,
+        /// Which price field the window aggregates; absent → `Low`.
+        #[serde(default = "default_lowest_source")]
+        source: PriceField,
+    },
+}
+
+/// `#[serde(default = …)]` target for [`IndicatorSpec::Highest`]'s `source`
+/// (Q1: the Donchian convention tracks the highs).
+fn default_highest_source() -> PriceField {
+    PriceField::High
+}
+
+/// `#[serde(default = …)]` target for [`IndicatorSpec::Lowest`]'s `source`.
+fn default_lowest_source() -> PriceField {
+    PriceField::Low
 }
 
 /// The operation of a [`ValueSource::Arith`] node (r3.s2.w3, schema 1.2.0 —

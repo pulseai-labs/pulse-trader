@@ -45,6 +45,11 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "macd_output",
         "a MACD operand's `output` selects `line`, `signal` or `histogram`; omitting it is the historical line — signal and histogram warm up over max(fast,slow)+signal−1 bars",
     ),
+    // r3.s2.w2 (Q1): schema 1.2.0 — the rolling extremes.
+    (
+        "rolling_extremes",
+        "`Highest{period, source}` and `Lowest{period, source}` cover the N closed bars BEFORE the current bar, excluding it (the prior-N convention, rendered `highest(high, 20 prior)`); `source` is any price field and defaults to `high` for `Highest` and `low` for `Lowest`; they warm up over N+1 bars and work on any series (`h4:highest(high, 20)` is the prior 20 closed H4 bars)",
+    ),
     // r3.s2.w3 (Q2): value expressions — the semantics the grammar cannot
     // express, keyed by the construct each entry covers.
     (

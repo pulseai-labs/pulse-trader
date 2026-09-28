@@ -81,6 +81,32 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
             )
         }
         IndicatorSpec::Atr { period } => format!("atr({})", u32_leaf(period)),
+        // The rolling extremes name the prior-N convention: the word `prior`
+        // is MANDATORY — it is the convention's name (Q1), e.g.
+        // `highest(high, 20 prior)`.
+        IndicatorSpec::Highest { period, source } => format!(
+            "highest({}, {} prior)",
+            field_word(*source),
+            u32_leaf(period)
+        ),
+        IndicatorSpec::Lowest { period, source } => {
+            format!(
+                "lowest({}, {} prior)",
+                field_word(*source),
+                u32_leaf(period)
+            )
+        }
+    }
+}
+
+/// A price field as the noun the conventions write (`high`, `close`, …).
+fn field_word(field: PriceField) -> &'static str {
+    match field {
+        PriceField::Open => "open",
+        PriceField::High => "high",
+        PriceField::Low => "low",
+        PriceField::Close => "close",
+        PriceField::Volume => "volume",
     }
 }
 

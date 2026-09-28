@@ -348,6 +348,11 @@ pub use adapters::indicators::adx::Adx;
 // unused outside its module is a `dead_code` build error, not a warning); the
 // indicator engine's factory consumes it.
 pub use adapters::indicators::atr::Atr;
+// r3.s2.w2: the rolling-extremes adapter (the prior-N window behind
+// `IndicatorSpec::Highest`/`Lowest`, schema 1.2.0 — Q1). All-`Decimal` — the
+// window value is one of the inputs, so no `convert` seam and no rounding;
+// the indicator engine's factory consumes it.
+pub use adapters::indicators::rolling::RollingExtremes;
 // VS-1.1.3 work-3.03: the multi-indicator engine that implements the frozen
 // `EvalContext` seam over real candles and streaming adapter values. Its
 // readiness gate is load-bearing for warmup safety under the current boolean DSL

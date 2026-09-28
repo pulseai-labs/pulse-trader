@@ -492,6 +492,15 @@ fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlF
                 IndicatorSpec::Atr { period } => {
                     f(&format!("{base}.atr.period"), LeafMut::Period(period))?;
                 }
+                // r3.s2.w2: the rolling extremes — the period is the sweepable
+                // leaf; `source` is a field tag, not a numeric parameter (the
+                // `series` precedent — see validate.rs's check arms).
+                IndicatorSpec::Highest { period, .. } => {
+                    f(&format!("{base}.highest.period"), LeafMut::Period(period))?;
+                }
+                IndicatorSpec::Lowest { period, .. } => {
+                    f(&format!("{base}.lowest.period"), LeafMut::Period(period))?;
+                }
             }
         }
         // The nesting-aware path grammar matches validate.rs's: `.arith.lhs`,

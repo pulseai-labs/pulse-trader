@@ -866,6 +866,189 @@ fn macd_line_vs_signal_condition_compiles_to_two_distinct_slots() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// r3.s2.w2 — schema 1.2.0 gains IndicatorSpec::Highest / Lowest (Q1, b1).
+// ---------------------------------------------------------------------------
+
+/// A 1.2.0 document whose entry compares `close` against `highest(high, 20)`
+/// and whose filter keeps only while the HTF `lowest(low, 20)` sits below the
+/// HTF low — exercising both new variants, the HTF prefix and the defaults.
+fn highest_lowest_doc(source_fields: (Option<&str>, Option<&str>)) -> String {
+    let (highest_source, lowest_source) = source_fields;
+    let highest = highest_source
+        .map(|f| format!(r#", "source": "{f}""#))
+        .unwrap_or_default();
+    let lowest = lowest_source
+        .map(|f| format!(r#", "source": "{f}""#))
+        .unwrap_or_default();
+    format!(
+        r#"{{
+  "schema_version": "1.2.0",
+  "name": "rolling extremes case (1.2.0)",
+  "direction": "long",
+  "entry": {{
+    "type": "Compare",
+    "lhs": {{
+      "type": "Indicator",
+      "series": "primary",
+      "spec": {{ "indicator": "Highest", "period": 20{highest} }}
+    }},
+    "op": "Gt",
+    "rhs": {{ "type": "Price", "series": "primary", "field": "Close" }}
+  }},
+  "filters": [
+    {{
+      "type": "Compare",
+      "lhs": {{
+        "type": "Indicator",
+        "series": "htf",
+        "spec": {{ "indicator": "Lowest", "period": 20{lowest} }}
+      }},
+      "op": "Lt",
+      "rhs": {{ "type": "Price", "series": "htf", "field": "Low" }}
+    }}
+  ],
+  "exits": [
+    {{ "type": "StopLoss", "distance_pct": "0.05" }},
+    {{ "type": "TakeProfit", "target_r": "2" }}
+  ],
+  "risk": {{
+    "risk_per_trade_pct": "0.01",
+    "max_leverage": "3"
+  }}
+}}"#
+    )
+}
+
+#[test]
+fn highest_and_lowest_round_trip_through_load_validate_compile_and_render() {
+    let doc = highest_lowest_doc((Some("High"), Some("Low")));
+    let loaded = Migrator::v1().load(&doc).expect("document loads");
+    let validated = validate(&loaded.dsl).expect("document validates");
+    let compiled = compile(&validated).expect("document compiles");
+
+    // The entry's Highest is a primary-series spec; the filter's Lowest is an
+    // HTF-series spec — compile splits them into the two collections.
+    let mut specs = compiled.required_indicators().to_vec();
+    specs.extend(compiled.required_htf_indicators().iter().cloned());
+    assert_eq!(
+        specs.len(),
+        2,
+        "the Highest and the Lowest are the two indicator specs"
+    );
+    let rendered: Vec<String> = specs.iter().map(render::indicator).collect();
+    assert!(
+        rendered.contains(&"highest(high, 20 prior)".to_owned()),
+        "the Highest renders with the prior-N convention word, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains(&"lowest(low, 20 prior)".to_owned()),
+        "the Lowest renders with the prior-N convention word, got {rendered:?}"
+    );
+    assert!(
+        compiled
+            .required_htf_indicators()
+            .iter()
+            .any(|s| matches!(s, IndicatorSpec::Lowest { .. })),
+        "the HTF Lowest routes to the HTF engine's collection"
+    );
+
+    // The HTF filter operand carries the h4: prefix on the same convention
+    // (rendered from the LOADED document — the compiled tree is a different
+    // shape).
+    let filter_operand = match &loaded.dsl.filters[0] {
+        Condition::Compare { lhs, .. } => render::value(lhs),
+        other => panic!("expected a Compare filter, got {other:?}"),
+    };
+    assert_eq!(
+        filter_operand, "h4:lowest(low, 20 prior)",
+        "an HTF rolling extreme renders under the existing h4: prefix"
+    );
+}
+
+#[test]
+fn highest_lowest_source_defaults_and_is_always_written() {
+    // A document omitting `source` on both variants defaults to high / low.
+    let loaded = Migrator::v1()
+        .load(&highest_lowest_doc((None, None)))
+        .expect("no-source document loads");
+    let mut seen = (None, None);
+    for spec in compiled_specs_of(&loaded.dsl) {
+        match spec {
+            IndicatorSpec::Highest { source, .. } => seen.0 = Some(source),
+            IndicatorSpec::Lowest { source, .. } => seen.1 = Some(source),
+            other => panic!("unexpected spec {other:?}"),
+        }
+    }
+    assert_eq!(
+        seen,
+        (Some(pulse::PriceField::High), Some(pulse::PriceField::Low)),
+        "absent source defaults to high for Highest and low for Lowest"
+    );
+
+    // The typed values ALWAYS write the field (no skip_serializing_if) — the
+    // `output`/`series` precedent.
+    let highest = IndicatorSpec::Highest {
+        period: SweepableValue::Fixed(20),
+        source: pulse::PriceField::High,
+    };
+    let json = serde_json::to_value(&highest).expect("spec serializes");
+    assert_eq!(json["source"], "High", "the source field is always written");
+    let lowest = IndicatorSpec::Lowest {
+        period: SweepableValue::Fixed(20),
+        source: pulse::PriceField::Low,
+    };
+    let json = serde_json::to_value(&lowest).expect("spec serializes");
+    assert_eq!(json["source"], "Low", "the source field is always written");
+}
+
+/// The required indicator specs of a loaded document — primary AND HTF series
+/// (compile splits them; both feed engine slots).
+fn compiled_specs_of(dsl: &StrategyDsl) -> Vec<IndicatorSpec> {
+    let validated = validate(dsl).expect("document validates");
+    let compiled = compile(&validated).expect("document compiles");
+    let mut specs = compiled.required_indicators().to_vec();
+    specs.extend(compiled.required_htf_indicators().iter().cloned());
+    specs
+}
+
+#[test]
+fn highest_and_lowest_period_zero_is_a_field_range_at_the_variant_path() {
+    for (tag, period_json) in [("Highest", 0), ("Lowest", 0)] {
+        let doc = format!(
+            r#"{{
+  "schema_version": "1.2.0",
+  "name": "zero period case",
+  "direction": "long",
+  "entry": {{
+    "type": "Compare",
+    "lhs": {{
+      "type": "Indicator",
+      "series": "primary",
+      "spec": {{ "indicator": "{tag}", "period": {period_json} }}
+    }},
+    "op": "Gt",
+    "rhs": {{ "type": "Price", "series": "primary", "field": "Close" }}
+  }},
+  "filters": [],
+  "exits": [{{ "type": "StopLoss", "distance_pct": "0.05" }}],
+  "risk": {{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }}
+}}"#
+        );
+        let loaded = Migrator::v1().load(&doc).expect("document loads");
+        let errors = validate(&loaded.dsl)
+            .expect_err("period 0 must fail validation")
+            .into_errors();
+        assert!(
+            errors.iter().any(|e| e.path
+                == format!("entry.lhs.indicator.{}.period", tag.to_lowercase())
+                && e.code == ValidationCode::FieldRange),
+            "expected entry.lhs.indicator.{}.period FieldRange, got {errors:?}",
+            tag.to_lowercase()
+        );
+    }
+}
+
 #[test]
 fn no_output_document_runs_identically_to_the_frozen_macd_line_run() {
     // The 1.2.0-authored twin of the frozen 1.0.0 MACD document: same
