@@ -215,7 +215,9 @@ mod prop_tests {
     use crate::domain::dsl::risk::{Direction, RiskParams};
     use crate::domain::dsl::schema_version::SchemaVersion;
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
+    use crate::domain::dsl::value::{
+        ArithOp, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
+    };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
 
@@ -282,14 +284,40 @@ mod prop_tests {
         prop_oneof![Just(Series::Primary), Just(Series::Htf)]
     }
 
-    fn arb_value_source() -> impl Strategy<Value = ValueSource> {
-        prop_oneof![
+    /// r3.s2.w3: lag depths the round-trip property exercises — the full legal
+    /// range 1..=500.
+    fn arb_bars() -> impl Strategy<Value = u32> {
+        1u32..=500
+    }
+
+    /// r3.s2.w3 (schema 1.2.0): the value grammar gains `Arith`/`Lag` through a
+    /// bounded `prop_recursive` of depth ≤ 2 with boxed arms (`.boxed()`) — the
+    /// #283 coordination bound, so this generator can never be the reason the
+    /// merged default-stack proptest re-run overflows.
+    fn arb_value_source() -> BoxedStrategy<ValueSource> {
+        let leaf = prop_oneof![
             arb_decimal().prop_map(|value| ValueSource::Constant { value }),
             (arb_series(), arb_price_field())
                 .prop_map(|(series, field)| ValueSource::Price { series, field }),
             (arb_series(), arb_indicator_spec())
                 .prop_map(|(series, spec)| ValueSource::Indicator { series, spec }),
-        ]
+        ];
+        leaf.prop_recursive(2, 8, 2, |inner| {
+            prop_oneof![
+                (any::<ArithOp>(), inner.clone(), inner.clone()).prop_map(|(op, lhs, rhs)| {
+                    ValueSource::Arith {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }),
+                (inner, arb_bars()).prop_map(|(value, bars)| ValueSource::Lag {
+                    value: Box::new(value),
+                    bars
+                }),
+            ]
+        })
+        .boxed()
     }
 
     fn arb_comparator() -> impl Strategy<Value = Comparator> {
@@ -312,6 +340,15 @@ mod prop_tests {
                 .prop_map(|(lhs, rhs)| Condition::CrossesAbove { lhs, rhs }),
             (arb_value_source(), arb_value_source())
                 .prop_map(|(lhs, rhs)| Condition::CrossesBelow { lhs, rhs }),
+            // r3.s2.w3: the expression conditions join the leaves.
+            (arb_value_source(), arb_bars()).prop_map(|(value, bars)| Condition::Rising {
+                value: Box::new(value),
+                bars
+            }),
+            (arb_value_source(), arb_bars()).prop_map(|(value, bars)| Condition::Falling {
+                value: Box::new(value),
+                bars
+            }),
         ];
         leaf.prop_recursive(4, 32, 4, |inner| {
             prop_oneof![

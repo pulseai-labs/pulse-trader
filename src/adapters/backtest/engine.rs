@@ -131,8 +131,11 @@ pub fn run_backtest(
     // `Htf` operand (the guard above guarantees `htf` is `Some` then). It is
     // stepped on each NEWLY aligned closed H4 bar — never once per primary bar.
     let mut htf_engine = if compiled.needs_htf() {
+        // The lag-aware HTF engine (r3.s2.w3): its rings advance once per
+        // closed H4 candle, so an `h4:` lag counts H4 bars — Q2's own-series
+        // rule falls out of the construction, no special case.
         Some(
-            IndicatorEngine::from_specs(compiled.required_htf_indicators())
+            IndicatorEngine::for_series(compiled, Series::Htf)
                 .map_err(|err| BacktestError::EngineInit(err.to_string()))?,
         )
     } else {
@@ -491,7 +494,7 @@ pub fn first_fully_warm_bar_ms(
 ) -> Option<i64> {
     let mut engine = IndicatorEngine::new(compiled).ok()?;
     let mut htf_engine = if compiled.needs_htf() {
-        Some(IndicatorEngine::from_specs(compiled.required_htf_indicators()).ok()?)
+        Some(IndicatorEngine::for_series(compiled, Series::Htf).ok()?)
     } else {
         None
     };
@@ -536,6 +539,7 @@ fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -> Option<De
             spec: IndicatorSpec::Atr {
                 period: SweepableValue::Fixed(period),
             },
+            lag: 0,
         }),
         StopRule::Pct(_) => None,
     }
@@ -573,6 +577,9 @@ struct DualSeriesContext<'a> {
 impl EvalContext for DualSeriesContext<'_> {
     fn current(&self, value: &CompiledValue) -> Option<Decimal> {
         match value {
+            // A compound value evaluates pointwise over this same routed
+            // context (r3.s2.w3): each operand leaf routes to its series.
+            CompiledValue::Arith { .. } => value.eval(self, false),
             CompiledValue::Const(..)
             | CompiledValue::Price {
                 series: Series::Primary,
@@ -595,6 +602,7 @@ impl EvalContext for DualSeriesContext<'_> {
 
     fn previous(&self, value: &CompiledValue) -> Option<Decimal> {
         match value {
+            CompiledValue::Arith { .. } => value.eval(self, true),
             CompiledValue::Const(..)
             | CompiledValue::Price {
                 series: Series::Primary,

@@ -181,6 +181,7 @@ fn current_value(engine: &IndicatorEngine, indicator: IndicatorName) -> Option<D
     engine.current(&CompiledValue::Indicator {
         series: Series::Primary,
         spec: indicator.spec(),
+        lag: 0,
     })
 }
 

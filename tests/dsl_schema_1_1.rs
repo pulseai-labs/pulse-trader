@@ -109,20 +109,30 @@ fn atr_stop(period: u32, multiple_mantissa: i64, multiple_scale: u32) -> ExitRul
 }
 
 /// Every `ValueSource::Price`/`ValueSource::Indicator` leaf reachable in `dsl`,
-/// with its `series` (Constant carries none).
+/// with its `series` (Constant carries none). Exhaustive over both enums — d19:
+/// new variants gain real arms, never wildcards. r3.s2.w3: `Arith`/`Lag` reach
+/// their operand leaves; `Rising`/`Falling` reach their value.
 fn operand_series(dsl: &StrategyDsl) -> Vec<Series> {
+    fn walk_value(src: &ValueSource, out: &mut Vec<Series>) {
+        match src {
+            ValueSource::Price { series, .. } | ValueSource::Indicator { series, .. } => {
+                out.push(*series);
+            }
+            ValueSource::Arith { lhs, rhs, .. } => {
+                walk_value(lhs, out);
+                walk_value(rhs, out);
+            }
+            ValueSource::Lag { value, .. } => walk_value(value, out),
+            ValueSource::Constant { .. } => {}
+        }
+    }
     fn walk(cond: &Condition, out: &mut Vec<Series>) {
         match cond {
             Condition::Compare { lhs, rhs, .. }
             | Condition::CrossesAbove { lhs, rhs }
             | Condition::CrossesBelow { lhs, rhs } => {
-                for src in [lhs, rhs] {
-                    match src {
-                        ValueSource::Price { series, .. }
-                        | ValueSource::Indicator { series, .. } => out.push(*series),
-                        ValueSource::Constant { .. } => {}
-                    }
-                }
+                walk_value(lhs, out);
+                walk_value(rhs, out);
             }
             Condition::And { conditions } | Condition::Or { conditions } => {
                 for c in conditions {
@@ -130,6 +140,9 @@ fn operand_series(dsl: &StrategyDsl) -> Vec<Series> {
                 }
             }
             Condition::Not { condition } => walk(condition, out),
+            Condition::Rising { value, .. } | Condition::Falling { value, .. } => {
+                walk_value(value, out);
+            }
         }
     }
     let mut out = Vec::new();
@@ -520,6 +533,7 @@ fn htf_operand_compiles_with_its_series() {
         spec: IndicatorSpec::Ema {
             period: SweepableValue::Fixed(200),
         },
+        lag: 0,
     };
     assert!(
         matches!(
@@ -568,6 +582,7 @@ fn htf_price_operand_compiles_and_needs_htf() {
             lhs: pulse::CompiledValue::Price {
                 series: Series::Htf,
                 field: PriceField::Close,
+                lag: 0,
             },
             ..
         }

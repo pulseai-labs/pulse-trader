@@ -63,4 +63,4 @@ pub use sweepable::SweepableValue;
 pub use validate::{
     FieldError, ValidatedDsl, ValidationCode, ValidationErrors, check_unknown_fields, validate,
 };
-pub use value::{IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
+pub use value::{ArithOp, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};

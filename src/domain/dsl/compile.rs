@@ -63,7 +63,7 @@ use super::exit::ExitRule;
 use super::risk::{Direction, RiskParams};
 use super::sweepable::SweepableValue;
 use super::validate::ValidatedDsl;
-use super::value::{IndicatorSpec, PriceField, Series, ValueSource};
+use super::value::{ArithOp, IndicatorSpec, PriceField, Series, ValueSource};
 
 /// An error produced while compiling a [`ValidatedDsl`].
 ///
@@ -103,7 +103,8 @@ pub enum CompileError {
 /// `Indicator` are resolved against the [`EvalContext`] at eval time.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompiledValue {
-    /// A literal constant (always available at eval time).
+    /// A literal constant (always available at eval time). A lagged constant is
+    /// the constant — the lag push-down erases it (r3.s2.w3).
     Const(Decimal),
     /// A field of the current candle (available once the candle exists).
     Price {
@@ -112,6 +113,9 @@ pub enum CompiledValue {
         series: Series,
         /// Which OHLCV field to read.
         field: PriceField,
+        /// How many bars back on this leaf's own series to read, 0 = today
+        /// (r3.s2.w3: the `Lag` push-down lands the bars here).
+        lag: u32,
     },
     /// A technical-indicator output (unavailable during warmup → `None`).
     Indicator {
@@ -120,7 +124,56 @@ pub enum CompiledValue {
         series: Series,
         /// The indicator and its parameters.
         spec: IndicatorSpec,
+        /// How many bars back on this leaf's own series to read, 0 = today
+        /// (r3.s2.w3: the `Lag` push-down lands the bars here).
+        lag: u32,
     },
+    /// A pointwise arithmetic tree over two operand values (r3.s2.w3, schema
+    /// 1.2.0 — Q2). Evaluated through [`CompiledValue::eval`]: any `None`
+    /// operand, a `Div` by an exactly-zero operand, or a `checked_*` overflow
+    /// gives no value. There is no expression-level history: the lag push-down
+    /// keeps every `bars` on the leaves, so only the engine's per-slot value
+    /// rings and its candle ring ever hold history.
+    Arith {
+        /// The pointwise operation.
+        op: ArithOp,
+        /// The left operand tree.
+        lhs: Box<CompiledValue>,
+        /// The right operand tree.
+        rhs: Box<CompiledValue>,
+    },
+}
+
+impl CompiledValue {
+    /// Evaluate this value — a leaf read or an `Arith` tree — against `ctx`.
+    ///
+    /// The Q2 no-value semantics: an `Arith` over any operand without a value
+    /// gives no value, `Div` by an exactly-zero operand gives no value, and a
+    /// `checked_*` overflow gives no value. `previous` evaluates the same tree
+    /// on the previous values, so crosses over expressions work.
+    #[must_use]
+    pub fn eval(&self, ctx: &dyn EvalContext, previous: bool) -> Option<Decimal> {
+        match self {
+            Self::Arith { op, lhs, rhs } => {
+                let l = lhs.eval(ctx, previous)?;
+                let r = rhs.eval(ctx, previous)?;
+                match op {
+                    ArithOp::Add => l.checked_add(r),
+                    ArithOp::Sub => l.checked_sub(r),
+                    ArithOp::Mul => l.checked_mul(r),
+                    ArithOp::Div if r.is_zero() => None,
+                    ArithOp::Div => l.checked_div(r),
+                }
+            }
+            leaf => {
+                if previous {
+                    ctx.previous(leaf)
+                } else {
+                    ctx.current(leaf)
+                }
+            }
+        }
+    }
 }
 
 /// The compiled boolean predicate tree — mirrors
@@ -172,7 +225,7 @@ impl CompiledCondition {
     pub fn eval(&self, ctx: &dyn EvalContext) -> bool {
         match self {
             CompiledCondition::Compare { lhs, op, rhs } => {
-                match (ctx.current(lhs), ctx.current(rhs)) {
+                match (lhs.eval(ctx, false), rhs.eval(ctx, false)) {
                     (Some(l), Some(r)) => compare(l, *op, r),
                     // Any unavailable operand (e.g. indicator warmup) → no signal.
                     _ => false,
@@ -180,10 +233,10 @@ impl CompiledCondition {
             }
             CompiledCondition::CrossesAbove { lhs, rhs } => {
                 match (
-                    ctx.previous(lhs),
-                    ctx.previous(rhs),
-                    ctx.current(lhs),
-                    ctx.current(rhs),
+                    lhs.eval(ctx, true),
+                    rhs.eval(ctx, true),
+                    lhs.eval(ctx, false),
+                    rhs.eval(ctx, false),
                 ) {
                     (Some(pl), Some(pr), Some(cl), Some(cr)) => pl <= pr && cl > cr,
                     // First bar (no previous) or warmup → no cross.
@@ -192,10 +245,10 @@ impl CompiledCondition {
             }
             CompiledCondition::CrossesBelow { lhs, rhs } => {
                 match (
-                    ctx.previous(lhs),
-                    ctx.previous(rhs),
-                    ctx.current(lhs),
-                    ctx.current(rhs),
+                    lhs.eval(ctx, true),
+                    rhs.eval(ctx, true),
+                    lhs.eval(ctx, false),
+                    rhs.eval(ctx, false),
                 ) {
                     (Some(pl), Some(pr), Some(cl), Some(cr)) => pl >= pr && cl < cr,
                     _ => false,
@@ -359,16 +412,20 @@ impl CompiledStrategy {
     #[must_use]
     pub fn needs_htf(&self) -> bool {
         fn value_is_htf(value: &CompiledValue) -> bool {
-            matches!(
-                value,
+            match value {
                 CompiledValue::Price {
                     series: Series::Htf,
                     ..
-                } | CompiledValue::Indicator {
+                }
+                | CompiledValue::Indicator {
                     series: Series::Htf,
                     ..
-                }
-            )
+                } => true,
+                // An expression is HTF when any operand leaf is (r3.s2.w3: the
+                // recursion reaches through `Arith`; lags live on the leaves).
+                CompiledValue::Arith { lhs, rhs, .. } => value_is_htf(lhs) || value_is_htf(rhs),
+                _ => false,
+            }
         }
         fn cond_has_htf(condition: &CompiledCondition) -> bool {
             match condition {
@@ -398,6 +455,97 @@ impl CompiledStrategy {
             self.direction, self.entry, self.exits, self.required_indicators
         )
     }
+
+    /// The deepest lag each indicator slot on `series` must serve, plus the
+    /// deepest lagged-`Price` read on the same series (r3.s2.w3, b4).
+    ///
+    /// The slot lags are **aligned with** [`Self::required_indicators`] (for
+    /// [`Series::Primary`]) and [`Self::required_htf_indicators`] (for
+    /// [`Series::Htf`]): entry `i` is the maximum `lag` of every compiled
+    /// `Indicator` leaf that resolves to that slot's spec — so a same-spec
+    /// sibling with a deeper lag raises the shared slot's depth (closing the
+    /// shared-slot under-keep recorded in w1's report). The price lag is the
+    /// maximum `lag` of every compiled `Price` leaf on the series, `0` when
+    /// none — the candle ring's depth. A strategy with no lag has all-zero
+    /// lags, which keeps its warm point exactly where it was (b4).
+    #[must_use]
+    pub(crate) fn series_lags(&self, series: Series) -> (Vec<u32>, u32) {
+        fn walk_value(value: &CompiledValue, series: Series, lags: &mut SeriesLags) {
+            match value {
+                CompiledValue::Indicator {
+                    series: leaf_series,
+                    spec,
+                    lag,
+                } if *leaf_series == series => {
+                    match lags.per_spec.iter_mut().find(|(s, _)| s == spec) {
+                        Some((_, max)) => *max = (*max).max(*lag),
+                        None => lags.per_spec.push((spec.clone(), *lag)),
+                    }
+                }
+                CompiledValue::Price {
+                    series: leaf_series,
+                    field: _,
+                    lag,
+                } if *leaf_series == series => {
+                    lags.price_lag = lags.price_lag.max(*lag);
+                }
+                // An Arith tree contributes every operand leaf on the series.
+                CompiledValue::Arith { lhs, rhs, .. } => {
+                    walk_value(lhs, series, lags);
+                    walk_value(rhs, series, lags);
+                }
+                _ => {}
+            }
+        }
+
+        fn walk_condition(condition: &CompiledCondition, series: Series, lags: &mut SeriesLags) {
+            match condition {
+                CompiledCondition::Compare { lhs, rhs, .. }
+                | CompiledCondition::CrossesAbove { lhs, rhs }
+                | CompiledCondition::CrossesBelow { lhs, rhs } => {
+                    walk_value(lhs, series, lags);
+                    walk_value(rhs, series, lags);
+                }
+                CompiledCondition::And(conditions) | CompiledCondition::Or(conditions) => {
+                    for c in conditions {
+                        walk_condition(c, series, lags);
+                    }
+                }
+                CompiledCondition::Not(condition) => walk_condition(condition, series, lags),
+            }
+        }
+
+        let mut lags = SeriesLags::default();
+        walk_condition(&self.entry, series, &mut lags);
+        for exit in &self.exits {
+            if let CompiledExit::SignalExit { condition } = exit {
+                walk_condition(condition, series, &mut lags);
+            }
+        }
+        let required = match series {
+            Series::Primary => &self.required_indicators,
+            Series::Htf => &self.required_htf_indicators,
+        };
+        let slot_lags = required
+            .iter()
+            .map(|spec| {
+                lags.per_spec
+                    .iter()
+                    .find(|(s, _)| s == spec)
+                    .map_or(0, |(_, l)| *l)
+            })
+            .collect();
+        (slot_lags, lags.price_lag)
+    }
+}
+
+/// [`CompiledStrategy::series_lags`]'s accumulator: per-spec maximum indicator
+/// lags (specs deduped by `PartialEq` — no `Eq`/`Hash` on the frozen
+/// `IndicatorSpec`) and the deepest lagged-`Price` read.
+#[derive(Default)]
+struct SeriesLags {
+    per_spec: Vec<(IndicatorSpec, u32)>,
+    price_lag: u32,
 }
 
 /// Direction-relative stop price (pure; NO sizing).
@@ -472,10 +620,48 @@ fn compile_value(source: &ValueSource) -> CompiledValue {
         ValueSource::Price { series, field } => CompiledValue::Price {
             series: *series,
             field: *field,
+            lag: 0,
         },
         ValueSource::Indicator { series, spec } => CompiledValue::Indicator {
             series: *series,
             spec: spec.clone(),
+            lag: 0,
+        },
+        // Pointwise tree — each operand compiles independently (r3.s2.w3).
+        ValueSource::Arith { op, lhs, rhs } => CompiledValue::Arith {
+            op: *op,
+            lhs: Box::new(compile_value(lhs)),
+            rhs: Box::new(compile_value(rhs)),
+        },
+        // The lag pushes down to the leaves (r3.s2.w3 §3): history stays
+        // leaf-only. Validation already refused a lag under a lag and a lag
+        // over a mixed-series value, so this is total over accepted documents.
+        ValueSource::Lag { value, bars } => push_lag(compile_value(value), *bars),
+    }
+}
+
+/// Push a lag down to the leaves: `lag(a ∘ b, n) ≡ lag(a, n) ∘ lag(b, n)`
+/// (Arith is pointwise) and a lagged constant is the constant. Leaves take the
+/// maximum of any lag they already carry — a document never produces that
+/// overlap (lag-of-a-lag is refused at validation), so the `max` only keeps the
+/// invariant locally safe.
+fn push_lag(value: CompiledValue, bars: u32) -> CompiledValue {
+    match value {
+        lagged @ CompiledValue::Const(_) => lagged,
+        CompiledValue::Price { series, field, lag } => CompiledValue::Price {
+            series,
+            field,
+            lag: lag.max(bars),
+        },
+        CompiledValue::Indicator { series, spec, lag } => CompiledValue::Indicator {
+            series,
+            spec,
+            lag: lag.max(bars),
+        },
+        CompiledValue::Arith { op, lhs, rhs } => CompiledValue::Arith {
+            op,
+            lhs: Box::new(push_lag(*lhs, bars)),
+            rhs: Box::new(push_lag(*rhs, bars)),
         },
     }
 }
@@ -484,20 +670,31 @@ fn compile_value(source: &ValueSource) -> CompiledValue {
 /// series — `primary` for the run's series, `htf` for the higher-timeframe one
 /// (schema 1.1.0; the htf vec feeds [`CompiledStrategy::required_htf_indicators`]).
 /// De-duplicates via `Vec::contains` (avoids needing `Eq`/`Hash` on the frozen
-/// `IndicatorSpec`).
+/// `IndicatorSpec`). Recurses through `Arith`/`Lag`, so an indicator nested in
+/// an expression is still required (r3.s2.w3).
 fn collect_indicators_from_value(
     source: &ValueSource,
     primary: &mut Vec<IndicatorSpec>,
     htf: &mut Vec<IndicatorSpec>,
 ) {
-    if let ValueSource::Indicator { series, spec } = source {
-        let acc = match series {
-            Series::Primary => primary,
-            Series::Htf => htf,
-        };
-        if !acc.contains(spec) {
-            acc.push(spec.clone());
+    match source {
+        ValueSource::Indicator { series, spec } => {
+            let acc = match series {
+                Series::Primary => primary,
+                Series::Htf => htf,
+            };
+            if !acc.contains(spec) {
+                acc.push(spec.clone());
+            }
         }
+        ValueSource::Arith { lhs, rhs, .. } => {
+            collect_indicators_from_value(lhs, primary, htf);
+            collect_indicators_from_value(rhs, primary, htf);
+        }
+        ValueSource::Lag { value, .. } => {
+            collect_indicators_from_value(value, primary, htf);
+        }
+        ValueSource::Constant { .. } | ValueSource::Price { .. } => {}
     }
 }
 
@@ -521,6 +718,10 @@ fn collect_indicators(
             }
         }
         Condition::Not { condition } => collect_indicators(condition, primary, htf),
+        // r3.s2.w3: an expression condition's indicators live in its value.
+        Condition::Rising { value, .. } | Condition::Falling { value, .. } => {
+            collect_indicators_from_value(value, primary, htf);
+        }
     }
 }
 
@@ -550,6 +751,20 @@ fn compile_condition(condition: &Condition) -> CompiledCondition {
         Condition::Not { condition } => {
             CompiledCondition::Not(Box::new(compile_condition(condition)))
         }
+        // Q2 (r3.s2.w3): Rising/Falling compile to EXACTLY the strict compare
+        // against the lagged twin — `Compare{value, Gt|Lt, Lag{value, bars}}` —
+        // through the same `Lag` push-down. There is no separate evaluation
+        // path, so a Rising behaves identically to its hand-written twin.
+        Condition::Rising { value, bars } => CompiledCondition::Compare {
+            lhs: compile_value(value),
+            op: Comparator::Gt,
+            rhs: push_lag(compile_value(value), *bars),
+        },
+        Condition::Falling { value, bars } => CompiledCondition::Compare {
+            lhs: compile_value(value),
+            op: Comparator::Lt,
+            rhs: push_lag(compile_value(value), *bars),
+        },
     }
 }
 
@@ -765,11 +980,16 @@ mod tests {
         fn key(value: &CompiledValue) -> String {
             match value {
                 CompiledValue::Const(d) => format!("const:{d}"),
-                CompiledValue::Price { series, field } => {
-                    format!("price:{series:?}:{field:?}")
+                CompiledValue::Price { series, field, lag } => {
+                    format!("price:{series:?}:{field:?}:{lag}")
                 }
-                CompiledValue::Indicator { series, spec } => {
-                    format!("ind:{series:?}:{spec:?}")
+                CompiledValue::Indicator { series, spec, lag } => {
+                    format!("ind:{series:?}:{spec:?}:{lag}")
+                }
+                // A compound value keys by its full tree, so a FakeCtx can pin
+                // an expression's operands pointwise (r3.s2.w3).
+                CompiledValue::Arith { op, lhs, rhs } => {
+                    format!("arith:{op:?}({},{})", Self::key(lhs), Self::key(rhs))
                 }
             }
         }
@@ -894,12 +1114,14 @@ mod tests {
         let close = CompiledValue::Price {
             series: Series::Primary,
             field: PriceField::Close,
+            lag: 0,
         };
         let rsi = CompiledValue::Indicator {
             series: Series::Primary,
             spec: IndicatorSpec::Rsi {
                 period: SweepableValue::Fixed(14),
             },
+            lag: 0,
         };
 
         // true ∧ true → true (Close=150 > 100, Rsi=20 < 30).
@@ -922,12 +1144,14 @@ mod tests {
         let close = CompiledValue::Price {
             series: Series::Primary,
             field: PriceField::Close,
+            lag: 0,
         };
         let rsi = CompiledValue::Indicator {
             series: Series::Primary,
             spec: IndicatorSpec::Rsi {
                 period: SweepableValue::Fixed(14),
             },
+            lag: 0,
         };
 
         // Compare: Close > 100.
@@ -1013,12 +1237,14 @@ mod tests {
             spec: IndicatorSpec::Ema {
                 period: SweepableValue::Fixed(9),
             },
+            lag: 0,
         };
         let slow = CompiledValue::Indicator {
             series: Series::Primary,
             spec: IndicatorSpec::Ema {
                 period: SweepableValue::Fixed(21),
             },
+            lag: 0,
         };
         let cross = CompiledCondition::CrossesAbove {
             lhs: fast.clone(),
@@ -1139,5 +1365,163 @@ mod tests {
             field: "risk.max_leverage".to_owned(),
         };
         assert!(err.to_string().contains("risk.max_leverage"));
+    }
+
+    // ---- r3.s2.w3: expression compilation ----------------------------------
+
+    use super::ArithOp as TestArithOp;
+
+    /// A lag pushes down to every leaf of an `Arith` tree and off a constant:
+    /// `lag(a ∘ b, n) ≡ lag(a, n) ∘ lag(b, n)`, a lagged constant is the
+    /// constant — history stays leaf-only (spec §3).
+    #[test]
+    fn lag_pushes_down_to_leaves() {
+        let value = ValueSource::Arith {
+            op: TestArithOp::Div,
+            lhs: Box::new(ValueSource::Indicator {
+                series: Series::Primary,
+                spec: IndicatorSpec::Atr {
+                    period: SweepableValue::Fixed(14),
+                },
+            }),
+            rhs: Box::new(ValueSource::Constant {
+                value: Decimal::new(2, 0),
+            }),
+        };
+        let compiled_value = super::compile_value(&ValueSource::Lag {
+            value: Box::new(value),
+            bars: 5,
+        });
+        match compiled_value {
+            CompiledValue::Arith { op, lhs, rhs } => {
+                assert_eq!(op, TestArithOp::Div);
+                assert!(
+                    matches!(*lhs, CompiledValue::Indicator { lag: 5, .. }),
+                    "the indicator leaf carries the lag, was {lhs:?}"
+                );
+                assert!(
+                    matches!(*rhs, CompiledValue::Const(_)),
+                    "a lagged constant is the constant, was {rhs:?}"
+                );
+            }
+            other => panic!("an Arith document value compiles to an Arith tree, was {other:?}"),
+        }
+    }
+
+    /// Q2: `Rising` compiles to EXACTLY `Compare{value, Gt, Lag{value, bars}}`
+    /// (and `Falling` to the `Lt` twin) — no separate evaluation path exists.
+    #[test]
+    fn rising_and_falling_compile_to_the_hand_written_twins() {
+        let ema200 = ValueSource::Indicator {
+            series: Series::Htf,
+            spec: IndicatorSpec::Ema {
+                period: SweepableValue::Fixed(200),
+            },
+        };
+        let rising = super::compile_condition(&Condition::Rising {
+            value: Box::new(ema200.clone()),
+            bars: 1,
+        });
+        assert_eq!(
+            rising,
+            super::compile_condition(&Condition::Compare {
+                lhs: ema200.clone(),
+                op: Comparator::Gt,
+                rhs: ValueSource::Lag {
+                    value: Box::new(ema200.clone()),
+                    bars: 1,
+                },
+            }),
+            "Rising must compile to exactly the hand-written twin"
+        );
+        let falling = super::compile_condition(&Condition::Falling {
+            value: Box::new(ema200.clone()),
+            bars: 3,
+        });
+        assert_eq!(
+            falling,
+            super::compile_condition(&Condition::Compare {
+                lhs: ema200,
+                op: Comparator::Lt,
+                rhs: ValueSource::Lag {
+                    value: Box::new(ValueSource::Indicator {
+                        series: Series::Htf,
+                        spec: IndicatorSpec::Ema {
+                            period: SweepableValue::Fixed(200),
+                        },
+                    }),
+                    bars: 3,
+                },
+            }),
+            "Falling must compile to exactly the Lt twin"
+        );
+    }
+
+    /// b4: `series_lags` reports, per slot, the MAXIMUM leaf lag on that spec —
+    /// a same-spec sibling with a deeper lag raises the shared slot's depth —
+    /// and the price lag tracks the deepest lagged `Price` leaf. An `AtrStop`'s
+    /// structural ATR stays at lag 0.
+    #[test]
+    fn series_lags_take_the_deepest_sibling() {
+        let ema10 = ValueSource::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Ema {
+                period: SweepableValue::Fixed(10),
+            },
+        };
+        let dsl = StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "deep sibling".to_owned(),
+            direction: Direction::Long,
+            entry: Condition::Compare {
+                lhs: ema10.clone(),
+                op: Comparator::Gt,
+                rhs: ValueSource::Lag {
+                    value: Box::new(ema10),
+                    bars: 5,
+                },
+            },
+            filters: vec![],
+            exits: vec![ExitRule::AtrStop {
+                period: SweepableValue::Fixed(14),
+                multiple: SweepableValue::Fixed(Decimal::new(2, 0)),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
+            },
+        };
+        let compiled = compile(&validate(&dsl).expect("validates")).expect("compiles");
+        let (slot_lags, price_lag) = compiled.series_lags(Series::Primary);
+        let ema_slot = compiled
+            .required_indicators()
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    IndicatorSpec::Ema {
+                        period: SweepableValue::Fixed(10)
+                    }
+                )
+            })
+            .expect("an Ema(10) slot exists");
+        assert_eq!(
+            slot_lags[ema_slot], 5,
+            "the shared slot's depth must be the deepest sibling's lag"
+        );
+        let atr_slot = compiled
+            .required_indicators()
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    IndicatorSpec::Atr {
+                        period: SweepableValue::Fixed(14)
+                    }
+                )
+            })
+            .expect("an Atr(14) slot exists");
+        assert_eq!(slot_lags[atr_slot], 0, "the AtrStop's ATR stays at lag 0");
+        assert_eq!(price_lag, 0, "no Price leaf carries a lag here");
     }
 }

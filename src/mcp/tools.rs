@@ -811,6 +811,7 @@ impl PulseMcp {
                             engine.current(&CompiledValue::Indicator {
                                 series: Series::Primary,
                                 spec: spec.clone(),
+                                lag: 0,
                             })
                         })
                         .collect::<Vec<_>>(),

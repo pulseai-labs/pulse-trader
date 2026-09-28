@@ -45,6 +45,24 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "macd_output",
         "a MACD operand's `output` selects `line`, `signal` or `histogram`; omitting it is the historical line — signal and histogram warm up over max(fast,slow)+signal−1 bars",
     ),
+    // r3.s2.w3 (Q2): value expressions — the semantics the grammar cannot
+    // express, keyed by the construct each entry covers.
+    (
+        "expressions",
+        "an `Arith` node computes add/sub/mul/div pointwise over two operand values, `Decimal` only; division by zero, an arithmetic overflow, or any operand without a value gives no value — a comparison over a no-value is false (a `Not` over it is true only behind the warm gate)",
+    ),
+    (
+        "expression_depth",
+        "at most 4 `Arith`/`Lag` nodes along any path through one value; a fifth is refused",
+    ),
+    (
+        "lag",
+        "`lag(value, bars)` reads the value `bars` bars back on the value's own series (`bars` in 1..=500; an `h4:` operand lags in H4 bars); a lag under a lag and a lag over a value mixing both series are refused — use one lag with a larger `bars`",
+    ),
+    (
+        "rising_falling",
+        "`rising`/`falling` mean the value is strictly greater/less than its own value `bars` bars ago on the same series (`bars` in 1..=500, default 1); over a value containing a lag, or mixing both series, they are refused",
+    ),
     // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
     (
         "schema_version",

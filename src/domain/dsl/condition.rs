@@ -79,6 +79,37 @@ pub enum Condition {
         /// The negated condition.
         condition: Box<Condition>,
     },
+    /// `value` is strictly greater than its own value `bars` bars back **on the
+    /// value's own series** (r3.s2.w3, schema 1.2.0 — Q2). Compiles to exactly
+    /// `Compare{value, Gt, Lag{value, bars}}`; validation refuses a Rising over
+    /// a value containing a `Lag` (the compiled form would be a lag of a lag)
+    /// and over a mixed-series value.
+    Rising {
+        /// The value that must be rising.
+        value: Box<ValueSource>,
+        /// How many bars back to compare, 1..=500. Absent on the wire ⇒ 1;
+        /// writes always emit it.
+        #[serde(default = "default_expression_bars")]
+        bars: u32,
+    },
+    /// `value` is strictly less than its own value `bars` bars back on the
+    /// value's own series — the mirror of [`Condition::Rising`]; compiles to
+    /// exactly `Compare{value, Lt, Lag{value, bars}}`.
+    Falling {
+        /// The value that must be falling.
+        value: Box<ValueSource>,
+        /// How many bars back to compare, 1..=500. Absent on the wire ⇒ 1;
+        /// writes always emit it.
+        #[serde(default = "default_expression_bars")]
+        bars: u32,
+    },
+}
+
+/// The `bars` default for [`Condition::Rising`]/[`Condition::Falling`] (Q2:
+/// default 1). Writes always emit the field explicitly; this only serves a
+/// document that omits it.
+fn default_expression_bars() -> u32 {
+    1
 }
 
 #[cfg(test)]
@@ -197,6 +228,51 @@ mod tests {
         let bad: Result<Condition, _> = serde_json::from_str(malformed);
         assert!(bad.is_err(), "malformed SweepableValue must be rejected");
     }
+
+    /// r3.s2.w3 (schema 1.2.0): a `Rising` condition round-trips value-equal,
+    /// writes always emit `bars`, and an omitted `bars` reads as 1 (Q2's
+    /// default). `Falling` mirrors.
+    #[test]
+    fn rising_and_falling_round_trip_and_default_bars_to_one() {
+        use crate::domain::dsl::value::PriceField;
+        let rising = Condition::Rising {
+            value: Box::new(ValueSource::Indicator {
+                series: Series::Htf,
+                spec: IndicatorSpec::Ema {
+                    period: SweepableValue::Fixed(200),
+                },
+            }),
+            bars: 1,
+        };
+        assert_eq!(round_trip(&rising), rising);
+        let json = serde_json::to_string(&rising).expect("serialize Rising");
+        assert!(json.contains("\"type\":\"Rising\""), "json was: {json}");
+        assert!(json.contains("\"bars\":1"), "writes always emit bars");
+
+        let omitted: Condition =
+            serde_json::from_str(r#"{"type":"Rising","value":{"type":"Price","field":"Close"}}"#)
+                .expect("bars-less Rising deserializes");
+        assert_eq!(
+            omitted,
+            Condition::Rising {
+                value: Box::new(ValueSource::Price {
+                    series: Series::Primary,
+                    field: PriceField::Close,
+                }),
+                bars: 1,
+            },
+            "an omitted bars reads as the Q2 default 1"
+        );
+
+        let falling = Condition::Falling {
+            value: Box::new(ValueSource::Price {
+                series: Series::Primary,
+                field: PriceField::Close,
+            }),
+            bars: 3,
+        };
+        assert_eq!(round_trip(&falling), falling);
+    }
 }
 
 #[cfg(test)]
@@ -204,7 +280,9 @@ mod tests {
 mod prop_tests {
     use super::{Comparator, Condition};
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
+    use crate::domain::dsl::value::{
+        ArithOp, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
+    };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
 
@@ -263,14 +341,40 @@ mod prop_tests {
         prop_oneof![Just(Series::Primary), Just(Series::Htf)]
     }
 
-    fn arb_value_source() -> impl Strategy<Value = ValueSource> {
-        prop_oneof![
+    /// r3.s2.w3: lag depths the round-trip property exercises — the full legal
+    /// range 1..=500 (deep lags are plain data to serde).
+    fn arb_bars() -> impl Strategy<Value = u32> {
+        1u32..=500
+    }
+
+    /// r3.s2.w3 (schema 1.2.0): the value grammar gains `Arith`/`Lag` through a
+    /// bounded `prop_recursive` of depth ≤ 2 with boxed arms (`.boxed()`) — the
+    /// recursion bound #283 coordination pins, so the generator can never be
+    /// the reason the merged default-stack proptest re-run overflows.
+    fn arb_value_source() -> BoxedStrategy<ValueSource> {
+        let leaf = prop_oneof![
             arb_decimal().prop_map(|value| ValueSource::Constant { value }),
             (arb_series(), arb_price_field())
                 .prop_map(|(series, field)| ValueSource::Price { series, field }),
             (arb_series(), arb_indicator_spec())
                 .prop_map(|(series, spec)| ValueSource::Indicator { series, spec }),
-        ]
+        ];
+        leaf.prop_recursive(2, 8, 2, |inner| {
+            prop_oneof![
+                (any::<ArithOp>(), inner.clone(), inner.clone()).prop_map(|(op, lhs, rhs)| {
+                    ValueSource::Arith {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }),
+                (inner, arb_bars()).prop_map(|(value, bars)| ValueSource::Lag {
+                    value: Box::new(value),
+                    bars
+                }),
+            ]
+        })
+        .boxed()
     }
 
     fn arb_comparator() -> impl Strategy<Value = Comparator> {
@@ -284,8 +388,9 @@ mod prop_tests {
     }
 
     /// A bounded recursive `Condition` generator. Leaf cases are the non-recursive
-    /// variants (`Compare`/`CrossesAbove`/`CrossesBelow`); `prop_recursive` caps
-    /// depth/size so it can't build pathological trees (spec §3 constraint a).
+    /// variants (`Compare`/`CrossesAbove`/`CrossesBelow` — plus r3.s2.w3's
+    /// `Rising`/`Falling` leaves); `prop_recursive` caps depth/size so it can't
+    /// build pathological trees (spec §3 constraint a).
     fn arb_condition() -> impl Strategy<Value = Condition> {
         let leaf = prop_oneof![
             (arb_value_source(), arb_comparator(), arb_value_source())
@@ -294,6 +399,14 @@ mod prop_tests {
                 .prop_map(|(lhs, rhs)| Condition::CrossesAbove { lhs, rhs }),
             (arb_value_source(), arb_value_source())
                 .prop_map(|(lhs, rhs)| Condition::CrossesBelow { lhs, rhs }),
+            (arb_value_source(), arb_bars()).prop_map(|(value, bars)| Condition::Rising {
+                value: Box::new(value),
+                bars
+            }),
+            (arb_value_source(), arb_bars()).prop_map(|(value, bars)| Condition::Falling {
+                value: Box::new(value),
+                bars
+            }),
         ];
         // depth ≤ 4, ≤ 32 total nodes, ≤ 4 children per collection.
         leaf.prop_recursive(4, 32, 4, |inner| {

@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 
 use pulse::render::{self, Rendered};
 use pulse::{
-    Comparator, Condition, Direction, ExitRule, IndicatorSpec, MacdOutput, PriceField, RiskParams,
-    SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource, dsl_summary, summarize_dsl,
+    ArithOp, Comparator, Condition, Direction, ExitRule, IndicatorSpec, MacdOutput, PriceField,
+    RiskParams, SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource, dsl_summary,
+    summarize_dsl,
 };
 use rust_decimal::Decimal;
 
@@ -422,4 +423,94 @@ fn both_dsl_adapters_agree_on_every_committed_fixture() {
         assert_eq!(library.exits, compose.exits, "{label}: exit lines disagree");
         assert_eq!(library.risk, compose.risk, "{label}: risk lines disagree");
     }
+}
+
+/// r3.s2.w3 (schema 1.2.0, spec §4): the expression vocabulary renders infix
+/// with parentheses, lags as calls, and rising/falling with the bar count
+/// (`1 bar` singular, `n bars` plural).
+#[test]
+fn expressions_render_infix_lag_and_rising_falling() {
+    fn arith(op: ArithOp, lhs: ValueSource, rhs: ValueSource) -> ValueSource {
+        ValueSource::Arith {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+    fn lag(value: ValueSource, bars: u32) -> ValueSource {
+        ValueSource::Lag {
+            value: Box::new(value),
+            bars,
+        }
+    }
+
+    // The goal's ratio: `(atr(14) / close) < 0.02`.
+    let ratio = compare(
+        arith(
+            ArithOp::Div,
+            indicator(
+                Series::Primary,
+                IndicatorSpec::Atr {
+                    period: fixed_u32(14),
+                },
+            ),
+            price(Series::Primary, PriceField::Close),
+        ),
+        Comparator::Lt,
+        constant(2, 2),
+    );
+    assert_eq!(
+        render::condition(&ratio),
+        "(atr(14) / close) < 0.02",
+        "Arith renders infix, parenthesized"
+    );
+
+    // `lag(close, 5)` and `lag(h4:ema(20), 1)` — the series tag belongs to the
+    // lagged operand.
+    assert_eq!(
+        render::value(&lag(price(Series::Primary, PriceField::Close), 5)),
+        "lag(close, 5)"
+    );
+    assert_eq!(
+        render::value(&lag(
+            indicator(
+                Series::Htf,
+                IndicatorSpec::Ema {
+                    period: fixed_u32(20)
+                }
+            ),
+            1
+        )),
+        "lag(h4:ema(20), 1)"
+    );
+
+    // `h4:ema(200) rising (1 bar)` and `ema(50) falling (3 bars)`.
+    let rising = Condition::Rising {
+        value: Box::new(indicator(
+            Series::Htf,
+            IndicatorSpec::Ema {
+                period: fixed_u32(200),
+            },
+        )),
+        bars: 1,
+    };
+    assert_eq!(
+        render::condition(&rising),
+        "h4:ema(200) rising (1 bar)",
+        "the singular bar count at 1"
+    );
+    let falling = Condition::Falling {
+        value: Box::new(indicator(
+            Series::Primary,
+            IndicatorSpec::Ema {
+                period: fixed_u32(50),
+            },
+        )),
+        bars: 3,
+    };
+    assert_eq!(
+        render::condition(&falling),
+        "ema(50) falling (3 bars)",
+        "the plural bar count above 1"
+    );
 }
