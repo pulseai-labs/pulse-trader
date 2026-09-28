@@ -33,6 +33,55 @@ use crate::domain::llm::{Message, ToolCall};
 /// The placeholder substituted for every redacted span in the persisted copy.
 pub(crate) const REDACTED: &str = "«REDACTED»";
 
+/// The byte bound on provider-derived detail that reaches a persisted row or
+/// a log (r3.s1.w5, #172). Moved here from the adapter: this is the ONE bound,
+/// owned by the seam that applies it AFTER scrubbing.
+pub const TRANSPORT_DETAIL_MAX_BYTES: usize = 4096;
+
+/// The explicit marker a cut detail ends in, so a reader can tell the provider
+/// body was truncated rather than complete. Applied only by
+/// [`scrub_then_bound`] — `tests/llm_scrub_seam.rs`'s structural guard fails
+/// any second application outside this file.
+pub const DETAIL_TRUNCATED: &str = "[truncated]";
+
+/// The ONE seam provider-derived detail crosses from the provider to storage
+/// (r3.s1.w5, #172's sixth recurrence; ADR-0016): redact the WHOLE string
+/// first — the exact-match replacement needs the credential intact to find it
+/// — then bound the scrubbed result at a UTF-8 boundary ending in
+/// [`DETAIL_TRUNCATED`].
+///
+/// The order is the invariant. Bounding before scrubbing — what the adapter
+/// did until this item — cuts a credential straddling the boundary into a
+/// fragment neither the exact-value nor the structural redaction recognizes,
+/// and the fragment is persisted in the immutable row. Every caller that
+/// persists or logs provider-derived detail goes through here; nothing may
+/// truncate provider detail anywhere else (`tests/llm_scrub_seam.rs`'s
+/// structural guard).
+#[must_use]
+pub fn scrub_then_bound(redactor: &Redactor, detail: &str, max_bytes: usize) -> String {
+    let scrubbed = redactor.redact(detail);
+    bound_at_utf8_boundary(scrubbed, max_bytes)
+}
+
+/// Cut `text` to at most `max_bytes` at a UTF-8 char boundary, ending a cut in
+/// [`DETAIL_TRUNCATED`]. A string that already fits is returned unchanged.
+fn bound_at_utf8_boundary(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let Some(room) = max_bytes.checked_sub(DETAIL_TRUNCATED.len()) else {
+        // A bound smaller than the marker itself carries only the marker.
+        return DETAIL_TRUNCATED.to_owned();
+    };
+    let mut end = room;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(DETAIL_TRUNCATED);
+    text
+}
+
 /// A scoped, data-driven secret scrubber for the PERSISTED copy of a prompt +
 /// completion (NFR-6, README C7, audit ch1).
 ///
@@ -216,7 +265,7 @@ impl Redactor {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::Redactor;
+    use super::{DETAIL_TRUNCATED, Redactor, TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
     use crate::domain::llm::{Message, ToolCall};
 
     /// The r1.s4.w2 (#150) MOVE FIXTURE — the risk gate's `no-secret-in-log`
@@ -365,5 +414,79 @@ mod tests {
             }
             other => panic!("the role is preserved, got {other:?}"),
         }
+    }
+
+    // ---- r3.s1.w5: the scrub-then-bound seam --------------------------------
+
+    /// The seam's order is its point: redact the WHOLE string first — the
+    /// exact-match replacement needs the credential intact to find it — and
+    /// bound only the scrubbed result. Bounding first (the pre-change adapter)
+    /// cuts a credential straddling the boundary into a fragment neither the
+    /// exact-value nor the structural redaction recognizes, and the fragment
+    /// is persisted.
+    #[test]
+    fn scrub_then_bound_redacts_the_whole_string_before_bounding() {
+        let key = "the-quick-brown-fox-leaps-over-the-lazy-transport-canary-key";
+        let redactor = Redactor::from_config(vec![key.to_owned()]);
+        let mut detail = "x".repeat(4_040);
+        detail.push_str(key);
+        detail.push_str(&"x".repeat(512));
+        assert!(detail.len() > TRANSPORT_DETAIL_MAX_BYTES);
+
+        let stored = scrub_then_bound(&redactor, &detail, TRANSPORT_DETAIL_MAX_BYTES);
+        assert!(
+            (0..=key.len() - 8).all(|start| !stored.contains(&key[start..start + 8])),
+            "no fragment of the credential of length >= 8 survives: {stored}"
+        );
+        assert!(
+            stored.len() <= TRANSPORT_DETAIL_MAX_BYTES,
+            "the stored detail is bounded: {} bytes",
+            stored.len()
+        );
+        assert!(
+            stored.ends_with(DETAIL_TRUNCATED),
+            "a cut detail ends in the marker: …{}",
+            &stored[stored.len() - 48..]
+        );
+
+        // The order is the defect: bounding FIRST — the pre-change adapter —
+        // leaks a fragment of the same detail. If this ever stops holding,
+        // the seam's order has stopped mattering; re-earn this test with a
+        // different offset, never by weakening it.
+        let cut = TRANSPORT_DETAIL_MAX_BYTES - DETAIL_TRUNCATED.len();
+        let mut bounded = detail[..cut].to_owned();
+        bounded.push_str(DETAIL_TRUNCATED);
+        let leaked = redactor.redact(&bounded);
+        assert!(
+            (0..=key.len() - 8).any(|start| leaked.contains(&key[start..start + 8])),
+            "bound-then-redact must demonstrably leak a fragment of the same detail"
+        );
+    }
+
+    /// The bound cuts at a UTF-8 char boundary: a multi-byte run is never
+    /// split mid-character.
+    #[test]
+    fn scrub_then_bound_cuts_at_a_char_boundary() {
+        let redactor = Redactor::from_config(Vec::new());
+        let detail = "é".repeat(TRANSPORT_DETAIL_MAX_BYTES); // 2 bytes per char
+        let stored = scrub_then_bound(&redactor, &detail, TRANSPORT_DETAIL_MAX_BYTES);
+        assert!(
+            stored.len() <= TRANSPORT_DETAIL_MAX_BYTES,
+            "bounded: {} bytes",
+            stored.len()
+        );
+        assert!(stored.ends_with(DETAIL_TRUNCATED));
+        // The cut left whole characters: everything before the marker is 'é'.
+        let head = stored.trim_end_matches(DETAIL_TRUNCATED);
+        assert!(head.chars().all(|c| c == 'é'), "no split character");
+    }
+
+    /// A detail that already fits comes back verbatim — no marker.
+    #[test]
+    fn scrub_then_bound_leaves_a_fitting_detail_verbatim() {
+        let redactor = Redactor::from_config(Vec::new());
+        let detail = "server error after 1 attempt(s): upstream refused (HTTP 503)";
+        let stored = scrub_then_bound(&redactor, detail, TRANSPORT_DETAIL_MAX_BYTES);
+        assert_eq!(stored, detail);
     }
 }

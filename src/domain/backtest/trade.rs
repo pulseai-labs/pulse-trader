@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 use super::regime::Regime;
 use crate::domain::Direction;
 
-/// Why a trade closed. Only the four exit kinds this slice models appear —
-/// `TrailingStop` / `TimeStop` are rejected fail-fast upstream
-/// ([`BacktestError::UnsupportedExit`](super::BacktestError::UnsupportedExit),
-/// C4), so they have no exit-reason here.
+/// Why a trade closed. The four v1 kinds plus the two kinds the engine has run
+/// since r3.s1.w1 (G1): a trailing stop that tightened past the initial stop or
+/// stands in for the stop family, and the next-bar-open exit after the
+/// `max_bars`-th held bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitReason {
@@ -35,6 +35,13 @@ pub enum ExitReason {
     /// The series ended with the position open; force-closed at the final bar's
     /// close (S4).
     EndOfData,
+    /// The trailing stop level was reached (r3.s1.w1, G1) — the effective stop
+    /// had tightened strictly past the initial stop, or the trail stands in
+    /// for the stop family.
+    TrailingStop,
+    /// The position left at the open after the `max_bars`-th held bar
+    /// (r3.s1.w1, G1) — the same next-bar-open fill a signal exit uses.
+    TimeStop,
 }
 
 /// How a trade originated. v1 is backtest-only; the variant exists so persisted

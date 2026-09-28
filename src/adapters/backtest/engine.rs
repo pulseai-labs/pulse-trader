@@ -3,15 +3,16 @@
 use rust_decimal::Decimal;
 
 use crate::adapters::backtest::regime::RegimeDetector;
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, CompiledValue, Direction, EngineFingerprint, EquityCurve, EvalContext,
-    ExitReason, Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime, RegimeBreakdown,
-    Series, SeriesEnd, Side, SizingOutcome, SkippedEntryCounts, SummaryStats, SweepableValue,
-    SymbolFilters, Trade, TradeSource, align, apply_slippage, atr_stop_price,
-    compute_position_size, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
-    stop_price, take_profit_price, taker_fee,
+    CompiledStrategy, CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve,
+    EvalContext, ExitReason, Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime,
+    RegimeBreakdown, Series, SeriesEnd, SeriesRole, Side, SizingOutcome, SkippedEntryCounts,
+    SummaryStats, SweepableValue, SymbolFilters, Trade, TradeSource, ValidationError, align,
+    apply_slippage, atr_stop_price, compute_position_size, funding_payment, realized_pnl,
+    realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -100,6 +101,28 @@ pub fn run_backtest(
     count_from_ms: Option<i64>,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
+    // Input guards (r3.s1.w3): structural soundness of the primary and — when
+    // handed — the htf series, then the funding-order precondition over the
+    // primary's counted span, all before any strategy precondition or
+    // computation.
+    validate_series(primary, SeriesRole::Primary)?;
+    if let Some(htf_series) = htf {
+        validate_series(htf_series, SeriesRole::Htf)?;
+    }
+    let interval = BinanceAdapter::new()
+        .funding_interval_ms(&primary.pair)
+        .map_err(|_| BacktestError::FundingIntervalUnknown {
+            pair: primary.pair.clone(),
+        })?;
+    if let Some(gap) = funding_gaps(primary, count_from_ms, interval)
+        .into_iter()
+        .next()
+    {
+        return Err(BacktestError::FundingGap {
+            from: gap.from,
+            to: gap.to,
+        });
+    }
     let exit_plan = ExitPlan::from_strategy(compiled)?;
     check_htf_inputs(compiled, primary, htf)?;
     let mut engine =
@@ -169,6 +192,15 @@ pub fn run_backtest(
                 update_excursion(position, bar.primary);
             }
             close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
+            // G1 (r3.s1.w1): the bar just closed folds into the position's
+            // trailing state only while the position survived it — a bar that
+            // closed the position is the exit bar, and its own extreme must
+            // never join the level it was just checked against. The fold
+            // counts the held bar, extends the closed-bar extreme and
+            // recomputes the effective stop for the NEXT bar's checks.
+            if let Some(position) = state.position.as_mut() {
+                position.hold_closed_bar(bar.primary);
+            }
         }
 
         engine.step(bar.primary);
@@ -215,6 +247,25 @@ pub fn run_backtest(
             state.pending_exit = Some(PendingExit {
                 signal_time: bar.primary.close_time,
                 reason: ExitReason::Signal,
+            });
+        }
+
+        // G1 (r3.s1.w1): the time stop triggers at the close of the
+        // `max_bars`-th held bar and fills at the next bar's open, exactly as
+        // a signal exit does (the same open-gap relabelling applies at that
+        // fill). Evaluated AFTER the signal block so a same-close tie keeps
+        // the `Signal` label.
+        if counted
+            && state.pending_exit.is_none()
+            && let Some(max_bars) = exit_plan.max_bars
+            && state
+                .position
+                .as_ref()
+                .is_some_and(|position| position.bars_held == max_bars)
+        {
+            state.pending_exit = Some(PendingExit {
+                signal_time: bar.primary.close_time,
+                reason: ExitReason::TimeStop,
             });
         }
 
@@ -303,6 +354,42 @@ pub fn run_backtest(
 /// refusal also lives at the request boundary; the missing-HTF and pair checks
 /// are defence-in-depth (the request carries no second pair), for callers that
 /// construct the series directly.
+/// Validate one input series' structural soundness (r3.s1.w3): strictly
+/// ascending `open_time`, no repeated `open_time`, and no missing candle
+/// (adjacent spacing beyond one timeframe duration). `Unsorted`/`Duplicate`
+/// map to [`BacktestError::SeriesUnsorted`] naming the offending `open_time`;
+/// the first reported spacing gap maps to [`BacktestError::SeriesGap`] naming
+/// the expected and the found stamp. The engine refuses corrupt input before
+/// any computation — alignment, signaling and funding indexing all assume
+/// ordered, contiguous bars.
+fn validate_series(series: &CandleSeries, role: SeriesRole) -> Result<(), BacktestError> {
+    let gaps = series.validate().map_err(|err| match err {
+        DataError::Validation(ValidationError::Unsorted { later, .. }) => {
+            BacktestError::SeriesUnsorted {
+                series: role,
+                at: later,
+            }
+        }
+        DataError::Validation(ValidationError::Duplicate(at)) => {
+            BacktestError::SeriesUnsorted { series: role, at }
+        }
+        // `CandleSeries::validate` constructs only `Validation` errors today;
+        // a future `DataError` variant must not silently pass the input guard.
+        other => BacktestError::SeriesUnreadable {
+            series: role,
+            message: other.to_string(),
+        },
+    })?;
+    if let Some(gap) = gaps.first() {
+        return Err(BacktestError::SeriesGap {
+            series: role,
+            expected: gap.expected,
+            found: gap.found,
+        });
+    }
+    Ok(())
+}
+
 fn check_htf_inputs(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -532,6 +619,15 @@ impl EvalContext for DualSeriesContext<'_> {
 #[derive(Debug, Clone)]
 struct ExitPlan<'a> {
     stop: StopRule,
+    /// The declared trailing distance, when a `TrailingStop` exit exists (G1,
+    /// r3.s1.w1).
+    trail_pct: Option<Decimal>,
+    /// True when no `StopLoss`/`AtrStop` family exists and the trailing stop
+    /// stands in for it (G1, r3.s1.w1): the initial stop and the sizing basis
+    /// derive from `trail_pct`, and every stop hit is labelled `TrailingStop`.
+    trail_only: bool,
+    /// The declared `TimeStop` bar count, when one exists (G1, r3.s1.w1).
+    max_bars: Option<u32>,
     take_profit_target_r: Option<Decimal>,
     signal_exits: Vec<&'a CompiledCondition>,
     risk_per_trade_pct: Decimal,
@@ -540,13 +636,26 @@ struct ExitPlan<'a> {
 
 impl<'a> ExitPlan<'a> {
     fn from_strategy(compiled: &'a CompiledStrategy) -> Result<Self, BacktestError> {
-        // Unsupported kinds gate FIRST: a `TrailingStop`/`TimeStop` is
-        // structurally valid but unmodelled here, so it must surface the typed
-        // `UnsupportedExit` — not `NoStopLoss`.
-        reject_unsupported(compiled.exits())?;
-        let Some(stop) = stop_rule(compiled.exits()) else {
-            return Err(BacktestError::NoStopLoss);
-        };
+        let trail_pct = compiled.exits().iter().find_map(|exit| match exit {
+            CompiledExit::TrailingStop { trail_pct } => Some(*trail_pct),
+            _ => None,
+        });
+        let max_bars = compiled.exits().iter().find_map(|exit| match exit {
+            CompiledExit::TimeStop { max_bars } => Some(*max_bars),
+            _ => None,
+        });
+        let family_stop = stop_rule(compiled.exits());
+        // G1 (r3.s1.w1): with a `StopLoss`/`AtrStop` declared, sizing and the
+        // initial stop come from it, as before. With ONLY a `TrailingStop`, it
+        // stands in for the stop loss — its initial level
+        // (`entry × (1 ∓ trail_pct)`) is known at fill, sizes the position
+        // exactly as a `Pct` stop does, and is covered by the same plan-time
+        // short-TP impossibility check below. A `TimeStop` alone (or with only
+        // signal exits) is still `NoStopLoss` — a time stop is no stop.
+        let stop = family_stop
+            .or_else(|| trail_pct.map(StopRule::Pct))
+            .ok_or(BacktestError::NoStopLoss)?;
+        let trail_only = family_stop.is_none();
         let take_profit_target_r = take_profit_target(compiled.exits());
         // The short-TP impossibility check is plan-time only for the
         // fixed-fraction stop (its distance is known before any bar). For an
@@ -561,6 +670,9 @@ impl<'a> ExitPlan<'a> {
         }
         Ok(Self {
             stop,
+            trail_pct,
+            trail_only,
+            max_bars,
             take_profit_target_r,
             signal_exits: signal_exits(compiled.exits()),
             risk_per_trade_pct: compiled.risk().risk_per_trade_pct,
@@ -674,7 +786,28 @@ struct OpenPosition {
     direction: Direction,
     qty: Decimal,
     entry_price: Decimal,
+    /// The INITIAL stop — the sizing basis (G1, r3.s1.w1), fixed at fill.
+    /// R, MFE R and MAE R stay denominated by its distance, and the trade
+    /// records it, for the whole life of the position.
+    initial_stop: Decimal,
+    /// The CURRENT EFFECTIVE stop every price check sees (`price_exit`,
+    /// `stop_only_exit`, `resolve_intra_bar_exit`, `open_gap_reason`). A
+    /// trailing stop tightens it bar by bar (`hold_closed_bar`); nothing
+    /// else ever moves it.
     stop_price: Decimal,
+    /// The declared trailing distance, when a `TrailingStop` exit exists.
+    trail_pct: Option<Decimal>,
+    /// True when the trailing stop stands in for the stop family (G1) —
+    /// every stop hit is then a `TrailingStop`, even at the initial level.
+    trail_only: bool,
+    /// The favourable extreme of CLOSED held bars, seeded with the entry
+    /// fill price (G1). The level for bar *t* derives from the extreme of
+    /// bars up to *t − 1*; bar *t*'s own extreme folds in only after its
+    /// close check. `None` when no trailing stop is declared.
+    trail_extreme: Option<Decimal>,
+    /// Held-bar count (G1): the entry bar counts as 1; incremented after
+    /// each bar's close check while the position stays open.
+    bars_held: u32,
     take_profit_price: Option<Decimal>,
     entry_signal_time: i64,
     entry_fill_time: i64,
@@ -689,6 +822,59 @@ struct OpenPosition {
     /// The market regime in effect at the entry-fill bar (FR-6), carried to the
     /// `Trade` at close so `RegimeBreakdown` can aggregate it.
     regime: Regime,
+}
+
+impl OpenPosition {
+    /// The label for a stop hit on this position (G1, r3.s1.w1):
+    /// `TrailingStop` when a trailing stop is declared and has stood in for
+    /// the stop family (trail-only) or tightened strictly past the initial
+    /// stop; `StopLoss` otherwise — including every position with no
+    /// trailing stop at all.
+    fn stop_hit_reason(&self) -> ExitReason {
+        if self.trail_pct.is_none() {
+            return ExitReason::StopLoss;
+        }
+        if self.trail_only {
+            return ExitReason::TrailingStop;
+        }
+        let tightened = match self.direction {
+            Direction::Long => self.stop_price > self.initial_stop,
+            Direction::Short => self.stop_price < self.initial_stop,
+        };
+        if tightened {
+            ExitReason::TrailingStop
+        } else {
+            ExitReason::StopLoss
+        }
+    }
+
+    /// Fold one CLOSED held bar into the position's trailing state (G1,
+    /// r3.s1.w1). Called in the `run_backtest` loop AFTER
+    /// `close_on_bar_open_or_price` and only while the position survived the
+    /// bar — so a bar's own extreme is never in its own check, and a bar
+    /// that closed the position folds nothing. The bar counts toward
+    /// `bars_held` (the entry bar is held bar 1), the favourable extreme
+    /// joins `trail_extreme`, and the effective stop recomputes for the
+    /// NEXT bar as the tighter of the initial stop and the closed-bar
+    /// trailing level.
+    fn hold_closed_bar(&mut self, candle: &Candle) {
+        self.bars_held += 1;
+        let Some(trail_pct) = self.trail_pct else {
+            return;
+        };
+        let extreme = match (self.direction, self.trail_extreme) {
+            (Direction::Long, Some(extreme)) => extreme.max(candle.high),
+            (Direction::Long, None) => candle.high,
+            (Direction::Short, Some(extreme)) => extreme.min(candle.low),
+            (Direction::Short, None) => candle.low,
+        };
+        self.trail_extreme = Some(extreme);
+        let level = stop_price(extreme, trail_pct, self.direction);
+        self.stop_price = match self.direction {
+            Direction::Long => self.initial_stop.max(level),
+            Direction::Short => self.initial_stop.min(level),
+        };
+    }
 }
 
 fn fill_pending_entry(
@@ -709,10 +895,13 @@ fn fill_pending_entry(
 
     let raw_entry = candle.open;
     let entry_price = apply_slippage(raw_entry, config.slippage_bps, direction, Side::Entry);
-    // The stop is derived once at the fill and FROZEN on the position — neither
-    // stop kind ever recomputes or trails afterwards (r2.s2.w2). For `AtrStop`
-    // the distance is `multiple × ATR` where the ATR was frozen into the
-    // pending entry at the signal bar.
+    // The stop is derived once at the fill and FROZEN on the position as the
+    // sizing basis (`initial_stop`); the effective `stop_price` starts there.
+    // A `Pct` distance comes from the `StopLoss` family, or from a trailing
+    // stop standing in for one (G1, r3.s1.w1). For `AtrStop` the distance is
+    // `multiple × ATR` where the ATR was frozen into the pending entry at the
+    // signal bar. Only a declared trailing stop moves `stop_price` afterwards,
+    // bar by bar (`hold_closed_bar`); `initial_stop` never moves.
     let stop = match plan.stop {
         StopRule::Pct(distance_pct) => stop_price(entry_price, distance_pct, direction),
         // `atr_at_signal` is guaranteed `Some` by the entry gate; a `None`
@@ -785,7 +974,12 @@ fn fill_pending_entry(
         direction,
         qty,
         entry_price,
+        initial_stop: stop,
         stop_price: stop,
+        trail_pct: plan.trail_pct,
+        trail_only: plan.trail_only,
+        trail_extreme: plan.trail_pct.map(|_| entry_price),
+        bars_held: 0,
         take_profit_price,
         entry_signal_time: pending.signal_time,
         entry_fill_time: candle.open_time,
@@ -813,7 +1007,9 @@ fn fill_pending_entry(
 /// path reconstruction), so `mfe_r >= realized_r >= mae_r` is NOT guaranteed.
 fn update_excursion(position: &mut OpenPosition, candle: &Candle) {
     let entry = position.entry_price;
-    let stop_distance = (entry - position.stop_price).abs();
+    // R stays denominated by the INITIAL stop distance (G1, r3.s1.w1) — a
+    // trailing stop tightens `stop_price` but never re-scales the excursion.
+    let stop_distance = (entry - position.initial_stop).abs();
     if stop_distance.is_zero() {
         // The sizer refuses a zero stop distance, so this is unreachable in a
         // real run; guard anyway to avoid a divide-by-zero on a degenerate path.
@@ -892,10 +1088,13 @@ fn close_on_bar_open_or_price(
 /// high/low are deliberately ignored, because the position is already closed at
 /// the open.
 fn open_gap_reason(open: Decimal, position: &OpenPosition) -> Option<ExitReason> {
+    // The stop arm labels through the position's G1 label (r3.s1.w1): an open
+    // through a trailed level is a `TrailingStop` hit; through the untouched
+    // initial stop, a `StopLoss` hit. The TP arm is unchanged.
     match position.direction {
         Direction::Long => {
             if open <= position.stop_price {
-                Some(ExitReason::StopLoss)
+                Some(position.stop_hit_reason())
             } else if position.take_profit_price.is_some_and(|tp| open >= tp) {
                 Some(ExitReason::TakeProfit)
             } else {
@@ -904,7 +1103,7 @@ fn open_gap_reason(open: Decimal, position: &OpenPosition) -> Option<ExitReason>
         }
         Direction::Short => {
             if open >= position.stop_price {
-                Some(ExitReason::StopLoss)
+                Some(position.stop_hit_reason())
             } else if position.take_profit_price.is_some_and(|tp| open <= tp) {
                 Some(ExitReason::TakeProfit)
             } else {
@@ -952,7 +1151,17 @@ fn price_exit(candle: &Candle, position: &OpenPosition) -> Option<ExitFill> {
             position.stop_price,
             tp,
             position.direction,
-        ),
+        )
+        .map(|exit| IntraBarExit {
+            // A stop resolution re-labels through the position's G1 label
+            // (r3.s1.w1); a take-profit resolution keeps its own label.
+            reason: if exit.reason == ExitReason::StopLoss {
+                position.stop_hit_reason()
+            } else {
+                exit.reason
+            },
+            price: exit.price,
+        }),
         None => stop_only_exit(candle, position),
     }?;
     Some(ExitFill {
@@ -964,21 +1173,25 @@ fn price_exit(candle: &Candle, position: &OpenPosition) -> Option<ExitFill> {
 }
 
 fn stop_only_exit(candle: &Candle, position: &OpenPosition) -> Option<IntraBarExit> {
+    // The hit's label is the position's G1 label (r3.s1.w1): `TrailingStop`
+    // when the trail stands in or has tightened, `StopLoss` otherwise. The
+    // fill prices and the level checks are unchanged.
+    let reason = position.stop_hit_reason();
     match position.direction {
         Direction::Long if candle.open <= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: candle.open,
         }),
         Direction::Long if candle.low <= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: position.stop_price,
         }),
         Direction::Short if candle.open >= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: candle.open,
         }),
         Direction::Short if candle.high >= position.stop_price => Some(IntraBarExit {
-            reason: ExitReason::StopLoss,
+            reason,
             price: position.stop_price,
         }),
         _ => None,
@@ -1018,7 +1231,9 @@ fn close_position(
     let realized_r = realized_r(
         position.entry_price,
         exit_price,
-        position.stop_price,
+        // G1 (r3.s1.w1): realized R keeps its sizing basis — the INITIAL stop
+        // distance — even when a trailing stop moved the effective level.
+        position.initial_stop,
         position.direction,
     )?;
 
@@ -1061,9 +1276,12 @@ fn close_position(
         // The market regime captured at the entry-fill bar (FR-6), carried
         // through to the trade record for `RegimeBreakdown` aggregation.
         regime: position.regime,
-        // The frozen stop level the position carried (r2.s2.w2) — recorded
-        // verbatim so the trade log shows the risk the entry was sized against.
-        stop_price: Some(position.stop_price),
+        // The INITIAL stop the position was sized against (G1, r3.s1.w1) —
+        // recorded verbatim so the trade log shows the risk the entry was
+        // sized against and realized R keeps its denominator, even when a
+        // trailing stop moved the effective level (`exit_price` shows where
+        // the trail was).
+        stop_price: Some(position.initial_stop),
     });
     Ok(())
 }
@@ -1121,6 +1339,140 @@ fn funding_between(
         .sum()
 }
 
+/// One uncovered segment of a run's counted span, in epoch ms.
+///
+/// An uncovered segment has two anchors. In the distance walk they are the
+/// previous stamp (or the counted span's first counted `open_time`) and the next
+/// stamp (or the last primary candle's `close_time`). In the boundary sweep
+/// (rule 2 below) they are the missing funding boundary itself, one primary
+/// candle either side of it, clamped to the counted span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingGapWindow {
+    /// The segment's earlier anchor: the previous stamp's `open_time`, or the
+    /// counted span's first counted `open_time` when no stamp precedes it.
+    pub from: i64,
+    /// The segment's later anchor: the next stamp's `open_time`, or the last
+    /// primary candle's `close_time` when no stamp follows.
+    pub to: i64,
+}
+
+/// Check the funding-order precondition (#45) over the run's counted span. Two
+/// rules, because either one alone leaves a hole (#45's r3.s1 review):
+///
+/// 1. **Distance.** From the span start to the first funding stamp, between
+///    consecutive stamps, and from the last stamp to the span end, each distance
+///    must be at most the pair's funding interval plus one primary candle
+///    duration — a stamp sits on the candle containing the event, up to one
+///    candle early.
+/// 2. **Boundaries.** Every funding boundary strictly inside the span must be
+///    covered by a stamp within one primary candle of it. Rule 1 is
+///    distance-only, so it excuses a span whose edges happen to be close
+///    together: a one-interval counted span starting mid-interval (00:15..08:15
+///    on M15) crosses the 08:00 event with nothing stamped, and the accrual
+///    would then charge zero for it without a word. A span with no boundary
+///    inside it still needs no stamp.
+///
+/// The uncovered segments come back in ascending order, merged where they
+/// overlap; an empty return means the precondition holds.
+///
+/// Only the COUNTED span is checked: when `count_from_ms` is `Some`, bars
+/// before it are lead-in (r2.s3.w2) — no funding accrues on them, so their
+/// stamps (or absence) are not this run's business. A zero-candle series or a
+/// `count_from_ms` past the series' end has no counted span and no gaps.
+///
+/// Precondition: `series.candles` is strictly ascending by `open_time` — the
+/// engine validates that before calling this; the real-snapshot scan runs
+/// `CandleSeries::validate` first for the same reason.
+#[must_use]
+pub fn funding_gaps(
+    series: &CandleSeries,
+    count_from_ms: Option<i64>,
+    interval_ms: i64,
+) -> Vec<FundingGapWindow> {
+    let Some(first) = series.candles.first() else {
+        return Vec::new();
+    };
+    let span_start = match count_from_ms {
+        Some(from) => match series
+            .candles
+            .iter()
+            .find(|candle| candle.open_time >= from)
+        {
+            Some(candle) => candle.open_time,
+            None => return Vec::new(),
+        },
+        None => first.open_time,
+    };
+    let span_end = series
+        .candles
+        .last()
+        .map_or(first.close_time, |last| last.close_time);
+    if span_end <= span_start {
+        return Vec::new();
+    }
+    let candle_ms = series.timeframe.duration_ms();
+    let tolerance = interval_ms + candle_ms;
+    let mut uncovered: Vec<FundingGapWindow> = Vec::new();
+
+    // Rule 1 — the distance walk over span start → in-span stamps → span end.
+    let mut anchors: Vec<i64> = Vec::with_capacity(series.candles.len() + 2);
+    anchors.push(span_start);
+    anchors.extend(
+        series
+            .candles
+            .iter()
+            .filter(|candle| candle.open_time > span_start && candle.funding_rate.is_some())
+            .map(|candle| candle.open_time),
+    );
+    anchors.push(span_end);
+    for window in anchors.windows(2) {
+        if window[1] - window[0] > tolerance {
+            uncovered.push(FundingGapWindow {
+                from: window[0],
+                to: window[1],
+            });
+        }
+    }
+
+    // Rule 2 — every funding boundary strictly inside the counted span must be
+    // stamped. The boundaries are the pair's interval on the epoch grid
+    // (`funding.rs`: 00:00/08:00/16:00 UTC for the pinned 8h BTCUSDT interval).
+    let mut boundary = span_start.div_euclid(interval_ms) * interval_ms + interval_ms;
+    while boundary < span_end {
+        // A stamp covers the boundary when it sits on a candle within one
+        // primary candle of it — the candle CONTAINING the event, or (the
+        // defensive placement slack rule 1 already allowed) one either side.
+        let covered = series.candles.iter().any(|candle| {
+            candle.funding_rate.is_some() && (candle.open_time - boundary).abs() <= candle_ms
+        });
+        if !covered {
+            uncovered.push(FundingGapWindow {
+                from: span_start.max(boundary - candle_ms),
+                to: span_end.min(boundary + candle_ms),
+            });
+        }
+        boundary += interval_ms;
+    }
+
+    merged_windows(uncovered)
+}
+
+/// Sort the uncovered segments ascending and merge the ones that overlap or
+/// touch: a boundary's narrow window sits inside the wide distance window that
+/// already covers the same segment, so the caller reports one segment, not two
+/// views of it.
+fn merged_windows(mut windows: Vec<FundingGapWindow>) -> Vec<FundingGapWindow> {
+    windows.sort_by_key(|window| (window.from, window.to));
+    let mut merged: Vec<FundingGapWindow> = Vec::with_capacity(windows.len());
+    for window in windows {
+        match merged.last_mut() {
+            Some(last) if window.from <= last.to => last.to = last.to.max(window.to),
+            _ => merged.push(window),
+        }
+    }
+    merged
+}
+
 fn stop_rule(exits: &[CompiledExit]) -> Option<StopRule> {
     exits.iter().find_map(|exit| match exit {
         CompiledExit::StopLoss { distance_pct } => Some(StopRule::Pct(*distance_pct)),
@@ -1176,21 +1528,6 @@ fn reject_impossible_short_tp(
     Ok(())
 }
 
-fn reject_unsupported(exits: &[CompiledExit]) -> Result<(), BacktestError> {
-    for exit in exits {
-        match exit {
-            CompiledExit::TrailingStop { .. } => {
-                return Err(BacktestError::UnsupportedExit("TrailingStop".to_owned()));
-            }
-            CompiledExit::TimeStop { .. } => {
-                return Err(BacktestError::UnsupportedExit("TimeStop".to_owned()));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 /// ATR-stop take-profit: `entry ± target_r × |entry − stop|` — the same 1R
 /// distance a fixed-fraction stop uses, measured against the frozen ATR stop.
 /// The short variant can resolve to a non-positive price (the plan-time
@@ -1220,8 +1557,8 @@ fn atr_take_profit_price(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        BacktestConfig, OpenPosition, build_funding_index, first_fully_warm_bar_ms,
-        funding_between, run_backtest, update_excursion,
+        BacktestConfig, FundingGapWindow, OpenPosition, build_funding_index,
+        first_fully_warm_bar_ms, funding_between, funding_gaps, run_backtest, update_excursion,
     };
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
@@ -1248,31 +1585,48 @@ mod tests {
         }
     }
 
+    /// A candle at absolute M15 index `idx` — true 900 000 ms spacing with
+    /// epoch-aligned boundaries (index 0 is 00:00 UTC, and every 32nd bar's
+    /// half-open span contains an 8h boundary), carrying the default zero-rate
+    /// funding stamp the engine's funding-order precondition expects on real
+    /// data. Tests that assert funding place their own non-zero stamps on top
+    /// (`funding_candle`, `funding_candle_rate`); a zero-rate stamp pays zero,
+    /// so no existing expected value moves.
     fn candle(idx: i64, open: i64, high: i64, low: i64, close: i64) -> Candle {
+        let open_time = idx * 900_000;
         Candle {
-            open_time: idx * 60_000,
-            close_time: idx * 60_000 + 59_999,
+            open_time,
+            close_time: open_time + 899_999,
             open: d(open),
             high: d(high),
             low: d(low),
             close: d(close),
             volume: Decimal::ONE,
-            funding_rate: None,
+            funding_rate: if open_time % 28_800_000 == 0 {
+                Some(Decimal::ZERO)
+            } else {
+                None
+            },
         }
     }
 
     /// `candle` with `Decimal` OHLC (for the excursion proptest, which builds bars
     /// at sub-integer offsets from the entry price).
     fn candle_dec(idx: i64, open: Decimal, high: Decimal, low: Decimal, close: Decimal) -> Candle {
+        let open_time = idx * 900_000;
         Candle {
-            open_time: idx * 60_000,
-            close_time: idx * 60_000 + 59_999,
+            open_time,
+            close_time: open_time + 899_999,
             open,
             high,
             low,
             close,
             volume: Decimal::ONE,
-            funding_rate: None,
+            funding_rate: if open_time % 28_800_000 == 0 {
+                Some(Decimal::ZERO)
+            } else {
+                None
+            },
         }
     }
 
@@ -1582,7 +1936,12 @@ mod tests {
             direction,
             qty: d(3),
             entry_price: d(100),
+            initial_stop: d(95),
             stop_price: d(95),
+            trail_pct: None,
+            trail_only: false,
+            trail_extreme: None,
+            bars_held: 0,
             take_profit_price: None,
             entry_signal_time: 0,
             entry_fill_time,
@@ -1603,8 +1962,9 @@ mod tests {
     /// proof that the perf refactor is byte-identical (NFR-2).
     #[test]
     fn funding_index_contents_and_windowed_fold_match_full_rescan() {
-        // open_time = idx * 60_000 (see `candle`). Funding on bars 1, 3, 4, 6;
-        // plain bars at 0, 2, 5 must be excluded from the index. Distinct rates
+        // open_time = idx * 900_000 (see `candle`). The default zero-rate stamp
+        // sits on index 0 (an 8h boundary); explicit rates on bars 1, 3, 4, 6;
+        // plain bars at 2, 5 must be excluded from the index. Distinct rates
         // (including a negative one) make order + per-event arithmetic load-bearing.
         let r1 = rate(1, 3); // 0.001
         let r3 = rate(2, 3); // 0.002
@@ -1620,15 +1980,17 @@ mod tests {
             funding_candle_rate(6, r6),
         ]);
 
-        // (a) index = exactly the funding-bearing candles, in ascending open_time.
+        // (a) index = exactly the funding-bearing candles, in ascending open_time
+        //     — including the zero-rate default stamp on index 0.
         let index = build_funding_index(&primary);
         assert_eq!(
             index,
             vec![
-                (60_000, r1),
-                (3 * 60_000, r3),
-                (4 * 60_000, r4),
-                (6 * 60_000, r6),
+                (0, Decimal::ZERO),
+                (900_000, r1),
+                (3 * 900_000, r3),
+                (4 * 900_000, r4),
+                (6 * 900_000, r6),
             ],
             "index must hold exactly the funding-bearing candles, in source (ascending) order"
         );
@@ -1638,14 +2000,16 @@ mod tests {
         );
 
         // (b) windowed fold == full-rescan fold, over representative windows and
-        // both directions. Each window is `(entry_fill_time, exit_fill_time]`.
+        // both directions. Each window is `(entry_fill_time, exit_fill_time]` —
+        // so the zero-rate stamp at open_time 0 sits OUTSIDE every window below
+        // (entry boundary excluded) and only the four explicit events ever pay.
         let windows = [
-            (0, 6 * 60_000),          // whole series: all four events
-            (60_000, 4 * 60_000), // entry ON a funding bar (1 EXCLUDED), exit ON one (4 INCLUDED): {3,4}
-            (3 * 60_000, 6 * 60_000), // {4,6}
-            (4 * 60_000, 5 * 60_000), // exit between events, after the last in-range one: {}
-            (6 * 60_000, 9 * 60_000), // entry at/after the last event: {} (empty upper tail)
-            (0, 0),               // degenerate empty window
+            (0, 6 * 900_000), // whole series: all four explicit events (the 0-time zero-rate stamp is outside the entry edge)
+            (900_000, 4 * 900_000), // entry ON a funding bar (1 EXCLUDED), exit ON one (4 INCLUDED): {3,4}
+            (3 * 900_000, 6 * 900_000), // {4,6}
+            (4 * 900_000, 5 * 900_000), // exit between events, after the last in-range one: {}
+            (6 * 900_000, 9 * 900_000), // entry at/after the last event: {} (empty upper tail)
+            (0, 0),                 // degenerate empty window
         ];
         for direction in [Direction::Long, Direction::Short] {
             for &(entry_fill_time, exit_fill_time) in &windows {
@@ -1662,7 +2026,7 @@ mod tests {
 
         // Spot-check a concrete value so the test is not purely self-referential:
         // long over the whole series folds -(r1+r3+r4+r6) * notional per event.
-        let long_whole = funding_between(&index, &position_at(0, Direction::Long), 6 * 60_000);
+        let long_whole = funding_between(&index, &position_at(0, Direction::Long), 6 * 900_000);
         let notional = d(3) * d(100);
         let expected = -(r1 * notional) - (r3 * notional) - (r4 * notional) - (r6 * notional);
         assert_eq!(
@@ -1695,8 +2059,11 @@ mod tests {
     }
 
     #[test]
-    fn trailing_and_time_exits_are_rejected() {
-        let primary = series(vec![candle(0, 100, 101, 99, 100)]);
+    fn trailing_runs_and_time_only_refuses_no_stop_loss() {
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 102, 99, 101),
+        ]);
         let trailing = compiled(
             price_entry(),
             vec![
@@ -1706,19 +2073,32 @@ mod tests {
                 },
             ],
         );
-        let time = compiled(
+        let time_only = compiled(
             price_entry(),
-            vec![
-                stop(),
-                ExitRule::TimeStop {
-                    max_bars: SweepableValue::Fixed(5),
-                },
-            ],
+            vec![ExitRule::TimeStop {
+                max_bars: SweepableValue::Fixed(5),
+            }],
         );
 
+        // r3.s1.w1 (G1): a `TrailingStop` runs, standalone or beside a stop
+        // family — the run no longer refuses it (its full semantics are pinned
+        // by `tests/exit_kinds.rs`).
+        run_backtest(
+            &trailing,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+            None,
+        )
+        .expect("a trailing stop is modelled since r3.s1.w1");
+
+        // A `TimeStop` alone is still no stop: the typed refusal stays
+        // `NoStopLoss` (G1) — the old unmodelled-kind refusal is retired.
         assert!(matches!(
             run_backtest(
-                &trailing,
+                &time_only,
                 &primary,
                 None,
                 &config(),
@@ -1727,20 +2107,7 @@ mod tests {
                 None,
             )
             .unwrap_err(),
-            BacktestError::UnsupportedExit(_)
-        ));
-        assert!(matches!(
-            run_backtest(
-                &time,
-                &primary,
-                None,
-                &config(),
-                &SymbolFilters::unconstrained(),
-                SeriesEnd::SnapshotEnd,
-                None,
-            )
-            .unwrap_err(),
-            BacktestError::UnsupportedExit(_)
+            BacktestError::NoStopLoss
         ));
     }
 
@@ -1832,9 +2199,9 @@ mod tests {
         assert_eq!(mark.direction, Direction::Long);
         assert_eq!(mark.qty, d(20), "1% of 10_000 at a 5% stop on 100");
         assert_eq!(mark.entry_price, d(100), "filled at bar 2's open");
-        assert_eq!(mark.entry_signal_time, 119_999, "bar 1's close_time");
-        assert_eq!(mark.entry_fill_time, 120_000, "bar 2's open_time");
-        assert_eq!(mark.mark_time, 179_999, "bar 2's close_time");
+        assert_eq!(mark.entry_signal_time, 1_799_999, "bar 1's close_time");
+        assert_eq!(mark.entry_fill_time, 1_800_000, "bar 2's open_time");
+        assert_eq!(mark.mark_time, 2_699_999, "bar 2's close_time");
         assert_eq!(mark.mark_price, d(103), "bar 2's close");
     }
 
@@ -2210,7 +2577,12 @@ mod tests {
                 direction,
                 qty: Decimal::ONE,
                 entry_price: entry,
+                initial_stop: stop,
                 stop_price: stop,
+                trail_pct: None,
+                trail_only: false,
+                trail_extreme: None,
+                bars_held: 0,
                 take_profit_price: None,
                 entry_signal_time: 0,
                 entry_fill_time: 0,
@@ -2394,6 +2766,179 @@ mod tests {
             trade.realized_pnl,
             gross + trade.funding_total - trade.fees_total,
             "net P&L must embed slippage via the fills only, not subtract it twice"
+        );
+    }
+
+    // --- funding_gaps: the funding-order precondition check (r3.s1.w3). ---
+
+    /// The pinned 8h BTCUSDT funding interval, mirrored here for hand-built
+    /// scenarios (the engine resolves it through `BinanceAdapter`).
+    const FUNDING_INTERVAL_TEST_MS: i64 = 28_800_000;
+
+    /// `candle` without the default zero-rate stamp — for the scenarios below
+    /// that pin their stamp pattern exactly.
+    fn raw_candle(idx: i64) -> Candle {
+        let mut candle = candle(idx, 100, 101, 99, 100);
+        candle.funding_rate = None;
+        candle
+    }
+
+    #[test]
+    fn funding_gaps_flags_a_whole_missing_event_between_two_stamps() {
+        // 65 M15 bars (0..=64) span 16h+; boundaries at indices 0, 32, 64.
+        // Stamps at 0 and 64 only — the index-32 event has no stamp.
+        let primary = series(
+            (0..=64)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 0 || i == 64 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        let gaps = funding_gaps(&primary, None, FUNDING_INTERVAL_TEST_MS);
+        assert_eq!(
+            gaps,
+            vec![FundingGapWindow {
+                from: 0,
+                to: 64 * 900_000,
+            }],
+            "the segment from the span start to the last stamp is one uncovered gap"
+        );
+    }
+
+    #[test]
+    fn funding_gaps_accepts_stamps_one_interval_apart() {
+        let primary = series(
+            (0..=64)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 0 || i == 32 || i == 64 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        assert!(
+            funding_gaps(&primary, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "stamps one interval apart leave no uncovered segment"
+        );
+    }
+
+    #[test]
+    fn funding_gaps_allows_a_short_unstamped_span_but_flags_a_long_one() {
+        // 30 bars = 7.5h: no funding boundary lies INSIDE the counted span
+        // (the first one is the 8h mark, past its end), so no stamp is needed.
+        let short = series((0..30).map(raw_candle).collect());
+        assert!(
+            funding_gaps(&short, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a counted span with no funding boundary inside it needs no stamp"
+        );
+        // 34 bars = 8.5h > one interval: unstamped, so uncovered.
+        let long = series((0..34).map(raw_candle).collect());
+        let gaps = funding_gaps(&long, None, FUNDING_INTERVAL_TEST_MS);
+        assert_eq!(
+            gaps,
+            vec![FundingGapWindow {
+                from: 0,
+                to: long.candles.last().expect("non-empty").close_time,
+            }],
+            "an unstamped span longer than one interval is one gap"
+        );
+    }
+
+    #[test]
+    fn funding_gaps_counts_only_the_windowed_counted_span() {
+        // Stamps only at index 64.
+        let primary = series(
+            (0..=64)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 64 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        // Counted from index 32: the counted span is one interval long, closed
+        // by the index-64 stamp — the unstamped lead-in does not count.
+        assert!(
+            funding_gaps(&primary, Some(32 * 900_000), FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "an unstamped lead-in must not refuse a windowed run"
+        );
+        // Counted from index 8: the counted span's start sits 14h before the
+        // only stamp — uncovered.
+        assert_eq!(
+            funding_gaps(&primary, Some(8 * 900_000), FUNDING_INTERVAL_TEST_MS),
+            vec![FundingGapWindow {
+                from: 8 * 900_000,
+                to: 64 * 900_000,
+            }],
+            "the counted span's own uncovered segment is what the check reports"
+        );
+        // Counted past the end: no counted bars, nothing to check.
+        assert!(
+            funding_gaps(&primary, Some(999 * 900_000), FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a window with no counted bars has no span to check"
+        );
+    }
+
+    /// The distance walk alone excused a span whose edges are close enough: a
+    /// one-interval counted span starting mid-interval crosses a real funding
+    /// event with nothing stamped, and the accrual would then charge zero for it
+    /// (#45's r3.s1 review). The boundary sweep is what refuses it.
+    #[test]
+    fn funding_gaps_flags_an_unstamped_boundary_inside_a_short_span() {
+        // Bars 1..=32 (00:15 .. 08:15): a counted span of 8h00m — inside the
+        // 8h15m distance tolerance — whose 08:00 boundary (index 32) has no
+        // stamp anywhere near it.
+        let short = series((1..=32).map(raw_candle).collect());
+        assert_eq!(
+            funding_gaps(&short, None, FUNDING_INTERVAL_TEST_MS),
+            vec![FundingGapWindow {
+                from: 31 * 900_000,
+                to: 32 * 900_000 + 899_999,
+            }],
+            "the unstamped 8h boundary inside the span is one uncovered segment"
+        );
+
+        // The same span with the boundary's own candle stamped is clean.
+        let stamped = series(
+            (1..=32)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 32 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        assert!(
+            funding_gaps(&stamped, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a stamped boundary inside a short span leaves no uncovered segment"
+        );
+
+        // And a boundary a candle early still covers it — the placement slack
+        // the distance walk already granted.
+        let early = series(
+            (1..=32)
+                .map(|i| {
+                    let mut candle = raw_candle(i);
+                    if i == 31 {
+                        candle.funding_rate = Some(rate(1, 3));
+                    }
+                    candle
+                })
+                .collect(),
+        );
+        assert!(
+            funding_gaps(&early, None, FUNDING_INTERVAL_TEST_MS).is_empty(),
+            "a stamp one candle early still covers the boundary"
         );
     }
 }

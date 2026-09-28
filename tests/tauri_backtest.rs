@@ -502,6 +502,21 @@ impl BacktestRunRepository for InjectingRunRepo {
         }
     }
 
+    fn latest_readable_run_for_version(
+        &self,
+        strategy_version_id: &VersionId,
+    ) -> impl std::future::Future<Output = Result<pulse::LatestReadableRun, DataError>> + Send {
+        let fail = self.fail;
+        let inner = &self.inner;
+        let id = strategy_version_id.clone();
+        async move {
+            if fail == FailAt::PriorRunRead {
+                return Err(DataError::Db("injected prior-run read failure".to_owned()));
+            }
+            inner.latest_readable_run_for_version(&id).await
+        }
+    }
+
     fn list_runs_for_version(
         &self,
         strategy_version_id: &VersionId,
@@ -1674,6 +1689,7 @@ fn seed_inputs() -> BacktestInputs {
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
+        symbol_filters: None,
         window: None,
         lead_in_from_ms: None,
     }

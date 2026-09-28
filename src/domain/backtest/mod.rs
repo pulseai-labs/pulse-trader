@@ -40,13 +40,13 @@ mod walk_forward;
 // type is a `dead_code` BUILD error under `deny(warnings)`).
 pub use collision::{IntraBarExit, resolve_intra_bar_exit};
 pub use cost::{Side, apply_slippage, funding_payment, realized_pnl, realized_r, taker_fee};
-pub use error::BacktestError;
+pub use error::{BacktestError, SeriesRole};
 pub use feed::{AlignedBar, align};
 pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
 pub use run::{
     BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig,
-    OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
 };
 pub use stats::{EquityCurve, EquityPoint, SummaryStats};
 pub use trade::{ExitReason, Fill, Trade, TradeSource};

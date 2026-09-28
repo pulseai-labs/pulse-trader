@@ -45,8 +45,10 @@ const FIXTURE_STORE: &str = "tests/fixtures/btcusdt-1m-store";
 /// is the pinned oracle `tests/walk_forward.rs` measured.
 const GOLDEN_STRATEGY: &str = "tests/fixtures/strategies/rsi-oversold-long.json";
 
-/// The oracle's first fully-warm bar (RSI(14) on the M15 fixture).
-const ORACLE_FIRST_WARM_MS: i64 = 1_735_702_200_000;
+/// The oracle's first fully-warm bar (RSI(14) on the M15 fixture). One bar
+/// later since #36 (warm also requires a previous value; was
+/// `1_735_702_200_000`).
+const ORACLE_FIRST_WARM_MS: i64 = 1_735_703_100_000;
 
 fn manifest(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)

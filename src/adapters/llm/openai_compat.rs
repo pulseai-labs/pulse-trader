@@ -107,6 +107,24 @@ fn provider_config(
         .with_max_retries(max_retries)
 }
 
+/// The problem class of the first byte an `Authorization` header value cannot
+/// carry: anything outside visible ASCII `0x21..=0x7E` (reqwest rejects a
+/// header value with control characters, and a space or non-ASCII byte is not
+/// a dispatchable bearer token). The byte itself is never returned — only its
+/// class — so a refusal message cannot echo the credential.
+fn first_undispatchable_byte_class(credential: &str) -> Option<&'static str> {
+    for &byte in credential.as_bytes() {
+        let class = match byte {
+            b' ' => "a space",
+            0x21..=0x7E => continue,
+            0x00..=0x1F | 0x7F => "a control character (including newline)",
+            _ => "a non-ASCII byte",
+        };
+        return Some(class);
+    }
+    None
+}
+
 /// The OpenAI-compatible transport adapter — implements `PulseTrader`'s
 /// [`LlmProvider`] port over the `PulseHive` OpenAI-compatible transport (README
 /// C2/C8), pointed at Ollama Cloud.
@@ -126,6 +144,13 @@ pub struct OpenAiCompatProvider {
     /// process. The `PulseHive` config view sanitizes userinfo out of the URL;
     /// the check must run on the string the SDK will actually dial.
     base_url: String,
+    /// The credential THIS provider instance dispatches with (r3.s1.w5): the
+    /// same value handed to the SDK config below, retained so
+    /// [`chat`](Self::chat)'s preflight validates, at the point of use, the
+    /// value that will actually reach the `Authorization` header for that
+    /// request. The type has no `Debug`/`Display` derive, so the retained copy
+    /// cannot render; the preflight refuses without echoing it.
+    credential: String,
     /// The retry posture this provider was built with, kept ONLY under `cfg(test)`.
     ///
     /// It is evidence, not runtime state: `PulseHive`'s provider does not surface
@@ -165,12 +190,12 @@ impl OpenAiCompatProvider {
     /// retry posture is unchanged; only the endpoint is caller-chosen.
     #[must_use]
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self::from_config(provider_config(
-            api_key,
-            base_url,
-            OLLAMA_TIMEOUT,
-            OLLAMA_MAX_RETRIES,
-        ))
+        let credential = api_key.into();
+        let base_url = base_url.into();
+        Self::from_config(
+            credential.clone(),
+            provider_config(credential, base_url, OLLAMA_TIMEOUT, OLLAMA_MAX_RETRIES),
+        )
     }
 
     /// Build a provider that makes exactly ONE upstream attempt (PR #128, finding
@@ -197,12 +222,12 @@ impl OpenAiCompatProvider {
         api_key: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
-        Self::from_config(provider_config(
-            api_key,
-            base_url,
-            OLLAMA_TIMEOUT,
-            COACH_MAX_RETRIES,
-        ))
+        let credential = api_key.into();
+        let base_url = base_url.into();
+        Self::from_config(
+            credential.clone(),
+            provider_config(credential, base_url, OLLAMA_TIMEOUT, COACH_MAX_RETRIES),
+        )
     }
 
     /// [`single_attempt`](Self::single_attempt) with a caller-chosen request
@@ -220,12 +245,16 @@ impl OpenAiCompatProvider {
         base_url: Option<&str>,
         timeout: Duration,
     ) -> Self {
-        Self::from_config(provider_config(
-            api_key,
-            base_url.unwrap_or(OLLAMA_BASE_URL),
-            timeout,
-            COACH_MAX_RETRIES,
-        ))
+        let credential = api_key.into();
+        Self::from_config(
+            credential.clone(),
+            provider_config(
+                credential,
+                base_url.unwrap_or(OLLAMA_BASE_URL),
+                timeout,
+                COACH_MAX_RETRIES,
+            ),
+        )
     }
 
     /// The retry posture this provider was built with — test-build evidence, so a
@@ -242,7 +271,7 @@ impl OpenAiCompatProvider {
         self.timeout_secs
     }
 
-    fn from_config(config: OpenAIConfig) -> Self {
+    fn from_config(credential: String, config: OpenAIConfig) -> Self {
         #[cfg(test)]
         let max_retries = config.max_retries;
         #[cfg(test)]
@@ -251,6 +280,7 @@ impl OpenAiCompatProvider {
         Self {
             inner: OpenAICompatibleProvider::new(config),
             base_url,
+            credential,
             #[cfg(test)]
             max_retries,
             #[cfg(test)]
@@ -289,6 +319,30 @@ impl LlmProvider for OpenAiCompatProvider {
                     "configured llm base_url is not a dispatchable URL: {reason}"
                 )));
             }
+        }
+        // The credential, validated at the point of use (r3.s1.w5): the value
+        // retained on this instance is the value handed to the SDK config, so
+        // what this check validates is what the `Authorization: Bearer` header
+        // will carry for THIS request. A credential that cannot become a
+        // header value fails inside `send` as a bare `PulseHiveError::Llm`,
+        // which `map_hive_error` cannot tell from a billed post-dispatch
+        // fault — as `Provider` the decorator would book a phantom zero-token
+        // row for a request that never left the process. Caught here it is
+        // `Config` — this process faulting. The refusal names the problem
+        // class and NEVER echoes the value or any part of it.
+        if self.credential.is_empty() {
+            return Err(LlmError::Config(
+                "the configured llm credential is empty; resolve a credential \
+                 before dispatching"
+                    .to_owned(),
+            ));
+        }
+        if let Some(class) = first_undispatchable_byte_class(&self.credential) {
+            return Err(LlmError::Config(format!(
+                "the configured llm credential contains {class}; an Authorization \
+                 header value can only carry visible ASCII (0x21-0x7E), so the \
+                 request is refused before dispatch"
+            )));
         }
         let hive_messages: Vec<HiveMessage> = messages.into_iter().map(to_hive_message).collect();
         // Translate the advertised tool defs field-by-field (anti-corruption per-field
@@ -454,27 +508,26 @@ fn map_hive_error(error: PulseHiveError) -> LlmError {
     }
 }
 
-/// The byte bound on a transport error's detail (PR #169, round 3).
-///
-/// The provider controls `body` and it is unbounded, yet the detail lands
-/// verbatim in the immutable `llm_call.completion` row — and again in the
-/// coach's failure record — so it is cut here, at the boundary where it is
-/// built, rather than trusting every consumer to bound it later.
-const TRANSPORT_DETAIL_MAX_BYTES: usize = 4096;
-
-/// The explicit marker a cut detail ends in, so a reader can tell the provider
-/// body was truncated rather than complete.
-const DETAIL_TRUNCATED: &str = "[truncated]";
+// The byte bound on a transport error's detail and the marker a cut ends in
+// moved to `domain::redaction` by r3.s1.w5 (#172): they belong to the ONE
+// seam (`domain::redaction::scrub_then_bound`), which scrubs BEFORE it
+// bounds, at every persisting consumer.
 
 /// The detail a transport error carries across the seam (R3): the SDK's own
 /// `Display` — `<kind> after <n> attempt(s): <message> (HTTP <status>)` — plus
 /// the two fields `Display` deliberately omits, the `finish_reason` and the
 /// verbatim provider `body`, appended so the provider's answer survives into
-/// the ledger row and the recorded failure. Whatever the body echoes — a quoted
-/// credential, request content — is scrubbed at the at-rest boundary (the
-/// decorator redacts the stored `completion`; the coach redacts the recorded
-/// `TransportFailure` detail), never here: this string is also the LIVE error
-/// the caller logs.
+/// the ledger row and the recorded failure.
+///
+/// Since r3.s1.w5 (#172) this returns the detail UNBOUNDED. The provider
+/// controls `body`, but the raw body is already fully in memory before this
+/// assembly runs — the old 4 KiB bound here never protected memory, and
+/// bounding BEFORE the scrub is the defect: a credential straddling the cut
+/// becomes a fragment neither redaction rule recognizes, persisted in the
+/// immutable `llm_call.completion` row. The bound is applied by the domain
+/// seam (`domain::redaction::scrub_then_bound`), AFTER the scrub, at every
+/// persisting consumer: the decorator's stored `completion`, the coach's
+/// recorded `TransportFailure` detail.
 fn transport_detail(error: &HiveLlmError) -> String {
     use std::fmt::Write;
     let mut detail = error.to_string();
@@ -484,37 +537,18 @@ fn transport_detail(error: &HiveLlmError) -> String {
     if let Some(body) = &error.body {
         let _ = write!(detail, " | body: {body}");
     }
-    bound_transport_detail(detail)
-}
-
-/// Bound the assembled detail to [`TRANSPORT_DETAIL_MAX_BYTES`], cutting at a
-/// UTF-8 char boundary and ending a cut detail in [`DETAIL_TRUNCATED`].
-///
-/// The bound exists for the provider-controlled `body` — everything before it
-/// is SDK-produced and short — but it applies to the whole string so no field
-/// added later can silently unbound it again.
-fn bound_transport_detail(detail: String) -> String {
-    if detail.len() <= TRANSPORT_DETAIL_MAX_BYTES {
-        return detail;
-    }
-    let mut end = TRANSPORT_DETAIL_MAX_BYTES - DETAIL_TRUNCATED.len();
-    while !detail.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = detail[..end].to_owned();
-    out.push_str(DETAIL_TRUNCATED);
-    out
+    detail
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        COACH_MAX_RETRIES, DETAIL_TRUNCATED, Duration, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES,
-        OLLAMA_MODEL_ID, OLLAMA_TIMEOUT, OpenAiCompatProvider, TRANSPORT_DETAIL_MAX_BYTES,
-        from_hive_response, map_hive_error, provider_config, to_hive_config, to_hive_message,
-        to_hive_tool_def,
+        COACH_MAX_RETRIES, Duration, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES, OLLAMA_MODEL_ID,
+        OLLAMA_TIMEOUT, OpenAiCompatProvider, from_hive_response, map_hive_error, provider_config,
+        to_hive_config, to_hive_message, to_hive_tool_def,
     };
+    use crate::domain::redaction::TRANSPORT_DETAIL_MAX_BYTES;
     use crate::domain::{
         LlmBackend, LlmConfig, LlmError, LlmProvider, Message, ReasoningEffort, ToolCall,
         ToolDefinition,
@@ -886,6 +920,61 @@ mod tests {
         assert!(matches!(err, LlmError::Config(_)));
     }
 
+    /// r3.s1.w5: a credential that cannot become an `Authorization` header
+    /// value — not visible ASCII `0x21..=0x7E` — is refused BEFORE dispatch as
+    /// [`LlmError::Config`] (this process faulting: no billed round-trip, no
+    /// phantom zero-token ledger row), and the refusal names the problem class
+    /// without ever echoing the value or any part of it.
+    #[tokio::test]
+    async fn a_credential_that_cannot_be_a_header_is_refused_before_dispatch() {
+        for (label, bad) in [
+            ("empty", ""),
+            ("space", "spilled key"),
+            ("newline", "spilled\nkey"),
+            ("control", "spilled\u{0001}key"),
+            ("non-ascii", "spilled-é-key"),
+        ] {
+            let provider =
+                OpenAiCompatProvider::single_attempt_with_base_url(bad, "http://127.0.0.1:9");
+            let err = provider
+                .chat(vec![Message::user("go")], &[], &sample_config())
+                .await
+                .expect_err("a non-dispatchable credential must be refused");
+            let LlmError::Config(message) = &err else {
+                panic!("{label}: expected Config, got {err:?}");
+            };
+            assert!(
+                message.contains("credential"),
+                "{label}: the refusal names the credential: {message}"
+            );
+            if !bad.is_empty() {
+                assert!(
+                    !message.contains(bad),
+                    "{label}: the refusal echoed the value: {message}"
+                );
+            }
+        }
+    }
+
+    /// The preflight must not over-refuse: a visible-ASCII credential passes
+    /// it and the request is dispatched. Here the dial to a closed port
+    /// faults as a transport `Provider` error — never `Config`.
+    #[tokio::test]
+    async fn a_visible_ascii_credential_passes_the_preflight() {
+        let provider = OpenAiCompatProvider::single_attempt_with_base_url(
+            "visible-ascii-credential-0123456789",
+            "http://127.0.0.1:9",
+        );
+        let err = provider
+            .chat(vec![Message::user("go")], &[], &sample_config())
+            .await
+            .expect_err("the dial to a closed port faults");
+        assert!(
+            !matches!(err, LlmError::Config(_)),
+            "a dispatchable credential must not be refused by the preflight: {err:?}"
+        );
+    }
+
     /// R3: the SDK's transport error carries what its `Display` deliberately
     /// omits — the kind, the provider `body` and the `finish_reason`. The domain
     /// detail keeps all three so the ledger row and the coach failure still say
@@ -943,35 +1032,35 @@ mod tests {
         }
     }
 
-    /// PR #169, round 3: the provider controls `body` and it is unbounded, but
-    /// the detail lands verbatim in the immutable `llm_call.completion` row
-    /// (and the coach's failure record) — so the detail is cut to
-    /// [`TRANSPORT_DETAIL_MAX_BYTES`], ending in an explicit marker so a reader
-    /// can tell it was truncated rather than complete.
+    /// r3.s1.w5: the adapter no longer bounds provider detail. The assembled
+    /// detail is returned UNBOUNDED — it stays in memory, inside the typed
+    /// error — and the domain seam (`domain::redaction::scrub_then_bound`)
+    /// scrubs-then-bounds it at every persisting consumer. Bounding here,
+    /// before the scrub, is the defect the seam closes: a credential
+    /// straddling the cut becomes a fragment neither redaction rule
+    /// recognizes, and the fragment is persisted.
     #[test]
-    fn a_huge_provider_body_is_bounded_with_a_truncation_marker() {
+    fn a_huge_provider_body_is_carried_unbounded_for_the_seam() {
         let body = "x".repeat(TRANSPORT_DETAIL_MAX_BYTES * 4);
         let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
             .with_status(503)
-            .with_body(body);
+            .with_body(body.clone());
         let detail = match map_hive_error(PulseHiveError::llm_transport(sdk_error)) {
             LlmError::Provider(detail) => detail,
             other => panic!("expected Provider, got {other:?}"),
         };
         assert!(
-            detail.len() <= TRANSPORT_DETAIL_MAX_BYTES,
-            "the detail must stay within the bound: {} bytes",
+            detail.len() > TRANSPORT_DETAIL_MAX_BYTES,
+            "the adapter must not bound provider detail: {} bytes",
             detail.len()
         );
         assert!(
-            detail.ends_with(DETAIL_TRUNCATED),
-            "a cut detail must end in the explicit marker: …{}",
-            &detail[detail.len() - 64..]
+            !detail.contains("[truncated]"),
+            "no truncation marker may be applied outside domain/redaction.rs"
         );
-        // The SDK-produced head survives the cut.
-        assert!(detail.contains("server"), "the kind is kept: {detail}");
+        assert!(detail.contains(&body), "the body is carried verbatim");
 
-        // A body that fits is carried verbatim — no marker, byte-for-byte.
+        // A body that fits is carried verbatim — byte-for-byte, no marker.
         let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
             .with_status(503)
             .with_body("upstream exploded");
@@ -983,12 +1072,9 @@ mod tests {
             detail.contains("| body: upstream exploded"),
             "a small body is verbatim: {detail}"
         );
-        assert!(
-            !detail.contains(DETAIL_TRUNCATED),
-            "an uncut detail carries no marker: {detail}"
-        );
+        assert!(!detail.contains("[truncated]"));
 
-        // A multi-byte char must not be split by the byte bound.
+        // A multi-byte body is carried whole, unsplit — the seam owns any cut.
         let body = "é".repeat(TRANSPORT_DETAIL_MAX_BYTES);
         let sdk_error = HiveLlmError::new(HiveLlmErrorKind::ServerError, "boom")
             .with_status(503)
@@ -997,8 +1083,8 @@ mod tests {
             LlmError::Provider(detail) => detail,
             other => panic!("expected Provider, got {other:?}"),
         };
-        assert!(detail.len() <= TRANSPORT_DETAIL_MAX_BYTES);
-        assert!(detail.ends_with(DETAIL_TRUNCATED));
+        assert!(detail.len() > TRANSPORT_DETAIL_MAX_BYTES);
+        assert!(!detail.contains("[truncated]"));
     }
 
     /// One coach turn is one upstream attempt (PR #128, finding H1).

@@ -34,8 +34,9 @@ use tempfile::TempDir;
 
 /// The oracle's first fully-warm bar, pinned by `tests/walk_forward.rs` — the
 /// seeded `MINIMAL_DSL` entry is RSI(14) on M15, the same warm gate the golden
-/// strategy carries, so the same measured bar bounds `from`.
-const ORACLE_FIRST_WARM_MS: i64 = 1_735_702_200_000;
+/// strategy carries, so the same measured bar bounds `from`. One bar later
+/// since #36 (warm also requires a previous value; was `1_735_702_200_000`).
+const ORACLE_FIRST_WARM_MS: i64 = 1_735_703_100_000;
 
 /// The walk-forward fixture: the version tree PLUS a real run on the PARENT —
 /// the child's `run_walk_forward` resolves its snapshot pins off that row, the

@@ -17,6 +17,20 @@ use crate::application::mcp_read::IndicatorColumn;
 use crate::domain::{Candle, DataError, Trade};
 use rust_decimal::Decimal;
 
+/// The export-path seam for tool results (r3.s1.w4, #199): a non-UTF-8 path
+/// refuses as a tool-level error message instead of reaching `serde_json` —
+/// the `json!` macro's `unwrap` would panic the tool handler and take the
+/// session down. The message names the problem, lossy-rendered path included.
+pub(crate) fn path_json(path: &Path) -> Result<serde_json::Value, String> {
+    let Some(text) = path.to_str() else {
+        return Err(format!(
+            "the export path is not valid UTF-8 ({}): refusing to emit it in the tool result",
+            path.display()
+        ));
+    };
+    Ok(serde_json::Value::String(text.to_owned()))
+}
+
 /// The per-process exports directory: `<data_dir>/exports/<pid>-<start>/`.
 ///
 /// `seq` makes each export's filename unique and deterministic within the
@@ -223,4 +237,46 @@ fn set_owner_only(path: &Path) -> Result<(), DataError> {
 #[cfg(not(unix))]
 fn set_owner_only(_path: &Path) -> Result<(), DataError> {
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::path_json;
+    use std::path::PathBuf;
+
+    /// r3.s1.w4 (#199): a path that is not valid UTF-8 refuses as the tool-level
+    /// message instead of reaching `serde_json` — whose `json!` unwrap would
+    /// panic the tool handler and take the MCP session down with it.
+    ///
+    /// Platform-independent on purpose: the path is CONSTRUCTED from invalid
+    /// UTF-8 bytes and never created on disk. The end-to-end case
+    /// (`tests/run_comparability.rs`) needs a real directory named with invalid
+    /// UTF-8 and is therefore Linux-only — APFS refuses such a name at
+    /// `create_dir_all` with `EILSEQ` — so this unit test is what pins the
+    /// refusal on the macOS CI leg.
+    #[cfg(unix)]
+    #[test]
+    fn path_json_refuses_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/exports-\xff-dir/export_trades-run-1-0.csv",
+        ));
+        let message = path_json(&path).expect_err("a non-UTF-8 path must refuse");
+        assert!(
+            message.contains("not valid UTF-8"),
+            "the refusal names the problem: {message}"
+        );
+    }
+
+    /// The other half of the seam: a UTF-8 path rides out verbatim, as a JSON
+    /// string (not a lossy rendering, not an object).
+    #[test]
+    fn path_json_keeps_a_utf8_path_verbatim() {
+        let path = PathBuf::from("/exports-dir/export_trades-run-1-0.csv");
+        assert_eq!(
+            path_json(&path).expect("a UTF-8 path renders"),
+            serde_json::json!("/exports-dir/export_trades-run-1-0.csv")
+        );
+    }
 }

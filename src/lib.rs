@@ -298,6 +298,23 @@ pub use application::coach_decision::{
     CoachDecisionRequest, run_coach_decision,
 };
 
+// r3.s1.w2: the MCP submit use case — the write edge every agent-authored
+// strategy version crosses. Re-exported on the `run_version_backtest` precedent
+// (the module stays `pub(crate)` and `lib.rs` curates what crosses): the
+// offline submit suite drives the REAL application function over the REAL
+// SQLite repositories, and an integration-test binary is a separate crate that
+// cannot reach a `pub(crate)` item. The refusal shape (ADR-0017) is the point:
+// `SubmitError::Validation` carries the typed, field-pathed `FieldError`s.
+pub use application::mcp_write::{
+    SubmitError, SubmitOutcome, SubmitRequest, SubmitTarget, submit_agent_version,
+};
+
+// r3.s1.w2: the version-content hash, re-exported so the persisted-impossible
+// suite can mint an OUT-OF-BAND version row (a pre-r3 database's shape, held
+// before this item's refusal rule existed) whose hash the read path verifies.
+// Same curated-surface precedent as the submit seam above.
+pub use adapters::db::strategy_repo::version_hash;
+
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
 // are the `Decimal↔f64` conversion seam (the ONLY place floats are allowed).
@@ -338,7 +355,9 @@ pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 // VS-1.2.1 work-1.03: deterministic, sequential backtest engine. The adapter
 // owns the concrete indicator engine while composing the pure domain backtest
 // types and money-math primitives.
-pub use adapters::backtest::{BacktestConfig, first_fully_warm_bar_ms, run_backtest};
+pub use adapters::backtest::{
+    BacktestConfig, FundingGapWindow, first_fully_warm_bar_ms, funding_gaps, run_backtest,
+};
 
 // VS-1.1.4 work-1.01: the SQLite persistence foundation. `Db` is the WAL pool
 // wrapper (`with_path`/`open_default`/`pool`); `MIGRATOR` is the embedded
@@ -447,8 +466,9 @@ pub use server::ops::{ComposeRunCtx, ComposeRunner, SweepConfig};
 // type is a `dead_code` build error, not a warning. Kept additive (work-1.02's
 // MTF feed extends the same `backtest` tree at the R1→R2 merge).
 pub use domain::{
-    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
-    apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, taker_fee,
+    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, Side, Trade,
+    TradeSource, apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
+    taker_fee,
 };
 
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
@@ -512,10 +532,12 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // r1.s3.w2 (#110): the durable INPUT provenance value types ride the same
 // re-export (an un-re-exported public domain type is a `dead_code` BUILD error
 // under `deny(warnings)`), so `tests/backtest_provenance.rs` and W3's DTO can
-// name them.
+// name them. r3.s1.w4 (#198): `LatestReadableRun` is the latest-readable
+// lookup's answer, beside the port method it belongs to.
 pub use domain::{
     BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, CandleWindowError,
-    FundingConfig, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    FundingConfig, LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd,
+    SnapshotSelection,
 };
 
 // r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025) —
@@ -630,7 +652,10 @@ pub use domain::{ApiKey, CredentialSource, CredentialStatus};
 // crossed inward so the application ring keeps ADR-0015's ONE adapters import. The
 // crate surface is unchanged: `pulse::Redactor` still resolves, to the same type.
 pub use adapters::llm::redacting_logging::RedactingLoggingProvider;
-pub use domain::Redactor;
+// r3.s1.w5 (#172): the scrub-then-bound seam and its one bound ride the same
+// surface, so the integration tests and any persisting caller reach them as
+// `pulse::scrub_then_bound` / `pulse::TRANSPORT_DETAIL_MAX_BYTES`.
+pub use domain::{Redactor, TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 
 // VS-1.3.2 work-2.04: the composer agent loop surface (FR-3 / FR-4, README C7). The
 // `Composer<P>` orchestrator + `compose()` + the `ComposeOutcome` value it RETURNS +

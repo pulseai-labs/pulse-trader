@@ -47,6 +47,10 @@ use crate::domain::strategy::CreatedBy;
 // (`crate::domain::redaction`). This decorator still owns the provider concerns —
 // the inner call, the price table, the ledger write — and still redacts BEFORE
 // persisting (ADR-0016); only the text kernel moved.
+// r3.s1.w5 (#172): the stored `completion` goes through the ONE
+// scrub-then-bound seam — the adapter no longer bounds provider detail, so the
+// bound (and the marker a cut ends in) are applied here, after the scrub.
+use crate::domain::redaction::{TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 use crate::domain::{
     Clock, CredentialSource, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError,
     LlmProvider, LlmResponse, Message, PriceTable, Redactor, TokenUsage, ToolDefinition,
@@ -178,13 +182,34 @@ where
             return result;
         }
 
+        // r3.s1.w5: the LIVE error is scrubbed and bounded by the same seam —
+        // a provider body echoing the credential must not survive into what
+        // the caller logs (the CLI's top-level eprintln!, the Tauri bus, any
+        // downstream Display or serialization). The payload keeps its variant
+        // and its non-secret text; only secret material is rewritten, and
+        // scrubbing is idempotent, so the coach's own pass through the seam at
+        // recording time is unchanged in effect.
+        let result =
+            result.map_err(|error| match error {
+                LlmError::Provider(detail) => LlmError::Provider(scrub_then_bound(
+                    &self.redactor,
+                    &detail,
+                    TRANSPORT_DETAIL_MAX_BYTES,
+                )),
+                LlmError::MalformedToolCall(detail) => LlmError::MalformedToolCall(
+                    scrub_then_bound(&self.redactor, &detail, TRANSPORT_DETAIL_MAX_BYTES),
+                ),
+                other => other,
+            });
+
         // A call that reached the provider is a billed round-trip whether it
         // answered or errored (PR #169, R1): under PulseHive 3.0.0 a billed
         // HTTP 200 with a truncated tool call arrives as `Err`, and an early
         // return here left the spend with no ledger row. The error rides
-        // `completion` — its kind and provider body included — scrubbed like
-        // every other stored string; the SDK's error exposes no usage, so the
-        // row records the tokens that are visible (zero), not invented ones.
+        // `completion` — its kind and provider body included — scrubbed and
+        // bounded by the ONE seam (r3.s1.w5): scrub the whole string first,
+        // THEN bound, so a credential echoed by the provider can never be cut
+        // into an unrecognizable fragment on its way into the immutable row.
         let (usage, completion) = match &result {
             Ok(response) => (
                 response.usage,
@@ -192,7 +217,11 @@ where
             ),
             Err(error) => (
                 TokenUsage::default(),
-                Some(self.redactor.redact(&error.to_string())),
+                Some(scrub_then_bound(
+                    &self.redactor,
+                    &error.to_string(),
+                    TRANSPORT_DETAIL_MAX_BYTES,
+                )),
             ),
         };
 
@@ -245,7 +274,7 @@ mod tests {
     use super::{RedactingLoggingProvider, Redactor};
     use crate::adapters::clock::FakeClock;
     use crate::cli::compose::COMPOSE_CANCELLED;
-    use crate::domain::redaction::REDACTED;
+    use crate::domain::redaction::{REDACTED, TRANSPORT_DETAIL_MAX_BYTES};
     use crate::domain::strategy::CreatedBy;
     use crate::domain::{
         DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError,
@@ -849,6 +878,85 @@ mod tests {
         assert!(
             saved.lock().expect("saved lock").is_empty(),
             "a request that never left the process must not reach the ledger"
+        );
+    }
+
+    /// An inner provider that fails every call with a fixed transport error.
+    struct FailingEchoProvider {
+        error: LlmError,
+    }
+
+    impl LlmProvider for FailingEchoProvider {
+        fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: &[ToolDefinition],
+            _config: &LlmConfig,
+        ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
+            std::future::ready(Err(self.error.clone()))
+        }
+    }
+
+    /// r3.s1.w5: the LIVE error a caller receives is scrubbed and bounded by
+    /// the same seam that produces the stored copy — a provider body echoing
+    /// the credential cannot survive into what the caller logs (the CLI's
+    /// top-level eprintln!, the Tauri bus). The row is scrubbed and bounded
+    /// the same way, as before.
+    #[tokio::test]
+    async fn the_returned_error_is_scrubbed_and_bounded_too() {
+        const KEY: &str = "the-quick-brown-fox-leaps-over-the-lazy-transport-canary-key";
+        let mut payload = "x".repeat(4_040);
+        payload.push_str(KEY);
+        payload.push_str(&"x".repeat(512));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let repo = RecordingRepo {
+            saved: Arc::clone(&saved),
+        };
+        let decorator = RedactingLoggingProvider::new(
+            FailingEchoProvider {
+                error: LlmError::Provider(payload),
+            },
+            repo,
+            FakeClock::at(1_700_000_000_000),
+            Redactor::from_config(vec![KEY.to_owned()]),
+            prices(),
+        );
+
+        let err = decorator
+            .chat(vec![Message::user("a prompt")], &[], &config())
+            .await
+            .expect_err("the transport fault is returned to the caller");
+        let LlmError::Provider(detail) = &err else {
+            panic!("expected Provider, got {err:?}");
+        };
+        assert!(
+            (0..=KEY.len() - 8).all(|start| !detail.contains(&KEY[start..start + 8])),
+            "the live error carries no credential fragment: {detail}"
+        );
+        assert!(
+            detail.len() <= TRANSPORT_DETAIL_MAX_BYTES,
+            "the live error payload is bounded: {} bytes",
+            detail.len()
+        );
+        assert!(
+            detail.ends_with("[truncated]"),
+            "a cut payload ends in the marker: …{}",
+            &detail[detail.len() - 48..]
+        );
+        // The billed row's stored copy is scrubbed and bounded the same way.
+        let stored = saved.lock().expect("saved lock");
+        let completion = stored[0]
+            .completion
+            .as_deref()
+            .expect("the errored call stores its detail");
+        assert!(
+            !completion.contains(KEY),
+            "the stored completion carries the credential: {completion}"
+        );
+        assert!(
+            completion.len() <= TRANSPORT_DETAIL_MAX_BYTES,
+            "the stored completion is bounded: {} bytes",
+            completion.len()
         );
     }
 

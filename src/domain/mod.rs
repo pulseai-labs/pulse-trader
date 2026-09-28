@@ -73,8 +73,8 @@ mod version;
 // error under `deny(warnings)`. `AlignedBar` borrows from the input series, so
 // its lifetime is tied to the caller's `CandleSeries`.
 pub use backtest::{
-    AlignedBar, BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade,
-    TradeSource, align, apply_slippage, funding_payment, realized_pnl, realized_r,
+    AlignedBar, BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, Side,
+    Trade, TradeSource, align, apply_slippage, funding_payment, realized_pnl, realized_r,
     resolve_intra_bar_exit, taker_fee,
 };
 // VS-1.2.2 work-2.03: the pure regime surface (EMA50/200 + ADX14 classifier).
@@ -93,7 +93,7 @@ pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 // `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{
     BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig,
-    OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
 };
 // r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025).
 // Re-exported so `lib.rs` can curate the crate surface — an un-re-exported
@@ -199,6 +199,10 @@ pub use llm::ToolDefinition;
 // not an API change.
 pub use llm_call::{LlmCall, LlmCallId};
 pub use redaction::Redactor;
+// r3.s1.w5 (#172): the scrub-then-bound seam and its one bound join the same
+// public surface — every persisting caller of provider-derived detail names
+// them, from the adapters ring and the application ring alike.
+pub use redaction::{TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 // r1.s4.w1: the attributed-call pair the sealed coach turn's provider port
 // returns. `pub(crate)`: a crate-internal use case's vocabulary (ADR-0015).
 pub(crate) use llm_call::{AttributedCall, AttributedCallError};

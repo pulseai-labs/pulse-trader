@@ -11,14 +11,25 @@
 //!   (`entry == stop`) has no risk denominator, so sizing refuses rather than
 //!   dividing by zero or inventing a fallback. The loop (1.03) also raises it as
 //!   a precondition when a compiled strategy carries no `StopLoss` exit.
-//! - [`BacktestError::UnsupportedExit`] (C4) — `TrailingStop` / `TimeStop` exits
-//!   are not modelled this slice; 1.03 fail-fast rejects them with this variant
-//!   rather than silently mis-pricing them.
+//! - [`BacktestError::UnsupportedExit`] (C4) — the fail-fast refusal for an exit
+//!   kind the backtester does not model. `TrailingStop` / `TimeStop` were the
+//!   examples when this variant landed (1.01); r3.s1.w1 made both REAL exits
+//!   (G1/G2), so nothing constructs this variant any more. It stays because the
+//!   enum serde round-trips across the `Tauri` boundary.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{Pair, Timeframe};
+
+/// Which input series an input-validation refusal names (r3.s1.w3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SeriesRole {
+    /// The run's primary series.
+    Primary,
+    /// The supplied higher-timeframe series.
+    Htf,
+}
 
 /// Errors produced by the backtester (domain layer).
 ///
@@ -33,9 +44,12 @@ pub enum BacktestError {
     #[error("cannot size a position without a stop-loss (zero stop distance)")]
     NoStopLoss,
 
-    /// A compiled exit kind this slice does not model was encountered —
-    /// `TrailingStop` or `TimeStop`. 1.03 rejects it fail-fast rather than
-    /// mis-pricing it (C4).
+    /// A compiled exit kind this backtester does not model. **No exit kind
+    /// constructs this any more**: `TrailingStop` and `TimeStop` were the
+    /// examples when it landed (1.01, C4), and r3.s1.w1 made both real exits
+    /// (G1/G2). The variant is retained because the enum serde round-trips
+    /// across the `Tauri` boundary — a payload written by an older build must
+    /// still deserialize.
     #[error("unsupported exit kind for this backtester: {0}")]
     UnsupportedExit(String),
 
@@ -146,5 +160,85 @@ pub enum BacktestError {
         /// The supplied higher-timeframe series' timeframe — the interval the
         /// slack is measured in.
         htf: Timeframe,
+    },
+
+    /// A named input series is not strictly ascending by `open_time`, or
+    /// repeats an `open_time` (`CandleSeries::validate`'s `Unsorted` /
+    /// `Duplicate`). The engine would align, signal and fill on the candles
+    /// in whatever order they arrive — wrong money on input it was handed —
+    /// so the run refuses before any computation (r3.s1.w3). `at` names the
+    /// offending `open_time`: the out-of-order candle's, or the repeated one's.
+    #[error(
+        "backtest input series {series:?} is not strictly ascending by open_time \
+         (offending open_time {at})"
+    )]
+    SeriesUnsorted {
+        /// Which series failed validation.
+        series: SeriesRole,
+        /// The offending candle's `open_time` (epoch ms) — out of order or
+        /// duplicated.
+        at: i64,
+    },
+
+    /// A named input series has a missing candle: adjacent spacing exceeds one
+    /// timeframe duration (`CandleSeries::validate`'s first reported gap). A
+    /// gapped series would bar-gate indicators, fills and funding events on
+    /// phantom time — the run refuses with the gap's expected and found
+    /// `open_time` rather than computing across the hole (r3.s1.w3).
+    #[error(
+        "backtest input series {series:?} has a gap: expected open_time {expected}, found {found}"
+    )]
+    SeriesGap {
+        /// Which series failed validation.
+        series: SeriesRole,
+        /// The `open_time` the next candle was expected at (epoch ms).
+        expected: i64,
+        /// The `open_time` actually found (epoch ms).
+        found: i64,
+    },
+
+    /// The run's counted span crosses an 8h funding boundary with no funding
+    /// stamp on (or before) the candle containing it (`funding_gaps`' first
+    /// uncovered segment). The funding fold counts only candles that CARRY a
+    /// rate, so a missed event would silently accrue as zero and misstate
+    /// every trade it touches — the run refuses with the uncovered segment's
+    /// anchors instead (#45, r3.s1.w3). `from` is the previous stamp's
+    /// `open_time` (or the counted span's first counted `open_time`); `to` is
+    /// the next stamp's (or the last primary candle's `close_time`).
+    #[error(
+        "funding-order precondition violated: no funding stamp within one interval \
+         of the ({from}, {to}] span segment — a missed 8h event would accrue as zero"
+    )]
+    FundingGap {
+        /// The uncovered segment's earlier anchor (epoch ms).
+        from: i64,
+        /// The uncovered segment's later anchor (epoch ms).
+        to: i64,
+    },
+
+    /// No funding interval is pinned for the run's pair — the engine refuses
+    /// rather than defaulting an ordering precondition it cannot know
+    /// (r3.s1.w3; the interval is pinned per-pair on `BinanceAdapter`, the
+    /// same home as the symbol filters).
+    #[error("no funding interval pinned for pair {pair}")]
+    FundingIntervalUnknown {
+        /// The pair with no pinned funding interval.
+        pair: Pair,
+    },
+
+    /// A named input series failed validation with an error variant
+    /// `CandleSeries::validate` cannot construct today (it raises only
+    /// `Unsorted`/`Duplicate`, both mapped to [`BacktestError::SeriesUnsorted`]
+    /// above). A defensive catch-all so a future `DataError` variant cannot
+    /// silently pass the input guard — following the `MutationError::
+    /// CompileFailed` / `UnexpectedSweep` precedent: documented unreachable,
+    /// part of the seam's contract, never reached by a test that bypasses the
+    /// production path (r3.s1.w3).
+    #[error("backtest input series {series:?} failed validation: {message}")]
+    SeriesUnreadable {
+        /// Which series failed validation.
+        series: SeriesRole,
+        /// The underlying validation failure's display.
+        message: String,
     },
 }

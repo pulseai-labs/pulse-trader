@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{SqliteBacktestRunRepo, SqliteStrategyRepo};
+use crate::adapters::db::{RunReadFailure, SqliteBacktestRunRepo, SqliteStrategyRepo};
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
     BacktestAppError, resolve_default_request, run_version_backtest,
@@ -561,15 +561,32 @@ impl PulseMcp {
         };
         let mut entries = Vec::with_capacity(summaries.len());
         for summary in &summaries {
-            match repo.get_run(&summary.id).await {
+            match repo.get_run_classified(&summary.id).await {
                 Ok(Some(run)) => entries.push(run_list_entry(&run)),
                 Ok(None) => {
-                    return Ok(tool_error(format!(
-                        "run {} listed but not readable (store corruption)",
-                        summary.id.as_str()
-                    )));
+                    // r3.s1.w4 (#198): one unreadable row is skipped with a
+                    // warning on the same channel the repository's list walk
+                    // uses — it never fails the whole catalog.
+                    eprintln!(
+                        "list_runs: run `{}` of version `{}` listed but not readable \
+                         (store corruption); skipping",
+                        summary.id.as_str(),
+                        version.id.as_str()
+                    );
                 }
-                Err(e) => return Ok(tool_error(e)),
+                Err(RunReadFailure::Corrupt(reason)) => {
+                    eprintln!(
+                        "list_runs: skipping unreadable run `{}` of version `{}`: {reason}",
+                        summary.id.as_str(),
+                        version.id.as_str()
+                    );
+                }
+                Err(RunReadFailure::Store(reason)) => {
+                    // r3.s1's round-1 review: the skip is for a corrupt ROW only.
+                    // A STORE failure is the catalog's, not one row's — reporting
+                    // it as an empty/short list would be a false success.
+                    return Ok(tool_error(DataError::Db(reason)));
+                }
             }
         }
         Ok(structured_list("runs", entries))
@@ -626,18 +643,23 @@ impl PulseMcp {
             .exports
             .write_csv("export_trades", run.id.as_str(), &csv)
         {
-            Ok(path) => Ok(CallToolResult::structured(json!({
-                "path": path,
-                "rows": trades.len(),
-                "columns": [
-                    "direction", "qty", "entry_price", "exit_price",
-                    "entry_signal_time", "entry_fill_time",
-                    "exit_signal_time", "exit_fill_time",
-                    "fills", "fees_total", "funding_total", "slippage_total",
-                    "realized_pnl", "realized_r", "mfe_r", "mae_r",
-                    "exit_reason", "source", "regime", "stop_price",
-                ],
-            }))),
+            Ok(path) => match export::path_json(&path) {
+                // r3.s1.w4 (#199): a non-UTF-8 path refuses as a tool error —
+                // never a panic inside serialization.
+                Ok(path_value) => Ok(CallToolResult::structured(json!({
+                    "path": path_value,
+                    "rows": trades.len(),
+                    "columns": [
+                        "direction", "qty", "entry_price", "exit_price",
+                        "entry_signal_time", "entry_fill_time",
+                        "exit_signal_time", "exit_fill_time",
+                        "fills", "fees_total", "funding_total", "slippage_total",
+                        "realized_pnl", "realized_r", "mfe_r", "mae_r",
+                        "exit_reason", "source", "regime", "stop_price",
+                    ],
+                }))),
+                Err(message) => Ok(tool_error(message)),
+            },
             Err(e) => Ok(tool_error(e)),
         }
     }
@@ -691,13 +713,16 @@ impl PulseMcp {
                     .exports
                     .write_csv("export_candles", &subject, &csv)
                 {
-                    Ok(path) => Ok(CallToolResult::structured(json!({
-                        "path": path,
-                        "rows": rows,
-                        "data_version": data_version,
-                        "timeframe": tf.binance_interval(),
-                        "pair": series.pair.to_string(),
-                    }))),
+                    Ok(path) => match export::path_json(&path) {
+                        Ok(path_value) => Ok(CallToolResult::structured(json!({
+                            "path": path_value,
+                            "rows": rows,
+                            "data_version": data_version,
+                            "timeframe": tf.binance_interval(),
+                            "pair": series.pair.to_string(),
+                        }))),
+                        Err(message) => Ok(tool_error(message)),
+                    },
                     Err(e) => Ok(tool_error(e)),
                 }
             }
@@ -721,13 +746,16 @@ impl PulseMcp {
                     .exports
                     .write_parquet_copy("export_candles", &subject, &bytes)
                 {
-                    Ok(path) => Ok(CallToolResult::structured(json!({
-                        "path": path,
-                        "rows": series.candles.len(),
-                        "data_version": data_version,
-                        "timeframe": tf.binance_interval(),
-                        "pair": series.pair.to_string(),
-                    }))),
+                    Ok(path) => match export::path_json(&path) {
+                        Ok(path_value) => Ok(CallToolResult::structured(json!({
+                            "path": path_value,
+                            "rows": series.candles.len(),
+                            "data_version": data_version,
+                            "timeframe": tf.binance_interval(),
+                            "pair": series.pair.to_string(),
+                        }))),
+                        Err(message) => Ok(tool_error(message)),
+                    },
                     Err(e) => Ok(tool_error(e)),
                 }
             }
@@ -804,14 +832,17 @@ impl PulseMcp {
             .exports
             .write_csv("export_indicators", &subject, &csv)
         {
-            Ok(path) => Ok(CallToolResult::structured(json!({
-                "path": path,
-                "rows": series.candles.len(),
-                "data_version": series.version.as_str(),
-                "timeframe": tf.binance_interval(),
-                "pair": series.pair.to_string(),
-                "columns": labels,
-            }))),
+            Ok(path) => match export::path_json(&path) {
+                Ok(path_value) => Ok(CallToolResult::structured(json!({
+                    "path": path_value,
+                    "rows": series.candles.len(),
+                    "data_version": series.version.as_str(),
+                    "timeframe": tf.binance_interval(),
+                    "pair": series.pair.to_string(),
+                    "columns": labels,
+                }))),
+                Err(message) => Ok(tool_error(message)),
+            },
             Err(e) => Ok(tool_error(e)),
         }
     }
