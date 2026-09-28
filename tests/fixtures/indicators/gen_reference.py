@@ -4,7 +4,7 @@
 Run from the repository root with a venv OUTSIDE the worktree at the pinned
 scratch path (`/tmp` is forbidden by host rule; `mktemp` lands there):
 
-    REFVENV="$HOME/.cache/pulse-scratch/r3.s2.w1/refgen"
+    REFVENV="$HOME/.cache/pulse-scratch/r3.s2.w2/refgen"
     uv venv --python 3.11 "$REFVENV"
     # PIN the versions below — a floating install resolved pandas-ta-classic
     # 0.8.32 on 2026-09-28 and CHANGED the early ADX settling-window values
@@ -14,7 +14,8 @@ scratch path (`/tmp` is forbidden by host rule; `mktemp` lands there):
 
 Resolved on 2026-06-12; regenerated 2026-09-19 for the r2.s2.w2 `atr_14`
 column; regenerated 2026-09-28 for the r3.s2.w1 `macd_signal_12_26_9` and
-`macd_hist_12_26_9` columns:
+`macd_hist_12_26_9` columns; regenerated 2026-09-29 for the r3.s2.w2
+`highest_high_20` and `lowest_low_20` columns:
     python 3.11.16
     numpy 2.4.6
     pandas 3.0.6
@@ -48,6 +49,11 @@ Indicator calls:
         rma over the first `period` true ranges, identically to the engine, so
         the cross-validation needs no settling window (measured at regen: worst
         relative delta ≈2.7e-12 post-warmup, settle_bars = 0).
+    highest_high_20 (r3.s2.w2): df["high"].rolling(20).max().shift(1) — plain
+        pandas, the prior-N convention: at row k it is the max high of rows
+        k-20..k-1, the 20 closed bars BEFORE k, excluding k (Q1). First
+        defined at index 20 — the engine's N+1 warm-up for the rolling
+        extremes. The same construction gives lowest_low_20 over `low`.
 
 The classic fork emits ADX values before the project ADX warmup boundary.
 Rows before index 27 (2 * 14 - 1) are blanked so the committed reference
@@ -84,6 +90,10 @@ EMA_FIRST_DEFINED_INDEX = 50 - 1
 MACD_FIRST_DEFINED_INDEX = 26 - 1
 # line first at 25 (0-based); signal/hist need `signal` line values → 25 + 9 - 1.
 MACD_SIGNAL_FIRST_DEFINED_INDEX = 26 - 1 + 9 - 1
+# r3.s2.w2: rolling(20).shift(1) is NaN through index 19 by construction; the
+# explicit blank pins the warm-up contract (first defined at index 20 = N+1).
+HIGHEST_FIRST_DEFINED_INDEX = 20
+LOWEST_FIRST_DEFINED_INDEX = 20
 
 
 def format_value(value: float) -> str:
@@ -151,12 +161,19 @@ def main() -> None:
     macd_hist = (macd - macd_signal).copy()
     atr = df.ta.atr(high=high, low=low, close=close, length=14, mamode="rma")
 
+    # r3.s2.w2: the rolling extremes are exact prior-N window aggregates over
+    # the raw price fields (Q1's convention), not a pandas-ta call.
+    highest_high_20 = high.rolling(20).max().shift(1)
+    lowest_low_20 = low.rolling(20).min().shift(1)
+
     ema.iloc[:EMA_FIRST_DEFINED_INDEX] = math.nan
     adx.iloc[:ADX_FIRST_DEFINED_INDEX] = math.nan
     macd.iloc[:MACD_FIRST_DEFINED_INDEX] = math.nan
     macd_signal.iloc[:MACD_SIGNAL_FIRST_DEFINED_INDEX] = math.nan
     macd_hist.iloc[:MACD_SIGNAL_FIRST_DEFINED_INDEX] = math.nan
     atr.iloc[:ATR_FIRST_DEFINED_INDEX] = math.nan
+    highest_high_20.iloc[:HIGHEST_FIRST_DEFINED_INDEX] = math.nan
+    lowest_low_20.iloc[:LOWEST_FIRST_DEFINED_INDEX] = math.nan
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT.open("w", newline="") as handle:
@@ -171,6 +188,8 @@ def main() -> None:
                 "atr_14",
                 "macd_signal_12_26_9",
                 "macd_hist_12_26_9",
+                "highest_high_20",
+                "lowest_low_20",
             ]
         )
         for idx, row in df.iterrows():
@@ -184,6 +203,8 @@ def main() -> None:
                     format_value(float(atr.iloc[idx])),
                     format_value(float(macd_signal.iloc[idx])),
                     format_value(float(macd_hist.iloc[idx])),
+                    format_value(float(highest_high_20.iloc[idx])),
+                    format_value(float(lowest_low_20.iloc[idx])),
                 ]
             )
 
@@ -196,7 +217,9 @@ def main() -> None:
         f"macd={MACD_FIRST_DEFINED_INDEX} "
         f"macd_signal={MACD_SIGNAL_FIRST_DEFINED_INDEX} "
         f"macd_hist={MACD_SIGNAL_FIRST_DEFINED_INDEX} "
-        f"atr={ATR_FIRST_DEFINED_INDEX}"
+        f"atr={ATR_FIRST_DEFINED_INDEX} "
+        f"highest_high_20={highest_high_20.first_valid_index()} "
+        f"lowest_low_20={lowest_low_20.first_valid_index()}"
     )
 
 

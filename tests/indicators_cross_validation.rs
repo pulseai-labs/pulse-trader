@@ -11,7 +11,7 @@ use std::{path::PathBuf, str::FromStr};
 
 use pulse::{
     Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, MacdOutput,
-    Pair, Series, SweepableValue, Timeframe,
+    Pair, PriceField, Series, SweepableValue, Timeframe,
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
@@ -29,6 +29,8 @@ enum IndicatorName {
     MacdSignal,
     MacdHist,
     Atr,
+    HighestHigh20,
+    LowestLow20,
 }
 
 impl IndicatorName {
@@ -41,6 +43,8 @@ impl IndicatorName {
             Self::MacdSignal => "MACD-signal(12,26,9)",
             Self::MacdHist => "MACD-hist(12,26,9)",
             Self::Atr => "ATR(14)",
+            Self::HighestHigh20 => "Highest(20,high)",
+            Self::LowestLow20 => "Lowest(20,low)",
         }
     }
 
@@ -68,6 +72,14 @@ impl IndicatorName {
                 output: MacdOutput::Histogram,
             },
             Self::Atr => IndicatorSpec::Atr { period: fixed(14) },
+            Self::HighestHigh20 => IndicatorSpec::Highest {
+                period: fixed(20),
+                source: PriceField::High,
+            },
+            Self::LowestLow20 => IndicatorSpec::Lowest {
+                period: fixed(20),
+                source: PriceField::Low,
+            },
         }
     }
 
@@ -80,7 +92,18 @@ impl IndicatorName {
             // identically — measured at regen (r2.s2.w2): the worst relative
             // delta over post-warmup rows is ≈2.7e-12, already below REL_EPS,
             // so no settling window is needed at all.
-            Self::Rsi | Self::Ema | Self::Macd | Self::MacdSignal | Self::MacdHist | Self::Atr => 0,
+            Self::Rsi
+            | Self::Ema
+            | Self::Macd
+            | Self::MacdSignal
+            | Self::MacdHist
+            | Self::Atr
+            // The rolling extremes are exact prior-N window aggregates over
+            // the raw price fields — no smoothing, nothing to settle. The
+            // engine's Decimal window max/min equals the pandas max/min
+            // exactly once warm (r3.s2.w2).
+            | Self::HighestHigh20
+            | Self::LowestLow20 => 0,
             // ADX uses the same Wilder alpha, but the adapter is SMA-seeded
             // while pandas-ta's RMA is recursively seeded. The first 280
             // post-warmup rows let the seed delta decay below REL_EPS.
@@ -99,6 +122,8 @@ struct ReferenceRow {
     macd_signal_12_26_9: String,
     macd_hist_12_26_9: String,
     atr_14: String,
+    highest_high_20: String,
+    lowest_low_20: String,
 }
 
 impl ReferenceRow {
@@ -111,6 +136,8 @@ impl ReferenceRow {
             IndicatorName::MacdSignal => &self.macd_signal_12_26_9,
             IndicatorName::MacdHist => &self.macd_hist_12_26_9,
             IndicatorName::Atr => &self.atr_14,
+            IndicatorName::HighestHigh20 => &self.highest_high_20,
+            IndicatorName::LowestLow20 => &self.lowest_low_20,
         };
         if raw.is_empty() {
             None
@@ -158,7 +185,7 @@ fn load_reference() -> Vec<ReferenceRow> {
         .collect()
 }
 
-fn indicator_names() -> [IndicatorName; 7] {
+fn indicator_names() -> [IndicatorName; 9] {
     [
         IndicatorName::Rsi,
         IndicatorName::Ema,
@@ -167,6 +194,8 @@ fn indicator_names() -> [IndicatorName; 7] {
         IndicatorName::MacdSignal,
         IndicatorName::MacdHist,
         IndicatorName::Atr,
+        IndicatorName::HighestHigh20,
+        IndicatorName::LowestLow20,
     ]
 }
 

@@ -12,6 +12,7 @@ pub mod convert;
 pub mod ema;
 pub mod engine;
 pub mod macd;
+pub mod rolling;
 pub mod rsi;
 pub mod wilder;
 

@@ -437,6 +437,8 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Adx { period } => format!("ADX({})", period_value(period)),
         IndicatorSpec::Macd { .. } => "MACD".to_owned(),
         IndicatorSpec::Atr { period } => format!("ATR({})", period_value(period)),
+        IndicatorSpec::Highest { period, .. } => format!("Highest({})", period_value(period)),
+        IndicatorSpec::Lowest { period, .. } => format!("Lowest({})", period_value(period)),
     }
 }
 
@@ -523,6 +525,27 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
         }
         IndicatorSpec::Atr { period } => {
             check_u32_positive(period, &format!("{path}.atr.period"), "ATR period", errors);
+        }
+        // The rolling extremes: the period is the window size N and must be
+        // > 0 (rules 1 + 6). `source` is any `PriceField` — including
+        // `Volume` — and carries no rule: the field is total at
+        // deserialization, and which field a window aggregates is a run-time
+        // concern, not a document rule (the `series` precedent).
+        IndicatorSpec::Highest { period, .. } => {
+            check_u32_positive(
+                period,
+                &format!("{path}.highest.period"),
+                "Highest period",
+                errors,
+            );
+        }
+        IndicatorSpec::Lowest { period, .. } => {
+            check_u32_positive(
+                period,
+                &format!("{path}.lowest.period"),
+                "Lowest period",
+                errors,
+            );
         }
     }
 }

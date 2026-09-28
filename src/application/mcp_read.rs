@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
     BacktestInputs, IndicatorSpec, MacdOutput, MfeMaeAggregates, OpenPositionMark, PersistedRun,
-    RegimeBreakdown, SkippedEntryCounts, SummaryStats, SweepableValue,
+    PriceField, RegimeBreakdown, SkippedEntryCounts, SummaryStats, SweepableValue,
 };
 
 /// One column of indicator output: the label a client sees (`<kind>:<period>`,
@@ -137,6 +137,14 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
         });
     }
 
+    // r3.s2.w2 (Q1): the rolling extremes carry one period and an optional
+    // price-field selector — `highest:<period>` / `highest:<period>:<field>`
+    // (the field defaults to high for `highest`, low for `lowest`; explicit
+    // writes always show in the label, the macd output precedent).
+    if kind == "highest" || kind == "lowest" {
+        return parse_rolling_extreme(token, &kind, rest);
+    }
+
     let period = parse_period(token, rest)?;
     let fixed = SweepableValue::Fixed(period);
     let spec = match kind.as_str() {
@@ -148,11 +156,58 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
             "invalid --indicator {token:?}: MACD needs fast/slow/signal and is not supported by <kind>:<period>"
         ),
         _ => anyhow::bail!(
-            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, adx, or atr)"
+            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, adx, atr, highest, or lowest)"
         ),
     };
     Ok(IndicatorColumn {
         label: format!("{kind}:{period}"),
+        spec,
+    })
+}
+
+/// Parse the `highest:<period>[:<field>]` / `lowest:<period>[:<field>]`
+/// forms (schema 1.2.0, r3.s2 — Q1).
+fn parse_rolling_extreme(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (period_str, field, field_label) = match parts.as_slice() {
+        [period] => (period, None, String::new()),
+        [period, field] => {
+            let trimmed = field.trim().to_ascii_lowercase();
+            let selected = match trimmed.as_str() {
+                "open" => PriceField::Open,
+                "high" => PriceField::High,
+                "low" => PriceField::Low,
+                "close" => PriceField::Close,
+                "volume" => PriceField::Volume,
+                other => anyhow::bail!(
+                    "invalid --indicator {token:?}: unknown {kind} field {other:?} \
+                     (expected open|high|low|close|volume)"
+                ),
+            };
+            (period, Some(selected), format!(":{trimmed}"))
+        }
+        _ => anyhow::bail!("invalid --indicator {token:?}: {kind} expects <period>[:<field>]"),
+    };
+    let period = parse_period(token, period_str)?;
+    let fixed = SweepableValue::Fixed(period);
+    let default_source = if kind == "highest" {
+        PriceField::High
+    } else {
+        PriceField::Low
+    };
+    let spec = if kind == "highest" {
+        IndicatorSpec::Highest {
+            period: fixed,
+            source: field.unwrap_or(default_source),
+        }
+    } else {
+        IndicatorSpec::Lowest {
+            period: fixed,
+            source: field.unwrap_or(default_source),
+        }
+    };
+    Ok(IndicatorColumn {
+        label: format!("{kind}:{period}{field_label}"),
         spec,
     })
 }
@@ -420,7 +475,9 @@ mod tests {
             IndicatorSpec::Rsi { period }
             | IndicatorSpec::Ema { period }
             | IndicatorSpec::Adx { period }
-            | IndicatorSpec::Atr { period } => match period {
+            | IndicatorSpec::Atr { period }
+            | IndicatorSpec::Highest { period, .. }
+            | IndicatorSpec::Lowest { period, .. } => match period {
                 SweepableValue::Fixed(period) => *period,
                 SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
             },
