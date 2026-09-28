@@ -363,6 +363,7 @@ pub struct CompiledStrategy {
     risk: CompiledRisk,
     required_indicators: Vec<IndicatorSpec>,
     required_htf_indicators: Vec<IndicatorSpec>,
+    required_d1_indicators: Vec<IndicatorSpec>,
 }
 
 impl CompiledStrategy {
@@ -406,43 +407,62 @@ impl CompiledStrategy {
         &self.required_htf_indicators
     }
 
+    /// The de-duplicated **daily-series** indicators this strategy references
+    /// (r3.s2.w4) — what the backtester steps on the aligned closed D1 bar
+    /// and routes `D1` operands to.
+    #[must_use]
+    pub fn required_d1_indicators(&self) -> &[IndicatorSpec] {
+        &self.required_d1_indicators
+    }
+
     /// Whether any operand is tagged `series: "htf"` (schema 1.1.0) — computed
     /// by walking the compiled tree rather than a stored flag, so it cannot
     /// drift from the actual leaves.
     #[must_use]
     pub fn needs_htf(&self) -> bool {
-        fn value_is_htf(value: &CompiledValue) -> bool {
+        self.has_series(Series::Htf)
+    }
+
+    /// Whether any operand is tagged `series: "d1"` (r3.s2.w4) — the same
+    /// compiled-tree walk [`Self::needs_htf`] uses, for the daily series.
+    #[must_use]
+    pub fn needs_d1(&self) -> bool {
+        self.has_series(Series::D1)
+    }
+
+    /// The one series-parameterised walk both [`Self::needs_htf`] and
+    /// [`Self::needs_d1`] delegate to (r3.s2.w4): `true` when any leaf of the
+    /// effective entry or a signal exit carries the given series tag.
+    fn has_series(&self, series: Series) -> bool {
+        fn value_carries(value: &CompiledValue, series: Series) -> bool {
             match value {
-                CompiledValue::Price {
-                    series: Series::Htf,
-                    ..
+                CompiledValue::Price { series: leaf, .. }
+                | CompiledValue::Indicator { series: leaf, .. } => *leaf == series,
+                // An expression carries the series when any operand leaf does
+                // (r3.s2.w3: the recursion reaches through `Arith`; lags live
+                // on the leaves).
+                CompiledValue::Arith { lhs, rhs, .. } => {
+                    value_carries(lhs, series) || value_carries(rhs, series)
                 }
-                | CompiledValue::Indicator {
-                    series: Series::Htf,
-                    ..
-                } => true,
-                // An expression is HTF when any operand leaf is (r3.s2.w3: the
-                // recursion reaches through `Arith`; lags live on the leaves).
-                CompiledValue::Arith { lhs, rhs, .. } => value_is_htf(lhs) || value_is_htf(rhs),
-                _ => false,
+                CompiledValue::Const(_) => false,
             }
         }
-        fn cond_has_htf(condition: &CompiledCondition) -> bool {
+        fn cond_carries(condition: &CompiledCondition, series: Series) -> bool {
             match condition {
                 CompiledCondition::Compare { lhs, rhs, .. }
                 | CompiledCondition::CrossesAbove { lhs, rhs }
                 | CompiledCondition::CrossesBelow { lhs, rhs } => {
-                    value_is_htf(lhs) || value_is_htf(rhs)
+                    value_carries(lhs, series) || value_carries(rhs, series)
                 }
                 CompiledCondition::And(conditions) | CompiledCondition::Or(conditions) => {
-                    conditions.iter().any(cond_has_htf)
+                    conditions.iter().any(|c| cond_carries(c, series))
                 }
-                CompiledCondition::Not(condition) => cond_has_htf(condition),
+                CompiledCondition::Not(condition) => cond_carries(condition, series),
             }
         }
-        cond_has_htf(&self.entry)
+        cond_carries(&self.entry, series)
             || self.exits.iter().any(|exit| {
-                matches!(exit, CompiledExit::SignalExit { condition } if cond_has_htf(condition))
+                matches!(exit, CompiledExit::SignalExit { condition } if cond_carries(condition, series))
             })
     }
 
@@ -460,8 +480,9 @@ impl CompiledStrategy {
     /// deepest lagged-`Price` read on the same series (r3.s2.w3, b4).
     ///
     /// The slot lags are **aligned with** [`Self::required_indicators`] (for
-    /// [`Series::Primary`]) and [`Self::required_htf_indicators`] (for
-    /// [`Series::Htf`]): entry `i` is the maximum `lag` of every compiled
+    /// [`Series::Primary`]), [`Self::required_htf_indicators`] (for
+    /// [`Series::Htf`]) and [`Self::required_d1_indicators`] (for
+    /// [`Series::D1`]): entry `i` is the maximum `lag` of every compiled
     /// `Indicator` leaf that resolves to that slot's spec — so a same-spec
     /// sibling with a deeper lag raises the shared slot's depth (closing the
     /// shared-slot under-keep recorded in w1's report). The price lag is the
@@ -525,6 +546,7 @@ impl CompiledStrategy {
         let required = match series {
             Series::Primary => &self.required_indicators,
             Series::Htf => &self.required_htf_indicators,
+            Series::D1 => &self.required_d1_indicators,
         };
         let slot_lags = required
             .iter()
@@ -668,7 +690,9 @@ fn push_lag(value: CompiledValue, bars: u32) -> CompiledValue {
 
 /// Append every [`IndicatorSpec`] referenced by `value` to the vec for its
 /// series — `primary` for the run's series, `htf` for the higher-timeframe one
-/// (schema 1.1.0; the htf vec feeds [`CompiledStrategy::required_htf_indicators`]).
+/// (schema 1.1.0), `d1` for the fixed daily one (r3.s2.w4; the htf/d1 vecs
+/// feed [`CompiledStrategy::required_htf_indicators`] /
+/// [`CompiledStrategy::required_d1_indicators`]).
 /// De-duplicates via `Vec::contains` (avoids needing `Eq`/`Hash` on the frozen
 /// `IndicatorSpec`). Recurses through `Arith`/`Lag`, so an indicator nested in
 /// an expression is still required (r3.s2.w3).
@@ -676,23 +700,25 @@ fn collect_indicators_from_value(
     source: &ValueSource,
     primary: &mut Vec<IndicatorSpec>,
     htf: &mut Vec<IndicatorSpec>,
+    d1: &mut Vec<IndicatorSpec>,
 ) {
     match source {
         ValueSource::Indicator { series, spec } => {
             let acc = match series {
                 Series::Primary => primary,
                 Series::Htf => htf,
+                Series::D1 => d1,
             };
             if !acc.contains(spec) {
                 acc.push(spec.clone());
             }
         }
         ValueSource::Arith { lhs, rhs, .. } => {
-            collect_indicators_from_value(lhs, primary, htf);
-            collect_indicators_from_value(rhs, primary, htf);
+            collect_indicators_from_value(lhs, primary, htf, d1);
+            collect_indicators_from_value(rhs, primary, htf, d1);
         }
         ValueSource::Lag { value, .. } => {
-            collect_indicators_from_value(value, primary, htf);
+            collect_indicators_from_value(value, primary, htf, d1);
         }
         ValueSource::Constant { .. } | ValueSource::Price { .. } => {}
     }
@@ -704,23 +730,24 @@ fn collect_indicators(
     condition: &Condition,
     primary: &mut Vec<IndicatorSpec>,
     htf: &mut Vec<IndicatorSpec>,
+    d1: &mut Vec<IndicatorSpec>,
 ) {
     match condition {
         Condition::Compare { lhs, rhs, .. }
         | Condition::CrossesAbove { lhs, rhs }
         | Condition::CrossesBelow { lhs, rhs } => {
-            collect_indicators_from_value(lhs, primary, htf);
-            collect_indicators_from_value(rhs, primary, htf);
+            collect_indicators_from_value(lhs, primary, htf, d1);
+            collect_indicators_from_value(rhs, primary, htf, d1);
         }
         Condition::And { conditions } | Condition::Or { conditions } => {
             for c in conditions {
-                collect_indicators(c, primary, htf);
+                collect_indicators(c, primary, htf, d1);
             }
         }
-        Condition::Not { condition } => collect_indicators(condition, primary, htf),
+        Condition::Not { condition } => collect_indicators(condition, primary, htf, d1),
         // r3.s2.w3: an expression condition's indicators live in its value.
         Condition::Rising { value, .. } | Condition::Falling { value, .. } => {
-            collect_indicators_from_value(value, primary, htf);
+            collect_indicators_from_value(value, primary, htf, d1);
         }
     }
 }
@@ -865,20 +892,24 @@ pub fn compile(validated: &ValidatedDsl) -> Result<CompiledStrategy, CompileErro
 
     // Required indicators: de-dup via Vec + PartialEq `contains` (NOT a HashSet,
     // so IndicatorSpec needs no Eq/Hash). Walk entry, filters, and any
-    // signal-exit condition trees — split by series (schema 1.1.0). An
-    // `AtrStop`'s ATR is always the primary series' — register it here too.
+    // signal-exit condition trees — split by series (schema 1.1.0; the `d1`
+    // split is r3.s2.w4). An `AtrStop`'s ATR is always the primary series' —
+    // register it here too.
     let mut required_indicators: Vec<IndicatorSpec> = Vec::new();
     let mut required_htf_indicators: Vec<IndicatorSpec> = Vec::new();
+    let mut required_d1_indicators: Vec<IndicatorSpec> = Vec::new();
     collect_indicators(
         &dsl.entry,
         &mut required_indicators,
         &mut required_htf_indicators,
+        &mut required_d1_indicators,
     );
     for filter in &dsl.filters {
         collect_indicators(
             filter,
             &mut required_indicators,
             &mut required_htf_indicators,
+            &mut required_d1_indicators,
         );
     }
     for exit in &dsl.exits {
@@ -887,6 +918,7 @@ pub fn compile(validated: &ValidatedDsl) -> Result<CompiledStrategy, CompileErro
                 condition,
                 &mut required_indicators,
                 &mut required_htf_indicators,
+                &mut required_d1_indicators,
             ),
             ExitRule::AtrStop {
                 period: SweepableValue::Fixed(period),
@@ -910,6 +942,7 @@ pub fn compile(validated: &ValidatedDsl) -> Result<CompiledStrategy, CompileErro
         risk,
         required_indicators,
         required_htf_indicators,
+        required_d1_indicators,
     })
 }
 

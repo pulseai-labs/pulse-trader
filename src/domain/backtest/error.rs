@@ -22,13 +22,16 @@ use thiserror::Error;
 
 use crate::domain::{Pair, Timeframe};
 
-/// Which input series an input-validation refusal names (r3.s1.w3).
+/// Which input series an input-validation refusal names (r3.s1.w3; `D1`
+/// since r3.s2.w4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SeriesRole {
     /// The run's primary series.
     Primary,
     /// The supplied higher-timeframe series.
     Htf,
+    /// The supplied fixed daily series (r3.s2.w4).
+    D1,
 }
 
 /// Errors produced by the backtester (domain layer).
@@ -160,6 +163,49 @@ pub enum BacktestError {
         /// The supplied higher-timeframe series' timeframe — the interval the
         /// slack is measured in.
         htf: Timeframe,
+    },
+
+    /// The compiled strategy references a `series: "d1"` operand but no daily
+    /// candle series was supplied (r3.s2.w4). The engine-level defence for
+    /// direct callers; the application ring loads the D1 series first and
+    /// reports a missing snapshot as the app-level `D1Required` naming the
+    /// fetch command.
+    #[error("strategy requires a daily candle series (series: \"d1\" operand present)")]
+    D1Required,
+
+    /// The supplied daily series is for a different trading pair than the
+    /// primary series — the same API-seam guard as
+    /// [`BacktestError::HtfPairMismatch`], for the fixed `d1` series
+    /// (r3.s2.w4): `Series::D1` operands must never read another symbol's
+    /// bars.
+    #[error(
+        "daily series is for a different pair (primary {primary}, d1 {d1}) — \
+         `Series::D1` operands must read the same symbol's bars"
+    )]
+    D1PairMismatch {
+        /// The primary series' trading pair.
+        primary: Pair,
+        /// The supplied daily series' trading pair.
+        d1: Pair,
+    },
+
+    /// The supplied daily series ends more than one D1 interval before the
+    /// primary series ends — the same forward-only-pointer staleness as
+    /// [`BacktestError::HtfCoverageShort`], for the fixed `d1` series
+    /// (r3.s2.w4). One interval of slack is allowed (at most one not-yet-closed
+    /// daily bar, the normal live shape) and an empty series is skipped; the
+    /// refusal applies only when the compiled strategy consumes the daily
+    /// series (`needs_d1`).
+    #[error(
+        "daily coverage ends at close_time {d1_end}, more than one D1 interval before the \
+         primary series ends at {primary_end} — `Series::D1` operands would read a stale \
+         final bar"
+    )]
+    D1CoverageShort {
+        /// The primary series' last candle `close_time` (epoch ms).
+        primary_end: i64,
+        /// The supplied daily series' last candle `close_time` (epoch ms).
+        d1_end: i64,
     },
 
     /// A named input series is not strictly ascending by `open_time`, or

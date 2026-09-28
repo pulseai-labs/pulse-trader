@@ -16,12 +16,16 @@ use serde::{Deserialize, Serialize};
 
 use super::sweepable::SweepableValue;
 
-/// Which candle series a [`ValueSource`] operand reads (r2.s2.w1, schema 1.1.0).
+/// Which candle series a [`ValueSource`] operand reads (r2.s2.w1, schema 1.1.0;
+/// `D1` since r3.s2.w4).
 ///
 /// `Primary` is the run's own series; `Htf` is the aligned higher-timeframe
 /// series — r2.s2.w2 evaluates it against the higher-timeframe indicator
-/// engine stepped on the aligned closed bar (never the primary one).
-/// Serializes lowercase (`"primary"`/`"htf"`); deserialization
+/// engine stepped on the aligned closed bar (never the primary one). `D1` is
+/// the run's fixed daily series (r3.s2.w4): loaded independently of the
+/// optional H4 HTF, evaluated on the last closed UTC-midnight bar the same
+/// way, and recorded in provenance as `inputs.d1`.
+/// Serializes lowercase (`"primary"`/`"htf"`/`"d1"`); deserialization
 /// defaults a missing `series` to `primary` via the `#[serde(default)]` on each
 /// operand field, while writes always emit the tag explicitly.
 #[derive(
@@ -34,6 +38,9 @@ pub enum Series {
     Primary,
     /// The aligned higher-timeframe series.
     Htf,
+    /// The run's fixed daily series (r3.s2.w4) — independent of [`Series::Htf`],
+    /// always UTC-midnight-aligned, read on closed bars only.
+    D1,
 }
 
 /// A field of the current candle (OHLCV). Serialized via its variant name.

@@ -311,6 +311,7 @@ fn run(
         compiled,
         primary,
         htf,
+        None,
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,
@@ -661,9 +662,10 @@ fn lag_five_shifts_the_first_warm_bar_by_exactly_five_bars() {
         vec![stop_loss()],
     ));
 
-    let lag5_warm = first_fully_warm_bar_ms(&lag5, &primary, None).expect("lag strategy warms");
+    let lag5_warm =
+        first_fully_warm_bar_ms(&lag5, &primary, None, None).expect("lag strategy warms");
     let no_lag_warm =
-        first_fully_warm_bar_ms(&no_lag, &primary, None).expect("no-lag strategy warms");
+        first_fully_warm_bar_ms(&no_lag, &primary, None, None).expect("no-lag strategy warms");
     assert_eq!(
         lag5_warm - no_lag_warm,
         5 * Timeframe::M15.duration_ms(),

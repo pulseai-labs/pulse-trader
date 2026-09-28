@@ -168,6 +168,7 @@ fn run(
         compiled_strategy,
         primary,
         htf,
+        None,
         &config(),
         &SymbolFilters::unconstrained(),
         pulse::SeriesEnd::SnapshotEnd,

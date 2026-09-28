@@ -176,6 +176,7 @@ fn run(
         &compiled(),
         primary,
         htf,
+        None,
         &zero_slippage(),
         &SymbolFilters::unconstrained(),
         SeriesEnd::SnapshotEnd,

@@ -589,6 +589,7 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                  primary_data_version    AS "primary_data_version?: String",
                  htf_timeframe           AS "htf_timeframe?: String",
                  htf_data_version        AS "htf_data_version?: String",
+                 d1_data_version         AS "d1_data_version?: String",
                  taker_fee_bps           AS "taker_fee_bps?: String",
                  slippage_bps            AS "slippage_bps?: String",
                  funding_config          AS "funding_config?: String",
@@ -716,6 +717,7 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
             r.primary_data_version.as_deref(),
             r.htf_timeframe.as_deref(),
             r.htf_data_version.as_deref(),
+            r.d1_data_version.as_deref(),
             r.taker_fee_bps.as_deref(),
             r.slippage_bps.as_deref(),
             r.funding_config.as_deref(),
@@ -956,6 +958,7 @@ fn decode_inputs(
     primary_data_version: Option<&str>,
     htf_timeframe: Option<&str>,
     htf_data_version: Option<&str>,
+    d1_data_version: Option<&str>,
     taker_fee_bps: Option<&str>,
     slippage_bps: Option<&str>,
     funding_config: Option<&str>,
@@ -990,8 +993,11 @@ fn decode_inputs(
     // pair is NULL there too, and is decoded with it rather than counted among
     // the `0006` shapes (a legacy row has no inputs at all). r3.s1.w4: a stray
     // filter value is equally corrupt — filters without the provenance they
-    // belong to cannot be trusted.
-    if present == 0 && htf_present == 0 {
+    // belong to cannot be trusted. r3.s2.w4: `d1_data_version` joins that list
+    // of strays — it is the tag of a snapshot the run read, and it cannot
+    // outlive the provenance of the series it was aligned to (`#191`'s mirror:
+    // a `D1` operand requires a primary to align against).
+    if present == 0 && htf_present == 0 && d1_data_version.is_none() {
         if filters_present > 0 {
             return Err(DataError::Db(format!(
                 "run `{run_id}` carries symbol filters but no input provenance: \
@@ -1040,6 +1046,16 @@ fn decode_inputs(
         }),
         _ => None,
     };
+    // r3.s2.w4: the daily series is fixed at `1d`, so the single tag is the whole
+    // selection — there is no `d1_timeframe` column to read and no pair to check
+    // for half-presence. `parse`, not `new`: same untrusted-tag rule as the HTF.
+    let d1 = match d1_data_version {
+        Some(version) => Some(SnapshotSelection {
+            timeframe: Timeframe::D1,
+            data_version: DataVersion::parse(version)?,
+        }),
+        None => None,
+    };
 
     // r3.s1.w4 (#142): the `0015` filter group — all four or none, the same
     // all-or-nothing discipline the `0006` shapes enforce above.
@@ -1068,6 +1084,7 @@ fn decode_inputs(
             data_version: DataVersion::parse(primary_data_version)?,
         },
         htf,
+        d1,
         taker_fee_bps: parse_decimal("backtest_run.taker_fee_bps", taker_fee_bps)?,
         slippage_bps: parse_decimal("backtest_run.slippage_bps", slippage_bps)?,
         funding: parse_funding("backtest_run.funding_config", funding_config)?,
@@ -1228,6 +1245,11 @@ pub(crate) fn check_inputs_path_safe(inputs: &BacktestInputs) -> Result<(), Data
     if let Some(htf) = inputs.htf.as_ref() {
         htf.data_version.ensure_path_safe()?;
     }
+    // r3.s2.w4: the `d1` tag takes the same route — `decode_inputs` hands it to
+    // `CandleStore::load_version` on replay, so it is checked on the way in too.
+    if let Some(d1) = inputs.d1.as_ref() {
+        d1.data_version.ensure_path_safe()?;
+    }
     Ok(())
 }
 
@@ -1326,6 +1348,15 @@ pub(crate) async fn insert_run_row(
         .htf
         .as_ref()
         .map(|htf| htf.data_version.as_str().to_owned());
+    // r3.s2.w4 — `0017`'s single daily-series tag. Unlike the HTF there is no
+    // timeframe column to pair it with: the daily series is fixed at `1d`, so
+    // the tag is the whole selection and a NULL is the whole "not recorded".
+    // The same path-safety rule applies, checked with the other two tags before
+    // the transaction opens (`check_inputs_path_safe`).
+    let d1_data_version = inputs
+        .d1
+        .as_ref()
+        .map(|d1| d1.data_version.as_str().to_owned());
     let taker_fee_bps_text = decimal_text(inputs.taker_fee_bps);
     let slippage_bps_text = decimal_text(inputs.slippage_bps);
     let funding_config = enum_token(&inputs.funding)?;
@@ -1383,13 +1414,13 @@ pub(crate) async fn insert_run_row(
           wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
           regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
-          taker_fee_bps, slippage_bps, funding_config, window_from_ms, window_to_ms, \
-          window_lead_in_from_ms, open_position, walk_forward_run_id, fold_index, \
-          lot_step, min_qty, min_notional, max_leverage) \
+          d1_data_version, taker_fee_bps, slippage_bps, funding_config, window_from_ms, \
+          window_to_ms, window_lead_in_from_ms, open_position, walk_forward_run_id, \
+          fold_index, lot_step, min_qty, min_notional, max_leverage) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
                  ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
-                 ?47, ?48, ?49, ?50)",
+                 ?47, ?48, ?49, ?50, ?51)",
         run_id,
         version_id_str,
         schema_version,
@@ -1427,6 +1458,7 @@ pub(crate) async fn insert_run_row(
         primary_data_version,
         htf_timeframe,
         htf_data_version,
+        d1_data_version,
         taker_fee_bps_text,
         slippage_bps_text,
         funding_config,
@@ -1623,6 +1655,7 @@ mod tests {
                 data_version: DataVersion::new("v-primary"),
             },
             htf: None,
+            d1: None,
             taker_fee_bps: d(4, 0),
             slippage_bps: d(1, 0),
             funding: FundingConfig::SnapshotRates,

@@ -1139,9 +1139,23 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
       <Field label="primary">
         {dto.primaryTimeframe} · {dto.primaryDataVersion}
       </Field>
-      <Field label="htf">
-        {dto.htfTimeframe !== null ? `${dto.htfTimeframe} · ${dto.htfDataVersion}` : EM_DASH}
-      </Field>
+      {/* r3.s2.w4 (#219): the HTF row is gated on the STRATEGY, not on the
+          recorded snapshot. Every run records an H4 selection — the resolver
+          supplies the application default even for a strategy with no `htf`
+          operand — so `htfTimeframe` alone would claim a higher timeframe the
+          strategy never read. `usesHtf` is the version's compiled answer. The
+          em-dash arm still covers a strategy that reads the HTF while the
+          recorded timeframe is absent (a pre-0006 row). */}
+      {dto.usesHtf && (
+        <Field label="htf">
+          {dto.htfTimeframe !== null ? `${dto.htfTimeframe} · ${dto.htfDataVersion}` : EM_DASH}
+        </Field>
+      )}
+      {/* r3.s2.w4: the daily row, gated on the RECORDED snapshot instead — a
+          strategy either read D1 (which pins the version it read) or it did
+          not. A pre-0017 row records none, so no row is the honest read. The
+          timeframe is fixed (`1d`), so the version is the whole value. */}
+      {dto.d1DataVersion != null && <Field label="d1">{dto.d1DataVersion}</Field>}
       <Field label="date range">
         {dto.firstOpenTimeMs} → {dto.lastCloseTimeMs}
       </Field>

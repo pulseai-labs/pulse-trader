@@ -403,6 +403,7 @@ async fn htf_engine_warms_on_lead_in() {
         &compiled,
         &m15.windowed(&window),
         Some(&h4.windowed(&window)),
+        None,
         &BacktestConfig::default(),
         &filters,
         SeriesEnd::WindowEdge,
@@ -650,6 +651,7 @@ fn engine_run(
     run_backtest(
         &compiled,
         &m15,
+        None,
         None,
         &BacktestConfig::default(),
         &filters,

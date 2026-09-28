@@ -99,7 +99,8 @@ impl IndicatorEngine {
     /// `Series::Htf` — the backtest adapter builds its HTF engine through this
     /// constructor, so an `h4:` lag counts H4 bars by construction (the HTF
     /// engine steps once per closed H4 candle; Q2's own-series rule needs no
-    /// special case).
+    /// special case) — and the fixed daily one via `Series::D1` (r3.s2.w4),
+    /// stepped once per closed UTC-midnight candle for the same reason.
     ///
     /// # Errors
     ///
@@ -110,6 +111,7 @@ impl IndicatorEngine {
         let specs = match series {
             Series::Primary => strategy.required_indicators(),
             Series::Htf => strategy.required_htf_indicators(),
+            Series::D1 => strategy.required_d1_indicators(),
         };
         Self::from_specs_with_lags(specs, &slot_lags, price_lag)
     }

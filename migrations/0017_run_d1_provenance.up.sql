@@ -1,0 +1,38 @@
+-- r3.s2.w4 — 0017 up: record the fixed daily-series snapshot a run read (Q4).
+--
+-- Q3 fixed a third series beside the primary and the optional H4 HTF: `d1`, the
+-- run's daily series. A strategy that carries a `d1` operand loads the pair's D1
+-- HEAD snapshot with no new request argument, so the same gap 0006 closed for
+-- the primary and the HTF opens again for D1 — once HEAD advances, nothing in
+-- the run record says which daily snapshot produced the row. This column closes
+-- it. A run that does not read D1 writes NULL, exactly as `htf_*` is NULL for a
+-- single-timeframe run.
+--
+-- ONE COLUMN, NOT A PAIR (Q3, Q4). `0006` writes `htf_timeframe` beside
+-- `htf_data_version` because the HTF is the run's freely *selected* higher
+-- timeframe and 0006 predates the rule that it is always H4. The daily series is
+-- fixed: it is always `1d` (`Timeframe::D1`), it can never be selected as the
+-- HTF (`HtfIsD1` refuses that before any I/O), and the decoder therefore needs
+-- no timeframe tag to reconstruct it. Adding a column that can hold exactly one
+-- value would be a constraint nothing can violate.
+--
+-- NULLABLE ON PURPOSE (ADR-0018). A pre-0017 row cannot be backfilled
+-- truthfully — the daily snapshot it used is not recoverable from anything
+-- stored — and ADR-0018 forbids rewriting immutable records with invented
+-- facts. Legacy rows keep NULL and read back as `inputs.d1: None`, an explicit
+-- "not recorded", never a guess. `#[serde(default)]` on
+-- `BacktestInputs.d1` carries the same reading through the persisted inputs
+-- JSON. SQLite also cannot ADD COLUMN ... NOT NULL without a default, and a
+-- default here would BE the guess.
+--
+-- NO NEW TRIGGER. `0006`'s `backtest_run_inputs_complete` trigger guards the
+-- six required columns and the all-or-nothing HTF pair; D1's single column has
+-- no half-state to guard, and a run that reads D1 without a primary snapshot is
+-- already refused by the required set. The immutability triggers are untouched:
+-- they are column-agnostic, so a new column inherits the same protection
+-- every other provenance column has.
+--
+-- The column is additive and inside schema 1.2.0 (b1) — no schema bump, no
+-- existing row rewritten.
+
+ALTER TABLE backtest_run ADD COLUMN d1_data_version TEXT; -- opaque DataVersion (ADR-0009)

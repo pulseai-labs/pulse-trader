@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::store::CandleStore;
-use crate::application::backtest::{resolve_default_request, run_version_backtest};
+use crate::application::backtest::{resolve_default_request, run_uses_htf, run_version_backtest};
 use crate::domain::strategy::VersionId;
 
 use super::backtest::{
@@ -1343,13 +1343,8 @@ pub async fn run_backtest_version_core(
     // One resolver for every surface (r2.s1.w3): parent's latest run → own
     // latest run → app defaults. `window: None` — the desktop has no date-range
     // surface, so a pinned snapshot runs in full.
-    let app_request = resolve_default_request(
-        &strategies,
-        &runs,
-        &VersionId::new(request.version_id),
-        None,
-    )
-    .await?;
+    let version_id = VersionId::new(&request.version_id);
+    let app_request = resolve_default_request(&strategies, &runs, &version_id, None).await?;
     let outcome = run_version_backtest(
         &strategies,
         &candles,
@@ -1359,8 +1354,10 @@ pub async fn run_backtest_version_core(
     )
     .await?;
     // The projection is fallible on purpose: a saved value that will not fit the wire
-    // refuses, and the refusal still names the run that exists.
-    Ok(backtest_run_dto(&outcome)?)
+    // refuses, and the refusal still names the run that exists. `uses_htf` comes
+    // from the version's own DSL, not from the recorded inputs (#219).
+    let uses_htf = run_uses_htf(&strategies, &version_id).await;
+    Ok(backtest_run_dto(&outcome, uses_htf)?)
 }
 
 /// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).
@@ -1867,6 +1864,7 @@ mod tests {
                 data_version: DataVersion::new("v-primary"),
             },
             htf: None,
+            d1: None,
             taker_fee_bps: Decimal::new(4, 0),
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,

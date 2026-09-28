@@ -40,6 +40,12 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "series_htf",
         "an `htf` operand is evaluated on the last closed H4 bar; an ATR stop uses the signal bar's ATR",
     ),
+    // r3.s2.w4 (Q3): the fixed daily series — same closed-bar rule, its own
+    // resolution (no argument) and the fetch that creates a missing snapshot.
+    (
+        "series_d1",
+        "a `d1` operand is evaluated on the last closed daily (1d) bar, never on the forming one; the daily snapshot needs no argument — it resolves automatically for the pair a strategy is run on, and a missing one is refused by name: fetch it with `pulse fetch-data <PAIR> --tf D1`; the `timeframe` argument still selects only `primary` or `htf`, and `1d` is refused there because the daily series is the fixed `d1` slot",
+    ),
     // r3.s2.w1 (b2): schema 1.2.0 — MACD's output selector.
     (
         "macd_output",
@@ -144,6 +150,17 @@ mod tests {
         assert_eq!(
             htf,
             "an `htf` operand is evaluated on the last closed H4 bar; an ATR stop uses the signal bar's ATR"
+        );
+        // r3.s2.w4 (Q3): the fixed daily series — the same closed-bar rule, the
+        // resolution that takes no argument, and the fetch that creates the
+        // snapshot a `d1` strategy needs.
+        let d1 = conventions
+            .get("series_d1")
+            .and_then(serde_json::Value::as_str)
+            .expect("conventions.series_d1 is a string");
+        assert_eq!(
+            d1,
+            "a `d1` operand is evaluated on the last closed daily (1d) bar, never on the forming one; the daily snapshot needs no argument — it resolves automatically for the pair a strategy is run on, and a missing one is refused by name: fetch it with `pulse fetch-data <PAIR> --tf D1`; the `timeframe` argument still selects only `primary` or `htf`, and `1d` is refused there because the daily series is the fixed `d1` slot"
         );
     }
 }

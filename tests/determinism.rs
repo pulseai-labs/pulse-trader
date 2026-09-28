@@ -116,6 +116,7 @@ fn run_once(
         compiled,
         primary,
         None,
+        None,
         &BacktestConfig::default(),
         filters,
         SeriesEnd::SnapshotEnd,

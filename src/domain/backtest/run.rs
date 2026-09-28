@@ -94,6 +94,12 @@ pub struct BacktestInputs {
     /// genuine single-timeframe run, not missing data — the debug CLI may omit
     /// `--htf`, while the r1 app path always records M15+H4.
     pub htf: Option<SnapshotSelection>,
+    /// The fixed daily series' exact snapshot, when the run consumed one
+    /// (r3.s2.w4). `#[serde(default)]` keeps every pre-`0017` persisted
+    /// `inputs` JSON decodable — legacy rows read `None`, a genuine
+    /// no-`d1` run, not missing data.
+    #[serde(default)]
+    pub d1: Option<SnapshotSelection>,
     /// Taker fee in basis points, exactly as passed to the engine.
     pub taker_fee_bps: Decimal,
     /// Adverse-fill slippage in basis points, exactly as passed to the engine.
