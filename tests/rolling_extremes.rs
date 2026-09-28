@@ -229,6 +229,7 @@ fn highest_and_lowest_follow_the_prior_n_convention() {
                 period: fixed(period),
                 source: PriceField::High,
             },
+            lag: 0,
         });
         if k < period as usize {
             assert_eq!(got, None, "bar {k}: inside the N+1 warm-up → None");
@@ -262,6 +263,7 @@ fn highest_and_lowest_follow_the_prior_n_convention() {
             period: fixed(period),
             source: PriceField::High,
         },
+        lag: 0,
     });
     assert_eq!(
         at_new_extreme,
@@ -283,6 +285,7 @@ fn highest_and_lowest_follow_the_prior_n_convention() {
                 period: fixed(period),
                 source: PriceField::Low,
             },
+            lag: 0,
         });
         if k < period as usize {
             assert_eq!(got, None, "bar {k}: inside the N+1 warm-up → None");
@@ -518,10 +521,12 @@ fn highest_close_and_highest_high_differ_and_compile_to_two_slots() {
         let close_value = close_engine.current(&pulse::CompiledValue::Indicator {
             series: Series::Primary,
             spec: close_spec.clone(),
+            lag: 0,
         });
         let high_value = high_engine.current(&pulse::CompiledValue::Indicator {
             series: Series::Primary,
             spec: high_spec.clone(),
+            lag: 0,
         });
         if let (Some(c), Some(h)) = (close_value, high_value) {
             compared += 1;

@@ -55,8 +55,8 @@ use std::path::{Path, PathBuf};
 
 use pulse::{
     BacktestConfig, BinanceAdapter, CandleSeries, CandleStore, Condition, CreatedBy, Db, Direction,
-    ExchangeAdapter, IndicatorEngine, IndicatorSpec, MIGRATOR, MacdOutput, Migrator, NewVersion,
-    Pair, RiskParams, SchemaVersion, SeriesEnd, SqliteStrategyRepo, StrategyDsl,
+    ExchangeAdapter, ExitRule, IndicatorEngine, IndicatorSpec, MIGRATOR, MacdOutput, Migrator,
+    NewVersion, Pair, RiskParams, SchemaVersion, SeriesEnd, SqliteStrategyRepo, StrategyDsl,
     StrategyRepository, SubmitRequest, SubmitTarget, SweepableValue, Timeframe, ValidationCode,
     ValueSource, compile, render, run_backtest, submit_agent_version, validate, version_hash,
 };
@@ -618,6 +618,177 @@ fn macd_signal_and_histogram_round_trip_through_load_validate_compile_and_render
         output: MacdOutput::Line,
     };
     assert_eq!(render::indicator(&line_spec), "macd(12,26,9)");
+}
+
+// ---------------------------------------------------------------------------
+// Case 5 — value expressions (r3.s2.w3): `Arith` / `Lag` / `Rising`/`Falling`.
+// ---------------------------------------------------------------------------
+
+/// A 1.2.0 expression strategy document using ALL THREE constructs (spec §5):
+/// entry `ema(10) > lag(ema(10), 3)`, the goal's volatility-normalised ratio
+/// filter `atr(14) / close < 0.02`, and a `Falling (2 bars)` signal exit.
+fn expression_doc_at_current() -> String {
+    r#"{
+  "schema_version": "1.2.0",
+  "name": "value expressions (1.2.0)",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": {
+      "type": "Indicator",
+      "spec": { "indicator": "Ema", "period": 10 }
+    },
+    "op": "Gt",
+    "rhs": {
+      "type": "Lag",
+      "value": {
+        "type": "Indicator",
+        "spec": { "indicator": "Ema", "period": 10 }
+      },
+      "bars": 3
+    }
+  },
+  "filters": [
+    {
+      "type": "Compare",
+      "lhs": {
+        "type": "Arith",
+        "op": "div",
+        "lhs": {
+          "type": "Indicator",
+          "spec": { "indicator": "Atr", "period": 14 }
+        },
+        "rhs": { "type": "Price", "field": "Close" }
+      },
+      "op": "Lt",
+      "rhs": { "type": "Constant", "value": "0.02" }
+    }
+  ],
+  "exits": [
+    { "type": "StopLoss", "distance_pct": "0.05" },
+    {
+      "type": "SignalExit",
+      "condition": {
+        "type": "Falling",
+        "value": { "type": "Price", "field": "Close" },
+        "bars": 2
+      }
+    }
+  ],
+  "risk": {
+    "risk_per_trade_pct": "0.01",
+    "max_leverage": "3"
+  }
+}"#
+    .to_owned()
+}
+
+/// Spec §5: an `Arith`/`Lag`/`Falling` document round-trips through serde,
+/// load, validate, compile and render — the render spellings match the pinned
+/// vocabulary (see `tests/dsl_render.rs`).
+#[test]
+fn expression_document_round_trips_through_load_validate_compile_and_render() {
+    let loaded = Migrator::v1()
+        .load(&expression_doc_at_current())
+        .expect("the expression document loads");
+    let dsl = &loaded.dsl;
+
+    // Render round-trip (implies the serde shape survived the load).
+    assert_eq!(
+        render::condition(&dsl.entry),
+        "ema(10) > lag(ema(10), 3)",
+        "the lagged entry renders in the pinned vocabulary"
+    );
+    let Condition::Compare { lhs: ratio, .. } = &dsl.filters[0] else {
+        panic!("the filter is a Compare, got {:?}", dsl.filters[0]);
+    };
+    assert_eq!(
+        render::value(ratio),
+        "(atr(14) / close)",
+        "the ratio filter renders infix, parenthesized"
+    );
+    let ExitRule::SignalExit { condition } = &dsl.exits[1] else {
+        panic!("exits[1] is a SignalExit, got {:?}", dsl.exits[1]);
+    };
+    assert_eq!(
+        render::condition(condition),
+        "close falling (2 bars)",
+        "the falling signal exit renders with its bar count"
+    );
+
+    // Validate + compile: the expression document is executable. The lag lives
+    // on the leaves after compilation — no expression-level node exists.
+    let validated = validate(dsl).expect("the expression document validates");
+    let compiled = compile(&validated).expect("the expression document compiles");
+    assert!(
+        !compiled.needs_htf(),
+        "every leaf sits on the primary series"
+    );
+    // The compiler folds the entry and its filters into one And tree.
+    let pulse::CompiledCondition::And(conditions) = compiled.entry() else {
+        panic!("the compiled entry is an And, got {:?}", compiled.entry());
+    };
+    assert_eq!(conditions.len(), 2, "entry + the ratio filter");
+    let pulse::CompiledCondition::Compare { lhs, rhs, .. } = &conditions[0] else {
+        panic!(
+            "conditions[0] is the lagged entry compare, got {:?}",
+            conditions[0]
+        );
+    };
+    assert!(
+        matches!(*lhs, pulse::CompiledValue::Indicator { lag: 0, .. }),
+        "the today-side leaf carries lag 0, got {lhs:?}"
+    );
+    assert!(
+        matches!(*rhs, pulse::CompiledValue::Indicator { lag: 3, .. }),
+        "the lag pushed down to the leaf: lag 3 on the same spec, got {rhs:?}"
+    );
+    let pulse::CompiledCondition::Compare { lhs: ratio, .. } = &conditions[1] else {
+        panic!("conditions[1] is the ratio filter, got {:?}", conditions[1]);
+    };
+    assert!(
+        matches!(
+            *ratio,
+            pulse::CompiledValue::Arith {
+                op: pulse::ArithOp::Div,
+                ..
+            }
+        ),
+        "the ratio filter compiles to an Arith tree, got {ratio:?}"
+    );
+}
+
+/// Spec §5 + Q2: `bars` omitted on a `Rising` reads as 1, and writes ALWAYS
+/// emit `bars` (the `series`/`output` precedent).
+#[test]
+fn expression_bars_default_to_one_and_are_always_written() {
+    let doc = r#"{
+  "schema_version": "1.2.0",
+  "name": "rising default bars",
+  "direction": "long",
+  "entry": {
+    "type": "Rising",
+    "value": { "type": "Price", "field": "Close" }
+  },
+  "filters": [],
+  "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+    let loaded = Migrator::v1().load(doc).expect("bars-less Rising loads");
+    let dsl = &loaded.dsl;
+    let Condition::Rising { bars, .. } = &dsl.entry else {
+        panic!("the entry is a Rising, got {:?}", dsl.entry);
+    };
+    assert_eq!(*bars, 1, "an omitted bars reads as the Q2 default 1");
+
+    // The typed value ALWAYS writes the field.
+    let json = serde_json::to_value(&dsl.entry).expect("entry serializes");
+    assert_eq!(json["bars"], 1, "writes always emit bars");
+
+    // …and the defaulted document validates, compiles, and renders `1 bar`.
+    let validated = validate(dsl).expect("validates");
+    compile(&validated).expect("compiles");
+    assert_eq!(render::condition(&dsl.entry), "close rising (1 bar)");
 }
 
 /// `macd.line > macd.signal` — the rule condition comparing the MACD line

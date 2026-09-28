@@ -108,9 +108,9 @@ pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
 // concrete indicator adapter implements and the backtester reads through.
 pub use dsl::{
-    Comparator, Condition, DSL_SCHEMA_VERSION, Direction, ExitRule, IndicatorSpec, MacdOutput,
-    PriceField, RiskParams, SchemaVersion, SchemaVersionParseError, Series, StrategyDsl,
-    SweepableValue, ValueSource,
+    ArithOp, Comparator, Condition, DSL_SCHEMA_VERSION, Direction, ExitRule, IndicatorSpec,
+    MacdOutput, PriceField, RiskParams, SchemaVersion, SchemaVersionParseError, Series,
+    StrategyDsl, SweepableValue, ValueSource,
 };
 pub use indicator::Indicator;
 // VS-1.1.2 work-2.03: the semantic-validation surface (FR-3 correctable rejection).

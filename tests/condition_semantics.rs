@@ -902,6 +902,7 @@ fn first_bar_with_current_values(series: &CandleSeries, specs: &[IndicatorSpec])
         .map(|spec| CompiledValue::Indicator {
             series: Series::Primary,
             spec: spec.clone(),
+            lag: 0,
         })
         .collect();
     for (idx, candle) in series.candles.iter().enumerate() {

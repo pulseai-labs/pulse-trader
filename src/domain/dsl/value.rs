@@ -156,10 +156,53 @@ fn default_lowest_source() -> PriceField {
     PriceField::Low
 }
 
+/// The operation of a [`ValueSource::Arith`] node (r3.s2.w3, schema 1.2.0 —
+/// Q2). Serializes `snake_case` (`"add"`/`"sub"`/`"mul"`/`"div"`).
+///
+/// All four operations evaluate on `Decimal` only, through the `checked_*`
+/// arithmetic: any overflow gives no value, and `Div` by an exactly-zero
+/// operand gives no value (Q2: "division by zero, or any operand without a
+/// value, gives no value").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArithOp {
+    /// Pointwise sum.
+    Add,
+    /// Pointwise difference.
+    Sub,
+    /// Pointwise product.
+    Mul,
+    /// Pointwise ratio; a zero divisor gives no value.
+    Div,
+}
+
+#[cfg(test)]
+impl proptest::arbitrary::Arbitrary for ArithOp {
+    type Parameters = ();
+    type Strategy = proptest::strategy::BoxedStrategy<Self>;
+
+    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(Self::Add),
+            Just(Self::Sub),
+            Just(Self::Mul),
+            Just(Self::Div),
+        ]
+        .boxed()
+    }
+}
+
 /// Where a scalar value in a [`Condition`](super::Condition) comes from.
 ///
 /// Internally-tagged (`#[serde(tag = "type")]`) with **all struct variants** —
 /// see the module docs for why tuple/newtype variants are forbidden.
+///
+/// r3.s2.w3 (schema 1.2.0, additive inside 1.2.0 — b1) adds the two expression
+/// nodes, `Arith` and `Lag`. Both are validated before any strategy persists
+/// (depth ≤ 4 over `Arith`+`Lag` nodes, `bars` ∈ 1..=500, no lag of a lag, no
+/// mixed-series lag — `validate.rs`), and both **compile by pushing the lag
+/// down to the leaves** (`compile.rs`), so evaluation history stays leaf-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ValueSource {
@@ -186,12 +229,35 @@ pub enum ValueSource {
         /// The indicator and its parameters.
         spec: IndicatorSpec,
     },
+    /// A pointwise arithmetic combination of two operand values (r3.s2.w3,
+    /// schema 1.2.0 — Q2). Division by zero, or any operand without a value,
+    /// gives no value.
+    Arith {
+        /// The pointwise operation.
+        op: ArithOp,
+        /// The left operand.
+        lhs: Box<ValueSource>,
+        /// The right operand.
+        rhs: Box<ValueSource>,
+    },
+    /// The operand's value `bars` bars back **on the operand's own series**
+    /// (r3.s2.w3, schema 1.2.0 — Q2): an `h4:` operand lags in H4 bars.
+    /// Validation refuses a lag under a lag (use one `Lag` with a larger
+    /// `bars`) and a lag over a mixed-series value.
+    Lag {
+        /// The value to lag.
+        value: Box<ValueSource>,
+        /// How many bars back to read, 1..=500.
+        bars: u32,
+    },
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue, ValueSource};
+    use super::{
+        ArithOp, IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue, ValueSource,
+    };
     use rust_decimal::Decimal;
 
     fn round_trip(v: &ValueSource) -> ValueSource {
@@ -298,5 +364,47 @@ mod tests {
         let json = serde_json::to_string(&v).expect("serialize Constant");
         assert!(json.contains("\"type\":\"Constant\""), "json was: {json}");
         assert!(json.contains("\"value\":\"30\""), "json was: {json}");
+    }
+
+    /// r3.s2.w3 (schema 1.2.0): an `Arith` node round-trips value-equal, its
+    /// `op` token is the lowercase Q2 spelling, and nested operands survive.
+    #[test]
+    fn arith_round_trips_with_snake_case_op() {
+        let v = ValueSource::Arith {
+            op: ArithOp::Div,
+            lhs: Box::new(ValueSource::Indicator {
+                series: Series::Primary,
+                spec: IndicatorSpec::Atr {
+                    period: SweepableValue::Fixed(14),
+                },
+            }),
+            rhs: Box::new(ValueSource::Price {
+                series: Series::Primary,
+                field: PriceField::Close,
+            }),
+        };
+        assert_eq!(round_trip(&v), v);
+        let json = serde_json::to_string(&v).expect("serialize Arith");
+        assert!(json.contains("\"type\":\"Arith\""), "json was: {json}");
+        assert!(json.contains("\"op\":\"div\""), "json was: {json}");
+        let wire: ValueSource = serde_json::from_str(&json).expect("deserialize Arith");
+        assert_eq!(wire, v);
+    }
+
+    /// r3.s2.w3 (schema 1.2.0): a `Lag` node round-trips value-equal and always
+    /// writes `bars`.
+    #[test]
+    fn lag_round_trips_and_writes_bars() {
+        let v = ValueSource::Lag {
+            value: Box::new(ValueSource::Price {
+                series: Series::Primary,
+                field: PriceField::Close,
+            }),
+            bars: 5,
+        };
+        assert_eq!(round_trip(&v), v);
+        let json = serde_json::to_string(&v).expect("serialize Lag");
+        assert!(json.contains("\"type\":\"Lag\""), "json was: {json}");
+        assert!(json.contains("\"bars\":5"), "json was: {json}");
     }
 }

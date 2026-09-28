@@ -50,6 +50,24 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "rolling_extremes",
         "`Highest{period, source}` and `Lowest{period, source}` cover the N closed bars BEFORE the current bar, excluding it (the prior-N convention, rendered `highest(high, 20 prior)`); `source` is any price field and defaults to `high` for `Highest` and `low` for `Lowest`; they warm up over N+1 bars and work on any series (`h4:highest(high, 20)` is the prior 20 closed H4 bars)",
     ),
+    // r3.s2.w3 (Q2): value expressions — the semantics the grammar cannot
+    // express, keyed by the construct each entry covers.
+    (
+        "expressions",
+        "an `Arith` node computes add/sub/mul/div pointwise over two operand values, `Decimal` only; division by zero, an arithmetic overflow, or any operand without a value gives no value — a comparison over a no-value is false (a `Not` over it is true only behind the warm gate)",
+    ),
+    (
+        "expression_depth",
+        "at most 4 `Arith`/`Lag` nodes along any path through one value; a fifth is refused",
+    ),
+    (
+        "lag",
+        "`lag(value, bars)` reads the value `bars` bars back on the value's own series (`bars` in 1..=500; an `h4:` operand lags in H4 bars); a lag under a lag and a lag over a value mixing both series are refused — use one lag with a larger `bars`",
+    ),
+    (
+        "rising_falling",
+        "`rising`/`falling` mean the value is strictly greater/less than its own value `bars` bars ago on the same series (`bars` in 1..=500, default 1); over a value containing a lag, or mixing both series, they are refused",
+    ),
     // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
     (
         "schema_version",

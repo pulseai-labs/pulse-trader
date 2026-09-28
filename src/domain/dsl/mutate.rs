@@ -448,48 +448,71 @@ fn visit_condition(cond: &mut Condition, path: &str, f: Visit<'_>) -> ControlFlo
         Condition::Not { condition } => {
             visit_condition(condition, &format!("{path}.not"), f)?;
         }
+        // r3.s2.w3: the expression conditions' sweepable leaves live in their
+        // value; the path grammar matches validate.rs's `.rising.value` /
+        // `.falling.value`.
+        Condition::Rising { value, .. } => {
+            visit_value_source(value, &format!("{path}.rising.value"), f)?;
+        }
+        Condition::Falling { value, .. } => {
+            visit_value_source(value, &format!("{path}.falling.value"), f)?;
+        }
     }
     ControlFlow::Continue(())
 }
 
-/// Only `Indicator` carries sweepable leaves; `Constant`/`Price` carry none —
-/// the same asymmetry `validate.rs`'s `check_value_source` encodes. `series` is
-/// not a leaf (it is a series tag, not a numeric parameter).
+/// Sweepable leaves live on `Indicator` (its periods); `Constant`/`Price` carry
+/// none — the same asymmetry `validate.rs`'s `check_value_source` encodes.
+/// `series` is not a leaf (it is a series tag, not a numeric parameter). The
+/// walk recurses through `Arith`/`Lag`, so sweepable periods nested inside
+/// expressions stay sweepable (r3.s2.w3).
 fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlFlow<()> {
-    if let ValueSource::Indicator { spec, .. } = v {
-        let base = format!("{path}.indicator");
-        match spec {
-            IndicatorSpec::Rsi { period } => {
-                f(&format!("{base}.rsi.period"), LeafMut::Period(period))?;
-            }
-            IndicatorSpec::Ema { period } => {
-                f(&format!("{base}.ema.period"), LeafMut::Period(period))?;
-            }
-            IndicatorSpec::Adx { period } => {
-                f(&format!("{base}.adx.period"), LeafMut::Period(period))?;
-            }
-            IndicatorSpec::Macd {
-                fast, slow, signal, ..
-            } => {
-                // `output` is not a numeric leaf — mutation targets periods
-                // only (schema 1.2.0: the selector is structural, not sweepable).
-                f(&format!("{base}.macd.fast"), LeafMut::Period(fast))?;
-                f(&format!("{base}.macd.slow"), LeafMut::Period(slow))?;
-                f(&format!("{base}.macd.signal"), LeafMut::Period(signal))?;
-            }
-            IndicatorSpec::Atr { period } => {
-                f(&format!("{base}.atr.period"), LeafMut::Period(period))?;
-            }
-            // The rolling extremes: the period is the sweepable leaf;
-            // `source` is a field tag, not a numeric parameter (the `series`
-            // precedent — see validate.rs's check arms).
-            IndicatorSpec::Highest { period, .. } => {
-                f(&format!("{base}.highest.period"), LeafMut::Period(period))?;
-            }
-            IndicatorSpec::Lowest { period, .. } => {
-                f(&format!("{base}.lowest.period"), LeafMut::Period(period))?;
+    match v {
+        ValueSource::Indicator { spec, .. } => {
+            let base = format!("{path}.indicator");
+            match spec {
+                IndicatorSpec::Rsi { period } => {
+                    f(&format!("{base}.rsi.period"), LeafMut::Period(period))?;
+                }
+                IndicatorSpec::Ema { period } => {
+                    f(&format!("{base}.ema.period"), LeafMut::Period(period))?;
+                }
+                IndicatorSpec::Adx { period } => {
+                    f(&format!("{base}.adx.period"), LeafMut::Period(period))?;
+                }
+                IndicatorSpec::Macd {
+                    fast, slow, signal, ..
+                } => {
+                    // `output` is not a numeric leaf — mutation targets periods
+                    // only (schema 1.2.0: the selector is structural, not sweepable).
+                    f(&format!("{base}.macd.fast"), LeafMut::Period(fast))?;
+                    f(&format!("{base}.macd.slow"), LeafMut::Period(slow))?;
+                    f(&format!("{base}.macd.signal"), LeafMut::Period(signal))?;
+                }
+                IndicatorSpec::Atr { period } => {
+                    f(&format!("{base}.atr.period"), LeafMut::Period(period))?;
+                }
+                // r3.s2.w2: the rolling extremes — the period is the sweepable
+                // leaf; `source` is a field tag, not a numeric parameter (the
+                // `series` precedent — see validate.rs's check arms).
+                IndicatorSpec::Highest { period, .. } => {
+                    f(&format!("{base}.highest.period"), LeafMut::Period(period))?;
+                }
+                IndicatorSpec::Lowest { period, .. } => {
+                    f(&format!("{base}.lowest.period"), LeafMut::Period(period))?;
+                }
             }
         }
+        // The nesting-aware path grammar matches validate.rs's: `.arith.lhs`,
+        // `.arith.rhs`, `.lag.value`.
+        ValueSource::Arith { lhs, rhs, .. } => {
+            visit_value_source(lhs, &format!("{path}.arith.lhs"), f)?;
+            visit_value_source(rhs, &format!("{path}.arith.rhs"), f)?;
+        }
+        ValueSource::Lag { value, .. } => {
+            visit_value_source(value, &format!("{path}.lag.value"), f)?;
+        }
+        ValueSource::Constant { .. } | ValueSource::Price { .. } => {}
     }
     ControlFlow::Continue(())
 }

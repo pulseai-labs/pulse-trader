@@ -467,6 +467,7 @@ async fn candle_and_indicator_exports_match_the_snapshot() {
         expected.push(engine.current(&CompiledValue::Indicator {
             series: Series::Primary,
             spec: spec.clone(),
+            lag: 0,
         }));
     }
 

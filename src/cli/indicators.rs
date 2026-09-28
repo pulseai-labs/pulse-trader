@@ -109,6 +109,7 @@ fn current_values(engine: &IndicatorEngine, columns: &[IndicatorColumn]) -> Vec<
             engine.current(&CompiledValue::Indicator {
                 series: Series::Primary,
                 spec: column.spec.clone(),
+                lag: 0,
             })
         })
         .collect()

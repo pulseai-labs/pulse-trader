@@ -87,6 +87,7 @@ fn current(engine: &IndicatorEngine, spec: &IndicatorSpec) -> Option<Decimal> {
     engine.current(&CompiledValue::Indicator {
         series: Series::Primary,
         spec: spec.clone(),
+        lag: 0,
     })
 }
 

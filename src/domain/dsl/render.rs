@@ -111,8 +111,10 @@ fn field_word(field: PriceField) -> &'static str {
 }
 
 /// Where a compared scalar comes from: a normalized constant (`30`, `0.5`), a
-/// price field's name (`close`), or an indicator call (`ema(200)`) — each
-/// `htf`-series operand prefixed `h4:` (`h4:close`, `h4:ema(200)`).
+/// price field's name (`close`), an indicator call (`ema(200)`), an infix
+/// arithmetic expression in parentheses (`(atr(14) / close)`), or a lag call
+/// (`lag(close, 5)`, `lag(h4:ema(20), 1)`) — each `htf`-series operand
+/// prefixed `h4:` (`h4:close`, `h4:ema(200)`).
 #[must_use]
 pub fn value(source: &ValueSource) -> String {
     match source {
@@ -128,6 +130,25 @@ pub fn value(source: &ValueSource) -> String {
             },
         ),
         ValueSource::Indicator { series, spec } => series_tag(*series, indicator(spec)),
+        // Infix with parentheses, one level per Arith node (spec §4):
+        // `(atr(14) / close)`. The children render through `value`, so a
+        // nested expression parenthesizes at each level deterministically.
+        ValueSource::Arith { op, lhs, rhs } => format!(
+            "({} {} {})",
+            value(lhs),
+            match op {
+                crate::domain::dsl::value::ArithOp::Add => "+",
+                crate::domain::dsl::value::ArithOp::Sub => "-",
+                crate::domain::dsl::value::ArithOp::Mul => "*",
+                crate::domain::dsl::value::ArithOp::Div => "/",
+            },
+            value(rhs)
+        ),
+        // `lag(close, 5)`; the series tag belongs to the lagged operand
+        // (own-series rule), so it renders inside: `lag(h4:ema(20), 1)`.
+        ValueSource::Lag { value: inner, bars } => {
+            format!("lag({}, {bars})", self::value(inner))
+        }
     }
 }
 
@@ -162,7 +183,30 @@ pub fn condition(c: &Condition) -> String {
         Condition::And { conditions } => joined(conditions, "and"),
         Condition::Or { conditions } => joined(conditions, "or"),
         Condition::Not { condition } => format!("not ({})", self::condition(condition)),
+        // Q2's renderings (spec §4): `h4:ema(200) rising (1 bar)` — the series
+        // tag belongs to the value; the bar count is singular at 1.
+        Condition::Rising { value, bars } => {
+            format!(
+                "{} rising ({} {})",
+                self::value(value),
+                bars,
+                bars_word(*bars)
+            )
+        }
+        Condition::Falling { value, bars } => {
+            format!(
+                "{} falling ({} {})",
+                self::value(value),
+                bars,
+                bars_word(*bars)
+            )
+        }
     }
+}
+
+/// `bar` at 1, `bars` otherwise — `rising (1 bar)`, `falling (3 bars)`.
+fn bars_word(bars: u32) -> &'static str {
+    if bars == 1 { "bar" } else { "bars" }
 }
 
 /// An exit rule as one line: `stop 1.5%`, `take profit 2R`, `trailing 1%`,

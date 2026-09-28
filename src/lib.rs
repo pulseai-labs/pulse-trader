@@ -107,9 +107,10 @@ pub use domain::strategy::Hypothesis as AgentHypothesis;
 // VS-1.1.2 work-2.01: the DSL grammar leaf + predicate layer. These are the
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
 // (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
-// same curated-surface pattern as the domain types above.
+// same curated-surface pattern as the domain types above. `ArithOp` rides
+// beside `ValueSource` since r3.s2.w3 (schema 1.2.0 expressions, Q2).
 pub use domain::{
-    Comparator, Condition, IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue,
+    ArithOp, Comparator, Condition, IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue,
     ValueSource,
 };
 
