@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use pulse::{
     Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, MacdOutput,
-    Pair, Series, SweepableValue, Timeframe,
+    Pair, PriceField, Series, SweepableValue, Timeframe,
 };
 use rust_decimal::Decimal;
 
@@ -20,13 +20,15 @@ struct IndicatorSnapshot {
     macd_signal_12_26_9: Option<Decimal>,
     macd_hist_12_26_9: Option<Decimal>,
     atr_14: Option<Decimal>,
+    highest_high_20: Option<Decimal>,
+    lowest_low_20: Option<Decimal>,
 }
 
 fn fixed(value: u32) -> SweepableValue<u32> {
     SweepableValue::Fixed(value)
 }
 
-fn specs() -> [IndicatorSpec; 7] {
+fn specs() -> [IndicatorSpec; 9] {
     [
         IndicatorSpec::Rsi { period: fixed(14) },
         IndicatorSpec::Ema { period: fixed(50) },
@@ -50,6 +52,14 @@ fn specs() -> [IndicatorSpec; 7] {
             output: MacdOutput::Histogram,
         },
         IndicatorSpec::Atr { period: fixed(14) },
+        IndicatorSpec::Highest {
+            period: fixed(20),
+            source: PriceField::High,
+        },
+        IndicatorSpec::Lowest {
+            period: fixed(20),
+            source: PriceField::Low,
+        },
     ]
 }
 
@@ -95,6 +105,8 @@ fn run_once(candles: &[Candle]) -> Vec<IndicatorSnapshot> {
                 macd_signal_12_26_9: current(&engine, &specs[4]),
                 macd_hist_12_26_9: current(&engine, &specs[5]),
                 atr_14: current(&engine, &specs[6]),
+                highest_high_20: current(&engine, &specs[7]),
+                lowest_low_20: current(&engine, &specs[8]),
             }
         })
         .collect()

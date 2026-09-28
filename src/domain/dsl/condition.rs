@@ -222,12 +222,26 @@ mod prop_tests {
         ]
     }
 
+    /// Every `prop_oneof` arm below is `.boxed()` — see
+    /// `strategy.rs`'s `arb_indicator_spec` for the #283 rationale: the
+    /// union's value tree holds a `Box<dyn ValueTree>` instead of the arm's
+    /// full monomorphized tree, so nested `new_tree`/drop-glue frames stay
+    /// small on pathological seeds. Distribution, weights and
+    /// `prop_recursive(4, 32, 4)` bounds are unchanged.
     fn arb_indicator_spec() -> impl Strategy<Value = IndicatorSpec> {
         prop_oneof![
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Rsi { period }),
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Ema { period }),
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Adx { period }),
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Atr { period }),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Rsi { period })
+                .boxed(),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Ema { period })
+                .boxed(),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Adx { period })
+                .boxed(),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Atr { period })
+                .boxed(),
             (
                 arb_sweepable_u32(),
                 arb_sweepable_u32(),
@@ -236,14 +250,23 @@ mod prop_tests {
                     Just(MacdOutput::Line),
                     Just(MacdOutput::Signal),
                     Just(MacdOutput::Histogram)
-                ],
+                ]
+                .boxed(),
             )
                 .prop_map(|(fast, slow, signal, output)| IndicatorSpec::Macd {
                     fast,
                     slow,
                     signal,
                     output
-                }),
+                })
+                .boxed(),
+            // r3.s2.w2 (Q1): the rolling extremes — any period, any source.
+            (arb_sweepable_u32(), arb_price_field())
+                .prop_map(|(period, source)| IndicatorSpec::Highest { period, source })
+                .boxed(),
+            (arb_sweepable_u32(), arb_price_field())
+                .prop_map(|(period, source)| IndicatorSpec::Lowest { period, source })
+                .boxed(),
         ]
     }
 
@@ -265,11 +288,15 @@ mod prop_tests {
 
     fn arb_value_source() -> impl Strategy<Value = ValueSource> {
         prop_oneof![
-            arb_decimal().prop_map(|value| ValueSource::Constant { value }),
+            arb_decimal()
+                .prop_map(|value| ValueSource::Constant { value })
+                .boxed(),
             (arb_series(), arb_price_field())
-                .prop_map(|(series, field)| ValueSource::Price { series, field }),
+                .prop_map(|(series, field)| ValueSource::Price { series, field })
+                .boxed(),
             (arb_series(), arb_indicator_spec())
-                .prop_map(|(series, spec)| ValueSource::Indicator { series, spec }),
+                .prop_map(|(series, spec)| ValueSource::Indicator { series, spec })
+                .boxed(),
         ]
     }
 
@@ -289,22 +316,29 @@ mod prop_tests {
     fn arb_condition() -> impl Strategy<Value = Condition> {
         let leaf = prop_oneof![
             (arb_value_source(), arb_comparator(), arb_value_source())
-                .prop_map(|(lhs, op, rhs)| Condition::Compare { lhs, op, rhs }),
+                .prop_map(|(lhs, op, rhs)| Condition::Compare { lhs, op, rhs })
+                .boxed(),
             (arb_value_source(), arb_value_source())
-                .prop_map(|(lhs, rhs)| Condition::CrossesAbove { lhs, rhs }),
+                .prop_map(|(lhs, rhs)| Condition::CrossesAbove { lhs, rhs })
+                .boxed(),
             (arb_value_source(), arb_value_source())
-                .prop_map(|(lhs, rhs)| Condition::CrossesBelow { lhs, rhs }),
+                .prop_map(|(lhs, rhs)| Condition::CrossesBelow { lhs, rhs })
+                .boxed(),
         ];
         // depth ≤ 4, ≤ 32 total nodes, ≤ 4 children per collection.
         leaf.prop_recursive(4, 32, 4, |inner| {
             prop_oneof![
                 prop::collection::vec(inner.clone(), 1..=4)
-                    .prop_map(|conditions| Condition::And { conditions }),
+                    .prop_map(|conditions| Condition::And { conditions })
+                    .boxed(),
                 prop::collection::vec(inner.clone(), 1..=4)
-                    .prop_map(|conditions| Condition::Or { conditions }),
-                inner.prop_map(|c| Condition::Not {
-                    condition: Box::new(c),
-                }),
+                    .prop_map(|conditions| Condition::Or { conditions })
+                    .boxed(),
+                inner
+                    .prop_map(|c| Condition::Not {
+                        condition: Box::new(c),
+                    })
+                    .boxed(),
             ]
         })
     }

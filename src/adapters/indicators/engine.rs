@@ -1,6 +1,6 @@
 //! Streaming indicator engine over the VS-1.1.3 indicator adapters.
 
-use super::{adx::Adx, atr::Atr, ema::Ema, macd::Macd, rsi::Rsi};
+use super::{adx::Adx, atr::Atr, ema::Ema, macd::Macd, rolling::RollingExtremes, rsi::Rsi};
 use crate::{
     Candle, CompiledStrategy, CompiledValue, EvalContext, Indicator, IndicatorSpec, PriceField,
     SweepableValue,
@@ -213,6 +213,18 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
             Atr::new(period)
                 .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
                 .ok_or_else(|| invalid_period(spec, format!("ATR period {period} is invalid")))
+        }
+        IndicatorSpec::Highest { period, source } => {
+            let period = fixed_u32(period, "highest.period")?;
+            RollingExtremes::new(period, *source, true)
+                .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+                .ok_or_else(|| invalid_period(spec, format!("Highest period {period} is invalid")))
+        }
+        IndicatorSpec::Lowest { period, source } => {
+            let period = fixed_u32(period, "lowest.period")?;
+            RollingExtremes::new(period, *source, false)
+                .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+                .ok_or_else(|| invalid_period(spec, format!("Lowest period {period} is invalid")))
         }
     }
 }
