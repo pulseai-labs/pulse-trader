@@ -38,7 +38,9 @@ use crate::domain::strategy::{
     AgentName, AgentSubmission, AgentSubmissionId, CreatedBy, Hypothesis, NewAgentSubmission,
     NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
 };
-use crate::domain::{Clock, DataError, Migrator, SchemaVersion, StrategyRepository, validate};
+use crate::domain::{
+    Clock, DataError, Migrator, SchemaVersion, StrategyRepository, check_unknown_fields, validate,
+};
 
 /// The `SQLite` [`StrategyRepository`](crate::domain::port::StrategyRepository)
 /// adapter over `pulse.db`.
@@ -101,6 +103,19 @@ impl<C: Clock> SqliteStrategyRepo<C> {
             .load(dsl_json)
             .map_err(|e| DataError::Db(format!("dsl load failed: {e}")))?;
         validate(&loaded.dsl).map_err(|e| DataError::Db(format!("dsl validation failed: {e}")))?;
+        // Write-path strictness (r3.s2): refuse raw keys the parsed document
+        // cannot express. Runs BEFORE anything is persisted; the read path
+        // (`row_to_version`) stays lenient by design. The walk compares the
+        // MIGRATED raw value (ADR-0024 amendment), so a renaming migration's
+        // consumed keys are not flagged.
+        let raw: serde_json::Value = serde_json::from_str(dsl_json)
+            .map_err(|e| DataError::Db(format!("dsl re-parse failed: {e}")))?;
+        let migrated_raw = self
+            .migrator
+            .migrated_value(raw)
+            .map_err(|e| DataError::Db(format!("dsl re-migrate failed: {e}")))?;
+        check_unknown_fields(&migrated_raw, &loaded.dsl)
+            .map_err(|e| DataError::Db(format!("dsl unknown-field check failed: {e}")))?;
         let dsl_current =
             serde_json::to_string(&loaded.dsl).map_err(|e| DataError::Db(e.to_string()))?;
         Ok((loaded.dsl_original, dsl_current))
@@ -399,6 +414,20 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
         // 1b. Validate the migrated DSL before persisting (gate-7 C2). The DB is
         //     the system-of-record; reject invalid-but-loadable DSLs here.
         validate(&loaded.dsl).map_err(|e| DataError::Db(format!("dsl validation failed: {e}")))?;
+
+        // 1c. Write-path strictness (r3.s2): refuse raw keys the parsed
+        //     document cannot express, BEFORE anything is persisted. The read
+        //     path (`row_to_version`) stays lenient by design. The walk
+        //     compares the MIGRATED raw value (ADR-0024 amendment), so a
+        //     renaming migration's consumed keys are not flagged.
+        let raw: serde_json::Value = serde_json::from_str(&request.dsl_json)
+            .map_err(|e| DataError::Db(format!("dsl re-parse failed: {e}")))?;
+        let migrated_raw = self
+            .migrator
+            .migrated_value(raw)
+            .map_err(|e| DataError::Db(format!("dsl re-migrate failed: {e}")))?;
+        check_unknown_fields(&migrated_raw, &loaded.dsl)
+            .map_err(|e| DataError::Db(format!("dsl unknown-field check failed: {e}")))?;
 
         // 2. Build the column values.
         let id = Uuid::new_v4().to_string();

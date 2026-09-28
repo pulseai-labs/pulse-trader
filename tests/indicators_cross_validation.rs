@@ -10,8 +10,8 @@
 use std::{path::PathBuf, str::FromStr};
 
 use pulse::{
-    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair, Series,
-    SweepableValue, Timeframe,
+    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, MacdOutput,
+    Pair, Series, SweepableValue, Timeframe,
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
@@ -26,6 +26,8 @@ enum IndicatorName {
     Ema,
     Adx,
     Macd,
+    MacdSignal,
+    MacdHist,
     Atr,
 }
 
@@ -36,6 +38,8 @@ impl IndicatorName {
             Self::Ema => "EMA(50)",
             Self::Adx => "ADX(14)",
             Self::Macd => "MACD(12,26,9)",
+            Self::MacdSignal => "MACD-signal(12,26,9)",
+            Self::MacdHist => "MACD-hist(12,26,9)",
             Self::Atr => "ATR(14)",
         }
     }
@@ -49,6 +53,19 @@ impl IndicatorName {
                 fast: fixed(12),
                 slow: fixed(26),
                 signal: fixed(9),
+                output: MacdOutput::Line,
+            },
+            Self::MacdSignal => IndicatorSpec::Macd {
+                fast: fixed(12),
+                slow: fixed(26),
+                signal: fixed(9),
+                output: MacdOutput::Signal,
+            },
+            Self::MacdHist => IndicatorSpec::Macd {
+                fast: fixed(12),
+                slow: fixed(26),
+                signal: fixed(9),
+                output: MacdOutput::Histogram,
             },
             Self::Atr => IndicatorSpec::Atr { period: fixed(14) },
         }
@@ -63,7 +80,7 @@ impl IndicatorName {
             // identically — measured at regen (r2.s2.w2): the worst relative
             // delta over post-warmup rows is ≈2.7e-12, already below REL_EPS,
             // so no settling window is needed at all.
-            Self::Rsi | Self::Ema | Self::Macd | Self::Atr => 0,
+            Self::Rsi | Self::Ema | Self::Macd | Self::MacdSignal | Self::MacdHist | Self::Atr => 0,
             // ADX uses the same Wilder alpha, but the adapter is SMA-seeded
             // while pandas-ta's RMA is recursively seeded. The first 280
             // post-warmup rows let the seed delta decay below REL_EPS.
@@ -79,6 +96,8 @@ struct ReferenceRow {
     ema_50: String,
     adx_14: String,
     macd_12_26_9: String,
+    macd_signal_12_26_9: String,
+    macd_hist_12_26_9: String,
     atr_14: String,
 }
 
@@ -89,6 +108,8 @@ impl ReferenceRow {
             IndicatorName::Ema => &self.ema_50,
             IndicatorName::Adx => &self.adx_14,
             IndicatorName::Macd => &self.macd_12_26_9,
+            IndicatorName::MacdSignal => &self.macd_signal_12_26_9,
+            IndicatorName::MacdHist => &self.macd_hist_12_26_9,
             IndicatorName::Atr => &self.atr_14,
         };
         if raw.is_empty() {
@@ -137,12 +158,14 @@ fn load_reference() -> Vec<ReferenceRow> {
         .collect()
 }
 
-fn indicator_names() -> [IndicatorName; 5] {
+fn indicator_names() -> [IndicatorName; 7] {
     [
         IndicatorName::Rsi,
         IndicatorName::Ema,
         IndicatorName::Adx,
         IndicatorName::Macd,
+        IndicatorName::MacdSignal,
+        IndicatorName::MacdHist,
         IndicatorName::Atr,
     ]
 }

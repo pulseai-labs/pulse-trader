@@ -51,6 +51,26 @@ pub enum PriceField {
     Volume,
 }
 
+/// Which output of a MACD an [`IndicatorSpec::Macd`] operand reads (schema
+/// 1.2.0, r3.s2 — b2). Serializes `snake_case` (`"line"`/`"signal"`/
+/// `"histogram"`); deserialization defaults a missing `output` to `line` via
+/// the `#[serde(default)]` on the `Macd` field, while writes always emit the
+/// tag explicitly (the `series` precedent). `Line` is the historical behaviour
+/// (schema ≤ 1.1.0 exposed only the line).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MacdOutput {
+    /// `EMA(fast) − EMA(slow)` — the v1 default.
+    #[default]
+    Line,
+    /// The signal line: the seeded EMA(signal period) of the MACD line.
+    Signal,
+    /// `line − signal`.
+    Histogram,
+}
+
 /// A typed reference to a technical indicator and its parameters.
 ///
 /// Internally-tagged (`#[serde(tag = "indicator")]`) with **all struct
@@ -82,6 +102,8 @@ pub enum IndicatorSpec {
         period: SweepableValue<u32>,
     },
     /// Moving Average Convergence Divergence with fast/slow/signal periods.
+    /// `output` selects which of the three ta-rs outputs the operand reads
+    /// (schema 1.2.0, r3.s2 — b2); absent → the historical line.
     Macd {
         /// Fast EMA period.
         fast: SweepableValue<u32>,
@@ -89,6 +111,9 @@ pub enum IndicatorSpec {
         slow: SweepableValue<u32>,
         /// Signal-line EMA period.
         signal: SweepableValue<u32>,
+        /// Which output the operand reads; defaults to [`MacdOutput::Line`].
+        #[serde(default)]
+        output: MacdOutput,
     },
     /// Average True Range over `period` bars (schema 1.1.0; r2.s2.w2 computes
     /// it — Wilder smoothing of the true range).
@@ -133,7 +158,7 @@ pub enum ValueSource {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{IndicatorSpec, PriceField, Series, SweepableValue, ValueSource};
+    use super::{IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue, ValueSource};
     use rust_decimal::Decimal;
 
     fn round_trip(v: &ValueSource) -> ValueSource {
@@ -177,6 +202,7 @@ mod tests {
                 fast: SweepableValue::Fixed(12),
                 slow: SweepableValue::Fixed(26),
                 signal: SweepableValue::Fixed(9),
+                output: MacdOutput::Line,
             },
         };
         assert_eq!(round_trip(&v), v);

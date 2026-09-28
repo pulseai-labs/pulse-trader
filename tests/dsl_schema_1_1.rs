@@ -148,7 +148,7 @@ fn operand_series(dsl: &StrategyDsl) -> Vec<Series> {
 // ---- (a) identity migration over fixtures + the inline document ------------
 
 #[test]
-fn every_committed_fixture_migrates_1_0_0_to_1_1_0() {
+fn every_committed_fixture_migrates_to_current() {
     let dir = manifest("tests/fixtures/strategies");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("fixture dir readable")
@@ -166,7 +166,7 @@ fn every_committed_fixture_migrates_1_0_0_to_1_1_0() {
 
         assert!(
             loaded.migrated,
-            "{} must report migrated (1.0.0 -> 1.1.0)",
+            "{} must report migrated (1.0.0 -> ... -> CURRENT)",
             path.display()
         );
         assert_eq!(
@@ -177,8 +177,8 @@ fn every_committed_fixture_migrates_1_0_0_to_1_1_0() {
         );
         assert_eq!(
             loaded.dsl.schema_version,
-            v(1, 1, 0),
-            "{} migrated version",
+            SchemaVersion::CURRENT,
+            "{} migrated version (the chain now runs 1.0.0 -> 1.1.0 -> CURRENT)",
             path.display()
         );
         assert_eq!(
@@ -206,7 +206,7 @@ fn inline_1_0_0_document_migrates_and_deserializes_equal() {
     let loaded = Migrator::v1().load(INLINE_1_0_0).expect("load inline");
     assert!(loaded.migrated);
     assert_eq!(loaded.from, v(1, 0, 0));
-    assert_eq!(loaded.dsl.schema_version, v(1, 1, 0));
+    assert_eq!(loaded.dsl.schema_version, SchemaVersion::CURRENT);
     assert_eq!(loaded.dsl_original, INLINE_1_0_0);
     let mut direct: StrategyDsl = serde_json::from_str(INLINE_1_0_0).expect("direct");
     direct.schema_version = SchemaVersion::CURRENT;
@@ -217,7 +217,7 @@ fn inline_1_0_0_document_migrates_and_deserializes_equal() {
 
 #[test]
 fn future_versions_still_reject() {
-    for future in ["1.2.0", "2.0.0"] {
+    for future in ["1.3.0", "2.0.0"] {
         let mut doc: Value = serde_json::from_str(INLINE_1_0_0).unwrap();
         doc["schema_version"] = json!(future);
         let err = Migrator::v1()
@@ -657,7 +657,7 @@ async fn repo() -> (SqliteStrategyRepo<pulse::SystemClock>, SqlitePool, TempDir)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn persisted_1_0_0_document_reads_back_at_1_1_0() {
+async fn persisted_1_0_0_document_reads_back_at_current() {
     let (repo, _pool, _tmp) = repo().await;
     let s = repo
         .create_strategy("MigrateMe", Some("alice"), &["btc".to_owned()])
@@ -681,7 +681,7 @@ async fn persisted_1_0_0_document_reads_back_at_1_1_0() {
         .expect("version exists");
     assert_eq!(
         fetched.dsl_schema_version,
-        v(1, 1, 0),
+        SchemaVersion::CURRENT,
         "persisted version must read back at CURRENT"
     );
     assert_eq!(

@@ -20,7 +20,7 @@ pub mod wilder;
 mod determinism_tests {
     use super::macd::Macd;
     use super::rsi::Rsi;
-    use crate::domain::{Candle, Indicator};
+    use crate::domain::{Candle, Indicator, MacdOutput};
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
@@ -64,7 +64,7 @@ mod determinism_tests {
             closes.iter().map(|c| rsi.next(&candle_close(c))).collect()
         };
         let run_macd = || -> Vec<Option<Decimal>> {
-            let mut macd = Macd::new(3, 6, 4).expect("periods >= 1");
+            let mut macd = Macd::new(3, 6, 4, MacdOutput::Line).expect("periods >= 1");
             closes.iter().map(|c| macd.next(&candle_close(c))).collect()
         };
 

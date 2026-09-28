@@ -22,7 +22,7 @@ use super::exit::ExitRule;
 use super::risk::{Direction, RiskParams};
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
-use super::value::{IndicatorSpec, PriceField, Series, ValueSource};
+use super::value::{IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
 
 /// A [`StrategyDsl`] rendered to summary lines — the fields both wire DTOs
 /// carry (`DslSummary` wraps `entry` in a one-element `Vec`; the compact card
@@ -59,12 +59,27 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Rsi { period } => format!("rsi({})", u32_leaf(period)),
         IndicatorSpec::Ema { period } => format!("ema({})", u32_leaf(period)),
         IndicatorSpec::Adx { period } => format!("adx({})", u32_leaf(period)),
-        IndicatorSpec::Macd { fast, slow, signal } => format!(
-            "macd({},{},{})",
-            u32_leaf(fast),
-            u32_leaf(slow),
-            u32_leaf(signal)
-        ),
+        IndicatorSpec::Macd {
+            fast,
+            slow,
+            signal,
+            output,
+        } => {
+            // The line renders bare (the historical spelling); the signal and
+            // histogram carry an output suffix (schema 1.2.0, r3.s2 — b2).
+            let selector = match output {
+                MacdOutput::Line => "",
+                MacdOutput::Signal => ".signal",
+                MacdOutput::Histogram => ".histogram",
+            };
+            format!(
+                "macd({},{},{}){}",
+                u32_leaf(fast),
+                u32_leaf(slow),
+                u32_leaf(signal),
+                selector
+            )
+        }
         IndicatorSpec::Atr { period } => format!("atr({})", u32_leaf(period)),
     }
 }

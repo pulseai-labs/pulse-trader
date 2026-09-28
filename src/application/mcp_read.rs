@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
-    BacktestInputs, IndicatorSpec, MfeMaeAggregates, OpenPositionMark, PersistedRun,
+    BacktestInputs, IndicatorSpec, MacdOutput, MfeMaeAggregates, OpenPositionMark, PersistedRun,
     RegimeBreakdown, SkippedEntryCounts, SummaryStats, SweepableValue,
 };
 
@@ -75,11 +75,69 @@ pub fn parse_indicator_specs(raw: &[String]) -> anyhow::Result<Vec<IndicatorColu
 }
 
 fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
-    let (kind, period) = token.split_once(':').ok_or_else(|| {
+    let (kind, rest) = token.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("invalid --indicator {token:?}: expected <kind>:<period>")
     })?;
     let kind = kind.trim().to_ascii_lowercase();
-    let period = parse_period(token, period)?;
+
+    // MACD carries three periods and (schema 1.2.0, r3.s2 — b2) an optional
+    // output selector: `macd:<fast>-<slow>-<signal>` or
+    // `macd:<fast>-<slow>-<signal>:<output>` with output in
+    // line|signal|histogram (absent → line). The bare `macd:<period>` form
+    // stays rejected.
+    if kind == "macd" {
+        let parts: Vec<&str> = rest.split(':').collect();
+        let (periods, output, output_label) = match parts.as_slice() {
+            [periods] => (periods, MacdOutput::Line, String::new()),
+            [periods, output] => {
+                let trimmed = output.trim();
+                let selected = match trimmed {
+                    "line" => MacdOutput::Line,
+                    "signal" => MacdOutput::Signal,
+                    "histogram" => MacdOutput::Histogram,
+                    other => anyhow::bail!(
+                        "invalid --indicator {token:?}: unknown macd output {other:?} (expected line|signal|histogram)"
+                    ),
+                };
+                (periods, selected, format!(":{trimmed}"))
+            }
+            _ => anyhow::bail!(
+                "invalid --indicator {token:?}: macd expects <fast>-<slow>-<signal>[:<output>]"
+            ),
+        };
+        let nums: Vec<&str> = periods.split('-').collect();
+        if nums.len() != 3 {
+            anyhow::bail!(
+                "invalid --indicator {token:?}: macd expects <fast>-<slow>-<signal>[:<output>]"
+            );
+        }
+        let parsed: Vec<u32> = nums
+            .iter()
+            .map(|p| {
+                p.trim().parse::<u32>().map_err(|e| {
+                    anyhow::anyhow!("invalid --indicator {token:?}: period must be u32: {e}")
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let [fast, slow, signal] = parsed[..] else {
+            anyhow::bail!("invalid --indicator {token:?}: macd expects three periods");
+        };
+        if fast == 0 || slow == 0 || signal == 0 {
+            anyhow::bail!("invalid --indicator {token:?}: periods must be >= 1");
+        }
+        let fixed = SweepableValue::Fixed;
+        return Ok(IndicatorColumn {
+            label: format!("macd:{fast}-{slow}-{signal}{output_label}"),
+            spec: IndicatorSpec::Macd {
+                fast: fixed(fast),
+                slow: fixed(slow),
+                signal: fixed(signal),
+                output,
+            },
+        });
+    }
+
+    let period = parse_period(token, rest)?;
     let fixed = SweepableValue::Fixed(period);
     let spec = match kind.as_str() {
         "rsi" => IndicatorSpec::Rsi { period: fixed },

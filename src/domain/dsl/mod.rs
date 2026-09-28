@@ -60,5 +60,7 @@ pub use risk::{Direction, RiskParams};
 pub use schema_version::{DSL_SCHEMA_VERSION, SchemaVersion, SchemaVersionParseError};
 pub use strategy::StrategyDsl;
 pub use sweepable::SweepableValue;
-pub use validate::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
-pub use value::{IndicatorSpec, PriceField, Series, ValueSource};
+pub use validate::{
+    FieldError, ValidatedDsl, ValidationCode, ValidationErrors, check_unknown_fields, validate,
+};
+pub use value::{IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};

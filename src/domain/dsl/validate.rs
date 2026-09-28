@@ -37,6 +37,7 @@ use super::exit::ExitRule;
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
 use super::value::{IndicatorSpec, PriceField, ValueSource};
+use crate::domain::DSL_SCHEMA_VERSION;
 
 /// A machine-actionable classification of a single semantic violation.
 ///
@@ -71,6 +72,11 @@ pub enum ValidationCode {
     /// impossible leaf is satisfiable), across `Series::Primary`/`Series::Htf`
     /// (different bars), or on non-invariant fields (`Volume`, indicators).
     ImpossibleCondition,
+    /// A raw-document object key the deserialized value cannot express (r3.s2
+    /// write-path strictness): present in the submitted/serialized raw JSON at
+    /// some path, absent from the re-serialized parsed value at the same path.
+    /// Refused on every WRITE prelude; never enforced on the lenient read path.
+    UnknownField,
 }
 
 /// A single field-level, correctable validation error.
@@ -491,7 +497,9 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
         IndicatorSpec::Adx { period } => {
             check_u32_positive(period, &format!("{path}.adx.period"), "ADX period", errors);
         }
-        IndicatorSpec::Macd { fast, slow, signal } => {
+        IndicatorSpec::Macd {
+            fast, slow, signal, ..
+        } => {
             check_u32_positive(fast, &format!("{path}.macd.fast"), "MACD fast", errors);
             check_u32_positive(slow, &format!("{path}.macd.slow"), "MACD slow", errors);
             check_u32_positive(
@@ -765,6 +773,114 @@ fn push_sweep(path: &str, errors: &mut Vec<FieldError>) {
     });
 }
 
+/// The write-path strictness check (r3.s2): reject raw-document object keys
+/// the parsed [`StrategyDsl`] cannot express.
+///
+/// Runs ONLY on the write preludes — MCP [`submit_agent_version`](crate::submit_agent_version),
+/// `strategy_repo::load_agent_document`, and `strategy_repo::create_version` —
+/// NEVER on [`Migrator::load`](super::migrate::Migrator::load) or the repo's
+/// `row_to_version` read defense: the read path stays lenient so pre-r3
+/// database rows survive engine upgrades (ADR-0024's forward-compatibility
+/// refusal would otherwise be the only protection, and it cannot see
+/// same-version typos).
+///
+/// Compares the raw document's object keys, recursively, against the keys of
+/// the re-serialized parsed value at the same path. A key present in raw and
+/// absent from the re-serialization is an [`ValidationCode::UnknownField`]
+/// error at that dotted/indexed path. Serde tags (`type`, `indicator`) and
+/// defaulted fields are present in the re-serialization, so they pass;
+/// defaulted fields MISSING from raw are fine — only raw-only keys are
+/// errors.
+///
+/// # Errors
+///
+/// [`ValidationErrors`] collecting every unknown field, in raw-document
+/// traversal order.
+///
+/// # Migration caveat
+///
+/// The comparison is against the value the caller holds after the migration
+/// produced the parsed document. For identity migrations (1.0.0/1.1.0 →
+/// 1.2.0) the raw keys equal the migrated keys, so comparing the submitted
+/// raw document directly is correct. A FUTURE migration that RENAMES a key
+/// must pass the migrated raw value (not the verbatim input), or the old
+/// name would be flagged as unknown.
+pub fn check_unknown_fields(
+    raw: &serde_json::Value,
+    parsed: &StrategyDsl,
+) -> Result<(), ValidationErrors> {
+    // Unreachable for a parsed `StrategyDsl`: serialization of these types
+    // can only fail on a non-finite `Decimal`, and `rust_decimal::Decimal`
+    // has no non-finite representation — so the re-serialization is total.
+    #[allow(clippy::expect_used)]
+    let current = serde_json::to_value(parsed).expect("a parsed StrategyDsl serializes");
+    let mut errors = Vec::new();
+    walk_unknown_fields(raw, &current, "", &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors { errors })
+    }
+}
+
+/// Recursive key walk: objects compare key-by-key at the same path; arrays
+/// compare element-by-element (`path[i]`); scalars carry no keys. A raw-only
+/// key (or raw-only array element) is one [`ValidationCode::UnknownField`]
+/// error; the walk CONTINUES so every unknown field is reported at once.
+fn walk_unknown_fields(
+    raw: &serde_json::Value,
+    current: &serde_json::Value,
+    path: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    match (raw, current) {
+        (serde_json::Value::Object(raw_map), serde_json::Value::Object(cur_map)) => {
+            for (key, raw_child) in raw_map {
+                if let Some(cur_child) = cur_map.get(key) {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk_unknown_fields(raw_child, cur_child, &child_path, errors);
+                } else {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    errors.push(FieldError {
+                        path: child_path,
+                        code: ValidationCode::UnknownField,
+                        message: format!(
+                            "unknown field `{key}` is not part of DSL schema {DSL_SCHEMA_VERSION}"
+                        ),
+                    });
+                }
+            }
+        }
+        (serde_json::Value::Array(raw_arr), serde_json::Value::Array(cur_arr)) => {
+            for (i, raw_child) in raw_arr.iter().enumerate() {
+                if let Some(cur_child) = cur_arr.get(i) {
+                    let child_path = format!("{path}[{i}]");
+                    walk_unknown_fields(raw_child, cur_child, &child_path, errors);
+                } else {
+                    errors.push(FieldError {
+                        path: format!("{path}[{i}]"),
+                        code: ValidationCode::UnknownField,
+                        message: format!(
+                            "unknown element at index {i}: not part of DSL schema {DSL_SCHEMA_VERSION}"
+                        ),
+                    });
+                }
+            }
+        }
+        // Scalars (and raw/current kind mismatches — unreachable after a
+        // successful deserialization) carry no keys to compare.
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 mod tests {
@@ -775,7 +891,7 @@ mod tests {
     use crate::domain::dsl::schema_version::SchemaVersion;
     use crate::domain::dsl::strategy::StrategyDsl;
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, Series, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, MacdOutput, Series, ValueSource};
     use rust_decimal::Decimal;
 
     /// The canonical demo-1 RSI-oversold strategy (the 2.02 fixture): long when
@@ -975,6 +1091,7 @@ mod tests {
                     fast: SweepableValue::Fixed(26),
                     slow: SweepableValue::Fixed(12),
                     signal: SweepableValue::Fixed(9),
+                    output: MacdOutput::Line,
                 },
             },
             op: Comparator::Gt,

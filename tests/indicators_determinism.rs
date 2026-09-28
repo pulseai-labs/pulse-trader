@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use pulse::{
-    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair, Series,
-    SweepableValue, Timeframe,
+    Candle, CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, MacdOutput,
+    Pair, Series, SweepableValue, Timeframe,
 };
 use rust_decimal::Decimal;
 
@@ -17,6 +17,8 @@ struct IndicatorSnapshot {
     ema_50: Option<Decimal>,
     adx_14: Option<Decimal>,
     macd_12_26_9: Option<Decimal>,
+    macd_signal_12_26_9: Option<Decimal>,
+    macd_hist_12_26_9: Option<Decimal>,
     atr_14: Option<Decimal>,
 }
 
@@ -24,7 +26,7 @@ fn fixed(value: u32) -> SweepableValue<u32> {
     SweepableValue::Fixed(value)
 }
 
-fn specs() -> [IndicatorSpec; 5] {
+fn specs() -> [IndicatorSpec; 7] {
     [
         IndicatorSpec::Rsi { period: fixed(14) },
         IndicatorSpec::Ema { period: fixed(50) },
@@ -33,6 +35,19 @@ fn specs() -> [IndicatorSpec; 5] {
             fast: fixed(12),
             slow: fixed(26),
             signal: fixed(9),
+            output: MacdOutput::Line,
+        },
+        IndicatorSpec::Macd {
+            fast: fixed(12),
+            slow: fixed(26),
+            signal: fixed(9),
+            output: MacdOutput::Signal,
+        },
+        IndicatorSpec::Macd {
+            fast: fixed(12),
+            slow: fixed(26),
+            signal: fixed(9),
+            output: MacdOutput::Histogram,
         },
         IndicatorSpec::Atr { period: fixed(14) },
     ]
@@ -77,7 +92,9 @@ fn run_once(candles: &[Candle]) -> Vec<IndicatorSnapshot> {
                 ema_50: current(&engine, &specs[1]),
                 adx_14: current(&engine, &specs[2]),
                 macd_12_26_9: current(&engine, &specs[3]),
-                atr_14: current(&engine, &specs[4]),
+                macd_signal_12_26_9: current(&engine, &specs[4]),
+                macd_hist_12_26_9: current(&engine, &specs[5]),
+                atr_14: current(&engine, &specs[6]),
             }
         })
         .collect()

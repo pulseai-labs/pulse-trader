@@ -336,6 +336,7 @@ mod tests {
                                 fast: SweepableValue::Fixed(12),
                                 slow: SweepableValue::Fixed(26),
                                 signal: SweepableValue::Fixed(9),
+                                output: crate::domain::MacdOutput::Line,
                             },
                         },
                         rhs: ValueSource::Constant {
