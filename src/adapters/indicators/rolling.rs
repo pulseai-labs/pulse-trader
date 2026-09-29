@@ -51,13 +51,20 @@ pub struct RollingExtremes {
 impl RollingExtremes {
     /// Build a rolling extreme over `period` candles of `source`. `period`
     /// must be ≥ 1; returns `None` on 0 (a degenerate window).
+    ///
+    /// The window grows LAZILY — one value per candle fed, never `period`
+    /// values up front. `pulse serve` accepts raw DSL over MCP from any
+    /// authenticated client, so an absurd `period` must not reserve memory for
+    /// a window that will never fill: it simply never warms (r3.s2 round-2
+    /// fix, D2 — an eager `with_capacity(period)` aborted the process on
+    /// allocation failure).
     #[must_use]
     pub fn new(period: u32, source: PriceField, highest: bool) -> Option<Self> {
         if period == 0 {
             return None;
         }
         Some(Self {
-            window: VecDeque::with_capacity(period as usize),
+            window: VecDeque::new(),
             source,
             extreme: if highest { Extreme::Max } else { Extreme::Min },
             period,
@@ -157,6 +164,34 @@ mod tests {
                 assert_eq!(out, Some(dec(*expected)), "bar {idx}: prior-3 max");
             }
         }
+    }
+
+    /// r3.s2 round-2 fix (D2): a period far larger than any series must not
+    /// pre-allocate. `pulse serve` accepts raw DSL over MCP from any
+    /// authenticated client, so `highest(high, 4294967295)` used to reserve
+    /// tens of gigabytes and abort the always-on process on allocation
+    /// failure. The window now grows with the candles fed, so an absurd N
+    /// simply never warms and the adapter stays silent.
+    #[test]
+    fn u32_max_period_does_not_abort_and_never_warms() {
+        let mut extreme =
+            RollingExtremes::new(u32::MAX, PriceField::High, true).expect("period >= 1");
+        assert!(!extreme.is_ready(), "an absurd period is never ready");
+        for idx in 0_i64..8 {
+            assert_eq!(
+                extreme.next(&candle(idx, 10 + idx, 9, 10)),
+                None,
+                "bar {idx}: a window that can never fill has no value"
+            );
+        }
+        assert!(!extreme.is_ready(), "still never ready after stepping");
+        // The regression itself: the reservation follows the candles seen, not
+        // the period (a `with_capacity(u32::MAX)` here aborts the test process).
+        assert!(
+            extreme.window.capacity() < 1024,
+            "the window must not pre-allocate for the period, capacity={}",
+            extreme.window.capacity()
+        );
     }
 
     #[test]
