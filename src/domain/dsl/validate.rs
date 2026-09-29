@@ -304,6 +304,18 @@ fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>, j
             // r3.s2.w3: the expression conditions carry their own rules (see
             // the helper) — the walk shape matches the extended path grammar.
             check_expression_condition(cond, value, *bars, path, errors);
+            // r3.s2 round-1 fix (C4): the slope carries rule 9 too. A value
+            // with no series operand is the same constant on both sides of the
+            // compiled strict compare, so the strategy can never enter — the
+            // constant-compare refusal, reached through the slope's own
+            // compiled form. `judge` follows G2 exactly as the other leaves do.
+            if judge && let Some(message) = impossibility(cond) {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::ImpossibleCondition,
+                    message,
+                });
+            }
         }
     }
 }
@@ -426,6 +438,13 @@ fn value_shape(v: &ValueSource) -> ExprContext {
             shape.has_primary |= rhs.has_primary;
             shape.has_htf |= rhs.has_htf;
             shape.has_d1 |= rhs.has_d1;
+            // A `Lag` in EITHER branch makes the whole value lagged. Merging
+            // only the series flags let a `Rising`/`Falling` over a
+            // right-hand-side lag through the refusal at the condition node,
+            // and `push_lag`'s `lag.max(bars)` — safe only because no accepted
+            // document overlaps a lag with a lag — then read the wrong bar
+            // instead of refusing (r3.s2 round-1 fix, C5).
+            shape.under_lag |= rhs.under_lag;
             shape
         }
         ValueSource::Lag { value, .. } => ExprContext {
@@ -457,12 +476,34 @@ fn impossibility(cond: &Condition) -> Option<String> {
                 )
             })
         }
-        // r3.s2.w3: a Rising/Falling leaf is never judged impossible — it is
-        // a strict compare against the value's own lagged twin, satisfiable
-        // whenever the series moves. A `Not` leaf is likewise never judged
-        // (G2).
-        Condition::Rising { .. } | Condition::Falling { .. } | Condition::Not { .. } => None,
+        // r3.s2.w3: a Rising/Falling leaf is judged only when its value cannot
+        // move — a value carrying at least one series leaf compiles to a strict
+        // compare against that value's own lagged twin, satisfiable whenever
+        // the series moves. A value with NO series leaf is the same constant on
+        // both sides, so the comparison is never true (r3.s2 round-1 fix, C4):
+        // the constant-compare refusal, reached through the slope's compiled
+        // form. A `Not` leaf is never judged (G2).
+        Condition::Rising { value, .. } => slope_never_true(value, true),
+        Condition::Falling { value, .. } => slope_never_true(value, false),
+        Condition::Not { .. } => None,
     }
+}
+
+/// Rule 9 for the slope conditions (r3.s2.w3; narrowed by the r3.s2 round-1
+/// fix, C4): `Rising`/`Falling` over a value with no series operand is a
+/// constant compared strictly against itself, which never holds. A value with
+/// any series leaf stays unjudged — the slope is satisfiable there.
+fn slope_never_true(value: &ValueSource, rising: bool) -> Option<String> {
+    let shape = value_shape(value);
+    if shape.has_primary || shape.has_htf || shape.has_d1 {
+        return None;
+    }
+    let shown = describe(value);
+    Some(format!(
+        "the constant comparison {shown} {} {shown} is never true — the value carries no \
+         series operand, so a slope over it never moves",
+        if rising { ">" } else { "<" }
+    ))
 }
 
 /// The impossibility table for one `Compare` leaf (rule 9).
@@ -691,11 +732,27 @@ fn check_value_source(
                 });
                 return;
             }
-            let mut inner = *ctx;
-            inner.depth += 1;
-            check_value_source(lhs, &format!("{path}.arith.lhs"), errors, &mut inner);
-            check_value_source(rhs, &format!("{path}.arith.rhs"), errors, &mut inner);
-            *ctx = inner;
+            // One context per SIBLING (r3.s2 round-1 fix, C3): a single shared
+            // context let the depth the `lhs` walk reached leak into the `rhs`
+            // walk, so a document with a legal four-node left branch refused
+            // any compound right branch as a fifth-level node — a shape Q2
+            // allows. Each child starts at THIS node's depth + 1 and only the
+            // series flags merge back up, so a lag's mixed-series rule still
+            // sees the whole value. `under_lag` is inherited, never raised at
+            // this node: an `Arith` is not a lag.
+            let mut left = ExprContext {
+                depth: ctx.depth + 1,
+                ..*ctx
+            };
+            check_value_source(lhs, &format!("{path}.arith.lhs"), errors, &mut left);
+            let mut right = ExprContext {
+                depth: ctx.depth + 1,
+                ..*ctx
+            };
+            check_value_source(rhs, &format!("{path}.arith.rhs"), errors, &mut right);
+            ctx.has_primary |= left.has_primary | right.has_primary;
+            ctx.has_htf |= left.has_htf | right.has_htf;
+            ctx.has_d1 |= left.has_d1 | right.has_d1;
         }
         ValueSource::Lag { value, bars } => {
             if ctx.depth >= MAX_EXPRESSION_DEPTH {

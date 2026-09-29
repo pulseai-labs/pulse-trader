@@ -817,6 +817,31 @@ fn depth_five_is_refused_with_field_range_at_the_exceeding_node() {
     }
     let dsl = base_dsl(cmp(value, Comparator::Gt, constant(0)), vec![stop_loss()]);
     validate(&dsl).expect("depth 4 is the legal maximum");
+
+    // r3.s2 round-1 fix (C3): the cap is judged PER PATH. A legal four-node
+    // left branch (root + three `lhs` nodes) must not make a compound right
+    // branch read as a fifth-level node — before the fix the depth the left
+    // walk reached leaked into the right walk and refused this document.
+    let mut deep_lhs = price(Series::Primary, PriceField::Close);
+    for _ in 0..3 {
+        deep_lhs = arith(ArithOp::Add, deep_lhs, constant(1));
+    }
+    let value = arith(
+        ArithOp::Mul,
+        deep_lhs,
+        arith(
+            ArithOp::Sub,
+            price(Series::Primary, PriceField::Close),
+            constant(2),
+        ),
+    );
+    let dsl = base_dsl(cmp(value, Comparator::Gt, constant(0)), vec![stop_loss()]);
+    let errors = validate(&dsl);
+    assert!(
+        errors.is_ok(),
+        "a four-node lhs path with a compound rhs is legal, got {:?}",
+        errors.err().map(|e| e.errors().to_vec())
+    );
 }
 
 /// (v) `bars` outside 1..=500 is refused with `FieldRange`, on `Lag` and on
@@ -982,6 +1007,124 @@ fn invalid_expressions_are_refused() {
         vec![stop_loss()],
     );
     validate(&dsl).expect("a constant never makes a value mixed");
+}
+
+/// (v) r3.s2 round-1 fix (C5): a `Lag` in EITHER `Arith` branch makes the whole
+/// value lagged, so `Rising`/`Falling` over it is refused wherever the lag sits
+/// — the merge used to drop `rhs.under_lag`, the document validated, and
+/// `push_lag`'s `lag.max(bars)` (safe only because no accepted document
+/// overlaps a lag with a lag) then read the bar at the outer lag instead of the
+/// composed one: silently different signals than the document states.
+#[test]
+fn slope_over_a_lag_in_either_branch_is_refused() {
+    // r3.s2 round-1 fix (C5): the lag sits in the RIGHT branch of the arith —
+    // still a lag under the slope, and still refused. Before the fix the merge
+    // dropped `rhs.under_lag`, the document validated, and `push_lag`'s
+    // `lag.max(bars)` read the bar at the OUTER lag instead of the composed one.
+    let dsl = base_dsl(
+        rising(
+            arith(
+                ArithOp::Sub,
+                price(Series::Primary, PriceField::Close),
+                lag(price(Series::Primary, PriceField::High), 1),
+            ),
+            2,
+        ),
+        vec![stop_loss()],
+    );
+    let errors = validate(&dsl).expect_err("Rising over a lag in the right branch must be refused");
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|e| e.code == ValidationCode::InvalidExpression),
+        "Rising over a rhs-only lag is InvalidExpression, got {:?}",
+        errors.errors()
+    );
+
+    // The same shape under `Falling` (the twin arm).
+    let dsl = base_dsl(
+        falling(
+            arith(
+                ArithOp::Add,
+                lag(price(Series::Primary, PriceField::Low), 3),
+                price(Series::Primary, PriceField::Close),
+            ),
+            1,
+        ),
+        vec![stop_loss()],
+    );
+    let errors = validate(&dsl).expect_err("Falling over a lag in the left branch must be refused");
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|e| e.code == ValidationCode::InvalidExpression),
+        "Falling over a lhs-only lag is InvalidExpression"
+    );
+
+    // A lag in NEITHER branch still validates: the rule is about lags, not
+    // about arithmetic under a slope.
+    let dsl = base_dsl(
+        rising(
+            arith(
+                ArithOp::Sub,
+                price(Series::Primary, PriceField::Close),
+                price(Series::Primary, PriceField::High),
+            ),
+            2,
+        ),
+        vec![stop_loss()],
+    );
+    validate(&dsl).expect("a slope over a lag-free arith is legal");
+}
+
+/// (v) r3.s2 round-1 fix (C4): a `Rising`/`Falling` over a value with NO series
+/// operand is the same constant on both sides of its compiled strict compare,
+/// so it can never hold — refused as `ImpossibleCondition`, the constant-compare
+/// rule reached through the slope's own compiled form (r3.s1.w2 rule 9, whose
+/// sibling shape `CrossesAbove{Constant, Constant}` is refused as
+/// `DegenerateCross`). A slope over any series operand stays legal.
+#[test]
+fn slope_over_a_constant_is_impossible() {
+    for condition in [
+        rising(constant(1), 1),
+        falling(arith(ArithOp::Mul, constant(2), constant(3)), 5),
+        // A lag over a constant is still a constant (the push-down drops it).
+        rising(lag(constant(7), 4), 1),
+    ] {
+        let dsl = base_dsl(condition, vec![stop_loss()]);
+        let errors = validate(&dsl).expect_err("a slope over a constant must be refused");
+        assert!(
+            errors
+                .errors()
+                .iter()
+                .any(|e| e.code == ValidationCode::ImpossibleCondition),
+            "a constant slope is ImpossibleCondition, got {:?}",
+            errors.errors()
+        );
+    }
+
+    // The message names the constant self-comparison, mirroring the
+    // constant-compare refusal.
+    let dsl = base_dsl(rising(constant(1), 1), vec![stop_loss()]);
+    let errors = validate(&dsl).expect_err("a slope over a constant must be refused");
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|e| e.message.contains("the constant comparison")
+                && e.message.contains("never true")),
+        "the message mirrors the constant-compare refusal, got {:?}",
+        errors.errors()
+    );
+
+    // A slope over a series operand is satisfiable and stays legal.
+    let dsl = base_dsl(
+        rising(price(Series::Primary, PriceField::Close), 1),
+        vec![stop_loss()],
+    );
+    validate(&dsl).expect("a slope over a price is legal");
 }
 
 /// (v) An MCP submit of the goal's ratio filter — `atr(14) / close < 0.02` as a
