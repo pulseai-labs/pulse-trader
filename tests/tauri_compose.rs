@@ -571,6 +571,135 @@ async fn compose_streams_steps_and_persists_an_attributable_version() {
     assert_ledger_redacted_labelled_and_attributed(&ledger, &version.creating_llm_call_ids).await;
 }
 
+/// The payload kind of each bus event, in order — the shape assertions name
+/// kinds, not payloads. Compose streams never emit `Progress`; it maps to
+/// `None` rather than being named a kind.
+fn kinds_of(events: &[BusEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            BusEventPayload::Started => Some("started"),
+            BusEventPayload::AssistantText { .. } => Some("assistantText"),
+            BusEventPayload::ToolCallStarted { .. } => Some("toolCallStarted"),
+            BusEventPayload::ToolCallResult { .. } => Some("toolCallResult"),
+            BusEventPayload::Finished { .. } => Some("finished"),
+            BusEventPayload::Progress { .. } => None,
+        })
+        .collect()
+}
+
+/// r3.s2.w5 (Q5 option 1): the composer's assistant prose reaches the bus as
+/// `assistantText` frames — one per prose-bearing provider turn, in stream
+/// order BEFORE that turn's tool events — and the scrub-then-bound seam holds
+/// at the desktop boundary: a key-shaped token in the model's prose arrives
+/// scrubbed, and a 10 000-byte turn arrives bounded with the seam's marker.
+/// The d3 shape above (every scripted turn `content: None`) is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compose_streams_assistant_text_frames_scrubbed_and_bounded() {
+    let (_tmp, db) = migrated_db().await;
+    let huge = format!("narration: {}", "x".repeat(10_000));
+    let script = vec![
+        LlmResponse {
+            content: Some(format!(
+                "Composing now; your api key {FAKE_KEY} will not be repeated."
+            )),
+            tool_calls: Vec::new(),
+            usage: usage(),
+        },
+        // The bounded turn: prose AND a tool call in one turn — the prose
+        // streams first.
+        LlmResponse {
+            content: Some(huge.clone()),
+            tool_calls: vec![ToolCall {
+                id: "c1".to_owned(),
+                name: "create_strategy".to_owned(),
+                arguments: json!({ "name": "RSI Oversold", "direction": "long" }),
+            }],
+            usage: usage(),
+        },
+        tool_turn(
+            "c2",
+            "add_entry_signal",
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": { "source": "indicator", "indicator": "highest", "period": 20, "price_field": "high" }
+            }),
+        ),
+        tool_turn(
+            "c3",
+            "set_exit_rules",
+            json!({ "stop_loss_pct": "0.01", "take_profit_r": "1.5" }),
+        ),
+        tool_turn(
+            "c4",
+            "set_risk_params",
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        ),
+        tool_turn("c5", "finalize_strategy", json!({})),
+    ];
+    let deps = fake_deps(&db, script);
+
+    let sink = Collector {
+        events: Mutex::new(Vec::new()),
+    };
+    let run_id = RunId::new();
+    let outcome = compose_strategy_core(&run_id, deps, "RSI oversold on BTC", &sink, new_latch())
+        .await
+        .expect("the scripted sequence streams and finalizes");
+    assert!(!outcome.cancelled);
+
+    let events = sink.events.lock().expect("events lock").clone();
+    assert_eq!(
+        kinds_of(&events),
+        vec![
+            "started",
+            "assistantText",
+            "assistantText",
+            "toolCallStarted",
+            "toolCallResult",
+            "toolCallStarted",
+            "toolCallResult",
+            "toolCallStarted",
+            "toolCallResult",
+            "toolCallStarted",
+            "toolCallResult",
+            "toolCallStarted",
+            "finished",
+        ],
+        "each prose-bearing turn emits one assistantText frame BEFORE its tool events"
+    );
+
+    for event in &events {
+        if let BusEventPayload::AssistantText { text } = &event.payload {
+            assert!(
+                !text.contains(FAKE_KEY),
+                "the key-shaped token in the model's prose must not reach the bus: {text}"
+            );
+            assert!(
+                text.len() <= pulse::ASSISTANT_TEXT_MAX_BYTES,
+                "the emitted text is bounded: {} bytes",
+                text.len()
+            );
+        }
+    }
+    // The bounded turn ends in the seam's truncation marker; the first turn's
+    // short prose does not.
+    let texts: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            BusEventPayload::AssistantText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(texts[0].starts_with("Composing now"));
+    assert!(!texts[0].ends_with("[truncated]"), "short prose is not cut");
+    assert!(
+        texts[1].ends_with("[truncated]"),
+        "the 10k prose is cut at the seam"
+    );
+}
+
 /// Bus contract clause 2 + spec step 4: a sink that dies MID-run is
 /// cancellation. The provider guard trips on the failed send, the composer ends
 /// with a provider error, and the core maps that to `cancelled: true` — never a

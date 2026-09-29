@@ -671,7 +671,10 @@ pub use domain::{Redactor, TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 // gotcha: the module-level `pub use` alone is necessary but NOT sufficient under
 // `deny(warnings)`; a `pub` item unused outside its private module is a `dead_code`
 // BUILD error). 2.05's `pulse compose` verb + composition root consume these.
-pub use agent::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
+pub use agent::{
+    ASSISTANT_TEXT_MAX_BYTES, ComposeOutcome, Composer, ComposerError, ComposerEvent,
+    LlmCallCapture,
+};
 
 // r1.s1.w1 (ADR-0020): the executable-topology surface. `launch_mode` is the pure
 // argv decision (`tests/entry_topology.rs` drives both directions over it);

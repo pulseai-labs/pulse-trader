@@ -39,8 +39,18 @@ import type { BusEvent, ComposeResult } from "../bindings";
 /** The finalize payload, minus the null a cancelled run carries. */
 export type StrategySummary = NonNullable<ComposeResult["strategy"]>;
 
+/**
+ * One streamed composer step: a tool call — opened by `toolCallStarted`,
+ * closed by its result — or a `note`, the composer's own scrubbed prose
+ * (r3.s2.w5, Q5 option 1), folded in WHERE it arrived between the tool steps.
+ */
+export type StepEntry =
+  | { kind: "tool"; name: string; preview: string; outcome: string | undefined }
+  | { kind: "note"; text: string };
+
 /** One streamed composer step: opened by `toolCallStarted`, closed by its result. */
-export interface StepState {
+export interface ToolStep {
+  kind: "tool";
   name: string;
   preview: string;
   outcome: string | undefined;
@@ -51,7 +61,7 @@ export type RunStatus = "streaming" | "finalized" | "cancelled" | "error";
 /** One agent message's run state — the step list and how it ended. */
 export interface AgentTurn {
   status: RunStatus;
-  steps: StepState[];
+  steps: StepEntry[];
   summary: StrategySummary | undefined;
   error: string | undefined;
 }
@@ -65,11 +75,13 @@ function clockLabel(): string {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-/** Append a tool result to the LAST open step of that name (names can repeat). */
-function attachOutcome(steps: StepState[], name: string, outcome: string): StepState[] {
+/** Append a tool result to the LAST open TOOL step of that name (names can
+ * repeat; a note never captures an outcome). */
+function attachOutcome(steps: StepEntry[], name: string, outcome: string): StepEntry[] {
   let target = -1;
   for (let i = steps.length - 1; i >= 0; i -= 1) {
-    if (steps[i].name === name && steps[i].outcome === undefined) {
+    const step = steps[i];
+    if (step.kind === "tool" && step.name === name && step.outcome === undefined) {
       target = i;
       break;
     }
@@ -78,7 +90,10 @@ function attachOutcome(steps: StepState[], name: string, outcome: string): StepS
     return steps;
   }
   const copy = steps.slice();
-  copy[target] = { ...copy[target], outcome };
+  const step = copy[target];
+  if (step.kind === "tool") {
+    copy[target] = { ...step, outcome };
+  }
   return copy;
 }
 
@@ -89,12 +104,21 @@ function applyEvent(turn: AgentTurn, payload: BusEvent["payload"]): AgentTurn {
       ...turn,
       steps: [
         ...turn.steps,
-        { name: payload.name, preview: payload.argumentsPreview, outcome: undefined },
+        {
+          kind: "tool",
+          name: payload.name,
+          preview: payload.argumentsPreview,
+          outcome: undefined,
+        },
       ],
     };
   }
   if (payload.kind === "toolCallResult") {
     return { ...turn, steps: attachOutcome(turn.steps, payload.name, payload.outcome) };
+  }
+  if (payload.kind === "assistantText") {
+    // The composer's own prose (r3.s2.w5): a note entry in stream order.
+    return { ...turn, steps: [...turn.steps, { kind: "note", text: payload.text }] };
   }
   return turn;
 }

@@ -1035,6 +1035,7 @@ where
             ComposerEvent::ToolCallResult { name, outcome } => {
                 BusEventPayload::ToolCallResult { name, outcome }
             }
+            ComposerEvent::AssistantText { text } => BusEventPayload::AssistantText { text },
             ComposerEvent::Finalized { version_summary } => BusEventPayload::Finished {
                 message: version_summary,
             },

@@ -156,6 +156,12 @@
 .cc-summary {
   color: var(--text-2);
   flex: 1;
+  /* Same one-line honesty as `.vnode-summary` (r3.s2.w5, #193): the summary
+     now carries the whole strategy line, so the collapsed card truncates it
+     visually; the full text rides the `title` attribute. */
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
 }
 .cc-kpis {
   display: flex;

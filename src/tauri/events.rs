@@ -103,6 +103,16 @@ pub enum BusEventPayload {
         /// The `Ok` summary or the serialized correctable errors.
         outcome: String,
     },
+    /// The composer's own prose for one turn (r3.s2.w5, Q5 option 1).
+    ///
+    /// Mirrors
+    /// [`ComposerEvent::AssistantText`](crate::agent::ComposerEvent) — the
+    /// text has already crossed the scrub-then-bound seam inside the composer,
+    /// so what rides the bus is safe to display and store.
+    AssistantText {
+        /// The scrubbed, bounded assistant text.
+        text: String,
+    },
     /// The run finished successfully. Always the last event on a channel.
     ///
     /// For a compose run (r1.s1.w4) the closing summary is the composer's own

@@ -262,7 +262,10 @@ function StrategyCard({
           <div className="scard-collapsed">
             <span className="cc-label">latest</span>
             <span className="cc-name">{labels.get(latest.id)}</span>
-            <span className="cc-summary">{summaryLine(latest)}</span>
+            {/* Same #193 honesty as the node line: full text on hover. */}
+            <span className="cc-summary" title={summaryLine(latest)}>
+              {summaryLine(latest)}
+            </span>
             <span className="cc-kpis mono">
               <Kpis stats={latest.stats} />
             </span>
@@ -470,7 +473,11 @@ function VersionNode({
       {version.hypothesis !== null && (
         <div className="vnode-hypothesis">{version.hypothesis}</div>
       )}
-      <div className="vnode-summary">{summaryLine(version)}</div>
+      {/* #193 (r3.s2.w5): the full line rides the `title`; the stylesheet's
+          ellipsis truncates it to the node's width. */}
+      <div className="vnode-summary" title={summaryLine(version)}>
+        {summaryLine(version)}
+      </div>
       <div className="vnode-kpis mono">
         <Kpis stats={version.stats} />
       </div>
@@ -649,10 +656,14 @@ function provenanceLine(version: LibraryVersion): string {
     : version.createdBy;
 }
 
-/** A version's one-line summary from its own DSL fields. */
+/** A version's one-line summary from its own DSL fields (r3.s2.w5, #193): the
+ * whole rendered strategy — direction · entry · filters · exits — so a
+ * filtered/exit-bearing version is recognisable from its node line alone. The
+ * node truncates it visually (the stylesheet's ellipsis); the full line rides
+ * the element's `title` attribute. */
 function summaryLine(version: LibraryVersion): string {
-  const entry = version.dsl.entry[0] ?? "(no entry)";
-  return `${version.dsl.direction} · ${entry}`;
+  const dsl = version.dsl;
+  return [dsl.direction, ...dsl.entry, ...dsl.filters, ...dsl.exits].join(" · ");
 }
 
 /** The `YYYY-MM-DD` slice of an RFC3339 timestamp — the record's own date. */
