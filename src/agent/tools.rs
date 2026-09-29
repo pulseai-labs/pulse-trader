@@ -680,6 +680,7 @@ mod mapping {
             // lag, bar ranges) are NOT re-checked here — `validate()` runs them
             // at finalize and the composer reports them at this same path.
             "arith" => {
+                reject_compound_timeframe(operand, path)?;
                 let arith_op = arith_op(operand.op.as_deref(), path)?;
                 let lhs = operand_to_value_source(
                     operand.lhs.as_deref().ok_or_else(|| {
@@ -708,6 +709,7 @@ mod mapping {
                 })
             }
             "lag" => {
+                reject_compound_timeframe(operand, path)?;
                 let bars = operand.bars.ok_or_else(|| {
                     field_error(
                         format!("{path}.bars"),
@@ -738,6 +740,24 @@ mod mapping {
                 ),
             )),
         }
+    }
+
+    /// Refuse a `timeframe` on a COMPOUND operand (r3.s2 round-1 fix, C6): an
+    /// `arith`/`lag` derivation takes its series from its leaves, so an outer
+    /// tag could only be dropped — and a silently dropped series is a different
+    /// strategy than the caller asked for (#160's silent-substitution class,
+    /// the rule the constant arm already enforces). Correctable, pathed at the
+    /// operand's own `timeframe`.
+    fn reject_compound_timeframe(operand: &Operand, path: &str) -> Result<(), FieldError> {
+        if operand.timeframe.is_some() {
+            return Err(field_error(
+                format!("{path}.timeframe"),
+                ValidationCode::FieldRange,
+                "an arith/lag operand takes its series from its operands — drop `timeframe` \
+                 here and set it on the leaves",
+            ));
+        }
+        Ok(())
     }
 
     /// Map the flat `arith` `op` string to a tagged [`ArithOp`].
@@ -967,7 +987,7 @@ fn operand_schema_level(nested: &Value) -> Value {
             "timeframe": {
                 "type": "string",
                 "enum": ["primary", "h4", "d1"],
-                "description": "series the operand is evaluated on; \"h4\" uses the last closed H4 bar, \"d1\" the last closed daily bar, omit for the primary series"
+                "description": "series the operand is evaluated on — indicator and price operands only; \"h4\" uses the last closed H4 bar, \"d1\" the last closed daily bar, omit for the primary series. A constant, arith or lag operand takes its series from its operands, so a `timeframe` on one is refused, never dropped"
             },
             "period": { "type": "integer", "minimum": 1 },
             "fast": { "type": "integer", "minimum": 1 },
@@ -1445,6 +1465,84 @@ mod tests {
                 "left": { "source": "price", "price_field": "close", "timeframe": "h4" },
                 "op": "gt",
                 "right": { "source": "constant", "value": "100" }
+            }),
+        ));
+    }
+
+    /// r3.s2 round-1 fix (C6): a `timeframe` on a COMPOUND operand (`arith` /
+    /// `lag`) is a correctable `FieldError` pathed at that operand — never a
+    /// silent drop. The advertised operand schema carries `timeframe` on every
+    /// shape, but a derivation takes its series from its leaves, so an outer
+    /// tag could only be ignored: the composed strategy would silently differ
+    /// from the request (pulse-trader#160's silent-substitution class, the rule
+    /// the `constant` arm already enforces).
+    #[test]
+    fn compound_operand_timeframe_is_correctable_not_dropped() {
+        let mut builder = StrategyBuilder::new();
+        // An outer `d1` on an `arith` whose leaves are untagged.
+        let outcome = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": {
+                    "source": "arith", "op": "div", "timeframe": "d1",
+                    "lhs": { "source": "price", "price_field": "close" },
+                    "rhs": { "source": "constant", "value": "2" }
+                },
+                "op": "gt",
+                "right": { "source": "constant", "value": "100" }
+            }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.path == "left.timeframe"),
+                    "the outer tag must be pathed at `left.timeframe`, got {errors:?}"
+                );
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!(
+                    "an outer `timeframe` on an arith must be a correctable Err, not a silent drop"
+                )
+            }
+        }
+
+        // The same tag one level deeper, inside a `lag`'s `of` operand.
+        let mut builder = StrategyBuilder::new();
+        let outcome = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": {
+                    "source": "lag", "bars": 2, "timeframe": "h4",
+                    "of": { "source": "price", "price_field": "close", "timeframe": "h4" }
+                }
+            }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.path == "right.timeframe"),
+                    "the tag on the lag itself must be pathed at `right.timeframe`, got {errors:?}"
+                );
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!("an outer `timeframe` on a lag must be a correctable Err, not a silent drop")
+            }
+        }
+
+        // The tag on the LEAF stays legal: only the derivation is refused.
+        let mut builder = StrategyBuilder::new();
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": {
+                    "source": "arith", "op": "sub",
+                    "lhs": { "source": "price", "price_field": "close", "timeframe": "d1" },
+                    "rhs": { "source": "price", "price_field": "close", "timeframe": "d1" }
+                },
+                "op": "gt",
+                "right": { "source": "constant", "value": "0" }
             }),
         ));
     }
