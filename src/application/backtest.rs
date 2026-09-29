@@ -335,6 +335,23 @@ pub enum BacktestAppError {
         field: &'static str,
     },
 
+    /// The request's PRIMARY timeframe is `D1` (r3.s2 round-1 fix, C1). The
+    /// daily series is the run's fixed *third* series — read only through
+    /// `series: "d1"` operands, never a run's primary — and a daily primary
+    /// would also make the money math wrong: `stamp_funding` keeps only the
+    /// LAST of a day's three 8-hourly funding events per candle, so a D1
+    /// primary would accrue one event a day instead of three and understate
+    /// every funding total (net `PnL`, R, the walk-forward verdict). Refused
+    /// before any candle I/O, with `field` pointing at the member to change.
+    #[error(
+        "{field} must not be D1 — the daily series is fixed and read through `series: \"d1\"` \
+         operands, never as a run's primary time frame"
+    )]
+    PrimaryIsD1 {
+        /// The request/input field at fault — always `"primary_timeframe"`.
+        field: &'static str,
+    },
+
     /// The strategy carries a `series: "d1"` operand but no D1 snapshot exists
     /// to load (r3.s2.w4) — the daily-series mirror of
     /// [`BacktestAppError::HtfRequired`], naming the fetch command that
@@ -713,8 +730,11 @@ struct EngineOutput {
 ///
 /// # Errors
 ///
-/// [`BacktestAppError::HtfRequired`] when the strategy needs a
-/// higher-timeframe series the request does not supply;
+/// [`BacktestAppError::PrimaryIsD1`] when the primary timeframe is the fixed
+/// daily one (r3.s2 round-1 fix, C1 — a D1 primary would mis-accrue funding);
+/// [`BacktestAppError::HtfIsD1`] when the supplied higher-timeframe selection
+/// is the fixed daily one; [`BacktestAppError::HtfRequired`] when the strategy
+/// needs a higher-timeframe series the request does not supply;
 /// [`BacktestAppError::HtfNotHigher`] when the supplied selection is not
 /// strictly higher than the primary timeframe.
 pub fn check_request_shape(
@@ -722,6 +742,17 @@ pub fn check_request_shape(
     primary_tf: Timeframe,
     htf_tf: Option<Timeframe>,
 ) -> Result<(), BacktestAppError> {
+    // r3.s2 round-1 fix (C1): D1 is never a run's PRIMARY either — the fixed
+    // daily series is read through `series: "d1"` operands. Checked first
+    // because a daily primary passes every later rule (24h is strictly higher
+    // than nothing, and the funding-gap walk tolerates daily spacing), yet it
+    // would accrue at most one of each day's three funding events and
+    // understate every funding total.
+    if primary_tf == Timeframe::D1 {
+        return Err(BacktestAppError::PrimaryIsD1 {
+            field: "primary_timeframe",
+        });
+    }
     // r3.s2.w4: D1 is never a higher timeframe — the run's daily series is
     // fixed, and an HTF selection of the same interval would collide with it.
     // Checked BEFORE the cadence rule (which D1 passes: 24h > 15m) so the

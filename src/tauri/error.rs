@@ -231,8 +231,10 @@ impl From<BacktestAppError> for BusError {
             | BacktestAppError::HtfNotHigher { .. }
             // r3.s2.w4: a D1-as-HTF selection and a missing D1 snapshot are
             // the same caller-correctable family (`inputs.htf` / `inputs.d1`)
-            // — `validation`, not `backtest`.
+            // — `validation`, not `backtest`. r3.s2 round-1 fix (C1) joins
+            // them with a D1 PRIMARY, whose field is `primary_timeframe`.
             | BacktestAppError::HtfIsD1 { .. }
+            | BacktestAppError::PrimaryIsD1 { .. }
             | BacktestAppError::D1Required { .. }
             // r2.s2 round-2 fix G1 + round-5: a different-pair or stale
             // (too-short) HTF series refusal is the same caller-correctable

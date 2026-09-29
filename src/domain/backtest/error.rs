@@ -99,6 +99,23 @@ pub enum BacktestError {
     #[error("strategy requires a higher-timeframe candle series (series: \"htf\" operand present)")]
     HtfRequired,
 
+    /// The PRIMARY series handed to the engine is the daily one (r3.s2 round-1
+    /// fix, C1). The daily series is the run's fixed *third* series — read
+    /// through `series: "d1"` operands only, never a run's primary. A daily
+    /// primary would also mis-accrue funding (`stamp_funding` keeps only the
+    /// last of a day's three 8-hourly events per candle), so every funding
+    /// total would be understated. The request boundary refuses such a request
+    /// before any candle I/O ([`BacktestAppError::PrimaryIsD1`] — the
+    /// application layer's variant); this arm is the engine-level defence for
+    /// callers that construct the series directly.
+    ///
+    /// [`BacktestAppError::PrimaryIsD1`]: crate::application::BacktestAppError::PrimaryIsD1
+    #[error(
+        "the primary series must not be D1 — the daily series is fixed and read through \
+         `Series::D1` operands, never as a run's primary time frame"
+    )]
+    PrimaryIsD1,
+
     /// The supplied higher-timeframe series is not strictly higher than the
     /// primary series (`htf.duration_ms() <= primary.duration_ms()`). An equal
     /// or lower interval would advance `Series::Htf` operands on the wrong

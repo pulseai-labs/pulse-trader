@@ -890,6 +890,54 @@ async fn d1_as_the_htf_refuses_before_any_io() {
     }
 }
 
+/// (iii-d) a request whose PRIMARY timeframe is D1 refuses `PrimaryIsD1` at the
+/// request boundary (r3.s2 round-1 fix, C1) — before any store read, so the
+/// store's lack of a D1 snapshot cannot mask it. D1 is the run's fixed
+/// *signal-only* third series, never a run's primary: a daily primary would
+/// also accrue at most one of each day's three 8-hourly funding events
+/// (`stamp_funding` keeps the last), understating every funding total.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d1_as_the_primary_refuses_before_any_io() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open db");
+    MIGRATOR.run(db.pool()).await.expect("run migrations");
+    let version = seed_version(&db, "primary-only-d1", PRIMARY_ONLY_DSL).await;
+
+    let store_dir = tmp.path().join("store");
+    seed_store(store_dir.clone(), false);
+    let store = CandleStore::with_base_dir(store_dir);
+    let err = run_version_backtest(
+        &SqliteStrategyRepo::new(db.pool().clone()),
+        &store,
+        &BinanceAdapter::new(),
+        &SqliteBacktestRunRepo::new(db.pool().clone()),
+        &BacktestRequest {
+            version_id: version,
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::D1,
+            htf_timeframe: None,
+            config: BacktestConfig::default(),
+            snapshots: None,
+            window: None,
+        },
+    )
+    .await
+    .expect_err("a D1 primary timeframe must refuse");
+
+    match &err {
+        BacktestAppError::PrimaryIsD1 { field } => {
+            assert_eq!(*field, "primary_timeframe");
+            assert!(
+                err.to_string().contains("D1"),
+                "the refusal must name D1; was: {err}"
+            );
+        }
+        other => panic!("expected PrimaryIsD1, got {other:?}"),
+    }
+}
+
 /// (iii-c) + (vi's recording half): a no-`d1` strategy over a D1-less store
 /// runs, and records `inputs.d1 = None` — nothing loaded, nothing recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -245,3 +245,40 @@ fn backtest_cli_missing_dsl_errors_non_zero() {
         "the error must be surfaced via the binary shim (no panic); stderr was:\n{stderr}"
     );
 }
+
+/// r3.s2 round-1 fix (C1): `--tf 1d` is refused by the request-shape guard
+/// BEFORE any candle I/O. D1 is the fixed *signal-only* third series, read
+/// through `series: "d1"` operands only, and a D1 primary would accrue at most
+/// one of each day's three 8-hourly funding events (`stamp_funding` keeps the
+/// last) — every funding total, and so net `PnL` and R, would be understated.
+/// The refusal names the member, so the user sees why rather than a
+/// missing-snapshot error.
+#[test]
+fn d1_primary_timeframe_is_refused_before_any_store_read() {
+    let (_dir, dsl_path) = write_minimal_dsl();
+    let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "backtest",
+            "--dsl",
+            &dsl_path,
+            "--pair",
+            "BTCUSDT",
+            "--tf",
+            "1d",
+            "--store",
+            "tests/fixtures/btcusdt-1m-store",
+        ])
+        .output()
+        .expect("run pulse backtest with a D1 primary");
+
+    assert!(
+        !output.status.success(),
+        "a D1 primary timeframe must exit non-zero; stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must not be D1"),
+        "the refusal must name the D1 primary; stderr was:\n{stderr}"
+    );
+}

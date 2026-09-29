@@ -106,6 +106,15 @@ pub fn run_backtest(
     count_from_ms: Option<i64>,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
+    // r3.s2 round-1 fix (C1): the engine's mirror of the app ring's
+    // `PrimaryIsD1` refusal — the primary is never the fixed daily series.
+    // A direct caller that builds the series itself gets the same refusal, and
+    // it lands before anything is computed: a daily primary would accrue at
+    // most one of each day's three funding events (`stamp_funding` keeps the
+    // last) and understate every funding total.
+    if primary.timeframe == Timeframe::D1 {
+        return Err(BacktestError::PrimaryIsD1);
+    }
     // Input guards (r3.s1.w3): structural soundness of the primary and — when
     // handed — the htf and d1 series, then the funding-order precondition over
     // the primary's counted span, all before any strategy precondition or
@@ -1856,6 +1865,53 @@ mod tests {
 
     fn base_strategy() -> CompiledStrategy {
         compiled(price_entry(), vec![stop(), tp(10)])
+    }
+
+    /// r3.s2 round-1 fix (C1): the engine mirror of the app ring's
+    /// `PrimaryIsD1` refusal — a primary series whose timeframe is the fixed
+    /// daily one is refused before anything is computed. A D1 primary would
+    /// accrue at most one of each day's three funding events (`stamp_funding`
+    /// keeps the last), understating every funding total; the request boundary
+    /// refuses the same shape before any candle I/O.
+    #[test]
+    fn d1_primary_series_is_refused_before_any_computation() {
+        let day = Timeframe::D1.duration_ms();
+        let primary = CandleSeries {
+            pair: Pair::new("BTCUSDT"),
+            timeframe: Timeframe::D1,
+            version: DataVersion::new("d1-primary"),
+            candles: (0..3)
+                .map(|i| {
+                    let open_time = i * day;
+                    Candle {
+                        open_time,
+                        close_time: open_time + day - 1,
+                        open: d(100),
+                        high: d(101),
+                        low: d(99),
+                        close: d(100),
+                        volume: Decimal::ONE,
+                        funding_rate: None,
+                    }
+                })
+                .collect(),
+        };
+        let err = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+            None,
+        )
+        .expect_err("a D1 primary series must be refused");
+        assert_eq!(
+            err,
+            BacktestError::PrimaryIsD1,
+            "the refusal must be the D1-primary guard, not a downstream error"
+        );
     }
 
     #[test]

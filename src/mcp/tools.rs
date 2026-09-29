@@ -428,11 +428,13 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         // two HTF variants (r2.s2.w2, round-1 fix F1), `"inputs.d1"` for a
         // strategy that reads D1 with no D1 snapshot, `"inputs.htf"` for a
         // request that selects D1 AS the HTF (r3.s2.w4: it would collide with
-        // the fixed `d1` slot, and it is refused before any load) — so all four
-        // surface it verbatim.
+        // the fixed `d1` slot, and it is refused before any load), and
+        // `"primary_timeframe"` for a request whose PRIMARY is D1 (r3.s2
+        // round-1 fix, C1) — so all five surface it verbatim.
         BacktestAppError::HtfRequired { field }
         | BacktestAppError::HtfNotHigher { field, .. }
         | BacktestAppError::D1Required { field, .. }
+        | BacktestAppError::PrimaryIsD1 { field }
         | BacktestAppError::HtfIsD1 { field } => field_error(field, err),
         // A different-pair or stale (too-short) series is refused by the ENGINE
         // (the request carries one pair, so no app-layer variant exists), which
