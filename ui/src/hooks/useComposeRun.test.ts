@@ -26,10 +26,15 @@ vi.mock("../bindings", () => ({
   },
 }));
 
-import { useComposeRun } from "./useComposeRun";
+import { useComposeRun, type StepEntry } from "./useComposeRun";
 
 /** The hook's current snapshot, for helper signatures. */
 type Hook = ReturnType<typeof useComposeRun>;
+
+/** The tool-call entries of a step list, narrowed (notes excluded). */
+function toolSteps(turn: { steps: StepEntry[] }): Extract<StepEntry, { kind: "tool" }>[] {
+  return turn.steps.filter((step): step is Extract<StepEntry, { kind: "tool" }> => step.kind === "tool");
+}
 
 /** One streamed event, at `seq`, on the run under test. */
 function event(seq: number, payload: BusEvent["payload"]): BusEvent {
@@ -151,7 +156,7 @@ describe("useComposeRun", () => {
       );
     });
     expect(lastTurn(result).steps).toEqual([
-      { name: "add_entry_signal", preview: "rsi(14) < 30", outcome: undefined },
+      { kind: "tool", name: "add_entry_signal", preview: "rsi(14) < 30", outcome: undefined },
     ]);
 
     // Its result closes the same step.
@@ -160,7 +165,7 @@ describe("useComposeRun", () => {
         event(2, { kind: "toolCallResult", name: "add_entry_signal", outcome: "entry signal added" }),
       );
     });
-    expect(lastTurn(result).steps[0]?.outcome).toBe("entry signal added");
+    expect(toolSteps(lastTurn(result))[0]?.outcome).toBe("entry signal added");
 
     // A repeated tool name opens a SECOND step of that name; each result must
     // attach to the LAST open one, leaving the earlier step untouched.
@@ -174,26 +179,65 @@ describe("useComposeRun", () => {
         event(4, { kind: "toolCallStarted", name: "add_filter", argumentsPreview: "volume > ma(20)" }),
       );
     });
-    expect(lastTurn(result).steps.map((step) => step.preview)).toEqual([
-      "rsi(14) < 30",
-      "close > ema(200)",
-      "volume > ma(20)",
-    ]);
+    expect(
+      lastTurn(result)
+        .steps.map((step) => (step.kind === "tool" ? step.preview : "(note)")),
+    ).toEqual(["rsi(14) < 30", "close > ema(200)", "volume > ma(20)"]);
 
     await act(async () => {
       channel.onmessage?.(
         event(5, { kind: "toolCallResult", name: "add_filter", outcome: "filter added (volume)" }),
       );
     });
-    expect(lastTurn(result).steps[2]?.outcome).toBe("filter added (volume)");
-    expect(lastTurn(result).steps[1]?.outcome).toBeUndefined();
+    expect(toolSteps(lastTurn(result))[2]?.outcome).toBe("filter added (volume)");
+    expect(toolSteps(lastTurn(result))[1]?.outcome).toBeUndefined();
 
     await act(async () => {
       channel.onmessage?.(
         event(6, { kind: "toolCallResult", name: "add_filter", outcome: "filter added (trend)" }),
       );
     });
-    expect(lastTurn(result).steps[1]?.outcome).toBe("filter added (trend)");
+    expect(toolSteps(lastTurn(result))[1]?.outcome).toBe("filter added (trend)");
+  });
+
+  it("folds an assistantText payload into a note entry in order, and no result ever attaches to a note", async () => {
+    const { result } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    await act(async () => {
+      channel.onmessage?.(
+        event(1, { kind: "toolCallStarted", name: "add_entry_signal", argumentsPreview: "rsi(14) < 30" }),
+      );
+    });
+    // The composer's prose lands BETWEEN the two tool steps, verbatim.
+    await act(async () => {
+      channel.onmessage?.(
+        event(2, { kind: "assistantText", text: "Entry set; adding the trend filter next." }),
+      );
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(3, { kind: "toolCallStarted", name: "add_filter", argumentsPreview: "close > ema(200)" }),
+      );
+    });
+    expect(lastTurn(result).steps).toEqual([
+      { kind: "tool", name: "add_entry_signal", preview: "rsi(14) < 30", outcome: undefined },
+      { kind: "note", text: "Entry set; adding the trend filter next." },
+      { kind: "tool", name: "add_filter", preview: "close > ema(200)", outcome: undefined },
+    ]);
+
+    // The result names add_entry_signal — the note must not capture it.
+    await act(async () => {
+      channel.onmessage?.(
+        event(4, { kind: "toolCallResult", name: "add_entry_signal", outcome: "entry signal added" }),
+      );
+    });
+    expect(toolSteps(lastTurn(result))[0]?.outcome).toBe("entry signal added");
+    expect(lastTurn(result).steps[1]).toEqual({
+      kind: "note",
+      text: "Entry set; adding the trend filter next.",
+    });
   });
 
   it("a finalized run keeps the returned summary and clears the running state", async () => {
@@ -281,7 +325,7 @@ describe("useComposeRun", () => {
       channel.onmessage?.(otherRunEvent(2, started("add_filter", "close > ema(200)")));
     });
     expect(lastTurn(result).steps).toHaveLength(1);
-    expect(lastTurn(result).steps[0]?.preview).toBe("rsi(14) < 30");
+    expect(toolSteps(lastTurn(result))[0]?.preview).toBe("rsi(14) < 30");
     expect(lastTurn(result).status).toBe("streaming");
   });
 
@@ -394,7 +438,7 @@ describe("useComposeRun", () => {
     const turn = lastTurn(result);
     expect(turn.status).toBe("streaming");
     expect(turn.steps).toHaveLength(1);
-    expect(turn.steps[0]?.preview).toBe("rsi(14) < 30");
+    expect(toolSteps(turn)[0]?.preview).toBe("rsi(14) < 30");
   });
 
   it("a first event past the tolerated baseline is a gap, not a new baseline", async () => {

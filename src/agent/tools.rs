@@ -101,16 +101,22 @@ fn parse_operand(path: &'static str, value: Value) -> Result<mapping::Operand, F
     })
 }
 
-/// Parse the `{ left, right }` operand pair, collecting every parse failure so
+/// Parse the `{ left, right? }` operand pair, collecting every parse failure so
 /// a call with two malformed operands reports both at once (the same
-/// collect-all-errors convention [`mapping::build_condition`] follows).
+/// collect-all-errors convention [`mapping::build_signal`] follows).
 fn parse_operand_pair(
     left: Value,
-    right: Value,
-) -> Result<(mapping::Operand, mapping::Operand), Vec<FieldError>> {
-    match (parse_operand("left", left), parse_operand("right", right)) {
-        (Ok(left), Ok(right)) => Ok((left, right)),
-        (left, right) => Err([left, right].into_iter().filter_map(Result::err).collect()),
+    right: Option<Value>,
+) -> Result<(mapping::Operand, Option<mapping::Operand>), Vec<FieldError>> {
+    let parsed_left = parse_operand("left", left);
+    let parsed_right = right.map(|value| parse_operand("right", value));
+    match (parsed_left, parsed_right) {
+        (Ok(left), None) => Ok((left, None)),
+        (Ok(left), Some(Ok(right))) => Ok((left, Some(right))),
+        (left, right) => Err([left.err(), right.and_then(Result::err)]
+            .into_iter()
+            .flatten()
+            .collect()),
     }
 }
 
@@ -160,8 +166,8 @@ pub(crate) fn create_strategy(builder: &mut StrategyBuilder, args: Value) -> Too
     }
 }
 
-/// `add_entry_signal { left, op, right }` — assemble a tagged [`Condition`] and
-/// set (replace) it as the entry trigger.
+/// `add_entry_signal { left, op, right?, bars? }` — assemble a tagged
+/// [`Condition`] and set (replace) it as the entry trigger.
 pub(crate) fn add_entry_signal(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
     let args: SignalArgs = match parse_args(args) {
         Ok(parsed) => parsed,
@@ -171,7 +177,7 @@ pub(crate) fn add_entry_signal(builder: &mut StrategyBuilder, args: Value) -> To
         Ok(pair) => pair,
         Err(errors) => return ToolOutcome::Err { errors },
     };
-    match mapping::build_condition(&left, &args.op, &right) {
+    match mapping::build_signal(&left, &args.op, right.as_ref(), args.bars) {
         Ok(condition) => {
             builder.set_entry(condition);
             ToolOutcome::Ok {
@@ -182,8 +188,8 @@ pub(crate) fn add_entry_signal(builder: &mut StrategyBuilder, args: Value) -> To
     }
 }
 
-/// `add_filter { left, op, right }` — assemble a tagged [`Condition`] and
-/// **append** it (AND-conjoined per the `StrategyDsl` convention).
+/// `add_filter { left, op, right?, bars? }` — assemble a tagged [`Condition`]
+/// and **append** it (AND-conjoined per the `StrategyDsl` convention).
 pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
     let args: SignalArgs = match parse_args(args) {
         Ok(parsed) => parsed,
@@ -193,7 +199,7 @@ pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutc
         Ok(pair) => pair,
         Err(errors) => return ToolOutcome::Err { errors },
     };
-    match mapping::build_condition(&left, &args.op, &right) {
+    match mapping::build_signal(&left, &args.op, right.as_ref(), args.bars) {
         Ok(condition) => {
             builder.push_filter(condition);
             ToolOutcome::Ok {
@@ -360,18 +366,23 @@ struct CreateStrategyArgs {
     direction: String,
 }
 
-/// `add_entry_signal` / `add_filter` args (flat `{ left, op, right }`).
+/// `add_entry_signal` / `add_filter` args (flat `{ left, op, right?, bars? }`).
 ///
 /// `left`/`right` stay raw [`Value`]s so each operand parses on its own: a
 /// `deny_unknown_fields` failure inside an operand is then pathed at `left` /
 /// `right` instead of collapsing into the unlocalized whole-struct
-/// `arguments` error (r2.s2 round-1 fix F7).
+/// `arguments` error (r2.s2 round-1 fix F7). `right` is OPTIONAL (r3.s2.w5):
+/// the `rising` / `falling` slope ops take a single value and no `right`;
+/// `bars` is their window, defaulting to 1.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignalArgs {
     left: Value,
     op: String,
-    right: Value,
+    #[serde(default)]
+    right: Option<Value>,
+    #[serde(default)]
+    bars: Option<u32>,
 }
 
 /// `set_exit_rules` args — flat scalar fields; `Decimal`s are carried as JSON
@@ -430,7 +441,7 @@ mod mapping {
     use serde::Deserialize;
 
     use crate::domain::{
-        Comparator, Condition, FieldError, IndicatorSpec, MacdOutput, PriceField, Series,
+        ArithOp, Comparator, Condition, FieldError, IndicatorSpec, MacdOutput, PriceField, Series,
         SweepableValue, ValidationCode, ValueSource,
     };
 
@@ -480,11 +491,27 @@ mod mapping {
         value: Option<Decimal>,
         // The TOOL boundary names it `timeframe`; the DSL names it `series`
         // (SPINE.md grill ruling 1) — this field is the only translation point.
-        // `"h4"` selects the run's higher-timeframe series (`Series::Htf`);
-        // `"primary"` or absent is the primary series. No `timeframe` word ever
-        // reaches a DSL type.
+        // `"h4"` selects the run's higher-timeframe series (`Series::Htf`),
+        // `"d1"` the daily series (`Series::D1`, r3.s2.w5); `"primary"` or
+        // absent is the primary series. No `timeframe` word ever reaches a
+        // DSL type.
         #[serde(default)]
         timeframe: Option<String>,
+        // `arith` only (r3.s2.w5): the pointwise operation, `add|sub|mul|div`.
+        #[serde(default)]
+        op: Option<String>,
+        // `arith` only: the left/right side of the pointwise operation. Boxed
+        // to keep the recursive type sized.
+        #[serde(default)]
+        lhs: Option<Box<Operand>>,
+        #[serde(default)]
+        rhs: Option<Box<Operand>>,
+        // `lag` only: the operand to lag (`of`, so it cannot collide with a
+        // constant's `value`) and how many closed bars back, `1..=500`.
+        #[serde(default)]
+        of: Option<Box<Operand>>,
+        #[serde(default)]
+        bars: Option<u32>,
     }
 
     /// The comparator/cross the flat `op` string selects.
@@ -492,22 +519,70 @@ mod mapping {
         Compare(Comparator),
         CrossesAbove,
         CrossesBelow,
+        Rising,
+        Falling,
     }
 
-    /// Assemble `{ left, op, right }` flat primitives into a tagged
+    /// Assemble `{ left, op, right?, bars? }` flat primitives into a tagged
     /// [`Condition`], collecting **every** correctable field error (fast
-    /// correctable feedback, FR-3). The non-degenerate-cross local check mirrors
-    /// [`validate`](crate::domain::validate) rule 2 for immediate feedback; the
-    /// whole-document validator re-checks it at finalize.
-    pub(super) fn build_condition(
+    /// correctable feedback, FR-3).
+    ///
+    /// The op/`right` shape rules are TOOL-BOUNDARY argument-shape rules, not
+    /// DSL rules: `rising`/`falling` take a single value (`right` must be
+    /// absent; `bars` defaults to 1 — r3.s2.w5), every other op requires a
+    /// `right`, and `bars` on a non-slope op is refused rather than silently
+    /// dropped (the silent-substitution class, #160). The DSL's own expression
+    /// rules (nesting depth ≤ 4, rising/falling over a lag, bar ranges) are NOT
+    /// duplicated here — [`validate`](crate::domain::validate) enforces them at
+    /// finalize and the composer reports them at the operand's path.
+    pub(super) fn build_signal(
         left: &Operand,
         op: &str,
-        right: &Operand,
+        right: Option<&Operand>,
+        bars: Option<u32>,
     ) -> Result<Condition, Vec<FieldError>> {
         let mut errors = Vec::new();
         let lhs = collect(operand_to_value_source(left, "left"), &mut errors);
-        let rhs = collect(operand_to_value_source(right, "right"), &mut errors);
         let parsed_op = collect(parse_op(op), &mut errors);
+        let slope = matches!(parsed_op, Some(Op::Rising | Op::Falling));
+        let rhs = right
+            .and_then(|operand| collect(operand_to_value_source(operand, "right"), &mut errors));
+        if slope {
+            if right.is_some() {
+                errors.push(field_error(
+                    "right",
+                    ValidationCode::FieldRange,
+                    "a rising/falling condition takes no `right` operand — drop it",
+                ));
+            }
+            let (Some(lhs), Some(parsed_op)) = (lhs, parsed_op) else {
+                return Err(errors);
+            };
+            if !errors.is_empty() {
+                return Err(errors);
+            }
+            let value = Box::new(lhs);
+            let bars = bars.unwrap_or(1);
+            return match parsed_op {
+                Op::Rising => Ok(Condition::Rising { value, bars }),
+                Op::Falling => Ok(Condition::Falling { value, bars }),
+                _ => unreachable!("slope is true only for Rising/Falling"),
+            };
+        }
+        if right.is_none() {
+            errors.push(field_error(
+                "right",
+                ValidationCode::FieldRange,
+                "a comparison or cross requires a `right` operand",
+            ));
+        }
+        if bars.is_some() {
+            errors.push(field_error(
+                "bars",
+                ValidationCode::FieldRange,
+                "`bars` only applies to the rising|falling ops",
+            ));
+        }
         let (Some(lhs), Some(rhs), Some(parsed_op)) = (lhs, rhs, parsed_op) else {
             return Err(errors);
         };
@@ -519,6 +594,7 @@ mod mapping {
             },
             Op::CrossesAbove => Condition::CrossesAbove { lhs, rhs },
             Op::CrossesBelow => Condition::CrossesBelow { lhs, rhs },
+            Op::Rising | Op::Falling => unreachable!("handled by the slope arm above"),
         };
         if is_degenerate_cross(&condition) {
             errors.push(field_error(
@@ -555,11 +631,13 @@ mod mapping {
             "eq" => Ok(Op::Compare(Comparator::Eq)),
             "crosses_above" => Ok(Op::CrossesAbove),
             "crosses_below" => Ok(Op::CrossesBelow),
+            "rising" => Ok(Op::Rising),
+            "falling" => Ok(Op::Falling),
             other => Err(field_error(
                 "op",
                 ValidationCode::FieldRange,
                 format!(
-                    "unknown op {other:?}; expected gt|gte|lt|lte|eq|crosses_above|crosses_below"
+                    "unknown op {other:?}; expected gt|gte|lt|lte|eq|crosses_above|crosses_below|rising|falling"
                 ),
             )),
         }
@@ -595,27 +673,108 @@ mod mapping {
                 series: series_from(operand.timeframe.as_deref(), path)?,
                 spec: indicator_spec(operand, path)?,
             }),
+            // r3.s2.w5: a pointwise arithmetic combination. The children
+            // recurse through the SAME mapper with an extended path, so a
+            // nested failure is localized at e.g. `left.lhs.rhs.period`. The
+            // DSL's own rules (nesting depth ≤ 4, lag under a lag, mixed-series
+            // lag, bar ranges) are NOT re-checked here — `validate()` runs them
+            // at finalize and the composer reports them at this same path.
+            "arith" => {
+                let arith_op = arith_op(operand.op.as_deref(), path)?;
+                let lhs = operand_to_value_source(
+                    operand.lhs.as_deref().ok_or_else(|| {
+                        field_error(
+                            format!("{path}.lhs"),
+                            ValidationCode::FieldRange,
+                            "an arith operand requires an `lhs` operand",
+                        )
+                    })?,
+                    &format!("{path}.lhs"),
+                )?;
+                let rhs = operand_to_value_source(
+                    operand.rhs.as_deref().ok_or_else(|| {
+                        field_error(
+                            format!("{path}.rhs"),
+                            ValidationCode::FieldRange,
+                            "an arith operand requires an `rhs` operand",
+                        )
+                    })?,
+                    &format!("{path}.rhs"),
+                )?;
+                Ok(ValueSource::Arith {
+                    op: arith_op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                })
+            }
+            "lag" => {
+                let bars = operand.bars.ok_or_else(|| {
+                    field_error(
+                        format!("{path}.bars"),
+                        ValidationCode::FieldRange,
+                        "a lag operand requires `bars` (how many closed bars back, 1..=500)",
+                    )
+                })?;
+                let value = operand_to_value_source(
+                    operand.of.as_deref().ok_or_else(|| {
+                        field_error(
+                            format!("{path}.of"),
+                            ValidationCode::FieldRange,
+                            "a lag operand requires `of` (the operand to lag)",
+                        )
+                    })?,
+                    &format!("{path}.of"),
+                )?;
+                Ok(ValueSource::Lag {
+                    value: Box::new(value),
+                    bars,
+                })
+            }
             other => Err(field_error(
                 format!("{path}.source"),
                 ValidationCode::FieldRange,
-                format!("unknown operand source {other:?}; expected indicator|price|constant"),
+                format!(
+                    "unknown operand source {other:?}; expected indicator|price|constant|arith|lag"
+                ),
+            )),
+        }
+    }
+
+    /// Map the flat `arith` `op` string to a tagged [`ArithOp`].
+    fn arith_op(op: Option<&str>, path: &str) -> Result<ArithOp, FieldError> {
+        match op {
+            Some("add") => Ok(ArithOp::Add),
+            Some("sub") => Ok(ArithOp::Sub),
+            Some("mul") => Ok(ArithOp::Mul),
+            Some("div") => Ok(ArithOp::Div),
+            Some(other) => Err(field_error(
+                format!("{path}.op"),
+                ValidationCode::FieldRange,
+                format!("unknown arith op {other:?}; expected add|sub|mul|div"),
+            )),
+            None => Err(field_error(
+                format!("{path}.op"),
+                ValidationCode::FieldRange,
+                "an arith operand requires `op` (add|sub|mul|div)",
             )),
         }
     }
 
     /// Map the flat `timeframe` token to a tagged [`Series`] — the ONLY place
     /// the tool boundary's `timeframe` becomes the DSL's `series` (SPINE.md
-    /// grill ruling 1). `"h4"` is the sole higher-timeframe token (the run pairs
-    /// exactly one HTF series); an unknown token is a correctable
-    /// `FieldError` localized at `{left|right}.timeframe`.
+    /// grill ruling 1). `"h4"` is the run's higher-timeframe token (the run
+    /// pairs exactly one HTF series) and `"d1"` the daily series (r3.s2.w5);
+    /// an unknown token is a correctable `FieldError` localized at
+    /// `{left|right}.timeframe`.
     fn series_from(timeframe: Option<&str>, path: &str) -> Result<Series, FieldError> {
         match timeframe {
             None | Some("primary") => Ok(Series::Primary),
             Some("h4") => Ok(Series::Htf),
+            Some("d1") => Ok(Series::D1),
             Some(other) => Err(field_error(
                 format!("{path}.timeframe"),
                 ValidationCode::FieldRange,
-                format!("unknown timeframe {other:?}; expected primary|h4"),
+                format!("unknown timeframe {other:?}; expected primary|h4|d1"),
             )),
         }
     }
@@ -672,11 +831,37 @@ mod mapping {
             "atr" => Ok(IndicatorSpec::Atr {
                 period: fixed_period(operand, path)?,
             }),
+            // The rolling extremes (r3.s2.w5): a price field defaults to the
+            // convention's own (`high` for highest, `low` for lowest).
+            "highest" => Ok(IndicatorSpec::Highest {
+                period: fixed_period(operand, path)?,
+                source: price_field_or(operand.price_field.as_deref(), PriceField::High, path)?,
+            }),
+            "lowest" => Ok(IndicatorSpec::Lowest {
+                period: fixed_period(operand, path)?,
+                source: price_field_or(operand.price_field.as_deref(), PriceField::Low, path)?,
+            }),
             other => Err(field_error(
                 format!("{path}.indicator"),
                 ValidationCode::FieldRange,
-                format!("unknown indicator {other:?}; expected rsi|ema|adx|macd|atr"),
+                format!(
+                    "unknown indicator {other:?}; expected rsi|ema|adx|macd|atr|highest|lowest"
+                ),
             )),
+        }
+    }
+
+    /// Map the flat `price_field` string to a tagged [`PriceField`], with a
+    /// default for the rolling extremes' convention (`highest` reads `high`,
+    /// `lowest` reads `low` when `price_field` is absent).
+    fn price_field_or(
+        field: Option<&str>,
+        default: PriceField,
+        path: &str,
+    ) -> Result<PriceField, FieldError> {
+        match field {
+            None => Ok(default),
+            Some(_) => price_field(field, path),
         }
     }
 
@@ -745,17 +930,44 @@ pub(crate) fn builder_tool_definitions() -> Vec<ToolDefinition> {
 }
 
 /// The reusable flat `operand` JSON Schema (README C5) — a `ValueSource` without
-/// serde tags.
+/// serde tags, unrolled **two levels deep** (r3.s2.w5): the outer level and one
+/// nested level carry the full property set (`arith` / `lag` included); beyond
+/// that, a nested operand is a bare `{"type": "object"}` placeholder. No
+/// `$ref` — the whole vocabulary is advertised inline, so the model never
+/// needs a definition resolver, and the depth-2 unroll shows composed shapes
+/// (`arith` of an indicator) without a third level of noise.
 fn operand_schema() -> Value {
+    let bare_nested = json!({ "type": "object", "description": "an operand (same shape)" });
+    // The INNER level: a full operand whose own lhs/rhs/of are the bare
+    // placeholder — this is the last detailed level.
+    let inner = operand_schema_level(&bare_nested);
+    // The OUTER level: a full operand whose lhs/rhs/of are the inner level.
+    let placeholder = json!({ "type": "object" });
+    let mut outer = operand_schema_level(&placeholder);
+    for key in ["lhs", "rhs", "of"] {
+        outer["properties"][key] = inner.clone();
+    }
+    outer
+}
+
+/// One unroll level of the operand schema: the full property set, with
+/// `lhs` / `rhs` / `of` set to `nested`.
+fn operand_schema_level(nested: &Value) -> Value {
     json!({
         "type": "object",
         "properties": {
-            "source": { "type": "string", "enum": ["indicator", "price", "constant"] },
-            "indicator": { "type": "string", "enum": ["rsi", "ema", "adx", "macd", "atr"] },
+            "source": {
+                "type": "string",
+                "enum": ["indicator", "price", "constant", "arith", "lag"]
+            },
+            "indicator": {
+                "type": "string",
+                "enum": ["rsi", "ema", "adx", "macd", "atr", "highest", "lowest"]
+            },
             "timeframe": {
                 "type": "string",
-                "enum": ["primary", "h4"],
-                "description": "series the operand is evaluated on; \"h4\" uses the last closed H4 bar, omit for the primary series"
+                "enum": ["primary", "h4", "d1"],
+                "description": "series the operand is evaluated on; \"h4\" uses the last closed H4 bar, \"d1\" the last closed daily bar, omit for the primary series"
             },
             "period": { "type": "integer", "minimum": 1 },
             "fast": { "type": "integer", "minimum": 1 },
@@ -768,15 +980,34 @@ fn operand_schema() -> Value {
             },
             "price_field": {
                 "type": "string",
-                "enum": ["open", "high", "low", "close", "volume"]
+                "enum": ["open", "high", "low", "close", "volume"],
+                "description": "highest/lowest default to high/low respectively; a price operand requires it"
             },
-            "value": { "type": "string", "description": "a decimal as a string, e.g. \"30\"" }
+            "value": { "type": "string", "description": "a decimal as a string, e.g. \"30\" (constant only)" },
+            "op": {
+                "type": "string",
+                "enum": ["add", "sub", "mul", "div"],
+                "description": "arith only: the pointwise operation"
+            },
+            "lhs": nested,
+            "rhs": nested,
+            "of": {
+                "type": "object",
+                "description": "lag only: the operand to lag (same shape)"
+            },
+            "bars": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "lag only: how many closed bars back (1..=500), on the lagged operand's own series"
+            }
         },
         "required": ["source"]
     })
 }
 
-/// The reusable `{ left, op, right }` JSON Schema for the two condition tools.
+/// The reusable `{ left, op, right?, bars? }` JSON Schema for the two condition
+/// tools (r3.s2.w5): the slope ops `rising` / `falling` take a single value and
+/// no `right`, with `bars` defaulting to 1; every other op requires `right`.
 fn signal_schema() -> Value {
     json!({
         "type": "object",
@@ -784,11 +1015,20 @@ fn signal_schema() -> Value {
             "left": operand_schema(),
             "op": {
                 "type": "string",
-                "enum": ["gt", "gte", "lt", "lte", "eq", "crosses_above", "crosses_below"]
+                "enum": [
+                    "gt", "gte", "lt", "lte", "eq",
+                    "crosses_above", "crosses_below",
+                    "rising", "falling"
+                ]
             },
-            "right": operand_schema()
+            "right": operand_schema(),
+            "bars": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "rising/falling only: the slope window in closed bars, default 1"
+            }
         },
-        "required": ["left", "op", "right"]
+        "required": ["left", "op"]
     })
 }
 
@@ -812,8 +1052,12 @@ fn def_create_strategy() -> ToolDefinition {
 fn def_add_entry_signal() -> ToolDefinition {
     ToolDefinition {
         name: "add_entry_signal".to_owned(),
-        description: "Set the entry trigger as `left op right` over flat operands (indicator, \
-                      price field, or a decimal-string constant). Re-calling replaces the entry."
+        description: "Set the entry trigger as `left op right` (or `left rising`/`left \
+                      falling` with an optional `bars` window) over flat operands — an \
+                      indicator (rsi/ema/adx/macd with an `output` selector/atr/highest/lowest), \
+                      a price field, a decimal-string constant, an `arith` combination, or a \
+                      `lag`ged value, each optionally on the h4 or d1 series via `timeframe`. \
+                      Re-calling replaces the entry."
             .to_owned(),
         parameters: signal_schema(),
     }
@@ -822,8 +1066,9 @@ fn def_add_entry_signal() -> ToolDefinition {
 fn def_add_filter() -> ToolDefinition {
     ToolDefinition {
         name: "add_filter".to_owned(),
-        description: "Append an AND-conjoined filter condition (same `left op right` shape as \
-                      add_entry_signal). Call repeatedly to conjoin several filters."
+        description: "Append an AND-conjoined filter condition (same `left op right`/slope shape \
+                      as add_entry_signal, including `arith`/`lag` operands and the h4/d1 \
+                      `timeframe`). Call repeatedly to conjoin several filters."
             .to_owned(),
         parameters: signal_schema(),
     }

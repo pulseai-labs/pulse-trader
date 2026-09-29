@@ -33,8 +33,8 @@ use serde_json::{Map, Value};
 
 use crate::domain::strategy::{CreatedBy, StrategyId, StrategyVersion, VersionId};
 use crate::domain::{
-    FieldError, LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, Message, ToolCall,
-    ToolDefinition, ValidatedDsl,
+    FieldError, LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, Message, Redactor,
+    ToolCall, ToolDefinition, ValidatedDsl, scrub_then_bound,
 };
 
 use super::{
@@ -44,6 +44,16 @@ use super::{
 
 /// The name of the sole terminal builder tool.
 const FINALIZE_TOOL: &str = "finalize_strategy";
+/// The ceiling on the assistant text the composer streams/stores
+/// (r3.s2.w5, Q5 option 1), in bytes.
+///
+/// Provider-derived prose the model controls the length of, emitted as a
+/// stored event and shown in the Designer. Same stored-string precedent as
+/// the coach's `MAX_INAPPLICABLE_FIELD_BYTES` (`2_000` bytes, r1.s4.w1 —
+/// `src/agent/coach.rs`): generous for a paragraph, far below anything that
+/// could bloat an event log. The text goes through `scrub_then_bound` — the
+/// ONE seam — never a hand-rolled cut.
+pub const ASSISTANT_TEXT_MAX_BYTES: usize = 2_000;
 /// The compose-time placeholder that replaces a stripped secret.
 const REDACTED: &str = "[REDACTED]";
 /// The nudge appended after a text-only (no-`tool_call`) model turn.
@@ -106,6 +116,15 @@ pub enum ComposerEvent {
         /// The `Ok` summary or the serialized correctable `FieldError`s.
         outcome: String,
     },
+    /// The model's own prose for one turn (r3.s2.w5, Q5 option 1) — scrubbed
+    /// and bounded through the redaction seam BEFORE it became an event.
+    /// Emitted once per provider turn whose `content` is non-empty after
+    /// trimming, BEFORE that turn's tool events; a text-only turn is exactly
+    /// this event.
+    AssistantText {
+        /// The scrubbed, bounded text.
+        text: String,
+    },
     /// `finalize_strategy` succeeded and produced a validated document.
     Finalized {
         /// A one-line summary of the finalized strategy.
@@ -149,6 +168,10 @@ pub struct Composer<P: LlmProvider> {
     max_consecutive_failures: usize,
     turn_timeout: Duration,
     captured: LlmCallCapture,
+    /// Scrubs and bounds every assistant text before it becomes an event
+    /// (r3.s2.w5) — the same redactor the ledger decorator holds, shared by
+    /// the composition root.
+    redactor: Redactor,
 }
 
 impl<P: LlmProvider> Composer<P> {
@@ -163,6 +186,9 @@ impl<P: LlmProvider> Composer<P> {
     ///
     /// `captured` is the shared read handle the composition root also wires into the
     /// capturing ledger repo (the composer reads it back after the loop).
+    /// `redactor` is the same kernel the ledger decorator holds — the composer
+    /// runs every assistant text through it (scrub, then bound) before the
+    /// text becomes a streamed/stored event (r3.s2.w5, Q5 option 1).
     #[must_use]
     pub fn new(
         provider: P,
@@ -170,6 +196,7 @@ impl<P: LlmProvider> Composer<P> {
         prompt: String,
         config: LlmConfig,
         captured: LlmCallCapture,
+        redactor: Redactor,
     ) -> Self {
         Self {
             provider,
@@ -180,6 +207,7 @@ impl<P: LlmProvider> Composer<P> {
             max_consecutive_failures: Self::DEFAULT_MAX_CONSECUTIVE_FAILURES,
             turn_timeout: Self::DEFAULT_TURN_TIMEOUT,
             captured,
+            redactor,
         }
     }
 
@@ -239,7 +267,14 @@ impl<P: LlmProvider> Composer<P> {
                 }
                 Err(error) => return Err(error),
             };
-            match process_turn(&mut builder, &mut messages, &mut events, on_event, response) {
+            match process_turn(
+                &mut builder,
+                &mut messages,
+                &mut events,
+                on_event,
+                response,
+                &self.redactor,
+            ) {
                 TurnOutcome::Finalized(validated) => {
                     let llm_call_ids = self.captured_since(start);
                     let version = build_version(&validated, &llm_call_ids);
@@ -310,12 +345,27 @@ fn process_turn(
     events: &mut Vec<ComposerEvent>,
     on_event: &mut (dyn FnMut(ComposerEvent) + Send),
     response: LlmResponse,
+    redactor: &Redactor,
 ) -> TurnOutcome {
     let LlmResponse {
         content,
         tool_calls,
         ..
     } = response;
+
+    // Q5 option 1 (r3.s2.w5): the model's prose is provider-derived detail —
+    // scrub, then bound, through the ONE seam BEFORE it becomes a streamed or
+    // stored event. Both turn shapes carry it (a text-only turn is exactly
+    // this event); the message history below keeps the model's own words
+    // verbatim, as it always has — only the EVENT crosses the seam.
+    if let Some(text) = content.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let note = scrub_then_bound(redactor, text, ASSISTANT_TEXT_MAX_BYTES);
+        emit(
+            events,
+            on_event,
+            ComposerEvent::AssistantText { text: note },
+        );
+    }
 
     // A text-only turn counts toward the cap and is NEVER a finalize: re-prompt.
     if tool_calls.is_empty() {
@@ -694,8 +744,8 @@ mod tests {
     };
     use crate::domain::strategy::CreatedBy;
     use crate::domain::{
-        Direction, LlmBackend, LlmCallId, LlmConfig, LlmError, LlmResponse, Message, StrategyDsl,
-        TokenUsage, ToolCall, ToolDefinition,
+        Direction, LlmBackend, LlmCallId, LlmConfig, LlmError, LlmResponse, Message, Redactor,
+        StrategyDsl, TokenUsage, ToolCall, ToolDefinition,
     };
     use serde_json::{Value, json};
     use std::collections::VecDeque;
@@ -868,6 +918,7 @@ mod tests {
             crate::agent::config::load_composer_prompt().unwrap(),
             demo_config(),
             captured,
+            Redactor::default(),
         )
     }
 
@@ -1333,6 +1384,7 @@ mod tests {
             prompt.clone(),
             demo_config(),
             Arc::clone(&captured),
+            Redactor::default(),
         );
 
         // The NL target smuggles an API-key-shaped secret; it must be stripped, and the

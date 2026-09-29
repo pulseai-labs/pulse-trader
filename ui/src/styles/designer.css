@@ -144,6 +144,15 @@
   gap: var(--sp-1);
 }
 
+/* The composer's own scrubbed prose (r3.s2.w5, Q5 option 1) — a text row
+   between the tool steps, visually quieter than a step. */
+.dsg-note {
+  padding: var(--sp-1) var(--sp-3);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  border-left: 2px solid var(--ai-line);
+}
+
 .dsg-step {
   display: flex;
   gap: var(--sp-2);
