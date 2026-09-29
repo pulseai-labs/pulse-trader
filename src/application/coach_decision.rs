@@ -779,7 +779,9 @@ where
         };
         // r3.s2.w4: the parent's persisted `inputs.d1` names the exact daily
         // snapshot the child replays — loaded only when the child reads it
-        // (see `load_d1_for_replay`).
+        // (see `load_d1_for_replay`), and recorded only when it is loaded
+        // (r3.s2 round-3 fix, F6 — the run's inputs ARE its provenance).
+        inputs = recorded_child_inputs(inputs, needs_d1);
         let mut d1 = load_d1_for_replay(&candles, &inputs, needs_d1)?;
         // r2.s1 G1: "the parent's exact persisted inputs" INCLUDES the window —
         // a windowed parent's child must replay the same counted slice, or the
@@ -924,6 +926,25 @@ where
         )?)),
         None => Ok(None),
     }
+}
+
+/// The inputs a coached child may RECORD (r3.s2 round-3 fix, F6).
+///
+/// A child inherits the PARENT's persisted inputs, and the daily series is
+/// loaded only when the child's own document reads it ([`load_d1_for_replay`]).
+/// A run's `inputs` are its provenance: a child that loaded no daily series must
+/// not keep the parent's `d1` selection, or the immutable row claims a snapshot
+/// the run never read — and a parent/child input comparison then reports the
+/// same series set for runs that differ. The selection survives when the child
+/// does read the series: the recorded snapshot is the one that was loaded.
+fn recorded_child_inputs(
+    mut inputs: crate::domain::BacktestInputs,
+    needs_d1: bool,
+) -> crate::domain::BacktestInputs {
+    if !needs_d1 {
+        inputs.d1 = None;
+    }
+    inputs
 }
 
 /// The reason this child cannot be compared to this parent, when there is one.
@@ -1266,5 +1287,209 @@ mod tests {
         ] {
             assert!(err.contains(needle), "the refusal names {needle:?}: {err}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // r3.s2 round-3 fix (F6): the inputs a coached child records
+    // -----------------------------------------------------------------------
+
+    use crate::domain::{
+        BacktestInputs, Candle, DataVersion, FundingConfig, Pair, SnapshotSelection,
+        StoredCandleSeries, StrategyDsl, Timeframe, validate,
+    };
+
+    /// The child's document with NO daily operand: `needs_d1()` is false, so the
+    /// daily series is never loaded.
+    const CHILD_DSL_NO_D1: &str = r#"{
+      "schema_version": "1.2.0",
+      "name": "no d1",
+      "direction": "long",
+      "entry": {
+        "type": "Compare",
+        "lhs": { "type": "Indicator", "spec": { "indicator": "Rsi", "period": 14 } },
+        "op": "Lt",
+        "rhs": { "type": "Constant", "value": "30" }
+      },
+      "filters": [],
+      "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+      "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+    }"#;
+
+    /// The child's document WITH a daily operand: `needs_d1()` is true, so the
+    /// parent's daily selection IS loaded — and must survive into the record.
+    const CHILD_DSL_WITH_D1: &str = r#"{
+      "schema_version": "1.2.0",
+      "name": "d1 gate",
+      "direction": "long",
+      "entry": {
+        "type": "Compare",
+        "lhs": { "type": "Price", "series": "d1", "field": "Close" },
+        "op": "Gt",
+        "rhs": { "type": "Constant", "value": "0" }
+      },
+      "filters": [],
+      "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+      "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+    }"#;
+
+    fn validated(json: &str) -> ValidatedDsl {
+        let dsl: StrategyDsl = serde_json::from_str(json).expect("the fixture parses");
+        validate(&dsl).expect("the fixture validates")
+    }
+
+    fn series(timeframe: Timeframe, version: &str, bars: i64) -> CandleSeries {
+        let step = timeframe.duration_ms();
+        CandleSeries {
+            pair: Pair::new("BTCUSDT"),
+            timeframe,
+            version: DataVersion::new(version),
+            candles: (0..bars)
+                .map(|i| {
+                    let open_time = i * step;
+                    Candle {
+                        open_time,
+                        close_time: open_time + step - 1,
+                        open: Decimal::new(100, 0),
+                        high: Decimal::new(101, 0),
+                        low: Decimal::new(99, 0),
+                        close: Decimal::new(100, 0),
+                        volume: Decimal::ONE,
+                        funding_rate: None,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// The PARENT's persisted inputs: they name a daily snapshot because the
+    /// parent's own document read the series.
+    fn parent_inputs(primary: &CandleSeries, d1: &CandleSeries) -> BacktestInputs {
+        BacktestInputs {
+            pair: primary.pair.clone(),
+            primary: SnapshotSelection {
+                timeframe: primary.timeframe,
+                data_version: primary.version.clone(),
+            },
+            htf: None,
+            d1: Some(SnapshotSelection {
+                timeframe: d1.timeframe,
+                data_version: d1.version.clone(),
+            }),
+            taker_fee_bps: Decimal::ZERO,
+            slippage_bps: Decimal::ZERO,
+            funding: FundingConfig::SnapshotRates,
+            symbol_filters: None,
+            window: None,
+            lead_in_from_ms: None,
+        }
+    }
+
+    /// Serves exactly the two snapshots the fixtures build, by version — the
+    /// store's own contract for an unknown version is an error, never data.
+    struct TwoSnapshotRepo {
+        primary: CandleSeries,
+        d1: CandleSeries,
+    }
+
+    impl CandleSeriesRepository for TwoSnapshotRepo {
+        fn load_head(
+            &self,
+            _pair: &Pair,
+            _timeframe: Timeframe,
+        ) -> Result<Option<StoredCandleSeries>, DataError> {
+            unimplemented!("the coach replay loads by version")
+        }
+
+        fn load_version(
+            &self,
+            pair: &Pair,
+            timeframe: Timeframe,
+            version: &DataVersion,
+        ) -> Result<StoredCandleSeries, DataError> {
+            let series = if timeframe == self.primary.timeframe && version == &self.primary.version
+            {
+                self.primary.clone()
+            } else if timeframe == self.d1.timeframe && version == &self.d1.version {
+                self.d1.clone()
+            } else {
+                return Err(DataError::Io(format!(
+                    "no snapshot for {pair} {} `{version}`",
+                    timeframe.binance_interval()
+                )));
+            };
+            Ok(StoredCandleSeries {
+                series,
+                storage_location: None,
+            })
+        }
+
+        fn commit(
+            &self,
+            _pair: &Pair,
+            _timeframe: Timeframe,
+            _candles: Vec<Candle>,
+        ) -> Result<StoredCandleSeries, DataError> {
+            unimplemented!("the coach replay never writes candles")
+        }
+    }
+
+    /// The filters seam: the replay needs only a resolved set.
+    struct Unconstrained;
+
+    impl ExchangeAdapter for Unconstrained {
+        fn symbol_filters(
+            &self,
+            _pair: &Pair,
+        ) -> Result<SymbolFilters, crate::domain::ExchangeError> {
+            Ok(SymbolFilters::unconstrained())
+        }
+    }
+
+    async fn prepare_child(json: &str) -> PreparedBacktest {
+        let primary = series(Timeframe::M15, "m15-v", 8);
+        let d1 = series(Timeframe::D1, "d1-v", 3);
+        let inputs = parent_inputs(&primary, &d1);
+        prepare_offthread(
+            TwoSnapshotRepo { primary, d1 },
+            Unconstrained,
+            validated(json),
+            inputs,
+            Decimal::new(10_000, 0),
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("the child prepares: {}", failure.message))
+    }
+
+    /// r3.s2 round-3 fix (F6): a child that loads NO daily series must not
+    /// RECORD one. The parent's persisted inputs carry a `d1` selection; the
+    /// child's document has no daily operand, so `load_d1_for_replay` returns
+    /// `None` — and the inputs carried on to `prepare_backtest` (and hence to
+    /// the immutable run row) must say exactly that. Without the fix the
+    /// inherited selection survives, the child records a snapshot it never
+    /// read, and a parent/child input comparison reports one series set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_that_loads_no_daily_series_records_none() {
+        let prepared = prepare_child(CHILD_DSL_NO_D1).await;
+        assert!(
+            prepared.inputs.d1.is_none(),
+            "the child loaded no daily series, so it may not record one: {:?}",
+            prepared.inputs.d1
+        );
+        // The rest of the inherited provenance is untouched.
+        assert_eq!(prepared.inputs.primary.data_version.as_str(), "m15-v");
+    }
+
+    /// The other half of the same rule: a child that DOES read the daily series
+    /// records the parent's snapshot — the rule clears only what was not loaded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_that_reads_the_daily_series_records_the_snapshot_it_loaded() {
+        let prepared = prepare_child(CHILD_DSL_WITH_D1).await;
+        let d1 = prepared
+            .inputs
+            .d1
+            .as_ref()
+            .expect("a child that reads D1 records the snapshot");
+        assert_eq!(d1.timeframe, Timeframe::D1);
+        assert_eq!(d1.data_version.as_str(), "d1-v");
     }
 }
