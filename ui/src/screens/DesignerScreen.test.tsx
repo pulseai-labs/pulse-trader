@@ -175,6 +175,56 @@ describe("<DesignerScreen /> streaming compose", () => {
     expect(screen.getByText(/completed/i)).toBeTruthy();
   });
 
+  it("renders the composer's prose as a note row between the tool steps, and counts tool calls only", async () => {
+    render(<DesignerScreen />);
+    submitTarget("RSI oversold bounce on BTC");
+    const channel = capturedChannel();
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(1, {
+          kind: "toolCallStarted",
+          name: "add_entry_signal",
+          argumentsPreview: "rsi(14) < 30",
+        }),
+      );
+    });
+    // The composer's own prose folds in as a note BETWEEN the tool steps.
+    await act(async () => {
+      channel.onmessage?.(
+        event(2, {
+          kind: "assistantText",
+          text: "Entry set; adding the trend filter next.",
+        }),
+      );
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(3, { kind: "toolCallStarted", name: "add_filter", argumentsPreview: "close > ema(200)" }),
+      );
+    });
+
+    const body = document.querySelector(".dsg-steps-body");
+    expect(body).not.toBeNull();
+    const rows = Array.from((body as HTMLElement).children);
+    expect(rows.map((row) => row.className)).toEqual([
+      "dsg-step is-running",
+      "dsg-note",
+      "dsg-step is-running",
+    ]);
+    expect(screen.getByText("Entry set; adding the trend filter next.")).toBeTruthy();
+
+    // The streaming header counts TOOL steps, not the note: two tool calls
+    // are open (the third list entry is the note, which adds nothing). The
+    // label is split across JSX text nodes, so assert on textContent.
+    const head = document.querySelector(".dsg-steps-head");
+    expect(head).not.toBeNull();
+    expect((head as HTMLElement).textContent).toContain("2 steps so far");
+  });
+
   it("renders a rejected command's error message in the conversation — no silent failure", async () => {
     render(<DesignerScreen />);
     submitTarget("RSI oversold bounce on BTC");

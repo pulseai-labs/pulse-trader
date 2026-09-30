@@ -385,11 +385,16 @@ fn default_fixture_base_dir() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Parse one timeframe token (case-insensitive: `M15`/`15m`, `H4`/`4h`).
+/// Parse one timeframe token (case-insensitive: `M15`/`15m`, `H4`/`4h`,
+/// `D1`/`1d` — r3.s2.w4 added the daily series, and the token is the same
+/// `binance_interval` the store's `<TF>` path segment and the `Timeframe` serde
+/// rename already use).
 pub(crate) fn parse_one_tf(token: &str) -> anyhow::Result<Timeframe> {
     match token.trim().to_ascii_uppercase().as_str() {
         "M15" | "15M" => Ok(Timeframe::M15),
         "H4" | "4H" => Ok(Timeframe::H4),
-        other => anyhow::bail!("unknown timeframe '{other}' (expected M15 or H4)"),
+        "D1" | "1D" => Ok(Timeframe::D1),
+        other => anyhow::bail!("unknown timeframe '{other}' (expected M15, H4 or D1)"),
     }
 }
 
@@ -536,11 +541,18 @@ mod tests {
         assert_eq!(parse_one_tf("15m").unwrap(), Timeframe::M15);
         assert_eq!(parse_one_tf("H4").unwrap(), Timeframe::H4);
         assert_eq!(parse_one_tf("4h").unwrap(), Timeframe::H4);
+        // r3.s2.w4: the daily series is fetchable — `pulse fetch-data BTCUSDT
+        // --tf D1` is the command the D1 refusals name.
+        assert_eq!(parse_one_tf("D1").unwrap(), Timeframe::D1);
+        assert_eq!(parse_one_tf("1d").unwrap(), Timeframe::D1);
     }
 
     #[test]
     fn rejects_unknown_timeframe() {
-        assert!(parse_one_tf("D1").is_err());
+        // `D1` used to be the example of an unknown token; it is supported now,
+        // so the refusal is pinned on a token no parser accepts.
+        assert!(parse_one_tf("W1").is_err());
+        assert!(parse_one_tf("1w").is_err());
         assert!(parse_timeframes(&[]).is_err());
     }
 

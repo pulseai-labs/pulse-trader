@@ -87,8 +87,14 @@ pub(crate) fn parse_funding(csv_body: &str) -> Result<Vec<FundingEvent>, DataErr
 /// are aligned to the candle range). `candles` is expected to be sorted
 /// ascending by `open_time` (the post-[`super::normalize`] state).
 ///
-/// If two events map to the same candle (should not happen at 8-hourly spacing
-/// vs. M15/H4 candles), the last one wins.
+/// If two events map to the same candle, the LAST one wins — the in-place write
+/// above overwrites, and nothing accumulates. That collision cannot happen at
+/// M15 (8-hourly events, 15-minute candles) nor at H4, but it is NORMAL for a
+/// `1d` candle: all three 8-hourly events of the day land in one interval, so
+/// the day keeps the 16:00 UTC rate. That is a property of this function, not a
+/// decision about D1 funding — r3.s2.w4 adds the daily series as a *signal*
+/// series (its operands are read for conditions) and leaves funding on D1 out of
+/// scope, so nothing here changes behaviour.
 pub(crate) fn stamp_funding(candles: &mut [Candle], events: &[FundingEvent]) {
     for event in events {
         // Find the candle whose [open_time, close_time) contains the event.

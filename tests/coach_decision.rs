@@ -866,6 +866,7 @@ async fn a_child_of_a_windowed_parent_replays_the_parents_slice() {
         &compiled,
         &primary,
         None,
+        None,
         &BacktestConfig::default(),
         &filters,
         SeriesEnd::SnapshotEnd,

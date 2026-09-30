@@ -40,6 +40,45 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "series_htf",
         "an `htf` operand is evaluated on the last closed H4 bar; an ATR stop uses the signal bar's ATR",
     ),
+    // r3.s2.w4 (Q3): the fixed daily series — same closed-bar rule, its own
+    // resolution (no argument) and the fetch that creates a missing snapshot.
+    (
+        "series_d1",
+        "a `d1` operand is evaluated on the last closed daily (1d) bar, never on the forming one; the daily snapshot needs no argument — it resolves automatically for the pair a strategy is run on, and a missing one is refused by name: fetch it with `pulse fetch-data <PAIR> --tf D1`; the `timeframe` argument still selects only `primary` or `htf`, and `1d` is refused there because the daily series is the fixed `d1` slot",
+    ),
+    // r3.s2.w1 (b2): schema 1.2.0 — MACD's output selector.
+    (
+        "macd_output",
+        "a MACD operand's `output` selects `line`, `signal` or `histogram`; omitting it is the historical line — signal and histogram warm up over max(fast,slow)+signal−1 bars",
+    ),
+    // r3.s2.w2 (Q1): schema 1.2.0 — the rolling extremes.
+    (
+        "rolling_extremes",
+        "`Highest{period, source}` and `Lowest{period, source}` cover the N closed bars BEFORE the current bar, excluding it (the prior-N convention, rendered `highest(high, 20 prior)`); `source` is any price field and defaults to `high` for `Highest` and `low` for `Lowest`; they warm up over N+1 bars and work on any series (`h4:highest(high, 20)` is the prior 20 closed H4 bars)",
+    ),
+    // r3.s2.w3 (Q2): value expressions — the semantics the grammar cannot
+    // express, keyed by the construct each entry covers.
+    (
+        "expressions",
+        "an `Arith` node computes add/sub/mul/div pointwise over two operand values, `Decimal` only; division by zero, an arithmetic overflow, or any operand without a value gives no value — a comparison over a no-value is false (a `Not` over it is true only behind the warm gate)",
+    ),
+    (
+        "expression_depth",
+        "at most 4 `Arith`/`Lag` nodes along any path through one value; a fifth is refused",
+    ),
+    (
+        "lag",
+        "`lag(value, bars)` reads the value `bars` bars back on the value's own series (`bars` in 1..=500; an `h4:` operand lags in H4 bars); a lag under a lag and a lag over a value mixing both series are refused — use one lag with a larger `bars`",
+    ),
+    (
+        "rising_falling",
+        "`rising`/`falling` mean the value is strictly greater/less than its own value `bars` bars ago on the same series (`bars` in 1..=500, default 1); over a value containing a lag, or mixing both series, they are refused",
+    ),
+    // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
+    (
+        "schema_version",
+        "this engine writes and serves schema 1.2.0 and also loads 1.0.0 and 1.1.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.2.0",
+    ),
 ];
 
 /// Build the `pulse://dsl/schema` document body (a compact JSON string).
@@ -86,12 +125,12 @@ mod tests {
             assert!(properties.contains_key(field), "missing property {field}");
         }
         // F6: `schema_version` publishes the ACCEPTED values, not an
-        // unconstrained string — `Migrator::v1()` loads `1.0.0` (identity-
-        // migrated) and `CURRENT`, so the schema a validating agent reads must
-        // pin exactly that enum.
+        // unconstrained string — `Migrator::v1()` loads `1.0.0` and `1.1.0`
+        // (identity-migrated) and `CURRENT`, so the schema a validating agent
+        // reads must pin exactly that enum.
         assert_eq!(
             properties["schema_version"]["enum"],
-            serde_json::json!(["1.0.0", DSL_SCHEMA_VERSION]),
+            serde_json::json!(["1.0.0", "1.1.0", DSL_SCHEMA_VERSION]),
             "schema_version property must publish the accepted enum"
         );
         let conventions = doc["conventions"].as_object().expect("conventions object");
@@ -111,6 +150,17 @@ mod tests {
         assert_eq!(
             htf,
             "an `htf` operand is evaluated on the last closed H4 bar; an ATR stop uses the signal bar's ATR"
+        );
+        // r3.s2.w4 (Q3): the fixed daily series — the same closed-bar rule, the
+        // resolution that takes no argument, and the fetch that creates the
+        // snapshot a `d1` strategy needs.
+        let d1 = conventions
+            .get("series_d1")
+            .and_then(serde_json::Value::as_str)
+            .expect("conventions.series_d1 is a string");
+        assert_eq!(
+            d1,
+            "a `d1` operand is evaluated on the last closed daily (1d) bar, never on the forming one; the daily snapshot needs no argument — it resolves automatically for the pair a strategy is run on, and a missing one is refused by name: fetch it with `pulse fetch-data <PAIR> --tf D1`; the `timeframe` argument still selects only `primary` or `htf`, and `1d` is refused there because the daily series is the fixed `d1` slot"
         );
     }
 }

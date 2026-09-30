@@ -194,6 +194,14 @@ where
         Some(htf_tf) => Some(load_series(repo, &pair, htf_tf)?),
         None => None,
     };
+    // r3.s2.w4: the fixed daily series loads ONLY when the compiled strategy
+    // carries a `d1` operand — a `--dsl` run that never reads D1 must not
+    // require a D1 snapshot.
+    let d1_series = if compiled.needs_d1() {
+        Some(load_series(repo, &pair, Timeframe::D1)?)
+    } else {
+        None
+    };
 
     // Resolve the symbol's exchange filters through the `ExchangeAdapter` port —
     // this is where the port is exercised end-to-end (NFR-3); the engine itself
@@ -209,6 +217,7 @@ where
         &compiled,
         &primary,
         htf_series.as_ref(),
+        d1_series.as_ref(),
         &config,
         &filters,
         SeriesEnd::SnapshotEnd,

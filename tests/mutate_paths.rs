@@ -24,9 +24,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 
 use pulse::{
-    Comparator, Condition, Direction, ExitRule, IndicatorSpec, Mutation, MutationError, ParamValue,
-    PriceField, RiskParams, SchemaVersion, Series, StrategyDsl, SweepableValue, ValueSource, apply,
-    sweepable_paths, validate,
+    Comparator, Condition, Direction, ExitRule, IndicatorSpec, MacdOutput, Mutation, MutationError,
+    ParamValue, PriceField, RiskParams, SchemaVersion, Series, StrategyDsl, SweepableValue,
+    ValueSource, apply, sweepable_paths, validate,
 };
 use rust_decimal::Decimal;
 
@@ -86,6 +86,7 @@ fn representative_strategy() -> StrategyDsl {
                                     fast: SweepableValue::Fixed(12),
                                     slow: SweepableValue::Fixed(26),
                                     signal: SweepableValue::Fixed(9),
+                                    output: MacdOutput::Line,
                                 },
                             },
                             op: Comparator::Gt,

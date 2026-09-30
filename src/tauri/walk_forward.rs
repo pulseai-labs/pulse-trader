@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapters::broker::BinanceAdapter;
 use crate::application::backtest::{
     BacktestAppError, ReadBackFailure, ReadBackStage, read_back, resolve_default_request,
+    run_uses_htf,
 };
 use crate::application::walk_forward::{WalkForwardRequest, run_walk_forward};
 use crate::application::walk_forward_read::{load_fold_runs, rfc3339_ms};
@@ -461,5 +462,8 @@ pub async fn get_backtest_run_core(
         }
         Err(other) => return Err(other.into()),
     };
-    Ok(backtest_run_dto(&outcome)?)
+    // #219 rides the same rule for a persisted read: `uses_htf` is the run's own
+    // version's compiled answer, never inferred from the recorded inputs.
+    let uses_htf = run_uses_htf(&state.strategy_repo(), &outcome.run.strategy_version_id).await;
+    Ok(backtest_run_dto(&outcome, uses_htf)?)
 }

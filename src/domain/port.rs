@@ -1676,6 +1676,7 @@ mod backtest_run_repository_tests {
                 data_version: DataVersion::new("v-primary"),
             },
             htf: None,
+            d1: None,
             taker_fee_bps: Decimal::new(4, 0),
             slippage_bps: Decimal::new(1, 0),
             funding: FundingConfig::SnapshotRates,

@@ -243,13 +243,22 @@ fn structured_list(key: &'static str, entries: impl serde::Serialize) -> CallToo
     CallToolResult::structured(serde_json::Value::Object(envelope))
 }
 
-/// Parse a timeframe token the way the wire names it (`15m`/`4h`), accepting
-/// the CLI spellings (`M15`/`H4`) as aliases.
+/// Parse a timeframe token the way the wire names it (`15m`/`4h`/`1d`),
+/// accepting the CLI spellings (`M15`/`H4`/`D1`) as aliases.
+///
+/// r3.s2.w4 added the daily series, so `1d` parses here like any other
+/// interval: whether a given *argument* may be daily is the application ring's
+/// call (a `1d` primary and a `1d` HTF are both refused there, by name), never
+/// this tokenizer's — a parser that refuses a real interval would report a
+/// vocabulary gap where the run's own guard belongs.
 fn parse_timeframe(raw: &str) -> Result<Timeframe, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "15m" | "m15" => Ok(Timeframe::M15),
         "4h" | "h4" => Ok(Timeframe::H4),
-        other => Err(format!("unknown timeframe {other:?} (expected 15m or 4h)")),
+        "1d" | "d1" => Ok(Timeframe::D1),
+        other => Err(format!(
+            "unknown timeframe {other:?} (expected 15m, 4h or 1d)"
+        )),
     }
 }
 
@@ -414,20 +423,30 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
             field_error("dsl", err)
         }
-        // r2.s2.w2 + round-1 fix F1: the strategy needs an HTF series the
-        // request lacked, or the `inputs.htf` selection is not strictly higher
-        // than the primary timeframe — the error's `field` already carries
-        // `"inputs.htf"`, so surface it verbatim.
-        BacktestAppError::HtfRequired { field } | BacktestAppError::HtfNotHigher { field, .. } => {
-            field_error(field, err)
-        }
-        // r2.s2 round-2 fix G1 + round-5: a different-pair or stale
-        // (too-short) HTF series is refused by the engine (the request itself
-        // carries only one pair, so no app-layer variant exists) — surface
-        // both on the same `inputs.htf` field.
+        // Every "supply the missing series / clear a bad selection" refusal
+        // carries the member to fix in its own `field` — `"inputs.htf"` for the
+        // two HTF variants (r2.s2.w2, round-1 fix F1), `"inputs.d1"` for a
+        // strategy that reads D1 with no D1 snapshot, `"inputs.htf"` for a
+        // request that selects D1 AS the HTF (r3.s2.w4: it would collide with
+        // the fixed `d1` slot, and it is refused before any load), and
+        // `"primary_timeframe"` for a request whose PRIMARY is D1 (r3.s2
+        // round-1 fix, C1) — so all five surface it verbatim.
+        BacktestAppError::HtfRequired { field }
+        | BacktestAppError::HtfNotHigher { field, .. }
+        | BacktestAppError::D1Required { field, .. }
+        | BacktestAppError::PrimaryIsD1 { field }
+        | BacktestAppError::HtfIsD1 { field } => field_error(field, err),
+        // A different-pair or stale (too-short) series is refused by the ENGINE
+        // (the request carries one pair, so no app-layer variant exists), which
+        // is why these name the member themselves: `inputs.htf` for the HTF
+        // pair (r2.s2 round-2 fix G1 + round-5), `inputs.d1` for the daily one
+        // (r3.s2.w4).
         BacktestAppError::Engine(
             BacktestError::HtfPairMismatch { .. } | BacktestError::HtfCoverageShort { .. },
         ) => field_error("inputs.htf", err),
+        BacktestAppError::Engine(
+            BacktestError::D1PairMismatch { .. } | BacktestError::D1CoverageShort { .. },
+        ) => field_error("inputs.d1", err),
         _ => tool_error(err),
     }
 }
@@ -811,6 +830,7 @@ impl PulseMcp {
                             engine.current(&CompiledValue::Indicator {
                                 series: Series::Primary,
                                 spec: spec.clone(),
+                                lag: 0,
                             })
                         })
                         .collect::<Vec<_>>(),

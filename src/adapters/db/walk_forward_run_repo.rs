@@ -425,6 +425,7 @@ fn experiment_disagreement(
             first.inputs.primary != fold.inputs.primary,
         ),
         ("the htf snapshot", first.inputs.htf != fold.inputs.htf),
+        ("the d1 snapshot", first.inputs.d1 != fold.inputs.d1),
         (
             "the taker fee",
             first.inputs.taker_fee_bps != fold.inputs.taker_fee_bps,

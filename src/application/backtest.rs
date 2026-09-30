@@ -71,6 +71,9 @@ pub struct SnapshotPins {
     pub primary: DataVersion,
     /// The HTF snapshot's `data_version`, when the source run used one.
     pub htf: Option<DataVersion>,
+    /// The fixed daily snapshot's `data_version`, when the source run used one
+    /// (r3.s2.w4) — replayed exactly like the other pins, never HEAD.
+    pub d1: Option<DataVersion>,
 }
 
 /// What a caller asks for: one persisted version, one pair, one primary timeframe,
@@ -132,6 +135,8 @@ pub enum PreSaveStage {
     PrimarySnapshot,
     /// Loading or validating the HTF `HEAD` snapshot.
     HtfSnapshot,
+    /// Loading or validating the fixed daily `HEAD` snapshot (r3.s2.w4).
+    D1Snapshot,
 }
 
 impl PreSaveStage {
@@ -143,6 +148,7 @@ impl PreSaveStage {
             PreSaveStage::PriorRun => "the prior run",
             PreSaveStage::PrimarySnapshot => "the primary candle snapshot",
             PreSaveStage::HtfSnapshot => "the HTF candle snapshot",
+            PreSaveStage::D1Snapshot => "the daily candle snapshot",
         }
     }
 }
@@ -158,6 +164,8 @@ pub enum ReadBackStage {
     PrimarySnapshot,
     /// Reloading the HTF snapshot named by the persisted inputs.
     HtfSnapshot,
+    /// Reloading the daily snapshot named by the persisted inputs (r3.s2.w4).
+    D1Snapshot,
     /// Projecting the saved values onto the wire shape.
     Projection,
 }
@@ -171,6 +179,7 @@ impl ReadBackStage {
             ReadBackStage::Trades => "trades",
             ReadBackStage::PrimarySnapshot => "primary snapshot",
             ReadBackStage::HtfSnapshot => "htf snapshot",
+            ReadBackStage::D1Snapshot => "d1 snapshot",
             ReadBackStage::Projection => "wire projection",
         }
     }
@@ -311,6 +320,50 @@ pub enum BacktestAppError {
         primary: Timeframe,
         /// The request's higher-timeframe selection.
         htf: Timeframe,
+    },
+
+    /// The request's `inputs.htf` selection is `D1` (r3.s2.w4). The run's
+    /// daily series is fixed — every `series: "d1"` operand reads the loaded
+    /// D1 snapshot, so an HTF selection of the same timeframe would collide
+    /// with it. Refused at the request boundary before any candle I/O, with
+    /// `field` pointing at the member to clear.
+    #[error(
+        "{field} must not be D1 — a D1 higher timeframe would collide with the fixed `d1` series; use the `d1` series operand instead"
+    )]
+    HtfIsD1 {
+        /// The request/input field at fault — always `"inputs.htf"`.
+        field: &'static str,
+    },
+
+    /// The request's PRIMARY timeframe is `D1` (r3.s2 round-1 fix, C1). The
+    /// daily series is the run's fixed *third* series — read only through
+    /// `series: "d1"` operands, never a run's primary — and a daily primary
+    /// would also make the money math wrong: `stamp_funding` keeps only the
+    /// LAST of a day's three 8-hourly funding events per candle, so a D1
+    /// primary would accrue one event a day instead of three and understate
+    /// every funding total (net `PnL`, R, the walk-forward verdict). Refused
+    /// before any candle I/O, with `field` pointing at the member to change.
+    #[error(
+        "{field} must not be D1 — the daily series is fixed and read through `series: \"d1\"` \
+         operands, never as a run's primary time frame"
+    )]
+    PrimaryIsD1 {
+        /// The request/input field at fault — always `"primary_timeframe"`.
+        field: &'static str,
+    },
+
+    /// The strategy carries a `series: "d1"` operand but no D1 snapshot exists
+    /// to load (r3.s2.w4) — the daily-series mirror of
+    /// [`BacktestAppError::HtfRequired`], naming the fetch command that
+    /// creates the missing snapshot.
+    #[error(
+        "strategy requires a daily candle series but {field} was not supplied and no D1 snapshot exists for {pair} — fetch one with `pulse fetch-data --tf D1`, i.e. `pulse fetch-data {pair} --tf D1`"
+    )]
+    D1Required {
+        /// The request/input field at fault — always `"inputs.d1"`.
+        field: &'static str,
+        /// The pair whose D1 snapshot is missing.
+        pair: Pair,
     },
 
     /// A READ failed before anything was saved.
@@ -492,6 +545,9 @@ pub struct BacktestOutcome {
     pub primary: CandleSeries,
     /// The HTF snapshot, reloaded the same way, when the run used one.
     pub htf: Option<CandleSeries>,
+    /// The fixed daily snapshot, reloaded by the identity the run records,
+    /// when the run used one (r3.s2.w4).
+    pub d1: Option<CandleSeries>,
     /// The FR-7 fingerprint warning, if the prior run was built by another engine.
     ///
     /// The only field not read back from storage: the comparison must happen before
@@ -536,6 +592,12 @@ pub(crate) enum PrepareError {
     /// work rather than silently evaluating the operand against primary data.
     /// Surfaces as [`BacktestAppError::HtfRequired`] on the standalone path.
     HtfRequired,
+    /// The compiled strategy carries a `series: "d1"` operand but no daily
+    /// series was supplied (r3.s2.w4) — the same refuse-before-candle-work
+    /// shape as [`PrepareError::HtfRequired`]. Surfaces as
+    /// [`BacktestAppError::D1Required`], naming the fetch command, on the
+    /// standalone path.
+    D1Required,
     /// The engine refused the run.
     Engine(BacktestError),
 }
@@ -554,11 +616,17 @@ pub(crate) enum PrepareError {
 ///
 /// Returns [`PrepareError::Compile`] when the validated document will not compile
 /// and [`PrepareError::Engine`] when the engine refuses the run.
+// Eight arguments: the validated document, the provenance it will record, the
+// three series it may read (primary, the optional HTF, the fixed optional D1),
+// the filters and the run's two engine knobs. Same reasoning as `run_backtest`'s
+// allowance — the series set is positional and every caller must name it in full.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_backtest(
     validated: &ValidatedDsl,
     inputs: BacktestInputs,
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
+    d1: Option<&CandleSeries>,
     filters: &SymbolFilters,
     starting_equity: Decimal,
     series_end: SeriesEnd,
@@ -570,6 +638,10 @@ pub(crate) fn prepare_backtest(
     // `BacktestError::HtfRequired` as the last line of defense.
     if compiled.needs_htf() && htf.is_none() {
         return Err(PrepareError::HtfRequired);
+    }
+    // r3.s2.w4: the D1 mirror of the same guard.
+    if compiled.needs_d1() && d1.is_none() {
+        return Err(PrepareError::D1Required);
     }
     let config = BacktestConfig {
         starting_equity,
@@ -584,6 +656,7 @@ pub(crate) fn prepare_backtest(
         &compiled,
         primary,
         htf,
+        d1,
         &config,
         filters,
         series_end,
@@ -657,8 +730,11 @@ struct EngineOutput {
 ///
 /// # Errors
 ///
-/// [`BacktestAppError::HtfRequired`] when the strategy needs a
-/// higher-timeframe series the request does not supply;
+/// [`BacktestAppError::PrimaryIsD1`] when the primary timeframe is the fixed
+/// daily one (r3.s2 round-1 fix, C1 — a D1 primary would mis-accrue funding);
+/// [`BacktestAppError::HtfIsD1`] when the supplied higher-timeframe selection
+/// is the fixed daily one; [`BacktestAppError::HtfRequired`] when the strategy
+/// needs a higher-timeframe series the request does not supply;
 /// [`BacktestAppError::HtfNotHigher`] when the supplied selection is not
 /// strictly higher than the primary timeframe.
 pub fn check_request_shape(
@@ -666,6 +742,27 @@ pub fn check_request_shape(
     primary_tf: Timeframe,
     htf_tf: Option<Timeframe>,
 ) -> Result<(), BacktestAppError> {
+    // r3.s2 round-1 fix (C1): D1 is never a run's PRIMARY either — the fixed
+    // daily series is read through `series: "d1"` operands. Checked first
+    // because a daily primary passes every later rule (24h is strictly higher
+    // than nothing, and the funding-gap walk tolerates daily spacing), yet it
+    // would accrue at most one of each day's three funding events and
+    // understate every funding total.
+    if primary_tf == Timeframe::D1 {
+        return Err(BacktestAppError::PrimaryIsD1 {
+            field: "primary_timeframe",
+        });
+    }
+    // r3.s2.w4: D1 is never a higher timeframe — the run's daily series is
+    // fixed, and an HTF selection of the same interval would collide with it.
+    // Checked BEFORE the cadence rule (which D1 passes: 24h > 15m) so the
+    // message names the actual collision, not a cadence that is not the
+    // problem. This runs before any candle I/O, on every entry point.
+    if htf_tf == Some(Timeframe::D1) {
+        return Err(BacktestAppError::HtfIsD1 {
+            field: "inputs.htf",
+        });
+    }
     if compiled.needs_htf() && htf_tf.is_none() {
         return Err(BacktestAppError::HtfRequired {
             field: "inputs.htf",
@@ -735,8 +832,14 @@ where
     //    r1.s4.w2: the compile + compute half of that closure is now
     //    `prepare_backtest`, the SHARED deterministic step the coach accept path
     //    also calls. Only its address moved; the sequence inside is unchanged.
-    let engine =
-        run_engine_offthread(candles.clone(), exchange.clone(), validated, request).await?;
+    let engine = run_engine_offthread(
+        candles.clone(),
+        exchange.clone(),
+        validated,
+        request,
+        compiled.needs_d1(),
+    )
+    .await?;
 
     // 4. FR-7 compare BEFORE the insert (D3): afterwards the fresh row is its own
     //    prior and the warning can never fire. r3.s1.w4 (#198): the prior is
@@ -852,7 +955,7 @@ where
     let mut htf = match inputs.htf.as_ref() {
         Some(selection) => Some(
             load_version_offthread(
-                candles,
+                candles.clone(),
                 inputs.pair.clone(),
                 selection.timeframe,
                 selection.data_version.clone(),
@@ -866,6 +969,26 @@ where
         htf = htf.map(|series| series.windowed(w));
     }
 
+    // r3.s2.w4: the daily snapshot the run recorded reloads by the SAME
+    // identity, never HEAD — the read-back replay follows `inputs.d1` exactly
+    // as it follows `inputs.htf`.
+    let mut d1 = match inputs.d1.as_ref() {
+        Some(selection) => Some(
+            load_version_offthread(
+                candles,
+                inputs.pair.clone(),
+                selection.timeframe,
+                selection.data_version.clone(),
+            )
+            .await
+            .map_err(|e| saved(ReadBackStage::D1Snapshot, ReadBackFailure::Data(e)))?,
+        ),
+        None => None,
+    };
+    if let Some(w) = &inputs.window {
+        d1 = d1.map(|series| series.windowed(w));
+    }
+
     let mfe = project_histogram(trades.iter().map(|t| t.mfe_r));
     // MAE is negated, not `abs()`d: a positive MAE would be a sign violation and
     // must surface in `underflow` rather than be folded into a plausible bin.
@@ -877,6 +1000,7 @@ where
         trades,
         primary,
         htf,
+        d1,
         fingerprint_warning,
         mfe,
         mae,
@@ -918,6 +1042,7 @@ async fn run_engine_offthread<C, E>(
     exchange: E,
     validated: ValidatedDsl,
     request: &BacktestRequest,
+    needs_d1: bool,
 ) -> Result<EngineOutput, BacktestAppError>
 where
     C: CandleSeriesRepository + Send + 'static,
@@ -948,6 +1073,34 @@ where
             )?),
             None => None,
         };
+        // r3.s2.w4: the fixed daily series loads ONLY when the compiled
+        // strategy carries a `d1` operand — a strategy that never reads D1
+        // must not require (or even touch) a D1 snapshot, the same
+        // only-what-the-run-needs rule the HTF load follows. A missing HEAD
+        // D1 snapshot is `D1Required` naming the fetch command, not a bare
+        // missing-snapshot error.
+        let mut d1 = if needs_d1 {
+            Some(
+                load_series(
+                    &candles,
+                    &pair,
+                    Timeframe::D1,
+                    pins.as_ref().and_then(|p| p.d1.as_ref()),
+                    PreSaveStage::D1Snapshot,
+                )
+                .map_err(|err| match err {
+                    BacktestAppError::SnapshotMissing { pair: missing, .. } => {
+                        BacktestAppError::D1Required {
+                            field: "inputs.d1",
+                            pair: missing,
+                        }
+                    }
+                    other => other,
+                })?,
+            )
+        } else {
+            None
+        };
         let prepared = prepare_over_loaded_series(
             &validated,
             &exchange,
@@ -957,6 +1110,7 @@ where
             window,
             &mut primary,
             &mut htf,
+            &mut d1,
         )?;
         Ok(EngineOutput { prepared })
     })
@@ -995,11 +1149,12 @@ pub(crate) fn prepare_over_loaded_series<E>(
     window: Option<CandleWindow>,
     primary: &mut CandleSeries,
     htf: &mut Option<CandleSeries>,
+    d1: &mut Option<CandleSeries>,
 ) -> Result<PreparedBacktest, BacktestAppError>
 where
     E: ExchangeAdapter,
 {
-    let lead_in = apply_lead_in_window(window.as_ref(), primary, htf, pair, primary_tf)?;
+    let lead_in = apply_lead_in_window(window.as_ref(), primary, htf, d1, pair, primary_tf)?;
     let series_end = lead_in
         .as_ref()
         .map_or(SeriesEnd::SnapshotEnd, |lead_in| lead_in.series_end);
@@ -1011,6 +1166,7 @@ where
     let inputs = inputs_from_run(
         primary,
         htf.as_ref(),
+        d1.as_ref(),
         config,
         &filters,
         window,
@@ -1021,6 +1177,7 @@ where
         inputs,
         primary,
         htf.as_ref(),
+        d1.as_ref(),
         &filters,
         config.starting_equity,
         series_end,
@@ -1029,6 +1186,10 @@ where
         PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
         PrepareError::HtfRequired => BacktestAppError::HtfRequired {
             field: "inputs.htf",
+        },
+        PrepareError::D1Required => BacktestAppError::D1Required {
+            field: "inputs.d1",
+            pair: pair.clone(),
         },
         PrepareError::Engine(source) => BacktestAppError::Engine(source),
     })
@@ -1098,6 +1259,7 @@ where
 fn inputs_from_run(
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
+    d1: Option<&CandleSeries>,
     config: &BacktestConfig,
     filters: &SymbolFilters,
     window: Option<CandleWindow>,
@@ -1110,6 +1272,10 @@ fn inputs_from_run(
             data_version: primary.version.clone(),
         },
         htf: htf.map(|series| SnapshotSelection {
+            timeframe: series.timeframe,
+            data_version: series.version.clone(),
+        }),
+        d1: d1.map(|series| SnapshotSelection {
             timeframe: series.timeframe,
             data_version: series.version.clone(),
         }),
@@ -1155,6 +1321,7 @@ pub(crate) fn apply_lead_in_window(
     window: Option<&CandleWindow>,
     primary: &mut CandleSeries,
     htf: &mut Option<CandleSeries>,
+    d1: &mut Option<CandleSeries>,
     pair: &Pair,
     timeframe: Timeframe,
 ) -> Result<Option<LeadInWindow>, BacktestAppError> {
@@ -1190,6 +1357,10 @@ pub(crate) fn apply_lead_in_window(
     };
     *primary = primary.windowed(&lead_in_slice);
     *htf = htf.take().map(|series| series.windowed(&lead_in_slice));
+    // r3.s2.w4: the daily series follows the same lead-in shape — kept whole
+    // from the snapshot start so the daily engine arrives warm, sliced at the
+    // window edge like the others.
+    *d1 = d1.take().map(|series| series.windowed(&lead_in_slice));
     let series_end = match snapshot_last_open {
         Some(last) if primary.candles.last().is_some_and(|c| c.open_time < last) => {
             SeriesEnd::WindowEdge
@@ -1313,6 +1484,33 @@ fn version_needs_htf(version: &StrategyVersion) -> bool {
         .is_some_and(|compiled| compiled.needs_htf())
 }
 
+/// Whether the run's strategy compiled with an `htf` operand (r3.s2.w4, #219) —
+/// the truth the Backtest Lab's provenance band gates its HTF row on.
+///
+/// `inputs.htf` alone cannot answer it: a run with **no** `htf` operand still
+/// loads and records the pair's H4 snapshot, because `resolve_default_request`
+/// supplies the application default and [`inputs_from_run`] records what was
+/// loaded. Recording that is deliberate (§3 #219 — dropping it would change
+/// `BacktestInputs` for every new run) so the fix is on the view, and the view
+/// needs a fact the run row does not carry: what the DSL asked for.
+///
+/// A version is immutable, so this answers exactly what the run's own compile
+/// answered. `false` when the version is missing or its stored DSL no longer
+/// validates/compiles — both are unreachable for a run that exists (a persisted
+/// run implies a version that compiled), and `false` is the honest direction: the
+/// band shows an HTF row only when the strategy can be *shown* to read the HTF.
+pub async fn run_uses_htf<S>(strategies: &S, version_id: &VersionId) -> bool
+where
+    S: StrategyRepository,
+{
+    strategies
+        .get_version(version_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|version| version_needs_htf(&version))
+}
+
 /// The version's latest persisted run's `inputs`, when it has a usable row.
 /// `inputs: None` (a pre-0006 row) reads the same as no run at all — skipped,
 /// never an error. Fold rows are excluded upstream by the read itself (N1), so
@@ -1350,6 +1548,7 @@ fn request_from_inputs(
         pair,
         primary,
         htf,
+        d1,
         taker_fee_bps,
         slippage_bps,
         ..
@@ -1367,6 +1566,7 @@ fn request_from_inputs(
         snapshots: Some(SnapshotPins {
             primary: primary.data_version,
             htf: htf.map(|selection| selection.data_version),
+            d1: d1.map(|selection| selection.data_version),
         }),
         window,
     }
@@ -1775,6 +1975,7 @@ mod tests {
         htf_v: Option<&str>,
         taker: i64,
         slippage: i64,
+        d1_v: Option<&str>,
     ) -> BacktestInputs {
         BacktestInputs {
             pair: Pair::new("BTCUSDT"),
@@ -1784,6 +1985,10 @@ mod tests {
             },
             htf: htf_v.map(|v| SnapshotSelection {
                 timeframe: Timeframe::H4,
+                data_version: DataVersion::new(v),
+            }),
+            d1: d1_v.map(|v| SnapshotSelection {
+                timeframe: Timeframe::D1,
                 data_version: DataVersion::new(v),
             }),
             taker_fee_bps: Decimal::new(taker, 0),
@@ -1802,11 +2007,17 @@ mod tests {
         let runs = FakeRuns::default();
         runs.push(persisted_run(
             &VersionId::new("parent-1"),
-            Some(recorded_inputs("v-parent", Some("v-parent-htf"), 7, 2)),
+            Some(recorded_inputs(
+                "v-parent",
+                Some("v-parent-htf"),
+                7,
+                2,
+                None,
+            )),
         ));
         runs.push(persisted_run(
             &VersionId::new("child-1"),
-            Some(recorded_inputs("v-own", None, 4, 1)),
+            Some(recorded_inputs("v-own", None, 4, 1, None)),
         ));
 
         let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
@@ -1823,6 +2034,7 @@ mod tests {
             Some(SnapshotPins {
                 primary: DataVersion::new("v-parent"),
                 htf: Some(DataVersion::new("v-parent-htf")),
+                d1: None,
             }),
             "the parent's recorded data_versions pin the load, not the child's"
         );
@@ -1836,7 +2048,7 @@ mod tests {
         let runs = FakeRuns::default();
         runs.push(persisted_run(
             &VersionId::new("child-1"),
-            Some(recorded_inputs("v-own", Some("v-own-htf"), 5, 3)),
+            Some(recorded_inputs("v-own", Some("v-own-htf"), 5, 3, None)),
         ));
 
         let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
@@ -1848,6 +2060,7 @@ mod tests {
             Some(SnapshotPins {
                 primary: DataVersion::new("v-own"),
                 htf: Some(DataVersion::new("v-own-htf")),
+                d1: None,
             }),
             "the parent has no run, so the version's own latest run supplies the request"
         );
@@ -1864,7 +2077,7 @@ mod tests {
         runs.push(persisted_run(&VersionId::new("parent-1"), None));
         runs.push(persisted_run(
             &VersionId::new("child-1"),
-            Some(recorded_inputs("v-own", None, 4, 1)),
+            Some(recorded_inputs("v-own", None, 4, 1, None)),
         ));
 
         let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
@@ -1876,6 +2089,7 @@ mod tests {
             Some(SnapshotPins {
                 primary: DataVersion::new("v-own"),
                 htf: None,
+                d1: None,
             }),
             "the parent's pre-0006 row is skipped, not an error"
         );
@@ -1914,7 +2128,7 @@ mod tests {
         let strategies = FakeStrategies::default();
         strategies.insert(version("child-1", Some("parent-1")));
         let runs = FakeRuns::default();
-        let mut inherited = recorded_inputs("v-parent", None, 4, 1);
+        let mut inherited = recorded_inputs("v-parent", None, 4, 1, None);
         inherited.window = Some(CandleWindow::new(100, 200).unwrap());
         runs.push(persisted_run(&VersionId::new("parent-1"), Some(inherited)));
 
@@ -1944,7 +2158,7 @@ mod tests {
         let runs = FakeRuns::default();
         runs.push(persisted_run(
             &VersionId::new("parent-1"),
-            Some(recorded_inputs("v-parent", None, 7, 2)),
+            Some(recorded_inputs("v-parent", None, 7, 2, None)),
         ));
 
         let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
@@ -1961,6 +2175,7 @@ mod tests {
             Some(SnapshotPins {
                 primary: DataVersion::new("v-parent"),
                 htf: None,
+                d1: None,
             }),
             "the primary pin is inherited; the HTF pin stays HEAD, the fresh-default shape"
         );
@@ -1981,7 +2196,7 @@ mod tests {
         let runs = FakeRuns::default();
         runs.push(persisted_run(
             &VersionId::new("parent-1"),
-            Some(recorded_inputs("v-parent", None, 7, 2)),
+            Some(recorded_inputs("v-parent", None, 7, 2, None)),
         ));
 
         let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
@@ -1994,6 +2209,7 @@ mod tests {
             Some(SnapshotPins {
                 primary: DataVersion::new("v-parent"),
                 htf: None,
+                d1: None,
             }),
             "a non-HTF version inherits the run's inputs untouched"
         );

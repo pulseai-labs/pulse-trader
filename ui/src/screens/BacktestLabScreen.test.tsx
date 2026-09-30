@@ -138,6 +138,10 @@ const SEEDED_RUN: BacktestRunDto = {
   primaryDataVersion: "btcusdt-15m-v7",
   htfTimeframe: "4h",
   htfDataVersion: "btcusdt-4h-v3",
+  // r3.s2.w4: the recorded daily snapshot, and the strategy-level flag the band
+  // gates the HTF row on. This fixture is the "both series" shape.
+  d1DataVersion: "btcusdt-1d-v1",
+  usesHtf: true,
   firstOpenTimeMs: "1735689600000",
   lastCloseTimeMs: "1756684800000",
   startingEquity: "10000.00",
@@ -252,6 +256,10 @@ const WARN_RUN: BacktestRunDto = {
   strategyVersionId: "v-alpha-2",
   htfTimeframe: null,
   htfDataVersion: null,
+  // A strategy that reads the HTF over a row that records no HTF timeframe
+  // (the pre-0006 shape): the row still renders, with the em dash.
+  usesHtf: true,
+  d1DataVersion: null,
   fingerprintWarning: "engine fingerprint changed since the prior run",
   profitFactor: "0.681",
   sharpe: -0.42,
@@ -498,6 +506,8 @@ describe("BacktestLabScreen (fresh result render)", () => {
       "btcusdt-15m-v7",
       "4h",
       "btcusdt-4h-v3",
+      // r3.s2.w4: the daily row, when the run recorded one.
+      "btcusdt-1d-v1",
       "1735689600000",
       "1756684800000",
       "10000.00",
@@ -530,6 +540,65 @@ describe("BacktestLabScreen (fresh result render)", () => {
     const text = band.textContent ?? "";
     expect(text).toContain("not recorded");
     expect(text).not.toContain("lot_step");
+  });
+
+  // -------------------------------------------------------------------------
+  // r3.s2.w4 (#219) — the two series rows are gated independently
+  // -------------------------------------------------------------------------
+  //
+  // The band's HTF row is gated on the STRATEGY (`usesHtf`), because every run
+  // records an H4 selection even when its DSL has no `htf` operand; the D1 row
+  // is gated on the RECORDED snapshot (`d1DataVersion`), because a run either
+  // read a daily series — and pinned the version it read — or it did not. The
+  // three shapes below are the ones the spec names.
+
+  it("shows neither series row for a run with no HTF operand and no daily snapshot", async () => {
+    const container = await renderRun({
+      ...SEEDED_RUN,
+      usesHtf: false,
+      d1DataVersion: null,
+    });
+    const text =
+      (container.querySelector(".bt-provenance") as HTMLElement).textContent ?? "";
+
+    // The recorded H4 selection is still in the DTO — the row is what is gone.
+    expect(text).not.toContain("4h");
+    expect(text).not.toContain("btcusdt-4h-v3");
+    expect(text).not.toContain("btcusdt-1d-v1");
+    // The primary row is untouched by either gate.
+    expect(text).toContain("15m");
+    expect(text).toContain("btcusdt-15m-v7");
+    // The em dash belongs to the HTF row alone: with the row gone it must not
+    // appear as a stray value elsewhere in the band.
+    expect(text.match(/—/g) ?? []).toHaveLength(0);
+  });
+
+  it("shows only the HTF row for an H4-only run that recorded no daily snapshot", async () => {
+    const container = await renderRun({
+      ...SEEDED_RUN,
+      usesHtf: true,
+      d1DataVersion: null,
+    });
+    const text =
+      (container.querySelector(".bt-provenance") as HTMLElement).textContent ?? "";
+
+    expect(text).toContain("4h");
+    expect(text).toContain("btcusdt-4h-v3");
+    expect(text).not.toContain("btcusdt-1d-v1");
+    expect(text).not.toContain("—");
+  });
+
+  it("shows the HTF row and the daily row for a run that read both", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    const text =
+      (container.querySelector(".bt-provenance") as HTMLElement).textContent ?? "";
+
+    expect(text).toContain("4h");
+    expect(text).toContain("btcusdt-4h-v3");
+    // The daily row names the version the run read; the timeframe is fixed at
+    // `1d`, so the version is the whole value and no `1d` label is added.
+    expect(text).toContain("btcusdt-1d-v1");
+    expect(text).not.toContain("—");
   });
 
   it("renders every KPI tile from the DTO, with an em dash for null ratio fields", async () => {

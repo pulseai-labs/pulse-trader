@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Generate the WI-3.04 pandas-ta reference CSV.
 
-Run from the repository root with a temporary venv outside the worktree:
+Run from the repository root with a venv OUTSIDE the worktree at the pinned
+scratch path (`/tmp` is forbidden by host rule; `mktemp` lands there):
 
-    REFVENV="$(mktemp -d)/refgen"
+    REFVENV="$HOME/.cache/pulse-scratch/r3.s2.w2/refgen"
     uv venv --python 3.11 "$REFVENV"
-    uv pip install --python "$REFVENV/bin/python" pandas-ta-classic pyarrow
+    # PIN the versions below — a floating install resolved pandas-ta-classic
+    # 0.8.32 on 2026-09-28 and CHANGED the early ADX settling-window values
+    # (rows 29-375); the committed CSV's existing columns must stay byte-identical.
+    uv pip install --python "$REFVENV/bin/python" pandas-ta-classic==0.6.20 pyarrow==25.0.1
     "$REFVENV/bin/python" tests/fixtures/indicators/gen_reference.py
 
-Resolved on 2026-06-12; regenerated 2026-09-19 for the r2.s2.w2 `atr_14` column:
+Resolved on 2026-06-12; regenerated 2026-09-19 for the r2.s2.w2 `atr_14`
+column; regenerated 2026-09-28 for the r3.s2.w1 `macd_signal_12_26_9` and
+`macd_hist_12_26_9` columns; regenerated 2026-09-29 for the r3.s2.w2
+`highest_high_20` and `lowest_low_20` columns:
     python 3.11.16
     numpy 2.4.6
     pandas 3.0.6
@@ -29,12 +36,24 @@ Indicator calls:
     ADX(14): df.ta.adx(high=high, low=low, close=close, length=14)
     MACD line: df.ta.ema(close=close, length=12, adjust=False, sma=False)
         - df.ta.ema(close=close, length=26, adjust=False, sma=False)
+    MACD signal (r3.s2.w1): a seeded recursive EMA(9) over the FULL UNBLANKED
+        line — both sides seed at candle 1, mirroring ta-rs, whose MACD
+        advances the signal EMA from the very first candle
+        (`signal_ema.next(macd)` inside `MovingAverageConvergenceDivergence::next`).
+        Composing the signal over the blanked line (first valid at index 25)
+        would seed 25 bars late and DISAGREE with the engine.
+    MACD histogram (r3.s2.w1): line − signal (ta-rs's `histogram = macd - signal`).
     ATR(14): df.ta.atr(high=high, low=low, close=close, length=14,
         mamode="rma") — the Wilder RMA (alpha = 1/period), matching the
         engine's shared WilderRma recursion. pandas-ta-classic SMA-seeds its
         rma over the first `period` true ranges, identically to the engine, so
         the cross-validation needs no settling window (measured at regen: worst
         relative delta ≈2.7e-12 post-warmup, settle_bars = 0).
+    highest_high_20 (r3.s2.w2): df["high"].rolling(20).max().shift(1) — plain
+        pandas, the prior-N convention: at row k it is the max high of rows
+        k-20..k-1, the 20 closed bars BEFORE k, excluding k (Q1). First
+        defined at index 20 — the engine's N+1 warm-up for the rolling
+        extremes. The same construction gives lowest_low_20 over `low`.
 
 The classic fork emits ADX values before the project ADX warmup boundary.
 Rows before index 27 (2 * 14 - 1) are blanked so the committed reference
@@ -43,6 +62,12 @@ pandas-ta ADX line after that boundary plus the documented settling window.
 pandas-ta's ATR likewise emits before the engine's first-defined index
 (candle index 14 — the first `period` real TRs seed its SMA), so rows before
 index 14 are blanked for the same warmup-contract reason.
+
+The MACD signal and histogram (r3.s2.w1) blank rows before index
+`max(fast, slow) + signal − 1 = 33`: the line first exists at index 25
+(0-based; `max(fast, slow) − 1`), and the seeded signal EMA needs `signal`
+line values (indices 25..33), so its first fully-defined value is index 33 —
+candle 34, the engine's warmup boundary for the selector-bearing slots.
 """
 
 from __future__ import annotations
@@ -63,6 +88,12 @@ ADX_FIRST_DEFINED_INDEX = 2 * 14 - 1
 ATR_FIRST_DEFINED_INDEX = 14
 EMA_FIRST_DEFINED_INDEX = 50 - 1
 MACD_FIRST_DEFINED_INDEX = 26 - 1
+# line first at 25 (0-based); signal/hist need `signal` line values → 25 + 9 - 1.
+MACD_SIGNAL_FIRST_DEFINED_INDEX = 26 - 1 + 9 - 1
+# r3.s2.w2: rolling(20).shift(1) is NaN through index 19 by construction; the
+# explicit blank pins the warm-up contract (first defined at index 20 = N+1).
+HIGHEST_FIRST_DEFINED_INDEX = 20
+LOWEST_FIRST_DEFINED_INDEX = 20
 
 
 def format_value(value: float) -> str:
@@ -121,19 +152,45 @@ def main() -> None:
     rsi = recursive_ema_rsi(close, 14)
     ema = recursive_ema(close, 50)
     adx = df.ta.adx(high=high, low=low, close=close, length=14)["ADX_14"].copy()
-    macd = recursive_ema(close, 12) - recursive_ema(close, 26)
+    # Compose the FULL line (both EMAs seeded at candle 1 — no NaNs), then the
+    # signal as a seeded recursive EMA over it, mirroring ta-rs's internal
+    # `signal_ema.next(macd)` from the very first candle. Blanking happens
+    # AFTER composition, on copies.
+    macd = (recursive_ema(close, 12) - recursive_ema(close, 26)).copy()
+    macd_signal = recursive_ema(macd, 9).copy()
+    macd_hist = (macd - macd_signal).copy()
     atr = df.ta.atr(high=high, low=low, close=close, length=14, mamode="rma")
+
+    # r3.s2.w2: the rolling extremes are exact prior-N window aggregates over
+    # the raw price fields (Q1's convention), not a pandas-ta call.
+    highest_high_20 = high.rolling(20).max().shift(1)
+    lowest_low_20 = low.rolling(20).min().shift(1)
 
     ema.iloc[:EMA_FIRST_DEFINED_INDEX] = math.nan
     adx.iloc[:ADX_FIRST_DEFINED_INDEX] = math.nan
     macd.iloc[:MACD_FIRST_DEFINED_INDEX] = math.nan
+    macd_signal.iloc[:MACD_SIGNAL_FIRST_DEFINED_INDEX] = math.nan
+    macd_hist.iloc[:MACD_SIGNAL_FIRST_DEFINED_INDEX] = math.nan
     atr.iloc[:ATR_FIRST_DEFINED_INDEX] = math.nan
+    highest_high_20.iloc[:HIGHEST_FIRST_DEFINED_INDEX] = math.nan
+    lowest_low_20.iloc[:LOWEST_FIRST_DEFINED_INDEX] = math.nan
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
-            ["open_time", "rsi_14", "ema_50", "adx_14", "macd_12_26_9", "atr_14"]
+            [
+                "open_time",
+                "rsi_14",
+                "ema_50",
+                "adx_14",
+                "macd_12_26_9",
+                "atr_14",
+                "macd_signal_12_26_9",
+                "macd_hist_12_26_9",
+                "highest_high_20",
+                "lowest_low_20",
+            ]
         )
         for idx, row in df.iterrows():
             writer.writerow(
@@ -144,6 +201,10 @@ def main() -> None:
                     format_value(float(adx.iloc[idx])),
                     format_value(float(macd.iloc[idx])),
                     format_value(float(atr.iloc[idx])),
+                    format_value(float(macd_signal.iloc[idx])),
+                    format_value(float(macd_hist.iloc[idx])),
+                    format_value(float(highest_high_20.iloc[idx])),
+                    format_value(float(lowest_low_20.iloc[idx])),
                 ]
             )
 
@@ -154,7 +215,11 @@ def main() -> None:
         f"ema={EMA_FIRST_DEFINED_INDEX} "
         f"adx={ADX_FIRST_DEFINED_INDEX} "
         f"macd={MACD_FIRST_DEFINED_INDEX} "
-        f"atr={ATR_FIRST_DEFINED_INDEX}"
+        f"macd_signal={MACD_SIGNAL_FIRST_DEFINED_INDEX} "
+        f"macd_hist={MACD_SIGNAL_FIRST_DEFINED_INDEX} "
+        f"atr={ATR_FIRST_DEFINED_INDEX} "
+        f"highest_high_20={highest_high_20.first_valid_index()} "
+        f"lowest_low_20={lowest_low_20.first_valid_index()}"
     )
 
 

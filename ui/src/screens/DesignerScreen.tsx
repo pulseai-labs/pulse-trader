@@ -143,14 +143,18 @@ function StepList({ turn }: { turn: AgentTurn }) {
   if (turn.steps.length === 0 && turn.status !== "streaming") {
     return null;
   }
-  const calls = `${turn.steps.length} tool ${turn.steps.length === 1 ? "call" : "calls"}`;
+  // r3.s2.w5: the composer's prose notes fold into the list, but both counts
+  // stay counts of TOOL CALLS — the finalize summary counts LLM calls, so a
+  // note must never inflate what the headers report.
+  const toolCount = turn.steps.filter((step) => step.kind === "tool").length;
+  const calls = `${toolCount} tool ${toolCount === 1 ? "call" : "calls"}`;
   return (
     <div className="dsg-steps">
       <div className="dsg-steps-head">
         {turn.status === "streaming" ? (
           <>
-            <span className="spinner-sm" /> streaming · {turn.steps.length}{" "}
-            {turn.steps.length === 1 ? "step" : "steps"} so far
+            <span className="spinner-sm" /> streaming · {toolCount}{" "}
+            {toolCount === 1 ? "step" : "steps"} so far
           </>
         ) : (
           <>
@@ -160,6 +164,15 @@ function StepList({ turn }: { turn: AgentTurn }) {
       </div>
       <div className="dsg-steps-body">
         {turn.steps.map((step, index) => {
+          if (step.kind === "note") {
+            // The composer's own scrubbed prose (r3.s2.w5) — a plain text
+            // row between the tool steps, never a step with an outcome.
+            return (
+              <div key={index} className="dsg-note">
+                {step.text}
+              </div>
+            );
+          }
           const open = step.outcome === undefined && turn.status === "streaming";
           return (
             <div key={index} className={`dsg-step${open ? " is-running" : " is-done"}`}>

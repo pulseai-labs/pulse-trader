@@ -173,6 +173,97 @@ describe("LibraryScreen (seeded payload)", () => {
     expect((kpis as HTMLElement).textContent).not.toMatch(/\d/);
   });
 
+  it("renders the version node line as direction · entry · filters · exits (#193)", async () => {
+    // A version whose DSL carries an H4 filter and an ATR stop: both tokens
+    // must be visible in the node's own summary line, untruncated.
+    const withH4Filter = {
+      ...version("v-alpha-1", null, stats("+0.3R", "46.2%", 38)),
+      dsl: {
+        name: "D47 Breakout",
+        direction: "long",
+        entry: ["close > highest(high, 20 prior)"],
+        filters: ["h4:ema(200) rising (1 bar)"],
+        exits: ["atr(14)×2", "take profit 2R"],
+        risk: ["risk 1% per trade"],
+      },
+    };
+    overviewMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        strategies: [
+          {
+            id: "strat-d47",
+            name: "D47 Breakout",
+            createdAt: "2026-08-01T09:00:00.000Z",
+            pinnedVersionId: null,
+            versions: [withH4Filter],
+          },
+        ],
+      },
+    });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle d47 breakout/i }));
+    const tree = container.querySelector(".vtree-wrap");
+    expect(tree).not.toBeNull();
+    const node = within(tree as HTMLElement).getByText("v1").closest(".vnode");
+    expect(node).not.toBeNull();
+    const line = (node as HTMLElement).querySelector(".vnode-summary");
+    expect(line).not.toBeNull();
+    expect((line as HTMLElement).textContent).toContain("h4:ema(200) rising (1 bar)");
+    expect((line as HTMLElement).textContent).toContain("atr(14)×2");
+    expect((line as HTMLElement).textContent).toContain("close > highest(high, 20 prior)");
+  });
+
+  it("keeps the full summary line reachable while the node truncates it visually", async () => {
+    // PROXY, stated plainly: the ellipsis itself is the stylesheet's job
+    // (`.vnode-summary` carries `text-overflow: ellipsis; overflow: hidden`),
+    // and jsdom performs no layout, so no DOM assertion can observe a rendered
+    // cut. What IS asserted here: the element is the truncating class, and the
+    // FULL line rides the `title` attribute for hover. The verifier should
+    // judge this as a proxy for "truncate to the node's width with an
+    // ellipsis", not as an observed truncation.
+    const longEntry = "close > highest(high, 20 prior) with an absurdly long extra tail ".repeat(4);
+    const longDsl = {
+      ...version("v-alpha-1", null, stats("+0.3R", "46.2%", 38)),
+      dsl: {
+        name: "Long Line",
+        direction: "long",
+        entry: [longEntry.trim()],
+        filters: [],
+        exits: ["atr(14)×2"],
+        risk: [],
+      },
+    };
+    overviewMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        strategies: [
+          {
+            id: "strat-long",
+            name: "Long Line",
+            createdAt: "2026-08-01T09:00:00.000Z",
+            pinnedVersionId: null,
+            versions: [longDsl],
+          },
+        ],
+      },
+    });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle long line/i }));
+    const tree = container.querySelector(".vtree-wrap");
+    expect(tree).not.toBeNull();
+    const node = within(tree as HTMLElement).getByText("v1").closest(".vnode");
+    expect(node).not.toBeNull();
+    const line = (node as HTMLElement).querySelector(".vnode-summary");
+    expect(line).not.toBeNull();
+    expect(line?.className).toContain("vnode-summary");
+    expect(line?.getAttribute("title")).toBe(
+      `long · ${longEntry.trim()} · atr(14)×2`,
+    );
+  });
+
   it("fills the third track's details pane from the selected version, with no coaching block (A3)", async () => {
     overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
     const { container } = render(<App />);

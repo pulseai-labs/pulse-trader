@@ -245,6 +245,7 @@ mod tests {
                     fast: SweepableValue::Fixed(26),
                     slow: SweepableValue::Fixed(12),
                     signal: SweepableValue::Fixed(9),
+                    output: crate::domain::MacdOutput::Line,
                 },
             },
             op: Comparator::Gt,

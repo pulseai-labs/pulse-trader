@@ -21,7 +21,10 @@ use crate::domain::strategy::{
     AgentName, AgentSubmission, CreatedBy, Hypothesis, NewAgentSubmission, NewVersion, StrategyId,
     StrategyVersion, VersionId,
 };
-use crate::domain::{DataError, Migrator, StrategyRepository, ValidationErrors, compile, validate};
+use crate::domain::{
+    DataError, Migrator, StrategyRepository, ValidationErrors, check_unknown_fields, compile,
+    validate,
+};
 use thiserror::Error;
 
 /// Where the submitted version attaches.
@@ -170,6 +173,20 @@ where
             message: e.to_string(),
         })?;
     let validated = validate(&loaded.dsl).map_err(SubmitError::Validation)?;
+    // 6b. Write-path strictness (r3.s2): refuse raw keys the parsed document
+    // cannot express — the agent's own typos (`entry.typo_field`,
+    // `name_of_thing`) are correctable errors, never silent no-ops. BEFORE
+    // any write. The walk compares the MIGRATED raw value (ADR-0024
+    // amendment); for the identity 1.0.0/1.1.0 → 1.2.0 steps that equals the
+    // submitted keys, and a renaming migration would not flag its consumed
+    // names.
+    let migrated_raw = Migrator::v1()
+        .migrated_value(request.dsl.clone())
+        .map_err(|e| SubmitError::Load {
+            path: "dsl",
+            message: e.to_string(),
+        })?;
+    check_unknown_fields(&migrated_raw, &loaded.dsl).map_err(SubmitError::Validation)?;
     compile(&validated).map_err(|e| SubmitError::Compile {
         path: "dsl",
         message: e.to_string(),

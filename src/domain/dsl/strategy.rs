@@ -215,7 +215,9 @@ mod prop_tests {
     use crate::domain::dsl::risk::{Direction, RiskParams};
     use crate::domain::dsl::schema_version::SchemaVersion;
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, PriceField, Series, ValueSource};
+    use crate::domain::dsl::value::{
+        ArithOp, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
+    };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
 
@@ -241,22 +243,55 @@ mod prop_tests {
         ]
     }
 
+    /// Every `prop_oneof` arm below is `.boxed()`: the union's value tree
+    /// then holds a `Box<dyn ValueTree>` for the picked arm instead of the
+    /// arm's full monomorphized tree. #283: on pathological seeds, nested
+    /// `new_tree`/drop-glue frames over the unboxed recursive tree types (each
+    /// frame holding its subtree **by value**) overflowed the 2 MiB
+    /// test-thread stack in a debug build. Boxing keeps the strategy's
+    /// distribution, arm weights and `prop_recursive(4, 32, 4)` bounds
+    /// byte-identical — it only moves value-tree state onto the heap.
     fn arb_indicator_spec() -> impl Strategy<Value = IndicatorSpec> {
         prop_oneof![
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Rsi { period }),
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Ema { period }),
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Adx { period }),
-            arb_sweepable_u32().prop_map(|period| IndicatorSpec::Atr { period }),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Rsi { period })
+                .boxed(),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Ema { period })
+                .boxed(),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Adx { period })
+                .boxed(),
+            arb_sweepable_u32()
+                .prop_map(|period| IndicatorSpec::Atr { period })
+                .boxed(),
             (
                 arb_sweepable_u32(),
                 arb_sweepable_u32(),
-                arb_sweepable_u32()
+                arb_sweepable_u32(),
+                prop_oneof![
+                    Just(MacdOutput::Line),
+                    Just(MacdOutput::Signal),
+                    Just(MacdOutput::Histogram)
+                ]
+                .boxed(),
             )
-                .prop_map(|(fast, slow, signal)| IndicatorSpec::Macd {
+                .prop_map(|(fast, slow, signal, output)| IndicatorSpec::Macd {
                     fast,
                     slow,
-                    signal
-                }),
+                    signal,
+                    output
+                })
+                .boxed(),
+            // r3.s2.w2 (Q1): the rolling extremes — any period, any source
+            // field (the defaults are a document-level concern the round trip
+            // exercises through the explicit form).
+            (arb_sweepable_u32(), arb_price_field())
+                .prop_map(|(period, source)| IndicatorSpec::Highest { period, source })
+                .boxed(),
+            (arb_sweepable_u32(), arb_price_field())
+                .prop_map(|(period, source)| IndicatorSpec::Lowest { period, source })
+                .boxed(),
         ]
     }
 
@@ -276,14 +311,45 @@ mod prop_tests {
         prop_oneof![Just(Series::Primary), Just(Series::Htf)]
     }
 
-    fn arb_value_source() -> impl Strategy<Value = ValueSource> {
-        prop_oneof![
-            arb_decimal().prop_map(|value| ValueSource::Constant { value }),
+    /// r3.s2.w3: lag depths the round-trip property exercises — the full legal
+    /// range 1..=500.
+    fn arb_bars() -> impl Strategy<Value = u32> {
+        1u32..=500
+    }
+
+    /// r3.s2.w3 (schema 1.2.0): the value grammar gains `Arith`/`Lag` through a
+    /// bounded `prop_recursive` of depth ≤ 2 with boxed arms (`.boxed()`) — the
+    /// #283 coordination bound, so this generator can never be the reason the
+    /// merged default-stack proptest re-run overflows. The leaf arms keep the
+    /// boxing the rolling-extremes round added.
+    fn arb_value_source() -> BoxedStrategy<ValueSource> {
+        let leaf = prop_oneof![
+            arb_decimal()
+                .prop_map(|value| ValueSource::Constant { value })
+                .boxed(),
             (arb_series(), arb_price_field())
-                .prop_map(|(series, field)| ValueSource::Price { series, field }),
+                .prop_map(|(series, field)| ValueSource::Price { series, field })
+                .boxed(),
             (arb_series(), arb_indicator_spec())
-                .prop_map(|(series, spec)| ValueSource::Indicator { series, spec }),
-        ]
+                .prop_map(|(series, spec)| ValueSource::Indicator { series, spec })
+                .boxed(),
+        ];
+        leaf.prop_recursive(2, 8, 2, |inner| {
+            prop_oneof![
+                (any::<ArithOp>(), inner.clone(), inner.clone()).prop_map(|(op, lhs, rhs)| {
+                    ValueSource::Arith {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }),
+                (inner, arb_bars()).prop_map(|(value, bars)| ValueSource::Lag {
+                    value: Box::new(value),
+                    bars
+                }),
+            ]
+        })
+        .boxed()
     }
 
     fn arb_comparator() -> impl Strategy<Value = Comparator> {
@@ -301,34 +367,66 @@ mod prop_tests {
     fn arb_condition() -> impl Strategy<Value = Condition> {
         let leaf = prop_oneof![
             (arb_value_source(), arb_comparator(), arb_value_source())
-                .prop_map(|(lhs, op, rhs)| Condition::Compare { lhs, op, rhs }),
+                .prop_map(|(lhs, op, rhs)| Condition::Compare { lhs, op, rhs })
+                .boxed(),
             (arb_value_source(), arb_value_source())
-                .prop_map(|(lhs, rhs)| Condition::CrossesAbove { lhs, rhs }),
+                .prop_map(|(lhs, rhs)| Condition::CrossesAbove { lhs, rhs })
+                .boxed(),
             (arb_value_source(), arb_value_source())
-                .prop_map(|(lhs, rhs)| Condition::CrossesBelow { lhs, rhs }),
+                .prop_map(|(lhs, rhs)| Condition::CrossesBelow { lhs, rhs })
+                .boxed(),
+            // r3.s2.w3: the expression conditions join the leaves, boxed like
+            // their siblings.
+            (arb_value_source(), arb_bars())
+                .prop_map(|(value, bars)| Condition::Rising {
+                    value: Box::new(value),
+                    bars
+                })
+                .boxed(),
+            (arb_value_source(), arb_bars())
+                .prop_map(|(value, bars)| Condition::Falling {
+                    value: Box::new(value),
+                    bars
+                })
+                .boxed(),
         ];
         leaf.prop_recursive(4, 32, 4, |inner| {
             prop_oneof![
                 prop::collection::vec(inner.clone(), 1..=4)
-                    .prop_map(|conditions| Condition::And { conditions }),
+                    .prop_map(|conditions| Condition::And { conditions })
+                    .boxed(),
                 prop::collection::vec(inner.clone(), 1..=4)
-                    .prop_map(|conditions| Condition::Or { conditions }),
-                inner.prop_map(|c| Condition::Not {
-                    condition: Box::new(c),
-                }),
+                    .prop_map(|conditions| Condition::Or { conditions })
+                    .boxed(),
+                inner
+                    .prop_map(|c| Condition::Not {
+                        condition: Box::new(c),
+                    })
+                    .boxed(),
             ]
         })
     }
 
     fn arb_exit_rule() -> impl Strategy<Value = ExitRule> {
         prop_oneof![
-            arb_sweepable_decimal().prop_map(|distance_pct| ExitRule::StopLoss { distance_pct }),
-            arb_sweepable_decimal().prop_map(|target_r| ExitRule::TakeProfit { target_r }),
-            arb_sweepable_decimal().prop_map(|trail_pct| ExitRule::TrailingStop { trail_pct }),
-            arb_sweepable_u32().prop_map(|max_bars| ExitRule::TimeStop { max_bars }),
-            arb_condition().prop_map(|condition| ExitRule::SignalExit { condition }),
+            arb_sweepable_decimal()
+                .prop_map(|distance_pct| ExitRule::StopLoss { distance_pct })
+                .boxed(),
+            arb_sweepable_decimal()
+                .prop_map(|target_r| ExitRule::TakeProfit { target_r })
+                .boxed(),
+            arb_sweepable_decimal()
+                .prop_map(|trail_pct| ExitRule::TrailingStop { trail_pct })
+                .boxed(),
+            arb_sweepable_u32()
+                .prop_map(|max_bars| ExitRule::TimeStop { max_bars })
+                .boxed(),
+            arb_condition()
+                .prop_map(|condition| ExitRule::SignalExit { condition })
+                .boxed(),
             (arb_sweepable_u32(), arb_sweepable_decimal())
-                .prop_map(|(period, multiple)| ExitRule::AtrStop { period, multiple }),
+                .prop_map(|(period, multiple)| ExitRule::AtrStop { period, multiple })
+                .boxed(),
         ]
     }
 

@@ -31,11 +31,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use pulse::{
-    BacktestInputs, BacktestResult, BacktestRunRepository, Candle, CandleSeriesRepository,
-    CandleStore, CandleWindow, CreatedBy, DataVersion, Db, EngineFingerprint, EquityCurve,
-    FundingConfig, MIGRATOR, NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts,
-    SnapshotSelection, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId, StrategyRepository,
-    SummaryStats, Timeframe, VersionId, run_migrations_with_backup, undo_to,
+    BacktestConfig, BacktestInputs, BacktestRequest, BacktestResult, BacktestRunRepository,
+    BinanceAdapter, Candle, CandleSeriesRepository, CandleStore, CandleWindow, CreatedBy,
+    DataVersion, Db, EngineFingerprint, EquityCurve, FundingConfig, MIGRATOR, NewVersion, Pair,
+    RegimeBreakdown, SkippedEntryCounts, SnapshotPins, SnapshotSelection, SqliteBacktestRunRepo,
+    SqliteStrategyRepo, StrategyId, StrategyRepository, SummaryStats, Timeframe, VersionId,
+    run_migrations_with_backup, run_version_backtest, undo_to,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -253,6 +254,26 @@ async fn seed_version_through_repo(db_path: &Path) -> VersionId {
     .id
 }
 
+/// The same shape with a caller-supplied document (r3.s2.w4's daily-leg tests
+/// seed a schema-1.2.0 `d1` strategy the `MINIMAL_DSL` path cannot carry).
+async fn seed_version_with_dsl(db: &Db, dsl_json: &str) -> VersionId {
+    let repo = SqliteStrategyRepo::new(db.pool().clone());
+    let strat = repo
+        .create_strategy("d1 read-back", None, &[])
+        .await
+        .expect("create strategy");
+    repo.create_version(NewVersion {
+        strategy_id: StrategyId::new(strat.id.as_str().to_owned()),
+        parent_version_id: None,
+        dsl_json: dsl_json.to_owned(),
+        created_by: CreatedBy::Human,
+        creating_llm_call_ids: vec![],
+    })
+    .await
+    .expect("create version")
+    .id
+}
+
 /// A trade-free result whose totals are all zero — the shape a hand-seeded row must
 /// hash to for `get_run`'s re-derive guard to accept it.
 fn empty_result() -> BacktestResult {
@@ -282,6 +303,7 @@ fn inputs_with_htf() -> BacktestInputs {
             timeframe: Timeframe::H4,
             data_version: DataVersion::new("htf-def456"),
         }),
+        d1: None,
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
@@ -294,6 +316,19 @@ fn inputs_with_htf() -> BacktestInputs {
 fn inputs_without_htf() -> BacktestInputs {
     BacktestInputs {
         htf: None,
+        ..inputs_with_htf()
+    }
+}
+
+/// r3.s2.w4: the same run with a recorded daily snapshot — the `0017` shape,
+/// three series wide. The tag is deliberately unlike the other two so a
+/// mix-up between the columns cannot pass.
+fn inputs_with_d1() -> BacktestInputs {
+    BacktestInputs {
+        d1: Some(SnapshotSelection {
+            timeframe: Timeframe::D1,
+            data_version: DataVersion::new("d1-ghi789"),
+        }),
         ..inputs_with_htf()
     }
 }
@@ -333,6 +368,71 @@ fn distinct_candles(tf: Timeframe, count: i64) -> Vec<Candle> {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// r3.s2.w4 — the daily-series fixtures the read-back leg runs over
+// ---------------------------------------------------------------------------
+
+/// A minimal `d1` strategy (schema 1.2.0): `d1:close > 0` — true on every
+/// paired bar once the daily engine is warm, so the run's D1 load is the only
+/// thing that can vary between the pinned snapshot and HEAD.
+const D1_GATE_DSL: &str = r#"{
+  "schema_version": "1.2.0",
+  "name": "d1 read-back",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Price", "series": "d1", "field": "Close" },
+    "op": "Gt",
+    "rhs": { "type": "Constant", "value": "0" }
+  },
+  "filters": [],
+  "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+
+/// The six daily closes: five closed days, and a sixth that never closes
+/// inside the primary's span (the run's forming bar).
+const D1_READ_BACK_CLOSES: [i64; 6] = [100, 101, 102, 103, 90, 91];
+
+/// One flat M15 candle at absolute index `i` (close 100), zero-rate funding
+/// stamps on every 8h boundary — the real-shaped-series rule the engine
+/// fixtures keep.
+fn flat_m15(i: i64) -> Candle {
+    let step = Timeframe::M15.duration_ms();
+    let open_time = i * step;
+    Candle {
+        open_time,
+        close_time: open_time + step - 1,
+        open: Decimal::new(100, 0),
+        high: Decimal::new(100, 0),
+        low: Decimal::new(100, 0),
+        close: Decimal::new(100, 0),
+        volume: Decimal::ONE,
+        funding_rate: if open_time % 28_800_000 == 0 {
+            Some(Decimal::ZERO)
+        } else {
+            None
+        },
+    }
+}
+
+/// One daily candle for day `j` at `close`: 00:00 UTC open, `close_time` =
+/// open + 86 400 000 − 1 (every daily open is an 8h boundary, so the stamp).
+fn daily(j: i64, close: i64) -> Candle {
+    let step = Timeframe::D1.duration_ms();
+    let open_time = j * step;
+    Candle {
+        open_time,
+        close_time: open_time + step - 1,
+        open: Decimal::new(close, 0),
+        high: Decimal::new(close, 0),
+        low: Decimal::new(close, 0),
+        close: Decimal::new(close, 0),
+        volume: Decimal::ONE,
+        funding_rate: Some(Decimal::ZERO),
+    }
 }
 
 /// Run `pulse backtest --version <id> … [--htf H4] --store <store> --db <db>`.
@@ -422,8 +522,9 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     // maximum to 10; r2.s2.w2's `0011` rides along likewise, to 11;
     // r2.s3.w2's `0012` (window lead-in) moves it to 12; r2.s3.w3's `0013`
     // (walk-forward run kind) moves it to 13; r2.s3.w4's `0014`
-    // (certification pointer) moves it to 14; and r3.s3.w1's `0016`
-    // (client tokens; `0015` is reserved for r3.s1) moves it to 16.
+    // (certification pointer) moves it to 14; r3.s3.w1's `0016`
+    // (client tokens; `0015` is reserved for r3.s1) moves it to 16; and
+    // r3.s2.w4's `0017` (the recorded daily snapshot) moves it to 17.
     assert!(applied.contains(&8), "0008 rides along: {applied:?}");
     assert!(applied.contains(&9), "0009 rides along: {applied:?}");
     assert!(applied.contains(&10), "0010 rides along: {applied:?}");
@@ -432,10 +533,11 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     assert!(applied.contains(&13), "0013 rides along: {applied:?}");
     assert!(applied.contains(&14), "0014 rides along: {applied:?}");
     assert!(applied.contains(&16), "0016 rides along: {applied:?}");
+    assert!(applied.contains(&17), "0017 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(16),
-        "0006 is recorded at its own version, below the maximum 0016 sets"
+        Some(17),
+        "0006 is recorded at its own version, below the maximum 0017 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;
@@ -663,7 +765,7 @@ async fn a_fresh_save_round_trips_every_encoded_input() {
     let result = empty_result();
     let version = VersionId::new("ver-1");
 
-    for expected in [inputs_with_htf(), inputs_without_htf()] {
+    for expected in [inputs_with_htf(), inputs_without_htf(), inputs_with_d1()] {
         let id = repo
             .save_run(
                 &version,
@@ -685,9 +787,53 @@ async fn a_fresh_save_round_trips_every_encoded_input() {
 }
 
 // ---------------------------------------------------------------------------
-// 4b. a stored `data_version` is untrusted in BOTH directions
+// 4a. the daily snapshot is a REFERENCED snapshot (r3.s2.w4)
 // ---------------------------------------------------------------------------
 //
+// `0017` records the daily series so a run stays explainable, and the D7 walk
+// (`referenced_snapshots`, used by backup and import) must therefore demand that
+// snapshot in a target the same way it demands the primary's and the HTF's —
+// otherwise a restore would silently drop the candles the daily operands read.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn referenced_snapshots_carries_the_daily_series() {
+    let (_tmp, _db_path, db) = migrated_db().await;
+    seed_strategy_and_version(db.pool()).await;
+    let repo = SqliteBacktestRunRepo::new(db.pool().clone());
+    let result = empty_result();
+    let inputs = inputs_with_d1();
+    repo.save_run(
+        &VersionId::new("ver-1"),
+        &inputs,
+        &result,
+        &result.summary,
+        Decimal::new(10_000, 0),
+    )
+    .await
+    .expect("save a three-series run");
+
+    let references = pulse::referenced_snapshots(db.pool())
+        .await
+        .expect("the reference walk reads");
+    let daily = pulse::SnapshotRef {
+        pair: "BTCUSDT".to_owned(),
+        // The timeframe is implicit in the column: `d1_data_version` can only
+        // ever name a `1d` snapshot, and the walk says so explicitly.
+        timeframe: "1d".to_owned(),
+        data_version: "d1-ghi789".to_owned(),
+    };
+    assert!(
+        references.contains(&daily),
+        "the D1 snapshot must be a referenced snapshot: {references:?}"
+    );
+    // The other two are still there — the daily arm is additive.
+    assert!(references.iter().any(|r| r.timeframe == "15m"));
+    assert!(references.iter().any(|r| r.timeframe == "4h"));
+}
+
+// ---------------------------------------------------------------------------
+// 4b. a stored `data_version` is untrusted in BOTH directions
+// ---------------------------------------------------------------------------
 // `DataVersion` is opaque by design, and opaque was being read as arbitrary. The
 // Parquet adapter joins a tag verbatim into
 // `<base>/candles/<PAIR>/<TF>/<tag>.parquet`, and W3 hands a decoded tag straight
@@ -1091,6 +1237,116 @@ async fn persisted_inputs_reload_the_exact_snapshots_after_both_heads_advance() 
     assert!(
         !replayed_primary.candles.is_empty() && !replayed_htf.candles.is_empty(),
         "the replayed snapshots are real series, not empty stand-ins"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6b. r3.s2.w4 — the APP-LAYER read-back reloads the daily snapshot by pin
+// ---------------------------------------------------------------------------
+
+/// The D1 leg of #110's guarantee, one layer above the domain port: the
+/// application read-back (`ReadBackStage::D1Snapshot`) reloads the daily
+/// snapshot by the identity the run records, never HEAD. The store's D1 HEAD
+/// advances to a DIFFERENT snapshot before the run, the request pins the
+/// original version, and the outcome's reloaded `d1` series carries the
+/// pinned bytes — a read-back that loaded HEAD would surface as the new
+/// version and the +1000 closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_back_reloads_the_pinned_d1_snapshot_after_head_advances() {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::with_path(&tmp.path().join("pulse.db")).await.unwrap();
+    MIGRATOR.run(db.pool()).await.unwrap();
+    let version_id = seed_version_with_dsl(&db, D1_GATE_DSL).await;
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+
+    let store_dir = tmp.path().join("store");
+    let store = CandleStore::with_base_dir(store_dir);
+    let pair = Pair::new("BTCUSDT");
+    let m15_version = store
+        .commit(&pair, Timeframe::M15, (0..500).map(flat_m15).collect())
+        .unwrap()
+        .series
+        .version;
+    let d1_candles: Vec<Candle> = D1_READ_BACK_CLOSES
+        .iter()
+        .enumerate()
+        .map(|(j, close)| daily(i64::try_from(j).unwrap(), *close))
+        .collect();
+    let pinned_d1 = store
+        .commit(&pair, Timeframe::D1, d1_candles.clone())
+        .unwrap()
+        .series
+        .version;
+
+    // HEAD advances to a snapshot with DIFFERENT content before the run —
+    // exactly what a later `fetch-data` does.
+    let leaked: Vec<Candle> = D1_READ_BACK_CLOSES
+        .iter()
+        .enumerate()
+        .map(|(j, close)| daily(i64::try_from(j).unwrap(), close + 1000))
+        .collect();
+    let head_d1 = store
+        .commit(&pair, Timeframe::D1, leaked)
+        .unwrap()
+        .series
+        .version;
+    assert_ne!(pinned_d1, head_d1, "the two commits are distinct snapshots");
+    let head = store
+        .load_head(&pair, Timeframe::D1)
+        .unwrap()
+        .expect("HEAD present")
+        .series
+        .version;
+    assert_eq!(
+        head, head_d1,
+        "the premise: D1 HEAD is no longer the snapshot the run will pin"
+    );
+
+    let outcome = run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &SqliteBacktestRunRepo::new(db.pool().clone()),
+        &BacktestRequest {
+            version_id: version_id.clone(),
+            pair: pair.clone(),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: None,
+            config: BacktestConfig::default(),
+            snapshots: Some(SnapshotPins {
+                primary: m15_version,
+                htf: None,
+                d1: Some(pinned_d1.clone()),
+            }),
+            window: None,
+        },
+    )
+    .await
+    .expect("the pinned d1 run completes over the advanced-HEAD store");
+
+    // The run consumed and recorded the PIN, and the read-back reloaded it.
+    assert_eq!(
+        outcome
+            .inputs
+            .d1
+            .as_ref()
+            .expect("the run records its D1 selection")
+            .data_version,
+        pinned_d1,
+        "the run consumed the pinned daily snapshot, never HEAD"
+    );
+    let reloaded = outcome
+        .d1
+        .expect("the read-back reloaded the daily snapshot");
+    assert_eq!(
+        reloaded.version, pinned_d1,
+        "the read-back reloaded the PINNED daily version, never HEAD"
+    );
+    let reloaded_closes: Vec<Decimal> = reloaded.candles.iter().map(|c| c.close).collect();
+    let pinned_closes: Vec<Decimal> = d1_candles.iter().map(|c| c.close).collect();
+    assert_eq!(
+        reloaded_closes, pinned_closes,
+        "the reloaded daily bytes are the run's snapshot, not HEAD's (+1000 closes)"
     );
 }
 

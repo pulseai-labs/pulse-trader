@@ -274,6 +274,22 @@ export type BacktestRunDto = {
 	htfTimeframe: string | null,
 	/**  The exact immutable HTF snapshot identity. */
 	htfDataVersion: string | null,
+	/**
+	 *  The exact immutable D1 snapshot identity, when the run read one
+	 *  (r3.s2.w4) — `None` for a strategy with no `d1` operand and for every
+	 *  row persisted before migration `0017`, whose daily snapshot is not
+	 *  recorded and is therefore never guessed.
+	 */
+	d1DataVersion: string | null,
+	/**
+	 *  Whether the run's strategy actually read the HTF (r3.s2.w4, #219).
+	 * 
+	 *  NOT derivable from the two fields above: every run records an H4
+	 *  snapshot even when its DSL has no `htf` operand (`resolve_default_request`
+	 *  supplies the application default), so the Lab gates its HTF row on this
+	 *  flag and renders the D1 row on `d1_data_version` alone.
+	 */
+	usesHtf: boolean,
 	/**  First candle `open_time` of the **reloaded** primary snapshot, epoch ms. */
 	firstOpenTimeMs: string,
 	/**  Last candle `close_time` of the **reloaded** primary snapshot, epoch ms. */
@@ -546,6 +562,17 @@ argumentsPreview: string } |
 name: string; 
 /**  The `Ok` summary or the serialized correctable errors. */
 outcome: string } | 
+/**
+ *  The composer's own prose for one turn (r3.s2.w5, Q5 option 1).
+ * 
+ *  Mirrors
+ *  [`ComposerEvent::AssistantText`](crate::agent::ComposerEvent) — the
+ *  text has already crossed the scrub-then-bound seam inside the composer,
+ *  so what rides the bus is safe to display and store.
+ */
+{ kind: "assistantText"; 
+/**  The scrubbed, bounded assistant text. */
+text: string } | 
 /**
  *  The run finished successfully. Always the last event on a channel.
  * 

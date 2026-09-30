@@ -141,6 +141,7 @@ pub fn seeded_inputs() -> BacktestInputs {
             timeframe: Timeframe::H4,
             data_version: DataVersion::new("v-htf"),
         }),
+        d1: None,
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,

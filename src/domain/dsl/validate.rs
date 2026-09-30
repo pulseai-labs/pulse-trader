@@ -37,6 +37,7 @@ use super::exit::ExitRule;
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
 use super::value::{IndicatorSpec, PriceField, ValueSource};
+use crate::domain::DSL_SCHEMA_VERSION;
 
 /// A machine-actionable classification of a single semantic violation.
 ///
@@ -71,6 +72,16 @@ pub enum ValidationCode {
     /// impossible leaf is satisfiable), across `Series::Primary`/`Series::Htf`
     /// (different bars), or on non-invariant fields (`Volume`, indicators).
     ImpossibleCondition,
+    /// A raw-document object key the deserialized value cannot express (r3.s2
+    /// write-path strictness): present in the submitted/serialized raw JSON at
+    /// some path, absent from the re-serialized parsed value at the same path.
+    /// Refused on every WRITE prelude; never enforced on the lenient read path.
+    UnknownField,
+    /// An expression shape the grammar carries but the engine refuses
+    /// (r3.s2.w3): a lag under a lag (use one `Lag` with a larger `bars`
+    /// instead), or a `Lag`/`Rising`/`Falling` over a value whose leaves sit on
+    /// both series (an `h4:` lag would be ambiguous).
+    InvalidExpression,
 }
 
 /// A single field-level, correctable validation error.
@@ -192,8 +203,18 @@ pub fn validate(dsl: &StrategyDsl) -> Result<ValidatedDsl, ValidationErrors> {
 fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>, judge: bool) {
     match cond {
         Condition::Compare { lhs, op: _, rhs } => {
-            check_value_source(lhs, &format!("{path}.lhs"), errors);
-            check_value_source(rhs, &format!("{path}.rhs"), errors);
+            check_value_source(
+                lhs,
+                &format!("{path}.lhs"),
+                errors,
+                &mut ExprContext::default(),
+            );
+            check_value_source(
+                rhs,
+                &format!("{path}.rhs"),
+                errors,
+                &mut ExprContext::default(),
+            );
             if judge && let Some(message) = impossibility(cond) {
                 errors.push(FieldError {
                     path: path.to_owned(),
@@ -221,8 +242,18 @@ fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>, j
                     message,
                 });
             }
-            check_value_source(lhs, &format!("{path}.lhs"), errors);
-            check_value_source(rhs, &format!("{path}.rhs"), errors);
+            check_value_source(
+                lhs,
+                &format!("{path}.lhs"),
+                errors,
+                &mut ExprContext::default(),
+            );
+            check_value_source(
+                rhs,
+                &format!("{path}.rhs"),
+                errors,
+                &mut ExprContext::default(),
+            );
         }
         Condition::And { conditions } => {
             // Rule 8: reject an empty And (vacuously true — "always fires").
@@ -269,6 +300,157 @@ fn check_condition(cond: &Condition, path: &str, errors: &mut Vec<FieldError>, j
             // impossible leaf is trivially satisfiable.
             check_condition(condition, &format!("{path}.not"), errors, false);
         }
+        Condition::Rising { value, bars } | Condition::Falling { value, bars } => {
+            // r3.s2.w3: the expression conditions carry their own rules (see
+            // the helper) — the walk shape matches the extended path grammar.
+            check_expression_condition(cond, value, *bars, path, errors);
+            // r3.s2 round-1 fix (C4): the slope carries rule 9 too. A value
+            // with no series operand is the same constant on both sides of the
+            // compiled strict compare, so the strategy can never enter — the
+            // constant-compare refusal, reached through the slope's own
+            // compiled form. `judge` follows G2 exactly as the other leaves do.
+            if judge && let Some(message) = impossibility(cond) {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::ImpossibleCondition,
+                    message,
+                });
+            }
+        }
+    }
+}
+
+/// The expression conditions' rules (r3.s2.w3): the `bars` range, and the two
+/// `InvalidExpression` shapes — over a lag (the compiled form would be a lag
+/// of a lag) and over a mixed-series value (the compiled lag would be
+/// ambiguous).
+fn check_expression_condition(
+    cond: &Condition,
+    value: &ValueSource,
+    bars: u32,
+    path: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    let node = if matches!(cond, Condition::Rising { .. }) {
+        "rising"
+    } else {
+        "falling"
+    };
+    if bars == 0 || bars > MAX_EXPRESSION_BARS {
+        errors.push(FieldError {
+            path: format!("{path}.{node}.bars"),
+            code: ValidationCode::FieldRange,
+            message: format!("`bars` must be in 1..={MAX_EXPRESSION_BARS}, got {bars}"),
+        });
+    }
+    check_value_source(
+        value,
+        &format!("{path}.{node}.value"),
+        errors,
+        &mut ExprContext::default(),
+    );
+    let shape = value_shape(value);
+    if shape.under_lag {
+        errors.push(FieldError {
+            path: format!("{path}.{node}.value"),
+            code: ValidationCode::InvalidExpression,
+            message: "a rising/falling over a lag compiles to a lag of a lag; remove the \
+                      inner lag and raise `bars` instead"
+                .to_owned(),
+        });
+    }
+    if let Some(pair) = shape.series_conflict() {
+        errors.push(FieldError {
+            path: format!("{path}.{node}.value"),
+            code: ValidationCode::InvalidExpression,
+            message: format!(
+                "a rising/falling compares a value with its own past on one series; \
+                 its leaves sit on {pair}"
+            ),
+        });
+    }
+}
+
+/// The `bars` range of a `Lag`/`Rising`/`Falling` (r3.s2.w3 — Q2).
+const MAX_EXPRESSION_BARS: u32 = 500;
+
+/// The maximum number of `Arith`/`Lag` nodes along any root-to-leaf path of one
+/// value (r3.s2.w3 — Q2: nesting depth ≤ 4, leaves counting 0).
+const MAX_EXPRESSION_DEPTH: u32 = 4;
+
+/// The expression-walk context threaded through [`check_value_source`]: the
+/// number of enclosing `Arith`/`Lag` nodes, whether the walk is inside a `Lag`
+/// (a lag under a lag is refused), and which series the leaves seen so far sit
+/// on (`Constant` is series-neutral — it never sets a flag).
+///
+/// One flag per series, not a set: the walk is `Copy`, allocation-free and
+/// branch-predictable, and `Series` has exactly three variants — so the struct
+/// is at most three bits of state, spelled so the mixed-series refusal can name
+/// what it found in a fixed order (`primary`, `htf`, `d1`).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Default, Clone, Copy)]
+struct ExprContext {
+    depth: u32,
+    under_lag: bool,
+    has_primary: bool,
+    has_htf: bool,
+    has_d1: bool,
+}
+
+impl ExprContext {
+    /// Which series the leaves seen so far span, when that is more than one
+    /// (r3.s2.w4: the mixed-series rule generalises from "primary and htf" to
+    /// any two of the three series), named for the refusal message.
+    fn series_conflict(self) -> Option<String> {
+        let present: Vec<&str> = [
+            self.has_primary.then_some("primary"),
+            self.has_htf.then_some("htf"),
+            self.has_d1.then_some("d1"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if present.len() > 1 {
+            Some(present.join(" and "))
+        } else {
+            None
+        }
+    }
+}
+
+/// The recursive scan [`Condition::Rising`]/[`Condition::Falling`] use to refuse
+/// a value that carries a `Lag` or spans more than one series. Depth is
+/// unbounded here — [`check_value_source`] already enforced the depth cap on
+/// the same walk.
+fn value_shape(v: &ValueSource) -> ExprContext {
+    use crate::domain::dsl::value::Series;
+    match v {
+        ValueSource::Constant { .. } => ExprContext::default(),
+        ValueSource::Price { series, .. } | ValueSource::Indicator { series, .. } => ExprContext {
+            has_primary: *series == Series::Primary,
+            has_htf: *series == Series::Htf,
+            has_d1: *series == Series::D1,
+            ..ExprContext::default()
+        },
+        ValueSource::Arith { lhs, rhs, .. } => {
+            let mut shape = value_shape(lhs);
+            let rhs = value_shape(rhs);
+            shape.has_primary |= rhs.has_primary;
+            shape.has_htf |= rhs.has_htf;
+            shape.has_d1 |= rhs.has_d1;
+            // A `Lag` in EITHER branch makes the whole value lagged. Merging
+            // only the series flags let a `Rising`/`Falling` over a
+            // right-hand-side lag through the refusal at the condition node,
+            // and `push_lag`'s `lag.max(bars)` — safe only because no accepted
+            // document overlaps a lag with a lag — then read the wrong bar
+            // instead of refusing (r3.s2 round-1 fix, C5).
+            shape.under_lag |= rhs.under_lag;
+            shape
+        }
+        ValueSource::Lag { value, .. } => ExprContext {
+            under_lag: true,
+            ..value_shape(value)
+        },
     }
 }
 
@@ -294,8 +476,34 @@ fn impossibility(cond: &Condition) -> Option<String> {
                 )
             })
         }
+        // r3.s2.w3: a Rising/Falling leaf is judged only when its value cannot
+        // move — a value carrying at least one series leaf compiles to a strict
+        // compare against that value's own lagged twin, satisfiable whenever
+        // the series moves. A value with NO series leaf is the same constant on
+        // both sides, so the comparison is never true (r3.s2 round-1 fix, C4):
+        // the constant-compare refusal, reached through the slope's compiled
+        // form. A `Not` leaf is never judged (G2).
+        Condition::Rising { value, .. } => slope_never_true(value, true),
+        Condition::Falling { value, .. } => slope_never_true(value, false),
         Condition::Not { .. } => None,
     }
+}
+
+/// Rule 9 for the slope conditions (r3.s2.w3; narrowed by the r3.s2 round-1
+/// fix, C4): `Rising`/`Falling` over a value with no series operand is a
+/// constant compared strictly against itself, which never holds. A value with
+/// any series leaf stays unjudged — the slope is satisfiable there.
+fn slope_never_true(value: &ValueSource, rising: bool) -> Option<String> {
+    let shape = value_shape(value);
+    if shape.has_primary || shape.has_htf || shape.has_d1 {
+        return None;
+    }
+    let shown = describe(value);
+    Some(format!(
+        "the constant comparison {shown} {} {shown} is never true — the value carries no \
+         series operand, so a slope over it never moves",
+        if rising { ">" } else { "<" }
+    ))
 }
 
 /// The impossibility table for one `Compare` leaf (rule 9).
@@ -409,6 +617,20 @@ fn describe(v: &ValueSource) -> String {
         ValueSource::Constant { value } => format!("the constant {value}"),
         ValueSource::Price { field, .. } => field_name(*field).to_owned(),
         ValueSource::Indicator { spec, .. } => format!("the {} value", spec_name(spec)),
+        ValueSource::Arith { op, lhs, rhs } => format!(
+            "the expression ({} {} {})",
+            describe(lhs),
+            match op {
+                crate::domain::dsl::value::ArithOp::Add => "+",
+                crate::domain::dsl::value::ArithOp::Sub => "-",
+                crate::domain::dsl::value::ArithOp::Mul => "*",
+                crate::domain::dsl::value::ArithOp::Div => "/",
+            },
+            describe(rhs)
+        ),
+        ValueSource::Lag { value, bars } => {
+            format!("lag({}, {bars})", describe(value))
+        }
     }
 }
 
@@ -431,6 +653,8 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Adx { period } => format!("ADX({})", period_value(period)),
         IndicatorSpec::Macd { .. } => "MACD".to_owned(),
         IndicatorSpec::Atr { period } => format!("ATR({})", period_value(period)),
+        IndicatorSpec::Highest { period, .. } => format!("Highest({})", period_value(period)),
+        IndicatorSpec::Lowest { period, .. } => format!("Lowest({})", period_value(period)),
     }
 }
 
@@ -467,14 +691,123 @@ fn is_constant(v: &ValueSource) -> bool {
     matches!(v, ValueSource::Constant { .. })
 }
 
-/// Validate a `ValueSource` — only `Indicator` carries sweepable period fields
-/// (rules 1/6); `Constant`/`Price` carry no validatable numeric leaf. `series`
-/// is total over its two values at deserialization and carries **no** rule —
-/// which series a run loads is an engine concern (w2's typed `HtfRequired`), a
-/// document is valid independent of it.
-fn check_value_source(v: &ValueSource, path: &str, errors: &mut Vec<FieldError>) {
-    if let ValueSource::Indicator { spec, .. } = v {
-        check_indicator(spec, &format!("{path}.indicator"), errors);
+/// Validate a `ValueSource` recursively (r3.s2.w3): every nested indicator is
+/// reached, so `check_indicator`'s range rules apply inside expressions, and the
+/// expression rules — depth ≤ [`MAX_EXPRESSION_DEPTH`] over `Arith`+`Lag`
+/// nodes, `bars` ∈ 1..=500, no lag under a lag, no mixed-series lag — are
+/// enforced at the node that violates them. `ctx` accumulates the walk state
+/// (see [`ExprContext`]); a call site that owns a fresh context is the root of
+/// one *value*, so mixed-series is judged per value, never across operands.
+fn check_value_source(
+    v: &ValueSource,
+    path: &str,
+    errors: &mut Vec<FieldError>,
+    ctx: &mut ExprContext,
+) {
+    match v {
+        // A constant is series-neutral: it never makes a value mixed.
+        ValueSource::Constant { .. } => {}
+        ValueSource::Price { series, .. } => match series {
+            crate::domain::dsl::value::Series::Primary => ctx.has_primary = true,
+            crate::domain::dsl::value::Series::Htf => ctx.has_htf = true,
+            crate::domain::dsl::value::Series::D1 => ctx.has_d1 = true,
+        },
+        ValueSource::Indicator { spec, series } => {
+            match series {
+                crate::domain::dsl::value::Series::Primary => ctx.has_primary = true,
+                crate::domain::dsl::value::Series::Htf => ctx.has_htf = true,
+                crate::domain::dsl::value::Series::D1 => ctx.has_d1 = true,
+            }
+            check_indicator(spec, &format!("{path}.indicator"), errors);
+        }
+        ValueSource::Arith { lhs, rhs, .. } => {
+            if ctx.depth >= MAX_EXPRESSION_DEPTH {
+                errors.push(FieldError {
+                    path: format!("{path}.arith"),
+                    code: ValidationCode::FieldRange,
+                    message: format!(
+                        "expression nesting exceeds the maximum depth of \
+                         {MAX_EXPRESSION_DEPTH} Arith/Lag nodes"
+                    ),
+                });
+                return;
+            }
+            // One context per SIBLING (r3.s2 round-1 fix, C3): a single shared
+            // context let the depth the `lhs` walk reached leak into the `rhs`
+            // walk, so a document with a legal four-node left branch refused
+            // any compound right branch as a fifth-level node — a shape Q2
+            // allows. Each child starts at THIS node's depth + 1 and only the
+            // series flags merge back up, so a lag's mixed-series rule still
+            // sees the whole value. `under_lag` is inherited, never raised at
+            // this node: an `Arith` is not a lag.
+            let mut left = ExprContext {
+                depth: ctx.depth + 1,
+                ..*ctx
+            };
+            check_value_source(lhs, &format!("{path}.arith.lhs"), errors, &mut left);
+            let mut right = ExprContext {
+                depth: ctx.depth + 1,
+                ..*ctx
+            };
+            check_value_source(rhs, &format!("{path}.arith.rhs"), errors, &mut right);
+            ctx.has_primary |= left.has_primary | right.has_primary;
+            ctx.has_htf |= left.has_htf | right.has_htf;
+            ctx.has_d1 |= left.has_d1 | right.has_d1;
+        }
+        ValueSource::Lag { value, bars } => {
+            if ctx.depth >= MAX_EXPRESSION_DEPTH {
+                errors.push(FieldError {
+                    path: format!("{path}.lag"),
+                    code: ValidationCode::FieldRange,
+                    message: format!(
+                        "expression nesting exceeds the maximum depth of \
+                         {MAX_EXPRESSION_DEPTH} Arith/Lag nodes"
+                    ),
+                });
+                return;
+            }
+            // Q2: a lag under a lag is refused — use one `Lag` with a larger
+            // `bars` instead.
+            if ctx.under_lag {
+                errors.push(FieldError {
+                    path: format!("{path}.lag"),
+                    code: ValidationCode::InvalidExpression,
+                    message: "a lag under a lag compiles to an ambiguous read; use one `Lag` \
+                              with a larger `bars` instead"
+                        .to_owned(),
+                });
+                return;
+            }
+            if *bars == 0 || *bars > MAX_EXPRESSION_BARS {
+                errors.push(FieldError {
+                    path: format!("{path}.lag.bars"),
+                    code: ValidationCode::FieldRange,
+                    message: format!("`bars` must be in 1..={MAX_EXPRESSION_BARS}, got {bars}"),
+                });
+            }
+            // A lag must cover one series: a fresh accumulator walks the
+            // lagged value, and multi-series leaves refuse at THIS node.
+            let mut inner = ExprContext {
+                depth: ctx.depth + 1,
+                under_lag: true,
+                has_primary: false,
+                has_htf: false,
+                has_d1: false,
+            };
+            check_value_source(value, &format!("{path}.lag.value"), errors, &mut inner);
+            if let Some(pair) = inner.series_conflict() {
+                errors.push(FieldError {
+                    path: format!("{path}.lag"),
+                    code: ValidationCode::InvalidExpression,
+                    message: format!(
+                        "a lag reads its value on one series; its leaves sit on {pair}"
+                    ),
+                });
+            }
+            ctx.has_primary |= inner.has_primary;
+            ctx.has_htf |= inner.has_htf;
+            ctx.has_d1 |= inner.has_d1;
+        }
     }
 }
 
@@ -491,7 +824,9 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
         IndicatorSpec::Adx { period } => {
             check_u32_positive(period, &format!("{path}.adx.period"), "ADX period", errors);
         }
-        IndicatorSpec::Macd { fast, slow, signal } => {
+        IndicatorSpec::Macd {
+            fast, slow, signal, ..
+        } => {
             check_u32_positive(fast, &format!("{path}.macd.fast"), "MACD fast", errors);
             check_u32_positive(slow, &format!("{path}.macd.slow"), "MACD slow", errors);
             check_u32_positive(
@@ -515,6 +850,27 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
         }
         IndicatorSpec::Atr { period } => {
             check_u32_positive(period, &format!("{path}.atr.period"), "ATR period", errors);
+        }
+        // The rolling extremes: the period is the window size N and must be
+        // > 0 (rules 1 + 6). `source` is any `PriceField` — including
+        // `Volume` — and carries no rule: the field is total at
+        // deserialization, and which field a window aggregates is a run-time
+        // concern, not a document rule (the `series` precedent).
+        IndicatorSpec::Highest { period, .. } => {
+            check_u32_positive(
+                period,
+                &format!("{path}.highest.period"),
+                "Highest period",
+                errors,
+            );
+        }
+        IndicatorSpec::Lowest { period, .. } => {
+            check_u32_positive(
+                period,
+                &format!("{path}.lowest.period"),
+                "Lowest period",
+                errors,
+            );
         }
     }
 }
@@ -765,6 +1121,114 @@ fn push_sweep(path: &str, errors: &mut Vec<FieldError>) {
     });
 }
 
+/// The write-path strictness check (r3.s2): reject raw-document object keys
+/// the parsed [`StrategyDsl`] cannot express.
+///
+/// Runs ONLY on the write preludes — MCP [`submit_agent_version`](crate::submit_agent_version),
+/// `strategy_repo::load_agent_document`, and `strategy_repo::create_version` —
+/// NEVER on [`Migrator::load`](super::migrate::Migrator::load) or the repo's
+/// `row_to_version` read defense: the read path stays lenient so pre-r3
+/// database rows survive engine upgrades (ADR-0024's forward-compatibility
+/// refusal would otherwise be the only protection, and it cannot see
+/// same-version typos).
+///
+/// Compares the raw document's object keys, recursively, against the keys of
+/// the re-serialized parsed value at the same path. A key present in raw and
+/// absent from the re-serialization is an [`ValidationCode::UnknownField`]
+/// error at that dotted/indexed path. Serde tags (`type`, `indicator`) and
+/// defaulted fields are present in the re-serialization, so they pass;
+/// defaulted fields MISSING from raw are fine — only raw-only keys are
+/// errors.
+///
+/// # Errors
+///
+/// [`ValidationErrors`] collecting every unknown field, in raw-document
+/// traversal order.
+///
+/// # Migration caveat
+///
+/// The comparison is against the value the caller holds after the migration
+/// produced the parsed document. For identity migrations (1.0.0/1.1.0 →
+/// 1.2.0) the raw keys equal the migrated keys, so comparing the submitted
+/// raw document directly is correct. A FUTURE migration that RENAMES a key
+/// must pass the migrated raw value (not the verbatim input), or the old
+/// name would be flagged as unknown.
+pub fn check_unknown_fields(
+    raw: &serde_json::Value,
+    parsed: &StrategyDsl,
+) -> Result<(), ValidationErrors> {
+    // Unreachable for a parsed `StrategyDsl`: serialization of these types
+    // can only fail on a non-finite `Decimal`, and `rust_decimal::Decimal`
+    // has no non-finite representation — so the re-serialization is total.
+    #[allow(clippy::expect_used)]
+    let current = serde_json::to_value(parsed).expect("a parsed StrategyDsl serializes");
+    let mut errors = Vec::new();
+    walk_unknown_fields(raw, &current, "", &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors { errors })
+    }
+}
+
+/// Recursive key walk: objects compare key-by-key at the same path; arrays
+/// compare element-by-element (`path[i]`); scalars carry no keys. A raw-only
+/// key (or raw-only array element) is one [`ValidationCode::UnknownField`]
+/// error; the walk CONTINUES so every unknown field is reported at once.
+fn walk_unknown_fields(
+    raw: &serde_json::Value,
+    current: &serde_json::Value,
+    path: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    match (raw, current) {
+        (serde_json::Value::Object(raw_map), serde_json::Value::Object(cur_map)) => {
+            for (key, raw_child) in raw_map {
+                if let Some(cur_child) = cur_map.get(key) {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk_unknown_fields(raw_child, cur_child, &child_path, errors);
+                } else {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    errors.push(FieldError {
+                        path: child_path,
+                        code: ValidationCode::UnknownField,
+                        message: format!(
+                            "unknown field `{key}` is not part of DSL schema {DSL_SCHEMA_VERSION}"
+                        ),
+                    });
+                }
+            }
+        }
+        (serde_json::Value::Array(raw_arr), serde_json::Value::Array(cur_arr)) => {
+            for (i, raw_child) in raw_arr.iter().enumerate() {
+                if let Some(cur_child) = cur_arr.get(i) {
+                    let child_path = format!("{path}[{i}]");
+                    walk_unknown_fields(raw_child, cur_child, &child_path, errors);
+                } else {
+                    errors.push(FieldError {
+                        path: format!("{path}[{i}]"),
+                        code: ValidationCode::UnknownField,
+                        message: format!(
+                            "unknown element at index {i}: not part of DSL schema {DSL_SCHEMA_VERSION}"
+                        ),
+                    });
+                }
+            }
+        }
+        // Scalars (and raw/current kind mismatches — unreachable after a
+        // successful deserialization) carry no keys to compare.
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 mod tests {
@@ -775,7 +1239,7 @@ mod tests {
     use crate::domain::dsl::schema_version::SchemaVersion;
     use crate::domain::dsl::strategy::StrategyDsl;
     use crate::domain::dsl::sweepable::SweepableValue;
-    use crate::domain::dsl::value::{IndicatorSpec, Series, ValueSource};
+    use crate::domain::dsl::value::{IndicatorSpec, MacdOutput, Series, ValueSource};
     use rust_decimal::Decimal;
 
     /// The canonical demo-1 RSI-oversold strategy (the 2.02 fixture): long when
@@ -975,6 +1439,7 @@ mod tests {
                     fast: SweepableValue::Fixed(26),
                     slow: SweepableValue::Fixed(12),
                     signal: SweepableValue::Fixed(9),
+                    output: MacdOutput::Line,
                 },
             },
             op: Comparator::Gt,
@@ -1362,5 +1827,82 @@ mod tests {
         assert!(json.contains("ImpossibleCondition"), "{json}");
         let back: FieldError = serde_json::from_str(&json).expect("deserialize FieldError");
         assert_eq!(back, e);
+    }
+
+    // ---- r3.s2.w3: the recursion reaches inside expressions ----------------
+
+    use super::check_unknown_fields;
+
+    /// `check_value_source` must reach every nested indicator, so
+    /// `check_indicator`'s range rules apply INSIDE expressions: an ATR with a
+    /// zero period under an `Arith` is refused at the nested path.
+    #[test]
+    fn range_rules_reach_indicators_nested_in_expressions() {
+        let dsl_json = serde_json::json!({
+            "schema_version": "1.2.0",
+            "name": "nested range",
+            "direction": "long",
+            "entry": {
+                "type": "Compare",
+                "lhs": {
+                    "type": "Arith",
+                    "op": "div",
+                    "lhs": { "type": "Indicator", "spec": { "indicator": "Atr", "period": 0 } },
+                    "rhs": { "type": "Price", "field": "Close" }
+                },
+                "op": "Lt",
+                "rhs": { "type": "Constant", "value": "0.02" }
+            },
+            "filters": [],
+            "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+            "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+        });
+        let dsl: StrategyDsl = serde_json::from_value(dsl_json).expect("parses");
+        let errors = validate(&dsl).expect_err("a zero period inside an expression is refused");
+        assert!(
+            errors
+                .errors()
+                .iter()
+                .any(|e| e.code == ValidationCode::FieldRange
+                    && e.path == "entry.lhs.arith.lhs.indicator.atr.period"),
+            "the range rule must reach the nested indicator, got {:?}",
+            errors.errors()
+        );
+    }
+
+    /// #17's unknown-field check (w1) walks nested objects: a typo key inside
+    /// an `Arith` node is refused at the nested path.
+    #[test]
+    fn unknown_field_check_reaches_inside_an_arith() {
+        let raw = serde_json::json!({
+            "schema_version": "1.2.0",
+            "name": "typo inside",
+            "direction": "long",
+            "entry": {
+                "type": "Compare",
+                "lhs": {
+                    "type": "Arith",
+                    "op": "div",
+                    "lhs": { "type": "Indicator", "spec": { "indicator": "Atr", "period": 14 } },
+                    "rhs": { "type": "Price", "field": "Close" },
+                    "typo": 1
+                },
+                "op": "Lt",
+                "rhs": { "type": "Constant", "value": "0.02" }
+            },
+            "filters": [],
+            "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+            "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+        });
+        let parsed: StrategyDsl = serde_json::from_value(raw.clone()).expect("parses (lenient)");
+        let err = check_unknown_fields(&raw, &parsed)
+            .expect_err("the typo key inside the Arith must be refused");
+        assert!(
+            err.errors()
+                .iter()
+                .any(|e| e.code == ValidationCode::UnknownField && e.path == "entry.lhs.typo"),
+            "the unknown-field walk must reach inside the Arith, got {:?}",
+            err.errors()
+        );
     }
 }

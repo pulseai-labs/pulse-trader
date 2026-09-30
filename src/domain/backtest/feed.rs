@@ -1,9 +1,11 @@
 //! MTF-aligned, no-look-ahead candle feed (FR-5, BACKLOG-4).
 //!
 //! The deterministic iteration substrate for the backtester: given a
-//! primary-timeframe [`CandleSeries`] (e.g. BTCUSDT M15) and an optional
-//! higher-timeframe series (e.g. H4), [`align`] produces one [`AlignedBar`] per
-//! primary candle, each paired with the most-recent HTF bar that has **already
+//! primary-timeframe [`CandleSeries`] (e.g. BTCUSDT M15), an optional
+//! higher-timeframe series (e.g. H4) and — since r3.s2.w4 — an optional fixed
+//! daily series, [`align`] produces one [`AlignedBar`] per
+//! primary candle, each paired with the most-recent HTF bar and the
+//! most-recent daily bar that have **already
 //! closed** at the primary bar's `close_time` — the no-look-ahead guarantee.
 //!
 //! Pure logic over already-loaded, already-`validate()`-d series (zero I/O, no
@@ -21,7 +23,7 @@ use crate::domain::series::CandleSeries;
 ///
 /// Borrows from the input series for the feed's lifetime — no clones, so the
 /// stream is allocation-cheap (one [`AlignedBar`] per primary candle, each a
-/// pair of references plus an index).
+/// tuple of references plus an index).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlignedBar<'a> {
     /// The primary-timeframe candle this step iterates.
@@ -31,26 +33,38 @@ pub struct AlignedBar<'a> {
     /// The most-recent HTF candle whose `close_time` is `<= primary.close_time`,
     /// or `None` when no HTF series was supplied or none has closed yet.
     pub htf: Option<&'a Candle>,
+    /// The most-recent daily candle whose `close_time` is
+    /// `<= primary.close_time`, or `None` when no D1 series was supplied or
+    /// none has closed yet (r3.s2.w4). Same closed-bar rule as [`AlignedBar::htf`],
+    /// advanced by its own forward-only pointer.
+    pub d1: Option<&'a Candle>,
 }
 
-/// Pair each primary candle with the most-recent already-closed HTF candle.
+/// Pair each primary candle with the most-recent already-closed HTF candle and
+/// the most-recent already-closed daily candle.
 ///
 /// The no-look-ahead invariant: for a primary bar with `close_time = c`, the
-/// paired HTF bar is the one with the **greatest `close_time <= c`**. An HTF bar
-/// that has not closed by `c` is invisible; before the first HTF close the
-/// pairing is `None`. Single-TF mode (`htf = None`) yields every `htf` as
-/// `None`.
+/// paired HTF (resp. daily) bar is the one with the **greatest
+/// `close_time <= c`**. A bar that has not closed by `c` is invisible; before
+/// the first close the pairing is `None`. Single-TF mode (`htf = None`) yields
+/// every `htf` as `None`; the same holds for `d1 = None`.
 ///
-/// The HTF pointer advances forward-only — both series are ascending and
-/// `validate()`-d upstream, so the walk is O(primary + htf) with no rescans and
-/// no gap-filling. Pure function of its inputs: identical inputs yield an
-/// identical stream.
+/// Each pointer advances forward-only — all series are ascending and
+/// `validate()`-d upstream, so the walk is O(primary + htf + d1) with no
+/// rescans and no gap-filling. Pure function of its inputs: identical inputs
+/// yield an identical stream.
 #[must_use]
-pub fn align<'a>(primary: &'a CandleSeries, htf: Option<&'a CandleSeries>) -> Vec<AlignedBar<'a>> {
+pub fn align<'a>(
+    primary: &'a CandleSeries,
+    htf: Option<&'a CandleSeries>,
+    d1: Option<&'a CandleSeries>,
+) -> Vec<AlignedBar<'a>> {
     let htf_candles: &[Candle] = htf.map_or(&[], |s| s.candles.as_slice());
-    // Index of the candidate HTF bar: the greatest j whose close_time <= the
+    let d1_candles: &[Candle] = d1.map_or(&[], |s| s.candles.as_slice());
+    // Index of each candidate bar: the greatest j whose close_time <= the
     // current primary close_time. Advances forward-only across the whole walk.
     let mut htf_idx: Option<usize> = None;
+    let mut d1_idx: Option<usize> = None;
 
     primary
         .candles
@@ -58,17 +72,24 @@ pub fn align<'a>(primary: &'a CandleSeries, htf: Option<&'a CandleSeries>) -> Ve
         .enumerate()
         .map(|(index, candle)| {
             let c = candle.close_time;
-            // Advance while the NEXT HTF bar has also already closed by `c`.
-            // Monotonic: primary close_times are ascending, so we never rewind.
+            // Advance while the NEXT bar of a series has also already closed
+            // by `c`. Monotonic: primary close_times are ascending, so we
+            // never rewind.
             let mut next = htf_idx.map_or(0, |i| i + 1);
             while next < htf_candles.len() && htf_candles[next].close_time <= c {
                 htf_idx = Some(next);
+                next += 1;
+            }
+            let mut next = d1_idx.map_or(0, |i| i + 1);
+            while next < d1_candles.len() && d1_candles[next].close_time <= c {
+                d1_idx = Some(next);
                 next += 1;
             }
             AlignedBar {
                 primary: candle,
                 index,
                 htf: htf_idx.map(|i| &htf_candles[i]),
+                d1: d1_idx.map(|i| &d1_candles[i]),
             }
         })
         .collect()
@@ -143,7 +164,7 @@ mod tests {
     #[test]
     fn single_tf_mode_yields_primary_count_with_htf_none() {
         let primary = m15_series(0, 5);
-        let feed = align(&primary, None);
+        let feed = align(&primary, None, None);
         assert_eq!(feed.len(), 5, "one AlignedBar per primary candle");
         for (i, bar) in feed.iter().enumerate() {
             assert_eq!(bar.index, i);
@@ -157,8 +178,8 @@ mod tests {
     fn empty_primary_yields_empty_feed() {
         let primary = m15_series(0, 0);
         let htf = h4_series(0, 3);
-        assert!(align(&primary, Some(&htf)).is_empty());
-        assert!(align(&primary, None).is_empty());
+        assert!(align(&primary, Some(&htf), None).is_empty());
+        assert!(align(&primary, None, None).is_empty());
     }
 
     /// (b) Correct most-recent-closed pairing across an H4 boundary.
@@ -172,7 +193,7 @@ mod tests {
     fn pairs_most_recent_closed_htf_bar() {
         let primary = m15_series(0, 64); // 64 * 15m = 16h, spans 4 H4 bars
         let htf = h4_series(0, 4);
-        let feed = align(&primary, Some(&htf));
+        let feed = align(&primary, Some(&htf), None);
 
         for bar in &feed {
             let c = bar.primary.close_time;
@@ -200,7 +221,7 @@ mod tests {
     fn no_look_ahead_never_pairs_a_future_htf_bar() {
         let primary = m15_series(0, 40);
         let htf = h4_series(0, 3);
-        let feed = align(&primary, Some(&htf));
+        let feed = align(&primary, Some(&htf), None);
 
         for bar in &feed {
             let c = bar.primary.close_time;
@@ -237,7 +258,7 @@ mod tests {
         // None.
         let primary = m15_series(0, 80); // 80 * 15m = 20h
         let htf = h4_series(Timeframe::H4.duration_ms(), 3); // starts at 4h
-        let feed = align(&primary, Some(&htf));
+        let feed = align(&primary, Some(&htf), None);
 
         let first_htf_close = htf.candles[0].close_time;
         let mut saw_none = false;
@@ -260,8 +281,62 @@ mod tests {
     fn align_is_deterministic() {
         let primary = m15_series(0, 30);
         let htf = h4_series(0, 2);
-        let a: Vec<AlignedBar> = align(&primary, Some(&htf));
-        let b: Vec<AlignedBar> = align(&primary, Some(&htf));
+        let a: Vec<AlignedBar> = align(&primary, Some(&htf), None);
+        let b: Vec<AlignedBar> = align(&primary, Some(&htf), None);
         assert_eq!(a, b);
+    }
+
+    /// D1 series: bars of nominal 1d width starting at `start`, `n` of them.
+    fn d1_series(start: i64, n: usize) -> CandleSeries {
+        let step = Timeframe::D1.duration_ms();
+        let candles = (0..n as i64)
+            .map(|i| {
+                let open = start + i * step;
+                candle(open, open + step - 1)
+            })
+            .collect();
+        CandleSeries {
+            pair: Pair::new("BTCUSDT"),
+            timeframe: Timeframe::D1,
+            version: DataVersion::new("v1"),
+            candles,
+        }
+    }
+
+    /// (r3.s2.w4) The daily pointer follows the same closed-bar rule as the
+    /// HTF pointer, independently: day 0 closes at 86_399_999 (M15 index 95),
+    /// day 1 at 172_799_999 (index 191). Every paired bar must be the greatest
+    /// close_time <= the primary's, the early bars stay None, and a forming
+    /// day-2 bar (never supplied here) would be invisible anyway.
+    #[test]
+    fn pairs_most_recent_closed_d1_bar_independently_of_htf() {
+        let primary = m15_series(0, 96 * 2);
+        let htf = h4_series(0, 12);
+        let daily = d1_series(0, 2);
+        let feed = align(&primary, Some(&htf), Some(&daily));
+
+        for bar in &feed {
+            let c = bar.primary.close_time;
+            let expected = daily.candles.iter().rev().find(|d| d.close_time <= c);
+            assert_eq!(
+                bar.d1, expected,
+                "bar idx {} close_time {c}: wrong D1 pairing",
+                bar.index
+            );
+            // The HTF pairing is unaffected by the daily pointer.
+            let expected_htf = htf.candles.iter().rev().find(|h| h.close_time <= c);
+            assert_eq!(
+                bar.htf, expected_htf,
+                "bar idx {}: H4 pairing drifted",
+                bar.index
+            );
+        }
+        assert_eq!(feed[94].d1, None);
+        assert_eq!(feed[95].d1, Some(&daily.candles[0]));
+        assert_eq!(feed[190].d1, Some(&daily.candles[0]));
+        assert_eq!(feed[191].d1, Some(&daily.candles[1]));
+        // No D1 series at all: every bar None, HTF unchanged.
+        let feed = align(&primary, Some(&htf), None);
+        assert!(feed.iter().all(|bar| bar.d1.is_none()));
     }
 }

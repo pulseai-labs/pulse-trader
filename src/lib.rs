@@ -107,9 +107,11 @@ pub use domain::strategy::Hypothesis as AgentHypothesis;
 // VS-1.1.2 work-2.01: the DSL grammar leaf + predicate layer. These are the
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
 // (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
-// same curated-surface pattern as the domain types above.
+// same curated-surface pattern as the domain types above. `ArithOp` rides
+// beside `ValueSource` since r3.s2.w3 (schema 1.2.0 expressions, Q2).
 pub use domain::{
-    Comparator, Condition, IndicatorSpec, PriceField, Series, SweepableValue, ValueSource,
+    ArithOp, Comparator, Condition, IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue,
+    ValueSource,
 };
 
 // VS-1.1.2 work-2.02: the whole-strategy document layer. `StrategyDsl` is the
@@ -346,6 +348,11 @@ pub use adapters::indicators::adx::Adx;
 // unused outside its module is a `dead_code` build error, not a warning); the
 // indicator engine's factory consumes it.
 pub use adapters::indicators::atr::Atr;
+// r3.s2.w2: the rolling-extremes adapter (the prior-N window behind
+// `IndicatorSpec::Highest`/`Lowest`, schema 1.2.0 — Q1). All-`Decimal` — the
+// window value is one of the inputs, so no `convert` seam and no rounding;
+// the indicator engine's factory consumes it.
+pub use adapters::indicators::rolling::RollingExtremes;
 // VS-1.1.3 work-3.03: the multi-indicator engine that implements the frozen
 // `EvalContext` seam over real candles and streaming adapter values. Its
 // readiness gate is load-bearing for warmup safety under the current boolean DSL
@@ -664,7 +671,10 @@ pub use domain::{Redactor, TRANSPORT_DETAIL_MAX_BYTES, scrub_then_bound};
 // gotcha: the module-level `pub use` alone is necessary but NOT sufficient under
 // `deny(warnings)`; a `pub` item unused outside its private module is a `dead_code`
 // BUILD error). 2.05's `pulse compose` verb + composition root consume these.
-pub use agent::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
+pub use agent::{
+    ASSISTANT_TEXT_MAX_BYTES, ComposeOutcome, Composer, ComposerError, ComposerEvent,
+    LlmCallCapture,
+};
 
 // r1.s1.w1 (ADR-0020): the executable-topology surface. `launch_mode` is the pure
 // argv decision (`tests/entry_topology.rs` drives both directions over it);

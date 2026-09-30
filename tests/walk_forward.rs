@@ -45,12 +45,13 @@ mod coach_support;
 mod support;
 
 use pulse::{
-    BacktestConfig, BacktestRequest, BacktestRunRepository, BinanceAdapter, CandleSeries,
-    CandleStore, CandleWindow, CompiledStrategy, Db, FakeClock, FoldScheme, FoldVerdict, Migrator,
-    Pair, RunVerdict, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
-    Timeframe, VersionId, WalkForwardAppError, WalkForwardError, WalkForwardMembership,
-    WalkForwardOutcome, WalkForwardRequest, WalkForwardRunRepository, compile,
-    first_fully_warm_bar_ms, fold_windows, run_version_backtest, run_walk_forward, validate,
+    BacktestConfig, BacktestRequest, BacktestRunRepository, BinanceAdapter, Candle, CandleSeries,
+    CandleSeriesRepository, CandleStore, CandleWindow, CompiledStrategy, Db, FakeClock, FoldScheme,
+    FoldVerdict, Migrator, Pair, RunVerdict, SqliteBacktestRunRepo, SqliteStrategyRepo,
+    StrategyDsl, StrategyRepository, Timeframe, VersionId, WalkForwardAppError, WalkForwardError,
+    WalkForwardMembership, WalkForwardOutcome, WalkForwardRequest, WalkForwardRunRepository,
+    compile, first_fully_warm_bar_ms, fold_windows, run_version_backtest, run_walk_forward,
+    validate,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -356,7 +357,7 @@ async fn span_from_defaults_to_first_warm_bar_and_explicit_from_is_identical() {
     let m15 = fixture_series(Timeframe::M15);
 
     let compiled = compile_dsl(&dsl);
-    let warm = first_fully_warm_bar_ms(&compiled, &m15, None)
+    let warm = first_fully_warm_bar_ms(&compiled, &m15, None, None)
         .expect("the fixture's RSI(14) warms inside a month");
     assert_eq!(
         warm, ORACLE_FIRST_WARM_MS,
@@ -414,7 +415,7 @@ fn first_warm_bar_is_the_pinned_fixture_golden() {
     let compiled = compile_dsl(&oracle_dsl());
 
     assert_eq!(
-        first_fully_warm_bar_ms(&compiled, &m15, None),
+        first_fully_warm_bar_ms(&compiled, &m15, None, None),
         Some(ORACLE_FIRST_WARM_MS)
     );
     let golden_idx = m15
@@ -431,7 +432,7 @@ fn first_warm_bar_is_the_pinned_fixture_golden() {
         m15.windowed(&CandleWindow::new(m15.candles[0].open_time, ORACLE_FIRST_WARM_MS).unwrap());
     assert_eq!(before.candles.len(), golden_idx);
     assert_eq!(
-        first_fully_warm_bar_ms(&compiled, &before, None),
+        first_fully_warm_bar_ms(&compiled, &before, None, None),
         None,
         "no bar before the golden is warm"
     );
@@ -448,7 +449,7 @@ async fn from_before_warm_is_refused_naming_the_earliest_allowed() {
     let version = make_version(&world, &dsl).await;
     let m15 = fixture_series(Timeframe::M15);
     let compiled = compile_dsl(&dsl);
-    let warm = first_fully_warm_bar_ms(&compiled, &m15, None).unwrap();
+    let warm = first_fully_warm_bar_ms(&compiled, &m15, None, None).unwrap();
 
     let mut req = request(&version);
     req.from_ms = Some(warm - 15 * 60_000); // one M15 bar earlier
@@ -515,7 +516,7 @@ async fn a_fold_with_no_counted_candle_refuses_before_any_persist() {
     let version = make_version(&world, &dsl).await;
     let m15 = fixture_series(Timeframe::M15);
     let compiled = compile_dsl(&dsl);
-    let warm = first_fully_warm_bar_ms(&compiled, &m15, None).unwrap();
+    let warm = first_fully_warm_bar_ms(&compiled, &m15, None, None).unwrap();
 
     // A counted span NARROWER than the bar spacing: six one-minute windows over
     // fifteen-minute candles, so fold 1 falls between two candle opens and no
@@ -623,6 +624,114 @@ async fn fold_runs_are_listed_and_read_with_walk_forward_membership() {
                 fold_index: fold.index,
             }),
             "fold {}'s provenance names its walk-forward parent",
+            fold.index
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// r3.s2.w4 — the D1 selection reaches every fold run's provenance
+// ---------------------------------------------------------------------------
+
+/// The `d1`-gated strategy the fold-provenance case runs: `d1:close > 0` is
+/// true on every paired bar once the daily engine is warm, so the folds differ
+/// only in their windows and every fold run must record the SAME D1 selection
+/// — the agreement `experiment_disagreement` then enforces across folds.
+fn d1_gated_dsl() -> StrategyDsl {
+    let json = r#"{
+      "schema_version": "1.2.0",
+      "name": "d1 gated walk-forward",
+      "direction": "long",
+      "entry": {
+        "type": "Compare",
+        "lhs": { "type": "Price", "series": "d1", "field": "Close" },
+        "op": "Gt",
+        "rhs": { "type": "Constant", "value": "0" }
+      },
+      "filters": [],
+      "exits": [ { "type": "StopLoss", "distance_pct": "0.05" } ],
+      "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+    }"#;
+    Migrator::v1().load(json).expect("d1 dsl loads").dsl
+}
+
+/// One flat D1 candle per UTC day the fixture's M15 head spans, priced at the
+/// last M15 close of that day — coverage the daily checks accept by
+/// construction, with the zero-rate funding stamp every 8h boundary carries.
+fn daily_candles_over(m15: &[Candle]) -> Vec<Candle> {
+    let day = Timeframe::D1.duration_ms();
+    let first_day = m15[0].open_time / day;
+    let last_day = m15[m15.len() - 1].close_time / day;
+    (first_day..=last_day)
+        .map(|d| {
+            let open_time = d * day;
+            let close = m15
+                .iter()
+                .rev()
+                .find(|c| c.open_time >= open_time && c.open_time < open_time + day)
+                .map(|c| c.close)
+                .expect("the fixture has at least one M15 bar every day it spans");
+            Candle {
+                open_time,
+                close_time: open_time + day - 1,
+                open: close,
+                high: close,
+                low: close,
+                close,
+                volume: Decimal::ONE,
+                funding_rate: Some(Decimal::ZERO),
+            }
+        })
+        .collect()
+}
+
+/// r3.s2.w4 correction — a walk-forward over a `d1` strategy records the daily
+/// selection on EVERY fold run's provenance (spec case (iv)'s fold leg): the
+/// folds are separate persisted runs, and each one names the seeded D1
+/// snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_fold_run_records_the_d1_selection() {
+    let world = world().await;
+    let m15 = fixture_series(Timeframe::M15);
+    let d1_version = world
+        .store
+        .commit(
+            &Pair::new("BTCUSDT"),
+            Timeframe::D1,
+            daily_candles_over(&m15.candles),
+        )
+        .expect("commit the daily snapshot into the scratch store")
+        .series
+        .version;
+
+    let version = make_version(&world, &d1_gated_dsl()).await;
+    let outcome = run(&world, &request(&version)).await;
+    let wf = &outcome.run;
+    assert!(
+        wf.folds.len() >= 2,
+        "the fixture spans several folds; the premise is several fold runs"
+    );
+    assert_eq!(
+        wf.folds.len(),
+        outcome.fold_summaries.len(),
+        "every fold has a catalog row"
+    );
+    for fold in &wf.folds {
+        let fold_run = world
+            .runs
+            .get_run(&fold.backtest_run_id)
+            .await
+            .expect("the fold run reads")
+            .expect("the fold run exists");
+        let inputs = fold_run
+            .inputs
+            .expect("a fresh fold run always carries inputs");
+        let recorded = inputs.d1.expect("the fold run records its D1 selection");
+        assert_eq!(recorded.timeframe, Timeframe::D1);
+        assert_eq!(
+            recorded.data_version, d1_version,
+            "fold {} recorded the seeded daily snapshot, not nothing and not \
+             another version",
             fold.index
         );
     }

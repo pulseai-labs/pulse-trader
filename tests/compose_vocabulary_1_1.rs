@@ -308,8 +308,8 @@ async fn htf_filter_and_atr_stop_compose_with_no_substitution() {
     // migrator into the same typed document (already-current, no migration).
     assert_eq!(
         version.dsl_schema_version.to_string(),
-        "1.1.0",
-        "the persisted version is stamped schema 1.1.0"
+        "1.2.0",
+        "the persisted version is stamped schema 1.2.0"
     );
     assert_eq!(version.dsl.schema_version, SchemaVersion::CURRENT);
     let loaded = Migrator::v1()
@@ -568,10 +568,12 @@ async fn advertised_tool_definitions_carry_the_1_1_0_vocabulary() {
     for signal_tool in ["add_entry_signal", "add_filter"] {
         for side in ["left", "right"] {
             let operand_props = &def(signal_tool).parameters["properties"][side]["properties"];
+            // r3.s2.w5 (the one AUTHORIZED loosening): the vocabulary now
+            // advertises the daily series too — `d1` joined the timeframe enum.
             assert_eq!(
                 operand_props["timeframe"]["enum"],
-                json!(["primary", "h4"]),
-                "{signal_tool}.{side} advertises timeframe primary|h4"
+                json!(["primary", "h4", "d1"]),
+                "{signal_tool}.{side} advertises timeframe primary|h4|d1"
             );
             let indicators = operand_props["indicator"]["enum"]
                 .as_array()

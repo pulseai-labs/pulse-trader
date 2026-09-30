@@ -205,17 +205,22 @@ where
     // `with_created_by(ComposerLlm)` is load-bearing: every row this decorator writes is
     // provenance-linked from a `StrategyVersion { created_by: ComposerLlm }`, and
     // `llm_call` is trigger-immutable — a row stamped `Human` here could never be fixed.
-    let decorator = RedactingLoggingProvider::new(provider, capturing, clock, redactor, prices)
-        .with_created_by(CreatedBy::ComposerLlm)
-        // r1.s1.w2: which credential source answered rides onto every ledger row, so
-        // a call's provenance is reconstructible without the key ever being stored.
-        .with_key_source(key_source);
+    // The SAME redactor kernel feeds BOTH halves of the seam (r3.s2.w5): the
+    // decorator scrubs the persisted ledger copies, and the Composer scrubs +
+    // bounds the assistant text before it becomes a streamed/stored event.
+    let decorator =
+        RedactingLoggingProvider::new(provider, capturing, clock, redactor.clone(), prices)
+            .with_created_by(CreatedBy::ComposerLlm)
+            // r1.s1.w2: which credential source answered rides onto every ledger row, so
+            // a call's provenance is reconstructible without the key ever being stored.
+            .with_key_source(key_source);
     let composer = Composer::new(
         decorator,
         builder_tool_definitions(),
         prompt,
         config,
         Arc::clone(&captured),
+        redactor,
     );
 
     // `.context(...)` rather than `anyhow!("...: {e}")` on all three: a formatted
@@ -368,6 +373,9 @@ fn render_event(event: &ComposerEvent) -> String {
             arguments_preview,
         } => format!("  -> {name} {arguments_preview}"),
         ComposerEvent::ToolCallResult { name, outcome } => format!("     {name}: {outcome}"),
+        // The composer's own prose (r3.s2.w5), indented as a quoted note so it
+        // reads as the model speaking, not as a tool event.
+        ComposerEvent::AssistantText { text } => format!("  note: \"{text}\""),
         ComposerEvent::Finalized { version_summary } => format!("  finalized: {version_summary}"),
     }
 }

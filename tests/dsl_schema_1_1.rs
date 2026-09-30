@@ -109,20 +109,30 @@ fn atr_stop(period: u32, multiple_mantissa: i64, multiple_scale: u32) -> ExitRul
 }
 
 /// Every `ValueSource::Price`/`ValueSource::Indicator` leaf reachable in `dsl`,
-/// with its `series` (Constant carries none).
+/// with its `series` (Constant carries none). Exhaustive over both enums — d19:
+/// new variants gain real arms, never wildcards. r3.s2.w3: `Arith`/`Lag` reach
+/// their operand leaves; `Rising`/`Falling` reach their value.
 fn operand_series(dsl: &StrategyDsl) -> Vec<Series> {
+    fn walk_value(src: &ValueSource, out: &mut Vec<Series>) {
+        match src {
+            ValueSource::Price { series, .. } | ValueSource::Indicator { series, .. } => {
+                out.push(*series);
+            }
+            ValueSource::Arith { lhs, rhs, .. } => {
+                walk_value(lhs, out);
+                walk_value(rhs, out);
+            }
+            ValueSource::Lag { value, .. } => walk_value(value, out),
+            ValueSource::Constant { .. } => {}
+        }
+    }
     fn walk(cond: &Condition, out: &mut Vec<Series>) {
         match cond {
             Condition::Compare { lhs, rhs, .. }
             | Condition::CrossesAbove { lhs, rhs }
             | Condition::CrossesBelow { lhs, rhs } => {
-                for src in [lhs, rhs] {
-                    match src {
-                        ValueSource::Price { series, .. }
-                        | ValueSource::Indicator { series, .. } => out.push(*series),
-                        ValueSource::Constant { .. } => {}
-                    }
-                }
+                walk_value(lhs, out);
+                walk_value(rhs, out);
             }
             Condition::And { conditions } | Condition::Or { conditions } => {
                 for c in conditions {
@@ -130,6 +140,9 @@ fn operand_series(dsl: &StrategyDsl) -> Vec<Series> {
                 }
             }
             Condition::Not { condition } => walk(condition, out),
+            Condition::Rising { value, .. } | Condition::Falling { value, .. } => {
+                walk_value(value, out);
+            }
         }
     }
     let mut out = Vec::new();
@@ -148,7 +161,7 @@ fn operand_series(dsl: &StrategyDsl) -> Vec<Series> {
 // ---- (a) identity migration over fixtures + the inline document ------------
 
 #[test]
-fn every_committed_fixture_migrates_1_0_0_to_1_1_0() {
+fn every_committed_fixture_migrates_to_current() {
     let dir = manifest("tests/fixtures/strategies");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("fixture dir readable")
@@ -166,7 +179,7 @@ fn every_committed_fixture_migrates_1_0_0_to_1_1_0() {
 
         assert!(
             loaded.migrated,
-            "{} must report migrated (1.0.0 -> 1.1.0)",
+            "{} must report migrated (1.0.0 -> ... -> CURRENT)",
             path.display()
         );
         assert_eq!(
@@ -177,8 +190,8 @@ fn every_committed_fixture_migrates_1_0_0_to_1_1_0() {
         );
         assert_eq!(
             loaded.dsl.schema_version,
-            v(1, 1, 0),
-            "{} migrated version",
+            SchemaVersion::CURRENT,
+            "{} migrated version (the chain now runs 1.0.0 -> 1.1.0 -> CURRENT)",
             path.display()
         );
         assert_eq!(
@@ -206,7 +219,7 @@ fn inline_1_0_0_document_migrates_and_deserializes_equal() {
     let loaded = Migrator::v1().load(INLINE_1_0_0).expect("load inline");
     assert!(loaded.migrated);
     assert_eq!(loaded.from, v(1, 0, 0));
-    assert_eq!(loaded.dsl.schema_version, v(1, 1, 0));
+    assert_eq!(loaded.dsl.schema_version, SchemaVersion::CURRENT);
     assert_eq!(loaded.dsl_original, INLINE_1_0_0);
     let mut direct: StrategyDsl = serde_json::from_str(INLINE_1_0_0).expect("direct");
     direct.schema_version = SchemaVersion::CURRENT;
@@ -217,7 +230,7 @@ fn inline_1_0_0_document_migrates_and_deserializes_equal() {
 
 #[test]
 fn future_versions_still_reject() {
-    for future in ["1.2.0", "2.0.0"] {
+    for future in ["1.3.0", "2.0.0"] {
         let mut doc: Value = serde_json::from_str(INLINE_1_0_0).unwrap();
         doc["schema_version"] = json!(future);
         let err = Migrator::v1()
@@ -520,6 +533,7 @@ fn htf_operand_compiles_with_its_series() {
         spec: IndicatorSpec::Ema {
             period: SweepableValue::Fixed(200),
         },
+        lag: 0,
     };
     assert!(
         matches!(
@@ -568,6 +582,7 @@ fn htf_price_operand_compiles_and_needs_htf() {
             lhs: pulse::CompiledValue::Price {
                 series: Series::Htf,
                 field: PriceField::Close,
+                lag: 0,
             },
             ..
         }
@@ -657,7 +672,7 @@ async fn repo() -> (SqliteStrategyRepo<pulse::SystemClock>, SqlitePool, TempDir)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn persisted_1_0_0_document_reads_back_at_1_1_0() {
+async fn persisted_1_0_0_document_reads_back_at_current() {
     let (repo, _pool, _tmp) = repo().await;
     let s = repo
         .create_strategy("MigrateMe", Some("alice"), &["btc".to_owned()])
@@ -681,7 +696,7 @@ async fn persisted_1_0_0_document_reads_back_at_1_1_0() {
         .expect("version exists");
     assert_eq!(
         fetched.dsl_schema_version,
-        v(1, 1, 0),
+        SchemaVersion::CURRENT,
         "persisted version must read back at CURRENT"
     );
     assert_eq!(

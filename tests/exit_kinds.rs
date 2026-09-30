@@ -203,6 +203,7 @@ fn run(
         strategy,
         series,
         None,
+        None,
         &BacktestConfig {
             starting_equity: dec("10000"),
             taker_fee_bps: Decimal::ZERO,

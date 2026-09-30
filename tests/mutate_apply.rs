@@ -20,7 +20,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pulse::{
-    CandidateDsl, Comparator, Condition, Direction, ExitRule, IndicatorSpec, Mutation,
+    CandidateDsl, Comparator, Condition, Direction, ExitRule, IndicatorSpec, MacdOutput, Mutation,
     MutationError, ParamKind, ParamValue, RiskParams, SchemaVersion, Series, StrategyDsl,
     SweepableValue, ValueSource, apply, compile,
 };
@@ -319,6 +319,7 @@ fn validation_failure_carries_the_field_errors() {
                 fast: SweepableValue::Fixed(12),
                 slow: SweepableValue::Fixed(26),
                 signal: SweepableValue::Fixed(9),
+                output: MacdOutput::Line,
             },
         },
         op: Comparator::Gt,

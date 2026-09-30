@@ -229,6 +229,11 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
 /// r3.s1.w4 (#142): the symbol filters render as four values when recorded;
 /// `filters=not recorded` for a pre-`0015` run — the honest read, never a
 /// guessed constant.
+///
+/// r3.s2.w4: a run whose strategy read a daily series names it as
+/// `d1_data_version=<tag>`, placed beside the HTF pair. A run with no `d1`
+/// operand and every pre-`0017` row print nothing here — the field is absent,
+/// not blank, exactly as the HTF pair is.
 fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
     let Some(i) = inputs else {
         return "inputs\tunavailable (legacy run, predates migration 0006)".to_owned();
@@ -243,6 +248,11 @@ fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
             )
         },
     );
+    // The D1 selection's timeframe is fixed at `1d`, so the tag is the whole
+    // field — printing `d1=1d` beside it would restate a constant.
+    let d1 = i.d1.as_ref().map_or_else(String::new, |d1| {
+        format!("\td1_data_version={}", d1.data_version)
+    });
     let filters = i.symbol_filters.as_ref().map_or_else(
         || "filters=not recorded".to_owned(),
         |f| {
@@ -276,7 +286,7 @@ fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
         )
     });
     format!(
-        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}\tfee_bps={}\tslippage_bps={}\tfunding={}\t{filters}{windowed}",
+        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}{d1}\tfee_bps={}\tslippage_bps={}\tfunding={}\t{filters}{windowed}",
         i.pair,
         i.primary.timeframe.binance_interval(),
         i.primary.data_version,
@@ -365,6 +375,7 @@ mod tests {
                 timeframe: Timeframe::H4,
                 data_version: DataVersion::new("htftag"),
             }),
+            d1: None,
             taker_fee_bps: Decimal::new(5, 2),
             slippage_bps: Decimal::new(2, 2),
             funding: FundingConfig::SnapshotRates,

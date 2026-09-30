@@ -80,7 +80,7 @@ async fn tools_and_dsl_schema_resource_are_served() {
         other => panic!("dsl_schema must be text contents, got {other:?}"),
     };
     let doc: Value = serde_json::from_str(&text).expect("dsl_schema body parses as JSON");
-    assert_eq!(doc["schema_version"], "1.1.0");
+    assert_eq!(doc["schema_version"], "1.2.0");
     let properties = doc["json_schema"]["properties"]
         .as_object()
         .expect("json_schema has properties");
@@ -143,7 +143,7 @@ async fn strategy_and_version_tools_return_the_seed() {
     assert_eq!(version["created_by"], "composer_llm");
     // The seeded `1.0.0` document was identity-migrated on write — the stored
     // column and the migrated `.dsl` read back at CURRENT.
-    assert_eq!(version["dsl_schema_version"], "1.1.0");
+    assert_eq!(version["dsl_schema_version"], "1.2.0");
     assert_eq!(version["dsl"]["name"], "RSI Oversold (mcp child)");
     assert_eq!(
         version["dsl_original"],
@@ -467,6 +467,7 @@ async fn candle_and_indicator_exports_match_the_snapshot() {
         expected.push(engine.current(&CompiledValue::Indicator {
             series: Series::Primary,
             spec: spec.clone(),
+            lag: 0,
         }));
     }
 

@@ -566,18 +566,33 @@ mod tests {
         );
     }
 
-    /// r2.s2.w3 (#160/#163): the shipped composer prompt must TEACH the
-    /// schema-1.1.0 vocabulary — the `"timeframe"` operand token and `"atr"` as
-    /// an indicator — or a described H4 filter / ATR stop is silently
-    /// substituted instead of composed. Same machine-guard shape as the
-    /// frontmatter pin above: a prompt edit that drops the vocabulary fails here.
+    /// r2.s2.w3 (#160/#163) + r3.s2.w5 (Q5): the shipped composer prompt must
+    /// TEACH the expanded builder vocabulary — the `"timeframe"` operand token
+    /// (now including `"d1"`), `"atr"` and the rolling extremes `"highest"` /
+    /// `"lowest"` as indicators, the `"arith"` / `"lag"` operand kinds, and the
+    /// `"rising"` / `"falling"` slope ops — plus the honesty invariant: a
+    /// specified-but-inexpressible request is named as such, never substituted.
+    /// Or a described filter/slope/confirmation is silently substituted instead
+    /// of composed. Same machine-guard shape as the frontmatter pin above: a
+    /// prompt edit that drops the vocabulary fails here.
     #[test]
-    fn composer_prompt_teaches_the_1_1_0_vocabulary() {
+    fn composer_prompt_teaches_the_1_2_0_vocabulary() {
         let prompt = load_composer_prompt_from(None).expect("compiled-in default");
-        for needle in ["\"timeframe\"", "\"atr\""] {
+        for needle in [
+            "\"timeframe\"",
+            "\"atr\"",
+            "\"highest\"",
+            "\"lowest\"",
+            "\"arith\"",
+            "\"lag\"",
+            "\"rising\"",
+            "\"falling\"",
+            "\"d1\"",
+            "specified but inexpressible",
+        ] {
             assert!(
                 prompt.contains(needle),
-                "composer prompt must carry {needle} — the 1.1.0 operand vocabulary"
+                "composer prompt must carry {needle} — the expanded operand vocabulary"
             );
         }
     }

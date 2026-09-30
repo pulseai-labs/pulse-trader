@@ -902,6 +902,7 @@ fn first_bar_with_current_values(series: &CandleSeries, specs: &[IndicatorSpec])
         .map(|spec| CompiledValue::Indicator {
             series: Series::Primary,
             spec: spec.clone(),
+            lag: 0,
         })
         .collect();
     for (idx, candle) in series.candles.iter().enumerate() {
@@ -952,6 +953,7 @@ fn not_compare_entry_cannot_fire_before_rsi_is_warm() {
         &compiled,
         &primary,
         None,
+        None,
         &BacktestConfig::default(),
         &btc_filters(),
         SeriesEnd::SnapshotEnd,
@@ -990,6 +992,7 @@ fn not_cross_entry_skips_the_first_bar_with_current_values() {
     let result = run_backtest(
         &compiled,
         &primary,
+        None,
         None,
         &BacktestConfig::default(),
         &btc_filters(),
