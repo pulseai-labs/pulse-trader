@@ -18,6 +18,10 @@ pub(crate) mod state;
 // event derivation (the ONE place `PaperEvent::Order` is constructed), the
 // shadow-identity comparison and the epoch scoping.
 pub(crate) mod runtime;
+// r3.s4.w4: the out-of-sample comparison (A8/A12/E3) — the live mean R against
+// the certifying run's fold-expectancy range, plus the engine-build span and
+// the stale-certification note.
+pub(crate) mod comparison;
 
 // The module's curated surface, re-exported once here so `domain/mod.rs` and
 // `lib.rs` can chain the crate and crate-boundary re-exports (an un-re-exported
@@ -38,3 +42,5 @@ pub use runtime::{
     BarBoundaries, EpochStart, ShadowResult, StepView, boundaries, compare, daily_shadow_due,
     events_for_step, first_open_bar_ms, next_utc_midnight_after,
 };
+// r3.s4.w4: the OOS comparison's pure surface (spec §3).
+pub use comparison::{ComparisonVerdict, OosComparison, comparison};

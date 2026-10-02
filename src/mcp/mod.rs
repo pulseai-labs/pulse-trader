@@ -85,6 +85,19 @@ impl PulseMcp {
     fn identity_lock(&self) -> MutexGuard<'_, AgentIdentity> {
         self.identity.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// The paper-session repository over this process's own pool and candle
+    /// store — the seam the four paper read tools share (r3.s4.w4). The store
+    /// handle matters only for materialisation, which the read tools never do,
+    /// but the repository's constructor owns it.
+    fn paper_repo(
+        &self,
+    ) -> crate::adapters::db::SqlitePaperSessionRepo<crate::adapters::clock::SystemClock> {
+        crate::adapters::db::SqlitePaperSessionRepo::new(
+            self.state.db.pool().clone(),
+            self.state.candles.clone(),
+        )
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -104,7 +117,9 @@ impl ServerHandler for PulseMcp {
         .with_instructions(
             "Access to the PulseTrader strategy library and backtester. Read tools: \
              list_strategies, get_version, list_runs, get_run, export_trades, \
-             export_candles, export_indicators. Write tools: submit_strategy_version \
+             export_candles, export_indicators, list_paper_sessions, \
+             get_paper_session, get_paper_trades, get_paper_comparison. Write tools: \
+             submit_strategy_version \
              (persist an agent-authored DSL variant with its hypothesis) and \
              run_backtest (run a version, optionally windowed to [from, to)). \
              Walk-forward tools: run_walk_forward (walk a version over \

@@ -468,6 +468,7 @@ async fn expired_progress_events_leave_only_the_terminal_then_the_record_vanishe
     let ts = spawn_server(ServerOptions {
         sweep: Some(fast_sweep(25, 120, 500)),
         compose_runner: None,
+        ..Default::default()
     })
     .await;
     let (_status, body) =
@@ -526,6 +527,7 @@ async fn compose_cancel_lands_as_the_cancelled_outcome_and_the_latch_empties() {
         compose_runner: Some(Box::new(|db: &Db| {
             scripted_compose_runner(two_valid_turns(), Duration::from_millis(300), db.clone())
         })),
+        ..Default::default()
     })
     .await;
 
@@ -707,6 +709,7 @@ async fn the_fake_credential_value_never_reaches_a_frame_a_body_or_the_log() {
         compose_runner: Some(Box::new(|db: &Db| {
             scripted_compose_runner(two_valid_turns(), Duration::from_millis(60), db.clone())
         })),
+        ..Default::default()
     })
     .await;
 

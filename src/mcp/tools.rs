@@ -1,16 +1,24 @@
-//! The eleven tools of `pulse mcp` (r2.s1.w2, w3; r2.s3.w5).
+//! The fifteen tools of `pulse mcp` (r2.s1.w2, w3; r2.s3.w5; r3.s4.w4).
 //!
-//! Seven read tools (`w2`): five query the strategy/run repositories and two
-//! read the candle store, with exports landing under the per-process exports
-//! dir. Two write tools (`w3`): `submit_strategy_version` persists an
-//! agent-authored DSL variant through the application submit use case, and
-//! `run_backtest` runs a version through the shared application flow with an
-//! optional `[from, to)` candle window. Two walk-forward tools (r2.s3.w5):
-//! `run_walk_forward` walks a version over `rolling-oos/v1` folds through the
-//! same shared flow and `get_walk_forward_run` reads one persisted run back —
-//! both answer the ONE `WalkForwardRunDetail` shape, and every fold is an
-//! ordinary `backtest_run` row the unchanged `list_runs`/`get_run` surfaces
-//! resolve.
+//! Eleven read tools: `w2`'s five repository queries and two candle-store
+//! readers, `r3.s4.w4`'s four paper-session reads (`list_paper_sessions`,
+//! `get_paper_session`, `get_paper_trades`, `get_paper_comparison` — all
+//! through the shared `application::paper_read` projection, so a tool and a
+//! route answer from the same code), with exports landing under the
+//! per-process exports dir. Two write tools (`w3`): `submit_strategy_version`
+//! persists an agent-authored DSL variant through the application submit use
+//! case, and `run_backtest` runs a version through the shared application flow
+//! with an optional `[from, to)` candle window. Two walk-forward tools
+//! (r2.s3.w5): `run_walk_forward` walks a version over `rolling-oos/v1` folds
+//! through the same shared flow and `get_walk_forward_run` reads one persisted
+//! run back — both answer the ONE `WalkForwardRunDetail` shape, and every fold
+//! is an ordinary `backtest_run` row the unchanged `list_runs`/`get_run`
+//! surfaces resolve.
+//!
+//! No tool can promote a session, stop one, sweep-stop every session or run a
+//! shadow check (A3, least privilege): the surface is read-only by
+//! construction, and the four paper tools' names and descriptions never name
+//! those actions.
 //!
 //! Argument validation failures come back as tool errors in the
 //! `{"field", "message"}` shape (the spec's `FieldError` contract); store/repo
@@ -37,6 +45,7 @@ use crate::application::mcp_read::{
 use crate::application::mcp_write::{
     SubmitError, SubmitRequest, SubmitTarget, submit_agent_version,
 };
+use crate::application::paper_read::{list_summaries, session_summary, session_trades};
 use crate::application::walk_forward::{WalkForwardAppError, WalkForwardRequest, run_walk_forward};
 use crate::application::walk_forward_read::{
     load_fold_runs, rfc3339_secs, run_summary_of, walk_forward_run_detail,
@@ -44,8 +53,8 @@ use crate::application::walk_forward_read::{
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
-    CompiledValue, DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PersistedRun,
-    Series, StrategyRepository, Timeframe, ValidationCode, WalkForwardRunId,
+    CompiledValue, DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PaperSessionId,
+    PersistedRun, Series, StrategyRepository, Timeframe, ValidationCode, WalkForwardRunId,
     WalkForwardRunRepository,
 };
 
@@ -209,6 +218,20 @@ pub(crate) struct RunWalkForwardArgs {
 pub(crate) struct GetWalkForwardRunArgs {
     /// The walk-forward run id.
     walk_forward_run_id: String,
+}
+
+/// `list_paper_sessions` args (r3.s4.w4): no arguments.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListPaperSessionsArgs {}
+
+/// `get_paper_session`, `get_paper_trades` and `get_paper_comparison` args
+/// (r3.s4.w4).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PaperSessionArgs {
+    /// The paper-session id.
+    session_id: String,
 }
 
 /// One tool error in the `{"field", "message"}` shape.
@@ -1102,5 +1125,81 @@ impl PulseMcp {
         Ok(CallToolResult::structured(
             serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
         ))
+    }
+
+    /// List every paper trading session, with its status, graduation, engine
+    /// epochs and out-of-sample comparison — the same projection the paper
+    /// routes serve.
+    #[tool(
+        description = "List paper trading sessions with their status, graduation, engine epochs, closed-trade count and out-of-sample comparison. The result is an object carrying the rows under `sessions`."
+    )]
+    async fn list_paper_sessions(
+        &self,
+        Parameters(_args): Parameters<ListPaperSessionsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let paper = self.paper_repo();
+        let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        match list_summaries(&paper, &runs).await {
+            Ok(summaries) => Ok(structured_list("sessions", summaries)),
+            Err(e) => Ok(tool_error(e)),
+        }
+    }
+
+    /// Fetch one paper trading session by id: the same summary shape the list
+    /// carries, plus its per-epoch verdicts.
+    #[tool(
+        description = "Fetch one paper trading session by id: status, graduation, engine epochs, closed-trade count, open position, the recorded verdicts per engine epoch and the out-of-sample comparison."
+    )]
+    async fn get_paper_session(
+        &self,
+        Parameters(args): Parameters<PaperSessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let paper = self.paper_repo();
+        let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        match session_summary(&paper, &runs, &PaperSessionId::new(args.session_id)).await {
+            Ok(Some(summary)) => Ok(CallToolResult::structured(
+                serde_json::to_value(summary).unwrap_or_else(|_| json!({})),
+            )),
+            Ok(None) => Ok(field_error("session_id", "no such paper session")),
+            Err(e) => Ok(tool_error(e)),
+        }
+    }
+
+    /// Fetch one paper trading session's closed trades (with their realized R)
+    /// and its open position.
+    #[tool(
+        description = "Fetch one paper trading session's closed trades with their realized R-multiple and its open position, by session id. The result carries the trades under `closed_trades`."
+    )]
+    async fn get_paper_trades(
+        &self,
+        Parameters(args): Parameters<PaperSessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let paper = self.paper_repo();
+        match session_trades(&paper, &PaperSessionId::new(args.session_id)).await {
+            Ok(Some(trades)) => Ok(CallToolResult::structured(
+                serde_json::to_value(trades).unwrap_or_else(|_| json!({})),
+            )),
+            Ok(None) => Ok(field_error("session_id", "no such paper session")),
+            Err(e) => Ok(tool_error(e)),
+        }
+    }
+
+    /// Fetch one paper trading session's out-of-sample comparison.
+    #[tool(
+        description = "Fetch one paper trading session's out-of-sample comparison, by session id: the live mean R against the certifying walk-forward's fold-expectancy range, the engine-build span and whether the certification is stale."
+    )]
+    async fn get_paper_comparison(
+        &self,
+        Parameters(args): Parameters<PaperSessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let paper = self.paper_repo();
+        let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        match session_summary(&paper, &runs, &PaperSessionId::new(args.session_id)).await {
+            Ok(Some(summary)) => Ok(CallToolResult::structured(
+                serde_json::to_value(summary.comparison).unwrap_or_else(|_| json!({})),
+            )),
+            Ok(None) => Ok(field_error("session_id", "no such paper session")),
+            Err(e) => Ok(tool_error(e)),
+        }
     }
 }

@@ -30,6 +30,8 @@ use pulse::{
 };
 use tempfile::TempDir;
 
+use crate::support::paper::PaperHost;
+
 /// The committed candle fixture every arm runs over (`tests/tauri_backtest.rs`).
 pub const FIXTURE_STORE: &str = "tests/fixtures/btcusdt-1m-store";
 
@@ -61,6 +63,11 @@ pub fn copy_tree(from: &Path, to: &Path) {
 /// handle once the harness has made it (a runner cannot be built beforehand).
 pub type ComposeRunnerFactory = Box<dyn Fn(&Db) -> ComposeRunner + Send + Sync>;
 
+/// The paper-runtime seam's factory (r3.s4.w4): built against the server's own
+/// pool and data dir once the harness has made them, so the runtime behind the
+/// routes rides the SAME database the router does.
+pub type PaperFactory = Box<dyn Fn(&Db, &Path) -> std::sync::Arc<PaperHost> + Send + Sync>;
+
 /// Construction-time seams: `None` keeps the production default.
 #[derive(Default)]
 pub struct ServerOptions {
@@ -68,6 +75,10 @@ pub struct ServerOptions {
     pub sweep: Option<SweepConfig>,
     /// The compose-runner seam (the spec's "narrowest test seam").
     pub compose_runner: Option<ComposeRunnerFactory>,
+    /// The paper-runtime seam (r3.s4.w4, AC-1): `Some` installs a control
+    /// handle and starts the runtime host over the scripted bar source and
+    /// stepped clock; `None` leaves the server with no runtime (the 503 arm).
+    pub paper: Option<PaperFactory>,
 }
 
 /// A live in-process server plus everything a scenario needs to drive it.
@@ -90,6 +101,8 @@ pub struct TestServer {
     pub log: Arc<CaptureLog>,
     pub app_token: String,
     pub agent_token: String,
+    /// The paper-runtime host when the seam installed one (r3.s4.w4).
+    pub paper: Option<Arc<PaperHost>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -135,6 +148,12 @@ pub async fn spawn_server(opts: ServerOptions) -> TestServer {
     if let Some(make_runner) = opts.compose_runner {
         state = state.with_compose_runner(make_runner(&db));
     }
+    let mut paper: Option<Arc<PaperHost>> = None;
+    if let Some(make_paper) = opts.paper {
+        let host = make_paper(&db, &data_dir);
+        state = state.with_paper_control(host.control.clone());
+        paper = Some(host);
+    }
     let state = Arc::new(state);
     let app = router(state.clone());
 
@@ -166,6 +185,7 @@ pub async fn spawn_server(opts: ServerOptions) -> TestServer {
         log,
         app_token,
         agent_token,
+        paper,
         handle,
     }
 }

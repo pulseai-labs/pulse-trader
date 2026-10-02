@@ -94,6 +94,12 @@ pub enum PaperEvent {
         price: Decimal,
         /// Why the position closed, when this fill closes one.
         exit_reason: Option<ExitReason>,
+        /// The closed trade's realized R-multiple (r3.s4.w4, spec §2): filled
+        /// from the engine `Trade` on an exit fill; `None` on an entry fill
+        /// and on every w3-era payload (`#[serde(default)]`), which the OOS
+        /// comparison then does not count.
+        #[serde(default)]
+        realized_r: Option<Decimal>,
     },
     /// A funding payment accrued on the open position.
     Funding {
@@ -209,6 +215,7 @@ impl PaperEvent {
                 qty,
                 price,
                 exit_reason,
+                realized_r,
                 ..
             } => Self::Fill {
                 seq,
@@ -217,6 +224,7 @@ impl PaperEvent {
                 qty,
                 price,
                 exit_reason,
+                realized_r,
             },
             Self::Funding {
                 at, rate, amount, ..

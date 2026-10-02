@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::adapters::backtest::{
     BacktestConfig, EngineSession, SessionTimeframes, first_fully_warm_bar_ms, run_backtest,
 };
+use crate::application::paper_control::{PaperCommand, ShadowCheckReply, StopAllReply, StopReply};
 use crate::domain::backtest::{BacktestError, OpenPositionMark};
 use crate::domain::paper::event::{PaperEvent, StopActor};
 use crate::domain::paper::runtime::{
@@ -161,6 +162,8 @@ pub enum PaperRuntimeError {
     Exchange(ExchangeError),
     /// The session's strategy version is gone.
     UnknownVersion(VersionId),
+    /// No such paper-session row.
+    UnknownSession(PaperSessionId),
     /// The session is not (or no longer) run by this runtime.
     NotRunning(PaperSessionId),
 }
@@ -176,7 +179,28 @@ impl core::fmt::Display for PaperRuntimeError {
             Self::UnknownVersion(id) => {
                 write!(f, "paper runtime: no such strategy version {}", id.as_str())
             }
+            Self::UnknownSession(id) => {
+                write!(f, "paper runtime: no such paper session {}", id.as_str())
+            }
             Self::NotRunning(id) => write!(f, "paper runtime: session {id} is not running"),
+        }
+    }
+}
+
+impl PaperRuntimeError {
+    /// The stable snake-case code a control reply names this refusal by
+    /// (`stop-all`'s `failures[].code`).
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Data(_) => "data",
+            Self::Replay(_) => "replay",
+            Self::Engine(_) => "engine",
+            Self::Compile(_) => "compile",
+            Self::Exchange(_) => "exchange",
+            Self::UnknownVersion(_) => "unknown_version",
+            Self::UnknownSession(_) => "unknown_session",
+            Self::NotRunning(_) => "not_running",
         }
     }
 }
@@ -513,6 +537,133 @@ where
             }
         }
         failures
+    }
+
+    // -- the control handle's entry points (r3.s4.w4, spec §1) --------------
+
+    /// The ids of the sessions this runtime currently runs.
+    #[must_use]
+    pub fn attached_ids(&self) -> Vec<PaperSessionId> {
+        self.sessions.keys().cloned().collect()
+    }
+
+    /// Attach one persisted session now (the promote path's `Attach`): the
+    /// per-session half of [`Self::attach_all`], reachable for one id. An
+    /// already-attached session is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`PaperRuntimeError::UnknownSession`] for an absent row; the replay,
+    /// compile, store and engine refusals [`Self::attach`] raises otherwise.
+    pub async fn attach_one(&mut self, id: &PaperSessionId) -> Result<(), PaperRuntimeError> {
+        if self.sessions.contains_key(id) {
+            return Ok(());
+        }
+        let session = self
+            .repo
+            .get_session(id)
+            .await?
+            .ok_or_else(|| PaperRuntimeError::UnknownSession(id.clone()))?;
+        self.attach(session).await
+    }
+
+    /// Stop a session whether or not it is attached (spec §1): an attached one
+    /// goes through the ordinary final-shadow-check path; an unattached one is
+    /// stopped through the repository directly — a final `Stop` append with no
+    /// shadow check. A session can always be stopped.
+    ///
+    /// # Errors
+    ///
+    /// The replay/store refusals the direct path can raise; an attached
+    /// session's errors come from [`Self::stop`].
+    pub async fn stop_or_unattached(
+        &mut self,
+        id: &PaperSessionId,
+        actor: StopActor,
+    ) -> Result<StopReply, PaperRuntimeError> {
+        if self.sessions.contains_key(id) {
+            self.stop(id, actor).await?;
+            return Ok(StopReply::Stopped);
+        }
+        let Some(session) = self.repo.get_session(id).await? else {
+            return Ok(StopReply::Unknown);
+        };
+        let log = self.repo.events(id).await?;
+        let state = PaperSessionState::replay(&session, &log)?;
+        if state.status == PaperSessionStatus::Stopped {
+            return Ok(StopReply::AlreadyStopped);
+        }
+        let event = PaperEvent::Stop {
+            seq: 0,
+            at: self.now_text(),
+            actor,
+        };
+        self.repo.append_bar(id, &[], &[event]).await?;
+        Ok(StopReply::StoppedWithoutShadow)
+    }
+
+    /// Run one session's shadow check on demand, or answer why not: an
+    /// unattached session has no live state to check, a stopped one has
+    /// nothing to check, and an absent one does not exist.
+    ///
+    /// # Errors
+    ///
+    /// The store/replay/materialisation/engine refusals the check can raise.
+    pub async fn shadow_check_outcome(
+        &mut self,
+        id: &PaperSessionId,
+    ) -> Result<ShadowCheckReply, PaperRuntimeError> {
+        if self.sessions.contains_key(id) {
+            return self.shadow_check(id).await.map(ShadowCheckReply::Checked);
+        }
+        let Some(session) = self.repo.get_session(id).await? else {
+            return Ok(ShadowCheckReply::Unknown);
+        };
+        let log = self.repo.events(id).await?;
+        let state = PaperSessionState::replay(&session, &log)?;
+        Ok(if state.status == PaperSessionStatus::Stopped {
+            ShadowCheckReply::Stopped
+        } else {
+            ShadowCheckReply::NotAttached
+        })
+    }
+
+    /// Apply one control command and answer through its reply channel. The
+    /// production loop and the test host both call exactly this, so the
+    /// command semantics have one home.
+    pub async fn handle_command(&mut self, command: PaperCommand) {
+        match command {
+            PaperCommand::Attach { session_id, reply } => {
+                let result = self.attach_one(&session_id).await;
+                if let Err(error) = &result {
+                    self.log.write(format!(
+                        "paper runtime: attach: session {session_id} could not start: {error}"
+                    ));
+                }
+                let _ = reply.send(result);
+            }
+            PaperCommand::Stop {
+                session_id,
+                actor,
+                reply,
+            } => {
+                let result = self.stop_or_unattached(&session_id, actor).await;
+                let _ = reply.send(result);
+            }
+            PaperCommand::StopAll { issuer, reply } => {
+                let ids = self.attached_ids();
+                let failures = self.stop_all(issuer).await;
+                let stopped = ids
+                    .into_iter()
+                    .filter(|id| !failures.iter().any(|failure| failure.session_id == *id))
+                    .collect();
+                let _ = reply.send(StopAllReply { stopped, failures });
+            }
+            PaperCommand::ShadowCheck { session_id, reply } => {
+                let result = self.shadow_check_outcome(&session_id).await;
+                let _ = reply.send(result);
+            }
+        }
     }
 
     // -- internals ----------------------------------------------------------

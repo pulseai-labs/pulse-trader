@@ -384,6 +384,10 @@ pub use adapters::db::{Db, MIGRATOR};
 // `db/mod.rs` re-export alone is necessary but NOT sufficient). 1.05's CLI consumes
 // it through the `StrategyRepository` port.
 pub use adapters::db::SqliteStrategyRepo;
+// r3.s4.w4: the client-token repository is the SSE suite's revocation seam
+// (revoking a token must end an open stream), so it is surfaced like the
+// other SQLite adapters.
+pub use adapters::db::SqliteClientTokenRepo;
 // VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter. `SqliteBacktestRunRepo`
 // implements the FR-6 persisted-run surface over `query!`/`query_as!` (the
 // committed `.sqlx/` cache). REQUIRED under `deny(warnings)` + `pub(crate) mod
@@ -447,8 +451,8 @@ pub use adapters::db::ops::{
 // a `dead_code` build error otherwise.
 pub use server::auth::{Scope, hash_token, mint_token};
 pub use server::bind::{
-    BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, bind_with_retry,
-    check_bind,
+    BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, WakeTrigger,
+    bind_with_retry, check_bind, run_paper_runtime,
 };
 pub use server::log::{CaptureLog, RequestLog};
 pub use server::{API_VERSION, ServerState, mount_scoped, router};
@@ -601,6 +605,20 @@ pub use domain::{
     PaperSessionStatus, PaperSide, PromotionDraft, PromotionOverride, PromotionRefused,
     ReplayError, SLIPPAGE_BPS, STARTING_EQUITY_USDT, StopActor, TAKER_FEE_BPS, decide_promotion,
 };
+
+// r3.s4.w4 (spec §1/§3/§4): the control handle into the runtime, the OOS
+// comparison's pure surface, and the paper read model — the three surfaces the
+// server routes and the MCP read tools share. Re-exported for the same
+// `deny(warnings)` reason as the w3 block above.
+pub use application::paper_control::{
+    DEFAULT_PAPER_REPLY_TIMEOUT_MS, PaperCommand, PaperControl, PaperControlError,
+    ShadowCheckReply, StopAllReply, StopReply,
+};
+pub use application::paper_read::{
+    EpochShadowCheck, PaperReadError, SessionStatus, SessionSummary, SessionTrades, list_summaries,
+    session_events, session_summary, session_trades,
+};
+pub use domain::{ComparisonVerdict, OosComparison, comparison};
 
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
 // `d11`). Re-exported because `tests/tauri_backtest.rs` injects post-save read
