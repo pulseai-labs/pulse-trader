@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 /// The serde representation is the `Binance` interval string (`"15m"` / `"4h"`
 /// / `"1d"`) so a serialized `Timeframe` round-trips through the exchange's
 /// vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `PartialOrd`/`Ord` follow the declaration order (M15 < H4 < D1) — the
+// cadence order the live runtime's per-timeframe maps key on (r3.s4.w3). The
+// file is not an engine-source-set root, so the fingerprint is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Timeframe {
     /// 15-minute candles.
     #[serde(rename = "15m")]

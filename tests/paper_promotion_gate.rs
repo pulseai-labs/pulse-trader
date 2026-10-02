@@ -67,8 +67,9 @@ async fn world() -> World {
     let (_path, db) = migrated_db(&tmp).await;
     let strategies = SqliteStrategyRepo::new(db.pool().clone());
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
-    let paper = SqlitePaperSessionRepo::with_clock(db.pool().clone(), FakeClock::at(NOW_MS));
     let store = CandleStore::with_base_dir(tmp.path().join("candles"));
+    let paper =
+        SqlitePaperSessionRepo::with_clock(db.pool().clone(), FakeClock::at(NOW_MS), store.clone());
     World {
         _tmp: tmp,
         db,

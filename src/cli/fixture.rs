@@ -68,7 +68,7 @@ pub async fn run_seed(
     let store = CandleStore::with_base_dir(data);
     let strategies = SqliteStrategyRepo::new(db.pool().clone());
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
-    let paper = SqlitePaperSessionRepo::new(db.pool().clone());
+    let paper = SqlitePaperSessionRepo::new(db.pool().clone(), store.clone());
 
     let exchange = crate::adapters::broker::BinanceAdapter::new();
     let outcome = crate::application::fixture::seed(&strategies, &store, &runs, &paper, &exchange)

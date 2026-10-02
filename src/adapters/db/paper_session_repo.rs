@@ -32,12 +32,21 @@ use chrono::{DateTime, SecondsFormat, Utc};
 pub struct SqlitePaperSessionRepo<C: Clock> {
     pool: SqlitePool,
     clock: C,
+    /// The candle store materialisation writes through (`write_snapshot`
+    /// only) — the repository owns the handle so the application ring never
+    /// names the store (r3.s4.w3).
+    store: crate::adapters::store::CandleStore,
 }
 
 impl<C: Clock> SqlitePaperSessionRepo<C> {
-    /// A repository over `pool` driven by the injected `clock`.
-    pub fn with_clock(pool: SqlitePool, clock: C) -> Self {
-        Self { pool, clock }
+    /// A repository over `pool` driven by the injected `clock`, materialising
+    /// through `store`.
+    pub fn with_clock(
+        pool: SqlitePool,
+        clock: C,
+        store: crate::adapters::store::CandleStore,
+    ) -> Self {
+        Self { pool, clock, store }
     }
 
     /// The injected instant, as the `(DateTime, RFC3339 text)` pair the other
@@ -52,10 +61,11 @@ impl<C: Clock> SqlitePaperSessionRepo<C> {
 }
 
 impl SqlitePaperSessionRepo<SystemClock> {
-    /// A repository over `pool` on the wall clock (production shape).
+    /// A repository over `pool` on the wall clock (production shape),
+    /// materialising through `store`.
     #[must_use]
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::with_clock(pool, SystemClock)
+    pub fn new(pool: SqlitePool, store: crate::adapters::store::CandleStore) -> Self {
+        Self::with_clock(pool, SystemClock, store)
     }
 }
 
@@ -487,33 +497,8 @@ impl<C: Clock + Send + Sync> PaperSessionRepository for SqlitePaperSessionRepo<C
             })
             .collect()
     }
-}
 
-/// The event's RFC3339 instant, for the row's `at` column.
-fn event_at(event: &crate::domain::paper::event::PaperEvent) -> String {
-    use crate::domain::paper::event::PaperEvent;
-    match event {
-        PaperEvent::BarProcessed { at, .. }
-        | PaperEvent::Order { at, .. }
-        | PaperEvent::Fill { at, .. }
-        | PaperEvent::Funding { at, .. }
-        | PaperEvent::Stop { at, .. }
-        | PaperEvent::DataEvent { at, .. }
-        | PaperEvent::EngineUpgraded { at, .. }
-        | PaperEvent::ShadowChecked { at, .. } => at.clone(),
-    }
-}
-
-impl<C: Clock + Send + Sync> SqlitePaperSessionRepo<C> {
-    /// Read one session's recorded candles for a timeframe back as `Candle`s,
-    /// in `open_time` order, lead-in included — the read half of
-    /// [`Self::append_bar`](crate::domain::PaperSessionRepository::append_bar).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
-    /// failure.
-    pub async fn bars(
+    async fn bars(
         &self,
         session_id: &PaperSessionId,
         timeframe: Timeframe,
@@ -550,30 +535,44 @@ impl<C: Clock + Send + Sync> SqlitePaperSessionRepo<C> {
             .collect()
     }
 
-    /// Materialise the session's recorded candles into content-addressed
-    /// snapshots — one `SnapshotSelection` per timeframe that holds rows (spec
-    /// 3b). The version derives with the candle store's `content_version` and
-    /// writes through `write_snapshot` ONLY: never a `commit`, never HEAD.
-    /// Content-addressed, so the same rows always give the same `data_version`
-    /// and a repeat write is a no-op. Runs only at a shadow check (w3
-    /// schedules it; this is the mechanism).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DataError::Db`] on a corrupt row, an absent session, or a
-    /// store failure.
-    pub async fn materialise(
+    async fn count_from_ms(&self, session_id: &PaperSessionId) -> Result<Option<i64>, DataError> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| DataError::Db("count_from_ms: no such paper session".to_owned()))?;
+        let session_text = session_id.as_str().to_owned();
+        let primary_text = session.primary_timeframe.binance_interval();
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT open_time, lead_in FROM paper_bar \
+             WHERE session_id = ?1 AND timeframe = ?2 ORDER BY open_time ASC",
+        )
+        .bind(session_text)
+        .bind(primary_text)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(format!("paper_bar lead-in read failed: {e}")))?;
+        if let Some((open_time, _)) = rows.iter().find(|(_, lead_in)| *lead_in == 0) {
+            return Ok(Some(*open_time));
+        }
+        // Lead-in only so far: the boundary the next primary bar opens at.
+        Ok(rows
+            .last()
+            .map(|(open_time, _)| *open_time + session.primary_timeframe.duration_ms()))
+    }
+
+    async fn materialise(
         &self,
         session_id: &PaperSessionId,
-        store: &crate::adapters::store::CandleStore,
     ) -> Result<Vec<crate::domain::SnapshotSelection>, DataError> {
         let session = self
             .get_session(session_id)
             .await?
             .ok_or_else(|| DataError::Db("materialise: no such paper session".to_owned()))?;
-        let timeframes = [Timeframe::M15, Timeframe::H4, Timeframe::D1];
         let mut out = Vec::new();
-        for timeframe in timeframes {
+        // The session's OWN timeframes (A10): its primary, its higher timeframe
+        // when one is in use, the daily series when it consumes one — never a
+        // hard-coded cadence list.
+        for timeframe in session.timeframes() {
             let candles = self.bars(session_id, timeframe).await?;
             if candles.is_empty() {
                 continue;
@@ -583,7 +582,7 @@ impl<C: Clock + Send + Sync> SqlitePaperSessionRepo<C> {
                 timeframe,
                 &candles,
             );
-            store
+            self.store
                 .write_snapshot(&crate::domain::CandleSeries {
                     pair: session.pair.clone(),
                     timeframe,
@@ -597,5 +596,20 @@ impl<C: Clock + Send + Sync> SqlitePaperSessionRepo<C> {
             });
         }
         Ok(out)
+    }
+}
+
+/// The event's RFC3339 instant, for the row's `at` column.
+fn event_at(event: &crate::domain::paper::event::PaperEvent) -> String {
+    use crate::domain::paper::event::PaperEvent;
+    match event {
+        PaperEvent::BarProcessed { at, .. }
+        | PaperEvent::Order { at, .. }
+        | PaperEvent::Fill { at, .. }
+        | PaperEvent::Funding { at, .. }
+        | PaperEvent::Stop { at, .. }
+        | PaperEvent::DataEvent { at, .. }
+        | PaperEvent::EngineUpgraded { at, .. }
+        | PaperEvent::ShadowChecked { at, .. } => at.clone(),
     }
 }

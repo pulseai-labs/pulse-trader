@@ -20,9 +20,10 @@
 mod support;
 
 use pulse::{
-    BarRef, Candle, Db, EngineFingerprint, FakeClock, Graduation, NonEmptyLabel, NonEmptyReason,
-    Pair, PaperEvent, PaperSession, PaperSessionId, PaperSessionRepository, PaperSessionState,
-    PaperSessionStatus, PaperSide, ReplayError, SqlitePaperSessionRepo, Timeframe, VersionId,
+    BarRef, Candle, CandleStore, Db, EngineFingerprint, FakeClock, Graduation, NonEmptyLabel,
+    NonEmptyReason, Pair, PaperEvent, PaperSession, PaperSessionId, PaperSessionRepository,
+    PaperSessionState, PaperSessionStatus, PaperSide, ReplayError, SqlitePaperSessionRepo,
+    Timeframe, VersionId,
 };
 use rust_decimal::Decimal;
 use support::mcp::migrated_db;
@@ -329,10 +330,11 @@ async fn world_with_session() -> World {
     .execute(&pool)
     .await
     .unwrap();
+    let store = CandleStore::with_base_dir(tmp.path().join("candles"));
     World {
         _tmp: tmp,
         db,
-        paper: SqlitePaperSessionRepo::with_clock(pool, FakeClock::at(1_767_225_600_000)),
+        paper: SqlitePaperSessionRepo::with_clock(pool, FakeClock::at(1_767_225_600_000), store),
     }
 }
 

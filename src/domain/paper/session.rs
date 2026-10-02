@@ -199,6 +199,28 @@ impl PaperSession {
     pub fn oos_comparable(&self) -> bool {
         matches!(self.graduation, Graduation::Certified { .. }) && !self.fixture
     }
+
+    /// The fixed daily timeframe, when this session consumes the daily series.
+    #[must_use]
+    pub fn d1_timeframe(&self) -> Option<Timeframe> {
+        self.uses_d1.then_some(Timeframe::D1)
+    }
+
+    /// The session's own timeframes, in the order its rows are recorded and
+    /// materialised: the primary, the higher timeframe when one is in use, and
+    /// the fixed daily series when the session consumes one. Nothing here is
+    /// hard-coded per cadence (A10) — a session declares its own set.
+    #[must_use]
+    pub fn timeframes(&self) -> Vec<Timeframe> {
+        let mut out = vec![self.primary_timeframe];
+        if let Some(htf) = self.htf_timeframe {
+            out.push(htf);
+        }
+        if let Some(d1) = self.d1_timeframe() {
+            out.push(d1);
+        }
+        out
+    }
 }
 
 /// What the repository persists: a [`PaperSession`] minus the columns the

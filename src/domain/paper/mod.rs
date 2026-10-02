@@ -14,6 +14,10 @@ pub(crate) mod gate;
 pub(crate) mod session;
 // r3.s4.w2 AC-3: the replay state machine — state IS the log replayed.
 pub(crate) mod state;
+// r3.s4.w3: the live runtime's pure half — boundary arithmetic, the per-step
+// event derivation (the ONE place `PaperEvent::Order` is constructed), the
+// shadow-identity comparison and the epoch scoping.
+pub(crate) mod runtime;
 
 // The module's curated surface, re-exported once here so `domain/mod.rs` and
 // `lib.rs` can chain the crate and crate-boundary re-exports (an un-re-exported
@@ -27,4 +31,10 @@ pub use session::{
 };
 pub use state::{
     PaperClosedTrade, PaperPosition, PaperSessionState, PaperSessionStatus, ReplayError,
+};
+// r3.s4.w3: the live runtime's pure surface — the boundary arithmetic, the
+// per-step event derivation, and the shadow comparison + its payload.
+pub use runtime::{
+    BarBoundaries, EpochStart, ShadowResult, StepView, boundaries, compare, daily_shadow_due,
+    events_for_step, first_open_bar_ms, next_utc_midnight_after,
 };
