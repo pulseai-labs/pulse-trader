@@ -760,9 +760,9 @@ async fn the_down_restores_the_0013_shape() {
     }
 
     // The round trip closes: 0014 re-applies on top of the restored 0013 —
-    // and so does everything the embedded set carries above it (0016, 0017),
-    // which is why the maximum is the embedded max, not 14.
+    // and so does everything the embedded set carries above it (0016, 0017,
+    // 0018), which is why the maximum is the embedded max, not 14.
     MIGRATOR.run(db.pool()).await.expect("re-run to 0014");
-    assert_eq!(applied_max(db.pool()).await, 17);
+    assert_eq!(applied_max(db.pool()).await, 18);
     assert_eq!(proposal_row(db.pool(), "prop-1").await, before);
 }

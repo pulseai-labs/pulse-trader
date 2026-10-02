@@ -42,6 +42,12 @@ mod indicator;
 mod llm;
 mod llm_call;
 mod pair;
+// r3.s4.w2 (ADR-0027): the paper-session aggregate — `PaperSession` + typed
+// `PaperEvent`/`Graduation` + `decide_promotion`, and the pure certify-fixture
+// generator the fixture strategy stamps through `application::fixture`. Pure +
+// zero-I/O like the rest of the ring; the application layer owns the SQLite
+// wiring (`paper_session_repo`).
+pub(crate) mod paper;
 mod port;
 mod series;
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
@@ -153,14 +159,27 @@ pub use error::{DataError, ValidationError};
 // type is a `dead_code` BUILD error under `deny(warnings)`.
 pub use fingerprint::EngineFingerprint;
 pub use pair::Pair;
+// r3.s4.w2 (ADR-0027): the paper-session aggregate's public surface — the
+// typed event log, the row-facing value types, and the pure promotion gate.
+// `fixture` is deliberately NOT re-listed: the generator is an internal
+// detail the `application::fixture` ring surfaces on purpose. An
+// un-re-exported public domain type is a `dead_code` BUILD error under
+// `deny(warnings)`.
+pub use paper::{
+    BarRef, CertifiedDataVersion, EmptyTextError, Graduation, MIN_TRADES, NonEmptyLabel,
+    NonEmptyReason, NonEmptyText, PaperClosedTrade, PaperEvent, PaperEventDecodeError,
+    PaperPosition, PaperSession, PaperSessionDraft, PaperSessionId, PaperSessionState,
+    PaperSessionStatus, PaperSide, PromotionDraft, PromotionOverride, PromotionRefused,
+    ReplayError, SLIPPAGE_BPS, STARTING_EQUITY_USDT, StopActor, TAKER_FEE_BPS, decide_promotion,
+};
 // VS-1.1.4 work-1.02: the `StrategyRepository` port (FR-4 / FR-11) alongside
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
     BacktestRunRepository, CandleSeriesRepository, CoachAcceptanceRepository, CoachingRepository,
-    ExchangeAdapter, LlmCallRepository, LlmProvider, MarketDataSource, StrategyRepository,
-    WalkForwardRunRepository,
+    ExchangeAdapter, FixtureSnapshotStore, LlmCallRepository, LlmProvider, MarketDataSource,
+    PaperSessionRepository, StrategyRepository, WalkForwardRunRepository,
 };
 // r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
 // live in `port` like every other port and are re-exported `pub(crate)` rather than

@@ -546,6 +546,33 @@ fn io(context: &str, err: &impl std::fmt::Display) -> DataError {
     DataError::Io(format!("{context}: {err}"))
 }
 
+impl crate::domain::FixtureSnapshotStore for CandleStore {
+    fn fixture_content_version(
+        &self,
+        pair: &crate::domain::Pair,
+        timeframe: crate::domain::Timeframe,
+        candles: &[crate::domain::Candle],
+    ) -> crate::domain::DataVersion {
+        Self::content_version(pair, timeframe, candles)
+    }
+
+    fn fixture_snapshot_exists(
+        &self,
+        pair: &crate::domain::Pair,
+        timeframe: crate::domain::Timeframe,
+        version: &crate::domain::DataVersion,
+    ) -> bool {
+        self.read_snapshot(pair, timeframe, version).is_ok()
+    }
+
+    fn fixture_write_snapshot(
+        &self,
+        series: &crate::domain::CandleSeries,
+    ) -> Result<(), DataError> {
+        self.write_snapshot(series)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

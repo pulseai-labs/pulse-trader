@@ -561,6 +561,33 @@ pub use domain::{
     folds_required,
 };
 
+// r3.s4.w2 (ADR-0027): the certify-fixture surface — the deterministic
+// synthetic series' accessors and the pinned fixture strategy document the
+// fixture proof (`tests/certify_fixture.rs`) and the `pulse fixture` command
+// ride. Re-exported because an un-re-exported public item is a `dead_code`
+// BUILD error under `deny(warnings)` (the harvested gotcha).
+pub use application::fixture::{
+    FIXTURE_PAIR, FIXTURE_SEED, FIXTURE_STRATEGY_NAME, FIXTURE_STRATEGY_TAG, fixture_h4_candles,
+    fixture_h4_candles_from, fixture_m15_candles, fixture_pair, fixture_strategy_dsl,
+};
+
+// r3.s4.w2 (ADR-0027): the paper-session surface — the promotion use case (E2)
+// and its typed refusal taxonomy, the repository port, and the SQLite adapter.
+// The domain value types ride the `pub use domain::{...}` re-export above.
+// Re-exported because an un-re-exported public item is a `dead_code` BUILD
+// error under `deny(warnings)` (the harvested gotcha).
+pub use adapters::db::SqlitePaperSessionRepo;
+pub use application::paper::{OverrideRequest, PaperPromotionError, promote};
+pub use domain::FixtureSnapshotStore;
+pub use domain::PaperSessionRepository;
+pub use domain::{
+    BarRef, CertifiedDataVersion, EmptyTextError, Graduation, MIN_TRADES, NonEmptyLabel,
+    NonEmptyReason, NonEmptyText, PaperClosedTrade, PaperEvent, PaperEventDecodeError,
+    PaperPosition, PaperSession, PaperSessionDraft, PaperSessionId, PaperSessionState,
+    PaperSessionStatus, PaperSide, PromotionDraft, PromotionOverride, PromotionRefused,
+    ReplayError, SLIPPAGE_BPS, STARTING_EQUITY_USDT, StopActor, TAKER_FEE_BPS, decide_promotion,
+};
+
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
 // `d11`). Re-exported because `tests/tauri_backtest.rs` injects post-save read
 // failures through the real ports, and because the desktop adapter maps this exact

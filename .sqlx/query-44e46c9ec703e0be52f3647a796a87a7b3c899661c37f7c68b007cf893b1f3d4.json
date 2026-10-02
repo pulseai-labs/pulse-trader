@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COALESCE(MAX(seq), 0) FROM paper_bar WHERE session_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "COALESCE(MAX(seq), 0)",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "44e46c9ec703e0be52f3647a796a87a7b3c899661c37f7c68b007cf893b1f3d4"
+}

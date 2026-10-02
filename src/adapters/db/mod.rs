@@ -86,6 +86,14 @@ pub use coach_acceptance_repo::SqliteCoachAcceptanceRepo;
 // confined to this module tree (the `.sqlx` cache covers this file too).
 pub mod walk_forward_run_repo;
 
+// r3.s4.w2 (ADR-0027): the paper-session aggregate's store — `paper_session`
+// rows (immutable, written once at promotion), the append-only `paper_event`
+// log, the recorded `paper_bar` candles, and the `fixture_snapshot` stamp.
+// `query!` macros for these tables are confined here (the `.sqlx` cache is
+// keyed to this file; `just prepare` regenerates it after new statements).
+pub mod paper_session_repo;
+pub use paper_session_repo::SqlitePaperSessionRepo;
+
 // r3.s3.w1 (D5/D8, ADR-0026): the client-token store — `client_token` rows and
 // the append-only `token_audit` ledger. `query!` macros for these two tables are
 // confined here (the `.sqlx` cache is keyed to this file).

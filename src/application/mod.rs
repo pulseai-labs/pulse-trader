@@ -27,6 +27,19 @@
 //! r1.s4.w2 — for exactly that, and for the ADR-0015 rule that
 //! `crate::adapters::backtest` is the ring's ONE deliberate adapter import.
 
+// r3.s4.w2 (ADR-0027): the paper-session promotion use case — resolve the
+// version, its latest walk-forward run and the fold runs' recorded inputs,
+// run the pure gate, derive the `fixture` flag from the `fixture_snapshot`
+// rows, and insert the session row. w4 wires the API surface.
+pub(crate) mod paper;
+
+// r3.s4.w2 (ADR-0027): the certify-fixture ring — the deterministic synthetic
+// series' pair/candle accessors, the pinned dip-buy strategy document minted
+// from the generator's own constants, and (with the AC-4 loop) the `seed` use
+// case that stamps the series into the candle store and the durable
+// fixture/strategy/walk-forward rows.
+pub(crate) mod fixture;
+
 pub(crate) mod backtest;
 
 // r1.s4.w1 (#131 / #132, ADR-0015): the SEALED coach turn. One crate-private entry

@@ -220,10 +220,11 @@ async fn stored_d1(pool: &SqlitePool, run: &str) -> Option<String> {
 #[tokio::test]
 async fn a_fresh_database_migrates_through_0017() {
     let (_tmp, db) = db_at_0017().await;
+    // The embedded max moved to 0018 (r3.s4.w2); the embedded set ends there.
     assert_eq!(
         applied_max(db.pool()).await,
-        17,
-        "the embedded set ends at 0017"
+        18,
+        "the embedded set ends at the embedded max"
     );
 
     let columns = columns_of(db.pool(), "backtest_run").await;
@@ -263,7 +264,9 @@ async fn a_pre_0017_database_migrates_forward_keeping_every_row() {
 
     // The up path: the embedded set applies on top of the older one.
     MIGRATOR.run(db.pool()).await.expect("0017 applies");
-    assert_eq!(applied_max(db.pool()).await, 17, "now at 0017");
+    // The embedded max moved to 0018 (r3.s4.w2) — the run carries the whole
+    // set, not 0017 alone.
+    assert_eq!(applied_max(db.pool()).await, 18, "now at the embedded max");
 
     assert_eq!(
         stored_d1(db.pool(), "run-legacy").await,
@@ -373,8 +376,8 @@ async fn the_down_restores_the_0016_shape() {
     MIGRATOR.run(db.pool()).await.expect("the up re-applies");
     assert_eq!(
         applied_max(db.pool()).await,
-        17,
-        "round trip closes at 0017"
+        18,
+        "round trip closes at the embedded max"
     );
     assert_eq!(
         stored_d1(db.pool(), "run-legacy").await,
