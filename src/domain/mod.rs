@@ -172,14 +172,20 @@ pub use paper::{
     PaperSessionStatus, PaperSide, PromotionDraft, PromotionOverride, PromotionRefused,
     ReplayError, SLIPPAGE_BPS, STARTING_EQUITY_USDT, StopActor, TAKER_FEE_BPS, decide_promotion,
 };
+// r3.s4.w3: the live runtime's pure surface — the polling boundary arithmetic,
+// the per-step event derivation and the shadow comparison.
+pub use paper::{
+    BarBoundaries, EpochStart, ShadowResult, StepView, boundaries, compare, daily_shadow_due,
+    events_for_step, first_open_bar_ms, next_utc_midnight_after,
+};
 // VS-1.1.4 work-1.02: the `StrategyRepository` port (FR-4 / FR-11) alongside
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
-    BacktestRunRepository, CandleSeriesRepository, CoachAcceptanceRepository, CoachingRepository,
-    ExchangeAdapter, FixtureSnapshotStore, LlmCallRepository, LlmProvider, MarketDataSource,
-    PaperSessionRepository, StrategyRepository, WalkForwardRunRepository,
+    BacktestRunRepository, CandleSeriesRepository, ClosedBarSource, CoachAcceptanceRepository,
+    CoachingRepository, ExchangeAdapter, FixtureSnapshotStore, LlmCallRepository, LlmProvider,
+    MarketDataSource, PaperSessionRepository, StrategyRepository, WalkForwardRunRepository,
 };
 // r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
 // live in `port` like every other port and are re-exported `pub(crate)` rather than

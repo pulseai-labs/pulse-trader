@@ -42,7 +42,10 @@ async fn world() -> World {
     let (_path, db) = migrated_db(&tmp).await;
     let pool = db.pool().clone();
     // The session's row (a certified BTCUSDT M15 session; the FKs + CHECK need
-    // the strategy/version/run seeds).
+    // the strategy/version/run seeds). r3.s4.w3: the row declares the H4 + D1
+    // inputs this suite's third case records — `materialise` now derives its
+    // timeframes from the session, so an under-declared row would drop them
+    // (the assertions are unchanged).
     sqlx::query("INSERT INTO strategy (id, name, created_at) VALUES ('st-1', 'recorded', '2026-01-01T00:00:00.000Z')")
         .execute(&pool)
         .await
@@ -71,7 +74,7 @@ async fn world() -> World {
           htf_timeframe, uses_d1, starting_equity, taker_fee_bps, slippage_bps, \
           engine_fingerprint, graduation, walk_forward_run_id, override_reason, \
           override_at, certified_data_versions, fixture, min_trades, promoted_by) \
-         VALUES ('sess-1', 1, 'ver-1', '2026-01-01T00:00:00.000Z', 'BTCUSDT', '15m', NULL, 0, \
+         VALUES ('sess-1', 1, 'ver-1', '2026-01-01T00:00:00.000Z', 'BTCUSDT', '15m', '4h', 1, \
                  '10000', '4', '1', 'fp', 'certified', 'run-1', NULL, NULL, \
                  '[{\"timeframe\":\"15m\",\"data_version\":\"a\"}]', 1, 20, 'operator-token')",
     )
@@ -84,7 +87,11 @@ async fn world() -> World {
         _tmp: tmp,
         candles_tmp,
         db,
-        paper: SqlitePaperSessionRepo::with_clock(pool, pulse::FakeClock::at(1_767_225_600_000)),
+        paper: SqlitePaperSessionRepo::with_clock(
+            pool,
+            pulse::FakeClock::at(1_767_225_600_000),
+            store.clone(),
+        ),
         store,
     }
 }
@@ -273,12 +280,12 @@ async fn materialised_series_run_the_engine_like_the_in_memory_series() {
     // Materialise twice — same rows, same data_version (content-addressed).
     let first = world
         .paper
-        .materialise(&session_id, &world.store)
+        .materialise(&session_id)
         .await
         .expect("the first materialisation");
     let second = world
         .paper
-        .materialise(&session_id, &world.store)
+        .materialise(&session_id)
         .await
         .expect("the second materialisation");
     assert_eq!(first, second, "two materialisations of the same rows agree");
@@ -401,12 +408,12 @@ async fn materialise_covers_every_recorded_timeframe_and_never_touches_head() {
 
     let first = world
         .paper
-        .materialise(&session_id, &world.store)
+        .materialise(&session_id)
         .await
         .expect("the first materialisation");
     let second = world
         .paper
-        .materialise(&session_id, &world.store)
+        .materialise(&session_id)
         .await
         .expect("the second materialisation");
     assert_eq!(

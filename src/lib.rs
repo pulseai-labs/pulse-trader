@@ -578,8 +578,22 @@ pub use application::fixture::{
 // error under `deny(warnings)` (the harvested gotcha).
 pub use adapters::db::SqlitePaperSessionRepo;
 pub use application::paper::{OverrideRequest, PaperPromotionError, promote};
+
+// r3.s4.w3 (ADR-0027, E1/E3): the live runtime's surface — the polling loop,
+// the boot catch-up, the shadow check and its typed payload, the closed-bar
+// source port and its REST adapter, and the pure boundary/event/compare half.
+// Re-exported because an un-re-exported public item is a `dead_code` BUILD
+// error under `deny(warnings)`.
+pub use adapters::binance::RestClosedBars;
+pub use application::paper_runtime::{
+    LiveEnv, PaperRuntime, PaperRuntimeError, RuntimeLog, SessionEnv, SessionFailure,
+};
 pub use domain::FixtureSnapshotStore;
 pub use domain::PaperSessionRepository;
+pub use domain::{
+    BarBoundaries, ClosedBarSource, EpochStart, ShadowResult, StepView, boundaries, compare,
+    daily_shadow_due, events_for_step, first_open_bar_ms, next_utc_midnight_after,
+};
 pub use domain::{
     BarRef, CertifiedDataVersion, EmptyTextError, Graduation, MIN_TRADES, NonEmptyLabel,
     NonEmptyReason, NonEmptyText, PaperClosedTrade, PaperEvent, PaperEventDecodeError,

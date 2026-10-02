@@ -32,7 +32,7 @@ use std::future::Future;
 use crate::domain::backtest::SummaryStats;
 use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, LatestReadableRun, PersistedRun, RunSummary,
-    Trade, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
+    SnapshotSelection, Trade, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
 };
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{
@@ -191,6 +191,33 @@ pub trait CandleSeriesRepository {
         timeframe: Timeframe,
         candles: Vec<Candle>,
     ) -> Result<StoredCandleSeries, DataError>;
+}
+
+/// A source of **closed** bars for the live paper runtime (r3.s4.w3, E1).
+///
+/// `closed_since` answers the candles of one `(pair, timeframe)` strictly newer
+/// than `since_ms` that are already closed relative to the source's own clock,
+/// with funding stamped onto the candle each event belongs to. It is the
+/// incremental top-up's contract under a smaller name: the runtime asks once per
+/// `(pair, timeframe)` per wake, and the REST adapter (`RestClosedBars`)
+/// implements it over the incremental fetch.
+///
+/// The runtime re-checks closed-ness itself, so a source that hands back a
+/// still-forming bar cannot poison a session: the bar is dropped, never
+/// appended.
+pub trait ClosedBarSource {
+    /// The closed candles of `(pair, timeframe)` strictly newer than `since_ms`,
+    /// in ascending `open_time` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when the underlying source fails (I/O, parse).
+    fn closed_since(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        since_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
 }
 
 /// The strategy-tree persistence port (VS-1.1.4, FR-4 / FR-11).
@@ -718,6 +745,59 @@ pub trait PaperSessionRepository {
         &self,
         session_id: &crate::domain::paper::session::PaperSessionId,
     ) -> impl Future<Output = Result<Vec<crate::domain::paper::event::PaperEvent>, DataError>> + Send;
+
+    /// Read one session's recorded candles for a `timeframe` back as
+    /// [`Candle`]s, in `open_time` order, lead-in included — the read half of
+    /// [`Self::append_bar`]. This is the live runtime's rebuild input (r3.s4.w3)
+    /// and what the shadow's materialisation is built from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
+    /// failure.
+    fn bars(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+        timeframe: Timeframe,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
+
+    /// The session's counted-span boundary: the `open_time` of the first
+    /// primary-timeframe bar NOT flagged `lead_in` — or, while only lead-in
+    /// bars are recorded, the `open_time` the next primary bar will have. `None`
+    /// before any primary bar lands.
+    ///
+    /// This is how the runtime derives `count_from_ms` (r3.s4.w3): from the
+    /// recorded flags, never from a marker event — the same derivation
+    /// `tests/paper_recorded_bars.rs` asserts over the raw column.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the session row is unreadable or the
+    /// store fails.
+    fn count_from_ms(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+    ) -> impl Future<Output = Result<Option<i64>, DataError>> + Send;
+
+    /// Materialise the session's recorded candles into content-addressed
+    /// snapshots — one [`SnapshotSelection`] per timeframe that holds rows,
+    /// in the session's own timeframe order (its primary, its HTF when set,
+    /// the daily series when it consumes one).
+    ///
+    /// The repository holds its candle-store handle, so the application ring
+    /// never names the store: it asks the repository, which writes through
+    /// `write_snapshot` ONLY — never `commit`, never `HEAD` (ADR-0009). Content
+    /// addressing makes a repeat write of the same rows a no-op with the same
+    /// `data_version`. Runs only at a shadow check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row, an absent session, or a
+    /// store failure.
+    fn materialise(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+    ) -> impl Future<Output = Result<Vec<SnapshotSelection>, DataError>> + Send;
 }
 
 /// `PulseTrader`'s own LLM chat port (VS-1.3.1 work-1.01, FR-23 / FR-24, README

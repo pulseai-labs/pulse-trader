@@ -33,6 +33,12 @@
 // rows, and insert the session row. w4 wires the API surface.
 pub(crate) mod paper;
 
+// r3.s4.w3 (ADR-0027, E1/E3): the live paper runtime — REST-polled closed bars
+// stepped through each session's `EngineSession`, one atomic append per bar,
+// boot catch-up, the shadow check and the engine epochs. `pulse serve` owns
+// the timer and the shutdown; w4 owns the routes.
+pub(crate) mod paper_runtime;
+
 // r3.s4.w2 (ADR-0027): the certify-fixture ring — the deterministic synthetic
 // series' pair/candle accessors, the pinned dip-buy strategy document minted
 // from the generator's own constants, and (with the AC-4 loop) the `seed` use

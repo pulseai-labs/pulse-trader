@@ -16,7 +16,10 @@ use crate::domain::DataError;
 /// [`Pair::new`] is the unchecked constructor for trusted call sites (test
 /// fixtures, and `Deserialize` of pairs that originated from our own Parquet/HEAD
 /// and were validated at the CLI boundary on the way in).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `PartialOrd`/`Ord` are the symbol's byte order — the live runtime keys its
+// per-`(pair, timeframe)` fetch map on them (r3.s4.w3). The file is not an
+// engine-source-set root, so the fingerprint is untouched.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Pair(String);
 
 impl Pair {
