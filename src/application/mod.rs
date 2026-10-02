@@ -39,6 +39,15 @@ pub(crate) mod paper;
 // the timer and the shutdown; w4 owns the routes.
 pub(crate) mod paper_runtime;
 
+// r3.s4.w4 (spec §1): the control handle into the runtime thread — the
+// cloneable command channel the routes hold, its typed replies and its bounded
+// reply timeout.
+pub(crate) mod paper_control;
+
+// r3.s4.w4 (spec §4): the paper read model — the session summary, the trades
+// and the event list, built once for both the HTTP routes and the MCP tools.
+pub(crate) mod paper_read;
+
 // r3.s4.w2 (ADR-0027): the certify-fixture ring — the deterministic synthetic
 // series' pair/candle accessors, the pinned dip-buy strategy document minted
 // from the generator's own constants, and (with the AC-4 loop) the `seed` use

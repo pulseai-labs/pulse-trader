@@ -16,6 +16,7 @@
 //! Pure: no store, no clock.
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::backtest::ExitReason;
 use crate::domain::fingerprint::EngineFingerprint;
@@ -32,7 +33,7 @@ pub enum PaperSessionStatus {
 }
 
 /// The open position a `fill` without an exit reason opened.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaperPosition {
     /// The position's side.
     pub side: PaperSide,
@@ -45,7 +46,7 @@ pub struct PaperPosition {
 }
 
 /// A closed trade: an exit `fill` paired with the position it closed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaperClosedTrade {
     /// The side that closed.
     pub side: PaperSide,
@@ -61,6 +62,10 @@ pub struct PaperClosedTrade {
     pub exit_fill_time: String,
     /// Why the position closed.
     pub exit_reason: ExitReason,
+    /// The trade's realized R-multiple (r3.s4.w4, spec §2), as the exit
+    /// `fill` recorded it. `None` for a w3-era fill written before the field
+    /// existed; the OOS comparison counts only `Some` values.
+    pub realized_r: Option<Decimal>,
 }
 
 /// Why a log (or one event) cannot be applied to a session's state.
@@ -192,6 +197,7 @@ impl PaperSessionState {
                 price,
                 exit_reason,
                 at,
+                realized_r,
                 ..
             } => match exit_reason {
                 Some(exit_reason) => {
@@ -204,6 +210,7 @@ impl PaperSessionState {
                         exit_price: *price,
                         exit_fill_time: at.clone(),
                         exit_reason: *exit_reason,
+                        realized_r: *realized_r,
                     });
                 }
                 None => {

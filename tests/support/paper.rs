@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pulse::{
     BinanceAdapter, Candle, CandleStore, Clock, ClosedBarSource, CreatedBy, DataError, Db, LiveEnv,
-    NewVersion, NonEmptyLabel, NonEmptyReason, OverrideRequest, Pair, PaperRuntime, PaperSession,
-    PaperSessionId, PaperSessionRepository, SqliteBacktestRunRepo, SqlitePaperSessionRepo,
-    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SystemClock, Timeframe, VersionId,
-    promote,
+    NewVersion, NonEmptyLabel, NonEmptyReason, OverrideRequest, Pair, PaperControl, PaperRuntime,
+    PaperSession, PaperSessionId, PaperSessionRepository, SqliteBacktestRunRepo,
+    SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SystemClock,
+    Timeframe, VersionId, promote,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -385,4 +385,133 @@ pub async fn recorded_bars(world: &PaperWorld, id: &PaperSessionId, tf: Timefram
 /// The session's log, decoded.
 pub async fn log_events(world: &PaperWorld, id: &PaperSessionId) -> Vec<pulse::PaperEvent> {
     world.paper().events(id).await.expect("the log reads back")
+}
+
+// ---------------------------------------------------------------------------
+// The runtime host (r3.s4.w4): the live runtime behind the API suites
+// ---------------------------------------------------------------------------
+
+/// The server-seam host: the real [`PaperRuntime`] over the same doubles the
+/// world builds, driven through the SAME command path the production loop
+/// uses — with a test-controlled wake trigger instead of the wall-clock timer,
+/// so a test advances [`Self::clock`] and calls [`Self::tick`] to run one
+/// deterministic wake.
+pub struct PaperHost {
+    /// The control handle the server stores (its commands reach the runtime).
+    pub control: PaperControl,
+    /// The hand-advanced clock the runtime and the repositories share.
+    pub clock: SteppedClock,
+    /// The scripted closed-bar source.
+    pub source: ScriptedBars,
+    /// Every runtime log line.
+    pub log: Arc<VecLog>,
+    db: Db,
+    store: CandleStore,
+    tick: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+    stop: tokio::sync::watch::Sender<bool>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl PaperHost {
+    /// Build the host over the server's own pool and store base, and start its
+    /// runtime thread (boot, then serve commands and ticks until dropped).
+    pub fn spawn(db: &Db, store_base: &std::path::Path) -> Arc<Self> {
+        let clock = SteppedClock::at(DEFAULT_NOW_MS);
+        let source = ScriptedBars::new("BTCUSDT", &clock);
+        let log = Arc::new(VecLog::default());
+        let store = CandleStore::with_base_dir(store_base.to_path_buf());
+        let (control, control_rx) = PaperControl::channel(30_000);
+        let (tick_tx, tick_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let pool = db.pool().clone();
+        let host = Arc::new(Self {
+            control: control.clone(),
+            clock: clock.clone(),
+            source: source.clone(),
+            log: log.clone(),
+            db: db.clone(),
+            store: store.clone(),
+            tick: tick_tx,
+            stop: stop_tx,
+            join: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("paper-test-runtime".to_owned())
+            .spawn(move || {
+                let Ok(thread_rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                else {
+                    return;
+                };
+                // The runtime is BUILT on this thread (its engine sessions are
+                // deliberately `!Send`, the w3 shape) over the shared doubles.
+                let repo =
+                    SqlitePaperSessionRepo::with_clock(pool.clone(), clock.clone(), store.clone());
+                let runtime = PaperRuntime::new(
+                    repo,
+                    source,
+                    store,
+                    clock,
+                    LiveEnv::new(SqliteStrategyRepo::new(pool.clone()), BinanceAdapter::new()),
+                    0,
+                    log,
+                );
+                // The PRODUCTION loop, driven by a tick instead of the
+                // wall-clock timer: commands and wakes interleave exactly as
+                // they do in `pulse serve`.
+                thread_rt.block_on(pulse::run_paper_runtime(
+                    runtime,
+                    stop_rx,
+                    control_rx,
+                    pulse::WakeTrigger::Tick(tick_rx),
+                ));
+            })
+            .expect("spawn the paper runtime host");
+        *lock(&host.join) = Some(handle);
+        host
+    }
+
+    /// A fresh paper-session repository over the host's pool/store/clock.
+    pub fn paper(&self) -> SqlitePaperSessionRepo<SteppedClock> {
+        SqlitePaperSessionRepo::with_clock(
+            self.db.pool().clone(),
+            self.clock.clone(),
+            self.store.clone(),
+        )
+    }
+
+    /// A fresh strategy repository over the host's pool.
+    pub fn strategies(&self) -> SqliteStrategyRepo<SystemClock> {
+        SqliteStrategyRepo::new(self.db.pool().clone())
+    }
+
+    /// A fresh backtest-run repository over the host's pool.
+    pub fn runs(&self) -> SqliteBacktestRunRepo<SystemClock> {
+        SqliteBacktestRunRepo::new(self.db.pool().clone())
+    }
+
+    /// The candle store the host's repository materialises through.
+    pub fn store(&self) -> CandleStore {
+        self.store.clone()
+    }
+
+    /// Run one wake now and wait for it to finish (the deterministic timer
+    /// stand-in: the test advances [`Self::clock`] first).
+    pub async fn tick(&self) {
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.tick
+            .send(reply)
+            .expect("the runtime host is still alive");
+        done.await.expect("the wake completes");
+    }
+}
+
+impl Drop for PaperHost {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(handle) = lock(&self.join).take() {
+            let _ = handle.join();
+        }
+    }
 }

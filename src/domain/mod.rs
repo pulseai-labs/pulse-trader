@@ -178,6 +178,8 @@ pub use paper::{
     BarBoundaries, EpochStart, ShadowResult, StepView, boundaries, compare, daily_shadow_due,
     events_for_step, first_open_bar_ms, next_utc_midnight_after,
 };
+// r3.s4.w4: the OOS comparison's pure surface (spec §3).
+pub use paper::{ComparisonVerdict, OosComparison, comparison};
 // VS-1.1.4 work-1.02: the `StrategyRepository` port (FR-4 / FR-11) alongside
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
 // via the `pub(crate) mod strategy` path directly (matching the

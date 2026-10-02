@@ -241,6 +241,9 @@ pub struct ServeConfig {
     /// Five seconds by default — long enough that the exchange's own clock has
     /// published the bar, short enough to feel live.
     pub poll_grace_ms: u64,
+    /// How long a paper control request waits for its reply (r3.s4.w4, spec
+    /// §1). Thirty seconds by default.
+    pub paper_reply_timeout_ms: u64,
 }
 
 /// The default polling grace: five seconds past each bar's close.
@@ -269,7 +272,12 @@ fn credential_source_label(source: CredentialSource) -> &'static str {
 /// [`ServeError`] on any refused bind, exhausted retry budget, bind failure or
 /// serve-loop failure.
 pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
-    let state = Arc::new(ServerState::new(config.db, config.data_dir));
+    // r3.s4.w4: the control channel is created BEFORE the state, so the
+    // routes' handle and the runtime's receiver come from one pair.
+    let (paper_control, paper_commands) =
+        crate::application::paper_control::PaperControl::channel(config.paper_reply_timeout_ms);
+    let state =
+        Arc::new(ServerState::new(config.db, config.data_dir).with_paper_control(paper_control));
     let sink = state.log().clone();
 
     // ---- Step 3: CREDENTIAL RESOLUTION — THE w3 SEAM (r3.s3.w3) ------------
@@ -326,7 +334,12 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     // and the listener carries on. The task observes the shutdown signal below
     // and never starts a write after it.
     let (runtime_stop, runtime_stop_rx) = tokio::sync::watch::channel(false);
-    spawn_paper_runtime(&state, config.poll_grace_ms, runtime_stop_rx);
+    spawn_paper_runtime(
+        &state,
+        config.poll_grace_ms,
+        runtime_stop_rx,
+        paper_commands,
+    );
 
     // ---- Step 7: serve until SIGTERM/SIGINT, then say goodbye — with a
     // BOUNDED drain (see [`DRAIN_BOUND`]).
@@ -444,6 +457,7 @@ fn spawn_paper_runtime(
     state: &Arc<ServerState>,
     poll_grace_ms: u64,
     stop: tokio::sync::watch::Receiver<bool>,
+    commands: tokio::sync::mpsc::Receiver<crate::application::paper_control::PaperCommand>,
 ) {
     let pool = state.db.pool().clone();
     let data_dir = state.data_dir.clone();
@@ -472,7 +486,12 @@ fn spawn_paper_runtime(
                 sink.write("pulse serve: paper runtime disabled: no timer".to_owned());
                 return;
             };
-            host.block_on(run_paper_runtime(runtime, stop));
+            host.block_on(run_paper_runtime(
+                runtime,
+                stop,
+                commands,
+                WakeTrigger::Timer,
+            ));
         });
     if let Err(error) = spawned {
         state
@@ -481,12 +500,44 @@ fn spawn_paper_runtime(
     }
 }
 
-/// The runtime task: boot once, then wake on the sessions' own cadence until
-/// the shutdown signal. Per-session failures are logged and never end the task;
-/// the signal ends it before any further wake starts.
-async fn run_paper_runtime<R, B, S, C, E>(
+/// What drives a wake (r3.s4.w4, spec §1): the loop selects on the command
+/// channel, the next-wake timer and the shutdown watch. Production uses
+/// [`WakeTrigger::Timer`]; the API suites drive the SAME loop with a tick, so
+/// a stepped clock stays deterministic and a command still interleaves between
+/// wakes exactly as it does in production.
+pub enum WakeTrigger {
+    /// The production timer: sleep until the next wake is due.
+    Timer,
+    /// A test tick: the sender's reply lands after the wake it triggers
+    /// completes, so a caller can await a deterministic wake.
+    Tick(tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>),
+}
+
+impl WakeTrigger {
+    /// Await the next trigger: `None` for the timer (a wake is due), `Some`
+    /// for a tick (run the wake, then answer the tick).
+    async fn next(&mut self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        match self {
+            Self::Timer => {
+                // The sleep target is computed by the caller (the loop).
+                std::future::pending().await
+            }
+            Self::Tick(receiver) => receiver.recv().await,
+        }
+    }
+}
+
+/// The runtime task: boot once, then wake on the sessions' own cadence (or a
+/// test tick) until the shutdown signal, applying control commands between
+/// wakes. Per-session failures are logged and never end the task; the signal
+/// ends it before any further wake starts. A command runs between wakes and
+/// never during an `append_bar`: this loop is single-task, so a wake runs to
+/// completion before the next command is received.
+pub async fn run_paper_runtime<R, B, S, C, E>(
     mut runtime: PaperRuntime<R, B, S, C, E>,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    mut commands: tokio::sync::mpsc::Receiver<crate::application::paper_control::PaperCommand>,
+    mut trigger: WakeTrigger,
 ) where
     R: PaperSessionRepository,
     B: ClosedBarSource,
@@ -506,9 +557,35 @@ async fn run_paper_runtime<R, B, S, C, E>(
         let delay_ms = u64::try_from(next_ms.saturating_sub(now_ms))
             .unwrap_or(0)
             .saturating_add(jitter_ms());
+        let armed = matches!(trigger, WakeTrigger::Timer);
+        let timer = async move {
+            if armed {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            } else {
+                // A tick-driven run has no timer: this branch never fires, so
+                // the loop wakes only when the harness ticks it.
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             _ = stop.changed() => break,
-            () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+            command = commands.recv() => {
+                if let Some(command) = command {
+                    runtime.handle_command(command).await;
+                }
+                continue;
+            }
+            tick = trigger.next() => {
+                match tick {
+                    Some(reply) => {
+                        runtime.wake().await;
+                        let _ = reply.send(());
+                    }
+                    None => break,
+                }
+                continue;
+            }
+            () = timer => {}
         }
         if *stop.borrow() {
             break;

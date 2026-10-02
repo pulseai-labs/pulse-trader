@@ -94,6 +94,7 @@ fn scripted_log() -> Vec<PaperEvent> {
             qty: Decimal::from(1),
             price: Decimal::from(60_000),
             exit_reason: None,
+            realized_r: None,
         },
         PaperEvent::Funding {
             seq: 3,
@@ -109,6 +110,9 @@ fn scripted_log() -> Vec<PaperEvent> {
             qty: Decimal::from(1),
             price: Decimal::from(60_100),
             exit_reason: Some(pulse::ExitReason::StopLoss),
+            // The scripted log has no engine trade behind this fill, so its
+            // true realized R is unknown — the w3-era shape.
+            realized_r: None,
         },
         PaperEvent::DataEvent {
             seq: 6,

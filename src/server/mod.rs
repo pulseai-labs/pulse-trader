@@ -18,6 +18,7 @@ pub mod auth;
 pub mod bind;
 pub mod log;
 pub mod ops;
+pub mod paper;
 pub mod routes;
 
 use std::path::PathBuf;
@@ -63,6 +64,11 @@ pub struct ServerState {
     /// the Tauri wrapper does, inside the spawned task; tests inject a
     /// scripted provider.
     pub(crate) compose_runner: ops::ComposeRunner,
+    /// The paper runtime's control handle (r3.s4.w4, spec §1): the paper
+    /// routes' commands reach the runtime thread through it. `None` means no
+    /// runtime is installed (tests, or a failed startup), and the control
+    /// routes answer 503 `runtime_unavailable`.
+    pub(crate) paper_control: Option<crate::application::paper_control::PaperControl>,
 }
 
 impl ServerState {
@@ -87,7 +93,19 @@ impl ServerState {
             desktop,
             ops: ops::OpRegistry::new(ops::SweepConfig::default()),
             compose_runner: ops::default_compose_runner(),
+            paper_control: None,
         }
+    }
+
+    /// The w4 seam: install the paper runtime's control handle, so the paper
+    /// routes can command the runtime `pulse serve` started.
+    #[must_use]
+    pub fn with_paper_control(
+        mut self,
+        control: crate::application::paper_control::PaperControl,
+    ) -> Self {
+        self.paper_control = Some(control);
+        self
     }
 
     /// The w2 test seam: swap the compose runner (the scripted-provider tests

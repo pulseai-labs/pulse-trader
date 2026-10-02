@@ -131,7 +131,14 @@ pub fn events_for_step(
     {
         let side = side_of(position.direction);
         events.push(order(side, position.qty, at));
-        events.push(fill(side, position.qty, position.entry_price, None, at));
+        events.push(fill(
+            side,
+            position.qty,
+            position.entry_price,
+            None,
+            None,
+            at,
+        ));
     }
     // Exits: every trade the step closed (the slice's new tail). One bar can
     // open and stop out a position, so both arms may fire.
@@ -143,6 +150,7 @@ pub fn events_for_step(
             trade.qty,
             trade.exit_price,
             Some(trade.exit_reason),
+            Some(trade.realized_r),
             at,
         ));
     }
@@ -180,12 +188,14 @@ fn order(side: PaperSide, qty: Decimal, at: &str) -> PaperEvent {
     }
 }
 
-/// A fill event.
+/// A fill event. `realized_r` rides only an exit fill (the closed trade's
+/// R-multiple, spec §2); an entry fill carries `None`.
 fn fill(
     side: PaperSide,
     qty: Decimal,
     price: Decimal,
     exit_reason: Option<crate::domain::backtest::ExitReason>,
+    realized_r: Option<Decimal>,
     at: &str,
 ) -> PaperEvent {
     PaperEvent::Fill {
@@ -195,6 +205,7 @@ fn fill(
         qty,
         price,
         exit_reason,
+        realized_r,
     }
 }
 
