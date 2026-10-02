@@ -1,0 +1,134 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id, seq, strategy_version_id, created_at, pair, primary_timeframe, htf_timeframe, uses_d1, starting_equity, taker_fee_bps, slippage_bps, engine_fingerprint, graduation, walk_forward_run_id, override_reason, override_at, certified_data_versions, fixture, min_trades, promoted_by FROM paper_session WHERE id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "seq",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "strategy_version_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "pair",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "primary_timeframe",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "htf_timeframe",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "uses_d1",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "starting_equity",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "taker_fee_bps",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "slippage_bps",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "engine_fingerprint",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "graduation",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "walk_forward_run_id",
+        "ordinal": 13,
+        "type_info": "Text"
+      },
+      {
+        "name": "override_reason",
+        "ordinal": 14,
+        "type_info": "Text"
+      },
+      {
+        "name": "override_at",
+        "ordinal": 15,
+        "type_info": "Text"
+      },
+      {
+        "name": "certified_data_versions",
+        "ordinal": 16,
+        "type_info": "Text"
+      },
+      {
+        "name": "fixture",
+        "ordinal": 17,
+        "type_info": "Integer"
+      },
+      {
+        "name": "min_trades",
+        "ordinal": 18,
+        "type_info": "Integer"
+      },
+      {
+        "name": "promoted_by",
+        "ordinal": 19,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ab1ef0a3f94de400d98fc65645441ae3774811726b31352c7bec68b02bd14e98"
+}

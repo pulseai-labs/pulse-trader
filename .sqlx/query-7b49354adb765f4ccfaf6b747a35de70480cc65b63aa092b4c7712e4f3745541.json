@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT seq FROM paper_session WHERE id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7b49354adb765f4ccfaf6b747a35de70480cc65b63aa092b4c7712e4f3745541"
+}

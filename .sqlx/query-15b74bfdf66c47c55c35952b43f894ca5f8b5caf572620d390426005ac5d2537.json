@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT seq, kind, payload FROM paper_event WHERE session_id = ?1 ORDER BY seq ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "kind",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "payload",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "15b74bfdf66c47c55c35952b43f894ca5f8b5caf572620d390426005ac5d2537"
+}

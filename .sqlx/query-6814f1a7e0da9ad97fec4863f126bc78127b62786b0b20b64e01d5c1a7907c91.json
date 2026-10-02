@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COALESCE(MAX(seq), 0) FROM paper_event WHERE session_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "COALESCE(MAX(seq), 0)",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6814f1a7e0da9ad97fec4863f126bc78127b62786b0b20b64e01d5c1a7907c91"
+}

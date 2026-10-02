@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO fixture_snapshot (pair, timeframe, data_version, created_at) VALUES (?1, ?2, ?3, ?4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "b5057cefc059c73eb3dde8b503a5acf23d1d5b1537c11f5a3eeca3a5b05e42a1"
+}

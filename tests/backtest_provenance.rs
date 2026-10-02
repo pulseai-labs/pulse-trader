@@ -524,7 +524,8 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     // (walk-forward run kind) moves it to 13; r2.s3.w4's `0014`
     // (certification pointer) moves it to 14; r3.s3.w1's `0016`
     // (client tokens; `0015` is reserved for r3.s1) moves it to 16; and
-    // r3.s2.w4's `0017` (the recorded daily snapshot) moves it to 17.
+    // r3.s2.w4's `0017` (the recorded daily snapshot) moves it to 17; and
+    // r3.s4.w2's `0018` (the paper-session tables, ADR-0027) moves it to 18.
     assert!(applied.contains(&8), "0008 rides along: {applied:?}");
     assert!(applied.contains(&9), "0009 rides along: {applied:?}");
     assert!(applied.contains(&10), "0010 rides along: {applied:?}");
@@ -534,10 +535,11 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     assert!(applied.contains(&14), "0014 rides along: {applied:?}");
     assert!(applied.contains(&16), "0016 rides along: {applied:?}");
     assert!(applied.contains(&17), "0017 rides along: {applied:?}");
+    assert!(applied.contains(&18), "0018 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(17),
-        "0006 is recorded at its own version, below the maximum 0017 sets"
+        Some(18),
+        "0006 is recorded at its own version, below the maximum 0018 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;

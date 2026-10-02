@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO paper_event (session_id, seq, at, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "19b1628874ce92e628668a64f79a4c2f110bf2af035349ee4b7542c163f825d0"
+}
