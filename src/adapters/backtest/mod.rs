@@ -6,8 +6,10 @@ mod engine;
 // `IndicatorEngine`. Pure value types + classification live in
 // `domain::backtest::regime`.
 mod regime;
+pub mod session;
 
 pub use engine::{
     BacktestConfig, FundingGapWindow, first_fully_warm_bar_ms, funding_gaps, run_backtest,
 };
 pub use regime::RegimeDetector;
+pub use session::{EngineSession, SessionTimeframes};

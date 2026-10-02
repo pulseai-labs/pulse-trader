@@ -86,6 +86,10 @@ const SCAN_TARGETS: &[&str] = &[
     "src/domain/backtest/regime.rs",
     "src/adapters/backtest/regime.rs",
     "src/adapters/backtest/engine.rs",
+    // r3.s4.w1: the stepwise engine session — the per-bar loop + funding-index
+    // append sequencing moved here from `run_backtest`'s loop body, so the
+    // money-math/reentrancy scan follows the code.
+    "src/adapters/backtest/session.rs",
     // VS-1.2.4 work-4.02 (#70/D6): the NEW f64-bearing math surface — Sharpe/
     // Sortino's `sqrt` + ratio. Scanned so a future banned call here is not a
     // false-green hole; passes because the only transcendental present is the

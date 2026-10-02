@@ -515,6 +515,7 @@ pub use adapters::broker::BinanceAdapter;
 // build error, not a warning. 2.04 steps the detector over the run + aggregates
 // the breakdown onto `BacktestResult`; 2.05 renders it.
 pub use adapters::backtest::RegimeDetector;
+pub use adapters::backtest::{EngineSession, SessionTimeframes};
 pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 
 // VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface

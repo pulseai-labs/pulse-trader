@@ -2,16 +2,16 @@
 
 use rust_decimal::Decimal;
 
-use crate::adapters::backtest::regime::RegimeDetector;
+use super::session::{EngineSession, SessionTimeframes};
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
-    BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve,
-    EvalContext, ExitReason, Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime,
-    RegimeBreakdown, Series, SeriesEnd, SeriesRole, Side, SizingOutcome, SkippedEntryCounts,
-    SummaryStats, SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource, ValidationError,
-    align, apply_slippage, atr_stop_price, compute_position_size, funding_payment, realized_pnl,
+    BacktestError, BacktestResult, Candle, CandleSeries, CompiledExit, CompiledStrategy,
+    CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve, EvalContext, ExitReason,
+    Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime, RegimeBreakdown, Series,
+    SeriesEnd, SeriesRole, Side, SizingOutcome, SkipReason, SkippedEntryCounts, SummaryStats,
+    SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource, ValidationError, align,
+    apply_slippage, atr_stop_price, compute_position_size, funding_payment, realized_pnl,
     realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
@@ -140,265 +140,72 @@ pub fn run_backtest(
             to: gap.to,
         });
     }
-    let exit_plan = ExitPlan::from_strategy(compiled)?;
+    // r3.s4.w1: the strategy preconditions that precede the whole-series
+    // checks' tail (ExitPlan, then the HTF/D1 guards) stay at their exact
+    // positions — the session's constructor re-runs the same helpers, so this
+    // binding is intentionally dropped (duplicate invocation, not duplicated
+    // logic) and the first error any caller sees cannot move.
+    ExitPlan::from_strategy(compiled)?;
     check_htf_inputs(compiled, primary, htf)?;
     check_d1_inputs(compiled, primary, d1)?;
-    let mut engine =
-        IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
-    // The higher-timeframe engine is built only when the strategy carries an
-    // `Htf` operand (the guard above guarantees `htf` is `Some` then). It is
-    // stepped on each NEWLY aligned closed H4 bar — never once per primary bar.
-    let mut htf_engine = if compiled.needs_htf() {
-        // The lag-aware HTF engine (r3.s2.w3): its rings advance once per
-        // closed H4 candle, so an `h4:` lag counts H4 bars — Q2's own-series
-        // rule falls out of the construction, no special case.
-        Some(
-            IndicatorEngine::for_series(compiled, Series::Htf)
-                .map_err(|err| BacktestError::EngineInit(err.to_string()))?,
-        )
-    } else {
-        None
-    };
-    // The daily-series engine (r3.s2.w4): built only when the strategy carries
-    // a `D1` operand (the guard above guarantees `d1` is `Some` then), stepped
-    // once per closed UTC-midnight candle through the same cursor machinery.
-    // **Loaded only when needed** is the application ring's job (`needs_d1`
-    // gates the load); here the guard only refuses an engine-less `D1` leaf.
-    let mut d1_engine = if compiled.needs_d1() {
-        Some(
-            IndicatorEngine::for_series(compiled, Series::D1)
-                .map_err(|err| BacktestError::EngineInit(err.to_string()))?,
-        )
-    } else {
-        None
-    };
-    // The regime detector is stepped over the PRIMARY M15 series (v1, README C7),
-    // independently of the strategy's indicators — so a trade is tagged with the
-    // market regime regardless of which indicators the strategy declares.
-    let mut detector = RegimeDetector::new();
-    let mut state = LoopState::default();
-    let direction = compiled.direction();
-    // Index into `htf.candles` of the next HTF bar not yet stepped through the
-    // HTF engine (r2.s2 round-1 fix F2). A cursor over the source series — not
+    // r3.s4.w1: the per-run event loop is an `EngineSession` — the fold owns
+    // the whole-series preconditions above (at their exact positions, so no
+    // first error moved) and the session owns the per-bar loop verbatim.
+    // The constructor re-runs the series-free preconditions internally
+    // (config/funding-interval/exit-plan/engine builds — duplicate
+    // invocations of the same helpers, not duplicated logic).
+    let mut session = EngineSession::new(
+        compiled,
+        &primary.pair,
+        SessionTimeframes {
+            primary: primary.timeframe,
+            htf: htf.map(|series| series.timeframe),
+            d1: d1.map(|series| series.timeframe),
+        },
+        *config,
+        filters.clone(),
+        count_from_ms,
+    )?;
+    // Index into `htf.candles` of the next HTF bar not yet drained into the
+    // session (r2.s2 round-1 fix F2). A cursor over the source series — not
     // the aligned pairing — is what guarantees every closed HTF candle is
-    // stepped exactly once, including the lead-in history `align` jumps past
+    // handed exactly once, including the lead-in history `align` jumps past
     // when several H4 closes precede the first primary bar.
     let mut htf_cursor = 0_usize;
     let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
     // The D1 mirror of the HTF cursor (r3.s2.w4): every closed daily candle
-    // steps the daily engine exactly once, lead-in history included.
+    // is handed to the session exactly once, lead-in history included.
     let mut d1_cursor = 0_usize;
     let d1_candles: &[Candle] = d1.map_or(&[][..], |series| series.candles.as_slice());
 
-    // D6 (NFR-1): build the funding-event index ONCE, before the trade loop, so
-    // funding accrual is O(trades × (log E + k)) over the ~1095 funding events
-    // instead of the old O(trades × candles) full rescan of ~35k bars. The index
-    // is `(open_time, rate)` for ONLY the funding-bearing candles; because the
-    // store guarantees gap-free chronological-ascending `open_time`, the index is
-    // sorted by construction (it preserves source order) — we assert/document
-    // this rather than re-sorting. Threaded by borrow through the close chain;
-    // built here, never per close.
-    let funding_index = build_funding_index(primary);
-
     for bar in align(primary, htf, d1) {
-        // r2.s3.w2: a lead-in bar (`open_time < count_from_ms`) warms both
-        // indicator engines and the regime detector but counts for NOTHING —
-        // no fill, no exit, no funding, no equity mark, no excursion, no
-        // entry or pending-entry evaluation. The trading-relevant blocks below
-        // are all gated on `counted`; the three warm-up steps are not.
-        let counted = count_from_ms.is_none_or(|from| bar.primary.open_time >= from);
-        if counted {
-            // The regime in effect for an entry filling at THIS bar's open is
-            // the one determined by already-closed bars (the detector is
-            // stepped at the bottom of the loop, mirroring `engine.step`) —
-            // the same no-look-ahead discipline the entry signal itself
-            // obeys. `current()` is `Unknown` until the EMA200/ADX warm.
-            let regime = detector.current();
-            fill_pending_entry(
-                &mut state,
-                bar.primary,
-                direction,
-                &exit_plan,
-                config,
-                filters,
-                regime,
-            )?;
-            if let Some(position) = state.position.as_mut() {
-                // Fold this bar (the just-opened entry bar, or any held bar
-                // including the full exit bar) into the running MFE/MAE before
-                // the close reads it. C5: after fill, before close.
-                update_excursion(position, bar.primary);
-            }
-            close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
-            // G1 (r3.s1.w1): the bar just closed folds into the position's
-            // trailing state only while the position survived it — a bar that
-            // closed the position is the exit bar, and its own extreme must
-            // never join the level it was just checked against. The fold
-            // counts the held bar, extends the closed-bar extreme and
-            // recomputes the effective stop for the NEXT bar's checks.
-            if let Some(position) = state.position.as_mut() {
-                position.hold_closed_bar(bar.primary);
-            }
-        }
-
-        engine.step(bar.primary);
-        // Step the HTF engine with EVERY HTF candle that has closed at or
-        // before this primary bar's close (r2.s2 round-1 fix F2). The aligned
-        // `bar.htf` stays the last of them, so `current()`/`previous()` remain
-        // H4-relative — but the warmup history a `close_time`-jumped pairing
-        // would skip (lead-in H4 bars already closed when the run's first
-        // primary bar lands) now feeds the engine instead of vanishing.
-        if let Some(engine_htf) = htf_engine.as_mut() {
-            step_closed_htf_candles(
-                engine_htf,
-                htf_candles,
-                &mut htf_cursor,
-                bar.primary.close_time,
-            );
-        }
-        // The D1 mirror (r3.s2.w4): every daily candle closed at or before
-        // this primary bar's close steps the daily engine exactly once — the
-        // aligned `bar.d1` stays the last of them, so `current()`/`previous()`
-        // are daily-bar-relative, and lead-in days already closed before the
-        // run's first primary bar still feed the engine.
-        if let Some(engine_d1) = d1_engine.as_mut() {
-            step_closed_htf_candles(
-                engine_d1,
-                d1_candles,
-                &mut d1_cursor,
-                bar.primary.close_time,
-            );
-        }
-        // Advance the regime detector in lock-step with the indicator engine, once
-        // per primary bar (README C7). The order vs. `engine.step` is irrelevant
-        // (independent state); both step after fill/close so the next bar reads
-        // only already-closed information.
-        detector.step(bar.primary);
-
-        // The series-routed evaluation context (r2.s2.w2): `Primary` leaves
-        // read the primary engine, `Htf` leaves read the HTF engine and `D1`
-        // leaves the daily engine (r3.s2.w4) — a missing series engine can
-        // only pair with a strategy free of that series' operands (the guard
-        // above enforced that), so a `None` here is unreachable for such a
-        // leaf.
-        let ctx = DualSeriesContext {
-            primary: &engine,
-            htf: htf_engine.as_ref(),
-            d1: d1_engine.as_ref(),
-        };
-
-        if counted
-            && state.position.is_some()
-            && state.pending_exit.is_none()
-            // r2.s2 round-1 fix F3: when the strategy needs the higher
-            // timeframe a signal exit must not evaluate before a closed HTF
-            // bar is actually paired — a `Not(...)` over an absent `Htf`
-            // operand otherwise reads `true` and exits against a bar that
-            // does not exist yet.
-            && (htf_engine.is_none() || bar.htf.is_some())
-            // r3.s2.w4: the D1 mirror of F3 for signal exits — a `D1` leaf
-            // must not evaluate against a day that has not closed.
-            && (d1_engine.is_none() || bar.d1.is_some())
-            && exit_plan.signal_triggered(&ctx)
+        // r3.s4.w1: the per-bar loop lives in `EngineSession::step` — the
+        // fold only drains the higher-timeframe candles that closed at or
+        // before this primary bar's close (the cursor rule
+        // `step_closed_htf_candles` applied on the whole-run path) and hands
+        // them to the session in order.
+        let mut closed_htf: Vec<Candle> = Vec::new();
+        while let Some(candle) = htf_candles.get(htf_cursor)
+            && candle.close_time <= bar.primary.close_time
         {
-            state.pending_exit = Some(PendingExit {
-                signal_time: bar.primary.close_time,
-                reason: ExitReason::Signal,
-            });
+            closed_htf.push(candle.clone());
+            htf_cursor += 1;
         }
-
-        // G1 (r3.s1.w1): the time stop triggers at the close of the
-        // `max_bars`-th held bar and fills at the next bar's open, exactly as
-        // a signal exit does (the same open-gap relabelling applies at that
-        // fill). Evaluated AFTER the signal block so a same-close tie keeps
-        // the `Signal` label.
-        if counted
-            && state.pending_exit.is_none()
-            && let Some(max_bars) = exit_plan.max_bars
-            && state
-                .position
-                .as_ref()
-                .is_some_and(|position| position.bars_held == max_bars)
+        let mut closed_d1: Vec<Candle> = Vec::new();
+        while let Some(candle) = d1_candles.get(d1_cursor)
+            && candle.close_time <= bar.primary.close_time
         {
-            state.pending_exit = Some(PendingExit {
-                signal_time: bar.primary.close_time,
-                reason: ExitReason::TimeStop,
-            });
+            closed_d1.push(candle.clone());
+            d1_cursor += 1;
         }
-
-        if counted
-            && state.position.is_none()
-            && state.pending_entry.is_none()
-            && bar.index > 0
-            && engine.is_warm()
-            // Warm gate (r2.s2.w2): when the strategy uses `Htf` operands the
-            // HTF engine must be warm too — an `Htf` EMA still seeding must not
-            // fire an entry (the same warmup discipline the primary gate has).
-            && htf_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
-            // r3.s2.w4: the D1 mirror — a daily EMA still seeding must not
-            // fire an entry.
-            && d1_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
-            // r2.s2 round-1 fix F3: `is_warm` is vacuous when the strategy's
-            // only `Htf` operand is a Price leaf (no HTF indicator exists to
-            // warm), so a paired closed HTF bar must exist before the entry
-            // may evaluate — a `Not(...)` over an absent `Htf` operand
-            // otherwise reads `true` and fires before any H4 bar exists.
-            && (htf_engine.is_none() || bar.htf.is_some())
-            // r3.s2.w4: the D1 mirror of F3 — a `D1` price leaf needs a
-            // closed daily bar paired before the entry may evaluate.
-            && (d1_engine.is_none() || bar.d1.is_some())
-            && compiled.entry().eval(&ctx)
-        {
-            // ATR-stop entries additionally require the primary ATR(period)
-            // available AT THE SIGNAL BAR (r2.s2.w2): the value is frozen into
-            // the pending entry now and turned into the absolute stop at fill —
-            // never recomputed there. `is_warm` already covers it when the
-            // `AtrStop` registers its ATR, but the explicit `Some` read keeps
-            // the gate honest if that registration ever changes.
-            let atr_at_signal = atr_at_signal(&exit_plan, &ctx);
-            if !matches!(exit_plan.stop, StopRule::Atr { .. }) || atr_at_signal.is_some() {
-                state.pending_entry = Some(PendingEntry {
-                    signal_time: bar.primary.close_time,
-                    atr_at_signal,
-                });
-            }
-        }
+        session.step(bar.primary, &closed_htf, &closed_d1)?;
     }
 
-    // The force-close fires ONLY when the series genuinely ran out. A window
-    // edge is not end-of-data: a position still open at `to` is the strategy's
-    // open position, and booking it as a trade fabricates an exit (r2.s1 G1).
-    // It must not silently vanish either — the run record carries it as an
-    // explicit mark (direction, entry fill, size, last in-window close), never
-    // as a trade and never inside the closed-trade statistics.
-    let open_position = if series_end == SeriesEnd::SnapshotEnd {
-        close_end_of_data(&mut state, primary, &funding_index, config)?;
-        None
-    } else {
-        match (state.position.as_ref(), primary.candles.last()) {
-            (Some(position), Some(last)) => Some(OpenPositionMark {
-                direction: position.direction,
-                qty: position.qty,
-                entry_price: position.entry_price,
-                entry_signal_time: position.entry_signal_time,
-                entry_fill_time: position.entry_fill_time,
-                mark_time: last.close_time,
-                mark_price: last.close,
-            }),
-            _ => None,
-        }
-    };
-    // The leading equity point's time is the run's first COUNTED primary
-    // candle open (README C2 / D5) — under lead-in that is the first bar at
-    // or after `count_from_ms`, not the snapshot's first bar. An empty counted
-    // slice has no run-start bar; fall back to 0 (the run produced no trades
-    // either, so the curve is just the leading point).
-    let run_start_time_ms = primary
-        .candles
-        .iter()
-        .find(|candle| count_from_ms.is_none_or(|from| candle.open_time >= from))
-        .map_or(0, |candle| candle.open_time);
-    Ok(state.into_result(config, run_start_time_ms, open_position))
+    // The session's finish carries the same end-of-series rule the loop body
+    // used to own: `SnapshotEnd` force-closes at the last bar's close,
+    // `WindowEdge` leaves a position open and marks it against the last
+    // candle (r2.s1 G1 — never booked as a trade the strategy never chose).
+    session.finish(series_end, primary.candles.last())
 }
 
 /// The engine-side HTF input guards: a strategy carrying an `Htf` operand must
@@ -654,7 +461,7 @@ pub fn first_fully_warm_bar_ms(
 /// exit — frozen into the pending entry so the stop derives from the signal
 /// bar's ATR, never recomputed at fill (r2.s2.w2). `None` for a `StopLoss`
 /// exit and while the ATR is still unwarm.
-fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -> Option<Decimal> {
+pub(super) fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -> Option<Decimal> {
     match exit_plan.stop {
         StopRule::Atr { period, .. } => ctx.current(&CompiledValue::Indicator {
             series: Series::Primary,
@@ -671,7 +478,7 @@ fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -> Option<De
 /// `StopLoss` distance or the `AtrStop`'s `multiple × ATR(period)` frozen at
 /// the signal bar.
 #[derive(Debug, Clone, Copy)]
-enum StopRule {
+pub(super) enum StopRule {
     /// `entry × (1 ∓ distance_pct)` — the stop distance in price units is
     /// `entry × distance_pct` (defines 1R).
     Pct(Decimal),
@@ -692,10 +499,10 @@ enum StopRule {
 /// strategy with no `Htf` operand and `d1` only for one with no `D1` operand —
 /// the [`BacktestError::HtfRequired`]/[`BacktestError::D1Required`] guards in
 /// [`run_backtest`] make the alternatives unreachable.
-struct DualSeriesContext<'a> {
-    primary: &'a IndicatorEngine,
-    htf: Option<&'a IndicatorEngine>,
-    d1: Option<&'a IndicatorEngine>,
+pub(super) struct DualSeriesContext<'a> {
+    pub(super) primary: &'a IndicatorEngine,
+    pub(super) htf: Option<&'a IndicatorEngine>,
+    pub(super) d1: Option<&'a IndicatorEngine>,
 }
 
 impl EvalContext for DualSeriesContext<'_> {
@@ -760,9 +567,16 @@ impl EvalContext for DualSeriesContext<'_> {
     }
 }
 
+/// The per-run exit plan. Owns a clone of the compiled strategy (r3.s4.w1) —
+/// no borrowed lifetime — so both the whole-run fold and the stepwise
+/// `EngineSession` share one type; the `SignalExit` conditions are addressed
+/// by index into the owned strategy's exits.
 #[derive(Debug, Clone)]
-struct ExitPlan<'a> {
-    stop: StopRule,
+pub(super) struct ExitPlan {
+    /// The owned compiled strategy the plan was built from; signal exits
+    /// evaluate through it.
+    pub(super) strategy: CompiledStrategy,
+    pub(super) stop: StopRule,
     /// The declared trailing distance, when a `TrailingStop` exit exists (G1,
     /// r3.s1.w1).
     trail_pct: Option<Decimal>,
@@ -771,15 +585,17 @@ struct ExitPlan<'a> {
     /// derive from `trail_pct`, and every stop hit is labelled `TrailingStop`.
     trail_only: bool,
     /// The declared `TimeStop` bar count, when one exists (G1, r3.s1.w1).
-    max_bars: Option<u32>,
+    pub(super) max_bars: Option<u32>,
     take_profit_target_r: Option<Decimal>,
-    signal_exits: Vec<&'a CompiledCondition>,
+    /// Indices into `strategy.exits()` of the `SignalExit` rules, in source
+    /// order — evaluation order is unchanged from the borrowed plan.
+    signal_exit_indices: Vec<usize>,
     risk_per_trade_pct: Decimal,
     max_leverage: Decimal,
 }
 
-impl<'a> ExitPlan<'a> {
-    fn from_strategy(compiled: &'a CompiledStrategy) -> Result<Self, BacktestError> {
+impl ExitPlan {
+    pub(super) fn from_strategy(compiled: &CompiledStrategy) -> Result<Self, BacktestError> {
         let trail_pct = compiled.exits().iter().find_map(|exit| match exit {
             CompiledExit::TrailingStop { trail_pct } => Some(*trail_pct),
             _ => None,
@@ -813,33 +629,38 @@ impl<'a> ExitPlan<'a> {
             )?;
         }
         Ok(Self {
+            strategy: compiled.clone(),
             stop,
             trail_pct,
             trail_only,
             max_bars,
             take_profit_target_r,
-            signal_exits: signal_exits(compiled.exits()),
+            signal_exit_indices: signal_exit_indices(compiled.exits()),
             risk_per_trade_pct: compiled.risk().risk_per_trade_pct,
             max_leverage: compiled.risk().max_leverage,
         })
     }
 
-    fn signal_triggered(&self, ctx: &dyn EvalContext) -> bool {
-        self.signal_exits
+    pub(super) fn signal_triggered(&self, ctx: &dyn EvalContext) -> bool {
+        let exits = self.strategy.exits();
+        self.signal_exit_indices
             .iter()
-            .any(|condition| condition.eval(ctx))
+            .any(|&index| match &exits[index] {
+                CompiledExit::SignalExit { condition } => condition.eval(ctx),
+                _ => false,
+            })
     }
 }
 
 #[derive(Debug, Default)]
-struct LoopState {
-    pending_entry: Option<PendingEntry>,
-    pending_exit: Option<PendingExit>,
-    position: Option<OpenPosition>,
-    trades: Vec<Trade>,
+pub(super) struct LoopState {
+    pub(super) pending_entry: Option<PendingEntry>,
+    pub(super) pending_exit: Option<PendingExit>,
+    pub(super) position: Option<OpenPosition>,
+    pub(super) trades: Vec<Trade>,
     /// Bounded O(1) per-reason tally of entries the exchange-constrained sizer
     /// suppressed over the run (audit C4); surfaced on the result.
-    skipped_entries: SkippedEntryCounts,
+    pub(super) skipped_entries: SkippedEntryCounts,
 }
 
 impl LoopState {
@@ -855,7 +676,7 @@ impl LoopState {
     /// left behind (built by the caller, which owns the last candle), or `None`
     /// — it lands on the result verbatim, outside the trade log and every
     /// closed-trade statistic.
-    fn into_result(
+    pub(super) fn into_result(
         self,
         config: &BacktestConfig,
         run_start_time_ms: i64,
@@ -910,26 +731,26 @@ impl LoopState {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingEntry {
-    signal_time: i64,
+pub(super) struct PendingEntry {
+    pub(super) signal_time: i64,
     /// The primary-series ATR(period) read AT THE SIGNAL BAR (r2.s2.w2) —
     /// `Some` iff the exit plan is an `AtrStop`. Frozen here so the fill turns
     /// it into the absolute stop without recomputing (the ATR may have moved
     /// between signal and fill bars).
-    atr_at_signal: Option<Decimal>,
+    pub(super) atr_at_signal: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingExit {
-    signal_time: i64,
-    reason: ExitReason,
+pub(super) struct PendingExit {
+    pub(super) signal_time: i64,
+    pub(super) reason: ExitReason,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct OpenPosition {
-    direction: Direction,
-    qty: Decimal,
-    entry_price: Decimal,
+pub(super) struct OpenPosition {
+    pub(super) direction: Direction,
+    pub(super) qty: Decimal,
+    pub(super) entry_price: Decimal,
     /// The INITIAL stop — the sizing basis (G1, r3.s1.w1), fixed at fill.
     /// R, MFE R and MAE R stay denominated by its distance, and the trade
     /// records it, for the whole life of the position.
@@ -951,10 +772,10 @@ struct OpenPosition {
     trail_extreme: Option<Decimal>,
     /// Held-bar count (G1): the entry bar counts as 1; incremented after
     /// each bar's close check while the position stays open.
-    bars_held: u32,
+    pub(super) bars_held: u32,
     take_profit_price: Option<Decimal>,
-    entry_signal_time: i64,
-    entry_fill_time: i64,
+    pub(super) entry_signal_time: i64,
+    pub(super) entry_fill_time: i64,
     entry_fee: Decimal,
     entry_slippage: Decimal,
     /// Running maximum favorable excursion in R-multiples (C5). Initialized to 0
@@ -969,6 +790,45 @@ struct OpenPosition {
 }
 
 impl OpenPosition {
+    /// Test-only constructor for the close-route rollback proof
+    /// (`session.rs`'s labeled injection): assembles a position with
+    /// caller-chosen sizing fields — including the zero-R
+    /// (`initial_stop == entry_price`) state the fill's geometry guard makes
+    /// unreachable through any public feed. Test scope only; it widens
+    /// nothing for production callers.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn for_rollback_tests(
+        direction: Direction,
+        qty: Decimal,
+        entry_price: Decimal,
+        initial_stop: Decimal,
+        stop_price: Decimal,
+        entry_signal_time: i64,
+        entry_fill_time: i64,
+        regime: Regime,
+    ) -> Self {
+        Self {
+            direction,
+            qty,
+            entry_price,
+            initial_stop,
+            stop_price,
+            trail_pct: None,
+            trail_only: false,
+            trail_extreme: None,
+            bars_held: 0,
+            take_profit_price: None,
+            entry_signal_time,
+            entry_fill_time,
+            entry_fee: Decimal::ZERO,
+            entry_slippage: Decimal::ZERO,
+            mfe_r: Decimal::ZERO,
+            mae_r: Decimal::ZERO,
+            regime,
+        }
+    }
+
     /// The label for a stop hit on this position (G1, r3.s1.w1):
     /// `TrailingStop` when a trailing stop is declared and has stood in for
     /// the stop family (trail-only) or tightened strictly past the initial
@@ -1001,7 +861,7 @@ impl OpenPosition {
     /// joins `trail_extreme`, and the effective stop recomputes for the
     /// NEXT bar as the tighter of the initial stop and the closed-bar
     /// trailing level.
-    fn hold_closed_bar(&mut self, candle: &Candle) {
+    pub(super) fn hold_closed_bar(&mut self, candle: &Candle) {
         self.bars_held += 1;
         let Some(trail_pct) = self.trail_pct else {
             return;
@@ -1021,20 +881,50 @@ impl OpenPosition {
     }
 }
 
-fn fill_pending_entry(
-    state: &mut LoopState,
+/// The pure, pre-mutation preparation of a pending entry's fill (r3.s4.w1
+/// correction): every fallible computation — stop geometry, sizing,
+/// take-profit resolution — runs HERE, before [`commit_pending_fill`] writes
+/// anything. This split is what makes [`EngineSession::step`](super::session::EngineSession::step)
+/// atomic: a refused fill returns from `prepare` with the session
+/// byte-identical, and the identical retry recomputes the same typed error.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PreparedEntry {
+    qty: Decimal,
+    entry_price: Decimal,
+    entry_fee: Decimal,
+    entry_slippage: Decimal,
+    stop: Decimal,
+    take_profit_price: Option<Decimal>,
+    signal_time: i64,
+}
+
+/// The commit instruction [`prepare_pending_fill`] produced.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PreparedFill {
+    /// No pending entry — nothing to consume, nothing to open.
+    Idle,
+    /// Consume the pending entry without opening a position: a position is
+    /// already held, the ATR frozen at the signal bar is missing (unreachable
+    /// through the entry gate), or the exchange-constrained sizer declined. A
+    /// `Some` reason records the matching skipped-entries tally.
+    Consume { skipped: Option<SkipReason> },
+    /// Open the prepared position.
+    Open(PreparedEntry),
+}
+
+pub(super) fn prepare_pending_fill(
+    state: &LoopState,
     candle: &Candle,
     direction: Direction,
-    plan: &ExitPlan<'_>,
+    plan: &ExitPlan,
     config: &BacktestConfig,
     filters: &SymbolFilters,
-    regime: Regime,
-) -> Result<(), BacktestError> {
-    let Some(pending) = state.pending_entry.take() else {
-        return Ok(());
+) -> Result<PreparedFill, BacktestError> {
+    let Some(pending) = state.pending_entry else {
+        return Ok(PreparedFill::Idle);
     };
     if state.position.is_some() {
-        return Ok(());
+        return Ok(PreparedFill::Consume { skipped: None });
     }
 
     let raw_entry = candle.open;
@@ -1053,7 +943,7 @@ fn fill_pending_entry(
         // impossible, so skip rather than invent a stop.
         StopRule::Atr { multiple, .. } => {
             let Some(atr) = pending.atr_at_signal else {
-                return Ok(());
+                return Ok(PreparedFill::Consume { skipped: None });
             };
             atr_stop_price(entry_price, atr, multiple, direction)
         }
@@ -1093,8 +983,9 @@ fn fill_pending_entry(
     )? {
         SizingOutcome::Sized(qty) => qty,
         SizingOutcome::Skipped(reason) => {
-            state.skipped_entries.record(reason);
-            return Ok(());
+            return Ok(PreparedFill::Consume {
+                skipped: Some(reason),
+            });
         }
     };
     let entry_fee = taker_fee(qty * entry_price, config.taker_fee_bps);
@@ -1114,26 +1005,60 @@ fn fill_pending_entry(
             StopRule::Atr { .. } => atr_take_profit_price(entry_price, stop, target, direction),
         })
         .transpose()?;
-    state.position = Some(OpenPosition {
-        direction,
+    Ok(PreparedFill::Open(PreparedEntry {
         qty,
         entry_price,
-        initial_stop: stop,
-        stop_price: stop,
-        trail_pct: plan.trail_pct,
-        trail_only: plan.trail_only,
-        trail_extreme: plan.trail_pct.map(|_| entry_price),
-        bars_held: 0,
-        take_profit_price,
-        entry_signal_time: pending.signal_time,
-        entry_fill_time: candle.open_time,
         entry_fee,
         entry_slippage: (entry_price - raw_entry).abs() * qty,
-        mfe_r: Decimal::ZERO,
-        mae_r: Decimal::ZERO,
-        regime,
-    });
-    Ok(())
+        stop,
+        take_profit_price,
+        signal_time: pending.signal_time,
+    }))
+}
+
+/// The infallible commit half of the fill: consumes the pending entry and
+/// either records a skip or opens the position `prepare_pending_fill` already
+/// costed. All of `prepare_pending_fill`'s refusals happened before this runs,
+/// so nothing here can fail.
+pub(super) fn commit_pending_fill(
+    state: &mut LoopState,
+    prepared: PreparedFill,
+    candle: &Candle,
+    direction: Direction,
+    plan: &ExitPlan,
+    regime: Regime,
+) {
+    match prepared {
+        PreparedFill::Idle => {}
+        PreparedFill::Consume { skipped } => {
+            state.pending_entry = None;
+            if let Some(reason) = skipped {
+                state.skipped_entries.record(reason);
+            }
+        }
+        PreparedFill::Open(entry) => {
+            state.pending_entry = None;
+            state.position = Some(OpenPosition {
+                direction,
+                qty: entry.qty,
+                entry_price: entry.entry_price,
+                initial_stop: entry.stop,
+                stop_price: entry.stop,
+                trail_pct: plan.trail_pct,
+                trail_only: plan.trail_only,
+                trail_extreme: plan.trail_pct.map(|_| entry.entry_price),
+                bars_held: 0,
+                take_profit_price: entry.take_profit_price,
+                entry_signal_time: entry.signal_time,
+                entry_fill_time: candle.open_time,
+                entry_fee: entry.entry_fee,
+                entry_slippage: entry.entry_slippage,
+                mfe_r: Decimal::ZERO,
+                mae_r: Decimal::ZERO,
+                regime,
+            });
+        }
+    }
 }
 
 /// Fold one held bar into the position's running MFE/MAE (C5). Called in the
@@ -1149,7 +1074,7 @@ fn fill_pending_entry(
 /// `mfe_r = max(mfe_r, fav)` and `mae_r = min(mae_r, adv)`. The init-0 sample
 /// keeps `mfe_r >= 0 ∧ mae_r <= 0` (C5). The full bar range counts (no intra-bar
 /// path reconstruction), so `mfe_r >= realized_r >= mae_r` is NOT guaranteed.
-fn update_excursion(position: &mut OpenPosition, candle: &Candle) {
+pub(super) fn update_excursion(position: &mut OpenPosition, candle: &Candle) {
     let entry = position.entry_price;
     // R stays denominated by the INITIAL stop distance (G1, r3.s1.w1) — a
     // trailing stop tightens `stop_price` but never re-scales the excursion.
@@ -1177,7 +1102,7 @@ fn update_excursion(position: &mut OpenPosition, candle: &Candle) {
     }
 }
 
-fn close_on_bar_open_or_price(
+pub(super) fn close_on_bar_open_or_price(
     state: &mut LoopState,
     funding_index: &[(i64, Decimal)],
     candle: &Candle,
@@ -1257,13 +1182,13 @@ fn open_gap_reason(open: Decimal, position: &OpenPosition) -> Option<ExitReason>
     }
 }
 
-fn close_end_of_data(
+pub(super) fn close_end_of_data(
     state: &mut LoopState,
-    primary: &CandleSeries,
+    last: Option<&Candle>,
     funding_index: &[(i64, Decimal)],
     config: &BacktestConfig,
 ) -> Result<(), BacktestError> {
-    let Some(last) = primary.candles.last() else {
+    let Some(last) = last else {
         return Ok(());
     };
     if state.position.is_none() {
@@ -1348,7 +1273,11 @@ fn close_position(
     exit: ExitFill,
     config: &BacktestConfig,
 ) -> Result<(), BacktestError> {
-    let Some(position) = state.position.take() else {
+    // r3.s4.w1 correction: the position is read as a `Copy` — the `take`
+    // moves BELOW every fallible computation, so a refusal on this route
+    // (unreachable by valid input, but fail-fast by contract) leaves the open
+    // position, the trade log and every other field untouched.
+    let Some(position) = state.position else {
         return Ok(());
     };
     let exit_price = apply_slippage(
@@ -1381,6 +1310,8 @@ fn close_position(
         position.direction,
     )?;
 
+    // All fallible computation is done — the mutations start here.
+    state.position = None;
     state.trades.push(Trade {
         direction: position.direction,
         qty: position.qty,
@@ -1437,8 +1368,14 @@ fn close_position(
 /// `open_time`, so filtering preserves that order ⇒ the index is sorted **by
 /// construction** (no re-sort). A `debug_assert!` documents and checks the
 /// ascending-`open_time` invariant the windowed binary search in
-/// [`funding_between`] relies on. Built ONCE in `run_backtest` before the trade
-/// loop and threaded by borrow through the close chain — never rebuilt per close.
+/// [`funding_between`] relies on.
+///
+/// r3.s4.w1: the whole-run fold no longer prebuilds the index — the
+/// `EngineSession` appends `(open_time, rate)` per stepped bar (lead-in
+/// included) and reaches the identical vector at any close. This constructor
+/// stays as the pinned whole-run reference the unit tests exercise, and as
+/// the spec the session's append must match.
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_funding_index(primary: &CandleSeries) -> Vec<(i64, Decimal)> {
     let index: Vec<(i64, Decimal)> = primary
         .candles
@@ -1635,11 +1572,12 @@ fn take_profit_target(exits: &[CompiledExit]) -> Option<Decimal> {
     })
 }
 
-fn signal_exits(exits: &[CompiledExit]) -> Vec<&CompiledCondition> {
+fn signal_exit_indices(exits: &[CompiledExit]) -> Vec<usize> {
     exits
         .iter()
-        .filter_map(|exit| match exit {
-            CompiledExit::SignalExit { condition } => Some(condition),
+        .enumerate()
+        .filter_map(|(index, exit)| match exit {
+            CompiledExit::SignalExit { .. } => Some(index),
             _ => None,
         })
         .collect()
