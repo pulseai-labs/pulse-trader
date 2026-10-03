@@ -48,10 +48,7 @@ fn h4_bar(open_time: i64, open: i64, close: i64) -> Candle {
 /// wakes exactly at a bar's close over a source that never revises a bar
 /// (the gate itself is `tests/paper_bar_settle.rs`).
 async fn ungated_world() -> PaperWorld {
-    PaperWorld {
-        settle: None,
-        ..PaperWorld::new().await
-    }
+    PaperWorld::ungated().await
 }
 
 async fn bar_count(world: &PaperWorld, id: &PaperSessionId) -> i64 {

@@ -243,6 +243,16 @@ impl PaperWorld {
         }
     }
 
+    /// The world without the #306 settle gate, for suites that wake exactly
+    /// at a bar's close over a source that never revises a bar (the gate has
+    /// its own suite, `tests/paper_bar_settle.rs`).
+    pub async fn ungated() -> Self {
+        Self {
+            settle: None,
+            ..Self::new().await
+        }
+    }
+
     /// A fresh paper-session repository over the world's pool/store/clock.
     pub fn paper(&self) -> SqlitePaperSessionRepo<SteppedClock> {
         SqlitePaperSessionRepo::with_clock(
