@@ -649,10 +649,14 @@ async fn first_start_records_lead_in_with_no_events() {
 // (viii) a failed append leaves no partial rows and consumes the bar once
 // ---------------------------------------------------------------------------
 
-/// A repository that fails the next `append_bar` once, then delegates.
+/// A repository that fails the next `append_bar` once, then delegates. Two
+/// switches: `fail_next` fails the next append that carries bars,
+/// `fail_events_next` the next events-only one (a `data_event` or a
+/// `shadow_checked`).
 struct FlakyRepo<P> {
     inner: P,
     fail_next: Arc<AtomicBool>,
+    fail_events_next: Arc<AtomicBool>,
     appends: Arc<AtomicUsize>,
 }
 
@@ -661,6 +665,7 @@ impl<P> FlakyRepo<P> {
         Self {
             inner,
             fail_next: Arc::new(AtomicBool::new(false)),
+            fail_events_next: Arc::new(AtomicBool::new(false)),
             appends: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -668,6 +673,11 @@ impl<P> FlakyRepo<P> {
     /// The failure switch, so a test can arm it after boot.
     fn flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.fail_next)
+    }
+
+    /// The events-only failure switch.
+    fn events_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fail_events_next)
     }
 }
 
@@ -717,6 +727,9 @@ where
         self.appends.fetch_add(1, Ordering::SeqCst);
         if self.fail_next.swap(false, Ordering::SeqCst) && !bars.is_empty() {
             return Err(DataError::Db("injected append failure".to_owned()));
+        }
+        if bars.is_empty() && self.fail_events_next.swap(false, Ordering::SeqCst) {
+            return Err(DataError::Db("injected events append failure".to_owned()));
         }
         self.inner.append_bar(session_id, bars, events).await
     }
@@ -817,9 +830,126 @@ async fn a_failed_append_leaves_no_rows_and_consumes_the_bar_once() {
     assert_eq!(consumed, 1, "the bar is consumed exactly once");
 }
 
+/// The runtime over a `FlakyRepo` on the world's real repository.
+type FlakyRuntime = PaperRuntime<
+    FlakyRepo<pulse::SqlitePaperSessionRepo<SteppedClock>>,
+    ScriptedBars,
+    pulse::CandleStore,
+    SteppedClock,
+    LiveEnv<SqliteStrategyRepo<SystemClock>, pulse::BinanceAdapter>,
+>;
+
+fn flaky_runtime(
+    world: &PaperWorld,
+    repo: FlakyRepo<pulse::SqlitePaperSessionRepo<SteppedClock>>,
+) -> FlakyRuntime {
+    PaperRuntime::new(
+        repo,
+        world.source.clone(),
+        world.store.clone(),
+        world.clock.clone(),
+        LiveEnv::new(world.strategies(), pulse::BinanceAdapter::new()),
+        0,
+        world.log.clone(),
+    )
+}
+
+fn data_event_count(events: &[PaperEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, PaperEvent::DataEvent { .. }))
+        .count()
+}
+
+/// A refused `data_event` append is retried on the next wake: the refusal is
+/// marked reported only once its event commits.
+#[tokio::test]
+async fn a_failed_data_event_append_is_retried_on_the_next_wake() {
+    let world = PaperWorld::new().await;
+    let script = |last_close: i64| {
+        vec![
+            m15_bar(BASE - 2 * M15_MS, 60_100, 60_050),
+            m15_bar(BASE - M15_MS, 60_050, 60_000),
+            m15_bar(BASE, 60_000, 60_050),
+            m15_bar(BASE + M15_MS, 60_050, last_close),
+        ]
+    };
+    world.source.script(Timeframe::M15, script(60_000));
+    let (_version, session) = price_session(&world, Timeframe::M15, None, false).await;
+    let repo = FlakyRepo::new(world.paper());
+    let fail_events = repo.events_flag();
+    let mut runtime = flaky_runtime(&world, repo);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    world.clock.set(BASE + 2 * M15_MS);
+    assert!(runtime.wake().await.is_empty(), "the live bar lands");
+    let before = data_event_count(&world.paper().events(&session.id).await.unwrap());
+
+    // The exchange's copy of the newest recorded bar now differs, and the
+    // data_event append is refused once.
+    world.source.script(Timeframe::M15, script(59_000));
+    fail_events.store(true, Ordering::SeqCst);
+    let failures = runtime.wake().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "the refused append is reported: {failures:?}"
+    );
+    assert_eq!(
+        data_event_count(&world.paper().events(&session.id).await.unwrap()),
+        before,
+        "nothing landed"
+    );
+
+    // The next wake writes it, and the one after does not repeat it.
+    assert!(runtime.wake().await.is_empty(), "the retry lands");
+    assert_eq!(
+        data_event_count(&world.paper().events(&session.id).await.unwrap()),
+        before + 1,
+        "the data event is retried after a refused append"
+    );
+    runtime.wake().await;
+    assert_eq!(
+        data_event_count(&world.paper().events(&session.id).await.unwrap()),
+        before + 1,
+        "at most one data event per distinct bar and refusal"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // the daily cadence
 // ---------------------------------------------------------------------------
+
+/// A session whose attach-time shadow check failed is due at once: the boot's
+/// daily pass retries it instead of waiting forever.
+#[tokio::test]
+async fn a_failed_attach_shadow_check_is_retried() {
+    let world = PaperWorld::new().await;
+    world.source.script(
+        Timeframe::M15,
+        vec![
+            m15_bar(BASE - 2 * M15_MS, 60_100, 60_050),
+            m15_bar(BASE - M15_MS, 60_050, 60_000),
+            m15_bar(BASE, 60_000, 60_050),
+        ],
+    );
+    let (_version, session) = price_session(&world, Timeframe::M15, None, false).await;
+    let repo = FlakyRepo::new(world.paper());
+    // The attach-time check's `shadow_checked` append is the first
+    // events-only append of the boot.
+    repo.events_flag().store(true, Ordering::SeqCst);
+    let mut runtime = flaky_runtime(&world, repo);
+    let failures = runtime.boot().await;
+    assert_eq!(failures.len(), 1, "the attach check failed: {failures:?}");
+    let checks = world
+        .paper()
+        .events(&session.id)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, PaperEvent::ShadowChecked { .. }))
+        .count();
+    assert_eq!(checks, 1, "the boot's daily pass retried the failed check");
+}
 
 #[tokio::test]
 async fn a_daily_shadow_check_runs_on_the_first_wake_after_midnight() {

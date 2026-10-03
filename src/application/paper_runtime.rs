@@ -288,8 +288,13 @@ enum StepOutcome {
         bars: Vec<(Timeframe, Candle, bool)>,
         events: Vec<PaperEvent>,
     },
-    /// The step refused; the session holds at this bar.
-    Refused { summary: String, first_time: bool },
+    /// The step refused; the session holds at this bar. `report` is the
+    /// `reported` entry to record once the `data_event` append commits.
+    Refused {
+        summary: String,
+        first_time: bool,
+        report: (i64, String),
+    },
     /// No new bar to consume.
     Idle,
 }
@@ -1125,13 +1130,14 @@ where
                 .get_mut(id)
                 .ok_or_else(|| PaperRuntimeError::NotRunning(id.clone()))?;
             let disagreements = scan_disagreements(run, fetched);
-            if let Some((_bar_open_time, summary, first_time)) = disagreements.first() {
+            if let Some((bar_open_time, summary, first_time, tag)) = disagreements.first() {
                 // Report the first and hold this session for the pass; the
                 // recorded bar is never replaced. At most one `data_event` per
                 // distinct bar and refusal.
                 StepOutcome::Refused {
                     summary: summary.clone(),
                     first_time: *first_time,
+                    report: (*bar_open_time, tag.clone()),
                 }
             } else {
                 prepare_step(run, fetched, &at)
@@ -1176,6 +1182,7 @@ where
             StepOutcome::Refused {
                 summary,
                 first_time,
+                report: (open_time, tag),
             } => {
                 if first_time {
                     let event = PaperEvent::DataEvent {
@@ -1184,6 +1191,11 @@ where
                         summary: summary.clone(),
                     };
                     self.repo.append_bar(id, &[], &[event]).await?;
+                    // Marked reported only once the event committed: a failed
+                    // append leaves it unreported, so the next wake retries it.
+                    if let Some(run) = self.sessions.get_mut(id) {
+                        run.reported.insert(open_time, tag);
+                    }
                     self.log
                         .write(format!("paper runtime: session {id}: {summary}"));
                 }
@@ -1198,7 +1210,12 @@ where
         let due: Vec<PaperSessionId> = self
             .sessions
             .iter()
-            .filter(|(_, run)| daily_shadow_due(now, run.last_shadow_ms.unwrap_or(now)))
+            // A session with no successful check yet (its attach-time check
+            // failed) is due now, so a transient failure is retried.
+            .filter(|(_, run)| {
+                run.last_shadow_ms
+                    .is_none_or(|last| daily_shadow_due(now, last))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         let mut failures = Vec::new();
@@ -1273,14 +1290,15 @@ impl RunningSession {
 }
 
 /// Every fetched bar that is already recorded with DIFFERENT values — the A6
-/// data disagreement. Each entry is `(bar open_time, summary, first_time)`;
-/// `first_time` is false when this exact `(bar, refusal)` was already written.
+/// data disagreement. Each entry is `(bar open_time, summary, first_time,
+/// tag)`; `first_time` is false when this exact `(bar, refusal)` was already
+/// written, and `tag` is the `reported` entry to record once it is.
 fn scan_disagreements(
-    run: &mut RunningSession,
+    run: &RunningSession,
     fetched: &BTreeMap<(Pair, Timeframe), Vec<Candle>>,
-) -> Vec<(i64, String, bool)> {
+) -> Vec<(i64, String, bool, String)> {
     let pair = run.session.pair.clone();
-    let mut disagreements: Vec<(i64, String, bool)> = Vec::new();
+    let mut disagreements: Vec<(i64, String, bool, String)> = Vec::new();
     for timeframe in run.session.timeframes() {
         let Some(bars) = fetched.get(&(pair.clone(), timeframe)) else {
             continue;
@@ -1294,9 +1312,6 @@ fn scan_disagreements(
             {
                 let tag = format!("disagreement:{timeframe:?}");
                 let first_time = run.reported.get(&bar.open_time) != Some(&tag);
-                if first_time {
-                    run.reported.insert(bar.open_time, tag);
-                }
                 disagreements.push((
                     bar.open_time,
                     format!(
@@ -1306,6 +1321,7 @@ fn scan_disagreements(
                         bar.open_time
                     ),
                     first_time,
+                    tag,
                 ));
             }
         }
@@ -1343,12 +1359,10 @@ fn prepare_step(
     if let Err(error) = run.engine.step(&bar, &htf_new, &d1_new) {
         let tag = format!("{error}");
         let first_time = run.reported.get(&bar.open_time) != Some(&tag);
-        if first_time {
-            run.reported.insert(bar.open_time, tag);
-        }
         return StepOutcome::Refused {
             summary: format!("step refused at bar {}: {error}", bar.open_time),
             first_time,
+            report: (bar.open_time, tag),
         };
     }
     let before = StepView {
