@@ -479,11 +479,13 @@ fn spawn_paper_runtime(
             let env = LiveEnv::new(SqliteStrategyRepo::new(pool), BinanceAdapter::new());
             let log: Arc<dyn RuntimeLog> = Arc::new(RuntimeSink { sink: sink.clone() });
             let runtime = PaperRuntime::new(repo, source, store, clock, env, grace_ms, log);
+            // `enable_all`: the timer drives the wakes, and the I/O driver
+            // carries `RestClosedBars`' reqwest calls.
             let Ok(host) = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
             else {
-                sink.write("pulse serve: paper runtime disabled: no timer".to_owned());
+                sink.write("pulse serve: paper runtime disabled: no tokio runtime".to_owned());
                 return;
             };
             host.block_on(run_paper_runtime(
