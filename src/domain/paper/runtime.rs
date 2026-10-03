@@ -125,10 +125,32 @@ pub fn events_for_step(
     at: &str,
 ) -> Vec<PaperEvent> {
     let mut events = Vec::new();
-    // An entry: a position that did not stand before and stands after.
-    if before.open_position.is_none()
-        && let Some(position) = after.open_position.as_ref()
-    {
+    // Exits: every trade the step closed (the slice's new tail), in order. One
+    // bar can open and stop out a position: a trade whose position did not
+    // stand when it was reached (none before the step, or an earlier trade of
+    // this step closed it) records its entry before its exit, so the replayed
+    // closed trade carries its entry price and instant.
+    let mut open = before.open_position.is_some();
+    for trade in &after.closed_trades[before.closed_trades.len().min(after.closed_trades.len())..] {
+        let side = side_of(trade.direction);
+        if !open {
+            events.push(order(side, trade.qty, at));
+            events.push(fill(side, trade.qty, trade.entry_price, None, None, at));
+        }
+        events.push(order(side, trade.qty, at));
+        events.push(fill(
+            side,
+            trade.qty,
+            trade.exit_price,
+            Some(trade.exit_reason),
+            Some(trade.realized_r),
+            at,
+        ));
+        open = false;
+    }
+    // An entry: a position stands after the step that did not stand before it
+    // (or the one that did was closed by this step).
+    if !open && let Some(position) = after.open_position.as_ref() {
         let side = side_of(position.direction);
         events.push(order(side, position.qty, at));
         events.push(fill(
@@ -137,20 +159,6 @@ pub fn events_for_step(
             position.entry_price,
             None,
             None,
-            at,
-        ));
-    }
-    // Exits: every trade the step closed (the slice's new tail). One bar can
-    // open and stop out a position, so both arms may fire.
-    for trade in &after.closed_trades[before.closed_trades.len().min(after.closed_trades.len())..] {
-        let side = side_of(trade.direction);
-        events.push(order(side, trade.qty, at));
-        events.push(fill(
-            side,
-            trade.qty,
-            trade.exit_price,
-            Some(trade.exit_reason),
-            Some(trade.realized_r),
             at,
         ));
     }
@@ -333,8 +341,14 @@ fn drift(index: usize, live: &[Trade], shadow: &[Trade]) -> ShadowResult {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        BarBoundaries, boundaries, daily_shadow_due, first_open_bar_ms, next_utc_midnight_after,
+        BarBoundaries, StepView, boundaries, daily_shadow_due, events_for_step, first_open_bar_ms,
+        next_utc_midnight_after,
     };
+    use crate::domain::Direction;
+    use crate::domain::backtest::{ExitReason, Regime, Trade, TradeSource};
+    use crate::domain::candle::Candle;
+    use crate::domain::paper::event::PaperEvent;
+    use rust_decimal::Decimal;
 
     const FIFTEEN_MINUTES: i64 = 900_000;
 
@@ -398,5 +412,73 @@ mod tests {
             1_735_689_600_000,
             1_735_689_600_000 - 86_400_000
         ));
+    }
+
+    /// A trade that opened and stopped out on the stepped bar.
+    fn same_bar_trade(bar_open: i64) -> Trade {
+        Trade {
+            direction: Direction::Long,
+            qty: Decimal::new(2, 0),
+            entry_price: Decimal::new(100, 0),
+            exit_price: Decimal::new(99, 0),
+            entry_signal_time: bar_open - FIFTEEN_MINUTES,
+            entry_fill_time: bar_open,
+            exit_signal_time: bar_open,
+            exit_fill_time: bar_open,
+            fills: Vec::new(),
+            fees_total: Decimal::ZERO,
+            funding_total: Decimal::ZERO,
+            slippage_total: Decimal::ZERO,
+            realized_pnl: Decimal::new(-2, 0),
+            realized_r: Decimal::new(-1, 0),
+            mfe_r: Decimal::ZERO,
+            mae_r: Decimal::new(-1, 0),
+            exit_reason: ExitReason::StopLoss,
+            source: TradeSource::Backtest,
+            regime: Regime::TrendingUp,
+            stop_price: Some(Decimal::new(99, 0)),
+        }
+    }
+
+    #[test]
+    fn a_trade_opened_and_closed_on_one_bar_records_its_entry_first() {
+        let bar_open = 1_735_689_600_000;
+        let bar = Candle {
+            open_time: bar_open,
+            open: Decimal::new(100, 0),
+            high: Decimal::new(101, 0),
+            low: Decimal::new(98, 0),
+            close: Decimal::new(99, 0),
+            volume: Decimal::ONE,
+            close_time: bar_open + FIFTEEN_MINUTES - 1,
+            funding_rate: None,
+        };
+        let trades = vec![same_bar_trade(bar_open)];
+        let events = events_for_step(
+            &StepView::empty(),
+            &StepView {
+                closed_trades: &trades,
+                open_position: None,
+            },
+            &bar,
+            "2025-01-01T00:15:00Z",
+        );
+        let fills: Vec<(Decimal, Option<ExitReason>)> = events
+            .iter()
+            .filter_map(|event| match event {
+                PaperEvent::Fill {
+                    price, exit_reason, ..
+                } => Some((*price, *exit_reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills,
+            vec![
+                (Decimal::new(100, 0), None),
+                (Decimal::new(99, 0), Some(ExitReason::StopLoss)),
+            ],
+            "the entry fill precedes the exit fill on a same-bar trade"
+        );
     }
 }
