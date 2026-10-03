@@ -1864,6 +1864,42 @@ fn step_refuses_a_gapped_higher_series_exactly_as_the_fold_does() {
     );
 }
 
+/// Round 2 (droid `session.rs:715`, primary alignment): a primary candle that
+/// opens less than one interval after the previous one is refused by `step`
+/// exactly as `run_backtest` (`CandleSeries::validate`) refuses it.
+#[test]
+fn step_refuses_a_misaligned_primary_exactly_as_the_fold_does() {
+    let m15_ms = Timeframe::M15.duration_ms();
+    let mut primary_candles: Vec<Candle> = (0..10).map(|i| m15(i, 100, 101, 99, 100)).collect();
+    let misaligned = 9 * m15_ms + m15_ms / 2;
+    primary_candles.push(m15_at(misaligned, 100, 101, 99, 100));
+    primary_candles.extend((11..20).map(|i| m15(i, 100, 101, 99, 100)));
+    let compiled_strategy = compiled(price_entry(), vec![stop_loss(5, 2)], Direction::Long);
+
+    let fold = run_backtest(
+        &compiled_strategy,
+        &series(Timeframe::M15, primary_candles.clone()),
+        None,
+        None,
+        &zero_cost(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+        None,
+    )
+    .expect_err("the fold refuses a misaligned primary");
+    let expected = BacktestError::SeriesGap {
+        series: pulse::SeriesRole::Primary,
+        expected: 10 * m15_ms,
+        found: misaligned,
+    };
+    assert_eq!(fold, expected);
+    assert_eq!(
+        first_step_refusal(&compiled_strategy, &primary_candles, Vec::new(), Vec::new()),
+        Some(expected),
+        "step refuses the misaligned primary the fold refuses"
+    );
+}
+
 #[test]
 fn step_refuses_an_out_of_order_d1_batch_and_continues_unchanged() {
     let (primary, d1_candles, schedule) = d1_refusal_fixture();

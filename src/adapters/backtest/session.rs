@@ -378,7 +378,9 @@ impl EngineSession {
                 });
             }
             let interval = self.timeframes.primary.duration_ms();
-            if primary.open_time - last_open > interval {
+            // Exactly one interval on (`CandleSeries::validate`'s rule): a
+            // missing candle and a misaligned one both refuse.
+            if primary.open_time != last_open + interval {
                 return Err(BacktestError::SeriesGap {
                     series: SeriesRole::Primary,
                     expected: last_open + interval,
