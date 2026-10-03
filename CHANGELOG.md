@@ -64,6 +64,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A live paper session no longer stalls when Binance finalizes a bar after the
+  poll.** The runtime polled 5 s past a bar's close and recorded the first kline it
+  read, but Binance can still update a kline after that. The next re-fetch then
+  disagreed with the recorded bar, and the "changed re-fetch" `data_event` held the
+  session for good — both sessions on the always-on server stopped within an hour
+  of promotion. The runtime now records and steps a bar (live or lead-in) only once
+  it is settled: read at least 30 s after its close and confirmed by an identical
+  read at least 10 s later, re-polled every 10 s until then — after a restart and
+  at a first start too, and a primary bar waits for a higher bar that closes with
+  it. A steady bar lands 40 s after its close; each read that differs from the one
+  before adds 10 s; a bar still unsettled 5 minutes after its close is logged once.
+  A disagreement with a bar that was already recorded is still a `data_event`, and
+  recorded bars are never replaced. The engine fingerprint is unchanged. Refs
+  [#306](https://github.com/pulseai-labs/pulse-trader/issues/306).
+
 - **`pulse import` can no longer publish a database whose committed rows were
   left behind outside it, and every rename that publishes a snapshot, a backup
   database or a backup's `HEAD` manifest is now made durable.** The import's

@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 
 use pulse::{
     BacktestConfig, BinanceAdapter, CandleSeries, CandleSeriesRepository, ExchangeAdapter, Pair,
-    PaperEvent, PaperSessionId, PaperSessionRepository, PaperSessionState, PaperSide, ShadowResult,
-    StrategyRepository, SymbolFilters, Timeframe, compile, run_backtest, validate,
+    PaperEvent, PaperSessionId, PaperSessionRepository, PaperSessionState, PaperSide, SettlePolicy,
+    ShadowResult, StrategyRepository, SymbolFilters, Timeframe, compile, run_backtest, validate,
 };
 use rust_decimal::Decimal;
 use support::paper::{PaperWorld, TestRuntime, create_version, promote_session};
@@ -138,9 +138,19 @@ async fn bar_flags(world: &PaperWorld, id: &PaperSessionId) -> Vec<(String, i64,
     .unwrap()
 }
 
-/// Advance the world's clock to the close of `bar_open` and run one wake.
+/// Run the wakes the production schedule gives the bar opening at `bar_open`
+/// over a steady source: its first counting read `settle_ms` past its close,
+/// then the confirming re-poll that consumes it (#306).
 async fn wake_at_bar(world: &PaperWorld, runtime: &mut TestRuntime, bar_open: i64) {
-    world.clock.set(bar_open + M15_MS);
+    let policy = SettlePolicy::DEFAULT;
+    world.clock.set(bar_open + M15_MS + policy.settle_ms);
+    let failures = runtime.wake().await;
+    assert!(failures.is_empty(), "wake failures: {failures:?}");
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(world.clock.now() + policy.repoll_ms)
+    );
+    world.clock.advance(policy.repoll_ms);
     let failures = runtime.wake().await;
     assert!(failures.is_empty(), "wake failures: {failures:?}");
 }
@@ -195,6 +205,13 @@ async fn catch_up_after_an_outage_equals_an_uninterrupted_session() {
     let mut runtime_b = world_b.runtime();
     assert!(runtime_a.boot().await.is_empty(), "A boots");
     assert!(runtime_b.boot().await.is_empty(), "B boots");
+    // The lead-in lands at its confirming read, one re-poll later (#306).
+    let repoll = SettlePolicy::DEFAULT.repoll_ms;
+    for (world, runtime) in [(&world_a, &mut runtime_a), (&world_b, &mut runtime_b)] {
+        assert_eq!(runtime.next_wake_ms(), Some(world.clock.now() + repoll));
+        world.clock.advance(repoll);
+        assert!(runtime.wake().await.is_empty(), "the lead-in confirms");
+    }
 
     let first_live = world_a
         .paper()
@@ -270,6 +287,19 @@ async fn catch_up_after_an_outage_equals_an_uninterrupted_session() {
     let mut runtime_b2 = world_b.runtime();
     let failures = runtime_b2.boot().await;
     assert!(failures.is_empty(), "B's reboot boots: {failures:?}");
+    // Catch-up confirms the backlog at the first re-poll after the boot, never
+    // with a second read at the boot's own instant (#306).
+    assert_eq!(
+        runtime_b2.next_wake_ms(),
+        Some(world_b.clock.now() + repoll)
+    );
+    world_b.clock.advance(repoll);
+    let failures = runtime_b2.wake().await;
+    assert!(failures.is_empty(), "B's catch-up re-poll: {failures:?}");
+    runtime_b2
+        .shadow_check(&session_b)
+        .await
+        .expect("B shadow-checks after catch-up");
 
     // (iii) the log equals A's, ignoring `seq`, `at` and the boot's extra
     // `ShadowChecked`.

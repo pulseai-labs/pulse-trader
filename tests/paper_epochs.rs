@@ -79,7 +79,7 @@ async fn run_until_one_trade(
 
 #[tokio::test]
 async fn a_foreign_epoch_upgrades_exactly_once_and_scopes_the_next_check() {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     world
         .source
         .script(Timeframe::M15, pulse::fixture_m15_candles());
