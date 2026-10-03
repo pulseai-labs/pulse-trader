@@ -37,6 +37,10 @@ pub(crate) mod events;
 // A separate module so `commands.rs` stays the registration surface while the
 // projection logic lives next to its own unit tests.
 pub(crate) mod library;
+// r3.s4.w5: the paper session surface's wire DTOs, its stream channel and the
+// sink trait the reader is generic over. A separate module so `commands.rs`
+// stays the registration surface while the shapes live beside their docs.
+pub(crate) mod paper;
 // r2.s3.w5: the walk-forward wire contract (DTOs + the projection) and the
 // three command cores. A separate module so `commands.rs` stays the
 // registration surface while the read/run behavior lives beside its own file.
@@ -63,6 +67,12 @@ pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
 pub use library::{
     DslSummary, LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, VersionStats,
     dsl_summary,
+};
+pub use paper::{
+    PaperCertifiedDataVersion, PaperComparison, PaperComparisonVerdict, PaperEpochMs,
+    PaperEventFrame, PaperGraduation, PaperJsonText, PaperSessionSummary, PaperShadowCheck,
+    PaperShadowResult, PaperStatus, PaperStopActor, PaperStopResult, PaperStreamEvent,
+    PaperStreamSink, PaperTrades, PromoteOverride, PromoteRequest, StopAllResult, StopFailure,
 };
 pub use walk_forward::{
     FoldVerdictDto, GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardFoldDto,
@@ -100,6 +110,15 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::server_connect,
         commands::server_status,
         commands::server_disconnect,
+        // r3.s4.w5: the paper session surface.
+        commands::paper_promote,
+        commands::paper_sessions,
+        commands::paper_session,
+        commands::paper_session_trades,
+        commands::paper_shadow_check,
+        commands::paper_stop,
+        commands::paper_stop_all,
+        commands::paper_session_events,
     ])
 }
 

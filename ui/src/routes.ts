@@ -36,6 +36,8 @@ import { createElement } from "react";
 
 import BacktestLabScreen from "./screens/BacktestLabScreen";
 
+import DeploymentDashboard from "./screens/DeploymentDashboard";
+
 import DesignerScreen from "./screens/DesignerScreen";
 
 import LibraryScreen from "./screens/LibraryScreen";
@@ -98,6 +100,18 @@ export const ROUTES: readonly Route[] = [
     title: "Backtest Lab",
     nav: "backtest",
     element: BacktestLabScreen,
+  },
+  // r3.s4.w5: the Deployment Dashboard goes live the same way — one appended
+  // entry, and the existing `deploy` nav row's derived "Soon" badge disappears
+  // on its own (`isNavBuilt`, G8), with zero nav-side edits. `details: true`
+  // opts into the third track, where the selected session's detail renders
+  // (the Library's two-pane shape).
+  {
+    path: "/deploy",
+    title: "Deployment Dashboard",
+    nav: "deploy",
+    element: DeploymentDashboard,
+    details: true,
   },
 ];
 

@@ -34,6 +34,10 @@ use serde::{Deserialize, Serialize};
 use crate::server::API_VERSION;
 use crate::tauri::error::{BusError, BusErrorCode};
 use crate::tauri::events::{BusEvent, EventSink};
+use crate::tauri::paper::{
+    PaperEventFrame, PaperJsonText, PaperSessionSummary, PaperShadowResult, PaperStopResult,
+    PaperStreamEvent, PaperStreamSink, PaperTrades, PromoteRequest, StopAllResult,
+};
 
 // ---------------------------------------------------------------------------
 // The client core
@@ -730,6 +734,200 @@ impl ServerClient {
             }
         }
     }
+
+    /// Consume one session's SSE stream until the channel or the token dies.
+    ///
+    /// Long-lived by design, and deliberately NOT [`Self::stream_events`]: an
+    /// operation's stream is capped at five reconnects and ends on a terminal
+    /// frame, while a paper session's stream is a subscription with no
+    /// terminal. This reader resumes through [`RetryBackoff`] with **no
+    /// attempt cap** while the channel lives, carrying `Last-Event-ID` = the
+    /// last forwarded seq so a reconnect replays only the tail. A duplicate
+    /// seq after a resume is dropped (the server already resumes from the
+    /// header; the guard is defensive). A `token_refused` frame — in band, or
+    /// as the attach's 401/403 — is terminal: the reader emits
+    /// [`PaperStreamEvent::TokenRefused`] and returns. A failed send means the
+    /// UI dropped the channel (unmount): the reader stops, reporting
+    /// cancellation rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// A [`BusError`] when the route refuses before streaming (an unknown
+    /// session, a malformed `Last-Event-ID`, a skew) or answers an unreadable
+    /// frame.
+    pub async fn stream_paper_session(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        sink: &(dyn PaperStreamSink + Send + Sync),
+    ) -> Result<(), BusError> {
+        self.stream_paper_session_inner(session_id, after_seq, sink)
+            .await
+            .map_err(WireFailure::into_bus)
+    }
+
+    pub(crate) async fn stream_paper_session_inner(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        sink: &(dyn PaperStreamSink + Send + Sync),
+    ) -> Result<(), WireFailure> {
+        let path = format!("/api/v1/paper/sessions/{session_id}/events");
+        let mut seen = after_seq;
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .paper_stream_once(&path, &mut seen, &mut attempt, sink)
+                .await?
+            {
+                PaperStreamEnd::Refused | PaperStreamEnd::ChannelDropped => return Ok(()),
+                PaperStreamEnd::Dropped => {
+                    let delay = self.backoff.delay(attempt);
+                    tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// One attach plus one body read for [`Self::stream_paper_session`].
+    ///
+    /// `seen` is the resume cursor the caller owns: entered holding the seq to
+    /// resume after, left holding the last forwarded seq. `attempt` is reset
+    /// once a connection is established, so the backoff grows only across
+    /// consecutive failed attaches.
+    async fn paper_stream_once(
+        &self,
+        path: &str,
+        seen: &mut Option<i64>,
+        attempt: &mut u32,
+        sink: &(dyn PaperStreamSink + Send + Sync),
+    ) -> Result<PaperStreamEnd, WireFailure> {
+        let mut request = self.http.get(self.url(path)).bearer_auth(&self.token);
+        if let Some(seq) = *seen {
+            request = request.header("Last-Event-ID", seq.to_string());
+        }
+        // The ATTACH is bounded — the response HEAD, and only the head (the
+        // ops reader's reasoning): the body streams untimed because a session
+        // may legitimately be quiet for minutes.
+        let attach = tokio::time::timeout(SSE_ATTACH_TIMEOUT, request.send()).await;
+        let Ok(Ok(response)) = attach else {
+            // A connect-level failure (or a head that never came) is a DROP:
+            // the session is server-owned and the resume re-attaches with the
+            // same cursor.
+            return Ok(PaperStreamEnd::Dropped);
+        };
+        check_skew(response.headers()).map_err(WireFailure::Refusal)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            // The token was refused at the head. Same terminal as the in-band
+            // `token_refused` frame, so a revocation caught either way ends
+            // the subscription the same way.
+            let _ = sink.send_paper_event(PaperStreamEvent::TokenRefused {
+                reason: format!("the server refused this token (HTTP {status} on {path})"),
+            });
+            return Ok(PaperStreamEnd::Refused);
+        }
+        if !status.is_success() {
+            let bytes = response.bytes().await.unwrap_or_default();
+            return Err(WireFailure::Bus(route_error(status, path, &bytes)));
+        }
+        *attempt = 0;
+
+        let mut parser = SseParser::default();
+        let body = response.bytes_stream();
+        tokio::pin!(body);
+        loop {
+            let chunk = match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                // A network error mid-stream is a DROP, not a failure: the
+                // session is server-owned and the resume re-attaches.
+                Some(Err(_)) | None => return Ok(PaperStreamEnd::Dropped),
+                Some(Ok(bytes)) => bytes,
+            };
+            for frame in parser.push(&chunk) {
+                match frame.event.as_str() {
+                    "paper" => {
+                        let value: serde_json::Value = match serde_json::from_str(frame.data.trim())
+                        {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return Err(WireFailure::Bus(BusError::internal(format!(
+                                    "session stream {path}: unreadable paper frame: {error}"
+                                ))));
+                            }
+                        };
+                        // The event's own `seq` — the payload's internal seq
+                        // always equals the row's (`paper_event`'s mint), and
+                        // the parser deliberately ignores the `id:` line.
+                        let Some(seq) = value.get("seq").and_then(serde_json::Value::as_i64) else {
+                            return Err(WireFailure::Bus(BusError::internal(format!(
+                                "session stream {path}: a paper frame carries no sequence"
+                            ))));
+                        };
+                        if seen.is_some_and(|seen| seq <= seen) {
+                            continue;
+                        }
+                        let event_type = value
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let frame = PaperEventFrame {
+                            seq: i32::try_from(seq).unwrap_or(i32::MAX),
+                            r#type: event_type,
+                            payload: PaperJsonText::new(frame.data.trim().to_owned()),
+                        };
+                        if sink
+                            .send_paper_event(PaperStreamEvent::Frame(frame))
+                            .is_err()
+                        {
+                            return Ok(PaperStreamEnd::ChannelDropped);
+                        }
+                        *seen = Some(seq);
+                    }
+                    "error" => {
+                        let body = serde_json::from_str::<serde_json::Value>(frame.data.trim())
+                            .unwrap_or(serde_json::Value::Null);
+                        let code = body
+                            .get("code")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let reason = body
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("the server ended the session stream")
+                            .to_owned();
+                        if code == "token_refused" {
+                            let _ =
+                                sink.send_paper_event(PaperStreamEvent::TokenRefused { reason });
+                            return Ok(PaperStreamEnd::Refused);
+                        }
+                        return Err(WireFailure::Bus(BusError::new(
+                            BusErrorCode::Internal,
+                            format!(
+                                "session stream {path}: the server ended the stream \
+                                 ({code}): {reason}"
+                            ),
+                        )));
+                    }
+                    // Keep-alive/comment frames carry no channel traffic.
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// How one session-stream connection ended.
+enum PaperStreamEnd {
+    /// The token was refused (in band or at the attach) and the terminal
+    /// [`PaperStreamEvent::TokenRefused`] was sent.
+    Refused,
+    /// The connection ended without a terminal — resume is allowed.
+    Dropped,
+    /// The channel is gone: the reader stops.
+    ChannelDropped,
 }
 
 /// How one SSE connection ended.
@@ -776,20 +974,43 @@ async fn decode<T: DeserializeOwned>(
         })
     })?;
     if !status.is_success() {
-        return Err(WireFailure::Bus(
-            serde_json::from_slice::<BusError>(&bytes).unwrap_or_else(|_| {
-                BusError::internal(format!(
-                    "HTTP {status} from {path}: {}",
-                    String::from_utf8_lossy(&bytes)
-                ))
-            }),
-        ));
+        return Err(WireFailure::Bus(route_error(status, path, &bytes)));
     }
     serde_json::from_slice(&bytes).map_err(|error| {
         WireFailure::Bus(BusError::internal(format!(
             "{path} answered an unexpected shape: {error}"
         )))
     })
+}
+
+/// Decode one route's error body into the bus's one shape.
+///
+/// The server's bodies are `{code, message}` with the ROUTE's own token
+/// vocabulary. The full [`BusError`] shape is tried first, so a `bus_422` body
+/// keeps its `run_id`/`session_id`/`child_run_id` carries; a body whose token
+/// has no variant of its own (`unknown_version`/`unknown_session` fold onto
+/// `not_found`, r3.s4.w5) is mapped through [`BusErrorCode::from_server_token`]
+/// with the server's message kept verbatim. Anything else is the synthetic
+/// internal error carrying the status, never a silently empty refusal.
+fn route_error(status: reqwest::StatusCode, path: &str, bytes: &[u8]) -> BusError {
+    #[derive(Deserialize)]
+    struct Body {
+        code: Option<String>,
+        message: Option<String>,
+    }
+    if let Ok(error) = serde_json::from_slice::<BusError>(bytes) {
+        return error;
+    }
+    if let Ok(body) = serde_json::from_slice::<Body>(bytes)
+        && let (Some(token), Some(message)) = (body.code.as_deref(), body.message)
+        && let Some(code) = BusErrorCode::from_server_token(token)
+    {
+        return BusError::new(code, message);
+    }
+    BusError::internal(format!(
+        "HTTP {status} from {path}: {}",
+        String::from_utf8_lossy(bytes)
+    ))
 }
 
 /// Incremental SSE framing: feed bytes, get complete frames.
@@ -1100,6 +1321,113 @@ impl ClientState {
     ) -> Result<RunOpOutcome<T>, BusError> {
         let client = self.client_for_call()?;
         self.proxy(client.op_inner(op, body, sink)).await
+    }
+
+    // -- the paper session surface (r3.s4.w5, spec §1) ---------------------
+    //
+    // Every route is `Scope::App` on the server, so the app token this
+    // connection carries is the only credential any of these needs. The
+    // command wrappers in `src/tauri/commands.rs` are thin: they call these
+    // and nothing else, so route knowledge lives here.
+
+    /// Promote a strategy version to a paper session.
+    ///
+    /// # Errors
+    ///
+    /// The promotion gate's typed refusals (`uncertified`, `empty_reason`,
+    /// `certified_under_other_engine`, `certification_unreadable`), the
+    /// not-connected refusal, or the wire failure flattened.
+    pub async fn paper_promote(
+        &self,
+        request: &PromoteRequest,
+    ) -> Result<PaperSessionSummary, BusError> {
+        self.post("/api/v1/paper/promote", request).await
+    }
+
+    /// Every session's summary, in catalog order.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`get`](Self::get).
+    pub async fn paper_sessions(&self) -> Result<Vec<PaperSessionSummary>, BusError> {
+        self.get("/api/v1/paper/sessions").await
+    }
+
+    /// One session's summary.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`get`](Self::get); an unknown id is `not_found`.
+    pub async fn paper_session(&self, id: &str) -> Result<PaperSessionSummary, BusError> {
+        self.get(&format!("/api/v1/paper/sessions/{id}")).await
+    }
+
+    /// One session's closed trades and open position.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`get`](Self::get); an unknown id is `not_found`.
+    pub async fn paper_session_trades(&self, id: &str) -> Result<PaperTrades, BusError> {
+        self.get(&format!("/api/v1/paper/sessions/{id}/trades"))
+            .await
+    }
+
+    /// Run one session's shadow check now.
+    ///
+    /// # Errors
+    ///
+    /// `session_stopped` for a stopped session, `session_not_attached` when
+    /// the runtime does not hold it, `runtime_unavailable` with no runtime.
+    pub async fn paper_shadow_check(&self, id: &str) -> Result<PaperShadowResult, BusError> {
+        self.post(
+            &format!("/api/v1/paper/sessions/{id}/shadow-check"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Stop one session; the log stays and becomes read-only.
+    ///
+    /// # Errors
+    ///
+    /// `session_stopped` for an already-stopped session,
+    /// `runtime_unavailable` with no runtime.
+    pub async fn paper_stop(&self, id: &str) -> Result<PaperStopResult, BusError> {
+        self.post(
+            &format!("/api/v1/paper/sessions/{id}/stop"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// The kill switch: stop every running session at once.
+    ///
+    /// # Errors
+    ///
+    /// `runtime_unavailable` with no runtime; per-session failures come back
+    /// IN the answer's `failures`, never as an error.
+    pub async fn paper_stop_all(&self) -> Result<StopAllResult, BusError> {
+        self.post("/api/v1/paper/stop-all", &serde_json::json!({}))
+            .await
+    }
+
+    /// Subscribe to one session's event stream, forwarding every frame into
+    /// `sink` until the token is refused or the channel dies.
+    ///
+    /// # Errors
+    ///
+    /// The not-connected refusal, a route refusal (an unknown session), or the
+    /// wire failure flattened. A token refusal is NOT an error: it is the
+    /// terminal [`PaperStreamEvent::TokenRefused`] on the channel.
+    pub async fn paper_session_events(
+        &self,
+        id: &str,
+        after_seq: Option<i64>,
+        sink: &(dyn PaperStreamSink + Send + Sync),
+    ) -> Result<(), BusError> {
+        let client = self.client_for_call()?;
+        self.proxy(client.stream_paper_session_inner(id, after_seq, sink))
+            .await
     }
 }
 

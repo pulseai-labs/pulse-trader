@@ -70,6 +70,62 @@ pub enum BusErrorCode {
     NotFound,
     /// The shell itself: a dead channel, a failed startup, a bug. Not a domain family.
     Internal,
+    /// The server refused a promotion because no walk-forward run certifies the
+    /// version (r3.s4.w5): `uncertified`.
+    ///
+    /// A family of its own rather than `Validation`: the remedy is not a
+    /// corrected argument but a decision — run a walk-forward, or supply the
+    /// typed override the uncertified path requires.
+    Uncertified,
+    /// The override's reason was empty (or whitespace) — `empty_reason`.
+    EmptyReason,
+    /// The certifying run passed under a **different** engine fingerprint —
+    /// `certified_under_other_engine` (E2). The override does not apply to
+    /// this case, so the code must be distinguishable from `uncertified`.
+    CertifiedUnderOtherEngine,
+    /// The certifying run's recorded inputs cannot be read, so the certified
+    /// data versions cannot be named — `certification_unreadable`.
+    CertificationUnreadable,
+    /// The session's log already ends in `stop`; it is read-only — `session_stopped`.
+    SessionStopped,
+    /// No paper runtime is running on the server, so a command that must reach
+    /// one cannot be honoured — `runtime_unavailable`.
+    RuntimeUnavailable,
+    /// The session runs but this runtime does not hold it — `session_not_attached`.
+    SessionNotAttached,
+}
+
+impl BusErrorCode {
+    /// The variant a server error body's `code` token names, when one does.
+    ///
+    /// The server's error bodies carry `{code, message}` with the *route's* own
+    /// vocabulary (`src/server/paper.rs`, `ops.rs`): the paper codes above, plus
+    /// tokens that deliberately fold onto an existing family — `unknown_version`
+    /// and `unknown_session` are `not_found` (the thing asked for is not there;
+    /// the remedy is a different name, not a retry). `None` means the token is
+    /// not one this bus knows, and the caller falls back to its own shape.
+    #[must_use]
+    pub fn from_server_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "data" => Self::Data,
+            "validation" => Self::Validation,
+            "backtest" => Self::Backtest,
+            "exchange" => Self::Exchange,
+            "llm" => Self::Llm,
+            "composer" => Self::Composer,
+            "busy" => Self::Busy,
+            "not_found" | "unknown_version" | "unknown_session" => Self::NotFound,
+            "internal" => Self::Internal,
+            "uncertified" => Self::Uncertified,
+            "empty_reason" => Self::EmptyReason,
+            "certified_under_other_engine" => Self::CertifiedUnderOtherEngine,
+            "certification_unreadable" => Self::CertificationUnreadable,
+            "session_stopped" => Self::SessionStopped,
+            "runtime_unavailable" => Self::RuntimeUnavailable,
+            "session_not_attached" => Self::SessionNotAttached,
+            _ => return None,
+        })
+    }
 }
 
 /// The single serializable error shape that crosses the Tauri boundary.

@@ -213,6 +213,85 @@ export const commands = {
 	 *  Never — the `Result` is the bus's uniform command shape.
 	 */
 	serverDisconnect: () => typedError<null, BusError>(__TAURI_INVOKE("server_disconnect")),
+	/**
+	 *  Promote a strategy version to a paper session — certified, or explicitly
+	 *  overridden with a typed reason.
+	 * 
+	 *  # Errors
+	 * 
+	 *  The promotion gate's typed refusals; see
+	 *  [`ClientState::paper_promote`](crate::client::ClientState::paper_promote).
+	 */
+	paperPromote: (request: PromoteRequest) => typedError<PaperSessionSummary, BusError>(__TAURI_INVOKE("paper_promote", { request })),
+	/**
+	 *  Every paper session's summary, in catalog order.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`] on a not-connected or wire failure.
+	 */
+	paperSessions: () => typedError<PaperSessionSummary[], BusError>(__TAURI_INVOKE("paper_sessions")),
+	/**
+	 *  One paper session's summary.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; an unknown id is `not_found`.
+	 */
+	paperSession: (id: string) => typedError<PaperSessionSummary, BusError>(__TAURI_INVOKE("paper_session", { id })),
+	/**
+	 *  One paper session's closed trades and open position.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; an unknown id is `not_found`.
+	 */
+	paperSessionTrades: (id: string) => typedError<PaperTrades, BusError>(__TAURI_INVOKE("paper_session_trades", { id })),
+	/**
+	 *  Run one session's shadow check now.
+	 * 
+	 *  # Errors
+	 * 
+	 *  `session_stopped`, `session_not_attached`, `runtime_unavailable` — see
+	 *  [`ClientState::paper_shadow_check`](crate::client::ClientState::paper_shadow_check).
+	 */
+	paperShadowCheck: (id: string) => typedError<PaperShadowResult, BusError>(__TAURI_INVOKE("paper_shadow_check", { id })),
+	/**
+	 *  Stop one paper session; the log stays and becomes read-only.
+	 * 
+	 *  # Errors
+	 * 
+	 *  `session_stopped` for an already-stopped session, `runtime_unavailable`
+	 *  with no runtime.
+	 */
+	paperStop: (id: string) => typedError<PaperStopResult, BusError>(__TAURI_INVOKE("paper_stop", { id })),
+	/**
+	 *  The kill switch: stop every running paper session at once. Per-session
+	 *  failures come back in the answer's `failures`, never as an error.
+	 * 
+	 *  # Errors
+	 * 
+	 *  `runtime_unavailable` with no runtime; see
+	 *  [`ClientState::paper_stop_all`](crate::client::ClientState::paper_stop_all).
+	 */
+	paperStopAll: () => typedError<StopAllResult, BusError>(__TAURI_INVOKE("paper_stop_all")),
+	/**
+	 *  Subscribe to one session's event stream, forwarding every `paper` frame
+	 *  into the per-invocation channel until the token is refused or the channel
+	 *  dies (the unmount shape). The channel IS the correlation: a second session
+	 *  gets a second channel.
+	 * 
+	 *  `after_seq` resumes from a known cursor; `None` replays the whole log. The
+	 *  sequence is `i32` because the bindings exporter refuses `i64` — the
+	 *  server's per-session counter, and the client widens it for the wire.
+	 * 
+	 *  # Errors
+	 * 
+	 *  The not-connected refusal or a route refusal (an unknown session). A token
+	 *  refusal is NOT an error: it is the terminal
+	 *  [`PaperStreamEvent::TokenRefused`] on the channel.
+	 */
+	paperSessionEvents: (id: string, afterSeq: number | null, channel: Channel<PaperStreamEvent>) => typedError<null, BusError>(__TAURI_INVOKE("paper_session_events", { id, afterSeq, channel })),
 };
 
 /* Types */
@@ -501,7 +580,38 @@ export type BusErrorCode =
  */
 "not_found" | 
 /**  The shell itself: a dead channel, a failed startup, a bug. Not a domain family. */
-"internal";
+"internal" | 
+/**
+ *  The server refused a promotion because no walk-forward run certifies the
+ *  version (r3.s4.w5): `uncertified`.
+ * 
+ *  A family of its own rather than `Validation`: the remedy is not a
+ *  corrected argument but a decision — run a walk-forward, or supply the
+ *  typed override the uncertified path requires.
+ */
+"uncertified" | 
+/**  The override's reason was empty (or whitespace) — `empty_reason`. */
+"empty_reason" | 
+/**
+ *  The certifying run passed under a **different** engine fingerprint —
+ *  `certified_under_other_engine` (E2). The override does not apply to
+ *  this case, so the code must be distinguishable from `uncertified`.
+ */
+"certified_under_other_engine" | 
+/**
+ *  The certifying run's recorded inputs cannot be read, so the certified
+ *  data versions cannot be named — `certification_unreadable`.
+ */
+"certification_unreadable" | 
+/**  The session's log already ends in `stop`; it is read-only — `session_stopped`. */
+"session_stopped" | 
+/**
+ *  No paper runtime is running on the server, so a command that must reach
+ *  one cannot be honoured — `runtime_unavailable`.
+ */
+"runtime_unavailable" | 
+/**  The session runs but this runtime does not hold it — `session_not_attached`. */
+"session_not_attached";
 
 /**
  *  One event on one run's channel.
@@ -1050,6 +1160,305 @@ export type MutationDto = {
 	newValue: string,
 };
 
+/**  One certified `(timeframe, data_version)` pair — `CertifiedDataVersion`. */
+export type PaperCertifiedDataVersion = {
+	/**  The timeframe the version belongs to (`15m`/`4h`/`1d`). */
+	timeframe: string,
+	/**  The content-hash `data_version`. */
+	data_version: string,
+};
+
+/**  A closed trade — `PaperClosedTrade`. */
+export type PaperClosedTrade = {
+	/**  The side that closed. */
+	side: string,
+	/**  The closed quantity, exact decimal text. */
+	qty: string,
+	/**  The entry price, when the log recorded one. */
+	entry_price: string | null,
+	/**  The entry instant, when the log recorded one. */
+	entry_fill_time: string | null,
+	/**  The exit fill price, exact decimal text. */
+	exit_price: string,
+	/**  The exit fill instant (RFC3339). */
+	exit_fill_time: string,
+	/**  Why the position closed. */
+	exit_reason: string,
+	/**  The trade's realized R-multiple, when the fill recorded one. */
+	realized_r: string | null,
+};
+
+/**
+ *  The session's comparison — `OosComparison`. The verdict is flattened, so
+ *  `status` sits beside the two notes exactly as it does on the wire.
+ */
+export type PaperComparison = {
+	/**  How many engine builds the session has run under. */
+	engine_builds: number,
+	/**
+	 *  Whether the certifying run's fingerprint is not this build's (E3:
+	 *  shown, never enforced).
+	 */
+	certification_stale: boolean,
+} & PaperComparisonVerdict;
+
+/**
+ *  The out-of-sample comparison's verdict — `ComparisonVerdict`, tagged on
+ *  `status`.
+ */
+export type PaperComparisonVerdict = 
+/**  No comparison applies; `reason` is the sentence to show. */
+{ status: "not_applicable"; 
+/**  Why there is nothing to compare (the server's own text). */
+reason: string } | 
+/**  Fewer than `of` counted closed trades so far. */
+{ status: "pending"; 
+/**  The counted closed trades with a realized R. */
+n: number; 
+/**  The floor (`session.min_trades`). */
+of: number } | 
+/**  The live mean R sits inside the fold range. */
+{ status: "within"; 
+/**  The live mean R, exact decimal text. */
+live_mean_r: string; 
+/**  The counted closed trades. */
+n: number; 
+/**  The certifying run's lowest fold mean R. */
+fold_min: string; 
+/**  The certifying run's highest fold mean R. */
+fold_max: string } | 
+/**  The live mean R is below the fold range. */
+{ status: "below"; 
+/**  The live mean R, exact decimal text. */
+live_mean_r: string; 
+/**  The counted closed trades. */
+n: number; 
+/**  The certifying run's lowest fold mean R. */
+fold_min: string; 
+/**  The certifying run's highest fold mean R. */
+fold_max: string } | 
+/**  The live mean R is above the fold range. */
+{ status: "above"; 
+/**  The live mean R, exact decimal text. */
+live_mean_r: string; 
+/**  The counted closed trades. */
+n: number; 
+/**  The certifying run's lowest fold mean R. */
+fold_min: string; 
+/**  The certifying run's highest fold mean R. */
+fold_max: string };
+
+/**
+ *  An epoch-millisecond integer carried as its exact text — `i64` is refused
+ *  by the bindings export (the `src/tauri/backtest.rs` `ms()` rule).
+ */
+export type PaperEpochMs = string;
+
+/**
+ *  One `paper` frame from the session stream: the log event's sequence, its
+ *  `type` tag, and the event's own JSON as text ([`json_text`] — the payload
+ *  is an arbitrary event body).
+ */
+export type PaperEventFrame = {
+	/**  The event's per-session sequence. */
+	seq: number,
+	/**  The event's `type` tag (`bar_processed`, `fill`, `shadow_checked`, …). */
+	type: string,
+	/**  The event's own JSON, compact text. */
+	payload: PaperJsonText,
+};
+
+/**
+ *  How the session was promoted — `Graduation`, internally tagged on
+ *  `graduation`.
+ */
+export type PaperGraduation = 
+/**  Promoted by a passing walk-forward on the current build. */
+{ graduation: "certified"; 
+/**  The certifying `walk_forward_run`. */
+walk_forward_run_id: string; 
+/**  The distinct certified versions, in fold order. */
+data_versions: PaperCertifiedDataVersion[] } | 
+/**  Promoted by a human override: the reason and the instant it was taken. */
+{ graduation: "override"; 
+/**  Why the human overrode the gate. */
+reason: string; 
+/**  The RFC3339 instant of the override decision. */
+at: string };
+
+/**
+ *  An arbitrary JSON value carried as its compact text.
+ * 
+ *  The `shadow_checked` verdict's two sides and a stream frame's payload are
+ *  the only arbitrary-JSON fields on this wire. They cross as text because
+ *  specta refuses `serde_json::Value` (module docs); deserialization accepts
+ *  ANY JSON value and stores its compact form, and serialization writes that
+ *  text back. The screen parses the text where it renders it — it never
+ *  re-derives a value the server computed.
+ */
+export type PaperJsonText = string;
+
+/**  The open position — `PaperPosition`. */
+export type PaperPosition = {
+	/**  The position's side (`long`/`short`). */
+	side: string,
+	/**  The filled quantity, exact decimal text. */
+	qty: string,
+	/**  The entry fill price, exact decimal text. */
+	entry_price: string,
+	/**  The entry fill instant (RFC3339). */
+	entry_fill_time: string,
+};
+
+/**
+ *  One session's summary — `SessionSummary`, the shape both the promote and
+ *  the read routes answer with.
+ */
+export type PaperSessionSummary = {
+	/**  The session id. */
+	id: string,
+	/**  The promoted strategy version. */
+	strategy_version_id: string,
+	/**  The traded pair. */
+	pair: string,
+	/**  The primary timeframe. */
+	primary_timeframe: string,
+	/**  The higher timeframe, when the session uses one. */
+	htf_timeframe: string | null,
+	/**  Whether the session consumes the fixed daily series. */
+	uses_d1: boolean,
+	/**  How the session was promoted. */
+	graduation: PaperGraduation,
+	/**  Whether every certified data version is a fixture snapshot. */
+	fixture: boolean,
+	/**  The promoting token's label. */
+	promoted_by: string,
+	/**  Running or stopped, with the stop actor. */
+	status: PaperStatus,
+	/**  The engine fingerprints in order (E3). */
+	epochs: string[],
+	/**  The newest consumed bar's `open_time`, as exact epoch-millisecond text. */
+	last_bar_open_time: PaperEpochMs | null,
+	/**  How many closed trades the log holds. */
+	closed_trade_count: number,
+	/**  The open position, when one stands. */
+	open_position: PaperPosition | null,
+	/**  The latest shadow verdict per epoch, in epoch order. */
+	shadow_checks: PaperShadowCheck[],
+	/**  Whether the certifying run's fingerprint is not this build's. */
+	certification_stale: boolean,
+	/**  The OOS comparison. */
+	comparison: PaperComparison,
+};
+
+/**  One epoch's latest shadow verdict — `EpochShadowCheck`. */
+export type PaperShadowCheck = {
+	/**  The epoch's engine fingerprint. */
+	engine_fingerprint: string,
+	/**  The epoch's latest verdict. */
+	result: PaperShadowResult,
+};
+
+/**
+ *  One shadow check's verdict — `ShadowResult`, tagged on `verdict`. `live` and
+ *  `shadow` are the server's own JSON values as text ([`json_text`]): the
+ *  server may put a trade, a count or a position mark there, so no shape may
+ *  be assumed.
+ */
+export type PaperShadowResult = 
+/**  The live epoch and the shadow agree. */
+{ verdict: "identical"; 
+/**  How many closed trades the check compared. */
+closed_trades: number; 
+/**  Whether an open position was compared (and agreed). */
+open_position: boolean } | 
+/**  They disagree; the first divergence is named in the server's own words. */
+{ verdict: "drift"; 
+/**  What diverged first, as the server wrote it. */
+first_divergence: string; 
+/**  The live side of the divergence, JSON text. */
+live: PaperJsonText; 
+/**  The shadow side of the divergence, JSON text. */
+shadow: PaperJsonText };
+
+/**  Whether a session runs or has stopped — `SessionStatus`, tagged on `state`. */
+export type PaperStatus = 
+/**  Live: bars are consumed and orders fill. */
+{ state: "running" } | 
+/**  Stopped: the log is read-only. */
+{ state: "stopped"; 
+/**  The recorded stopping actor, when the log names one. */
+stopped_by: PaperStopActor | null };
+
+/**  Who stopped a session — `StopActor`. */
+export type PaperStopActor = 
+/**  A single session stopped by this client token. */
+({ token: {
+	/**  The stopping token's label. */
+	label: string,
+} }) & { stop_all?: never } | 
+/**  Every running session stopped by a `stop_all` sweep. */
+({ stop_all: {
+	/**  The token label that issued the sweep. */
+	issuer: string,
+} }) & { token?: never };
+
+/**  What `paper_stop` answered — the stop route's body. */
+export type PaperStopResult = {
+	/**  The session that stopped. */
+	session_id: string,
+	/**
+	 *  Whether the stop skipped the final shadow check (an unattached
+	 *  session).
+	 */
+	stopped_without_shadow: boolean,
+};
+
+/**
+ *  What arrives on a session stream's channel: one frame, in seq order, or the
+ *  terminal refusal. Internally tagged, so the frontend switches on one
+ *  discriminated union.
+ */
+export type PaperStreamEvent = 
+/**  One log frame, in seq order. */
+{
+	kind: "frame",
+} & PaperEventFrame | 
+/**  The server revoked the presented token; the stream is over. */
+{ kind: "tokenRefused"; 
+/**  The server's own reason text. */
+reason: string };
+
+/**  One session's trades — `SessionTrades`. */
+export type PaperTrades = {
+	/**  The closed trades, in log order, with their realized R. */
+	closed_trades: PaperClosedTrade[],
+	/**  The open position, when one stands. */
+	open_position: PaperPosition | null,
+};
+
+/**  The typed override half of a promote — `OverrideRequest` on the wire. */
+export type PromoteOverride = {
+	/**  Why the human overrode the gate (trimmed non-empty by the server). */
+	reason: string,
+	/**  The pair the session trades. */
+	pair: string,
+	/**  The session's primary timeframe. */
+	primary_timeframe: string,
+	/**  The session's higher timeframe, when named. */
+	htf_timeframe: string | null,
+	/**  Whether the session consumes the fixed daily series. */
+	uses_d1: boolean,
+};
+
+/**  What `paper_promote` is asked for — the route's body, literally. */
+export type PromoteRequest = {
+	/**  The strategy version to promote. */
+	version_id: string,
+	/**  The typed override, when the caller supplies one. */
+	override: PromoteOverride | null,
+};
+
 /**  The coach's single proposal, as the rail's card renders it. */
 export type ProposalDto = {
 	/**  The one change. */
@@ -1159,6 +1568,26 @@ export type ShellInfo = {
 	targetTriple: string,
 	/**  How many strategies the database holds — a real read through managed state. */
 	strategyCount: number,
+};
+
+/**
+ *  What `paper_stop_all` answered — the kill switch's own shape. `failures` is
+ *  always present: a sweep that reports only its successes would hide exactly
+ *  the sessions a trader needs to see.
+ */
+export type StopAllResult = {
+	/**  The sessions that stopped. */
+	stopped: string[],
+	/**  The sessions that did not, with their typed code. */
+	failures: StopFailure[],
+};
+
+/**  One session `stop_all` could not stop — the route's `failures[]` entry. */
+export type StopFailure = {
+	/**  The session that did not stop. */
+	id: string,
+	/**  The runtime's typed error code for it. */
+	code: string,
 };
 
 /**  How a streaming run ended. */

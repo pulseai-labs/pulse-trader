@@ -458,6 +458,14 @@ interface WindowChromeProps {
    * else. Absent (undefined) renders no pill at all.
    */
   serverStatus?: ServerStatus;
+  /**
+   * How many paper sessions are running, when the count is known (r3.s4.w5).
+   * The strip renders "N paper · 0 live" — the live half is the recorded truth
+   * that no live-execution path exists in this release, never a count read
+   * from anywhere. Absent (undefined) renders no paper pill at all, so a
+   * disconnected app claims nothing.
+   */
+  paperRunning?: number;
   children?: ReactNode;
 }
 
@@ -466,7 +474,12 @@ interface WindowChromeProps {
  * `decorations: false` for exactly this reason) plus whatever `children` mounts
  * below it. `installFit()` is NOT ported — see this file's header comment.
  */
-export function WindowChrome({ docTitle, serverStatus, children }: WindowChromeProps) {
+export function WindowChrome({
+  docTitle,
+  serverStatus,
+  paperRunning,
+  children,
+}: WindowChromeProps) {
   const { mode, theme, cycle } = useTheme();
   return (
     <div className="window" data-theme={theme}>
@@ -528,6 +541,11 @@ export function WindowChrome({ docTitle, serverStatus, children }: WindowChromeP
             <span className="title-status">
               <span className="dot" data-state={serverStatus.state} />
               {serverStatusText(serverStatus)}
+            </span>
+          )}
+          {paperRunning !== undefined && (
+            <span className="title-status" title="Paper sessions running on the server">
+              {paperRunning} paper · 0 live
             </span>
           )}
         </div>

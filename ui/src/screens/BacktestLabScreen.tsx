@@ -47,7 +47,9 @@ import type {
   BusResult,
   OperationRecord,
 } from "../hooks/useActiveOperations";
+import { PromoteSheet } from "../components/PromoteSheet";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
+import { openSessionDetail, takeRequestedBacktestVersion } from "../paper/handoff";
 
 /** The em dash every null renders — a statement that no value exists, never
  * a zero dressed up as data (the Library's grill A1 rule, applied here). */
@@ -601,6 +603,7 @@ const TRADE_FIELDS = [
 export default function BacktestLabScreen() {
   const [catalog, setCatalog] = useState<CatalogState>({ kind: "loading" });
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [promoting, setPromoting] = useState(false);
   /** Every active operation, held above the route (#141). The Lab READS it. */
   const operations = useActiveOperations();
 
@@ -661,6 +664,19 @@ export default function BacktestLabScreen() {
       alive = false;
     };
   }, [loadCatalog]);
+
+  // r3.s4.w5: the stale sheet's only action — "Re-run walk-forward" — asks for
+  // THIS version and lands here. Consumed on mount (the navigation mounts this
+  // screen) and on the next hash change (the screen was already open).
+  useEffect(() => {
+    const take = () => {
+      const requested = takeRequestedBacktestVersion();
+      if (requested !== null) setSelectedId(requested);
+    };
+    take();
+    window.addEventListener("hashchange", take);
+    return () => window.removeEventListener("hashchange", take);
+  }, []);
 
   // C2 (r2.s1.w4): versions and runs written by `pulse mcp` surface on window
   // focus — DOM events only, throttled inside the hook. The refetch is the
@@ -912,7 +928,23 @@ export default function BacktestLabScreen() {
           a fold row's "open run" lands in the ordinary result view below it.
           #268: it renders this session's own run, or the version's persisted
           one read back by id. */}
-      <WalkForwardPane state={pane} onOpenFold={wf.openFold} />
+      <WalkForwardPane
+        state={pane}
+        onOpenFold={wf.openFold}
+        onPromote={selectedVersion === null ? null : () => setPromoting(true)}
+      />
+
+      {promoting && selectedVersion !== null && (
+        <PromoteSheet
+          target={{
+            version: selectedVersion,
+            strategyName: selectedVersion.dsl.name,
+            versionLabel: options.find((option) => option.value === selectedVersion.id)?.label ?? selectedVersion.id,
+          }}
+          onClose={() => setPromoting(false)}
+          onPromoted={openSessionDetail}
+        />
+      )}
 
       {/* #212: a refused fold count starts no operation — the refusal renders on
           the same error surface the failed states use, naming the allowed
@@ -987,9 +1019,11 @@ export default function BacktestLabScreen() {
 function WalkForwardPane({
   state,
   onOpenFold,
+  onPromote,
 }: {
   state: PaneState;
   onOpenFold: (runId: string) => void;
+  onPromote: (() => void) | null;
 }) {
   if (state.kind === "running") {
     return (
@@ -1029,7 +1063,7 @@ function WalkForwardPane({
             Persisted run, reopened by id — nothing was re-run.
           </p>
         )}
-        <WalkForwardResult dto={state.dto} onOpenFold={onOpenFold} />
+        <WalkForwardResult dto={state.dto} onOpenFold={onOpenFold} onPromote={onPromote} />
       </>
     );
   }
@@ -1040,9 +1074,11 @@ function WalkForwardPane({
 function WalkForwardResult({
   dto,
   onOpenFold,
+  onPromote,
 }: {
   dto: WalkForwardRunDto;
   onOpenFold: (runId: string) => void;
+  onPromote: (() => void) | null;
 }) {
   const verdict = dto.verdict;
   return (
@@ -1070,6 +1106,14 @@ function WalkForwardResult({
         </span>{" "}
         folds hold · pooled lower bound{" "}
         <span className="mono">{verdict.pooled.lowerBound ?? EM_DASH}</span>
+        {/* r3.s4.w5: spec §2's second entry point — a passing verdict offers
+            the promotion right here. The sheet decides the variant from the
+            server; this button only opens it. */}
+        {verdict.pass && onPromote !== null && (
+          <button className="btn-sec-sm bt-wf-promote" onClick={onPromote}>
+            Promote to paper
+          </button>
+        )}
       </p>
       <div className="bt-table-scroll" role="region" aria-label="Fold rows" tabIndex={0}>
         <table className="bt-trades bt-wf-folds">

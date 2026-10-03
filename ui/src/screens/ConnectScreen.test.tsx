@@ -22,6 +22,9 @@ vi.mock("../bindings", () => ({
     // The credential banner rides App; a no-credential env keeps the tree
     // quiet so the gate is the only thing under assertion.
     credentialStatus: vi.fn().mockResolvedValue("env"),
+    // r3.s4.w5: App polls the running paper-session count for the titlebar
+    // pill; an empty list keeps the strip at "0 paper · 0 live".
+    paperSessions: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
   },
 }));
 
