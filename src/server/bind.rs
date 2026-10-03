@@ -570,10 +570,15 @@ pub async fn run_paper_runtime<R, B, S, C, E>(
         tokio::select! {
             _ = stop.changed() => break,
             command = commands.recv() => {
-                if let Some(command) = command {
-                    runtime.handle_command(command).await;
+                match command {
+                    Some(command) => {
+                        runtime.handle_command(command).await;
+                        continue;
+                    }
+                    // The control handle is gone: nothing will ever arrive
+                    // again, so re-polling this arm would busy-spin.
+                    None => break,
                 }
-                continue;
             }
             tick = trigger.next() => {
                 match tick {
