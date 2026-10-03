@@ -234,7 +234,9 @@ export default function DeploymentDashboard() {
       {paneHost !== null &&
         selected !== null &&
         createPortal(
-          <SessionDetail sessionId={selected} onChanged={() => void load()} />,
+          // Keyed by id: a switch remounts the detail, so a read still pending
+          // for the previous session cannot land in the new one.
+          <SessionDetail key={selected} sessionId={selected} onChanged={() => void load()} />,
           paneHost,
         )}
     </>
