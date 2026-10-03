@@ -27,6 +27,34 @@
 //! r1.s4.w2 — for exactly that, and for the ADR-0015 rule that
 //! `crate::adapters::backtest` is the ring's ONE deliberate adapter import.
 
+// r3.s4.w2 (ADR-0027): the paper-session promotion use case — resolve the
+// version, its latest walk-forward run and the fold runs' recorded inputs,
+// run the pure gate, derive the `fixture` flag from the `fixture_snapshot`
+// rows, and insert the session row. w4 wires the API surface.
+pub(crate) mod paper;
+
+// r3.s4.w3 (ADR-0027, E1/E3): the live paper runtime — REST-polled closed bars
+// stepped through each session's `EngineSession`, one atomic append per bar,
+// boot catch-up, the shadow check and the engine epochs. `pulse serve` owns
+// the timer and the shutdown; w4 owns the routes.
+pub(crate) mod paper_runtime;
+
+// r3.s4.w4 (spec §1): the control handle into the runtime thread — the
+// cloneable command channel the routes hold, its typed replies and its bounded
+// reply timeout.
+pub(crate) mod paper_control;
+
+// r3.s4.w4 (spec §4): the paper read model — the session summary, the trades
+// and the event list, built once for both the HTTP routes and the MCP tools.
+pub(crate) mod paper_read;
+
+// r3.s4.w2 (ADR-0027): the certify-fixture ring — the deterministic synthetic
+// series' pair/candle accessors, the pinned dip-buy strategy document minted
+// from the generator's own constants, and (with the AC-4 loop) the `seed` use
+// case that stamps the series into the candle store and the durable
+// fixture/strategy/walk-forward rows.
+pub(crate) mod fixture;
+
 pub(crate) mod backtest;
 
 // r1.s4.w1 (#131 / #132, ADR-0015): the SEALED coach turn. One crate-private entry

@@ -384,6 +384,10 @@ pub use adapters::db::{Db, MIGRATOR};
 // `db/mod.rs` re-export alone is necessary but NOT sufficient). 1.05's CLI consumes
 // it through the `StrategyRepository` port.
 pub use adapters::db::SqliteStrategyRepo;
+// r3.s4.w4: the client-token repository is the SSE suite's revocation seam
+// (revoking a token must end an open stream), so it is surfaced like the
+// other SQLite adapters.
+pub use adapters::db::SqliteClientTokenRepo;
 // VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter. `SqliteBacktestRunRepo`
 // implements the FR-6 persisted-run surface over `query!`/`query_as!` (the
 // committed `.sqlx/` cache). REQUIRED under `deny(warnings)` + `pub(crate) mod
@@ -447,8 +451,8 @@ pub use adapters::db::ops::{
 // a `dead_code` build error otherwise.
 pub use server::auth::{Scope, hash_token, mint_token};
 pub use server::bind::{
-    BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, bind_with_retry,
-    check_bind,
+    BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, WakeTrigger,
+    bind_with_retry, check_bind, run_paper_runtime,
 };
 pub use server::log::{CaptureLog, RequestLog};
 pub use server::{API_VERSION, ServerState, mount_scoped, router};
@@ -515,6 +519,7 @@ pub use adapters::broker::BinanceAdapter;
 // build error, not a warning. 2.04 steps the detector over the run + aggregates
 // the breakdown onto `BacktestResult`; 2.05 renders it.
 pub use adapters::backtest::RegimeDetector;
+pub use adapters::backtest::{EngineSession, SessionTimeframes};
 pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 
 // VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface
@@ -559,6 +564,61 @@ pub use domain::{
     WalkForwardRunDraft, WalkForwardRunId, WalkForwardRunRepository, Z, fold_windows,
     folds_required,
 };
+
+// r3.s4.w2 (ADR-0027): the certify-fixture surface — the deterministic
+// synthetic series' accessors and the pinned fixture strategy document the
+// fixture proof (`tests/certify_fixture.rs`) and the `pulse fixture` command
+// ride. Re-exported because an un-re-exported public item is a `dead_code`
+// BUILD error under `deny(warnings)` (the harvested gotcha).
+pub use application::fixture::{
+    FIXTURE_PAIR, FIXTURE_SEED, FIXTURE_STRATEGY_NAME, FIXTURE_STRATEGY_TAG, fixture_h4_candles,
+    fixture_h4_candles_from, fixture_m15_candles, fixture_pair, fixture_strategy_dsl,
+};
+
+// r3.s4.w2 (ADR-0027): the paper-session surface — the promotion use case (E2)
+// and its typed refusal taxonomy, the repository port, and the SQLite adapter.
+// The domain value types ride the `pub use domain::{...}` re-export above.
+// Re-exported because an un-re-exported public item is a `dead_code` BUILD
+// error under `deny(warnings)` (the harvested gotcha).
+pub use adapters::db::SqlitePaperSessionRepo;
+pub use application::paper::{OverrideRequest, PaperPromotionError, promote};
+
+// r3.s4.w3 (ADR-0027, E1/E3): the live runtime's surface — the polling loop,
+// the boot catch-up, the shadow check and its typed payload, the closed-bar
+// source port and its REST adapter, and the pure boundary/event/compare half.
+// Re-exported because an un-re-exported public item is a `dead_code` BUILD
+// error under `deny(warnings)`.
+pub use adapters::binance::RestClosedBars;
+pub use application::paper_runtime::{
+    LiveEnv, PaperRuntime, PaperRuntimeError, RuntimeLog, SessionEnv, SessionFailure,
+};
+pub use domain::FixtureSnapshotStore;
+pub use domain::PaperSessionRepository;
+pub use domain::{
+    BarBoundaries, ClosedBarSource, EpochStart, ShadowResult, StepView, boundaries, compare,
+    daily_shadow_due, events_for_step, first_open_bar_ms, next_utc_midnight_after,
+};
+pub use domain::{
+    BarRef, CertifiedDataVersion, EmptyTextError, Graduation, MIN_TRADES, NonEmptyLabel,
+    NonEmptyReason, NonEmptyText, PaperClosedTrade, PaperEvent, PaperEventDecodeError,
+    PaperPosition, PaperSession, PaperSessionDraft, PaperSessionId, PaperSessionState,
+    PaperSessionStatus, PaperSide, PromotionDraft, PromotionOverride, PromotionRefused,
+    ReplayError, SLIPPAGE_BPS, STARTING_EQUITY_USDT, StopActor, TAKER_FEE_BPS, decide_promotion,
+};
+
+// r3.s4.w4 (spec §1/§3/§4): the control handle into the runtime, the OOS
+// comparison's pure surface, and the paper read model — the three surfaces the
+// server routes and the MCP read tools share. Re-exported for the same
+// `deny(warnings)` reason as the w3 block above.
+pub use application::paper_control::{
+    DEFAULT_PAPER_REPLY_TIMEOUT_MS, PaperCommand, PaperControl, PaperControlError,
+    ShadowCheckReply, StopAllReply, StopReply,
+};
+pub use application::paper_read::{
+    EpochShadowCheck, PaperReadError, SessionStatus, SessionSummary, SessionTrades, list_summaries,
+    session_events, session_summary, session_trades,
+};
+pub use domain::{ComparisonVerdict, OosComparison, comparison};
 
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
 // `d11`). Re-exported because `tests/tauri_backtest.rs` injects post-save read
@@ -722,6 +782,18 @@ pub use crate::tauri::{
     FoldVerdictDto, GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardFoldDto,
     WalkForwardRunDto, WalkForwardRunRequest, WalkForwardVerdictDto, get_backtest_run_core,
     get_walk_forward_run_core, run_walk_forward_version_core,
+};
+// r3.s4.w5: the paper session surface's wire contract — the DTOs the eight
+// commands answer with, the stream channel's event and sink types, and the
+// request bodies. `tests/tauri_paper.rs` (AC-1) drives them through the
+// `ClientState` the command wrappers use. (`tauri::paper::PaperPosition` is
+// deliberately NOT re-exported here: the domain's own `PaperPosition` already
+// owns that name at the crate root, and the two are the same wire shape.)
+pub use crate::tauri::{
+    PaperCertifiedDataVersion, PaperComparison, PaperComparisonVerdict, PaperEpochMs,
+    PaperEventFrame, PaperGraduation, PaperJsonText, PaperSessionSummary, PaperShadowCheck,
+    PaperShadowResult, PaperStatus, PaperStopActor, PaperStopResult, PaperStreamEvent,
+    PaperStreamSink, PaperTrades, PromoteOverride, PromoteRequest, StopAllResult, StopFailure,
 };
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the

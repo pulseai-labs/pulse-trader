@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::adapters::store::default_base_dir;
-use crate::server::bind::ServeConfig;
+use crate::application::paper_control::DEFAULT_PAPER_REPLY_TIMEOUT_MS;
+use crate::server::bind::{DEFAULT_POLL_GRACE_MS, ServeConfig};
 
 /// `pulse serve --bind <ip:port>` — run the server on this host until
 /// SIGTERM/SIGINT.
@@ -52,6 +53,8 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
         dev_loopback: args.dev_loopback,
         db,
         data_dir,
+        poll_grace_ms: DEFAULT_POLL_GRACE_MS,
+        paper_reply_timeout_ms: DEFAULT_PAPER_REPLY_TIMEOUT_MS,
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))

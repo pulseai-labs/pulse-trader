@@ -129,8 +129,8 @@ fn stdout_carries_only_jsonrpc_frames_and_stdin_close_exits_cleanly() {
     let tools: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(
         tools["result"]["tools"].as_array().map(Vec::len),
-        Some(11),
-        "the eleven declared tools are listed (seven read + w3's two write + w5's two walk-forward)"
+        Some(15),
+        "the fifteen declared tools are listed (eleven read + w3's two write + w5's two walk-forward)"
     );
 
     // 4. One export — a real store read whose response must still be a single

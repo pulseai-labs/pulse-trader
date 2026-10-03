@@ -87,6 +87,62 @@ impl PageSource for RestPageSource {
     }
 }
 
+/// The production [`ClosedBarSource`](crate::domain::ClosedBarSource) for the
+/// live paper runtime (r3.s4.w3, E1): the incremental REST top-up under the
+/// runtime's port. Generic over its [`PageSource`] and [`Clock`], so a test
+/// drives the whole adapter offline against recorded pages.
+///
+/// Funding is fetched from one millisecond past the boundary candle, so an
+/// event already stamped onto the recorded boundary bar never re-stamps a newer
+/// one (`BinanceDataSource`'s convention, `source.rs`).
+pub struct RestClosedBars<P, C> {
+    pages: P,
+    clock: C,
+}
+
+impl<P, C> RestClosedBars<P, C> {
+    /// Compose over explicit seams (the offline-testable constructor).
+    #[must_use]
+    pub fn new(pages: P, clock: C) -> Self {
+        Self { pages, clock }
+    }
+}
+
+impl<C: Clock> RestClosedBars<RestPageSource, C> {
+    /// The live source over a fresh [`RestPageSource`] (the sole
+    /// network-touching seam — the production `pulse serve` path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Io`] if the underlying HTTP client cannot be built.
+    pub fn live(clock: C) -> Result<Self, DataError> {
+        Ok(Self {
+            pages: RestPageSource::new()?,
+            clock,
+        })
+    }
+}
+
+impl<P, C> crate::domain::ClosedBarSource for RestClosedBars<P, C>
+where
+    P: PageSource + Sync,
+    C: Clock + Sync,
+{
+    fn closed_since(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        since_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send {
+        let pair = pair.clone();
+        let pages = &self.pages;
+        let clock = &self.clock;
+        async move {
+            fetch_incremental_with(pages, clock, &pair, timeframe, since_ms, since_ms + 1).await
+        }
+    }
+}
+
 /// One raw funding row from `/fapi/v1/fundingRate`.
 #[derive(Debug, Deserialize)]
 struct RawFunding {

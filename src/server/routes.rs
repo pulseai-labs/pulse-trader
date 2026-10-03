@@ -38,7 +38,7 @@ use crate::tauri::walk_forward::{get_backtest_run_core, get_walk_forward_run_cor
 /// matchit, and the five static `ops/...` POSTs coexist with the two `{op_id}`
 /// GETs because their methods differ.
 pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum::Router {
-    router
+    let router = router
         // The five operation spawns (202 before any work).
         .mount_post(state, "/api/v1/ops/compose-strategy", |state, req| {
             Box::pin(ops::op_compose_strategy(state, req))
@@ -97,7 +97,10 @@ pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum:
             state,
             "/api/v1/bus-selftest-failure",
             |_state, _body: Value| Box::pin(std::future::ready(plain_bus_selftest_failure())),
-        )
+        );
+    // r3.s4.w4: the paper routes (promote, stop, stop-all, the reads, the
+    // shadow check and the session SSE stream) — all `Scope::App`.
+    super::paper::mount(router, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -114,8 +117,9 @@ type BoxedFut = std::pin::Pin<Box<dyn Future<Output = Response> + Send>>;
 /// One mount, one closure shape. Each helper adapts a handler that takes what
 /// it actually needs (the state plus its extractors) into a state-capturing
 /// method router, then hands it to `mount_scoped` so the outer stack rides on
-/// every route identically.
-trait MountExt: Sized {
+/// every route identically. `pub(crate)` because `server::paper` mounts the
+/// paper routes through the same helpers.
+pub(crate) trait MountExt: Sized {
     fn mount_get<F>(self, state: &Arc<ServerState>, path: &'static str, handler: F) -> Self
     where
         F: Fn(Arc<ServerState>) -> BoxedFut + Clone + Send + Sync + 'static;
@@ -144,6 +148,10 @@ trait MountExt: Sized {
         path: &'static str,
         handler: F,
     ) -> Self
+    where
+        F: Fn(Arc<ServerState>, String, Request) -> BoxedFut + Clone + Send + Sync + 'static;
+
+    fn mount_post_path<F>(self, state: &Arc<ServerState>, path: &'static str, handler: F) -> Self
     where
         F: Fn(Arc<ServerState>, String, Request) -> BoxedFut + Clone + Send + Sync + 'static;
 }
@@ -206,6 +214,15 @@ impl MountExt for axum::Router {
         let st = state.clone();
         let method =
             get(move |Path(op_id): Path<String>, req: Request| handler(st.clone(), op_id, req));
+        super::mount_scoped(self, state, Scope::App, path, method)
+    }
+
+    fn mount_post_path<F>(self, state: &Arc<ServerState>, path: &'static str, handler: F) -> Self
+    where
+        F: Fn(Arc<ServerState>, String, Request) -> BoxedFut + Clone + Send + Sync + 'static,
+    {
+        let st = state.clone();
+        let method = post(move |Path(id): Path<String>, req: Request| handler(st.clone(), id, req));
         super::mount_scoped(self, state, Scope::App, path, method)
     }
 }

@@ -272,6 +272,23 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
         (BusErrorCode::Busy, "busy"),
         (BusErrorCode::NotFound, "not_found"),
         (BusErrorCode::Internal, "internal"),
+        // r3.s4.w5: the paper promotion/control refusals. Each is a family of
+        // its own so the screen can branch on the code rather than on prose —
+        // and `certified_under_other_engine` MUST be distinguishable from
+        // `uncertified`, because E2 refuses the first with no override at all.
+        (BusErrorCode::Uncertified, "uncertified"),
+        (BusErrorCode::EmptyReason, "empty_reason"),
+        (
+            BusErrorCode::CertifiedUnderOtherEngine,
+            "certified_under_other_engine",
+        ),
+        (
+            BusErrorCode::CertificationUnreadable,
+            "certification_unreadable",
+        ),
+        (BusErrorCode::SessionStopped, "session_stopped"),
+        (BusErrorCode::RuntimeUnavailable, "runtime_unavailable"),
+        (BusErrorCode::SessionNotAttached, "session_not_attached"),
     ];
 
     for (code, token) in &pinned {
@@ -298,10 +315,17 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
             | BusErrorCode::Composer
             | BusErrorCode::Busy
             | BusErrorCode::NotFound
-            | BusErrorCode::Internal => {}
+            | BusErrorCode::Internal
+            | BusErrorCode::Uncertified
+            | BusErrorCode::EmptyReason
+            | BusErrorCode::CertifiedUnderOtherEngine
+            | BusErrorCode::CertificationUnreadable
+            | BusErrorCode::SessionStopped
+            | BusErrorCode::RuntimeUnavailable
+            | BusErrorCode::SessionNotAttached => {}
         }
     }
-    assert_eq!(pinned.len(), 9, "every code is pinned exactly once");
+    assert_eq!(pinned.len(), 16, "every code is pinned exactly once");
 }
 
 /// The one crossable error that CAN name a persisted run. The shape test above

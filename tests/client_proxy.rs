@@ -40,6 +40,22 @@ use pulse::{
     shell_info_core,
 };
 
+/// Serializes the tests that set or read `$PULSE_CONFIG_DIR` — the
+/// `src/agent/config.rs` `ENV_LOCK` precedent, in its async form.
+///
+/// `src/client/connection.rs` reads the variable at CALL time and
+/// process-wide, so two tests interleaving their windows read each other's
+/// directory: one `ClientState::connect` writes into the other's temp dir, and
+/// `ClientState::disconnect` deletes the other test's connection file
+/// mid-assertion. `cargo test` runs these in threads of one process (nextest's
+/// process-per-test is what the old SAFETY comments assumed), so the window
+/// needs a lock, not a comment.
+///
+/// A `tokio` mutex rather than a `std` one because these tests are async and
+/// the guard crosses awaits — the `multi_thread` tests require `Send` futures,
+/// which a `std::sync::MutexGuard` held across an await is not.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ---------------------------------------------------------------------------
 // Dispatch-2 correction 1 — the compose proxy forwards the route's LITERAL key
 // ---------------------------------------------------------------------------
@@ -773,6 +789,10 @@ async fn the_servers_own_op_unknown_body_maps_to_the_typed_expiry() {
 
 #[tokio::test]
 async fn client_state_tracks_connect_refusal_disconnect_and_dead_sockets() {
+    // The successful connect writes the connection file and `disconnect`
+    // removes it — both resolve `$PULSE_CONFIG_DIR` at call time, so this test
+    // shares the env window with the tests that set it.
+    let _guard = ENV_LOCK.lock().await;
     let server = spawn_server(ServerOptions::default()).await;
     let state = ClientState::new();
 
@@ -906,10 +926,12 @@ async fn a_millisecond_backoff_policy_makes_the_resume_fast() {
 async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    let _guard = ENV_LOCK.lock().await;
     let server = spawn_server(ServerOptions::default()).await;
     let config_dir = tempfile::TempDir::new().expect("tempdir");
-    // SAFETY: nextest runs every test in its own process — no other thread
-    // reads the environment while this runs.
+    // SAFETY: serialized by ENV_LOCK — every test that reads
+    // `$PULSE_CONFIG_DIR` holds the same lock, so no other thread can be
+    // inside an env window while this one is.
     unsafe {
         std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
     }
@@ -950,7 +972,7 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
         "the connection file reconnects a relaunched app"
     );
 
-    // SAFETY: see above — single-test process isolation.
+    // SAFETY: see above — the ENV_LOCK guard still held.
     unsafe {
         std::env::remove_var("PULSE_CONFIG_DIR");
     }
@@ -1024,10 +1046,12 @@ async fn a_configured_system_proxy_never_sees_a_bearer_request() {
 /// It is now refused at connect, by name, before anything is saved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_refuses_an_agent_scoped_token_and_writes_no_connection_file() {
+    let _guard = ENV_LOCK.lock().await;
     let server = spawn_server(ServerOptions::default()).await;
     let config_dir = tempfile::TempDir::new().expect("tempdir");
-    // SAFETY: nextest runs every test in its own process — no other thread
-    // reads the environment while this runs.
+    // SAFETY: serialized by ENV_LOCK — every test that reads
+    // `$PULSE_CONFIG_DIR` holds the same lock, so no other thread can be
+    // inside an env window while this one is.
     unsafe {
         std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
     }
@@ -1067,7 +1091,7 @@ async fn connect_refuses_an_agent_scoped_token_and_writes_no_connection_file() {
         app_file.display()
     );
 
-    // SAFETY: see above — single-test process isolation.
+    // SAFETY: see above — the ENV_LOCK guard still held.
     unsafe {
         std::env::remove_var("PULSE_CONFIG_DIR");
     }
@@ -1078,6 +1102,7 @@ async fn connect_refuses_an_agent_scoped_token_and_writes_no_connection_file() {
 /// as it did before the field existed — connected, no refusal, persisted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_against_a_server_without_the_scope_field_still_connects() {
+    let _guard = ENV_LOCK.lock().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind stub");
@@ -1130,7 +1155,7 @@ async fn connect_against_a_server_without_the_scope_field_still_connects() {
         "and the connection is persisted"
     );
 
-    // SAFETY: see above — single-test process isolation.
+    // SAFETY: see above — the ENV_LOCK guard still held.
     unsafe {
         std::env::remove_var("PULSE_CONFIG_DIR");
     }
@@ -1142,10 +1167,12 @@ async fn connect_against_a_server_without_the_scope_field_still_connects() {
 async fn a_loose_connection_file_is_refused_on_load_with_a_named_reason() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    let _guard = ENV_LOCK.lock().await;
     let server = spawn_server(ServerOptions::default()).await;
     let config_dir = tempfile::TempDir::new().expect("tempdir");
-    // SAFETY: nextest runs every test in its own process — no other thread
-    // reads the environment while this runs.
+    // SAFETY: serialized by ENV_LOCK — every test that reads
+    // `$PULSE_CONFIG_DIR` holds the same lock, so no other thread can be
+    // inside an env window while this one is.
     unsafe {
         std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
     }
@@ -1182,7 +1209,7 @@ async fn a_loose_connection_file_is_refused_on_load_with_a_named_reason() {
         "the command refusal names the state: {err}"
     );
 
-    // SAFETY: see above — single-test process isolation.
+    // SAFETY: see above — the ENV_LOCK guard still held.
     unsafe {
         std::env::remove_var("PULSE_CONFIG_DIR");
     }

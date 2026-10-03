@@ -116,6 +116,29 @@ impl RegimeDetector {
 }
 
 #[cfg(test)]
+impl RegimeDetector {
+    /// Test-only state digest (the r3.s4.w1 step-atomicity proof): the
+    /// current classification plus the readiness of all three adapters.
+    /// The adapters' recursion state is a deterministic function of the
+    /// stepped candle sequence, and the detector only steps after every
+    /// fallible point in `EngineSession::step`, so equal digests plus the
+    /// structural ordering imply equal later behaviour.
+    pub(crate) fn state_digest(&self) -> String {
+        let readiness = self.indicators.as_ref().map_or("none".to_owned(), |ind| {
+            format!(
+                "{}/{}",
+                ind.ema50.is_ready() && ind.ema200.is_ready(),
+                ind.adx.is_ready()
+            )
+        });
+        format!(
+            "RegimeDetector{{current:{:?},ready:{readiness}}}",
+            self.current
+        )
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::RegimeDetector;

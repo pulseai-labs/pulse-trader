@@ -131,8 +131,10 @@ pub fn hash_token(token: &str) -> String {
 
 /// Extract the bearer token from the `Authorization` header. `Err(())` means
 /// the header is missing, not `Bearer`, or carries no value — all one refusal
-/// reason (`missing`, per the table).
-fn bearer_token(headers: &axum::http::HeaderMap) -> Result<String, ()> {
+/// reason (`missing`, per the table). `pub(crate)` because the session SSE
+/// route re-hashes the same header on every poll (the revocable-token control)
+/// and must read it exactly as this middleware does.
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Result<String, ()> {
     let value = headers.get(AUTHORIZATION).ok_or(())?;
     let value = value.to_str().map_err(|_| ())?;
     let rest = value.strip_prefix("Bearer ").ok_or(())?;

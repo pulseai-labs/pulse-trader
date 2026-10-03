@@ -18,6 +18,8 @@ pub(crate) mod backup;
 pub(crate) mod coach;
 pub(crate) mod compose;
 pub(crate) mod fetch_data;
+// r3.s4.w2 (ADR-0027): the certify fixture's seed verb (E4).
+pub(crate) mod fixture;
 // r3.s3.w4 (D7, ADR-0026): the verified one-way import of a Mac `pulse.db` +
 // its candle snapshots; the shared verified-copy engine lives here.
 pub(crate) mod import;
@@ -113,6 +115,11 @@ pub enum Command {
     /// serve `/api/v1` until SIGTERM/SIGINT. One stderr line per request and
     /// per startup step; stdout stays empty.
     Serve(ServeArgs),
+    /// Stamp the certify fixture (r3.s4.w2, ADR-0027 / E4): synthetic
+    /// BTCUSDT snapshots + `fixture_snapshot` rows + the fixture
+    /// strategy/version + one walk-forward certification per build. Never
+    /// touches BTCUSDT HEAD.
+    Fixture(fixture::FixtureArgs),
     /// Move a Mac `pulse.db` + its candle snapshots onto this host with full
     /// hash verification (r3.s3.w4, D7). A non-empty target is refused
     /// without `--replace`; `--replace` backs the target up first.
@@ -240,6 +247,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // r3.s3.w1: the token administration arm. The migrated-db open is the
         // same migrate-then-open every other DB-using arm uses.
         Command::Token(args) => run_token(&args).await,
+        // r3.s4.w2 (E4): the certify-fixture seed arm — the migrated-db open
+        // is the same migrate-then-open every other DB-using arm uses.
+        Command::Fixture(args) => match args.command {
+            fixture::FixtureCommand::Seed { db, data_dir } => {
+                fixture::run_seed(db.as_deref(), data_dir).await
+            }
+        },
         // r3.s3.w1 (ADR-0026): the server arm — the D6 bind policy gates it,
         // then the retrying bind, then serve until SIGTERM/SIGINT.
         Command::Serve(args) => run_serve(&args).await,

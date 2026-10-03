@@ -41,7 +41,7 @@ use incremental::{RestPageSource, fetch_incremental_with};
 use merge::merge_new;
 
 pub use funding::FundingEvent;
-pub use incremental::PageSource;
+pub use incremental::{PageSource, RestClosedBars};
 pub use source::BinanceDataSource;
 
 /// One verified, parsed calendar month of klines + funding (the unit the bulk

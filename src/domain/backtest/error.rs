@@ -304,4 +304,27 @@ pub enum BacktestError {
         /// The underlying validation failure's display.
         message: String,
     },
+
+    /// A higher-timeframe (or daily) candle was handed to an
+    /// [`EngineSession`](crate::adapters::backtest::EngineSession) step whose
+    /// `close_time` is after the primary bar's `close_time` — the bar has not
+    /// closed yet. A stepwise caller must never let the strategy read a bar
+    /// that does not exist yet: this is the no-look-ahead rule the whole-run
+    /// aligner enforces by construction, typed for the stepwise seam
+    /// (r3.s4.w1). Only `Htf` and `D1` roles occur — the primary candle is
+    /// the step's own clock.
+    #[error(
+        "{series:?} candle closing at {close_time} is not closed by the primary bar's \
+         close_time {primary_close} — a step may only hand over closed higher-timeframe candles"
+    )]
+    HigherBarNotClosed {
+        /// Which higher series the still-forming candle belongs to (`Htf` or
+        /// `D1`).
+        series: SeriesRole,
+        /// The offending candle's `close_time` (epoch ms).
+        close_time: i64,
+        /// The primary bar's `close_time` (epoch ms) the candle was checked
+        /// against.
+        primary_close: i64,
+    },
 }

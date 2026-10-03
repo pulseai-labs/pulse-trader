@@ -97,7 +97,7 @@ else
 fi
 
 if [[ ! -f src/mcp/tools.rs ]]; then
-  fail "src/mcp/tools.rs is missing — the seven read tools have no home"
+  fail "src/mcp/tools.rs is missing — the eleven read tools have no home"
 fi
 
 if [[ ! -f src/mcp/identity.rs ]]; then

@@ -9,6 +9,8 @@
 // exactly the fake `r1.s1` SPINE.md's ledger exists to catch.
 
 import { useEffect, useState } from "react";
+
+import { commands } from "./bindings";
 import type { ReactNode } from "react";
 
 import { CredentialBanner } from "./components/CredentialBanner";
@@ -100,6 +102,35 @@ export function RouteContent({ route }: { route: Route | undefined }): ReactNode
   return <UnbuiltScreen />;
 }
 
+/**
+ * The running paper-session count the titlebar pill shows (r3.s4.w5).
+ *
+ * Polled on the status strip's own cadence. A failed read keeps the last
+ * count — a number nobody reported is never invented — and `null` (nothing
+ * read yet, or a disconnected server) renders no pill.
+ */
+function usePaperRunningCount(): number | null {
+  const [count, setCount] = useState<number | null>(null);
+  useEffect(() => {
+    const read = () => {
+      commands
+        .paperSessions()
+        .then((result) => {
+          if (result.status === "ok") {
+            setCount(result.data.filter((session) => session.status.state !== "stopped").length);
+          }
+        })
+        .catch(() => {
+          // Keep the last count; the next poll retries.
+        });
+    };
+    read();
+    const timer = window.setInterval(read, 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  return count;
+}
+
 export function App() {
   const [navId, setNavId] = useState<string>(() =>
     resolveNavId(window.location.hash, KNOWN_NAV_IDS),
@@ -110,6 +141,7 @@ export function App() {
   // the full app before a "not connected" gate would be a lie on the way to
   // the truth.
   const { status: serverStatus, refresh: refreshStatus } = useServerStatus();
+  const paperRunning = usePaperRunningCount();
   // The gate's memory. A read that FAILED changes no status (the hook keeps the
   // last one), so it counts nothing here either: only statuses that actually
   // arrived are folded in.
@@ -165,7 +197,13 @@ export function App() {
   // unmounts while operations are live.
   return (
     <ActiveOperationsProvider>
-      <WindowChrome docTitle={title} serverStatus={serverStatus}>
+      {/* The count is only claimed while the server is up: a down server's
+          last-known count would read as a live one beside "server down". */}
+      <WindowChrome
+        docTitle={title}
+        serverStatus={serverStatus}
+        paperRunning={serverStatus.state === "up" ? (paperRunning ?? undefined) : undefined}
+      >
         <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
           <Sidebar active={navId} />
           <main className="content">

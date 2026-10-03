@@ -36,6 +36,9 @@ vi.mock("./bindings", () => ({
     runBacktestVersion: vi.fn(),
     coachTurn: vi.fn(),
     coachDecide: vi.fn(),
+    // r3.s4.w5: the titlebar's paper pill counts the running sessions App
+    // polls; an empty list keeps the strip at "0 paper · 0 live".
+    paperSessions: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
   },
 }));
 
@@ -118,8 +121,10 @@ describe("<App /> shell navigation", () => {
     render(<App />);
     const backtestRow = await screen.findByRole("link", { name: /backtest lab/i });
     expect(within(backtestRow).queryByText("Soon")).toBeNull();
+    // r3.s4.w5: the deploy row went live the same way — its ROUTES entry
+    // landed, so the derived badge is gone.
     const deployRow = screen.getByRole("link", { name: /deployment dashboard/i });
-    expect(within(deployRow).getByText("Soon")).toBeTruthy();
+    expect(within(deployRow).queryByText("Soon")).toBeNull();
   });
 
   it("keeps the credential banner mounted regardless of the active route", async () => {

@@ -205,8 +205,10 @@ fn parse_regime(s: &str) -> Result<Regime, DataError> {
 /// Parse a `Timeframe` `TEXT` column, fail-closed (r1.s3.w2). `Timeframe`'s serde
 /// representation IS the Binance interval string (`15m` / `4h`), so the same
 /// quote-and-decode trick the enum columns use round-trips it exactly — no second
-/// text mapping to keep in sync with `binance_interval()`.
-fn parse_timeframe(column: &str, s: &str) -> Result<Timeframe, DataError> {
+/// text mapping to keep in sync with `binance_interval()`. `pub(crate)` so the
+/// sibling adapters (`paper_session_repo`, r3.s4.w2) decode their timeframe
+/// columns with the same single mapping instead of copying it.
+pub(crate) fn parse_timeframe(column: &str, s: &str) -> Result<Timeframe, DataError> {
     parse_json(column, &json_token(s))
 }
 

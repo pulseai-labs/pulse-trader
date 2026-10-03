@@ -35,8 +35,18 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 
+use crate::adapters::binance::RestClosedBars;
+use crate::adapters::broker::BinanceAdapter;
+use crate::adapters::clock::SystemClock;
+use crate::adapters::db::{SqlitePaperSessionRepo, SqliteStrategyRepo};
 use crate::adapters::secrets::{self, CredentialProfile, StartupCredential};
-use crate::domain::CredentialSource;
+use crate::adapters::store::CandleStore;
+use crate::application::paper_runtime::{
+    LiveEnv, PaperRuntime, RuntimeLog, SessionEnv, SessionFailure,
+};
+use crate::domain::{
+    CandleSeriesRepository, Clock, ClosedBarSource, CredentialSource, PaperSessionRepository,
+};
 
 use super::log::RequestLog;
 use super::{ServerState, router};
@@ -227,7 +237,17 @@ pub struct ServeConfig {
     pub db: crate::adapters::db::Db,
     /// The data dir (snapshot/export base).
     pub data_dir: std::path::PathBuf,
+    /// How long after a bar's close the paper runtime polls it (r3.s4.w3, E1).
+    /// Five seconds by default — long enough that the exchange's own clock has
+    /// published the bar, short enough to feel live.
+    pub poll_grace_ms: u64,
+    /// How long a paper control request waits for its reply (r3.s4.w4, spec
+    /// §1). Thirty seconds by default.
+    pub paper_reply_timeout_ms: u64,
 }
+
+/// The default polling grace: five seconds past each bar's close.
+pub const DEFAULT_POLL_GRACE_MS: u64 = 5_000;
 
 /// The credential source's kebab-case LABEL — the same strings the ledger's
 /// `key_source` stores (the serde tags on
@@ -252,7 +272,12 @@ fn credential_source_label(source: CredentialSource) -> &'static str {
 /// [`ServeError`] on any refused bind, exhausted retry budget, bind failure or
 /// serve-loop failure.
 pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
-    let state = Arc::new(ServerState::new(config.db, config.data_dir));
+    // r3.s4.w4: the control channel is created BEFORE the state, so the
+    // routes' handle and the runtime's receiver come from one pair.
+    let (paper_control, paper_commands) =
+        crate::application::paper_control::PaperControl::channel(config.paper_reply_timeout_ms);
+    let state =
+        Arc::new(ServerState::new(config.db, config.data_dir).with_paper_control(paper_control));
     let sink = state.log().clone();
 
     // ---- Step 3: CREDENTIAL RESOLUTION — THE w3 SEAM (r3.s3.w3) ------------
@@ -303,6 +328,19 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     })?;
     sink.write(format!("pulse serve: listening on {bound}"));
 
+    // ---- Step 6b: the live paper runtime (r3.s4.w3, ADR-0026/E1) ----------
+    // The runtime rides the server's own database, data dir and clock. It adds
+    // no listener and no route: a construction or runtime failure is logged
+    // and the listener carries on. The task observes the shutdown signal below
+    // and never starts a write after it.
+    let (runtime_stop, runtime_stop_rx) = tokio::sync::watch::channel(false);
+    spawn_paper_runtime(
+        &state,
+        config.poll_grace_ms,
+        runtime_stop_rx,
+        paper_commands,
+    );
+
     // ---- Step 7: serve until SIGTERM/SIGINT, then say goodbye — with a
     // BOUNDED drain (see [`DRAIN_BOUND`]).
     let app = router(Arc::clone(&state));
@@ -313,6 +351,8 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     let mut signalled = Some(signalled);
     let graceful = async move {
         shutdown_signal(bound).await;
+        // The runtime task stops taking new work on the same event.
+        let _ = runtime_stop.send(true);
         if let Some(signalled) = signalled.take() {
             let _ = signalled.send(());
         }
@@ -387,4 +427,192 @@ async fn shutdown_signal(bound: SocketAddr) {
         let _ = bound;
         let _ = ctrl_c.await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The live paper runtime (r3.s4.w3, ADR-0026/E1)
+// ---------------------------------------------------------------------------
+
+/// The runtime's diagnostics go through the server's own sink — one line each,
+/// never a second logging stack.
+struct RuntimeSink {
+    sink: Arc<dyn RequestLog>,
+}
+
+impl RuntimeLog for RuntimeSink {
+    fn write(&self, line: String) {
+        self.sink.write(line);
+    }
+}
+
+/// Spawn the live paper runtime over the server's database, data dir and
+/// clock. A construction failure is logged; the listener is untouched.
+///
+/// The engine session is deliberately single-threaded (its indicator engines
+/// hold plain trait objects and the engine ring is closed), so the runtime is
+/// BUILT and driven on a thread of its own with a current-thread runtime
+/// rather than spawned onto the multi-thread pool. One thread, one session
+/// set, no cross-thread engine access.
+fn spawn_paper_runtime(
+    state: &Arc<ServerState>,
+    poll_grace_ms: u64,
+    stop: tokio::sync::watch::Receiver<bool>,
+    commands: tokio::sync::mpsc::Receiver<crate::application::paper_control::PaperCommand>,
+) {
+    let pool = state.db.pool().clone();
+    let data_dir = state.data_dir.clone();
+    let sink = state.log().clone();
+    let grace_ms = i64::try_from(poll_grace_ms).unwrap_or(i64::MAX);
+    let spawned = std::thread::Builder::new()
+        .name("paper-runtime".to_owned())
+        .spawn(move || {
+            let clock = SystemClock;
+            let store = CandleStore::with_base_dir(data_dir);
+            let repo = SqlitePaperSessionRepo::with_clock(pool.clone(), clock, store.clone());
+            let source = match RestClosedBars::live(clock) {
+                Ok(source) => source,
+                Err(error) => {
+                    sink.write(format!("pulse serve: paper runtime disabled: {error}"));
+                    return;
+                }
+            };
+            let env = LiveEnv::new(SqliteStrategyRepo::new(pool), BinanceAdapter::new());
+            let log: Arc<dyn RuntimeLog> = Arc::new(RuntimeSink { sink: sink.clone() });
+            let runtime = PaperRuntime::new(repo, source, store, clock, env, grace_ms, log);
+            // `enable_all`: the timer drives the wakes, and the I/O driver
+            // carries `RestClosedBars`' reqwest calls.
+            let Ok(host) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                sink.write("pulse serve: paper runtime disabled: no tokio runtime".to_owned());
+                return;
+            };
+            host.block_on(run_paper_runtime(
+                runtime,
+                stop,
+                commands,
+                WakeTrigger::Timer,
+            ));
+        });
+    if let Err(error) = spawned {
+        state
+            .log()
+            .write(format!("pulse serve: paper runtime disabled: {error}"));
+    }
+}
+
+/// What drives a wake (r3.s4.w4, spec §1): the loop selects on the command
+/// channel, the next-wake timer and the shutdown watch. Production uses
+/// [`WakeTrigger::Timer`]; the API suites drive the SAME loop with a tick, so
+/// a stepped clock stays deterministic and a command still interleaves between
+/// wakes exactly as it does in production.
+pub enum WakeTrigger {
+    /// The production timer: sleep until the next wake is due.
+    Timer,
+    /// A test tick: the sender's reply lands after the wake it triggers
+    /// completes, so a caller can await a deterministic wake.
+    Tick(tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>),
+}
+
+impl WakeTrigger {
+    /// Await the next trigger: `None` for the timer (a wake is due), `Some`
+    /// for a tick (run the wake, then answer the tick).
+    async fn next(&mut self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        match self {
+            Self::Timer => {
+                // The sleep target is computed by the caller (the loop).
+                std::future::pending().await
+            }
+            Self::Tick(receiver) => receiver.recv().await,
+        }
+    }
+}
+
+/// The runtime task: boot once, then wake on the sessions' own cadence (or a
+/// test tick) until the shutdown signal, applying control commands between
+/// wakes. Per-session failures are logged and never end the task; the signal
+/// ends it before any further wake starts. A command runs between wakes and
+/// never during an `append_bar`: this loop is single-task, so a wake runs to
+/// completion before the next command is received.
+pub async fn run_paper_runtime<R, B, S, C, E>(
+    mut runtime: PaperRuntime<R, B, S, C, E>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut commands: tokio::sync::mpsc::Receiver<crate::application::paper_control::PaperCommand>,
+    mut trigger: WakeTrigger,
+) where
+    R: PaperSessionRepository,
+    B: ClosedBarSource,
+    S: CandleSeriesRepository,
+    C: Clock,
+    E: SessionEnv,
+{
+    let _: Vec<SessionFailure> = runtime.boot().await;
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        let Some(next_ms) = runtime.next_wake_ms() else {
+            break;
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let delay_ms = u64::try_from(next_ms.saturating_sub(now_ms))
+            .unwrap_or(0)
+            .saturating_add(jitter_ms());
+        let armed = matches!(trigger, WakeTrigger::Timer);
+        let timer = async move {
+            if armed {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            } else {
+                // A tick-driven run has no timer: this branch never fires, so
+                // the loop wakes only when the harness ticks it.
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = stop.changed() => break,
+            command = commands.recv() => {
+                match command {
+                    Some(command) => {
+                        runtime.handle_command(command).await;
+                        continue;
+                    }
+                    // The control handle is gone: nothing will ever arrive
+                    // again, so re-polling this arm would busy-spin.
+                    None => break,
+                }
+            }
+            tick = trigger.next() => {
+                match tick {
+                    Some(reply) => {
+                        runtime.wake().await;
+                        let _ = reply.send(());
+                    }
+                    None => break,
+                }
+                continue;
+            }
+            () = timer => {}
+        }
+        if *stop.borrow() {
+            break;
+        }
+        runtime.wake().await;
+    }
+}
+
+/// A small per-wake jitter (0..250 ms), so repeated wakes do not land on the
+/// same millisecond forever. Dependency-free: a xorshift seeded from the wall
+/// clock.
+fn jitter_ms() -> u64 {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9E37_79B9_7F4A_7C15, |elapsed| {
+            u64::from(elapsed.subsec_nanos()) ^ elapsed.as_secs()
+        });
+    let mut state = seed;
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state % 250
 }

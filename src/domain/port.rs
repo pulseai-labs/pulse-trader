@@ -32,7 +32,7 @@ use std::future::Future;
 use crate::domain::backtest::SummaryStats;
 use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, LatestReadableRun, PersistedRun, RunSummary,
-    Trade, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
+    SnapshotSelection, Trade, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
 };
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{
@@ -191,6 +191,33 @@ pub trait CandleSeriesRepository {
         timeframe: Timeframe,
         candles: Vec<Candle>,
     ) -> Result<StoredCandleSeries, DataError>;
+}
+
+/// A source of **closed** bars for the live paper runtime (r3.s4.w3, E1).
+///
+/// `closed_since` answers the candles of one `(pair, timeframe)` strictly newer
+/// than `since_ms` that are already closed relative to the source's own clock,
+/// with funding stamped onto the candle each event belongs to. It is the
+/// incremental top-up's contract under a smaller name: the runtime asks once per
+/// `(pair, timeframe)` per wake, and the REST adapter (`RestClosedBars`)
+/// implements it over the incremental fetch.
+///
+/// The runtime re-checks closed-ness itself, so a source that hands back a
+/// still-forming bar cannot poison a session: the bar is dropped, never
+/// appended.
+pub trait ClosedBarSource {
+    /// The closed candles of `(pair, timeframe)` strictly newer than `since_ms`,
+    /// in ascending `open_time` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when the underlying source fails (I/O, parse).
+    fn closed_since(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        since_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
 }
 
 /// The strategy-tree persistence port (VS-1.1.4, FR-4 / FR-11).
@@ -609,6 +636,168 @@ pub trait WalkForwardRunRepository {
         &self,
         id: &WalkForwardRunId,
     ) -> impl Future<Output = Result<Option<WalkForwardRun>, DataError>> + Send;
+}
+
+/// `PulseTrader`'s paper-session persistence port (r3.s4.w2, ADR-0027) — the
+/// immutable `paper_session` rows, the append-only `paper_event` log, the
+/// recorded `paper_bar` candles, and the `fixture_snapshot` stamp. The
+/// established repository style: `impl Future<Output = ...> + Send`, consumed
+/// generically, never `dyn`; the SQLite adapter (`adapters::db::
+/// paper_session_repo`) implements it over `pulse.db` behind `0018`'s
+/// immutability triggers.
+///
+/// **Rows are create + read only** — a promotion is written once, a session
+/// log appends but never rewrites, and `0018`'s `BEFORE UPDATE`/`BEFORE
+/// DELETE` triggers enforce it in the schema.
+pub trait PaperSessionRepository {
+    /// Persist one promotion as a new `paper_session` row: the adapter mints
+    /// the id, the `MAX(seq)+1` insertion sequence and the injected-Clock
+    /// `created_at`; the draft carries everything else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] if the `strategy_version_id` is absent, the
+    /// draft violates the schema (an empty `promoted_by`, an override without
+    /// a reason), or the store fails.
+    fn insert_session(
+        &self,
+        draft: &crate::domain::paper::session::PaperSessionDraft,
+    ) -> impl Future<Output = Result<crate::domain::paper::session::PaperSession, DataError>> + Send;
+
+    /// Fetch one persisted session by id (`Ok(None)` if no such row).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
+    /// failure.
+    fn get_session(
+        &self,
+        id: &crate::domain::paper::session::PaperSessionId,
+    ) -> impl Future<Output = Result<Option<crate::domain::paper::session::PaperSession>, DataError>>
+    + Send;
+
+    /// The session catalog (spec §3b): EVERY persisted session, complete
+    /// rows, in insertion order (`seq` ascending — the tables' own mint).
+    /// A stopped session's row reads like any other; the catalog is the
+    /// read w3's catch-up and w4's list API ride.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
+    /// failure.
+    fn list_sessions(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::domain::paper::session::PaperSession>, DataError>> + Send;
+
+    /// Whether EVERY named certified `(timeframe, data_version)` pair has a
+    /// `fixture_snapshot` row — the fact a certified session's `fixture` flag
+    /// states (A12). An empty list answers `false` (nothing certified is not
+    /// fixture-certified).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a store failure.
+    fn all_versions_are_fixtures(
+        &self,
+        versions: &[crate::domain::paper::session::CertifiedDataVersion],
+    ) -> impl Future<Output = Result<bool, DataError>> + Send;
+
+    /// Append ONE consumed bar's `paper_bar` rows and ALL of its events in
+    /// one transaction (audit #4): any failure — a schema trigger, a
+    /// mid-batch refusal — rolls the whole batch back, so a bar is in the log
+    /// entirely or not at all. `seq` mints `MAX(seq)+1` per session inside
+    /// the transaction on BOTH tables, and the persisted events come back
+    /// re-keyed to their minted sequences (the payload's internal `seq`
+    /// always equals the row's).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] if the session is absent, a trigger refuses
+    /// an event (a stopped session's log is read-only), or the store fails.
+    fn append_bar(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+        bars: &[(Timeframe, Candle, bool)],
+        events: &[crate::domain::paper::event::PaperEvent],
+    ) -> impl Future<Output = Result<Vec<crate::domain::paper::event::PaperEvent>, DataError>> + Send;
+
+    /// Stamp one `(pair, timeframe, data_version)` into `fixture_snapshot`
+    /// — the certify fixture's durable row (E4). Idempotent: an existing row
+    /// is left alone, so a second seed adds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a store failure.
+    fn insert_fixture_snapshot(
+        &self,
+        pair: &crate::domain::Pair,
+        timeframe: Timeframe,
+        data_version: &crate::domain::DataVersion,
+    ) -> impl Future<Output = Result<(), DataError>> + Send;
+
+    /// Read one session's event log back, decoded and typed, in `seq` order.
+    /// Fail-closed: a corrupt row is an `Err`, never a partial log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on an undecodable row or a store failure.
+    fn events(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+    ) -> impl Future<Output = Result<Vec<crate::domain::paper::event::PaperEvent>, DataError>> + Send;
+
+    /// Read one session's recorded candles for a `timeframe` back as
+    /// [`Candle`]s, in `open_time` order, lead-in included — the read half of
+    /// [`Self::append_bar`]. This is the live runtime's rebuild input (r3.s4.w3)
+    /// and what the shadow's materialisation is built from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
+    /// failure.
+    fn bars(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+        timeframe: Timeframe,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
+
+    /// The session's counted-span boundary: the `open_time` of the first
+    /// primary-timeframe bar NOT flagged `lead_in` — or, while only lead-in
+    /// bars are recorded, the `open_time` the next primary bar will have. `None`
+    /// before any primary bar lands.
+    ///
+    /// This is how the runtime derives `count_from_ms` (r3.s4.w3): from the
+    /// recorded flags, never from a marker event — the same derivation
+    /// `tests/paper_recorded_bars.rs` asserts over the raw column.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the session row is unreadable or the
+    /// store fails.
+    fn count_from_ms(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+    ) -> impl Future<Output = Result<Option<i64>, DataError>> + Send;
+
+    /// Materialise the session's recorded candles into content-addressed
+    /// snapshots — one [`SnapshotSelection`] per timeframe that holds rows,
+    /// in the session's own timeframe order (its primary, its HTF when set,
+    /// the daily series when it consumes one).
+    ///
+    /// The repository holds its candle-store handle, so the application ring
+    /// never names the store: it asks the repository, which writes through
+    /// `write_snapshot` ONLY — never `commit`, never `HEAD` (ADR-0009). Content
+    /// addressing makes a repeat write of the same rows a no-op with the same
+    /// `data_version`. Runs only at a shadow check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row, an absent session, or a
+    /// store failure.
+    fn materialise(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+    ) -> impl Future<Output = Result<Vec<SnapshotSelection>, DataError>> + Send;
 }
 
 /// `PulseTrader`'s own LLM chat port (VS-1.3.1 work-1.01, FR-23 / FR-24, README
@@ -1878,4 +2067,39 @@ mod llm_call_repository_tests {
         assert_eq!(fetched.cost_currency, "CNY");
         assert_eq!(fetched.cost, Decimal::new(1234, 4));
     }
+}
+
+/// The snapshot-stamping capability the certify fixture's seed needs (r3.s4.w2,
+/// E4) — content-addressed identity, existence probing, and content-addressed
+/// writes, NEVER a `commit` and never `HEAD`. A domain port so the application
+/// ring can stamp snapshots without naming an adapters namespace (ADR-0015's
+/// one-import rule); the candle store implements it in the adapters ring, and
+/// the CLI composes the two.
+pub trait FixtureSnapshotStore {
+    /// The content-hash `data_version` of `(pair, timeframe, candles)` under
+    /// the store's candle schema version.
+    fn fixture_content_version(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        candles: &[Candle],
+    ) -> DataVersion;
+
+    /// Whether the content-addressed snapshot file for this exact version
+    /// already exists (`true` = the seed skips the write; no new file).
+    fn fixture_snapshot_exists(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        version: &DataVersion,
+    ) -> bool;
+
+    /// Write the series as a content-addressed snapshot. The write derives the
+    /// version from the content and refuses a mismatched caller-supplied one;
+    /// a repeat write of the same content is a no-op. Never sets HEAD.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on a store failure.
+    fn fixture_write_snapshot(&self, series: &CandleSeries) -> Result<(), DataError>;
 }
