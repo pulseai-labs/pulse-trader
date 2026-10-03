@@ -1789,17 +1789,18 @@ fn first_step_refusal(
 
 /// Round 1 (droid `session.rs:404`): a higher series with a missing candle is
 /// refused by `step` exactly as `run_backtest` refuses it — the same
-/// `SeriesGap`, the same expected and found instants — for HTF and for D1.
+/// `SeriesGap`, the same expected and found instants — for HTF and for D1,
+/// supplied to a strategy that does not read them (round 4: one that reads
+/// them trips the coverage rule first, as the fold does on that prefix).
 #[test]
 fn step_refuses_a_gapped_higher_series_exactly_as_the_fold_does() {
     // HTF: the htf fixture with its third H4 candle removed.
     let (primary_candles, mut htf_candles) = htf_fixture();
     let missing = htf_candles.remove(2);
-    let compiled_strategy = compiled(
-        compare(htf_ema(2), pulse::Comparator::Gt, constant(99, 0)),
-        vec![stop_loss(5, 2)],
-        Direction::Long,
-    );
+    // The series is supplied but not read: the coverage rule is gated off,
+    // so the gap rule is the refusal (for a strategy that reads the series,
+    // the lag past the last candle trips coverage before a later one closes).
+    let compiled_strategy = compiled(price_entry(), vec![stop_loss(5, 2)], Direction::Long);
     let fold = run_backtest(
         &compiled_strategy,
         &series(Timeframe::M15, primary_candles.clone()),
@@ -1831,15 +1832,10 @@ fn step_refuses_a_gapped_higher_series_exactly_as_the_fold_does() {
     // D1: three days of M15 bars with day 1 missing from the daily series.
     let primary_candles: Vec<Candle> = (0..288).map(|i| m15(i, 100, 100, 100, 100)).collect();
     let d1_candles = vec![d1(0, 100), d1(2, 100)];
-    let compiled_strategy = compiled(
-        compare(
-            d1_price(PriceField::Close),
-            pulse::Comparator::Lt,
-            constant(101, 0),
-        ),
-        vec![stop_loss(5, 2)],
-        Direction::Long,
-    );
+    // The series is supplied but not read: the coverage rule is gated off,
+    // so the gap rule is the refusal (for a strategy that reads the series,
+    // the lag past the last candle trips coverage before a later one closes).
+    let compiled_strategy = compiled(price_entry(), vec![stop_loss(5, 2)], Direction::Long);
     let fold = run_backtest(
         &compiled_strategy,
         &series(Timeframe::M15, primary_candles.clone()),
@@ -1897,6 +1893,181 @@ fn step_refuses_a_misaligned_primary_exactly_as_the_fold_does() {
         first_step_refusal(&compiled_strategy, &primary_candles, Vec::new(), Vec::new()),
         Some(expected),
         "step refuses the misaligned primary the fold refuses"
+    );
+}
+
+/// Round 4 (Codex `session.rs:414`): a higher series that stops short of the
+/// primary is refused by `step` with the same coverage variant, the same last
+/// higher close and the same series as `run_backtest` refuses it. `step`
+/// cannot know where the series ends, so its `primary_end` is the first bar
+/// whose close is more than one higher interval past that last close.
+#[test]
+fn step_refuses_short_higher_coverage_as_the_fold_does() {
+    let m15_ms = Timeframe::M15.duration_ms();
+    let h4_ms = Timeframe::H4.duration_ms();
+    let d1_ms = Timeframe::D1.duration_ms();
+
+    // HTF: the htf fixture (24h of M15) with only its first three H4 candles.
+    let (primary_candles, mut htf_candles) = htf_fixture();
+    htf_candles.truncate(3);
+    let htf_end = 3 * h4_ms - 1;
+    let compiled_strategy = compiled(
+        compare(htf_ema(2), pulse::Comparator::Gt, constant(99, 0)),
+        vec![stop_loss(5, 2)],
+        Direction::Long,
+    );
+    let fold = run_backtest(
+        &compiled_strategy,
+        &series(Timeframe::M15, primary_candles.clone()),
+        Some(&series(Timeframe::H4, htf_candles.clone())),
+        None,
+        &zero_cost(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+        None,
+    )
+    .expect_err("the fold refuses short HTF coverage");
+    assert_eq!(
+        fold,
+        BacktestError::HtfCoverageShort {
+            primary_end: primary_candles.last().expect("non-empty").close_time,
+            htf_end,
+            htf: Timeframe::H4,
+        }
+    );
+    assert_eq!(
+        first_step_refusal(
+            &compiled_strategy,
+            &primary_candles,
+            htf_candles,
+            Vec::new()
+        ),
+        Some(BacktestError::HtfCoverageShort {
+            primary_end: 4 * h4_ms + m15_ms - 1,
+            htf_end,
+            htf: Timeframe::H4,
+        }),
+        "step refuses the HTF coverage lag the fold refuses"
+    );
+
+    // D1: three days of M15 bars and only the first daily candle.
+    let primary_candles: Vec<Candle> = (0..288).map(|i| m15(i, 100, 100, 100, 100)).collect();
+    let d1_candles = vec![d1(0, 100)];
+    let compiled_strategy = compiled(
+        compare(
+            d1_price(PriceField::Close),
+            pulse::Comparator::Lt,
+            constant(101, 0),
+        ),
+        vec![stop_loss(5, 2)],
+        Direction::Long,
+    );
+    let fold = run_backtest(
+        &compiled_strategy,
+        &series(Timeframe::M15, primary_candles.clone()),
+        None,
+        Some(&series(Timeframe::D1, d1_candles.clone())),
+        &zero_cost(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+        None,
+    )
+    .expect_err("the fold refuses short D1 coverage");
+    assert_eq!(
+        fold,
+        BacktestError::D1CoverageShort {
+            primary_end: 3 * d1_ms - 1,
+            d1_end: d1_ms - 1,
+        }
+    );
+    assert_eq!(
+        first_step_refusal(&compiled_strategy, &primary_candles, Vec::new(), d1_candles),
+        Some(BacktestError::D1CoverageShort {
+            primary_end: 2 * d1_ms + m15_ms - 1,
+            d1_end: d1_ms - 1,
+        }),
+        "step refuses the D1 coverage lag the fold refuses"
+    );
+}
+
+/// Round 4: every prefix of a series the whole-run coverage check accepts
+/// still steps — the fold accepts each prefix, and `step` refuses no bar.
+#[test]
+fn step_accepts_every_prefix_of_a_covered_higher_series() {
+    // HTF: the full htf fixture.
+    let (primary_candles, htf_candles) = htf_fixture();
+    let compiled_strategy = compiled(
+        compare(htf_ema(2), pulse::Comparator::Gt, constant(99, 0)),
+        vec![stop_loss(5, 2)],
+        Direction::Long,
+    );
+    for end in 1..=primary_candles.len() {
+        let prefix = &primary_candles[..end];
+        let close = prefix.last().expect("non-empty").close_time;
+        let htf_prefix: Vec<Candle> = htf_candles
+            .iter()
+            .filter(|candle| candle.close_time <= close)
+            .cloned()
+            .collect();
+        run_backtest(
+            &compiled_strategy,
+            &series(Timeframe::M15, prefix.to_vec()),
+            Some(&series(Timeframe::H4, htf_prefix)),
+            None,
+            &zero_cost(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("the fold accepts the {end}-bar prefix: {error}"));
+    }
+    assert_eq!(
+        first_step_refusal(
+            &compiled_strategy,
+            &primary_candles,
+            htf_candles,
+            Vec::new()
+        ),
+        None,
+        "step accepts every bar of the covered HTF series"
+    );
+
+    // D1: six days of M15 bars and all six daily candles.
+    let primary_candles: Vec<Candle> = (0..576).map(|i| m15(i, 100, 100, 100, 100)).collect();
+    let d1_candles: Vec<Candle> = (0..6).map(|j| d1(j, 100)).collect();
+    let compiled_strategy = compiled(
+        compare(
+            d1_price(PriceField::Close),
+            pulse::Comparator::Lt,
+            constant(101, 0),
+        ),
+        vec![stop_loss(5, 2)],
+        Direction::Long,
+    );
+    for end in (1..=primary_candles.len()).step_by(7) {
+        let prefix = &primary_candles[..end];
+        let close = prefix.last().expect("non-empty").close_time;
+        let d1_prefix: Vec<Candle> = d1_candles
+            .iter()
+            .filter(|candle| candle.close_time <= close)
+            .cloned()
+            .collect();
+        run_backtest(
+            &compiled_strategy,
+            &series(Timeframe::M15, prefix.to_vec()),
+            None,
+            Some(&series(Timeframe::D1, d1_prefix)),
+            &zero_cost(),
+            &SymbolFilters::unconstrained(),
+            SeriesEnd::SnapshotEnd,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("the fold accepts the {end}-bar prefix: {error}"));
+    }
+    assert_eq!(
+        first_step_refusal(&compiled_strategy, &primary_candles, Vec::new(), d1_candles),
+        None,
+        "step accepts every bar of the covered D1 series"
     );
 }
 

@@ -478,6 +478,44 @@ impl EngineSession {
                 });
             }
         }
+        self.check_higher_coverage(primary, closed_htf, closed_d1)
+    }
+
+    /// The whole-run coverage rule (`check_htf_inputs` / `check_d1_inputs`)
+    /// for one step — the last check of [`Self::validate_step`].
+    fn check_higher_coverage(
+        &self,
+        primary: &Candle,
+        closed_htf: &[Candle],
+        closed_d1: &[Candle],
+    ) -> Result<(), BacktestError> {
+        // The whole-run coverage rule (`check_htf_inputs` / `check_d1_inputs`):
+        // once a higher candle has been handed, the newest one must close
+        // within one higher interval of this primary bar's close, or the
+        // operands would read a frozen bar. Gated, like the whole-run arm, on
+        // the strategy reading the series (its engine exists only then). Each
+        // step is the series' end so far, so every prefix of a series the
+        // whole-run check accepts still steps.
+        if self.htf_engine.is_some()
+            && let Some(timeframe) = self.timeframes.htf
+            && let Some(last) = closed_htf.last().or(self.paired_htf.as_ref())
+            && primary.close_time - last.close_time > timeframe.duration_ms()
+        {
+            return Err(BacktestError::HtfCoverageShort {
+                primary_end: primary.close_time,
+                htf_end: last.close_time,
+                htf: timeframe,
+            });
+        }
+        if self.d1_engine.is_some()
+            && let Some(last) = closed_d1.last().or(self.paired_d1.as_ref())
+            && primary.close_time - last.close_time > Timeframe::D1.duration_ms()
+        {
+            return Err(BacktestError::D1CoverageShort {
+                primary_end: primary.close_time,
+                d1_end: last.close_time,
+            });
+        }
         Ok(())
     }
 
