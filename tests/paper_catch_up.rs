@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 
 use pulse::{
     BacktestConfig, BinanceAdapter, CandleSeries, CandleSeriesRepository, ExchangeAdapter, Pair,
-    PaperEvent, PaperSessionId, PaperSessionRepository, PaperSessionState, PaperSide, ShadowResult,
-    StrategyRepository, SymbolFilters, Timeframe, compile, run_backtest, validate,
+    PaperEvent, PaperSessionId, PaperSessionRepository, PaperSessionState, PaperSide, SettlePolicy,
+    ShadowResult, StrategyRepository, SymbolFilters, Timeframe, compile, run_backtest, validate,
 };
 use rust_decimal::Decimal;
 use support::paper::{PaperWorld, TestRuntime, create_version, promote_session};
@@ -138,9 +138,19 @@ async fn bar_flags(world: &PaperWorld, id: &PaperSessionId) -> Vec<(String, i64,
     .unwrap()
 }
 
-/// Advance the world's clock to the close of `bar_open` and run one wake.
+/// Run the wakes the production schedule gives the bar opening at `bar_open`
+/// over a steady source: its first counting read `settle_ms` past its close,
+/// then the confirming re-poll that consumes it (#306).
 async fn wake_at_bar(world: &PaperWorld, runtime: &mut TestRuntime, bar_open: i64) {
-    world.clock.set(bar_open + M15_MS);
+    let policy = SettlePolicy::DEFAULT;
+    world.clock.set(bar_open + M15_MS + policy.settle_ms);
+    let failures = runtime.wake().await;
+    assert!(failures.is_empty(), "wake failures: {failures:?}");
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(world.clock.now() + policy.repoll_ms)
+    );
+    world.clock.advance(policy.repoll_ms);
     let failures = runtime.wake().await;
     assert!(failures.is_empty(), "wake failures: {failures:?}");
 }

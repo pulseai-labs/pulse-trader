@@ -3,6 +3,14 @@
 //! appended to its log one atomic batch per bar, caught up on boot, and
 //! shadow-checked against its own recorded bars.
 //!
+//! **Only settled bars are recorded (#306).** The exchange can still update a
+//! kline for some seconds after its close, so the first read past the close
+//! is provisional. A bar is recorded and stepped only once it is final: read
+//! at least [`SettlePolicy::settle_ms`] after its close and confirmed by an
+//! identical read in a later poll pass. Until then the runtime re-polls every
+//! [`SettlePolicy::repoll_ms`]. A disagreement with a bar that was already
+//! recorded is a true revision and stays a `data_event`.
+//!
 //! **What runs where.** [`PaperRuntime`] polls each running session's own
 //! timeframes, steps the session's engine, and writes through the
 //! [`PaperSessionRepository`] port; `pulse serve` owns the timer and the
@@ -58,6 +66,39 @@ const CATCH_UP_PASSES: usize = 64;
 /// The snapshot version tag the warm-up probe's throwaway series carries; the
 /// engine never reads it.
 const PROBE_VERSION: &str = "paper-probe";
+
+/// When a fetched bar is final enough to record (#306).
+///
+/// A read counts only once it lies `settle_ms` or more past the bar's close,
+/// and the bar is final once a later poll pass reads it identically. The
+/// first poll of a bar is therefore `max(grace, settle_ms)` past its close and
+/// the confirming poll `repoll_ms` after that: with the default policy and a
+/// steady source a bar lands 40 s after its close (plus the serve loop's
+/// jitter). Each read that differs from the one before restarts the
+/// confirmation, one more `repoll_ms` each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlePolicy {
+    /// How long after its close a bar must be read for the read to count.
+    pub settle_ms: i64,
+    /// How soon the runtime polls again while a bar awaits confirmation.
+    pub repoll_ms: i64,
+}
+
+impl SettlePolicy {
+    /// The production policy. Binance revised a 15m kline more than the 5 s
+    /// grace after its close (2026-10-03); 30 s leaves the exchange six times
+    /// that, and a 10 s re-poll confirms it at a fraction of the bar.
+    pub const DEFAULT: Self = Self {
+        settle_ms: 30_000,
+        repoll_ms: 10_000,
+    };
+}
+
+impl Default for SettlePolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The seams
@@ -270,6 +311,16 @@ pub struct PaperRuntime<R, B, S, C, E> {
     clock: C,
     env: E,
     grace_ms: i64,
+    /// `None` takes every closed bar as final on its first read.
+    settle: Option<SettlePolicy>,
+    /// The last poll pass's counting reads per `(pair, timeframe)`, by bar
+    /// `open_time`: what the next read must equal for a bar to be final.
+    reads: BTreeMap<(Pair, Timeframe), BTreeMap<i64, Candle>>,
+    /// When the last pass left a bar awaiting confirmation: the re-poll.
+    repoll_at_ms: Option<i64>,
+    /// Whether the last pass read a bar that a second read, now, would
+    /// confirm (the catch-up loop's other progress signal).
+    confirmable: bool,
     log: Arc<dyn RuntimeLog>,
     sessions: BTreeMap<PaperSessionId, RunningSession>,
     /// Sessions a stop was issued for whose `stop` append has not committed:
@@ -379,6 +430,10 @@ where
             clock,
             env,
             grace_ms,
+            settle: Some(SettlePolicy::DEFAULT),
+            reads: BTreeMap::new(),
+            repoll_at_ms: None,
+            confirmable: false,
             log,
             sessions: BTreeMap::new(),
             halted: BTreeSet::new(),
@@ -386,18 +441,42 @@ where
         }
     }
 
-    /// The next instant any attached session's timeframes need a poll — or, with
-    /// nothing running, the idle re-scan instant (a session promoted later must
-    /// be picked up without a restart).
+    /// Replace the settle policy ([`SettlePolicy::DEFAULT`] unless set).
+    #[must_use]
+    pub fn with_settle(mut self, policy: SettlePolicy) -> Self {
+        self.settle = Some(policy);
+        self
+    }
+
+    /// Take every closed bar as final on its first read — the intake before
+    /// #306. For suites whose scripted source never revises a bar; the server
+    /// never calls it.
+    #[must_use]
+    pub fn without_settle_gate(mut self) -> Self {
+        self.settle = None;
+        self
+    }
+
+    /// The next instant any attached session's timeframes need a poll (the
+    /// first poll past a close waits out the settle time), or the re-poll a
+    /// bar awaiting confirmation needs — or, with nothing running, the idle
+    /// re-scan instant (a session promoted later must be picked up without a
+    /// restart).
     #[must_use]
     pub fn next_wake_ms(&self) -> Option<i64> {
         let now = self.clock.now_ms();
+        let offset = self
+            .settle
+            .map_or(self.grace_ms, |policy| self.grace_ms.max(policy.settle_ms));
         let mut next: Option<i64> = None;
         for run in self.sessions.values() {
             for timeframe in run.session.timeframes() {
-                let probe = boundaries(timeframe.duration_ms(), now, self.grace_ms);
+                let probe = boundaries(timeframe.duration_ms(), now, offset);
                 next = Some(next.map_or(probe.next_poll_ms, |cur| cur.min(probe.next_poll_ms)));
             }
+        }
+        if let (Some(cur), Some(repoll)) = (next, self.repoll_at_ms) {
+            next = Some(cur.min(repoll));
         }
         Some(next.unwrap_or(now + IDLE_SCAN_MS))
     }
@@ -934,10 +1013,11 @@ where
 
         // Catch up through the SAME polling pass a wake runs — there is no
         // special catch-up code path: repeat the pass until it consumes
-        // nothing (or a pass fails).
+        // nothing and leaves no bar a second read would confirm (or a pass
+        // fails).
         for _ in 0..CATCH_UP_PASSES {
             let (failures, consumed) = self.poll_pass().await;
-            if consumed == 0 || !failures.is_empty() {
+            if (consumed == 0 && !self.confirmable) || !failures.is_empty() {
                 break;
             }
         }
@@ -1088,6 +1168,10 @@ where
     /// proves the engine arrives warm at `L` (warmth is monotone), and no
     /// constant is invented. A source that cannot supply more history ends the
     /// loop honestly: the engine then warms up live.
+    ///
+    /// Lead-in is recorded, so it passes the same settle gate as a live bar
+    /// (#306): only bars read `settle_ms` past their close, and only the prefix
+    /// a second read confirms. A bar it leaves out is consumed live later.
     async fn probe_lead_in(
         &self,
         session: &PaperSession,
@@ -1097,6 +1181,7 @@ where
         let primary = session.primary_timeframe;
         let step = primary.duration_ms();
         let first_live = first_open_bar_ms(step, now);
+        let settle_ms = self.settle.map_or(0, |policy| policy.settle_ms);
         let mut depth = 2_i64;
         let mut previous_len: Option<usize> = None;
         loop {
@@ -1109,7 +1194,9 @@ where
                     .await?;
                 let bars: Vec<Candle> = bars
                     .into_iter()
-                    .filter(|bar| bar.open_time < first_live && bar.close_time < now)
+                    .filter(|bar| {
+                        bar.open_time < first_live && bar.close_time + 1 + settle_ms <= now
+                    })
                     .collect();
                 probe.insert(timeframe, bars);
             }
@@ -1130,6 +1217,20 @@ where
             .is_some();
             let grew = previous_len.is_none_or(|previous| len > previous);
             if warm || !grew || len == 0 || depth >= PROBE_MAX_DEPTH {
+                if self.settle.is_some() {
+                    for (timeframe, bars) in &mut probe {
+                        let again = self
+                            .source
+                            .closed_since(&session.pair, *timeframe, since)
+                            .await?;
+                        let agreed = bars
+                            .iter()
+                            .zip(&again)
+                            .take_while(|(first, second)| first == second)
+                            .count();
+                        bars.truncate(agreed);
+                    }
+                }
                 return Ok((probe, first_live));
             }
             previous_len = Some(len);
@@ -1174,17 +1275,21 @@ where
             }
         }
         let now = self.clock.now_ms();
+        self.reads.retain(|key, _| needs.contains_key(key));
+        self.repoll_at_ms = None;
+        self.confirmable = false;
         let mut fetched: BTreeMap<(Pair, Timeframe), Vec<Candle>> = BTreeMap::new();
         let mut fetch_errors: BTreeMap<(Pair, Timeframe), DataError> = BTreeMap::new();
         for ((pair, timeframe), since) in needs {
             match self.source.closed_since(&pair, timeframe, since).await {
                 Ok(bars) => {
-                    fetched.insert(
-                        (pair, timeframe),
-                        bars.into_iter()
-                            .filter(|bar| bar.close_time < now)
-                            .collect(),
-                    );
+                    let closed: Vec<Candle> = bars
+                        .into_iter()
+                        .filter(|bar| bar.close_time < now)
+                        .collect();
+                    let key = (pair, timeframe);
+                    let bars = self.gate(&key, closed, now);
+                    fetched.insert(key, bars);
                 }
                 Err(error) => {
                     fetch_errors.insert((pair, timeframe), error);
@@ -1231,6 +1336,23 @@ where
             }
         }
         (failures, consumed_total)
+    }
+
+    /// Pass one `(pair, timeframe)` read through the settle gate: keep its
+    /// counting reads for the next pass, schedule the re-poll a waiting bar
+    /// needs, and return the settled bars (all of them without a gate).
+    fn gate(&mut self, key: &(Pair, Timeframe), closed: Vec<Candle>, now: i64) -> Vec<Candle> {
+        let Some(policy) = self.settle else {
+            return closed;
+        };
+        let previous = self.reads.remove(key).unwrap_or_default();
+        let read = settle_read(closed, &previous, now, policy);
+        self.reads.insert(key.clone(), read.reads);
+        if let Some(at) = read.next_read_ms {
+            self.repoll_at_ms = Some(earliest(self.repoll_at_ms, at));
+        }
+        self.confirmable |= read.confirmable;
+        read.settled
     }
 
     /// Consume the next new primary bar of one session, with its newly closed
@@ -1404,6 +1526,63 @@ impl RunningSession {
             })
             .unwrap_or_default()
     }
+}
+
+/// One `(pair, timeframe)` read split by the settle gate (#306).
+struct SettleRead {
+    /// The bars final at this read, ascending and contiguous from the first:
+    /// the only bars the session may record, step or compare.
+    settled: Vec<Candle>,
+    /// This read's counting copies, by `open_time` (the next read's reference).
+    reads: BTreeMap<i64, Candle>,
+    /// A closed bar is not final yet: when the runtime should read again.
+    next_read_ms: Option<i64>,
+    /// A counting read is not confirmed yet: a second read now would do it.
+    confirmable: bool,
+}
+
+/// The earlier of an optional instant and `at`.
+fn earliest(current: Option<i64>, at: i64) -> i64 {
+    current.map_or(at, |cur| cur.min(at))
+}
+
+/// Gate one read: a closed bar is final when this read lies `settle_ms` or
+/// more past its close and equals the previous pass's counting read. The
+/// settled bars stop at the first bar that is not final, so a session never
+/// records past a provisional bar.
+fn settle_read(
+    closed: Vec<Candle>,
+    previous: &BTreeMap<i64, Candle>,
+    now: i64,
+    policy: SettlePolicy,
+) -> SettleRead {
+    let mut read = SettleRead {
+        settled: Vec::new(),
+        reads: BTreeMap::new(),
+        next_read_ms: None,
+        confirmable: false,
+    };
+    let mut contiguous = true;
+    for bar in closed {
+        // `close_time` is the bar's last millisecond: it closes one later.
+        let counts_from = bar.close_time + 1 + policy.settle_ms;
+        if now < counts_from {
+            read.next_read_ms = Some(earliest(read.next_read_ms, counts_from));
+            contiguous = false;
+            continue;
+        }
+        let confirmed = previous.get(&bar.open_time) == Some(&bar);
+        if !confirmed {
+            read.next_read_ms = Some(earliest(read.next_read_ms, now + policy.repoll_ms));
+            read.confirmable = true;
+            contiguous = false;
+        }
+        if contiguous {
+            read.settled.push(bar.clone());
+        }
+        read.reads.insert(bar.open_time, bar);
+    }
+    read
 }
 
 /// Every fetched bar that is already recorded with DIFFERENT values — the A6

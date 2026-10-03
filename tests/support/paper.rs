@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use pulse::{
     BinanceAdapter, Candle, CandleStore, Clock, ClosedBarSource, CreatedBy, DataError, Db, LiveEnv,
     NewVersion, NonEmptyLabel, NonEmptyReason, OverrideRequest, Pair, PaperControl, PaperRuntime,
-    PaperSession, PaperSessionId, PaperSessionRepository, SqliteBacktestRunRepo,
+    PaperSession, PaperSessionId, PaperSessionRepository, SettlePolicy, SqliteBacktestRunRepo,
     SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SystemClock,
     Timeframe, VersionId, promote,
 };
@@ -214,6 +214,9 @@ pub struct PaperWorld {
     pub source: ScriptedBars,
     pub log: Arc<VecLog>,
     pub grace_ms: i64,
+    /// The runtime's settle gate (#306): the production policy unless a suite
+    /// opts out with `None` (every closed bar final on its first read).
+    pub settle: Option<SettlePolicy>,
 }
 
 /// The clock every suite starts at unless it says otherwise: a Monday, one day
@@ -233,6 +236,7 @@ impl PaperWorld {
             log: Arc::new(VecLog::default()),
             clock,
             grace_ms: 0,
+            settle: Some(SettlePolicy::DEFAULT),
             db,
             tmp,
             candles_tmp,
@@ -265,7 +269,7 @@ impl PaperWorld {
 
     /// A runtime over this world, with the standard seams.
     pub fn runtime(&self) -> TestRuntime {
-        PaperRuntime::new(
+        let runtime = PaperRuntime::new(
             self.paper(),
             self.source.clone(),
             self.store.clone(),
@@ -273,7 +277,11 @@ impl PaperWorld {
             LiveEnv::new(self.strategies(), BinanceAdapter::new()),
             self.grace_ms,
             self.log.clone(),
-        )
+        );
+        match self.settle {
+            Some(policy) => runtime.with_settle(policy),
+            None => runtime.without_settle_gate(),
+        }
     }
 }
 
@@ -456,7 +464,11 @@ impl PaperHost {
                     LiveEnv::new(SqliteStrategyRepo::new(pool.clone()), BinanceAdapter::new()),
                     0,
                     log,
-                );
+                )
+                // The host's suites wake exactly at a bar's close over a
+                // source that never revises a bar: no settle gate (#306's
+                // own suite drives the gate).
+                .without_settle_gate();
                 // The PRODUCTION loop, driven by a tick instead of the
                 // wall-clock timer: commands and wakes interleave exactly as
                 // they do in `pulse serve`.
