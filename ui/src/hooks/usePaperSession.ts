@@ -50,6 +50,10 @@ export interface PaperSessionView {
 
 /** The event types that change the summary. */
 const REFETCH_TYPES: Record<string, true> = {
+  // A fill opens or closes the position (`open_position`, the closed trades);
+  // a funding payment moves `funding_total`. An `order` is a signal only.
+  fill: true,
+  funding: true,
   shadow_checked: true,
   stop: true,
   engine_upgraded: true,

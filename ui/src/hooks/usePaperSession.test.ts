@@ -110,15 +110,23 @@ describe("usePaperSession", () => {
     expect(result.current.lastSeq).toBe(3);
   });
 
-  it("re-fetches the summary on shadow_checked, stop and engine_upgraded", async () => {
+  it("re-fetches the summary on fill, funding, shadow_checked, stop and engine_upgraded", async () => {
     const { result } = renderHook(() => usePaperSession("s-1"));
     await waitFor(() => expect(result.current.summary).not.toBeNull());
     expect(paperSessionMock).toHaveBeenCalledTimes(1);
 
-    for (const type of ["bar_processed", "shadow_checked", "stop", "engine_upgraded"]) {
-      push(frame(result.current.lastSeq === null ? 1 : result.current.lastSeq + 1, type));
-    }
-    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(4));
+    const types = [
+      "bar_processed",
+      "order",
+      "fill",
+      "funding",
+      "shadow_checked",
+      "stop",
+      "engine_upgraded",
+    ];
+    types.forEach((type, index) => push(frame(index + 1, type)));
+    // bar_processed and order change no summary field: five re-fetches.
+    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(6));
   });
 
   it("drops the live-epoch bar count when a new epoch opens", async () => {
