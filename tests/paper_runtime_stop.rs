@@ -538,6 +538,86 @@ async fn a_refused_stop_append_still_detaches_the_session() {
     );
 }
 
+/// Round 1 (iL): a refused `Stop` append keeps the session halted — the next
+/// wake's discovery does not re-attach it, and a second stop retries the
+/// append.
+#[tokio::test]
+async fn a_refused_stop_append_is_not_reattached_by_the_next_wake() {
+    let (world, ids) = fixture_world_with_sessions(1).await;
+    let id = &ids[0];
+    let mut runtime = stop_fault_runtime(&world);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    run_bars(&world, &mut runtime, id, 40).await;
+
+    let issuer = NonEmptyLabel::try_new("kill-switch-halted").unwrap();
+    runtime
+        .stop(id, StopActor::StopAll { issuer })
+        .await
+        .expect_err("the refused Stop append comes back");
+    let bars_before = world.paper().bars(id, Timeframe::M15).await.unwrap().len();
+
+    // Later wakes past new closed bars: the session is not picked up again.
+    let first_live = world.paper().count_from_ms(id).await.unwrap().unwrap();
+    for step in 41..44 {
+        world.clock.set(first_live + step * M15_MS);
+        runtime.wake().await;
+        assert!(
+            !runtime.attached_ids().contains(id),
+            "a halted session is never re-attached"
+        );
+    }
+    assert_eq!(
+        world.paper().bars(id, Timeframe::M15).await.unwrap().len(),
+        bars_before,
+        "a halted session consumes no bar"
+    );
+}
+
+/// Round 1 (iP): stop-all sweeps persisted running sessions the runtime has
+/// not attached, through the direct `Stop` path.
+#[tokio::test]
+async fn stop_all_stops_a_running_session_that_is_not_attached() {
+    let (world, ids) = fixture_world_with_sessions(1).await;
+    let attached = &ids[0];
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "boot");
+
+    // Promoted after the boot and never woken: persisted, running, unattached.
+    let version = create_version(
+        &world,
+        "stop-all-unattached",
+        &pulse::fixture_strategy_dsl(),
+    )
+    .await;
+    let unattached =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    assert!(!runtime.attached_ids().contains(&unattached.id));
+
+    let issuer = NonEmptyLabel::try_new("kill-switch-unattached").unwrap();
+    let reply = runtime.stop_all_reply(issuer.clone()).await;
+    assert!(reply.failures.is_empty(), "{:?}", reply.failures);
+    assert!(reply.stopped.contains(attached), "{:?}", reply.stopped);
+    assert!(
+        reply.stopped.contains(&unattached.id),
+        "{:?}",
+        reply.stopped
+    );
+    for id in [attached, &unattached.id] {
+        let events = world.paper().events(id).await.unwrap();
+        assert_eq!(
+            stops(&events),
+            vec![StopActor::StopAll {
+                issuer: issuer.clone()
+            }],
+            "session {id} carries the stop_all"
+        );
+    }
+
+    // A later wake does not start it.
+    runtime.wake().await;
+    assert!(runtime.attached_ids().is_empty());
+}
+
 /// F2: the serve loop ends when its control handle is dropped instead of
 /// re-firing the `recv()` arm (a busy-spin once the sender is gone).
 ///

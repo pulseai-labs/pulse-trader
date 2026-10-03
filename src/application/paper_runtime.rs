@@ -19,7 +19,7 @@
 //! [`crate::domain::paper::runtime`]'s derivation; the signal/fill vocabulary
 //! lives in that domain module and nowhere else.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::adapters::backtest::{
@@ -250,6 +250,10 @@ pub struct PaperRuntime<R, B, S, C, E> {
     grace_ms: i64,
     log: Arc<dyn RuntimeLog>,
     sessions: BTreeMap<PaperSessionId, RunningSession>,
+    /// Sessions a stop was issued for whose `stop` append has not committed:
+    /// never attached again by this process, so a refused append cannot let
+    /// the next wake's discovery restart them.
+    halted: BTreeSet<PaperSessionId>,
 }
 
 /// One attached session's live state.
@@ -318,6 +322,7 @@ where
             grace_ms,
             log,
             sessions: BTreeMap::new(),
+            halted: BTreeSet::new(),
         }
     }
 
@@ -495,7 +500,8 @@ where
     /// never vetoes the stop — the check is evidence, not a gate. And the
     /// session leaves `self.sessions` even when the `stop` append itself is
     /// refused: the in-memory halt wins over the log write, so a store
-    /// failure cannot keep it trading. The append's error still comes back
+    /// failure cannot keep it trading, and the session stays halted — this
+    /// process never attaches it again. The append's error still comes back
     /// (`stop_all` lists it under `failures`); the log then holds no `stop`,
     /// so a later boot re-attaches the session.
     ///
@@ -528,7 +534,18 @@ where
         // The halt precedes the append's outcome: the session stops trading
         // now even if the log write is refused.
         self.sessions.remove(session_id);
+        self.append_stop(session_id, event).await
+    }
+
+    /// Append a `stop`, holding the session halted until it commits.
+    async fn append_stop(
+        &mut self,
+        session_id: &PaperSessionId,
+        event: PaperEvent,
+    ) -> Result<(), PaperRuntimeError> {
+        self.halted.insert(session_id.clone());
         self.repo.append_bar(session_id, &[], &[event]).await?;
+        self.halted.remove(session_id);
         Ok(())
     }
 
@@ -536,23 +553,54 @@ where
     /// never leaves the others running: every stop is attempted, and the
     /// failures come back (and are logged).
     pub async fn stop_all(&mut self, issuer: NonEmptyLabel) -> Vec<SessionFailure> {
-        let ids: Vec<PaperSessionId> = self.sessions.keys().cloned().collect();
+        self.stop_all_reply(issuer).await.failures
+    }
+
+    /// [`Self::stop_all`] with the stopped ids. The sweep covers the attached
+    /// sessions AND every persisted session that is not attached (its attach
+    /// failed, or it is halted): an unattached running one is stopped through
+    /// the direct path, so a later wake or boot cannot start it.
+    pub async fn stop_all_reply(&mut self, issuer: NonEmptyLabel) -> StopAllReply {
         let mut failures = Vec::new();
+        let mut ids: Vec<PaperSessionId> = self.sessions.keys().cloned().collect();
+        match self.repo.list_sessions().await {
+            Ok(persisted) => {
+                for session in persisted {
+                    if !self.sessions.contains_key(&session.id) {
+                        ids.push(session.id);
+                    }
+                }
+            }
+            Err(error) => {
+                self.log.write(format!(
+                    "paper runtime: stop_all: listing the persisted sessions failed: {error}"
+                ));
+                failures.push(SessionFailure {
+                    session_id: PaperSessionId::new(String::new()),
+                    error: PaperRuntimeError::Data(error),
+                });
+            }
+        }
+        let mut stopped = Vec::new();
         for id in ids {
             let actor = StopActor::StopAll {
                 issuer: issuer.clone(),
             };
-            if let Err(error) = self.stop(&id, actor).await {
-                self.log.write(format!(
-                    "paper runtime: stop_all: session {id} failed: {error}"
-                ));
-                failures.push(SessionFailure {
-                    session_id: id,
-                    error,
-                });
+            match self.stop_or_unattached(&id, actor).await {
+                Ok(StopReply::Stopped | StopReply::StoppedWithoutShadow) => stopped.push(id),
+                Ok(StopReply::AlreadyStopped | StopReply::Unknown) => {}
+                Err(error) => {
+                    self.log.write(format!(
+                        "paper runtime: stop_all: session {id} failed: {error}"
+                    ));
+                    failures.push(SessionFailure {
+                        session_id: id,
+                        error,
+                    });
+                }
             }
         }
-        failures
+        StopAllReply { stopped, failures }
     }
 
     // -- the control handle's entry points (r3.s4.w4, spec §1) --------------
@@ -572,7 +620,7 @@ where
     /// [`PaperRuntimeError::UnknownSession`] for an absent row; the replay,
     /// compile, store and engine refusals [`Self::attach`] raises otherwise.
     pub async fn attach_one(&mut self, id: &PaperSessionId) -> Result<(), PaperRuntimeError> {
-        if self.sessions.contains_key(id) {
+        if self.sessions.contains_key(id) || self.halted.contains(id) {
             return Ok(());
         }
         let session = self
@@ -614,7 +662,7 @@ where
             at: self.now_text(),
             actor,
         };
-        self.repo.append_bar(id, &[], &[event]).await?;
+        self.append_stop(id, event).await?;
         Ok(StopReply::StoppedWithoutShadow)
     }
 
@@ -667,13 +715,8 @@ where
                 let _ = reply.send(result);
             }
             PaperCommand::StopAll { issuer, reply } => {
-                let ids = self.attached_ids();
-                let failures = self.stop_all(issuer).await;
-                let stopped = ids
-                    .into_iter()
-                    .filter(|id| !failures.iter().any(|failure| failure.session_id == *id))
-                    .collect();
-                let _ = reply.send(StopAllReply { stopped, failures });
+                let result = self.stop_all_reply(issuer).await;
+                let _ = reply.send(result);
             }
             PaperCommand::ShadowCheck { session_id, reply } => {
                 let result = self.shadow_check_outcome(&session_id).await;
@@ -698,7 +741,7 @@ where
             }
         };
         for session in sessions {
-            if self.sessions.contains_key(&session.id) {
+            if self.sessions.contains_key(&session.id) || self.halted.contains(&session.id) {
                 continue;
             }
             let id = session.id.clone();
