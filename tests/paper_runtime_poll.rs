@@ -657,6 +657,8 @@ struct FlakyRepo<P> {
     inner: P,
     fail_next: Arc<AtomicBool>,
     fail_events_next: Arc<AtomicBool>,
+    /// While set, every `bars` read fails (a rebuild's first read).
+    fail_bars: Arc<AtomicBool>,
     appends: Arc<AtomicUsize>,
 }
 
@@ -666,6 +668,7 @@ impl<P> FlakyRepo<P> {
             inner,
             fail_next: Arc::new(AtomicBool::new(false)),
             fail_events_next: Arc::new(AtomicBool::new(false)),
+            fail_bars: Arc::new(AtomicBool::new(false)),
             appends: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -678,6 +681,11 @@ impl<P> FlakyRepo<P> {
     /// The events-only failure switch.
     fn events_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.fail_events_next)
+    }
+
+    /// The `bars`-read failure switch.
+    fn bars_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fail_bars)
     }
 }
 
@@ -743,6 +751,9 @@ where
         session_id: &PaperSessionId,
         timeframe: Timeframe,
     ) -> Result<Vec<Candle>, DataError> {
+        if self.fail_bars.load(Ordering::SeqCst) {
+            return Err(DataError::Db("injected bars read failure".to_owned()));
+        }
         self.inner.bars(session_id, timeframe).await
     }
 
@@ -912,6 +923,104 @@ async fn a_failed_data_event_append_is_retried_on_the_next_wake() {
         data_event_count(&world.paper().events(&session.id).await.unwrap()),
         before + 1,
         "at most one data event per distinct bar and refusal"
+    );
+}
+
+/// Round 2 (Codex): a shadow check after a failed bar append rebuilds the
+/// engine first, so it never records a verdict over a bar that never
+/// committed. The fixture strategy trades, so at some step the uncommitted bar
+/// moves the engine; every verdict must still be identical.
+#[tokio::test]
+async fn a_shadow_check_after_a_failed_append_never_counts_the_uncommitted_bar() {
+    let world = PaperWorld::new().await;
+    world
+        .source
+        .script(Timeframe::M15, pulse::fixture_m15_candles());
+    world
+        .source
+        .script(Timeframe::H4, pulse::fixture_h4_candles());
+    let version = create_version(&world, "rollback", &pulse::fixture_strategy_dsl()).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let repo = FlakyRepo::new(world.paper());
+    let fail_next = repo.flag();
+    let mut runtime = flaky_runtime(&world, repo);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let first_live = world
+        .paper()
+        .count_from_ms(&session.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut trades_seen = 0;
+    for step in 0..60 {
+        world.clock.set(first_live + (step + 1) * M15_MS);
+        fail_next.store(true, Ordering::SeqCst);
+        let failures = runtime.wake().await;
+        assert!(!failures.is_empty(), "step {step}: the append failed");
+        let verdict = runtime
+            .shadow_check(&session.id)
+            .await
+            .expect("the check runs");
+        assert!(
+            verdict.is_identical(),
+            "step {step}: no verdict over an uncommitted bar: {verdict:?}"
+        );
+        assert!(
+            runtime.wake().await.is_empty(),
+            "step {step}: the bar lands"
+        );
+        if let pulse::ShadowResult::Identical { closed_trades, .. } = verdict {
+            trades_seen = closed_trades;
+        }
+    }
+    assert!(trades_seen > 0, "the fixture traded (non-vacuous)");
+}
+
+/// Round 2 (the rebuild-first ruling): the rebuild a stop's final shadow check runs first
+/// can itself fail; the stop still lands — a failed check never vetoes it.
+#[tokio::test]
+async fn a_stop_lands_when_the_pre_check_rebuild_fails() {
+    let world = PaperWorld::new().await;
+    world.source.script(
+        Timeframe::M15,
+        vec![
+            m15_bar(BASE - 2 * M15_MS, 60_100, 60_050),
+            m15_bar(BASE - M15_MS, 60_050, 60_000),
+            m15_bar(BASE, 60_000, 60_050),
+            m15_bar(BASE + M15_MS, 60_050, 60_000),
+        ],
+    );
+    let (_version, session) = price_session(&world, Timeframe::M15, None, false).await;
+    let repo = FlakyRepo::new(world.paper());
+    let fail_next = repo.flag();
+    let fail_bars = repo.bars_flag();
+    let mut runtime = flaky_runtime(&world, repo);
+    assert!(runtime.boot().await.is_empty(), "boot");
+
+    // A failed bar append leaves the session needing a rebuild, and the
+    // rebuild's reads then fail.
+    world.clock.set(BASE + 2 * M15_MS);
+    fail_next.store(true, Ordering::SeqCst);
+    assert_eq!(runtime.wake().await.len(), 1, "the append failed");
+    fail_bars.store(true, Ordering::SeqCst);
+
+    let label = pulse::NonEmptyLabel::try_new("desk-token-rebuild").unwrap();
+    runtime
+        .stop(&session.id, pulse::StopActor::Token { label })
+        .await
+        .expect("a failed pre-check rebuild does not veto the stop");
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert_eq!(events.last().map(PaperEvent::kind), Some("stop"));
+    assert!(runtime.attached_ids().is_empty());
+    assert!(
+        world
+            .log
+            .lines()
+            .iter()
+            .any(|line| line.contains("final shadow check failed")),
+        "the failed check is logged"
     );
 }
 

@@ -385,6 +385,15 @@ where
         &mut self,
         session_id: &PaperSessionId,
     ) -> Result<ShadowResult, PaperRuntimeError> {
+        // A failed append left the engine a bar ahead of the log: rebuild
+        // first, so the check never compares a bar that never committed.
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|run| run.needs_rebuild)
+        {
+            self.rebuild(session_id).await?;
+        }
         let run = self
             .sessions
             .get(session_id)
