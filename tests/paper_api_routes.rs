@@ -278,6 +278,34 @@ async fn i_uncertified_and_empty_reason_refuse_without_writing() {
     assert_eq!(row_count(&ts, "paper_session").await, before);
 }
 
+/// Round 3 (Codex): an override naming a pair the exchange adapter does not
+/// know is 422 `validation`, and no row is written — the runtime could never
+/// attach it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i_an_override_with_an_unsupported_pair_refuses_without_writing() {
+    let ts = paper_server().await;
+    let version_id = uncertified_version(&ts.db, "routes-unsupported-pair").await;
+    let before = row_count(&ts, "paper_session").await;
+    let response = post_promote(
+        &ts,
+        json!({
+            "version_id": version_id.as_str(),
+            "override": {
+                "reason": "promoting early on purpose",
+                "pair": "ETHUSDT",
+                "primary_timeframe": "15m",
+                "htf_timeframe": "4h",
+                "uses_d1": false,
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = response.json().await.expect("a json refusal");
+    assert_eq!(body["code"], json!("validation"), "{body:?}");
+    assert_eq!(row_count(&ts, "paper_session").await, before);
+}
+
 /// An override promotes with 201, badged override with its reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i_an_override_promotes_badged_with_its_reason() {

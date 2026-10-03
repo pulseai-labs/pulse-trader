@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use super::auth::{AuthenticatedLabel, bearer_token, hash_token};
 use super::routes::MountExt;
 use super::{ServerState, ops};
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
     SqliteBacktestRunRepo, SqliteClientTokenRepo, SqlitePaperSessionRepo, SqliteStrategyRepo,
@@ -52,7 +53,7 @@ use crate::domain::PaperSessionRepository;
 use crate::domain::paper::event::StopActor;
 use crate::domain::paper::session::{NonEmptyLabel, NonEmptyReason, PaperSessionId};
 use crate::domain::strategy::VersionId;
-use crate::domain::{Pair, PromotionRefused, Timeframe};
+use crate::domain::{ExchangeAdapter as _, Pair, PromotionRefused, Timeframe};
 
 /// How often the session SSE stream polls the repository for new events
 /// (spec §5: "default every 2 s", the item's call).
@@ -618,6 +619,17 @@ fn override_request(body: OverrideBody) -> Result<OverrideRequest, Response> {
             format!("invalid pair: {error}"),
         )
     })?;
+    // The runtime attaches only a pair the exchange adapter knows (its symbol
+    // filters); any other would persist a session that can never attach.
+    BinanceAdapter::new()
+        .symbol_filters(&pair)
+        .map_err(|error| {
+            api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+                format!("unsupported pair: {error}"),
+            )
+        })?;
     Ok(OverrideRequest {
         reason,
         pair,
