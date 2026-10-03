@@ -618,6 +618,106 @@ async fn stop_all_stops_a_running_session_that_is_not_attached() {
     assert!(runtime.attached_ids().is_empty());
 }
 
+/// Round 2 (Codex, the epoch rebuild): a session whose log disagrees with the engine rebuilt
+/// from its recorded bars is held — never attached, one `data_event` naming
+/// the session, both states and the engine fingerprint — and is still stopped
+/// by a single stop (the direct path) and by stop-all.
+#[tokio::test]
+async fn a_held_session_is_never_attached_and_is_still_stopped() {
+    let (world, ids) = fixture_world_with_sessions(2).await;
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "boot");
+    for id in &ids {
+        run_bars(&world, &mut runtime, id, 40).await;
+    }
+    // Tamper each log with an exit the engine never made: the replayed
+    // closed-trade count no longer matches a rebuild.
+    for id in &ids {
+        world
+            .paper()
+            .append_bar(
+                id,
+                &[],
+                &[PaperEvent::Fill {
+                    seq: 0,
+                    at: "2025-02-03T00:00:00.000Z".to_owned(),
+                    side: pulse::PaperSide::Long,
+                    qty: rust_decimal::Decimal::ONE,
+                    price: rust_decimal::Decimal::new(100, 0),
+                    exit_reason: Some(pulse::ExitReason::StopLoss),
+                    realized_r: None,
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let data_events = |events: &[PaperEvent]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PaperEvent::DataEvent { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // A fresh process: both sessions are held at attach.
+    let mut reborn = world.runtime();
+    let failures = reborn.boot().await;
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert!(
+        failures
+            .iter()
+            .all(|failure| matches!(failure.error, PaperRuntimeError::StateMismatch { .. })),
+        "{failures:?}"
+    );
+    assert!(
+        reborn.attached_ids().is_empty(),
+        "a held session is not attached"
+    );
+    for _ in 0..2 {
+        reborn.wake().await;
+    }
+    let fingerprint = pulse::EngineFingerprint::current();
+    for id in &ids {
+        let held = data_events(&world.paper().events(id).await.unwrap());
+        assert_eq!(held.len(), 1, "one data_event per process: {held:?}");
+        assert!(held[0].contains(id.as_str()), "{held:?}");
+        assert!(held[0].contains(fingerprint.as_str()), "{held:?}");
+        assert!(
+            held[0].contains("rebuilt:") && held[0].contains("log:"),
+            "{held:?}"
+        );
+    }
+
+    // A single stop reaches the held session through the direct path.
+    let label = NonEmptyLabel::try_new("desk-token-held").unwrap();
+    let reply = reborn
+        .stop_or_unattached(
+            &ids[0],
+            StopActor::Token {
+                label: label.clone(),
+            },
+        )
+        .await
+        .expect("a held session is stoppable");
+    assert_eq!(reply, pulse::StopReply::StoppedWithoutShadow);
+    assert_eq!(
+        stops(&world.paper().events(&ids[0]).await.unwrap()),
+        vec![StopActor::Token { label }]
+    );
+
+    // stop-all includes the other held session.
+    let issuer = NonEmptyLabel::try_new("kill-switch-held").unwrap();
+    let reply = reborn.stop_all_reply(issuer.clone()).await;
+    assert!(reply.failures.is_empty(), "{:?}", reply.failures);
+    assert_eq!(reply.stopped, vec![ids[1].clone()]);
+    assert_eq!(
+        stops(&world.paper().events(&ids[1]).await.unwrap()),
+        vec![StopActor::StopAll { issuer }]
+    );
+}
+
 /// F2: the serve loop ends when its control handle is dropped instead of
 /// re-firing the `recv()` arm (a busy-spin once the sender is gone).
 ///

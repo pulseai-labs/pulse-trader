@@ -22,12 +22,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use rust_decimal::Decimal;
+
 use crate::adapters::backtest::{
     BacktestConfig, EngineSession, SessionTimeframes, first_fully_warm_bar_ms, run_backtest,
 };
 use crate::application::paper_control::{PaperCommand, ShadowCheckReply, StopAllReply, StopReply};
 use crate::domain::backtest::{BacktestError, OpenPositionMark};
-use crate::domain::paper::event::{PaperEvent, StopActor};
+use crate::domain::paper::event::{PaperEvent, PaperSide, StopActor};
 use crate::domain::paper::runtime::{
     EpochStart, ShadowResult, StepView, boundaries, compare, daily_shadow_due, events_for_step,
     first_open_bar_ms,
@@ -166,6 +168,16 @@ pub enum PaperRuntimeError {
     UnknownSession(PaperSessionId),
     /// The session is not (or no longer) run by this runtime.
     NotRunning(PaperSessionId),
+    /// The engine rebuilt from the recorded bars disagrees with the log's
+    /// replayed trades: the session is held, never attached, until stopped.
+    StateMismatch {
+        /// The held session.
+        session_id: PaperSessionId,
+        /// The rebuilt engine's state.
+        rebuilt: String,
+        /// The log's replayed state.
+        logged: String,
+    },
 }
 
 impl core::fmt::Display for PaperRuntimeError {
@@ -183,6 +195,15 @@ impl core::fmt::Display for PaperRuntimeError {
                 write!(f, "paper runtime: no such paper session {}", id.as_str())
             }
             Self::NotRunning(id) => write!(f, "paper runtime: session {id} is not running"),
+            Self::StateMismatch {
+                session_id,
+                rebuilt,
+                logged,
+            } => write!(
+                f,
+                "paper runtime: session {session_id} is held: the rebuilt engine \
+                 ({rebuilt}) disagrees with the log ({logged})"
+            ),
         }
     }
 }
@@ -201,6 +222,7 @@ impl PaperRuntimeError {
             Self::UnknownVersion(_) => "unknown_version",
             Self::UnknownSession(_) => "unknown_session",
             Self::NotRunning(_) => "not_running",
+            Self::StateMismatch { .. } => "state_mismatch",
         }
     }
 }
@@ -254,6 +276,10 @@ pub struct PaperRuntime<R, B, S, C, E> {
     /// never attached again by this process, so a refused append cannot let
     /// the next wake's discovery restart them.
     halted: BTreeSet<PaperSessionId>,
+    /// Sessions whose rebuilt engine disagreed with their log at attach:
+    /// never attached again by this process (their `data_event` is written
+    /// once). A held session is still stopped through the direct path.
+    held: BTreeSet<PaperSessionId>,
 }
 
 /// One attached session's live state.
@@ -279,6 +305,34 @@ struct RunningSession {
     reported: BTreeMap<i64, String>,
     /// A failed append rebuilds from the log before the next attempt.
     needs_rebuild: bool,
+}
+
+/// The replayed trade state the attach-time check compares exactly: the
+/// closed-trade count and the open position's side, quantity and entry price.
+#[derive(Debug, PartialEq)]
+struct TradeState {
+    closed_trades: usize,
+    open: Option<(PaperSide, Decimal, Decimal)>,
+}
+
+impl core::fmt::Display for TradeState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} closed trades, ", self.closed_trades)?;
+        match &self.open {
+            Some((side, qty, entry_price)) => {
+                write!(f, "open {side:?} qty {qty} at {entry_price}")
+            }
+            None => write!(f, "no open position"),
+        }
+    }
+}
+
+/// The paper log's side for an engine direction.
+fn side_of_direction(direction: crate::domain::Direction) -> PaperSide {
+    match direction {
+        crate::domain::Direction::Long => PaperSide::Long,
+        crate::domain::Direction::Short => PaperSide::Short,
+    }
 }
 
 /// What one bar's processing produced.
@@ -328,6 +382,7 @@ where
             log,
             sessions: BTreeMap::new(),
             halted: BTreeSet::new(),
+            held: BTreeSet::new(),
         }
     }
 
@@ -634,7 +689,7 @@ where
     /// [`PaperRuntimeError::UnknownSession`] for an absent row; the replay,
     /// compile, store and engine refusals [`Self::attach`] raises otherwise.
     pub async fn attach_one(&mut self, id: &PaperSessionId) -> Result<(), PaperRuntimeError> {
-        if self.sessions.contains_key(id) || self.halted.contains(id) {
+        if self.sessions.contains_key(id) || self.halted.contains(id) || self.held.contains(id) {
             return Ok(());
         }
         let session = self
@@ -755,7 +810,10 @@ where
             }
         };
         for session in sessions {
-            if self.sessions.contains_key(&session.id) || self.halted.contains(&session.id) {
+            if self.sessions.contains_key(&session.id)
+                || self.halted.contains(&session.id)
+                || self.held.contains(&session.id)
+            {
                 continue;
             }
             let id = session.id.clone();
@@ -807,6 +865,56 @@ where
         let loaded = self
             .load_and_build(&session, &compiled, config, &filters)
             .await?;
+        // The rebuilt engine must reproduce the log's replayed trades exactly
+        // (an engine upgrade that changed an earlier decision, or any
+        // non-determinism, would otherwise corrupt the trade record with the
+        // next delta). On a mismatch the session is held: not attached, one
+        // `data_event`, still stoppable. No reconciliation is attempted.
+        let rebuilt_open = loaded
+            .recorded
+            .get(&session.primary_timeframe)
+            .and_then(|bars| bars.values().next_back())
+            .and_then(|last| loaded.engine.open_position_mark(last));
+        let rebuilt = TradeState {
+            closed_trades: loaded.engine.closed_trades().len(),
+            open: rebuilt_open.map(|mark| {
+                (
+                    side_of_direction(mark.direction),
+                    mark.qty,
+                    mark.entry_price,
+                )
+            }),
+        };
+        let logged = TradeState {
+            closed_trades: state.closed_trades.len(),
+            open: state
+                .open_position
+                .as_ref()
+                .map(|position| (position.side, position.qty, position.entry_price)),
+        };
+        if rebuilt != logged {
+            let summary = format!(
+                "session {id} is held: the engine rebuilt from its recorded bars under engine {} \
+                 disagrees with its log (rebuilt: {rebuilt}; log: {logged}); stop it and promote \
+                 again",
+                EngineFingerprint::current().as_str()
+            );
+            if !self.held.contains(&id) {
+                let event = PaperEvent::DataEvent {
+                    seq: 0,
+                    at: self.now_text(),
+                    summary: summary.clone(),
+                };
+                self.repo.append_bar(&id, &[], &[event]).await?;
+                self.held.insert(id.clone());
+                self.log.write(format!("paper runtime: {summary}"));
+            }
+            return Err(PaperRuntimeError::StateMismatch {
+                session_id: id,
+                rebuilt: rebuilt.to_string(),
+                logged: logged.to_string(),
+            });
+        }
         self.sessions.insert(
             id.clone(),
             RunningSession {
