@@ -205,6 +205,13 @@ async fn catch_up_after_an_outage_equals_an_uninterrupted_session() {
     let mut runtime_b = world_b.runtime();
     assert!(runtime_a.boot().await.is_empty(), "A boots");
     assert!(runtime_b.boot().await.is_empty(), "B boots");
+    // The lead-in lands at its confirming read, one re-poll later (#306).
+    let repoll = SettlePolicy::DEFAULT.repoll_ms;
+    for (world, runtime) in [(&world_a, &mut runtime_a), (&world_b, &mut runtime_b)] {
+        assert_eq!(runtime.next_wake_ms(), Some(world.clock.now() + repoll));
+        world.clock.advance(repoll);
+        assert!(runtime.wake().await.is_empty(), "the lead-in confirms");
+    }
 
     let first_live = world_a
         .paper()
@@ -280,6 +287,19 @@ async fn catch_up_after_an_outage_equals_an_uninterrupted_session() {
     let mut runtime_b2 = world_b.runtime();
     let failures = runtime_b2.boot().await;
     assert!(failures.is_empty(), "B's reboot boots: {failures:?}");
+    // Catch-up confirms the backlog at the first re-poll after the boot, never
+    // with a second read at the boot's own instant (#306).
+    assert_eq!(
+        runtime_b2.next_wake_ms(),
+        Some(world_b.clock.now() + repoll)
+    );
+    world_b.clock.advance(repoll);
+    let failures = runtime_b2.wake().await;
+    assert!(failures.is_empty(), "B's catch-up re-poll: {failures:?}");
+    runtime_b2
+        .shadow_check(&session_b)
+        .await
+        .expect("B shadow-checks after catch-up");
 
     // (iii) the log equals A's, ignoring `seq`, `at` and the boot's extra
     // `ShadowChecked`.

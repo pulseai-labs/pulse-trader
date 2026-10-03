@@ -71,9 +71,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   session for good — both sessions on the always-on server stopped within an hour
   of promotion. The runtime now records and steps a bar (live or lead-in) only once
   it is settled: read at least 30 s after its close and confirmed by an identical
-  read in a later poll pass, re-polled every 10 s until then. A steady bar lands
-  40 s after its close; each read that differs from the one before adds 10 s. A
-  disagreement with a bar that was already recorded is still a `data_event`, and
+  read at least 10 s later, re-polled every 10 s until then — after a restart and
+  at a first start too, and a primary bar waits for a higher bar that closes with
+  it. A steady bar lands 40 s after its close; each read that differs from the one
+  before adds 10 s; a bar still unsettled 5 minutes after its close is logged once.
+  A disagreement with a bar that was already recorded is still a `data_event`, and
   recorded bars are never replaced. The engine fingerprint is unchanged. Refs
   [#306](https://github.com/pulseai-labs/pulse-trader/issues/306).
 

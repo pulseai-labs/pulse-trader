@@ -13,9 +13,12 @@
 
 mod support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use pulse::{
-    Candle, PaperEvent, PaperSession, PaperSessionId, PaperSessionRepository, SettlePolicy,
-    Timeframe,
+    BinanceAdapter, Candle, ClosedBarSource, DataError, LiveEnv, Pair, PaperEvent, PaperRuntime,
+    PaperSession, PaperSessionId, PaperSessionRepository, SettlePolicy, Timeframe,
 };
 use rust_decimal::Decimal;
 use support::paper::{PaperWorld, TestRuntime, create_version, m15_bar, promote_session};
@@ -27,8 +30,10 @@ const BASE: i64 = 1_738_368_000_000;
 /// The production poll grace (`DEFAULT_POLL_GRACE_MS`).
 const GRACE_MS: i64 = 5_000;
 /// How long after its close the source keeps serving the provisional copy of
-/// a bar — longer than the grace, as observed live.
-const PROVISIONAL_FOR_MS: i64 = 12_000;
+/// a bar — longer than the grace, as observed live, and longer than the settle
+/// time, so the first counting read IS provisional and only the confirming
+/// read can catch it.
+const PROVISIONAL_FOR_MS: i64 = 35_000;
 
 /// The final copy of a bar.
 fn final_bar(open_time: i64, open: i64, close: i64) -> Candle {
@@ -64,9 +69,20 @@ fn script_with(world: &PaperWorld, finals: &[Candle], now: i64, provisional_for_
     world.source.script(Timeframe::M15, served);
 }
 
-/// Drive the runtime by its own wake schedule until the clock passes `until`,
-/// re-scripting the source before every wake.
+/// Drive the runtime by its own wake schedule through every wake due by
+/// `until`, re-scripting the source before every wake.
 async fn drive(world: &PaperWorld, runtime: &mut TestRuntime, finals: &[Candle], until: i64) {
+    drive_with(world, runtime, finals, until, PROVISIONAL_FOR_MS).await;
+}
+
+/// [`drive`] with a chosen provisional window.
+async fn drive_with(
+    world: &PaperWorld,
+    runtime: &mut TestRuntime,
+    finals: &[Candle],
+    until: i64,
+    provisional_for_ms: i64,
+) {
     for _ in 0..1_000 {
         let now = world.clock.now();
         if now > until {
@@ -74,8 +90,11 @@ async fn drive(world: &PaperWorld, runtime: &mut TestRuntime, finals: &[Candle],
         }
         let next = runtime.next_wake_ms().expect("a wake is always scheduled");
         assert!(next > now, "the next wake {next} lies after now {now}");
+        if next > until {
+            return;
+        }
         world.clock.set(next);
-        script_at(world, finals, next);
+        script_with(world, finals, next, provisional_for_ms);
         let failures = runtime.wake().await;
         assert!(failures.is_empty(), "{failures:?}");
     }
@@ -277,6 +296,8 @@ async fn a_steady_bar_lands_one_repoll_after_the_settle_time() {
     let session = session(&world).await;
     let mut runtime = world.runtime();
     assert!(runtime.boot().await.is_empty(), "boot");
+    // The lead-in lands at its confirming read; the 00:15 bar is still open.
+    drive(&world, &mut runtime, &finals, BASE + M15_MS + 120_000).await;
 
     let close = BASE + 2 * M15_MS;
     let policy = SettlePolicy::DEFAULT;
@@ -305,6 +326,8 @@ async fn a_bar_that_changes_after_the_settle_time_is_confirmed_again_before_it_l
     let session = session(&world).await;
     let mut runtime = world.runtime();
     assert!(runtime.boot().await.is_empty(), "boot");
+    // The lead-in lands at its confirming read; the 00:15 bar is still open.
+    drive(&world, &mut runtime, &finals, BASE + M15_MS + 120_000).await;
 
     // Provisional for 35 s: the 30 s read is provisional, the 40 s read final.
     let close = BASE + 2 * M15_MS;
@@ -323,5 +346,259 @@ async fn a_bar_that_changes_after_the_settle_time_is_confirmed_again_before_it_l
         data_events(&events).is_empty(),
         "{:?}",
         data_events(&events)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A restart or a promotion between the settle time and the final copy
+// ---------------------------------------------------------------------------
+
+/// The window in which a restart lands: the first counting read (30 s) has
+/// already seen the provisional copy, the final copy arrives at 37 s.
+const LATE_FINAL_MS: i64 = 37_000;
+
+#[tokio::test]
+async fn a_restart_between_the_settle_time_and_the_final_copy_records_the_final_copy() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + M15_MS + 60_000);
+    let finals = finals();
+    script_with(&world, &finals, world.clock.now(), LATE_FINAL_MS);
+    let session = session(&world).await;
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let close = BASE + 2 * M15_MS;
+    // Run to the first counting read of the 00:15 bar (provisional), then die.
+    drive_with(&world, &mut runtime, &finals, close + 30_000, LATE_FINAL_MS).await;
+    assert_eq!(
+        world.clock.now(),
+        close + 30_000,
+        "the provisional copy was read"
+    );
+    drop(runtime);
+
+    // A fresh runtime boots at 32 s: its catch-up reads the provisional copy
+    // too, and must not confirm it with a second read at the same instant.
+    world.clock.set(close + 32_000);
+    script_with(&world, &finals, world.clock.now(), LATE_FINAL_MS);
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "reboot");
+    drive_with(
+        &world,
+        &mut runtime,
+        &finals,
+        BASE + 4 * M15_MS + 120_000,
+        LATE_FINAL_MS,
+    )
+    .await;
+
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+    let bars = recorded(&world, &session.id).await;
+    assert_eq!(bars, finals, "every recorded bar is the FINAL copy");
+}
+
+#[tokio::test]
+async fn a_first_start_between_the_settle_time_and_the_final_copy_records_the_final_copy() {
+    let world = world_with_grace(PaperWorld::new().await);
+    // Promotion 32 s after the 00:00 bar's close: past the settle time, and
+    // the exchange still serves its provisional copy until 37 s.
+    world.clock.set(BASE + M15_MS + 32_000);
+    let finals = finals();
+    script_with(&world, &finals, world.clock.now(), LATE_FINAL_MS);
+    let session = session(&world).await;
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "boot");
+    drive_with(
+        &world,
+        &mut runtime,
+        &finals,
+        BASE + 4 * M15_MS + 120_000,
+        LATE_FINAL_MS,
+    )
+    .await;
+
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+    let bars = recorded(&world, &session.id).await;
+    assert_eq!(
+        bars.last().map(|bar| bar.open_time),
+        Some(BASE + 3 * M15_MS)
+    );
+    for bar in &bars {
+        let expected = finals
+            .iter()
+            .find(|candidate| candidate.open_time == bar.open_time)
+            .expect("a scripted bar");
+        assert_eq!(bar, expected, "bar {} is the FINAL copy", bar.open_time);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A primary bar waits for the higher bar that closes with it
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_primary_bar_waits_for_the_higher_bar_that_closes_with_it() {
+    const H_MS: i64 = 3_600_000;
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 60_000);
+    let m15: Vec<Candle> = (0..22)
+        .map(|i| m15_bar(BASE + 7 * H_MS + i * M15_MS, 60_100, 60_050))
+        .collect();
+    world.source.script(Timeframe::M15, m15);
+    // The H4 bar opening 08:00 closes with the M15 bar opening 11:45; the
+    // exchange serves a provisional copy of it until 35 s past that close, so
+    // its first counting read is provisional while the M15 bar is steady.
+    let h4_early = support::paper::bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050);
+    let h4_final = support::paper::bar_of(Timeframe::H4, BASE + 8 * H_MS, 60_050, 60_000);
+    let h4_close = h4_final.close_time + 1;
+    let script_h4 = |now: i64| {
+        let mut h4 = h4_final.clone();
+        if now < h4_close + 35_000 {
+            h4.close -= Decimal::new(1, 1);
+        }
+        world
+            .source
+            .script(Timeframe::H4, vec![h4_early.clone(), h4]);
+    };
+    script_h4(world.clock.now());
+    let version = create_version(&world, "settle-h4", &pulse::fixture_strategy_dsl()).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "boot");
+    for _ in 0..200 {
+        let next = runtime.next_wake_ms().expect("a wake is always scheduled");
+        if next > h4_close + 16 * 60_000 {
+            break;
+        }
+        world.clock.set(next);
+        script_h4(next);
+        assert!(runtime.wake().await.is_empty());
+    }
+
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+    let last_primary = BASE + 11 * H_MS + 45 * 60_000;
+    let batch = events
+        .iter()
+        .find_map(|event| match event {
+            PaperEvent::BarProcessed { bars, .. }
+                if bars.iter().any(|bar| {
+                    bar.timeframe == Timeframe::M15 && bar.open_time == last_primary
+                }) =>
+            {
+                Some(bars.clone())
+            }
+            _ => None,
+        })
+        .expect("the 11:45 bar was consumed");
+    assert!(
+        batch
+            .iter()
+            .any(|bar| bar.timeframe == Timeframe::H4 && bar.open_time == BASE + 8 * H_MS),
+        "the settled H4 bar rides the batch of the M15 bar closing with it: {batch:?}"
+    );
+    let h4 = world
+        .paper()
+        .bars(&session.id, Timeframe::H4)
+        .await
+        .unwrap();
+    assert_eq!(h4.last(), Some(&h4_final), "the FINAL H4 copy landed");
+}
+
+// ---------------------------------------------------------------------------
+// A failed confirming poll keeps the re-poll
+// ---------------------------------------------------------------------------
+
+/// The scripted source, failing every read while `fail` is set.
+#[derive(Clone)]
+struct FailingBars {
+    inner: support::paper::ScriptedBars,
+    fail: Arc<AtomicBool>,
+}
+
+impl ClosedBarSource for FailingBars {
+    fn closed_since(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        since_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send {
+        let fail = self.fail.load(Ordering::SeqCst);
+        let read = self.inner.closed_since(pair, timeframe, since_ms);
+        async move {
+            if fail {
+                Err(DataError::Io("scripted outage".to_owned()))
+            } else {
+                read.await
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_confirming_poll_keeps_the_repoll() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + M15_MS + 60_000);
+    let finals = finals();
+    script_with(&world, &finals, world.clock.now(), 0);
+    let session = session(&world).await;
+    let fail = Arc::new(AtomicBool::new(false));
+    let mut runtime = PaperRuntime::new(
+        world.paper(),
+        FailingBars {
+            inner: world.source.clone(),
+            fail: fail.clone(),
+        },
+        world.store.clone(),
+        world.clock.clone(),
+        LiveEnv::new(world.strategies(), BinanceAdapter::new()),
+        GRACE_MS,
+        world.log.clone(),
+    );
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let close = BASE + 2 * M15_MS;
+    // The lead-in confirms; then the first counting read of the 00:15 bar.
+    for _ in 0..10 {
+        let next = runtime.next_wake_ms().unwrap();
+        world.clock.set(next);
+        script_with(&world, &finals, next, 0);
+        assert!(runtime.wake().await.is_empty());
+        if next == close + 30_000 {
+            break;
+        }
+    }
+    assert_eq!(world.clock.now(), close + 30_000);
+    assert_eq!(runtime.next_wake_ms(), Some(close + 40_000));
+
+    // The confirming poll fails: the re-poll is kept, not lost to the next
+    // bar boundary.
+    fail.store(true, Ordering::SeqCst);
+    world.clock.set(close + 40_000);
+    assert!(!runtime.wake().await.is_empty(), "the outage is reported");
+    assert_eq!(runtime.next_wake_ms(), Some(close + 50_000));
+
+    fail.store(false, Ordering::SeqCst);
+    world.clock.set(close + 50_000);
+    script_with(&world, &finals, close + 50_000, 0);
+    assert!(runtime.wake().await.is_empty());
+    let bars = recorded(&world, &session.id).await;
+    assert_eq!(
+        bars.last(),
+        Some(&finals[2]),
+        "the bar lands at the kept re-poll"
     );
 }
