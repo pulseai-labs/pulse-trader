@@ -67,6 +67,11 @@ use super::library::{
     LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
     latest_run_summary, recent_run_summary, version_stats,
 };
+// r3.s4.w5: the paper session surface's shapes and stream channel.
+use super::paper::{
+    PaperSessionSummary, PaperShadowResult, PaperStopResult, PaperStreamEvent, PaperTrades,
+    PromoteRequest, StopAllResult,
+};
 use super::walk_forward::{
     GetBacktestRunRequest, GetWalkForwardRunRequest, WalkForwardRunDto, WalkForwardRunRequest,
 };
@@ -128,6 +133,16 @@ pub const BUS_COMMANDS: &[&str] = &[
     "server_connect",
     "server_status",
     "server_disconnect",
+    // r3.s4.w5: the paper session surface — promote, the reads, the shadow
+    // check, stop / stop-all and the live session stream.
+    "paper_promote",
+    "paper_sessions",
+    "paper_session",
+    "paper_session_trades",
+    "paper_shadow_check",
+    "paper_stop",
+    "paper_stop_all",
+    "paper_session_events",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1765,6 +1780,144 @@ impl EventSink for NullSink {
     fn send_event(&self, _event: BusEvent) -> Result<(), BusError> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// The paper session commands (r3.s4.w5) — thin wrappers over `ClientState`
+// ---------------------------------------------------------------------------
+//
+// Every route behind these is `Scope::App` on the server (an agent token is
+// refused everywhere), and every one of them is a thin pass-through: the route
+// paths, bodies and error decoding live in `src/client` and `src/tauri/paper.rs`,
+// so this file carries no protocol knowledge beyond the command's own name.
+
+/// Promote a strategy version to a paper session — certified, or explicitly
+/// overridden with a typed reason.
+///
+/// # Errors
+///
+/// The promotion gate's typed refusals; see
+/// [`ClientState::paper_promote`](crate::client::ClientState::paper_promote).
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_promote(
+    state: tauri::State<'_, ClientState>,
+    request: PromoteRequest,
+) -> Result<PaperSessionSummary, BusError> {
+    state.paper_promote(&request).await
+}
+
+/// Every paper session's summary, in catalog order.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] on a not-connected or wire failure.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_sessions(
+    state: tauri::State<'_, ClientState>,
+) -> Result<Vec<PaperSessionSummary>, BusError> {
+    state.paper_sessions().await
+}
+
+/// One paper session's summary.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; an unknown id is `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_session(
+    state: tauri::State<'_, ClientState>,
+    id: String,
+) -> Result<PaperSessionSummary, BusError> {
+    state.paper_session(&id).await
+}
+
+/// One paper session's closed trades and open position.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; an unknown id is `not_found`.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_session_trades(
+    state: tauri::State<'_, ClientState>,
+    id: String,
+) -> Result<PaperTrades, BusError> {
+    state.paper_session_trades(&id).await
+}
+
+/// Run one session's shadow check now.
+///
+/// # Errors
+///
+/// `session_stopped`, `session_not_attached`, `runtime_unavailable` — see
+/// [`ClientState::paper_shadow_check`](crate::client::ClientState::paper_shadow_check).
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_shadow_check(
+    state: tauri::State<'_, ClientState>,
+    id: String,
+) -> Result<PaperShadowResult, BusError> {
+    state.paper_shadow_check(&id).await
+}
+
+/// Stop one paper session; the log stays and becomes read-only.
+///
+/// # Errors
+///
+/// `session_stopped` for an already-stopped session, `runtime_unavailable`
+/// with no runtime.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_stop(
+    state: tauri::State<'_, ClientState>,
+    id: String,
+) -> Result<PaperStopResult, BusError> {
+    state.paper_stop(&id).await
+}
+
+/// The kill switch: stop every running paper session at once. Per-session
+/// failures come back in the answer's `failures`, never as an error.
+///
+/// # Errors
+///
+/// `runtime_unavailable` with no runtime; see
+/// [`ClientState::paper_stop_all`](crate::client::ClientState::paper_stop_all).
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_stop_all(
+    state: tauri::State<'_, ClientState>,
+) -> Result<StopAllResult, BusError> {
+    state.paper_stop_all().await
+}
+
+/// Subscribe to one session's event stream, forwarding every `paper` frame
+/// into the per-invocation channel until the token is refused or the channel
+/// dies (the unmount shape). The channel IS the correlation: a second session
+/// gets a second channel.
+///
+/// `after_seq` resumes from a known cursor; `None` replays the whole log. The
+/// sequence is `i32` because the bindings exporter refuses `i64` — the
+/// server's per-session counter, and the client widens it for the wire.
+///
+/// # Errors
+///
+/// The not-connected refusal or a route refusal (an unknown session). A token
+/// refusal is NOT an error: it is the terminal
+/// [`PaperStreamEvent::TokenRefused`] on the channel.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_session_events(
+    state: tauri::State<'_, ClientState>,
+    id: String,
+    after_seq: Option<i32>,
+    channel: tauri::ipc::Channel<PaperStreamEvent>,
+) -> Result<(), BusError> {
+    state
+        .paper_session_events(&id, after_seq.map(i64::from), &channel)
+        .await
 }
 
 #[cfg(test)]

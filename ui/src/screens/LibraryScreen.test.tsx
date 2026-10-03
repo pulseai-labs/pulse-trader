@@ -25,6 +25,9 @@ vi.mock("../bindings", () => ({
       status: "ok",
       data: { state: "up", binary_version: "0.0.0", engine_fingerprint: null, reason: null },
     }),
+    // r3.s4.w5: App polls the running paper-session count for the titlebar
+    // pill; an empty list keeps the strip at "0 paper · 0 live".
+    paperSessions: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
   },
 }));
 

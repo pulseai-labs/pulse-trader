@@ -783,6 +783,18 @@ pub use crate::tauri::{
     WalkForwardRunDto, WalkForwardRunRequest, WalkForwardVerdictDto, get_backtest_run_core,
     get_walk_forward_run_core, run_walk_forward_version_core,
 };
+// r3.s4.w5: the paper session surface's wire contract — the DTOs the eight
+// commands answer with, the stream channel's event and sink types, and the
+// request bodies. `tests/tauri_paper.rs` (AC-1) drives them through the
+// `ClientState` the command wrappers use. (`tauri::paper::PaperPosition` is
+// deliberately NOT re-exported here: the domain's own `PaperPosition` already
+// owns that name at the crate root, and the two are the same wire shape.)
+pub use crate::tauri::{
+    PaperCertifiedDataVersion, PaperComparison, PaperComparisonVerdict, PaperEpochMs,
+    PaperEventFrame, PaperGraduation, PaperJsonText, PaperSessionSummary, PaperShadowCheck,
+    PaperShadowResult, PaperStatus, PaperStopActor, PaperStopResult, PaperStreamEvent,
+    PaperStreamSink, PaperTrades, PromoteOverride, PromoteRequest, StopAllResult, StopFailure,
+};
 // r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
 // single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the
 // REAL cores through these — the `run_backtest_version_core` precedent, with the
