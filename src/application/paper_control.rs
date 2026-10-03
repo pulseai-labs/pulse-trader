@@ -71,7 +71,8 @@ pub enum PaperCommand {
 /// What a `Stop` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReply {
-    /// The session was attached: a final shadow check, then the `stop` event.
+    /// The session was attached: the final shadow check is attempted, then the
+    /// `stop` event — a failed check is logged and does not veto the stop.
     Stopped,
     /// The session was not attached: a direct final `Stop` append with no
     /// shadow check (spec §1 — a session can always be stopped).

@@ -488,13 +488,22 @@ where
         Ok(verdict)
     }
 
-    /// Stop one session: a final shadow check first (the schema refuses
-    /// anything after `stop`), then the `stop` event, then forget it.
+    /// Stop one session: attempt a final shadow check (the schema refuses
+    /// anything after `stop`), append the `stop` event, then forget it.
+    ///
+    /// The kill switch is fail-safe. A failed final shadow check is logged but
+    /// never vetoes the stop — the check is evidence, not a gate. And the
+    /// session leaves `self.sessions` even when the `stop` append itself is
+    /// refused: the in-memory halt wins over the log write, so a store
+    /// failure cannot keep it trading. The append's error still comes back
+    /// (`stop_all` lists it under `failures`); the log then holds no `stop`,
+    /// so a later boot re-attaches the session.
     ///
     /// # Errors
     ///
     /// [`PaperRuntimeError::NotRunning`] for a session this runtime does not
-    /// run; the check's or the append's refusals otherwise.
+    /// run; the `stop` append's refusal otherwise (a failed check is logged,
+    /// never returned).
     pub async fn stop(
         &mut self,
         session_id: &PaperSessionId,
@@ -504,15 +513,22 @@ where
             return Err(PaperRuntimeError::NotRunning(session_id.clone()));
         }
         // The shadow check runs BEFORE `stop` — the trigger makes the log
-        // read-only afterwards.
-        self.shadow_check(session_id).await?;
+        // read-only afterwards — but its failure is not a veto: a kill switch
+        // a failed check can block is not a kill switch.
+        if let Err(error) = self.shadow_check(session_id).await {
+            self.log.write(format!(
+                "paper runtime: stop: session {session_id}: final shadow check failed: {error}"
+            ));
+        }
         let event = PaperEvent::Stop {
             seq: 0,
             at: self.now_text(),
             actor,
         };
-        self.repo.append_bar(session_id, &[], &[event]).await?;
+        // The halt precedes the append's outcome: the session stops trading
+        // now even if the log write is refused.
         self.sessions.remove(session_id);
+        self.repo.append_bar(session_id, &[], &[event]).await?;
         Ok(())
     }
 
