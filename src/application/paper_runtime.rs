@@ -9,7 +9,10 @@
 //! at least [`SettlePolicy::settle_ms`] after its close and confirmed by an
 //! identical read at least [`SettlePolicy::repoll_ms`] later; the runtime
 //! re-polls on that spacing until then. Lead-in passes the same gate, and a
-//! primary bar waits for every higher bar that closes with it. A disagreement
+//! primary bar waits for every higher bar that closes with it — including one
+//! that no read has returned yet while it lies inside the session's fetch
+//! window (R2-4), so a read that omits the bar never steps the primary
+//! without it. A disagreement
 //! with a bar that was already recorded is a true revision and stays a
 //! `data_event`.
 //!
@@ -411,6 +414,11 @@ enum StepOutcome {
         first_time: bool,
         report: (i64, String),
     },
+    /// A higher bar that closes with the next primary bar is not ready: a read
+    /// saw it unsettled, or every read so far closed without it (R2-4). The
+    /// primary waits — and keeps the short re-poll alive — rather than step on
+    /// a higher input a rebuild would not reproduce.
+    AwaitingHigher,
     /// No new bar to consume.
     Idle,
 }
@@ -471,8 +479,9 @@ where
 
     /// The next instant any attached session's timeframes need a poll (the
     /// first poll past a close waits out the settle time), or the re-poll a
-    /// bar awaiting confirmation needs — or, with nothing running, the idle
-    /// re-scan instant (a session promoted later must be picked up without a
+    /// bar awaiting confirmation needs — a primary bar waiting for its due
+    /// higher bar included — or, with nothing running, the idle re-scan
+    /// instant (a session promoted later must be picked up without a
     /// restart).
     #[must_use]
     pub fn next_wake_ms(&self) -> Option<i64> {
@@ -1269,12 +1278,13 @@ where
         Ok(true)
     }
 
-    /// A first start's lead-in, once settled (#306): the probe's window, read
-    /// again `repoll_ms` or more later over the same `since`, keeps the bars
-    /// both reads agree on — cut, across every timeframe, at the first close
-    /// where they differ, so no higher bar is kept without its primary bar.
-    /// `None` while the confirming read is not due; a bar the cut leaves out
-    /// is consumed live later. Without a gate the probe is the lead-in.
+    /// A first start's lead-in, once settled (#306): the probe's window is
+    /// read again `repoll_ms` or more later over the same `since`, and the
+    /// lead-in is recorded only when that read returns every bar of the window
+    /// unchanged. Any change, gap or truncation starts the first start over
+    /// with a fresh probe, so the lead-in is never cut short (a short lead-in
+    /// would leave the engine cold for good). `None` while no confirmed window
+    /// is ready. Without a gate the probe is the lead-in.
     async fn settled_lead_in(
         &mut self,
         session: &PaperSession,
@@ -1283,32 +1293,33 @@ where
         let Some(policy) = self.settle else {
             return Ok(Some(self.probe_lead_in(session, compiled).await?.0));
         };
-        let now = self.clock.now_ms();
-        let Some(pending) = self.pending_lead_in.remove(&session.id) else {
-            let (bars, since) = self.probe_lead_in(session, compiled).await?;
-            self.pending_lead_in.insert(
-                session.id.clone(),
-                PendingLeadIn {
-                    since,
-                    read_at_ms: now,
-                    bars,
-                },
-            );
-            return Ok(None);
-        };
-        if now < pending.read_at_ms + policy.repoll_ms {
-            self.pending_lead_in.insert(session.id.clone(), pending);
-            return Ok(None);
+        if let Some(pending) = self.pending_lead_in.remove(&session.id) {
+            if self.clock.now_ms() < pending.read_at_ms + policy.repoll_ms {
+                self.pending_lead_in.insert(session.id.clone(), pending);
+                return Ok(None);
+            }
+            let mut confirmed = true;
+            for (timeframe, bars) in &pending.bars {
+                let again = self
+                    .source
+                    .closed_since(&session.pair, *timeframe, pending.since)
+                    .await?;
+                confirmed &= bars.iter().all(|bar| again.contains(bar));
+            }
+            if confirmed {
+                return Ok(Some(pending.bars));
+            }
         }
-        let mut again: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
-        for timeframe in session.timeframes() {
-            let bars = self
-                .source
-                .closed_since(&session.pair, timeframe, pending.since)
-                .await?;
-            again.insert(timeframe, bars);
-        }
-        Ok(Some(agreed_lead_in(pending.bars, &again)))
+        let (bars, since) = self.probe_lead_in(session, compiled).await?;
+        self.pending_lead_in.insert(
+            session.id.clone(),
+            PendingLeadIn {
+                since,
+                read_at_ms: self.clock.now_ms(),
+                bars,
+            },
+        );
+        Ok(None)
     }
 
     /// One polling pass: one fetch per `(pair, timeframe)` from the oldest
@@ -1361,7 +1372,11 @@ where
                         .filter(|bar| bar.close_time < now)
                         .collect();
                     let key = (pair, timeframe);
-                    let (bars, first_unsettled) = self.gate(&key, closed, now);
+                    // A read counts from when it returned, not from when the
+                    // pass started: a slow request must not shorten the
+                    // confirmation spacing.
+                    let read_at = self.clock.now_ms();
+                    let (bars, first_unsettled) = self.gate(&key, closed, read_at);
                     if let Some(close_time) = first_unsettled {
                         unsettled.insert(key.clone(), close_time);
                     }
@@ -1490,6 +1505,19 @@ where
 
         match outcome {
             StepOutcome::Idle => Ok(false),
+            StepOutcome::AwaitingHigher => {
+                // The higher bar can arrive at any read, so keep the short
+                // re-poll alive: the next poll boundary may be a whole primary
+                // bar away. Without a settle policy there is no re-poll to
+                // keep, and the boundary cadence already wakes in time.
+                if let Some(policy) = self.settle {
+                    self.repoll_at_ms = Some(earliest(
+                        self.repoll_at_ms,
+                        self.clock.now_ms() + policy.repoll_ms,
+                    ));
+                }
+                Ok(false)
+            }
             StepOutcome::Consumed { bars, events } => {
                 let primary_candle = bars[0].1.clone();
                 let appended = self.repo.append_bar(id, &bars, &events).await;
@@ -1641,6 +1669,57 @@ impl RunningSession {
             })
             .unwrap_or_default()
     }
+
+    /// Whether the higher bar this primary bar needs — the newest one whose
+    /// `close_time` is at or before `primary_close`, the one
+    /// [`Self::new_higher_bars`] and the rebuild both drain — is missing from
+    /// the read.
+    ///
+    /// `fetched` holds only settled bars, so a bar the gate is still
+    /// confirming is not in it; the caller judges that case from its
+    /// `unsettled` marker. What this answers is the read that closed WITHOUT
+    /// the bar at all (R2-4): no marker exists for it, and stepping the primary
+    /// would hand the engine a higher input a rebuild would not reproduce.
+    ///
+    /// **The fetch-floor exception.** Eligibility is the session's own fetch
+    /// window: [`Self::since_for`] is the last recorded higher `open_time`
+    /// minus one, or the recording floor minus one while no higher bar is
+    /// recorded. A due bar opening at or before that boundary can never be
+    /// delivered by any read of this window — it is either recorded already, or
+    /// it opened before the session's first live bar and so never entered its
+    /// recorded lead-in — and waiting for it would deadlock the session for
+    /// good. Such a bar is NOT required: the rebuild drains recorded bars only,
+    /// and lacks it exactly as the live session does.
+    ///
+    /// Inside the window the due bar ITSELF must be in hand: a read that
+    /// carried a newer bar but skipped this one is still a read that never
+    /// returned it, and stepping on it would feed the engine a higher bar on a
+    /// later primary bar than the rebuild's drain does.
+    fn due_higher_missing(
+        &self,
+        timeframe: Timeframe,
+        fetched: &BTreeMap<(Pair, Timeframe), Vec<Candle>>,
+        pair: &Pair,
+        primary_close: i64,
+    ) -> bool {
+        let duration = timeframe.duration_ms();
+        // Derived from the cadence and this primary bar's close, never from
+        // wall time: the bar closing at or before that close.
+        let due_open = ((primary_close + 1).div_euclid(duration) - 1) * duration;
+        if due_open <= self.since_for(timeframe) {
+            return false;
+        }
+        if self
+            .recorded
+            .get(&timeframe)
+            .is_some_and(|bars| bars.contains_key(&due_open))
+        {
+            return false;
+        }
+        !fetched
+            .get(&(pair.clone(), timeframe))
+            .is_some_and(|bars| bars.iter().any(|bar| bar.open_time == due_open))
+    }
 }
 
 /// One `(pair, timeframe)` read split by the settle gate (#306).
@@ -1705,35 +1784,16 @@ fn settle_read(
         }
         read.reads.insert(bar.open_time, (bar, first_read_ms));
     }
-    read
-}
-
-/// A first start's lead-in read twice: the bars both reads agree on, cut at
-/// the earliest `close_time` (across every timeframe) of a bar the second read
-/// changed or no longer serves.
-fn agreed_lead_in(
-    mut first: BTreeMap<Timeframe, Vec<Candle>>,
-    again: &BTreeMap<Timeframe, Vec<Candle>>,
-) -> BTreeMap<Timeframe, Vec<Candle>> {
-    let cut = first
-        .iter()
-        .filter_map(|(timeframe, bars)| {
-            let second = again.get(timeframe);
-            bars.iter()
-                .find(|bar| {
-                    second.is_none_or(|second| {
-                        second.iter().find(|other| other.open_time == bar.open_time) != Some(*bar)
-                    })
-                })
-                .map(|bar| bar.close_time)
-        })
-        .min();
-    if let Some(cut) = cut {
-        for bars in first.values_mut() {
-            bars.retain(|bar| bar.close_time < cut);
+    // An empty or truncated response is no evidence about the bars it left
+    // out: keep their counting reads and read again on the re-poll spacing.
+    let newest = read.reads.keys().next_back().copied();
+    for (open_time, entry) in previous {
+        if newest.is_none_or(|newest| *open_time > newest) {
+            read.reads.insert(*open_time, entry.clone());
+            read.next_read_ms = Some(earliest(read.next_read_ms, now + policy.repoll_ms));
         }
     }
-    first
+    read
 }
 
 /// Every fetched bar that is already recorded with DIFFERENT values — the A6
@@ -1797,17 +1857,21 @@ fn prepare_step(
         return StepOutcome::Idle;
     };
     // A higher bar that closes with this one and is not final yet must ride
-    // this bar's batch, as the rebuild drains it (#306): wait for it.
+    // this bar's batch, as the rebuild drains it (#306): wait for it. Two ways
+    // it is not ready: a read has seen it unsettled, or the reads have closed
+    // without it at all (R2-4) — the second leaves no marker, so it is derived
+    // from the higher cadence and this bar's close.
     let higher_waiting = [run.session.htf_timeframe, run.session.d1_timeframe()]
         .into_iter()
         .flatten()
         .any(|timeframe| {
-            unsettled
+            let unsettled_close = unsettled
                 .get(&(pair.clone(), timeframe))
-                .is_some_and(|close_time| *close_time <= bar.close_time)
+                .is_some_and(|close_time| *close_time <= bar.close_time);
+            unsettled_close || run.due_higher_missing(timeframe, fetched, &pair, bar.close_time)
         });
     if higher_waiting {
-        return StepOutcome::Idle;
+        return StepOutcome::AwaitingHigher;
     }
     let htf_new = run.new_higher_bars(run.session.htf_timeframe, fetched, &pair, bar.close_time);
     let d1_new = run.new_higher_bars(run.session.d1_timeframe(), fetched, &pair, bar.close_time);
