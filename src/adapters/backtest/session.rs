@@ -390,7 +390,8 @@ impl EngineSession {
         // candle's own stamp is accounted before any absence is judged.
         self.check_funding_order(primary, counted)?;
         // Each higher series strictly ascending across AND within steps;
-        // duplicates refuse as `SeriesUnsorted` (the whole-series rule).
+        // duplicates refuse as `SeriesUnsorted`, and a missing candle as
+        // `SeriesGap` (the whole-series rules).
         let mut prev_htf_open = self.last_htf_open;
         for candle in closed_htf {
             if let Some(prev) = prev_htf_open
@@ -403,6 +404,25 @@ impl EngineSession {
             }
             prev_htf_open = Some(candle.open_time);
         }
+        // Then the gap rule, as `CandleSeries::validate` orders them (ascent
+        // over the whole series first): each candle opens exactly one
+        // interval after the previous one.
+        if let Some(timeframe) = self.timeframes.htf {
+            let mut prev_open = self.last_htf_open;
+            for candle in closed_htf {
+                if let Some(prev) = prev_open {
+                    let expected = prev + timeframe.duration_ms();
+                    if candle.open_time != expected {
+                        return Err(BacktestError::SeriesGap {
+                            series: SeriesRole::Htf,
+                            expected,
+                            found: candle.open_time,
+                        });
+                    }
+                }
+                prev_open = Some(candle.open_time);
+            }
+        }
         let mut prev_d1_open = self.last_d1_open;
         for candle in closed_d1 {
             if let Some(prev) = prev_d1_open
@@ -414,6 +434,25 @@ impl EngineSession {
                 });
             }
             prev_d1_open = Some(candle.open_time);
+        }
+        // Then the gap rule, as `CandleSeries::validate` orders them (ascent
+        // over the whole series first): each candle opens exactly one
+        // interval after the previous one.
+        if let Some(timeframe) = self.timeframes.d1 {
+            let mut prev_open = self.last_d1_open;
+            for candle in closed_d1 {
+                if let Some(prev) = prev_open {
+                    let expected = prev + timeframe.duration_ms();
+                    if candle.open_time != expected {
+                        return Err(BacktestError::SeriesGap {
+                            series: SeriesRole::D1,
+                            expected,
+                            found: candle.open_time,
+                        });
+                    }
+                }
+                prev_open = Some(candle.open_time);
+            }
         }
         // Every handed higher candle must be CLOSED by this primary bar's
         // close — a still-forming candle would let the strategy read a bar

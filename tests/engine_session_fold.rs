@@ -1663,8 +1663,10 @@ fn step_refuses_a_not_yet_closed_htf_candle_and_continues_unchanged() {
     for (bar_idx, bar) in primary.iter().enumerate() {
         if bar_idx == 31 {
             // H4[2] only CLOSES at M15 47 — handing it at 31 must refuse.
+            // H4[1] rides ahead of it so the batch has no gap (a gap refuses
+            // first, as the fold's series validation does).
             let err = refused
-                .step_raw(bar, &[htf_candles[2].clone()], &[])
+                .step_raw(bar, &[htf_candles[1].clone(), htf_candles[2].clone()], &[])
                 .expect_err("a still-forming H4 candle must refuse");
             assert_eq!(
                 err,
@@ -1771,6 +1773,95 @@ fn run_d1_schedule(
             .expect("scheduled D1 batch accepts");
     }
     manual.finish(SeriesEnd::SnapshotEnd, primary.last())
+}
+
+/// Step every primary candle through a [`Manual`] driver (the fold's cursor
+/// rule) and return the first refusal.
+fn first_step_refusal(
+    compiled_strategy: &CompiledStrategy,
+    primary: &[Candle],
+    htf: Vec<Candle>,
+    d1_candles: Vec<Candle>,
+) -> Option<BacktestError> {
+    let mut manual = Manual::new(compiled_strategy, htf, d1_candles, None);
+    primary.iter().find_map(|bar| manual.step_drain(bar).err())
+}
+
+/// Round 1 (droid `session.rs:404`): a higher series with a missing candle is
+/// refused by `step` exactly as `run_backtest` refuses it — the same
+/// `SeriesGap`, the same expected and found instants — for HTF and for D1.
+#[test]
+fn step_refuses_a_gapped_higher_series_exactly_as_the_fold_does() {
+    // HTF: the htf fixture with its third H4 candle removed.
+    let (primary_candles, mut htf_candles) = htf_fixture();
+    let missing = htf_candles.remove(2);
+    let compiled_strategy = compiled(
+        compare(htf_ema(2), pulse::Comparator::Gt, constant(99, 0)),
+        vec![stop_loss(5, 2)],
+        Direction::Long,
+    );
+    let fold = run_backtest(
+        &compiled_strategy,
+        &series(Timeframe::M15, primary_candles.clone()),
+        Some(&series(Timeframe::H4, htf_candles.clone())),
+        None,
+        &zero_cost(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+        None,
+    )
+    .expect_err("the fold refuses a gapped HTF series");
+    let expected = BacktestError::SeriesGap {
+        series: pulse::SeriesRole::Htf,
+        expected: missing.open_time,
+        found: missing.open_time + Timeframe::H4.duration_ms(),
+    };
+    assert_eq!(fold, expected);
+    assert_eq!(
+        first_step_refusal(
+            &compiled_strategy,
+            &primary_candles,
+            htf_candles,
+            Vec::new()
+        ),
+        Some(expected),
+        "step refuses the HTF gap the fold refuses"
+    );
+
+    // D1: three days of M15 bars with day 1 missing from the daily series.
+    let primary_candles: Vec<Candle> = (0..288).map(|i| m15(i, 100, 100, 100, 100)).collect();
+    let d1_candles = vec![d1(0, 100), d1(2, 100)];
+    let compiled_strategy = compiled(
+        compare(
+            d1_price(PriceField::Close),
+            pulse::Comparator::Lt,
+            constant(101, 0),
+        ),
+        vec![stop_loss(5, 2)],
+        Direction::Long,
+    );
+    let fold = run_backtest(
+        &compiled_strategy,
+        &series(Timeframe::M15, primary_candles.clone()),
+        None,
+        Some(&series(Timeframe::D1, d1_candles.clone())),
+        &zero_cost(),
+        &SymbolFilters::unconstrained(),
+        SeriesEnd::SnapshotEnd,
+        None,
+    )
+    .expect_err("the fold refuses a gapped D1 series");
+    let expected = BacktestError::SeriesGap {
+        series: pulse::SeriesRole::D1,
+        expected: Timeframe::D1.duration_ms(),
+        found: 2 * Timeframe::D1.duration_ms(),
+    };
+    assert_eq!(fold, expected);
+    assert_eq!(
+        first_step_refusal(&compiled_strategy, &primary_candles, Vec::new(), d1_candles),
+        Some(expected),
+        "step refuses the D1 gap the fold refuses"
+    );
 }
 
 #[test]
