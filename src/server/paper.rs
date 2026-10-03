@@ -202,6 +202,11 @@ async fn promote_route(state: Arc<ServerState>, req: Request) -> Response {
         Err(PaperPromotionError::Data(error)) => {
             internal(&format!("paper promotion store failure: {error}"))
         }
+        Err(error @ PaperPromotionError::InvalidShape(_)) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation",
+            error.to_string(),
+        ),
     }
 }
 

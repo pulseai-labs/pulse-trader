@@ -585,6 +585,38 @@ async fn iv_override_promotion_records_reason_and_at() {
     assert_eq!(read_back, session);
 }
 
+/// Round 1 (iQ): an override's session shape is held to the backtest's
+/// request-shape rules — a D1 primary, a D1 HTF and an HTF not higher than the
+/// primary are each refused as `InvalidShape`, and no row is written.
+#[tokio::test]
+async fn iv_b_override_with_an_impossible_shape_is_refused() {
+    let world = world().await;
+    let version_id = uncertified_version(&world, "override-shape").await;
+    let shapes = [
+        (Timeframe::D1, None),
+        (Timeframe::M15, Some(Timeframe::D1)),
+        (Timeframe::H4, Some(Timeframe::H4)),
+        (Timeframe::H4, Some(Timeframe::M15)),
+    ];
+    for (primary, htf) in shapes {
+        let request = pulse::OverrideRequest {
+            reason: NonEmptyReason::try_new("operator decision").unwrap(),
+            pair: fixture_pair(),
+            primary_timeframe: primary,
+            htf_timeframe: htf,
+            uses_d1: false,
+        };
+        let error = try_promote(&world, &version_id, Some(request), "operator-token")
+            .await
+            .expect_err("an impossible shape refuses");
+        assert!(
+            matches!(error, PaperPromotionError::InvalidShape(_)),
+            "{primary:?}/{htf:?}: {error:?}"
+        );
+    }
+    assert_eq!(session_count(&world).await, 0, "no row is written");
+}
+
 /// (v) E2: a passing walk-forward under a foreign fingerprint refuses as
 /// `CertifiedUnderOtherEngine`, naming both fingerprints — with or without an
 /// override — and writes no row.

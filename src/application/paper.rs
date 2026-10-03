@@ -20,7 +20,7 @@ use crate::domain::paper::session::{Graduation, NonEmptyLabel, NonEmptyReason, P
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestRunRepository, Clock, DataError, EngineFingerprint, Pair, PaperSessionRepository,
-    StrategyRepository, Timeframe, WalkForwardRunRepository,
+    StrategyRepository, Timeframe, WalkForwardRunRepository, compile, validate,
 };
 
 /// Why a promotion could not complete. The gate's refusals are typed through;
@@ -33,6 +33,10 @@ pub enum PaperPromotionError {
     UnknownVersion(VersionId),
     /// A store read or write failed.
     Data(DataError),
+    /// An override's session shape the engine cannot run for this version
+    /// (a D1 primary, a D1 or not-higher HTF, or a series the strategy reads
+    /// that the shape does not supply), or a version that does not compile.
+    InvalidShape(String),
 }
 
 impl core::fmt::Display for PaperPromotionError {
@@ -41,6 +45,7 @@ impl core::fmt::Display for PaperPromotionError {
             Self::Refused(refused) => write!(f, "{refused}"),
             Self::UnknownVersion(id) => write!(f, "no such strategy version: {}", id.as_str()),
             Self::Data(e) => write!(f, "paper promotion store failure: {e}"),
+            Self::InvalidShape(message) => write!(f, "invalid session shape: {message}"),
         }
     }
 }
@@ -149,6 +154,27 @@ where
         promoted_by,
     )
     .map_err(PaperPromotionError::Refused)?;
+
+    // An override's shape is the caller's: hold it to the backtest's own
+    // request-shape rules before any row is written (a certified shape came
+    // from passing fold runs that already met them).
+    if matches!(draft.graduation, Graduation::Override { .. }) {
+        let compiled = validate(&version.dsl)
+            .map_err(|e| e.to_string())
+            .and_then(|validated| compile(&validated).map_err(|e| e.to_string()))
+            .map_err(PaperPromotionError::InvalidShape)?;
+        crate::application::backtest::check_request_shape(
+            &compiled,
+            draft.primary_timeframe,
+            draft.htf_timeframe,
+        )
+        .map_err(|e| PaperPromotionError::InvalidShape(e.to_string()))?;
+        if compiled.needs_d1() && !draft.uses_d1 {
+            return Err(PaperPromotionError::InvalidShape(
+                "the strategy reads the daily series, so `uses_d1` must be true".to_owned(),
+            ));
+        }
+    }
 
     // The fixture flag is a store fact: every certified data version has a
     // `fixture_snapshot` row (A12). An override names no versions and is
