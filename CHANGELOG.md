@@ -79,10 +79,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   recorded bars are never replaced. The initialization lifecycle got the same
   treatment: an absent or zero-consumed read never proves completeness. A first
   start confirms its settled lead-in over ONE pinned eligible window, whose
-  read deadline is stamped when each read returns, so an empty, shortened,
-  changed or failed re-read can neither erase the history it already holds nor
-  pass as complete; recovered history joins that window, and the probe keeps
-  growing while the window is not yet warm and the source can still supply it.
+  read deadline is stamped when each read returns — and each timeframe's reply is
+  judged by the instant its OWN read returned, never by a later fetch's — so an
+  empty, shortened, changed or failed re-read can neither erase the history it
+  already holds nor pass as complete; recovered history joins that window, and
+  the probe keeps growing while the window is not yet warm and the source can
+  still supply it. Lead-in eligibility takes bars that CLOSED before the pinned
+  cutoff, so a higher bar that opens before it but closes after it stays with the
+  live drain (and the rebuild's `close_time` drain) that owns it, and only a
+  deeper read that returns the whole candidate — every configured timeframe —
+  and no more may release a not-yet-warm window: the merged candidate preserves
+  history, it does not prove the deeper read contained it.
   A due primary bar keeps the 10 s retry until every bar of its owed span is in
   hand — even before any counting read exists, a transient first failure
   included — and nothing due means no short poll. A restart's confirmation-

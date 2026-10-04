@@ -2381,3 +2381,535 @@ async fn the_attach_checkpoint_stays_pending_until_it_succeeds() {
     assert_eq!(bar_count, total_recorded_rows(&world, &session.id).await);
     assert!(verdict.is_identical(), "{verdict:?}");
 }
+
+// ---------------------------------------------------------------------------
+// R4: the pinned cutoff, the per-timeframe completion instants and the raw
+// deeper response — the three counterexamples the current-head review proved
+// ---------------------------------------------------------------------------
+
+/// The higher bar that straddles the pinned cutoff is live input, never
+/// lead-in: it opens before the cutoff but closes after it, so the live drain
+/// — and the rebuild's `close_time` drain — owns it (R4-1, H4).
+#[tokio::test]
+async fn a_straddling_h4_bar_is_never_lead_in() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 11 * H_MS + 50 * 60_000); // 11:50: the pinned cutoff is 11:45
+    let cutoff = BASE + 11 * H_MS + 45 * 60_000;
+    let m15 = m15_run(BASE + 4 * H_MS, BASE + 12 * H_MS);
+    // The H4 bar opening 08:00 opens before the 11:45 cutoff and closes after
+    // it (11:59:59.999): a straddler. It settles 31 s after its close.
+    let early = bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050);
+    let straddler = bar_of(Timeframe::H4, BASE + 8 * H_MS, 60_050, 60_050);
+    let serve_at = straddler.close_time + 1 + SettlePolicy::DEFAULT.settle_ms;
+    let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+    let version = create_version(&world, "r4-straddle-h4", &dsl).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    // The boot's probe succeeds over a primary window with no higher bar at
+    // all: the first start pins it, not warm. From the first re-poll on the
+    // source is down, so every confirming read fails — the pin survives the
+    // whole H4 boundary on its own re-poll.
+    source.fail.store(false, Ordering::SeqCst);
+    world.source.script(Timeframe::M15, m15.clone());
+    world.source.script(Timeframe::H4, Vec::new());
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let script = |now: i64| {
+        source.fail.store(now < serve_at, Ordering::SeqCst);
+        world.source.script(Timeframe::M15, m15.clone());
+        world.source.script(
+            Timeframe::H4,
+            if now < serve_at {
+                Vec::new()
+            } else {
+                vec![early.clone(), straddler.clone()]
+            },
+        );
+    };
+    let pending_check = |at: i64, _: &[pulse::SessionFailure], attached: &[PaperSessionId]| {
+        assert!(
+            at >= serve_at || attached.is_empty(),
+            "no attach while the straddling bar is unsettled (at {at})"
+        );
+    };
+    drive_phased(
+        &world,
+        &mut runtime,
+        &script,
+        BASE + 11 * H_MS + 55 * 60_000,
+        &pending_check,
+    )
+    .await;
+    // The runtime keeps retrying the same read on its own re-poll and the
+    // source stays down across the H4 boundary; resume once the straddling bar
+    // has settled — the pin has never left its window or its cutoff.
+    world.clock.set(serve_at);
+    let (_, failures) = drive_phased(
+        &world,
+        &mut runtime,
+        &script,
+        serve_at + 5 * 60_000,
+        &|_, _, _| {},
+    )
+    .await;
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let h4_lead_in = lead_in_bars(&world, &session.id, Timeframe::H4).await;
+    assert!(
+        h4_lead_in.iter().all(|bar| bar.close_time < cutoff),
+        "every lead-in higher bar closes before the cutoff: {h4_lead_in:?}"
+    );
+    assert_eq!(
+        h4_lead_in,
+        vec![early.clone()],
+        "the eligible H4 bar ending before the cutoff is lead-in; the straddler is not"
+    );
+    let straddler_rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT open_time, lead_in FROM paper_bar \
+         WHERE session_id = ?1 AND timeframe = '4h' AND open_time = ?2",
+    )
+    .bind(session.id.as_str())
+    .bind(straddler.open_time)
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        straddler_rows.is_empty() || straddler_rows == vec![(straddler.open_time, 0)],
+        "the straddling H4 bar is live input, never lead-in: {straddler_rows:?}"
+    );
+    // The live drain fed it to the primary bar closing with it.
+    let events = world.paper().events(&session.id).await.unwrap();
+    let live_batches = batches(&events);
+    let closing_primary = straddler.close_time + 1 - M15_MS;
+    assert!(
+        live_batches.iter().any(|(open, bars)| {
+            *open == closing_primary
+                && bars.iter().any(|(timeframe, bar)| {
+                    *timeframe == Timeframe::H4 && *bar == straddler.open_time
+                })
+        }),
+        "the live run fed the H4 bar to the primary bar closing with it: {live_batches:?}"
+    );
+    // A restart rebuilds the same history and the same decisions: the same
+    // higher input rides the same primary step in both.
+    drop(runtime);
+    let mut rebooted = world.runtime();
+    assert!(
+        rebooted.boot().await.is_empty(),
+        "the rebuild agrees with the log"
+    );
+    let verdict = rebooted.shadow_check(&session.id).await.unwrap();
+    assert!(verdict.is_identical(), "shadow drift: {verdict:?}");
+    let rebooted_events = world.paper().events(&session.id).await.unwrap();
+    assert_eq!(
+        batches(&rebooted_events),
+        live_batches,
+        "the same higher inputs rode the same primary bars"
+    );
+    assert!(
+        data_events(&rebooted_events).is_empty(),
+        "{:?}",
+        data_events(&rebooted_events)
+    );
+}
+
+/// The same cutoff rule for the daily cadence: the D1 bar containing the first
+/// live primary bar opens before the pinned cutoff and closes after it, so it
+/// is live input (R4-1, D1).
+#[tokio::test]
+async fn a_straddling_d1_bar_is_never_lead_in() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + D1_MS - 10 * 60_000); // 23:50: the pinned cutoff is 23:45
+    let cutoff = BASE + D1_MS - 15 * 60_000;
+    let m15 = m15_run(BASE - 8 * H_MS, BASE + D1_MS + 2 * H_MS);
+    // The daily bar opening 00:00 opens before the 23:45 cutoff and closes
+    // after it (23:59:59.999): a straddler, settling 31 s after its close.
+    let early = bar_of(Timeframe::D1, BASE - D1_MS, 60_100, 60_050);
+    let straddler = bar_of(Timeframe::D1, BASE, 60_050, 60_050);
+    let serve_at = straddler.close_time + 1 + SettlePolicy::DEFAULT.settle_ms;
+    let dsl = series_operand_dsl(Series::D1, 60_100, 60_000);
+    let version = create_version(&world, "r4-straddle-d1", &dsl).await;
+    let session = promote_session(&world, &version, Timeframe::M15, None, true).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    source.fail.store(false, Ordering::SeqCst);
+    world.source.script(Timeframe::M15, m15.clone());
+    world.source.script(Timeframe::D1, Vec::new());
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let script = |now: i64| {
+        source.fail.store(now < serve_at, Ordering::SeqCst);
+        world.source.script(Timeframe::M15, m15.clone());
+        world.source.script(
+            Timeframe::D1,
+            if now < serve_at {
+                Vec::new()
+            } else {
+                vec![early.clone(), straddler.clone()]
+            },
+        );
+    };
+    let pending_check = |at: i64, _: &[pulse::SessionFailure], attached: &[PaperSessionId]| {
+        assert!(
+            at >= serve_at || attached.is_empty(),
+            "no attach while the straddling bar is unsettled (at {at})"
+        );
+    };
+    drive_phased(
+        &world,
+        &mut runtime,
+        &script,
+        BASE + D1_MS - 5 * 60_000,
+        &pending_check,
+    )
+    .await;
+    // The pin survives the whole daily boundary on its own re-poll while the
+    // source is down; resume once the straddling bar has settled.
+    world.clock.set(serve_at);
+    let (_, failures) = drive_phased(
+        &world,
+        &mut runtime,
+        &script,
+        serve_at + 20 * 60_000,
+        &|_, _, _| {},
+    )
+    .await;
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let d1_lead_in = lead_in_bars(&world, &session.id, Timeframe::D1).await;
+    assert!(
+        d1_lead_in.iter().all(|bar| bar.close_time < cutoff),
+        "every lead-in daily bar closes before the cutoff: {d1_lead_in:?}"
+    );
+    assert_eq!(
+        d1_lead_in,
+        vec![early.clone()],
+        "the eligible D1 bar ending before the cutoff is lead-in; the straddler is not"
+    );
+    // The live drain fed it to the primary bar closing with it, the 23:45 one.
+    let events = world.paper().events(&session.id).await.unwrap();
+    let live_batches = batches(&events);
+    let closing_primary = straddler.close_time + 1 - M15_MS;
+    assert!(
+        live_batches.iter().any(|(open, bars)| {
+            *open == closing_primary
+                && bars.iter().any(|(timeframe, bar)| {
+                    *timeframe == Timeframe::D1 && *bar == straddler.open_time
+                })
+        }),
+        "the live run fed the D1 bar to the primary bar closing with it: {live_batches:?}"
+    );
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+}
+
+/// A slow higher-timeframe fetch must not qualify a primary copy the probe read
+/// before its settle threshold: each timeframe's reply is filtered with the
+/// instant ITS OWN awaited read returned (R4-2, the probe path).
+#[tokio::test]
+async fn a_slow_higher_read_does_not_qualify_an_early_probe_copy() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 15 * 60_000); // 08:15: the cutoff is 08:15
+    let cutoff = BASE + 8 * H_MS + 15 * 60_000;
+    let m15 = m15_run(BASE + 4 * H_MS, BASE + 9 * H_MS);
+    world.source.script(Timeframe::H4, Vec::new());
+    // The newest eligible bar (08:00, closing 08:14:59.999, settling at
+    // 08:15:30) is still being revised: the exchange serves the provisional
+    // copy until 08:15:55, so a read taken before 08:15:30 is too early.
+    let provisional_for_ms = 55_000;
+    let script = |now: i64| script_with(&world, &m15, now, provisional_for_ms);
+    script(world.clock.now());
+    let version = create_version(&world, "r4-stamp-probe", &pulse::fixture_strategy_dsl()).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    // Every read takes 20 s: the probe's M15 reply returns at 08:15:20, before
+    // the 08:00 bar's settle threshold; the H4 reply returns 20 s later.
+    source.slow_ms.store(20_000, Ordering::SeqCst);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    source.slow_ms.store(0, Ordering::SeqCst);
+    let (_, failures) = drive_tolerant(&world, &mut runtime, &script, cutoff + 4 * 60_000).await;
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let newest_final = m15
+        .iter()
+        .find(|bar| bar.open_time == cutoff - M15_MS)
+        .cloned()
+        .expect("the scripted bar");
+    let lead_in = lead_in_bars(&world, &session.id, Timeframe::M15).await;
+    assert!(
+        !lead_in.contains(&provisional_of(&newest_final)),
+        "no provisional copy is ever recorded: {lead_in:?}"
+    );
+    assert!(
+        lead_in.contains(&newest_final),
+        "the FINAL copy of the newest eligible bar is the lead-in: {lead_in:?}"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "no revision hold: {:?}",
+        data_events(&events)
+    );
+}
+
+/// The same rule on the confirming read (R4-2, the confirmation path): a slow
+/// higher fetch must not make an earlier primary reply eligible, so no
+/// provisional copy is ever recorded and no later final copy is held.
+#[tokio::test]
+async fn a_slow_higher_read_does_not_qualify_an_early_confirm_copy() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 15 * 60_000); // 08:15: the cutoff is 08:15
+    let cutoff = BASE + 8 * H_MS + 15 * 60_000;
+    let m15 = m15_run(BASE + 4 * H_MS, BASE + 9 * H_MS);
+    world.source.script(Timeframe::H4, Vec::new());
+    // The 08:00 bar (settling at 08:15:30) is still being revised: the exchange
+    // serves the provisional copy until 08:15:55.
+    let provisional_for_ms = 55_000;
+    let script = |now: i64| script_with(&world, &m15, now, provisional_for_ms);
+    script(world.clock.now());
+    let version = create_version(&world, "r4-stamp-confirm", &pulse::fixture_strategy_dsl()).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    // Every read takes 3.5 s. The probe's replies still land before the 08:00
+    // bar's threshold, so the pinned candidate stops at the 07:45 bar; the
+    // confirming read's M15 reply returns at 08:15:27.5 — still too early —
+    // while the H4 reply 3.5 s behind it ends at 08:15:31, past the threshold.
+    source.slow_ms.store(3_500, Ordering::SeqCst);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    drive_until_attached(&world, &mut runtime, &session.id, &script).await;
+
+    let newest_final = m15
+        .iter()
+        .find(|bar| bar.open_time == cutoff - M15_MS)
+        .cloned()
+        .expect("the scripted bar");
+    let recorded_m15 = recorded(&world, &session.id).await;
+    assert!(
+        !recorded_m15.contains(&provisional_of(&newest_final)),
+        "no provisional copy is recorded at all: {recorded_m15:?}"
+    );
+    let lead_in = lead_in_bars(&world, &session.id, Timeframe::M15).await;
+    assert!(
+        lead_in.last().map(|bar| bar.open_time) == Some(cutoff - 2 * M15_MS),
+        "the lead-in stops at the last settled bar: {lead_in:?}"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "no revision hold: {:?}",
+        data_events(&events)
+    );
+}
+
+/// A source whose DEEP reads degrade while `now < recover_at`: a window
+/// strictly deeper than `deep_since` serves only the newest primary bar, or —
+/// with `drop_higher` — no higher bar at all. A transient truncation, never
+/// proof of exhaustion (R4-3).
+#[derive(Clone)]
+struct TruncatingBars {
+    inner: support::paper::ScriptedBars,
+    clock: support::paper::SteppedClock,
+    recover_at: i64,
+    deep_since: i64,
+    drop_higher: bool,
+}
+
+impl ClosedBarSource for TruncatingBars {
+    fn closed_since(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        since_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send {
+        let read = self.inner.closed_since(pair, timeframe, since_ms);
+        let truncate = self.clock.now() < self.recover_at && since_ms < self.deep_since;
+        let primary = timeframe == Timeframe::M15;
+        let drop_higher = self.drop_higher;
+        async move {
+            let mut bars = read.await?;
+            if truncate {
+                if primary {
+                    let cut = bars.len().saturating_sub(1);
+                    bars.drain(..cut);
+                } else if drop_higher {
+                    bars.clear();
+                }
+            }
+            Ok(bars)
+        }
+    }
+}
+
+/// A runtime reading through a [`TruncatingBars`].
+type TruncatingRuntime = PaperRuntime<
+    pulse::SqlitePaperSessionRepo<support::paper::SteppedClock>,
+    TruncatingBars,
+    pulse::CandleStore,
+    support::paper::SteppedClock,
+    LiveEnv<pulse::SqliteStrategyRepo<pulse::SystemClock>, BinanceAdapter>,
+>;
+
+/// A runtime over `world` reading through a [`TruncatingBars`] it returns.
+fn truncating_runtime(
+    world: &PaperWorld,
+    recover_at: i64,
+    deep_since: i64,
+    drop_higher: bool,
+) -> (TruncatingBars, TruncatingRuntime) {
+    let source = TruncatingBars {
+        inner: world.source.clone(),
+        clock: world.clock.clone(),
+        recover_at,
+        deep_since,
+        drop_higher,
+    };
+    let runtime = PaperRuntime::new(
+        world.paper(),
+        source.clone(),
+        world.store.clone(),
+        world.clock.clone(),
+        LiveEnv::new(world.strategies(), BinanceAdapter::new()),
+        world.grace_ms,
+        world.log.clone(),
+    );
+    let runtime = match world.settle {
+        Some(policy) => runtime.with_settle(policy),
+        None => runtime.without_settle_gate(),
+    };
+    (source, runtime)
+}
+
+/// A deeper read that omits candidate primary bars is not exhaustion: the pin
+/// keeps waiting for the history the source still owes (R4-3, the primary).
+#[tokio::test]
+async fn a_shortened_deeper_primary_read_is_not_exhaustion() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 60_000); // 08:01; the pinned cutoff is 08:00
+    let cutoff = BASE + 8 * H_MS;
+    // The source's primary history ends at 07:30, so the H4 bar closing
+    // 07:59:59.999 has no primary bar to pair with and the window never warms.
+    let m15 = m15_run(BASE, cutoff - 2 * M15_MS);
+    let h4 = bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050);
+    world.source.script(Timeframe::M15, m15.clone());
+    world.source.script(Timeframe::H4, vec![h4.clone()]);
+    let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+    let version = create_version(&world, "r4-deep-primary", &dsl).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    // The probe stops at the 64-bar depth (its 31 eligible primary bars); every
+    // read strictly deeper than that is transiently truncated to the newest
+    // primary bar until RECOVERY.
+    let deep_since = cutoff - 64 * M15_MS - 1;
+    let recover_at = BASE + 8 * H_MS + 5 * 60_000;
+    let (_, mut runtime) = truncating_runtime(&world, recover_at, deep_since, false);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let check = |at: i64, _: &[pulse::SessionFailure], attached: &[PaperSessionId]| {
+        assert!(
+            at >= recover_at || attached.is_empty(),
+            "a truncated deeper read is not exhaustion (at {at})"
+        );
+    };
+    let (wakes, failures) = drive_phased(
+        &world,
+        &mut runtime,
+        &|_| {},
+        recover_at + 5 * 60_000,
+        &check,
+    )
+    .await;
+    assert!(wakes.len() < 2_000, "the drive is bounded");
+    assert!(failures.is_empty(), "{failures:?}");
+
+    // The recovered lead-in holds the whole eligible window the pin knew plus
+    // everything the source served on recovery — never just the truncated read.
+    let expected: Vec<Candle> = m15
+        .iter()
+        .filter(|bar| bar.open_time < cutoff)
+        .cloned()
+        .collect();
+    let lead_in = lead_in_bars(&world, &session.id, Timeframe::M15).await;
+    assert!(
+        lead_in.iter().all(|bar| bar.open_time < cutoff),
+        "no live bar is lead-in: {lead_in:?}"
+    );
+    assert_eq!(
+        lead_in, expected,
+        "the recovered primary history landed whole"
+    );
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::H4).await,
+        vec![h4.clone()],
+        "the eligible H4 bar landed too"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+}
+
+/// The same rule across timeframes: a deeper read that omits a candidate HIGHER
+/// bar is no more proof of exhaustion than a shortened primary one (R4-3).
+#[tokio::test]
+async fn a_deeper_read_that_omits_a_higher_candidate_bar_is_not_exhaustion() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 60_000); // 08:01; the pinned cutoff is 08:00
+    let cutoff = BASE + 8 * H_MS;
+    let m15 = m15_run(BASE, cutoff - 2 * M15_MS);
+    let h4 = bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050);
+    world.source.script(Timeframe::M15, m15.clone());
+    world.source.script(Timeframe::H4, vec![h4.clone()]);
+    let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+    let version = create_version(&world, "r4-deep-higher", &dsl).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    // The primary is complete in every read; the HIGHER reply is dropped for
+    // every read strictly deeper than the pinned window until RECOVERY.
+    let deep_since = cutoff - 64 * M15_MS - 1;
+    let recover_at = BASE + 8 * H_MS + 5 * 60_000;
+    let (_, mut runtime) = truncating_runtime(&world, recover_at, deep_since, true);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let check = |at: i64, _: &[pulse::SessionFailure], attached: &[PaperSessionId]| {
+        assert!(
+            at >= recover_at || attached.is_empty(),
+            "a deeper read missing a candidate bar is not exhaustion (at {at})"
+        );
+    };
+    let (wakes, failures) = drive_phased(
+        &world,
+        &mut runtime,
+        &|_| {},
+        recover_at + 5 * 60_000,
+        &check,
+    )
+    .await;
+    assert!(wakes.len() < 2_000, "the drive is bounded");
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let expected: Vec<Candle> = m15
+        .iter()
+        .filter(|bar| bar.open_time < cutoff)
+        .cloned()
+        .collect();
+    let lead_in = lead_in_bars(&world, &session.id, Timeframe::M15).await;
+    assert!(
+        lead_in.iter().all(|bar| bar.open_time < cutoff),
+        "no live bar is lead-in: {lead_in:?}"
+    );
+    assert_eq!(lead_in, expected, "the complete primary window landed");
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::H4).await,
+        vec![h4.clone()],
+        "the candidate higher bar landed with it"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+}

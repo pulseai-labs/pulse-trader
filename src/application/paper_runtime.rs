@@ -1249,9 +1249,11 @@ where
     /// loop honestly: the engine then warms up live.
     ///
     /// `previous_len` seeds the growth test with a candidate already in hand
-    /// (R3-A's deepened re-probe); `None` is a fresh probe. Only bars read
-    /// `settle_ms` past their close and strictly before `cutoff_ms` are in the
-    /// window (#306, R3-A); [`Self::settled_lead_in`] confirms them.
+    /// (R3-A's deepened re-probe); `None` is a fresh probe. Only bars that
+    /// CLOSED strictly before `cutoff_ms` and were read `settle_ms` past their
+    /// close are in the window, each timeframe's copy judged by its own read's
+    /// instant (#306, R3-A, R4-1/R4-2); [`Self::settled_lead_in`] confirms
+    /// them.
     async fn probe_lead_in_from(
         &self,
         session: &PaperSession,
@@ -1266,28 +1268,13 @@ where
         let mut previous_len = previous_len;
         loop {
             let since = cutoff_ms - depth * step - 1;
-            let mut raw: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
-            for timeframe in session.timeframes() {
-                raw.insert(
-                    timeframe,
-                    self.source
-                        .closed_since(&session.pair, timeframe, since)
-                        .await?,
-                );
-            }
-            // The window's instant is when its last read RETURNED: a slow
-            // response must not leave an already-due confirmation deadline, and
-            // only bars it saw settled are eligible (R2-1, R3 sweep).
-            let read_at = self.clock.now_ms();
-            let probe: BTreeMap<Timeframe, Vec<Candle>> = raw
-                .into_iter()
-                .map(|(timeframe, bars)| {
-                    (
-                        timeframe,
-                        eligible_window(bars, cutoff_ms, read_at, settle_ms),
-                    )
-                })
-                .collect();
+            // Each timeframe's reply is judged by the instant ITS OWN read
+            // returned, and the window's confirmation deadline by the last of
+            // them (R2-1, R4-2): a slow higher-timeframe fetch must not make a
+            // primary copy that was read before its settle threshold eligible.
+            let (read_at, probe) = self
+                .read_lead_in_window(session, since, cutoff_ms, settle_ms)
+                .await?;
             let len = probe.get(&session.primary_timeframe).map_or(0, Vec::len);
             let warm = lead_in_warm(&session.pair, session, compiled, &probe);
             // Growth is only evidence when the read actually held bars: an
@@ -1323,11 +1310,12 @@ where
     }
 
     /// Keep the probe growing over the SAME pinned obligation (R3-A): a deeper
-    /// window is read and merged into the candidate. A complete, non-empty
-    /// deeper read that served no more history releases the window — it is what
-    /// exists — while an empty or growing one keeps the pin waiting, so absence
-    /// is never taken for completeness. The pin's own deadline keeps the retry
-    /// bounded, and a failed deeper read leaves it exactly as it was.
+    /// window is read and merged into the candidate. Only a deeper read that
+    /// returns the WHOLE candidate, every timeframe, and no more releases the
+    /// window — it is what exists — while an empty, shortened, changed or
+    /// growing one keeps the pin waiting, so absence is never taken for
+    /// completeness (R4-3). The pin's own deadline keeps the retry bounded, and
+    /// a failed deeper read leaves it exactly as it was.
     async fn deepen_lead_in(
         &mut self,
         session: &PaperSession,
@@ -1367,7 +1355,13 @@ where
             .bars
             .get(&session.primary_timeframe)
             .is_some_and(|bars| !bars.is_empty());
-        if grown == pending.bars && deeper_has_primary {
+        // Exhaustion is the RAW deeper response's evidence, never the merged
+        // view's: the merge keeps every candidate bar, so "no growth" alone is
+        // also true of a shortened or otherwise incomplete read that omitted
+        // candidate bars. Only a deeper response that returns the whole
+        // candidate — every timeframe — and nothing more releases the window
+        // (R4-3).
+        if deeper.bars == pending.bars && deeper_has_primary {
             let released = pending.bars.clone();
             self.pending_lead_in.insert(
                 session.id.clone(),
@@ -1394,36 +1388,45 @@ where
         Ok(None)
     }
 
-    /// One confirming read over a pinned lead-in window: the raw bars, then the
-    /// instant the read returned, then the eligibility filter — never a stamp
-    /// taken before the I/O (R2-1, R3 sweep). R3-A keeps the pin regardless of
-    /// the read's outcome; the caller re-inserts it on failure.
+    /// One lead-in read over `since`: every configured timeframe, each reply
+    /// filtered with the instant ITS OWN awaited fetch returned (R2-1, R4-2) —
+    /// never one later stamp applied to an earlier copy — and the instant the
+    /// last read returned, the window's conservative confirmation deadline.
+    async fn read_lead_in_window(
+        &self,
+        session: &PaperSession,
+        since: i64,
+        cutoff_ms: i64,
+        settle_ms: i64,
+    ) -> Result<(i64, BTreeMap<Timeframe, Vec<Candle>>), PaperRuntimeError> {
+        let mut bars: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
+        let mut last_read_at = self.clock.now_ms();
+        for timeframe in session.timeframes() {
+            let raw = self
+                .source
+                .closed_since(&session.pair, timeframe, since)
+                .await?;
+            let read_at = self.clock.now_ms();
+            bars.insert(
+                timeframe,
+                eligible_window(raw, cutoff_ms, read_at, settle_ms),
+            );
+            last_read_at = last_read_at.max(read_at);
+        }
+        Ok((last_read_at, bars))
+    }
+
+    /// One confirming read over a pinned lead-in window: the same per-timeframe
+    /// read instants as the probe (R4-2). R3-A keeps the pin regardless of the
+    /// read's outcome; the caller re-inserts it on failure.
     async fn confirm_read(
         &self,
         session: &PaperSession,
         pending: &PendingLeadIn,
         settle_ms: i64,
     ) -> Result<(i64, BTreeMap<Timeframe, Vec<Candle>>), PaperRuntimeError> {
-        let mut raw: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
-        for timeframe in session.timeframes() {
-            raw.insert(
-                timeframe,
-                self.source
-                    .closed_since(&session.pair, timeframe, pending.since)
-                    .await?,
-            );
-        }
-        let read_at = self.clock.now_ms();
-        let read = raw
-            .into_iter()
-            .map(|(timeframe, bars)| {
-                (
-                    timeframe,
-                    eligible_window(bars, pending.cutoff_ms, read_at, settle_ms),
-                )
-            })
-            .collect();
-        Ok((read_at, read))
+        self.read_lead_in_window(session, pending.since, pending.cutoff_ms, settle_ms)
+            .await
     }
 
     /// A fresh probe: the window for this instant's first live bar.
@@ -1947,11 +1950,14 @@ struct LeadInWindow {
     bars: BTreeMap<Timeframe, Vec<Candle>>,
 }
 
-/// The lead-in eligible part of one read: strictly before the pinned cutoff,
-/// and settled `settle_ms` past its close (the #306 probe rule).
+/// The lead-in eligible part of one read: bars that CLOSED before the pinned
+/// cutoff — so a higher bar that opens before it but closes after it stays live
+/// input for the drain that owns it (R4-1) — and settled `settle_ms` past their
+/// close, judged by `read_at`, the instant of the read that returned them (the
+/// #306 probe rule, R4-2).
 fn eligible_window(bars: Vec<Candle>, cutoff_ms: i64, read_at: i64, settle_ms: i64) -> Vec<Candle> {
     bars.into_iter()
-        .filter(|bar| bar.open_time < cutoff_ms && bar.close_time + 1 + settle_ms <= read_at)
+        .filter(|bar| bar.close_time < cutoff_ms && bar.close_time + 1 + settle_ms <= read_at)
         .collect()
 }
 
