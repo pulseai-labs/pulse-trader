@@ -365,6 +365,12 @@ struct RunningSession {
     epoch: EpochStart,
     /// When the last shadow check ran (the daily cadence's anchor).
     last_shadow_ms: Option<i64>,
+    /// The attach snapshot's owed primary history while the restart catch-up
+    /// obligation is open (R3-C): the newest primary bar closed when this
+    /// session attached. Cleared only by a successful shadow check of the
+    /// state that committed that history contiguously — a zero-consumed pass,
+    /// a pre-backlog check or the daily timestamp never discharge it.
+    catch_up_to: Option<i64>,
     /// The refusals and data disagreements already written, by bar `open_time`
     /// — at most one `data_event` per distinct bar and refusal.
     reported: BTreeMap<i64, String>,
@@ -513,6 +519,7 @@ where
     pub async fn boot(&mut self) -> Vec<SessionFailure> {
         let mut failures = self.attach_all().await;
         failures.extend(self.poll_pass().await.0);
+        failures.extend(self.catch_up_checkpoints().await);
         failures.extend(self.daily_checks().await);
         for failure in &failures {
             self.log.write(format!(
@@ -528,6 +535,7 @@ where
     pub async fn wake(&mut self) -> Vec<SessionFailure> {
         let mut failures = self.attach_all().await;
         failures.extend(self.poll_pass().await.0);
+        failures.extend(self.catch_up_checkpoints().await);
         failures.extend(self.daily_checks().await);
         failures
     }
@@ -928,9 +936,13 @@ where
             }
             let id = session.id.clone();
             if let Err(error) = self.attach(session).await {
-                // A failed attach starts its lead-in over: no overdue
-                // confirming read is left to wake the loop at once.
-                self.pending_lead_in.remove(&id);
+                // Only a session this process can never attach again (held for
+                // a state mismatch) gives up its pinned window: a transient
+                // failure keeps it, so the retry resumes over the SAME eligible
+                // history instead of re-probing past it and moving the cutoff.
+                if self.held.contains(&id) {
+                    self.pending_lead_in.remove(&id);
+                }
                 self.log.write(format!(
                     "paper runtime: session {id} could not start: {error}"
                 ));
@@ -1033,6 +1045,24 @@ where
                 logged: logged.to_string(),
             });
         }
+        // R3-C: pin the attach snapshot's owed primary history — the newest
+        // primary bar closed at this instant, including input still awaiting
+        // its confirming read. A zero-consumed catch-up pass is not completion:
+        // the obligation holds until the recorded history is contiguous through
+        // the watermark, and only then does the mandatory post-catch-up
+        // checkpoint run. The check below covers the state it runs over; if the
+        // obligation is already complete here, that check IS the required one.
+        let watermark = boundaries(
+            session.primary_timeframe.duration_ms(),
+            self.clock.now_ms(),
+            0,
+        )
+        .last_closed_open_ms;
+        // The obligation is pinned unconditionally: whether the loaded history
+        // already covers the watermark or the catch-up completes inside the
+        // loop below, only a SUCCESSFUL check of the state this attach leaves
+        // behind may clear it (R3 sweep).
+        let catch_up_to = Some(watermark);
         self.sessions.insert(
             id.clone(),
             RunningSession {
@@ -1045,6 +1075,7 @@ where
                 since_floor_ms: loaded.since_floor_ms,
                 epoch,
                 last_shadow_ms: None,
+                catch_up_to,
                 reported: BTreeMap::new(),
                 needs_rebuild: false,
             },
@@ -1059,10 +1090,37 @@ where
                 break;
             }
         }
+        // The check below covers the state this attach leaves behind: when the
+        // pinned catch-up obligation is already complete (the backlog was
+        // consumed in the loop above, or the loaded history already covered the
+        // watermark) that check IS the mandatory post-catch-up checkpoint and
+        // discharges it — on SUCCESS only. When the backlog is still owed, the
+        // obligation stays and the wake that commits it runs the checkpoint.
         // A session whose first start only landed lead-in has nothing to check
         // yet; the check still runs (an empty comparison) so the boot's shape is
         // uniform.
-        self.shadow_check(&id).await?;
+        let complete = self.sessions.get(&id).is_some_and(|run| {
+            run.catch_up_to.is_some_and(|watermark| {
+                catch_up_reached(&run.recorded, run.session.primary_timeframe, watermark)
+            })
+        });
+        match self.shadow_check(&id).await {
+            Ok(_) => {
+                if complete && let Some(run) = self.sessions.get_mut(&id) {
+                    run.catch_up_to = None;
+                }
+            }
+            Err(error) => {
+                // The required checkpoint stays pending, on a bounded wake.
+                if let Some(policy) = self.settle {
+                    self.repoll_at_ms = Some(earliest(
+                        self.repoll_at_ms,
+                        self.clock.now_ms() + policy.repoll_ms,
+                    ));
+                }
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -1183,66 +1241,201 @@ where
 
     /// The warm-up probe (spec step 2): the lead-in window for a session whose
     /// first bar is `L` = the first bar of its primary cadence not closed at
-    /// `now`. The window starts two primary bars back and doubles until
+    /// `now`. The window starts `depth` primary bars back and doubles until
     /// [`first_fully_warm_bar_ms`] finds a fully warm bar inside it — the probe
     /// series IS the windows the live engine will step, so a warm bar in it
     /// proves the engine arrives warm at `L` (warmth is monotone), and no
     /// constant is invented. A source that cannot supply more history ends the
     /// loop honestly: the engine then warms up live.
     ///
-    /// Returns the window and the `since` it was read from. Only bars read
-    /// `settle_ms` past their close are in it (#306); [`Self::settled_lead_in`]
-    /// confirms them.
-    async fn probe_lead_in(
+    /// `previous_len` seeds the growth test with a candidate already in hand
+    /// (R3-A's deepened re-probe); `None` is a fresh probe. Only bars read
+    /// `settle_ms` past their close and strictly before `cutoff_ms` are in the
+    /// window (#306, R3-A); [`Self::settled_lead_in`] confirms them.
+    async fn probe_lead_in_from(
         &self,
         session: &PaperSession,
         compiled: &CompiledStrategy,
-    ) -> Result<(BTreeMap<Timeframe, Vec<Candle>>, i64), PaperRuntimeError> {
-        let now = self.clock.now_ms();
-        let primary = session.primary_timeframe;
-        let step = primary.duration_ms();
-        let first_live = first_open_bar_ms(step, now);
+        cutoff_ms: i64,
+        depth: i64,
+        previous_len: Option<usize>,
+    ) -> Result<LeadInWindow, PaperRuntimeError> {
+        let step = session.primary_timeframe.duration_ms();
         let settle_ms = self.settle.map_or(0, |policy| policy.settle_ms);
-        let mut depth = 2_i64;
-        let mut previous_len: Option<usize> = None;
+        let mut depth = depth;
+        let mut previous_len = previous_len;
         loop {
-            let since = first_live - depth * step - 1;
-            let mut probe: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
+            let since = cutoff_ms - depth * step - 1;
+            let mut raw: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
             for timeframe in session.timeframes() {
-                let bars = self
-                    .source
-                    .closed_since(&session.pair, timeframe, since)
-                    .await?;
-                let bars: Vec<Candle> = bars
-                    .into_iter()
-                    .filter(|bar| {
-                        bar.open_time < first_live && bar.close_time + 1 + settle_ms <= now
-                    })
-                    .collect();
-                probe.insert(timeframe, bars);
+                raw.insert(
+                    timeframe,
+                    self.source
+                        .closed_since(&session.pair, timeframe, since)
+                        .await?,
+                );
             }
-            let primary_series = probe_series(&session.pair, primary, &probe);
-            let htf_series = session
-                .htf_timeframe
-                .map(|timeframe| probe_series(&session.pair, timeframe, &probe));
-            let d1_series = session
-                .d1_timeframe()
-                .map(|timeframe| probe_series(&session.pair, timeframe, &probe));
-            let len = primary_series.candles.len();
-            let warm = first_fully_warm_bar_ms(
-                compiled,
-                &primary_series,
-                htf_series.as_ref(),
-                d1_series.as_ref(),
-            )
-            .is_some();
+            // The window's instant is when its last read RETURNED: a slow
+            // response must not leave an already-due confirmation deadline, and
+            // only bars it saw settled are eligible (R2-1, R3 sweep).
+            let read_at = self.clock.now_ms();
+            let probe: BTreeMap<Timeframe, Vec<Candle>> = raw
+                .into_iter()
+                .map(|(timeframe, bars)| {
+                    (
+                        timeframe,
+                        eligible_window(bars, cutoff_ms, read_at, settle_ms),
+                    )
+                })
+                .collect();
+            let len = probe.get(&session.primary_timeframe).map_or(0, Vec::len);
+            let warm = lead_in_warm(&session.pair, session, compiled, &probe);
+            // Growth is only evidence when the read actually held bars: an
+            // empty response proves nothing, so the search keeps deepening to
+            // its cap instead of ending on it (R3 sweep).
             let grew = previous_len.is_none_or(|previous| len > previous);
-            if warm || !grew || len == 0 || depth >= PROBE_MAX_DEPTH {
-                return Ok((probe, since));
+            let exhausted = len > 0 && !grew;
+            if warm || exhausted || depth >= PROBE_MAX_DEPTH {
+                return Ok(LeadInWindow {
+                    since,
+                    cutoff_ms,
+                    depth,
+                    read_at_ms: read_at,
+                    bars: probe,
+                });
             }
             previous_len = Some(len);
             depth *= 2;
         }
+    }
+
+    /// Hand a confirmed lead-in window to the first start (R3-A): the pin stays
+    /// — refreshed to this read's instant — until the append it feeds has
+    /// committed, so a failed append resumes over the same eligible history.
+    fn release_lead_in(
+        &mut self,
+        id: &PaperSessionId,
+        pin: PendingLeadIn,
+    ) -> BTreeMap<Timeframe, Vec<Candle>> {
+        let released = pin.bars.clone();
+        self.pending_lead_in.insert(id.clone(), pin);
+        released
+    }
+
+    /// Keep the probe growing over the SAME pinned obligation (R3-A): a deeper
+    /// window is read and merged into the candidate. A complete, non-empty
+    /// deeper read that served no more history releases the window — it is what
+    /// exists — while an empty or growing one keeps the pin waiting, so absence
+    /// is never taken for completeness. The pin's own deadline keeps the retry
+    /// bounded, and a failed deeper read leaves it exactly as it was.
+    async fn deepen_lead_in(
+        &mut self,
+        session: &PaperSession,
+        compiled: &CompiledStrategy,
+        pending: PendingLeadIn,
+    ) -> Result<Option<BTreeMap<Timeframe, Vec<Candle>>>, PaperRuntimeError> {
+        let candidate_len = pending
+            .bars
+            .get(&session.primary_timeframe)
+            .map_or(0, Vec::len);
+        let deeper = match self
+            .probe_lead_in_from(
+                session,
+                compiled,
+                pending.cutoff_ms,
+                (pending.depth * 2).min(PROBE_MAX_DEPTH),
+                Some(candidate_len),
+            )
+            .await
+        {
+            Ok(deeper) => deeper,
+            Err(error) => {
+                // A failed read is no evidence: the pin stays, retrying on a
+                // deadline stamped now.
+                self.pending_lead_in.insert(
+                    session.id.clone(),
+                    PendingLeadIn {
+                        read_at_ms: self.clock.now_ms(),
+                        ..pending
+                    },
+                );
+                return Err(error);
+            }
+        };
+        let grown = merge_lead_in(&pending.bars, &deeper.bars);
+        let deeper_has_primary = deeper
+            .bars
+            .get(&session.primary_timeframe)
+            .is_some_and(|bars| !bars.is_empty());
+        if grown == pending.bars && deeper_has_primary {
+            let released = pending.bars.clone();
+            self.pending_lead_in.insert(
+                session.id.clone(),
+                PendingLeadIn {
+                    since: deeper.since,
+                    cutoff_ms: pending.cutoff_ms,
+                    depth: deeper.depth,
+                    read_at_ms: deeper.read_at_ms,
+                    bars: released.clone(),
+                },
+            );
+            return Ok(Some(released));
+        }
+        self.pending_lead_in.insert(
+            session.id.clone(),
+            PendingLeadIn {
+                since: deeper.since,
+                cutoff_ms: pending.cutoff_ms,
+                depth: deeper.depth,
+                read_at_ms: deeper.read_at_ms,
+                bars: grown,
+            },
+        );
+        Ok(None)
+    }
+
+    /// One confirming read over a pinned lead-in window: the raw bars, then the
+    /// instant the read returned, then the eligibility filter — never a stamp
+    /// taken before the I/O (R2-1, R3 sweep). R3-A keeps the pin regardless of
+    /// the read's outcome; the caller re-inserts it on failure.
+    async fn confirm_read(
+        &self,
+        session: &PaperSession,
+        pending: &PendingLeadIn,
+        settle_ms: i64,
+    ) -> Result<(i64, BTreeMap<Timeframe, Vec<Candle>>), PaperRuntimeError> {
+        let mut raw: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
+        for timeframe in session.timeframes() {
+            raw.insert(
+                timeframe,
+                self.source
+                    .closed_since(&session.pair, timeframe, pending.since)
+                    .await?,
+            );
+        }
+        let read_at = self.clock.now_ms();
+        let read = raw
+            .into_iter()
+            .map(|(timeframe, bars)| {
+                (
+                    timeframe,
+                    eligible_window(bars, pending.cutoff_ms, read_at, settle_ms),
+                )
+            })
+            .collect();
+        Ok((read_at, read))
+    }
+
+    /// A fresh probe: the window for this instant's first live bar.
+    async fn probe_lead_in(
+        &self,
+        session: &PaperSession,
+        compiled: &CompiledStrategy,
+    ) -> Result<LeadInWindow, PaperRuntimeError> {
+        let cutoff_ms =
+            first_open_bar_ms(session.primary_timeframe.duration_ms(), self.clock.now_ms());
+        self.probe_lead_in_from(session, compiled, cutoff_ms, 2, None)
+            .await
     }
 
     /// A session with no recorded bars records its lead-in once it is
@@ -1259,6 +1452,7 @@ where
             .await?
             .is_empty()
         {
+            self.pending_lead_in.remove(&session.id);
             return Ok(true);
         }
         let Some(lead_in) = self.settled_lead_in(session, compiled).await? else {
@@ -1275,48 +1469,92 @@ where
         if !batch.is_empty() {
             self.repo.append_bar(&session.id, &batch, &[]).await?;
         }
+        // Only a committed lead-in discharges the pinned window: a failed
+        // append keeps it, so the retry resumes over the same eligible history.
+        self.pending_lead_in.remove(&session.id);
         Ok(true)
     }
 
-    /// A first start's lead-in, once settled (#306): the probe's window is
-    /// read again `repoll_ms` or more later over the same `since`, and the
-    /// lead-in is recorded only when that read returns every bar of the window
-    /// unchanged. Any change, gap or truncation starts the first start over
-    /// with a fresh probe, so the lead-in is never cut short (a short lead-in
-    /// would leave the engine cold for good). `None` while no confirmed window
-    /// is ready. Without a gate the probe is the lead-in.
+    /// A first start's lead-in, once settled (#306, R3-A): the pinned eligible
+    /// window is read again `repoll_ms` or more later and compared, bar for bar,
+    /// against the candidate over that SAME window — later live bars lie past
+    /// the cutoff and never enter the comparison. Only exact equality over a
+    /// non-vacuous primary window can discharge the obligation: an empty,
+    /// shortened, changed or failed read keeps the pin (with its window and
+    /// cutoff, whatever cadence boundaries passed), recovered eligible history
+    /// joins the candidate, and the confirmation starts over — its deadline
+    /// always stamped when a read RETURNED, never before it. While the window is
+    /// still not warm and the source can supply more history, the probe keeps
+    /// doubling (the same stopping rules); an empty response is never evidence
+    /// that history is exhausted. `None` while no confirmed window is ready.
+    /// Without a gate the probe is the lead-in.
     async fn settled_lead_in(
         &mut self,
         session: &PaperSession,
         compiled: &CompiledStrategy,
     ) -> Result<Option<BTreeMap<Timeframe, Vec<Candle>>>, PaperRuntimeError> {
         let Some(policy) = self.settle else {
-            return Ok(Some(self.probe_lead_in(session, compiled).await?.0));
+            return Ok(Some(self.probe_lead_in(session, compiled).await?.bars));
         };
-        if let Some(pending) = self.pending_lead_in.remove(&session.id) {
-            if self.clock.now_ms() < pending.read_at_ms + policy.repoll_ms {
-                self.pending_lead_in.insert(session.id.clone(), pending);
-                return Ok(None);
-            }
-            let mut confirmed = true;
-            for (timeframe, bars) in &pending.bars {
-                let again = self
-                    .source
-                    .closed_since(&session.pair, *timeframe, pending.since)
-                    .await?;
-                confirmed &= bars.iter().all(|bar| again.contains(bar));
-            }
-            if confirmed {
-                return Ok(Some(pending.bars));
-            }
+        let due = self.clock.now_ms();
+        let Some(pending) = self.pending_lead_in.remove(&session.id) else {
+            let probe = self.probe_lead_in(session, compiled).await?;
+            self.pending_lead_in.insert(
+                session.id.clone(),
+                PendingLeadIn {
+                    since: probe.since,
+                    cutoff_ms: probe.cutoff_ms,
+                    depth: probe.depth,
+                    read_at_ms: probe.read_at_ms,
+                    bars: probe.bars,
+                },
+            );
+            return Ok(None);
+        };
+        if due < pending.read_at_ms + policy.repoll_ms {
+            self.pending_lead_in.insert(session.id.clone(), pending);
+            return Ok(None);
         }
-        let (bars, since) = self.probe_lead_in(session, compiled).await?;
+        let (read_at, read) = match self.confirm_read(session, &pending, policy.settle_ms).await {
+            Ok(read) => read,
+            Err(error) => {
+                // A failed read is no evidence: the pin stays, and its own
+                // deadline (stamped now) keeps the retry bounded, never overdue.
+                self.pending_lead_in.insert(
+                    session.id.clone(),
+                    PendingLeadIn {
+                        read_at_ms: self.clock.now_ms(),
+                        ..pending
+                    },
+                );
+                return Err(error);
+            }
+        };
+        let merged = merge_lead_in(&pending.bars, &read);
+        if read == pending.bars {
+            let primary_non_empty = pending
+                .bars
+                .get(&session.primary_timeframe)
+                .is_some_and(|bars| !bars.is_empty());
+            if primary_non_empty && lead_in_warm(&session.pair, session, compiled, &pending.bars) {
+                return Ok(Some(self.release_lead_in(
+                    &session.id,
+                    PendingLeadIn {
+                        read_at_ms: read_at,
+                        ..pending
+                    },
+                )));
+            }
+            return self.deepen_lead_in(session, compiled, pending).await;
+        }
+        // Shortened, changed or newly recovered eligible history: keep the
+        // strongest candidate and restart its timed confirmation.
         self.pending_lead_in.insert(
             session.id.clone(),
             PendingLeadIn {
-                since,
-                read_at_ms: self.clock.now_ms(),
-                bars,
+                read_at_ms: read_at,
+                bars: merged,
+                ..pending
             },
         );
         Ok(None)
@@ -1394,6 +1632,7 @@ where
         }
 
         let mut consumed_total = 0_usize;
+        self.keep_due_primary_retry(&fetched);
         let ids: Vec<PaperSessionId> = self.sessions.keys().cloned().collect();
         for id in ids {
             let blocked: Option<PaperRuntimeError> = {
@@ -1432,6 +1671,72 @@ where
             }
         }
         (failures, consumed_total)
+    }
+
+    /// Keep the short retry alive while a due eligible primary bar is missing
+    /// (R3-B): an empty, truncated or failed FIRST read of the bar is no
+    /// evidence it does not exist, and no counting copy needs to exist for the
+    /// obligation to hold. Derived from the cadence and each session's fetch
+    /// window — never from the counting cache — so the boundary read itself is
+    /// covered; a session with no eligible primary bar due keeps the ordinary
+    /// boundary schedule.
+    fn keep_due_primary_retry(&mut self, fetched: &BTreeMap<(Pair, Timeframe), Vec<Candle>>) {
+        let Some(policy) = self.settle else {
+            return;
+        };
+        let now = self.clock.now_ms();
+        let missing = self
+            .sessions
+            .values()
+            .any(|run| run.due_primary_missing(fetched, now, policy.settle_ms));
+        if missing {
+            self.repoll_at_ms = Some(earliest(self.repoll_at_ms, now + policy.repoll_ms));
+        }
+    }
+
+    /// The mandatory post-catch-up shadow checkpoints (R3-C): a session whose
+    /// pinned catch-up obligation is now complete is checked over exactly that
+    /// caught-up state, immediately, whatever an earlier check or the daily
+    /// cadence says. A failed check keeps the obligation pending on a bounded
+    /// wake; one session's failure never blocks another's.
+    async fn catch_up_checkpoints(&mut self) -> Vec<SessionFailure> {
+        let now = self.clock.now_ms();
+        let due: Vec<PaperSessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, run)| {
+                run.catch_up_to.is_some_and(|watermark| {
+                    catch_up_reached(&run.recorded, run.session.primary_timeframe, watermark)
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut failures = Vec::new();
+        for id in due {
+            match self.shadow_check(&id).await {
+                Ok(_) => {
+                    if let Some(run) = self.sessions.get_mut(&id) {
+                        run.catch_up_to = None;
+                    }
+                }
+                Err(error) => {
+                    // The obligation stays: the checkpoint is required, and the
+                    // short re-poll keeps it wakeable.
+                    if let Some(policy) = self.settle {
+                        self.repoll_at_ms =
+                            Some(earliest(self.repoll_at_ms, now + policy.repoll_ms));
+                    }
+                    self.log.write(format!(
+                        "paper runtime: session {id} catch-up checkpoint failed: {error}"
+                    ));
+                    failures.push(SessionFailure {
+                        session_id: id.clone(),
+                        error,
+                    });
+                }
+            }
+        }
+        failures
     }
 
     /// Pass one `(pair, timeframe)` read through the settle gate: keep its
@@ -1612,14 +1917,108 @@ where
     }
 }
 
-/// A first start's probe read, awaiting its confirming read (#306).
+/// A first start's probe read, awaiting its confirming read (#306, R3-A).
 struct PendingLeadIn {
-    /// The `since` the probe read from (the confirming read reuses it).
+    /// The fetch boundary the pinned window is read from. Set by the probe and
+    /// only ever deepened, never moved forward: a later, shorter or empty read
+    /// cannot shrink the history the session owes.
     since: i64,
-    /// When the probe read.
+    /// The eligibility cutoff: the first primary bar not closed at the probe
+    /// instant. Bars at or after it are live input, never lead-in.
+    cutoff_ms: i64,
+    /// The probe depth behind `since` (the window-growth state).
+    depth: i64,
+    /// When the window was last read: its confirmation is due `repoll_ms`
+    /// after this.
     read_at_ms: i64,
-    /// The probe's window, per timeframe.
+    /// Every eligible bar seen so far, per timeframe — the candidate, never
+    /// shortened.
     bars: BTreeMap<Timeframe, Vec<Candle>>,
+}
+
+/// One probed lead-in window: where it was read from, the eligibility cutoff it
+/// was filtered by, the probe depth, the instant its read RETURNED, and the
+/// eligible bars it holds.
+struct LeadInWindow {
+    since: i64,
+    cutoff_ms: i64,
+    depth: i64,
+    read_at_ms: i64,
+    bars: BTreeMap<Timeframe, Vec<Candle>>,
+}
+
+/// The lead-in eligible part of one read: strictly before the pinned cutoff,
+/// and settled `settle_ms` past its close (the #306 probe rule).
+fn eligible_window(bars: Vec<Candle>, cutoff_ms: i64, read_at: i64, settle_ms: i64) -> Vec<Candle> {
+    bars.into_iter()
+        .filter(|bar| bar.open_time < cutoff_ms && bar.close_time + 1 + settle_ms <= read_at)
+        .collect()
+}
+
+/// Fold a confirming read into the lead-in candidate: every bar either side
+/// knows, the read's copy winning a shared `open_time` — so recovered history
+/// joins the candidate and a changed eligible value restarts its confirmation,
+/// while no candidate bar is ever dropped (R3-A).
+fn merge_lead_in(
+    candidate: &BTreeMap<Timeframe, Vec<Candle>>,
+    read: &BTreeMap<Timeframe, Vec<Candle>>,
+) -> BTreeMap<Timeframe, Vec<Candle>> {
+    let mut merged: BTreeMap<Timeframe, BTreeMap<i64, Candle>> = BTreeMap::new();
+    for (timeframe, bars) in candidate.iter().chain(read) {
+        let entry = merged.entry(*timeframe).or_default();
+        for bar in bars {
+            entry.insert(bar.open_time, bar.clone());
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(timeframe, bars)| (timeframe, bars.into_values().collect()))
+        .collect()
+}
+
+/// Whether a lead-in candidate holds a bar whose entry warm gate is satisfied
+/// — the probe's own stopping rule, reused so a window is never accepted while
+/// the source can still supply the history the engine is meant to arrive warm
+/// on (R3-A).
+fn lead_in_warm(
+    pair: &Pair,
+    session: &PaperSession,
+    compiled: &CompiledStrategy,
+    bars: &BTreeMap<Timeframe, Vec<Candle>>,
+) -> bool {
+    let primary = probe_series(pair, session.primary_timeframe, bars);
+    let htf = session
+        .htf_timeframe
+        .map(|timeframe| probe_series(pair, timeframe, bars));
+    let d1 = session
+        .d1_timeframe()
+        .map(|timeframe| probe_series(pair, timeframe, bars));
+    first_fully_warm_bar_ms(compiled, &primary, htf.as_ref(), d1.as_ref()).is_some()
+}
+
+/// Whether the recorded primary history is contiguous from its first recorded
+/// bar through `watermark` — every owed catch-up bar committed, never a partial
+/// prefix (R3-C).
+fn catch_up_reached(
+    recorded: &BTreeMap<Timeframe, BTreeMap<i64, Candle>>,
+    primary: Timeframe,
+    watermark: i64,
+) -> bool {
+    let Some(bars) = recorded.get(&primary) else {
+        return false;
+    };
+    let (Some(&first), Some(&newest)) = (bars.keys().next(), bars.keys().next_back()) else {
+        return false;
+    };
+    if first > watermark {
+        return true;
+    }
+    if newest < watermark {
+        return false;
+    }
+    // Contiguous bars on the cadence's grid: the count is the span.
+    let expected = (newest - first) / primary.duration_ms() + 1;
+    i64::try_from(bars.len()).is_ok_and(|len| len == expected)
 }
 
 /// One session's freshly built engine plus its recorded-bar map.
@@ -1668,6 +2067,52 @@ impl RunningSession {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether any primary bar this session owes — the span from the first bar
+    /// after its recorded frontier (or its fetch floor) through the newest bar
+    /// already past its counting time — is missing from the settled read
+    /// (R3-B).
+    ///
+    /// Derived from the cadence and the recording window, never from the
+    /// counting cache: an empty, truncated or failed read leaves the span
+    /// unfilled, a response that carries the newest bar but skipped an older
+    /// owed one is incomplete, and a read that carries the whole span raises no
+    /// retry at all — so a caught-up session keeps the ordinary boundary
+    /// schedule.
+    fn due_primary_missing(
+        &self,
+        fetched: &BTreeMap<(Pair, Timeframe), Vec<Candle>>,
+        now: i64,
+        settle_ms: i64,
+    ) -> bool {
+        let primary = self.session.primary_timeframe;
+        let duration = primary.duration_ms();
+        // `now - settle_ms` is the cutoff: a bar whose counting read is not due
+        // yet belongs to the settle gate's own deadline, not to this retry.
+        let due_open = boundaries(duration, now - settle_ms, 0).last_closed_open_ms;
+        let owed_from = self
+            .recorded
+            .get(&primary)
+            .and_then(|bars| bars.keys().next_back().copied())
+            .map_or(self.since_floor_ms, |last| last + duration);
+        if due_open < owed_from {
+            // Nothing owed: everything up to the newest counting-eligible bar is
+            // already recorded.
+            return false;
+        }
+        let expected = (due_open - owed_from) / duration + 1;
+        let present = fetched
+            .get(&(self.session.pair.clone(), primary))
+            .map_or(0, |bars| {
+                i64::try_from(
+                    bars.iter()
+                        .filter(|bar| bar.open_time >= owed_from && bar.open_time <= due_open)
+                        .count(),
+                )
+                .unwrap_or(i64::MAX)
+            });
+        present != expected
     }
 
     /// Whether the higher bar this primary bar needs — the newest one whose

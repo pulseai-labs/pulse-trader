@@ -76,7 +76,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it. A steady bar lands 40 s after its close; each read that differs from the one
   before adds 10 s; a bar still unsettled 5 minutes after its close is logged once.
   A disagreement with a bar that was already recorded is still a `data_event`, and
-  recorded bars are never replaced. The engine fingerprint is unchanged. Refs
+  recorded bars are never replaced. The initialization lifecycle got the same
+  treatment: an absent or zero-consumed read never proves completeness. A first
+  start confirms its settled lead-in over ONE pinned eligible window, whose
+  read deadline is stamped when each read returns, so an empty, shortened,
+  changed or failed re-read can neither erase the history it already holds nor
+  pass as complete; recovered history joins that window, and the probe keeps
+  growing while the window is not yet warm and the source can still supply it.
+  A due primary bar keeps the 10 s retry until every bar of its owed span is in
+  hand — even before any counting read exists, a transient first failure
+  included — and nothing due means no short poll. A restart's confirmation-
+  delayed backlog is shadow-checked over the caught-up state once it commits,
+  not only beforehand, and the required checkpoint stays pending until it
+  succeeds on every attach path. The engine fingerprint is unchanged. Refs
   [#306](https://github.com/pulseai-labs/pulse-trader/issues/306).
 
 - **`pulse import` can no longer publish a database whose committed rows were

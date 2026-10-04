@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 use pulse::{
-    BinanceAdapter, Candle, ClosedBarSource, Comparator, Condition, DataError, LiveEnv, Pair,
-    PaperEvent, PaperRuntime, PaperSession, PaperSessionId, PaperSessionRepository, PriceField,
-    Series, SettlePolicy, StrategyDsl, Timeframe, ValueSource,
+    BinanceAdapter, Candle, CandleSeriesRepository, Clock, ClosedBarSource, Comparator, Condition,
+    DataError, DataVersion, LiveEnv, Pair, PaperEvent, PaperRuntime, PaperSession, PaperSessionId,
+    PaperSessionRepository, PriceField, Series, SessionEnv, SettlePolicy, ShadowResult,
+    StoredCandleSeries, StrategyDsl, Timeframe, ValueSource,
 };
 use rust_decimal::Decimal;
 use support::paper::{
@@ -821,12 +822,19 @@ fn batches(events: &[PaperEvent]) -> Vec<(i64, Vec<(Timeframe, i64)>)> {
 /// Drive the runtime by its own wake schedule through every wake due by
 /// `until`, re-scripting the source before each wake. Returns the wake
 /// instants. Bounded, so a deadlock fails fast instead of hanging the test.
-async fn drive_scripted(
+async fn drive_scripted<R, B, S, C, E>(
     world: &PaperWorld,
-    runtime: &mut TestRuntime,
+    runtime: &mut PaperRuntime<R, B, S, C, E>,
     script: &impl Fn(i64),
     until: i64,
-) -> Vec<i64> {
+) -> Vec<i64>
+where
+    R: PaperSessionRepository,
+    B: ClosedBarSource,
+    S: CandleSeriesRepository,
+    C: Clock,
+    E: SessionEnv,
+{
     let mut wakes = Vec::new();
     for _ in 0..2_000 {
         let now = world.clock.now();
@@ -842,6 +850,69 @@ async fn drive_scripted(
         wakes.push(next);
     }
     panic!("the wake schedule never reached {until}");
+}
+
+/// [`drive_scripted`] without the failure assertion: returns the wakes and
+/// every wake's failures, so a suite can assert the history it cares about
+/// first and the absence of failures after it.
+async fn drive_tolerant<R, B, S, C, E>(
+    world: &PaperWorld,
+    runtime: &mut PaperRuntime<R, B, S, C, E>,
+    script: &impl Fn(i64),
+    until: i64,
+) -> (Vec<i64>, Vec<pulse::SessionFailure>)
+where
+    R: PaperSessionRepository,
+    B: ClosedBarSource,
+    S: CandleSeriesRepository,
+    C: Clock,
+    E: SessionEnv,
+{
+    let mut wakes = Vec::new();
+    let mut failures = Vec::new();
+    for _ in 0..2_000 {
+        let now = world.clock.now();
+        let next = runtime.next_wake_ms().expect("a wake is always scheduled");
+        assert!(next > now, "the next wake {next} lies after now {now}");
+        if next > until {
+            return (wakes, failures);
+        }
+        world.clock.set(next);
+        script(next);
+        failures.extend(runtime.wake().await);
+        wakes.push(next);
+    }
+    panic!("the wake schedule never reached {until}");
+}
+
+/// Drive the runtime's own schedule until `id` is attached. Bounded.
+async fn drive_until_attached<R, B, S, C, E>(
+    world: &PaperWorld,
+    runtime: &mut PaperRuntime<R, B, S, C, E>,
+    id: &PaperSessionId,
+    script: &impl Fn(i64),
+) where
+    R: PaperSessionRepository,
+    B: ClosedBarSource,
+    S: CandleSeriesRepository,
+    C: Clock,
+    E: SessionEnv,
+{
+    for _ in 0..200 {
+        if runtime.attached_ids().contains(id) {
+            return;
+        }
+        let next = runtime.next_wake_ms().expect("a wake is always scheduled");
+        assert!(
+            next > world.clock.now(),
+            "the wake {next} lies in the future"
+        );
+        world.clock.set(next);
+        script(next);
+        let failures = runtime.wake().await;
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+    panic!("the session never attached");
 }
 
 /// The R2-4 higher-timeframe scenario: an HTF-reading M15 session booted at
@@ -1231,4 +1302,1082 @@ async fn the_same_guard_holds_the_primary_for_a_missing_due_d1_bar() {
         "{:?}",
         data_events(&events)
     );
+}
+
+// ---------------------------------------------------------------------------
+// R3-A/B/C: the initialization/checkpoint lifecycle. An absent response or a
+// zero-consumed pass is NOT proof that input is complete.
+// ---------------------------------------------------------------------------
+
+/// The rows of one timeframe this session recorded as LEAD-IN, from the table:
+/// what the first start actually committed. Matched against the recorded bars
+/// so the values are the repo's own decoding.
+async fn lead_in_bars(
+    world: &PaperWorld,
+    id: &PaperSessionId,
+    timeframe: Timeframe,
+) -> Vec<Candle> {
+    let flags: Vec<(i64,)> = sqlx::query_as(
+        "SELECT open_time FROM paper_bar \
+         WHERE session_id = ?1 AND timeframe = ?2 AND lead_in = 1 ORDER BY open_time",
+    )
+    .bind(id.as_str())
+    .bind(timeframe.binance_interval())
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    let recorded = world.paper().bars(id, timeframe).await.unwrap();
+    flags
+        .into_iter()
+        .map(|(open_time,)| {
+            recorded
+                .iter()
+                .find(|bar| bar.open_time == open_time)
+                .cloned()
+                .expect("a recorded lead-in row")
+        })
+        .collect()
+}
+
+/// Every `shadow_checked` event: its position in the log, its `bar_count` and
+/// its decoded verdict.
+fn shadow_checks(events: &[PaperEvent]) -> Vec<(usize, u64, ShadowResult)> {
+    events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            PaperEvent::ShadowChecked {
+                bar_count, result, ..
+            } => Some((
+                index,
+                *bar_count,
+                serde_json::from_value(result.clone()).expect("a decoded shadow verdict"),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every recorded `paper_bar` row of one session, across its timeframes.
+async fn total_recorded_rows(world: &PaperWorld, id: &PaperSessionId) -> u64 {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paper_bar WHERE session_id = ?1")
+        .bind(id.as_str())
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap();
+    u64::try_from(count).unwrap()
+}
+
+/// The eligible M15 lead-in the HTF probe settles on at the 08:01 boot: its
+/// doubling stops at the depth (16 primary bars) where the 04:00 H4 bar enters
+/// the window and pairs, so the window is `[08:00 - 4h, 08:00)`.
+fn r3_expected_lead_in(m15: &[Candle], cutoff: i64) -> Vec<Candle> {
+    let from = cutoff - 16 * M15_MS;
+    m15.iter()
+        .filter(|bar| bar.open_time >= from && bar.open_time < cutoff)
+        .cloned()
+        .collect()
+}
+
+/// The real store with `load_version` refused while the counter is non-zero:
+/// the mandatory post-catch-up checkpoint dies at its snapshot read and every
+/// other path stays the real store's (the `paper_runtime_stop.rs`
+/// `RefusingSeries` precedent, made transient).
+#[derive(Clone)]
+struct FlakySeries {
+    inner: pulse::CandleStore,
+    fail_loads: Arc<AtomicUsize>,
+}
+
+impl CandleSeriesRepository for FlakySeries {
+    fn load_head(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+    ) -> Result<Option<StoredCandleSeries>, DataError> {
+        self.inner.load_head(pair, timeframe)
+    }
+
+    fn load_version(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        version: &DataVersion,
+    ) -> Result<StoredCandleSeries, DataError> {
+        let fail = self
+            .fail_loads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if fail {
+            return Err(DataError::Db(format!(
+                "injected: the {timeframe:?} snapshot is unreadable"
+            )));
+        }
+        self.inner.load_version(pair, timeframe, version)
+    }
+
+    fn commit(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        candles: Vec<Candle>,
+    ) -> Result<StoredCandleSeries, DataError> {
+        self.inner.commit(pair, timeframe, candles)
+    }
+}
+
+/// A runtime reading snapshots through [`FlakySeries`].
+type CheckpointRuntime = PaperRuntime<
+    pulse::SqlitePaperSessionRepo<support::paper::SteppedClock>,
+    support::paper::ScriptedBars,
+    FlakySeries,
+    support::paper::SteppedClock,
+    LiveEnv<pulse::SqliteStrategyRepo<pulse::SystemClock>, BinanceAdapter>,
+>;
+
+/// A runtime over `world` whose snapshot reads fail while the returned counter
+/// says so.
+fn checkpoint_runtime(world: &PaperWorld) -> (FlakySeries, CheckpointRuntime) {
+    let series = FlakySeries {
+        inner: world.store.clone(),
+        fail_loads: Arc::new(AtomicUsize::new(0)),
+    };
+    let runtime = PaperRuntime::new(
+        world.paper(),
+        world.source.clone(),
+        series.clone(),
+        world.clock.clone(),
+        LiveEnv::new(world.strategies(), BinanceAdapter::new()),
+        world.grace_ms,
+        world.log.clone(),
+    )
+    .with_settle(SettlePolicy::DEFAULT);
+    (series, runtime)
+}
+
+// ---------------------------------------------------------------------------
+// R3-A: the settled lead-in is the pinned eligible window, and it is never
+// weakened by an empty, failed or shortened read
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_first_start_recovers_history_the_first_probe_read_missed() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 60_000); // 08:01; the first live bar opens 08:00
+    let cutoff = BASE + 8 * H_MS;
+    let m15 = m15_run(BASE, BASE + 9 * H_MS);
+    let h4 = vec![
+        bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050),
+        bar_of(Timeframe::H4, BASE + 8 * H_MS, 59_950, 59_900),
+    ];
+    world.source.script(Timeframe::M15, m15.clone());
+    world.source.script(Timeframe::H4, h4.clone());
+    let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+    let version = create_version(&world, "r3-a1", &dsl).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    // The probe's FIRST read (the M15 window) closes empty: no history at all.
+    source.empty_reads.store(1, Ordering::SeqCst);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    assert!(
+        recorded(&world, &session.id).await.is_empty(),
+        "nothing is attached on an unconfirmed window"
+    );
+
+    // The confirming reads recover the history: the session must attach with
+    // the COMPLETE eligible window, never with the empty first probe.
+    drive_scripted(&world, &mut runtime, &|_| {}, BASE + 9 * H_MS).await;
+
+    let expected = r3_expected_lead_in(&m15, cutoff);
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::M15).await,
+        expected,
+        "the whole eligible primary window landed, not the empty first probe"
+    );
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::H4).await,
+        vec![h4[0].clone()],
+        "the eligible H4 bar landed; the live 08:00 one is outside the cutoff"
+    );
+    assert_eq!(
+        recorded(&world, &session.id)
+            .await
+            .last()
+            .map(|bar| bar.open_time),
+        Some(BASE + 8 * H_MS + 30 * 60_000),
+        "the session kept consuming live bars"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+}
+
+#[tokio::test]
+async fn a_complete_lead_in_candidate_survives_empty_confirmation_reads() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 60_000);
+    let cutoff = BASE + 8 * H_MS;
+    let m15 = m15_run(BASE, BASE + 9 * H_MS);
+    let h4 = vec![
+        bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050),
+        bar_of(Timeframe::H4, BASE + 8 * H_MS, 59_950, 59_900),
+    ];
+    world.source.script(Timeframe::M15, m15.clone());
+    world.source.script(Timeframe::H4, h4.clone());
+    let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+    let version = create_version(&world, "r3-a2", &dsl).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    assert!(
+        runtime.boot().await.is_empty(),
+        "boot: the probe saw the full window"
+    );
+    // The next reads close empty: the confirmation, then the re-probe a failed
+    // containment would take, then another confirm. The saved complete
+    // candidate must survive all of them.
+    source.empty_reads.store(3, Ordering::SeqCst);
+
+    drive_scripted(&world, &mut runtime, &|_| {}, BASE + 9 * H_MS).await;
+
+    let expected = r3_expected_lead_in(&m15, cutoff);
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::M15).await,
+        expected,
+        "the saved complete window was kept, never replaced by an empty one"
+    );
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::H4).await,
+        vec![h4[0].clone()]
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+}
+
+#[tokio::test]
+async fn recovered_eligible_history_joins_the_candidate_and_live_bars_stay_out() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 60_000);
+    let cutoff = BASE + 8 * H_MS;
+    let m15 = m15_run(BASE, BASE + 9 * H_MS);
+    let h4 = vec![
+        bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050),
+        bar_of(Timeframe::H4, BASE + 8 * H_MS, 59_950, 59_900),
+    ];
+    // The probe sees only the newest eligible primary bar: the rest of the
+    // history is not served yet.
+    let newest = m15
+        .iter()
+        .find(|bar| bar.open_time == cutoff - M15_MS)
+        .cloned()
+        .expect("a scripted bar");
+    world.source.script(Timeframe::M15, vec![newest]);
+    world.source.script(Timeframe::H4, Vec::new());
+    let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+    let version = create_version(&world, "r3-a3", &dsl).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let (_source, mut runtime) = faulty_runtime(&world);
+    assert!(
+        runtime.boot().await.is_empty(),
+        "boot: the probe missed the history"
+    );
+    // From the confirming reads on, the source serves the whole eligible
+    // history AND the live bars that follow the cutoff.
+    let script = |_: i64| {
+        world.source.script(Timeframe::M15, m15.clone());
+        world.source.script(Timeframe::H4, h4.clone());
+    };
+    let (_, failures) = drive_tolerant(&world, &mut runtime, &script, BASE + 9 * H_MS).await;
+
+    let expected = r3_expected_lead_in(&m15, cutoff);
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::M15).await,
+        expected,
+        "the recovered eligible history inside the window joined the candidate"
+    );
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::H4).await,
+        vec![h4[0].clone()],
+        "the eligible H4 bar joined too; the 08:00 one is outside the cutoff"
+    );
+    // The bars at and after the cutoff are live input, recorded without the
+    // lead-in flag: the comparison never ran over them.
+    let live: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT open_time, lead_in FROM paper_bar \
+         WHERE session_id = ?1 AND timeframe = '15m' AND open_time >= ?2 ORDER BY open_time",
+    )
+    .bind(session.id.as_str())
+    .bind(cutoff)
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        live.len() >= 2 && live.iter().all(|(_, lead_in)| *lead_in == 0),
+        "later live bars stay outside the lead-in: {live:?}"
+    );
+    assert!(
+        failures.is_empty(),
+        "no stepped-input refusal once the H4 history is in: {failures:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R3-B: a due eligible primary bar keeps the short retry, even before any
+// counting copy exists
+// ---------------------------------------------------------------------------
+
+/// The session of the R3-B suites: a primary-only session whose source serves
+/// nothing until `admit_at`, so it attaches with no counting reads at all.
+struct DueRetry {
+    world: PaperWorld,
+    session: PaperSession,
+    /// The first live bar (the one the empty source never served).
+    first_live: i64,
+    /// The first live bar's counting read (its close plus the settle time).
+    boundary: i64,
+}
+
+impl DueRetry {
+    async fn new() -> Self {
+        let world = world_with_grace(PaperWorld::new().await);
+        world.clock.set(BASE + 8 * H_MS + 5 * 60_000); // 08:05: the lead-in is 07:30/07:45
+        world
+            .source
+            .script(Timeframe::M15, m15_run(BASE, BASE + 9 * H_MS));
+        let version = create_version(&world, "r3-b", &pulse::fixture_strategy_dsl()).await;
+        let session = promote_session(&world, &version, Timeframe::M15, None, false).await;
+        Self {
+            world,
+            session,
+            first_live: BASE + 8 * H_MS,
+            boundary: BASE + 8 * H_MS + M15_MS + SettlePolicy::DEFAULT.settle_ms,
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_empty_first_read_of_a_due_primary_bar_keeps_the_short_retry() {
+    let scenario = DueRetry::new().await;
+    let world = &scenario.world;
+    let repoll = SettlePolicy::DEFAULT.repoll_ms;
+    let (source, mut runtime) = faulty_runtime(world);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    drive_until_attached(world, &mut runtime, &scenario.session.id, &|_| {}).await;
+    // Settle the lead-in's own confirming read, then nothing is due until the
+    // first live bar's boundary.
+    drive_scripted(world, &mut runtime, &|_| {}, scenario.boundary - 1).await;
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(scenario.boundary),
+        "no other retry deadline exists: the next wake is the first due bar's boundary poll"
+    );
+
+    // The bar's first counting read closes empty, with no counting copy behind
+    // it: the due bar keeps the short retry.
+    source.empty_reads.store(1, Ordering::SeqCst);
+    world.clock.set(scenario.boundary);
+    let failures = runtime.wake().await;
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(scenario.boundary + repoll),
+        "the missing due primary bar keeps the short retry"
+    );
+
+    // The retry reads the bar, and the ordinary confirmation lands it.
+    world.clock.set(scenario.boundary + repoll);
+    assert!(runtime.wake().await.is_empty());
+    world.clock.set(scenario.boundary + 2 * repoll);
+    assert!(runtime.wake().await.is_empty());
+    assert_eq!(
+        recorded(world, &scenario.session.id)
+            .await
+            .last()
+            .map(|bar| bar.open_time),
+        Some(scenario.first_live),
+        "the bar landed at the kept retry"
+    );
+    let events = world.paper().events(&scenario.session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "{:?}",
+        data_events(&events)
+    );
+}
+
+#[tokio::test]
+async fn a_first_transient_failure_at_the_boundary_keeps_the_short_retry() {
+    let scenario = DueRetry::new().await;
+    let world = &scenario.world;
+    let repoll = SettlePolicy::DEFAULT.repoll_ms;
+    let (source, mut runtime) = faulty_runtime(world);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    drive_until_attached(world, &mut runtime, &scenario.session.id, &|_| {}).await;
+    drive_scripted(world, &mut runtime, &|_| {}, scenario.boundary - 1).await;
+    assert_eq!(runtime.next_wake_ms(), Some(scenario.boundary));
+
+    // The FIRST read at the boundary fails: no counting copy exists and no
+    // other deadline is set, so nothing else would keep the retry alive.
+    source.fail.store(true, Ordering::SeqCst);
+    world.clock.set(scenario.boundary);
+    assert!(!runtime.wake().await.is_empty(), "the outage is reported");
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(scenario.boundary + repoll),
+        "the failed first read of a due bar keeps the short retry"
+    );
+
+    source.fail.store(false, Ordering::SeqCst);
+    world.clock.set(scenario.boundary + repoll);
+    assert!(runtime.wake().await.is_empty());
+    world.clock.set(scenario.boundary + 2 * repoll);
+    assert!(runtime.wake().await.is_empty());
+    assert_eq!(
+        recorded(world, &scenario.session.id)
+            .await
+            .last()
+            .map(|bar| bar.open_time),
+        Some(scenario.first_live),
+        "the bar landed after the retry"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R3-C: the restart catch-up obligation requires a shadow checkpoint of the
+// CAUGHT-UP state, not the pre-catch-up one
+// ---------------------------------------------------------------------------
+
+/// The restart scenario of the R3-C suites: a live run through the 08:30 bar,
+/// then an outage of three bars, then a fresh runtime at 09:31 whose backlog is
+/// withheld for confirmation.
+struct RestartBacklog {
+    world: PaperWorld,
+    session: PaperSession,
+    /// The instant the fresh runtime boots (09:31).
+    restart_at: i64,
+    /// The newest primary bar closed at `restart_at` (09:15).
+    watermark: i64,
+}
+
+impl RestartBacklog {
+    async fn new() -> Self {
+        let world = world_with_grace(PaperWorld::new().await);
+        world.clock.set(BASE + 8 * H_MS + 60_000);
+        world
+            .source
+            .script(Timeframe::M15, m15_run(BASE, BASE + 10 * H_MS));
+        world.source.script(
+            Timeframe::H4,
+            vec![
+                bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050),
+                bar_of(Timeframe::H4, BASE + 8 * H_MS, 59_950, 59_900),
+            ],
+        );
+        let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+        let version = create_version(&world, "r3-c", &dsl).await;
+        let session =
+            promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+        let mut runtime = world.runtime();
+        assert!(runtime.boot().await.is_empty(), "boot");
+        drive_scripted(
+            &world,
+            &mut runtime,
+            &|_| {},
+            BASE + 8 * H_MS + 45 * 60_000 + 40_000,
+        )
+        .await;
+        assert_eq!(
+            world
+                .paper()
+                .bars(&session.id, Timeframe::M15)
+                .await
+                .unwrap()
+                .last()
+                .map(|bar| bar.open_time),
+            Some(BASE + 8 * H_MS + 30 * 60_000),
+            "the live run reached the 08:30 bar"
+        );
+        drop(runtime);
+        Self {
+            world,
+            session,
+            restart_at: BASE + 9 * H_MS + 31 * 60_000,
+            watermark: BASE + 9 * H_MS + 15 * 60_000,
+        }
+    }
+
+    /// Boot a fresh runtime at the restart instant (the server's own `boot()`).
+    async fn restart(&self) -> TestRuntime {
+        self.world.clock.set(self.restart_at);
+        let mut runtime = self.world.runtime();
+        assert!(runtime.boot().await.is_empty(), "the restart boots");
+        runtime
+    }
+
+    /// The backlog bars the restart owes: closed at `restart_at`, not recorded.
+    fn backlog(&self) -> Vec<i64> {
+        [
+            BASE + 8 * H_MS + 45 * 60_000,
+            BASE + 9 * H_MS,
+            self.watermark,
+        ]
+        .to_vec()
+    }
+}
+
+#[tokio::test]
+async fn a_restart_backlog_is_shadow_checked_after_it_is_confirmed() {
+    let scenario = RestartBacklog::new().await;
+    let world = &scenario.world;
+    let id = &scenario.session.id;
+    let mut runtime = scenario.restart().await;
+
+    // The attach-time check ran over the PRE-catch-up state: the backlog is
+    // still owed and nothing of it is recorded.
+    let checks_before = shadow_checks(&world.paper().events(id).await.unwrap());
+    assert!(!checks_before.is_empty(), "the attach-time check ran");
+    let recorded_before = total_recorded_rows(world, id).await;
+    let &(_, attach_bars, _) = checks_before.last().expect("the attach-time check");
+    assert_eq!(
+        attach_bars, recorded_before,
+        "the attach-time check covered the PRE-catch-up state"
+    );
+    assert_eq!(
+        recorded(world, id).await.last().map(|bar| bar.open_time),
+        Some(BASE + 8 * H_MS + 30 * 60_000),
+        "the backlog is withheld for confirmation"
+    );
+
+    // The confirming read commits the backlog; the REQUIRED checkpoint must
+    // cover that caught-up state in the same wake.
+    world.clock.set(runtime.next_wake_ms().unwrap());
+    assert!(runtime.wake().await.is_empty(), "the backlog lands");
+    let recorded_after = recorded(world, id).await;
+    assert_eq!(
+        recorded_after.last().map(|bar| bar.open_time),
+        Some(scenario.watermark),
+        "the whole backlog landed: {:?}",
+        scenario.backlog()
+    );
+    let events = world.paper().events(id).await.unwrap();
+    let checks = shadow_checks(&events);
+    assert_eq!(
+        checks.len(),
+        checks_before.len() + 1,
+        "exactly one new check, and nothing else: {checks:?}"
+    );
+    let &(index, bar_count, ref verdict) = checks.last().expect("a check landed");
+    let last_bar = events
+        .iter()
+        .rposition(|event| matches!(event, PaperEvent::BarProcessed { .. }))
+        .expect("the backlog's batch");
+    assert!(
+        index > last_bar,
+        "the mandatory checkpoint follows the committed backlog"
+    );
+    assert_eq!(
+        bar_count,
+        total_recorded_rows(world, id).await,
+        "it covers the caught-up state, higher series included"
+    );
+    assert!(verdict.is_identical(), "{verdict:?}");
+    assert_eq!(
+        bar_count,
+        recorded_before + 3,
+        "the committed backlog is one row per withheld bar"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_post_catch_up_checkpoint_stays_pending_and_retries() {
+    let scenario = RestartBacklog::new().await;
+    let world = &scenario.world;
+    let repoll = SettlePolicy::DEFAULT.repoll_ms;
+    let id = &scenario.session.id;
+    // A fresh runtime reading snapshots through the injected store.
+    world.clock.set(scenario.restart_at);
+    let (series, mut runtime) = checkpoint_runtime(world);
+    assert!(runtime.boot().await.is_empty(), "the restart boots");
+    let checks_before = shadow_checks(&world.paper().events(id).await.unwrap());
+    assert!(!checks_before.is_empty(), "the attach-time check ran");
+
+    // The mandatory checkpoint's snapshot read fails.
+    series.fail_loads.store(1, Ordering::SeqCst);
+    let retry = runtime.next_wake_ms().expect("a wake is always scheduled");
+    assert_eq!(
+        retry,
+        scenario.restart_at + repoll,
+        "the withheld backlog's confirming read is the next wake"
+    );
+    world.clock.set(retry);
+    let failures = runtime.wake().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "the required checkpoint failed: {failures:?}"
+    );
+    assert_eq!(
+        recorded(world, id).await.last().map(|bar| bar.open_time),
+        Some(scenario.watermark),
+        "the backlog still committed"
+    );
+    assert_eq!(
+        shadow_checks(&world.paper().events(id).await.unwrap()).len(),
+        checks_before.len(),
+        "the failed check wrote no verdict"
+    );
+    // The obligation is still pending, on a bounded wake.
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(retry + repoll),
+        "the required checkpoint retries"
+    );
+
+    world.clock.set(retry + repoll);
+    assert!(runtime.wake().await.is_empty(), "the retry succeeds");
+    let events = world.paper().events(id).await.unwrap();
+    let checks = shadow_checks(&events);
+    assert_eq!(checks.len(), checks_before.len() + 1, "{checks:?}");
+    let &(index, bar_count, ref verdict) = checks.last().expect("a check landed");
+    let last_bar = events
+        .iter()
+        .rposition(|event| matches!(event, PaperEvent::BarProcessed { .. }))
+        .expect("the backlog's batch");
+    assert!(index > last_bar, "the check covers the caught-up state");
+    assert_eq!(bar_count, total_recorded_rows(world, id).await);
+    assert!(verdict.is_identical(), "{verdict:?}");
+}
+
+// ---------------------------------------------------------------------------
+// R3 lifecycle sweep: the paths a failure, an empty deep read, an incomplete
+// owed span or an unchecked attach must NOT discharge
+// ---------------------------------------------------------------------------
+
+/// Drive the runtime's own schedule with a per-wake script and a per-wake
+/// assertion, so a suite can hold a phase boundary. Bounded.
+async fn drive_phased<R, B, S, C, E>(
+    world: &PaperWorld,
+    runtime: &mut PaperRuntime<R, B, S, C, E>,
+    script: &impl Fn(i64),
+    until: i64,
+    check: &impl Fn(i64, &[pulse::SessionFailure], &[PaperSessionId]),
+) -> (Vec<i64>, Vec<pulse::SessionFailure>)
+where
+    R: PaperSessionRepository,
+    B: ClosedBarSource,
+    S: CandleSeriesRepository,
+    C: Clock,
+    E: SessionEnv,
+{
+    let mut wakes = Vec::new();
+    let mut failures = Vec::new();
+    for _ in 0..2_000 {
+        let now = world.clock.now();
+        let next = runtime
+            .next_wake_ms()
+            .expect("a wake is always scheduled")
+            .max(now);
+        if next > until {
+            return (wakes, failures);
+        }
+        world.clock.set(next);
+        script(next);
+        let wake_failures = runtime.wake().await;
+        check(next, &wake_failures, &runtime.attached_ids());
+        failures.extend(wake_failures);
+        wakes.push(next);
+    }
+    panic!("the wake schedule never reached {until}");
+}
+
+#[tokio::test]
+async fn a_pinned_lead_in_window_survives_failures_and_shorter_reads() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 5 * 60_000); // 08:05: the intended cutoff is 08:00
+    let m15 = m15_run(BASE, BASE + 9 * H_MS);
+    let intended: Vec<Candle> = m15
+        .iter()
+        .filter(|bar| {
+            bar.open_time >= BASE + 8 * H_MS - 2 * M15_MS && bar.open_time < BASE + 8 * H_MS
+        })
+        .cloned()
+        .collect();
+    let newest = intended[1].clone();
+    world.source.script(Timeframe::M15, m15.clone());
+    let version = create_version(&world, "r3-sweep-a", &pulse::fixture_strategy_dsl()).await;
+    let session = promote_session(&world, &version, Timeframe::M15, None, false).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    assert!(
+        runtime.boot().await.is_empty(),
+        "boot: the probe read the complete window"
+    );
+    let probe_done = world.clock.now();
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(probe_done + SettlePolicy::DEFAULT.repoll_ms),
+        "the probe's read is stamped when it returned"
+    );
+
+    // Phase 1: the confirming read fails. Phase 2: the source serves only the
+    // newest eligible bar. Phase 3: the history recovers. The pinned window (and
+    // its 08:00 cutoff) must survive all three, across a cadence boundary.
+    let fail_until = BASE + 8 * H_MS + 20 * 60_000;
+    let short_until = BASE + 8 * H_MS + 30 * 60_000;
+    let until = BASE + 8 * H_MS + 45 * 60_000;
+    let script = |now: i64| {
+        if now < fail_until {
+            source.fail.store(true, Ordering::SeqCst);
+            world.source.script(Timeframe::M15, m15.clone());
+        } else if now < short_until {
+            source.fail.store(false, Ordering::SeqCst);
+            world.source.script(Timeframe::M15, vec![newest.clone()]);
+        } else {
+            source.fail.store(false, Ordering::SeqCst);
+            world.source.script(Timeframe::M15, m15.clone());
+        }
+    };
+    let (wakes, _) = drive_phased(&world, &mut runtime, &script, until, &|_, _, _| {}).await;
+    assert!(wakes.len() < 2_000, "the drive is bounded");
+    source.fail.store(false, Ordering::SeqCst);
+
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::M15).await,
+        intended,
+        "the pinned eligible window survived the failure and the shortened read"
+    );
+    // The bar the cadence boundary moved past is live input, never lead-in.
+    let at_cutoff: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT open_time, lead_in FROM paper_bar \
+         WHERE session_id = ?1 AND timeframe = '15m' AND open_time = ?2",
+    )
+    .bind(session.id.as_str())
+    .bind(BASE + 8 * H_MS)
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        at_cutoff == vec![(BASE + 8 * H_MS, 0)] || at_cutoff.is_empty(),
+        "the 08:00 bar is live, never lead-in: {at_cutoff:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_lead_in_read_is_stamped_when_it_returns() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 5 * 60_000);
+    let cutoff = BASE + 8 * H_MS;
+    let m15 = m15_run(BASE, BASE + 9 * H_MS);
+    // The newest eligible bar is still being revised: the source serves a
+    // provisional copy until 08:05:20 and the final copy after.
+    let provisional_until = BASE + 8 * H_MS + 5 * 60_000 + 20_000;
+    let provisional: Vec<Candle> = m15
+        .iter()
+        .map(|bar| {
+            if bar.open_time == cutoff - M15_MS {
+                provisional_of(bar)
+            } else {
+                bar.clone()
+            }
+        })
+        .collect();
+    let script = |now: i64| {
+        world.source.script(
+            Timeframe::M15,
+            if now < provisional_until {
+                provisional.clone()
+            } else {
+                m15.clone()
+            },
+        );
+    };
+    script(world.clock.now());
+    let version = create_version(&world, "r3-sweep-b", &pulse::fixture_strategy_dsl()).await;
+    let session = promote_session(&world, &version, Timeframe::M15, None, false).await;
+    let (source, mut runtime) = faulty_runtime(&world);
+    // The probe's read takes 12 s: it returns past the deadline a pre-I/O stamp
+    // would have set.
+    source.slow_ms.store(12_000, Ordering::SeqCst);
+    assert!(runtime.boot().await.is_empty(), "boot");
+    source.slow_ms.store(0, Ordering::SeqCst);
+    let probe_done = world.clock.now();
+    assert_eq!(
+        probe_done,
+        BASE + 8 * H_MS + 5 * 60_000 + 12_000,
+        "the slow read advanced the clock"
+    );
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(probe_done + SettlePolicy::DEFAULT.repoll_ms),
+        "the confirmation is spaced from when the probe RETURNED"
+    );
+
+    // The spaced confirmation sees the FINAL copy, restarts, and lands it: no
+    // back-to-back confirmation and no #306 revision hold.
+    let (_, failures) = drive_tolerant(&world, &mut runtime, &script, BASE + 9 * H_MS).await;
+    assert!(failures.is_empty(), "{failures:?}");
+    let settled = m15
+        .iter()
+        .find(|bar| bar.open_time == cutoff - M15_MS)
+        .cloned()
+        .expect("the scripted bar");
+    let lead_in = lead_in_bars(&world, &session.id, Timeframe::M15).await;
+    assert_eq!(lead_in.len(), 2, "{lead_in:?}");
+    assert_eq!(
+        lead_in.last(),
+        Some(&settled),
+        "the FINAL copy is the lead-in"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert!(
+        data_events(&events).is_empty(),
+        "no #306 revision hold: {:?}",
+        data_events(&events)
+    );
+}
+
+/// The instant the R3-sweep fixtures start serving history again.
+const RECOVERY_AT: i64 = BASE + 8 * H_MS + 10 * 60_000;
+
+#[tokio::test]
+async fn repeated_empty_lead_in_reads_are_not_a_completeness_witness() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 60_000); // 08:01; cutoff 08:00
+    let cutoff = BASE + 8 * H_MS;
+    let m15 = m15_run(BASE, BASE + 9 * H_MS);
+    let h4 = vec![
+        bar_of(Timeframe::H4, BASE + 4 * H_MS, 60_100, 60_050),
+        bar_of(Timeframe::H4, BASE + 8 * H_MS, 59_950, 59_900),
+    ];
+    world.source.script(Timeframe::M15, Vec::new());
+    world.source.script(Timeframe::H4, Vec::new());
+    let dsl = series_operand_dsl(Series::Htf, 60_100, 60_000);
+    let version = create_version(&world, "r3-sweep-c", &dsl).await;
+    let session =
+        promote_session(&world, &version, Timeframe::M15, Some(Timeframe::H4), false).await;
+    let mut runtime = world.runtime();
+    // The probe, its confirmations and every deepening read close empty until
+    // RECOVERY_AT: not one of them is evidence that the history is complete.
+    let script = |now: i64| {
+        if now < RECOVERY_AT {
+            world.source.script(Timeframe::M15, Vec::new());
+            world.source.script(Timeframe::H4, Vec::new());
+        } else {
+            world.source.script(Timeframe::M15, m15.clone());
+            world.source.script(Timeframe::H4, h4.clone());
+        }
+    };
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let check = |at: i64, _: &[pulse::SessionFailure], attached: &[PaperSessionId]| {
+        assert!(
+            at >= RECOVERY_AT || attached.is_empty(),
+            "no attach while the eligible history has not been served (at {at})"
+        );
+    };
+    let (wakes, failures) = drive_phased(
+        &world,
+        &mut runtime,
+        &script,
+        BASE + 8 * H_MS + 20 * 60_000,
+        &check,
+    )
+    .await;
+    assert!(wakes.len() < 2_000, "the drive is bounded");
+    assert!(failures.is_empty(), "{failures:?}");
+    let lead_in = lead_in_bars(&world, &session.id, Timeframe::M15).await;
+    assert!(
+        !lead_in.is_empty(),
+        "the recovered history landed as lead-in"
+    );
+    assert_eq!(
+        lead_in.last().map(|bar| bar.open_time),
+        Some(cutoff - M15_MS),
+        "the window reaches the cutoff's predecessor"
+    );
+    assert!(
+        lead_in.iter().all(|bar| bar.open_time < cutoff),
+        "no live bar is lead-in: {lead_in:?}"
+    );
+    assert!(
+        r3_expected_lead_in(&m15, cutoff)
+            .iter()
+            .all(|bar| lead_in.contains(bar)),
+        "the intended window is inside the recovered lead-in"
+    );
+    assert_eq!(
+        lead_in_bars(&world, &session.id, Timeframe::H4).await,
+        vec![h4[0].clone()],
+        "the eligible H4 bar landed too"
+    );
+}
+
+#[tokio::test]
+async fn an_older_owed_primary_keeps_the_short_retry_while_the_newest_is_present() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 5 * 60_000);
+    let m15 = m15_run(BASE, BASE + 9 * H_MS);
+    // The 08:15 bar is never served: the response carries the newest bar
+    // (08:30) while the older owed one is missing.
+    let holed: Vec<Candle> = m15
+        .iter()
+        .filter(|bar| bar.open_time != BASE + 8 * H_MS + M15_MS)
+        .cloned()
+        .collect();
+    world.source.script(Timeframe::M15, m15.clone());
+    let version = create_version(&world, "r3-sweep-d", &pulse::fixture_strategy_dsl()).await;
+    let session = promote_session(&world, &version, Timeframe::M15, None, false).await;
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "boot");
+    let repoll = SettlePolicy::DEFAULT.repoll_ms;
+    // Drive to the 08:30 bar's counting read with the hole in place.
+    let boundary = BASE + 8 * H_MS + 3 * M15_MS + SettlePolicy::DEFAULT.settle_ms;
+    let script = |now: i64| {
+        world.source.script(
+            Timeframe::M15,
+            if now <= boundary + repoll {
+                holed.clone()
+            } else {
+                m15.clone()
+            },
+        );
+    };
+    world.source.script(Timeframe::M15, holed.clone());
+    drive_phased(&world, &mut runtime, &script, boundary - 1, &|_, _, _| {}).await;
+    assert_eq!(runtime.next_wake_ms(), Some(boundary));
+    // The newest bar's counting read, then its confirming read: from there the
+    // frontier is settled and in hand while the older owed bar is not.
+    world.clock.set(boundary);
+    script(boundary);
+    assert!(runtime.wake().await.is_empty());
+    world.clock.set(boundary + repoll);
+    script(boundary + repoll);
+    assert!(runtime.wake().await.is_empty());
+    assert_eq!(
+        recorded(&world, &session.id)
+            .await
+            .last()
+            .map(|bar| bar.open_time),
+        Some(BASE + 8 * H_MS),
+        "the older owed bar is still missing"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert_eq!(
+        data_events(&events).len(),
+        1,
+        "the engine refused the gap once: {:?}",
+        data_events(&events)
+    );
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(boundary + 2 * repoll),
+        "the incomplete owed span keeps the short retry"
+    );
+
+    // Once the missing bar arrives, the span fills and both bars land.
+    drive_scripted(&world, &mut runtime, &script, boundary + 4 * repoll).await;
+    let bars = recorded(&world, &session.id).await;
+    assert_eq!(
+        bars.iter()
+            .filter(|bar| bar.open_time >= BASE + 8 * H_MS)
+            .map(|bar| bar.open_time)
+            .collect::<Vec<_>>(),
+        vec![
+            BASE + 8 * H_MS,
+            BASE + 8 * H_MS + M15_MS,
+            BASE + 8 * H_MS + 2 * M15_MS
+        ],
+        "the hole bar and the newest bar both landed"
+    );
+    // Caught up: the ordinary boundary schedule, no false short poll.
+    let next = runtime.next_wake_ms().expect("a wake is always scheduled");
+    assert!(
+        next > world.clock.now() + repoll,
+        "a caught-up session is not short-polled: {next}"
+    );
+}
+
+#[tokio::test]
+async fn the_attach_checkpoint_stays_pending_until_it_succeeds() {
+    let world = world_with_grace(PaperWorld::new().await);
+    world.clock.set(BASE + 8 * H_MS + 5 * 60_000);
+    world
+        .source
+        .script(Timeframe::M15, m15_run(BASE, BASE + 9 * H_MS));
+    let version = create_version(&world, "r3-sweep-e", &pulse::fixture_strategy_dsl()).await;
+    let session = promote_session(&world, &version, Timeframe::M15, None, false).await;
+    let mut runtime = world.runtime();
+    assert!(runtime.boot().await.is_empty(), "boot");
+    // A steady, caught-up session with nothing due: the only deadline is the
+    // required attach checkpoint.
+    drive_scripted(
+        &world,
+        &mut runtime,
+        &|_| {},
+        BASE + 8 * H_MS + 45 * 60_000 + 40_000,
+    )
+    .await;
+    assert_eq!(
+        recorded(&world, &session.id)
+            .await
+            .last()
+            .map(|bar| bar.open_time),
+        Some(BASE + 8 * H_MS + 30 * 60_000),
+        "the live run reached the 08:30 bar"
+    );
+    drop(runtime);
+
+    // 08:46: the recorded frontier IS the newest closed bar, so nothing is owed
+    // and the attach checkpoint is the only obligation.
+    let restart_at = BASE + 8 * H_MS + 46 * 60_000;
+    world.clock.set(restart_at);
+    let (series, mut runtime) = checkpoint_runtime(&world);
+    let checks_before = shadow_checks(&world.paper().events(&session.id).await.unwrap());
+    // Every snapshot read fails: the required attach checkpoint cannot land.
+    series.fail_loads.store(100, Ordering::SeqCst);
+    let boot_failures = runtime.boot().await;
+    assert!(!boot_failures.is_empty(), "the required checkpoint failed");
+    assert_eq!(
+        shadow_checks(&world.paper().events(&session.id).await.unwrap()).len(),
+        checks_before.len(),
+        "no verdict landed"
+    );
+    let repoll = SettlePolicy::DEFAULT.repoll_ms;
+    // Consume the read timer the fresh gate set on its first pass, so the only
+    // remaining deadline is the required checkpoint's.
+    world.clock.set(world.clock.now() + repoll);
+    let failures = runtime.wake().await;
+    assert!(!failures.is_empty(), "the checkpoint is still required");
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(world.clock.now() + repoll),
+        "the required attach checkpoint keeps a bounded retry"
+    );
+    // A second failed attempt keeps it pending, still bounded.
+    world.clock.set(world.clock.now() + repoll);
+    let failures = runtime.wake().await;
+    assert!(!failures.is_empty(), "the checkpoint is still required");
+    assert_eq!(
+        runtime.next_wake_ms(),
+        Some(world.clock.now() + repoll),
+        "still bounded"
+    );
+
+    // The store recovers: the required checkpoint runs over the caught-up state.
+    series.fail_loads.store(0, Ordering::SeqCst);
+    world.clock.set(world.clock.now() + repoll);
+    assert!(runtime.wake().await.is_empty(), "the retry succeeds");
+    let events = world.paper().events(&session.id).await.unwrap();
+    let checks = shadow_checks(&events);
+    assert_eq!(checks.len(), checks_before.len() + 1, "{checks:?}");
+    let &(_, bar_count, ref verdict) = checks.last().expect("a check landed");
+    assert_eq!(bar_count, total_recorded_rows(&world, &session.id).await);
+    assert!(verdict.is_identical(), "{verdict:?}");
 }
