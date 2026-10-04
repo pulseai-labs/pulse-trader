@@ -7,7 +7,8 @@
 //! the missing bar; two sessions sharing a timeframe share one fetch; the loop
 //! is timeframe-agnostic (run over two configurations, the second a real daily
 //! series); the first start records lead-in with no events; a failed append
-//! leaves no partial rows and the bar lands exactly once afterwards.
+//! leaves no partial rows and the bar lands exactly once afterwards. Every
+//! case runs without the #306 settle gate (see [`ungated_world`]).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 
 mod support;
@@ -43,6 +44,13 @@ fn h4_bar(open_time: i64, open: i64, close: i64) -> Candle {
     bar
 }
 
+/// A world without the settle gate: these rules sit behind it, and each case
+/// wakes exactly at a bar's close over a source that never revises a bar
+/// (the gate itself is `tests/paper_bar_settle.rs`).
+async fn ungated_world() -> PaperWorld {
+    PaperWorld::ungated().await
+}
+
 async fn bar_count(world: &PaperWorld, id: &PaperSessionId) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM paper_bar WHERE session_id = ?1")
         .bind(id.as_str())
@@ -70,7 +78,7 @@ async fn price_session(
 
 #[tokio::test]
 async fn only_closed_bars_are_consumed() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     // The bar opening 00:15 closes at 00:29:59.999: NOT closed at 00:15:00.
     world.source.script(
         Timeframe::M15,
@@ -138,7 +146,7 @@ async fn only_closed_bars_are_consumed() {
 
 #[tokio::test]
 async fn repeated_wakes_with_no_new_bar_append_nothing() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.source.script(
         Timeframe::M15,
         vec![
@@ -173,7 +181,7 @@ async fn repeated_wakes_with_no_new_bar_append_nothing() {
 
 #[tokio::test]
 async fn higher_bar_closing_at_the_same_boundary_rides_its_primary_bar() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.clock.set(BASE + 8 * 3_600_000); // 08:00:00 exactly
     let m15: Vec<Candle> = (0..21)
         .map(|i| m15_bar(BASE + 7 * 3_600_000 + i * M15_MS, 60_100, 60_050))
@@ -241,7 +249,7 @@ async fn higher_bar_closing_at_the_same_boundary_rides_its_primary_bar() {
 
 #[tokio::test]
 async fn a_changed_refetch_is_one_data_event_and_never_replaces_a_bar() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     let script = |last_close: i64| {
         vec![
             m15_bar(BASE - 2 * M15_MS, 60_100, 60_050),
@@ -312,7 +320,7 @@ async fn a_changed_refetch_is_one_data_event_and_never_replaces_a_bar() {
 
 #[tokio::test]
 async fn a_gap_holds_the_session_until_the_missing_bar_arrives() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     let without_gap_bar = || {
         vec![
             m15_bar(BASE - 2 * M15_MS, 60_100, 60_050),
@@ -396,7 +404,7 @@ async fn a_gap_holds_the_session_until_the_missing_bar_arrives() {
 
 #[tokio::test]
 async fn two_sessions_sharing_a_timeframe_share_one_fetch_per_wake() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.source.script(
         Timeframe::M15,
         vec![
@@ -501,7 +509,7 @@ async fn agnostic_case(
     dsl: StrategyDsl,
     bars: i64,
 ) {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     if primary == Timeframe::M15 {
         world
             .source
@@ -587,7 +595,7 @@ async fn the_runtime_is_timeframe_agnostic_over_two_configurations() {
 
 #[tokio::test]
 async fn first_start_records_lead_in_with_no_events() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.source.script(
         Timeframe::M15,
         vec![
@@ -771,7 +779,7 @@ where
 
 #[tokio::test]
 async fn a_failed_append_leaves_no_rows_and_consumes_the_bar_once() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.source.script(
         Timeframe::M15,
         vec![
@@ -798,7 +806,8 @@ async fn a_failed_append_leaves_no_rows_and_consumes_the_bar_once() {
         LiveEnv::new(world.strategies(), pulse::BinanceAdapter::new()),
         0,
         world.log.clone(),
-    );
+    )
+    .without_settle_gate();
     assert!(runtime.boot().await.is_empty(), "boot");
     let bars_before = bar_count(&world, &session.id).await;
     let events_before = world.paper().events(&session.id).await.unwrap().len();
@@ -863,6 +872,7 @@ fn flaky_runtime(
         0,
         world.log.clone(),
     )
+    .without_settle_gate()
 }
 
 fn data_event_count(events: &[PaperEvent]) -> usize {
@@ -876,7 +886,7 @@ fn data_event_count(events: &[PaperEvent]) -> usize {
 /// marked reported only once its event commits.
 #[tokio::test]
 async fn a_failed_data_event_append_is_retried_on_the_next_wake() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     let script = |last_close: i64| {
         vec![
             m15_bar(BASE - 2 * M15_MS, 60_100, 60_050),
@@ -932,7 +942,7 @@ async fn a_failed_data_event_append_is_retried_on_the_next_wake() {
 /// moves the engine; every verdict must still be identical.
 #[tokio::test]
 async fn a_shadow_check_after_a_failed_append_never_counts_the_uncommitted_bar() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world
         .source
         .script(Timeframe::M15, pulse::fixture_m15_candles());
@@ -982,7 +992,7 @@ async fn a_shadow_check_after_a_failed_append_never_counts_the_uncommitted_bar()
 /// can itself fail; the stop still lands — a failed check never vetoes it.
 #[tokio::test]
 async fn a_stop_lands_when_the_pre_check_rebuild_fails() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.source.script(
         Timeframe::M15,
         vec![
@@ -1032,7 +1042,7 @@ async fn a_stop_lands_when_the_pre_check_rebuild_fails() {
 /// daily pass retries it instead of waiting forever.
 #[tokio::test]
 async fn a_failed_attach_shadow_check_is_retried() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.source.script(
         Timeframe::M15,
         vec![
@@ -1062,7 +1072,7 @@ async fn a_failed_attach_shadow_check_is_retried() {
 
 #[tokio::test]
 async fn a_daily_shadow_check_runs_on_the_first_wake_after_midnight() {
-    let world = PaperWorld::new().await;
+    let world = ungated_world().await;
     world.source.script(
         Timeframe::M15,
         vec![

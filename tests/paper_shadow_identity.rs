@@ -267,7 +267,7 @@ async fn shadow_over_materialised(
 
 #[tokio::test]
 async fn live_session_equals_its_shadow_field_for_field() {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     script_fixture(&world);
     let version = create_version(&world, "shadow-identity", &pulse::fixture_strategy_dsl()).await;
     let session =
@@ -496,7 +496,7 @@ async fn live_session_equals_its_shadow_field_for_field() {
 /// exit — so the closed trades stay equal and the marks are what differs.
 #[tokio::test]
 async fn an_open_position_divergence_is_a_drift_on_the_runtime_path() {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     script_fixture(&world);
     let version = create_version(&world, "shadow-open-drift", &pulse::fixture_strategy_dsl()).await;
     let session =
@@ -602,7 +602,7 @@ async fn an_open_position_divergence_is_a_drift_on_the_runtime_path() {
 
 #[tokio::test]
 async fn compare_names_the_first_divergence_of_a_drifted_shadow() {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     script_fixture(&world);
     let version = create_version(&world, "shadow-compare", &pulse::fixture_strategy_dsl()).await;
     let session =
@@ -719,7 +719,7 @@ async fn compare_names_the_first_divergence_of_a_drifted_shadow() {
 
 #[tokio::test]
 async fn repeat_shadow_checks_agree_and_never_touch_head() {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     script_fixture(&world);
     let version = create_version(&world, "shadow-repeat", &pulse::fixture_strategy_dsl()).await;
     let session =
@@ -769,7 +769,7 @@ async fn repeat_shadow_checks_agree_and_never_touch_head() {
 
 #[tokio::test]
 async fn shadow_payload_round_trips_and_replay_accepts_the_log() {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     script_fixture(&world);
     let version = create_version(&world, "shadow-roundtrip", &pulse::fixture_strategy_dsl()).await;
     let session =

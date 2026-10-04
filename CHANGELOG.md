@@ -64,6 +64,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A live paper session no longer stalls when Binance finalizes a bar after the
+  poll.** The runtime polled 5 s past a bar's close and recorded the first kline it
+  read, but Binance can still update a kline after that. The next re-fetch then
+  disagreed with the recorded bar, and the "changed re-fetch" `data_event` held the
+  session for good — both sessions on the always-on server stopped within an hour
+  of promotion. The runtime now records and steps a bar (live or lead-in) only once
+  it is settled: read at least 30 s after its close and confirmed by an identical
+  read at least 10 s later, re-polled every 10 s until then — after a restart and
+  at a first start too, and a primary bar waits for a higher bar that closes with
+  it. A steady bar lands 40 s after its close; each read that differs from the one
+  before adds 10 s; a bar still unsettled 5 minutes after its close is logged once.
+  A disagreement with a bar that was already recorded is still a `data_event`, and
+  recorded bars are never replaced. The initialization lifecycle got the same
+  treatment: an absent or zero-consumed read never proves completeness. A first
+  start confirms its settled lead-in over ONE pinned eligible window, whose
+  read deadline is stamped when each read returns — and each timeframe's reply is
+  judged by the instant its OWN read returned, never by a later fetch's — so an
+  empty, shortened, changed or failed re-read can neither erase the history it
+  already holds nor pass as complete; recovered history joins that window, and
+  the probe keeps growing while the window is not yet warm and the source can
+  still supply it. Lead-in eligibility takes bars that CLOSED before the pinned
+  cutoff, so a higher bar that opens before it but closes after it stays with the
+  live drain (and the rebuild's `close_time` drain) that owns it. The window
+  keeps two views of what a probe operation saw: an OBSERVED union — every
+  eligible bar any of its replies returned, across every depth and timeframe,
+  which no later shorter, empty, changed or failed reply of that operation can
+  erase, and which joins the pin even when a later timeframe's fetch fails — and
+  the LAST read operation alone, whose whole raw response (every configured
+  timeframe, nothing failed) is the only thing that may witness completeness: a
+  union or a maximum-length view never proves the source currently serves that
+  window, so only a raw response equal to the whole retained candidate — the one
+  a spaced confirming read already witnessed before that operation — releases
+  a not-yet-warm window. A bar, or a revised copy of a known bar, that the
+  deepening operation's own reads are the first to see is not discharged by
+  their raw completeness: it waits for a later confirming read.
+  A due primary bar keeps the 10 s retry until every bar of its owed span is in
+  hand — even before any counting read exists, a transient first failure
+  included — and nothing due means no short poll. A restart's confirmation-
+  delayed backlog is shadow-checked over the caught-up state once it commits,
+  not only beforehand, and the required checkpoint stays pending until it
+  succeeds on every attach path. The engine fingerprint is unchanged. Refs
+  [#306](https://github.com/pulseai-labs/pulse-trader/issues/306).
+
 - **`pulse import` can no longer publish a database whose committed rows were
   left behind outside it, and every rename that publishes a snapshot, a backup
   database or a backup's `HEAD` manifest is now made durable.** The import's

@@ -39,7 +39,7 @@ fn stops(events: &[PaperEvent]) -> Vec<StopActor> {
 }
 
 async fn fixture_world_with_sessions(count: usize) -> (PaperWorld, Vec<PaperSessionId>) {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     world
         .source
         .script(Timeframe::M15, pulse::fixture_m15_candles());
@@ -378,6 +378,7 @@ fn series_fault_runtime(world: &PaperWorld) -> FaultRuntime {
         world.grace_ms,
         world.log.clone(),
     )
+    .without_settle_gate()
 }
 
 /// The world's runtime, with an append that carries a `Stop` refused.
@@ -393,6 +394,7 @@ fn stop_fault_runtime(world: &PaperWorld) -> StopFaultRuntime {
         world.grace_ms,
         world.log.clone(),
     )
+    .without_settle_gate()
 }
 
 /// F1 (a): a failed final shadow check is logged and does NOT veto the stop.
@@ -449,7 +451,7 @@ async fn a_failed_final_shadow_check_does_not_block_the_stop() {
 /// (M15 only) both stop, and neither is a failure.
 #[tokio::test]
 async fn stop_all_stops_every_session_when_one_final_check_fails() {
-    let world = PaperWorld::new().await;
+    let world = PaperWorld::ungated().await;
     world
         .source
         .script(Timeframe::M15, pulse::fixture_m15_candles());
@@ -739,7 +741,7 @@ fn a_dropped_control_sender_ends_the_serve_loop() {
                 return;
             };
             thread_rt.block_on(async move {
-                let world = PaperWorld::new().await;
+                let world = PaperWorld::ungated().await;
                 let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(8);
                 let (_tick_tx, tick_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);

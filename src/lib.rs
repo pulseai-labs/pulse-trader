@@ -590,7 +590,7 @@ pub use application::paper::{OverrideRequest, PaperPromotionError, promote};
 // error under `deny(warnings)`.
 pub use adapters::binance::RestClosedBars;
 pub use application::paper_runtime::{
-    LiveEnv, PaperRuntime, PaperRuntimeError, RuntimeLog, SessionEnv, SessionFailure,
+    LiveEnv, PaperRuntime, PaperRuntimeError, RuntimeLog, SessionEnv, SessionFailure, SettlePolicy,
 };
 pub use domain::FixtureSnapshotStore;
 pub use domain::PaperSessionRepository;
