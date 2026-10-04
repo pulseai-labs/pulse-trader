@@ -86,10 +86,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the probe keeps growing while the window is not yet warm and the source can
   still supply it. Lead-in eligibility takes bars that CLOSED before the pinned
   cutoff, so a higher bar that opens before it but closes after it stays with the
-  live drain (and the rebuild's `close_time` drain) that owns it, and only a
-  deeper read that returns the whole candidate — every configured timeframe —
-  and no more may release a not-yet-warm window: the merged candidate preserves
-  history, it does not prove the deeper read contained it.
+  live drain (and the rebuild's `close_time` drain) that owns it. The window
+  keeps two views of what a probe operation saw: an OBSERVED union — every
+  eligible bar any of its replies returned, across every depth and timeframe,
+  which no later shorter, empty, changed or failed reply of that operation can
+  erase, and which joins the pin even when a later timeframe's fetch fails — and
+  the LAST read operation alone, whose whole raw response (every configured
+  timeframe, nothing failed) is the only thing that may witness completeness: a
+  union or a maximum-length view never proves the source currently serves that
+  window, so only a raw response equal to the whole retained candidate — the one
+  a spaced confirming read already witnessed before that operation — releases
+  a not-yet-warm window. A bar, or a revised copy of a known bar, that the
+  deepening operation's own reads are the first to see is not discharged by
+  their raw completeness: it waits for a later confirming read.
   A due primary bar keeps the 10 s retry until every bar of its owed span is in
   hand — even before any counting read exists, a transient first failure
   included — and nothing due means no short poll. A restart's confirmation-

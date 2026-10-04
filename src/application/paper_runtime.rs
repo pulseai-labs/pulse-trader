@@ -1248,50 +1248,59 @@ where
     /// constant is invented. A source that cannot supply more history ends the
     /// loop honestly: the engine then warms up live.
     ///
-    /// `previous_len` seeds the growth test with a candidate already in hand
-    /// (R3-A's deepened re-probe); `None` is a fresh probe. Only bars that
-    /// CLOSED strictly before `cutoff_ms` and were read `settle_ms` past their
-    /// close are in the window, each timeframe's copy judged by its own read's
-    /// instant (#306, R3-A, R4-1/R4-2); [`Self::settled_lead_in`] confirms
-    /// them.
+    /// `seed` is what the caller already observed (the pin's candidate on a
+    /// deepened re-probe, empty on a fresh probe): every successful read of
+    /// this operation joins that OBSERVED union immediately, across depths and
+    /// timeframes, and a later shorter, empty, changed or failed read never
+    /// erases it (R5). Only bars that CLOSED strictly before `cutoff_ms` and
+    /// were read `settle_ms` past their close are eligible, each timeframe's
+    /// copy judged by its own read's instant (#306, R3-A, R4-1/R4-2).
+    /// [`Self::settled_lead_in`] confirms the union; only the last read's raw
+    /// map, returned alongside it, may witness completeness.
     async fn probe_lead_in_from(
         &self,
         session: &PaperSession,
         compiled: &CompiledStrategy,
         cutoff_ms: i64,
         depth: i64,
-        previous_len: Option<usize>,
-    ) -> Result<LeadInWindow, PaperRuntimeError> {
+        seed: BTreeMap<Timeframe, Vec<Candle>>,
+    ) -> LeadInProbe {
         let step = session.primary_timeframe.duration_ms();
         let settle_ms = self.settle.map_or(0, |policy| policy.settle_ms);
         let mut depth = depth;
-        let mut previous_len = previous_len;
+        let mut observed = seed;
+        let mut previous_len = observed.get(&session.primary_timeframe).map_or(0, Vec::len);
         loop {
             let since = cutoff_ms - depth * step - 1;
             // Each timeframe's reply is judged by the instant ITS OWN read
             // returned, and the window's confirmation deadline by the last of
             // them (R2-1, R4-2): a slow higher-timeframe fetch must not make a
             // primary copy that was read before its settle threshold eligible.
-            let (read_at, probe) = self
+            let last = self
                 .read_lead_in_window(session, since, cutoff_ms, settle_ms)
-                .await?;
-            let len = probe.get(&session.primary_timeframe).map_or(0, Vec::len);
-            let warm = lead_in_warm(&session.pair, session, compiled, &probe);
-            // Growth is only evidence when the read actually held bars: an
+                .await;
+            // Every reply joins the OBSERVED union before anything can act on
+            // it: the operation's own history is never discarded by a later
+            // read of this loop, whatever that read returns or fails with (R5).
+            observed = merge_lead_in(&observed, &last.bars);
+            let len = observed.get(&session.primary_timeframe).map_or(0, Vec::len);
+            let warm = lead_in_warm(&session.pair, session, compiled, &observed);
+            // Growth is only evidence when the union actually held bars: an
             // empty response proves nothing, so the search keeps deepening to
-            // its cap instead of ending on it (R3 sweep).
-            let grew = previous_len.is_none_or(|previous| len > previous);
+            // its cap instead of ending on it (R3 sweep). A failed read ends
+            // the search at once: it observed nothing to grow on.
+            let grew = len > previous_len;
             let exhausted = len > 0 && !grew;
-            if warm || exhausted || depth >= PROBE_MAX_DEPTH {
-                return Ok(LeadInWindow {
+            if last.failed.is_some() || warm || exhausted || depth >= PROBE_MAX_DEPTH {
+                return LeadInProbe {
                     since,
                     cutoff_ms,
                     depth,
-                    read_at_ms: read_at,
-                    bars: probe,
-                });
+                    observed,
+                    last,
+                };
             }
-            previous_len = Some(len);
+            previous_len = len;
             depth *= 2;
         }
     }
@@ -1310,66 +1319,72 @@ where
     }
 
     /// Keep the probe growing over the SAME pinned obligation (R3-A): a deeper
-    /// window is read and merged into the candidate. Only a deeper read that
-    /// returns the WHOLE candidate, every timeframe, and no more releases the
-    /// window — it is what exists — while an empty, shortened, changed or
-    /// growing one keeps the pin waiting, so absence is never taken for
-    /// completeness (R4-3). The pin's own deadline keeps the retry bounded, and
-    /// a failed deeper read leaves it exactly as it was.
+    /// window is read and every reply of that operation joins the candidate
+    /// (R5). Only ONE actual read operation whose whole raw response — every
+    /// timeframe, nothing failed — equals the WHOLE retained candidate releases
+    /// the window, and only when that candidate is the one the spaced
+    /// confirming read already witnessed before this operation: a bar, or a
+    /// revised copy of a known bar, that first appears in this operation's own
+    /// (possibly back-to-back) reads is not confirmed by their raw
+    /// completeness, so the expanded pin waits for a later spaced read (R5
+    /// pre-push). A union or a maximum-length view never proves the source
+    /// currently serves that window, so an empty, shortened, changed, growing
+    /// or failed read keeps the pin waiting (R4-3, R5). The pin's own deadline
+    /// keeps the retry bounded; a failed read keeps the history it observed.
     async fn deepen_lead_in(
         &mut self,
         session: &PaperSession,
         compiled: &CompiledStrategy,
         pending: PendingLeadIn,
     ) -> Result<Option<BTreeMap<Timeframe, Vec<Candle>>>, PaperRuntimeError> {
-        let candidate_len = pending
-            .bars
-            .get(&session.primary_timeframe)
-            .map_or(0, Vec::len);
-        let deeper = match self
+        // The caller deepens only a pin whose confirming read equalled it, so
+        // this is the already-confirmed candidate the release must prove —
+        // not a window these deeper reads grow or revise (R5).
+        let confirmed = pending.bars.clone();
+        let deeper = self
             .probe_lead_in_from(
                 session,
                 compiled,
                 pending.cutoff_ms,
                 (pending.depth * 2).min(PROBE_MAX_DEPTH),
-                Some(candidate_len),
+                pending.bars,
             )
-            .await
-        {
-            Ok(deeper) => deeper,
-            Err(error) => {
-                // A failed read is no evidence: the pin stays, retrying on a
-                // deadline stamped now.
-                self.pending_lead_in.insert(
-                    session.id.clone(),
-                    PendingLeadIn {
-                        read_at_ms: self.clock.now_ms(),
-                        ..pending
-                    },
-                );
-                return Err(error);
-            }
-        };
-        let grown = merge_lead_in(&pending.bars, &deeper.bars);
-        let deeper_has_primary = deeper
-            .bars
-            .get(&session.primary_timeframe)
-            .is_some_and(|bars| !bars.is_empty());
-        // Exhaustion is the RAW deeper response's evidence, never the merged
-        // view's: the merge keeps every candidate bar, so "no growth" alone is
-        // also true of a shortened or otherwise incomplete read that omitted
-        // candidate bars. Only a deeper response that returns the whole
-        // candidate — every timeframe — and nothing more releases the window
-        // (R4-3).
-        if deeper.bars == pending.bars && deeper_has_primary {
-            let released = pending.bars.clone();
+            .await;
+        let observed = deeper.observed;
+        if let Some(error) = deeper.last.failed {
+            // The read failed, so there is no completeness witness — but the
+            // history this operation already observed is not lost with it: the
+            // pin carries the union, retrying on a deadline stamped now (R5).
             self.pending_lead_in.insert(
                 session.id.clone(),
                 PendingLeadIn {
                     since: deeper.since,
                     cutoff_ms: pending.cutoff_ms,
                     depth: deeper.depth,
-                    read_at_ms: deeper.read_at_ms,
+                    read_at_ms: self.clock.now_ms(),
+                    bars: observed,
+                },
+            );
+            return Err(error);
+        }
+        let has_primary = observed
+            .get(&session.primary_timeframe)
+            .is_some_and(|bars| !bars.is_empty());
+        // Exhaustion is ONE actual read's evidence, never a union's, and only
+        // for the candidate the pin already confirmed: a complete raw reply
+        // equal to a union this operation GREW or REVISED cannot discharge the
+        // observations it just added — those need a later, spaced read — or the
+        // honest unchanged-seed exhaustion (and its bounded live warm-up) is
+        // kept (R5).
+        if deeper.last.bars == observed && observed == confirmed && has_primary {
+            let released = observed.clone();
+            self.pending_lead_in.insert(
+                session.id.clone(),
+                PendingLeadIn {
+                    since: deeper.since,
+                    cutoff_ms: pending.cutoff_ms,
+                    depth: deeper.depth,
+                    read_at_ms: deeper.last.read_at_ms,
                     bars: released.clone(),
                 },
             );
@@ -1381,50 +1396,66 @@ where
                 since: deeper.since,
                 cutoff_ms: pending.cutoff_ms,
                 depth: deeper.depth,
-                read_at_ms: deeper.read_at_ms,
-                bars: grown,
+                read_at_ms: deeper.last.read_at_ms,
+                bars: observed,
             },
         );
         Ok(None)
     }
 
-    /// One lead-in read over `since`: every configured timeframe, each reply
-    /// filtered with the instant ITS OWN awaited fetch returned (R2-1, R4-2) —
-    /// never one later stamp applied to an earlier copy — and the instant the
-    /// last read returned, the window's conservative confirmation deadline.
+    /// One lead-in read operation over `since`: every configured timeframe,
+    /// each reply filtered with the instant ITS OWN awaited fetch returned
+    /// (R2-1, R4-2) — never one later stamp applied to an earlier copy — the
+    /// instant the last reply returned, and the failure when a later fetch
+    /// failed. The replies that DID arrive are observations either way: an
+    /// error never discards what earlier timeframes already returned (R5).
     async fn read_lead_in_window(
         &self,
         session: &PaperSession,
         since: i64,
         cutoff_ms: i64,
         settle_ms: i64,
-    ) -> Result<(i64, BTreeMap<Timeframe, Vec<Candle>>), PaperRuntimeError> {
+    ) -> LeadInRead {
         let mut bars: BTreeMap<Timeframe, Vec<Candle>> = BTreeMap::new();
-        let mut last_read_at = self.clock.now_ms();
+        let mut read_at_ms = self.clock.now_ms();
+        let mut failed: Option<PaperRuntimeError> = None;
         for timeframe in session.timeframes() {
-            let raw = self
+            match self
                 .source
                 .closed_since(&session.pair, timeframe, since)
-                .await?;
-            let read_at = self.clock.now_ms();
-            bars.insert(
-                timeframe,
-                eligible_window(raw, cutoff_ms, read_at, settle_ms),
-            );
-            last_read_at = last_read_at.max(read_at);
+                .await
+            {
+                Ok(raw) => {
+                    let read_at = self.clock.now_ms();
+                    bars.insert(
+                        timeframe,
+                        eligible_window(raw, cutoff_ms, read_at, settle_ms),
+                    );
+                    read_at_ms = read_at_ms.max(read_at);
+                }
+                Err(error) => {
+                    failed = Some(PaperRuntimeError::Data(error));
+                    read_at_ms = self.clock.now_ms();
+                    break;
+                }
+            }
         }
-        Ok((last_read_at, bars))
+        LeadInRead {
+            bars,
+            read_at_ms,
+            failed,
+        }
     }
 
     /// One confirming read over a pinned lead-in window: the same per-timeframe
     /// read instants as the probe (R4-2). R3-A keeps the pin regardless of the
-    /// read's outcome; the caller re-inserts it on failure.
+    /// read's outcome; the caller retains the observations it did return.
     async fn confirm_read(
         &self,
         session: &PaperSession,
         pending: &PendingLeadIn,
         settle_ms: i64,
-    ) -> Result<(i64, BTreeMap<Timeframe, Vec<Candle>>), PaperRuntimeError> {
+    ) -> LeadInRead {
         self.read_lead_in_window(session, pending.since, pending.cutoff_ms, settle_ms)
             .await
     }
@@ -1434,10 +1465,10 @@ where
         &self,
         session: &PaperSession,
         compiled: &CompiledStrategy,
-    ) -> Result<LeadInWindow, PaperRuntimeError> {
+    ) -> LeadInProbe {
         let cutoff_ms =
             first_open_bar_ms(session.primary_timeframe.duration_ms(), self.clock.now_ms());
-        self.probe_lead_in_from(session, compiled, cutoff_ms, 2, None)
+        self.probe_lead_in_from(session, compiled, cutoff_ms, 2, BTreeMap::new())
             .await
     }
 
@@ -1486,55 +1517,67 @@ where
     /// shortened, changed or failed read keeps the pin (with its window and
     /// cutoff, whatever cadence boundaries passed), recovered eligible history
     /// joins the candidate, and the confirmation starts over — its deadline
-    /// always stamped when a read RETURNED, never before it. While the window is
-    /// still not warm and the source can supply more history, the probe keeps
-    /// doubling (the same stopping rules); an empty response is never evidence
-    /// that history is exhausted. `None` while no confirmed window is ready.
-    /// Without a gate the probe is the lead-in.
+    /// always stamped when a read RETURNED, never before it. Every reply a read
+    /// DID return joins the candidate even when a later fetch failed (R5):
+    /// observations are never discarded by the failure that followed them.
+    /// While the window is still not warm and the source can supply more
+    /// history, the probe keeps doubling (the same stopping rules); an empty
+    /// response is never evidence that history is exhausted. `None` while no
+    /// confirmed window is ready. Without a gate the probe is the lead-in.
     async fn settled_lead_in(
         &mut self,
         session: &PaperSession,
         compiled: &CompiledStrategy,
     ) -> Result<Option<BTreeMap<Timeframe, Vec<Candle>>>, PaperRuntimeError> {
         let Some(policy) = self.settle else {
-            return Ok(Some(self.probe_lead_in(session, compiled).await?.bars));
+            let probe = self.probe_lead_in(session, compiled).await;
+            return match probe.last.failed {
+                Some(error) => Err(error),
+                None => Ok(Some(probe.observed)),
+            };
         };
         let due = self.clock.now_ms();
         let Some(pending) = self.pending_lead_in.remove(&session.id) else {
-            let probe = self.probe_lead_in(session, compiled).await?;
+            let probe = self.probe_lead_in(session, compiled).await;
+            // The observations the probe DID make are pinned even when a later
+            // read failed: the retry resumes over them, never from nothing (R5).
             self.pending_lead_in.insert(
                 session.id.clone(),
                 PendingLeadIn {
                     since: probe.since,
                     cutoff_ms: probe.cutoff_ms,
                     depth: probe.depth,
-                    read_at_ms: probe.read_at_ms,
-                    bars: probe.bars,
+                    read_at_ms: probe.last.read_at_ms,
+                    bars: probe.observed,
                 },
             );
-            return Ok(None);
+            return match probe.last.failed {
+                Some(error) => Err(error),
+                None => Ok(None),
+            };
         };
         if due < pending.read_at_ms + policy.repoll_ms {
             self.pending_lead_in.insert(session.id.clone(), pending);
             return Ok(None);
         }
-        let (read_at, read) = match self.confirm_read(session, &pending, policy.settle_ms).await {
-            Ok(read) => read,
-            Err(error) => {
-                // A failed read is no evidence: the pin stays, and its own
-                // deadline (stamped now) keeps the retry bounded, never overdue.
-                self.pending_lead_in.insert(
-                    session.id.clone(),
-                    PendingLeadIn {
-                        read_at_ms: self.clock.now_ms(),
-                        ..pending
-                    },
-                );
-                return Err(error);
-            }
-        };
-        let merged = merge_lead_in(&pending.bars, &read);
-        if read == pending.bars {
+        let read = self.confirm_read(session, &pending, policy.settle_ms).await;
+        let read_at = read.read_at_ms;
+        if let Some(error) = read.failed {
+            // No completeness witness, but not amnesia either: the replies this
+            // read DID return join the pin, whose own deadline (stamped now)
+            // keeps the retry bounded, never overdue (R5).
+            self.pending_lead_in.insert(
+                session.id.clone(),
+                PendingLeadIn {
+                    read_at_ms: self.clock.now_ms(),
+                    bars: merge_lead_in(&pending.bars, &read.bars),
+                    ..pending
+                },
+            );
+            return Err(error);
+        }
+        let merged = merge_lead_in(&pending.bars, &read.bars);
+        if read.bars == pending.bars {
             let primary_non_empty = pending
                 .bars
                 .get(&session.primary_timeframe)
@@ -1939,15 +1982,28 @@ struct PendingLeadIn {
     bars: BTreeMap<Timeframe, Vec<Candle>>,
 }
 
-/// One probed lead-in window: where it was read from, the eligibility cutoff it
-/// was filtered by, the probe depth, the instant its read RETURNED, and the
-/// eligible bars it holds.
-struct LeadInWindow {
+/// One lead-in read operation's outcome (R5): the eligible bars its replies
+/// returned — every timeframe that DID answer, in order, so a later failure
+/// never discards what earlier keys returned — the instant its last reply
+/// returned, and the failure when one did.
+struct LeadInRead {
+    bars: BTreeMap<Timeframe, Vec<Candle>>,
+    read_at_ms: i64,
+    /// The failure of a later fetch: the operation is then no completeness
+    /// witness, whatever it returned.
+    failed: Option<PaperRuntimeError>,
+}
+
+/// A multi-depth probe's progress (R5): the OBSERVED view — the union of every
+/// eligible bar its replies have returned, across depths and timeframes, never
+/// shrunk — where it last read, and the LAST read operation, whose completeness
+/// is the only single-read witness a release may use.
+struct LeadInProbe {
     since: i64,
     cutoff_ms: i64,
     depth: i64,
-    read_at_ms: i64,
-    bars: BTreeMap<Timeframe, Vec<Candle>>,
+    observed: BTreeMap<Timeframe, Vec<Candle>>,
+    last: LeadInRead,
 }
 
 /// The lead-in eligible part of one read: bars that CLOSED before the pinned
