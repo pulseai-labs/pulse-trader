@@ -135,7 +135,15 @@ pub fn events_for_step(
         let side = side_of(trade.direction);
         if !open {
             events.push(order(side, trade.qty, at));
-            events.push(fill(side, trade.qty, trade.entry_price, None, None, at));
+            events.push(fill(
+                side,
+                trade.qty,
+                trade.entry_price,
+                None,
+                None,
+                trade.entry_fill_time,
+                at,
+            ));
         }
         events.push(order(side, trade.qty, at));
         events.push(fill(
@@ -144,6 +152,7 @@ pub fn events_for_step(
             trade.exit_price,
             Some(trade.exit_reason),
             Some(trade.realized_r),
+            trade.exit_fill_time,
             at,
         ));
         open = false;
@@ -159,6 +168,7 @@ pub fn events_for_step(
             position.entry_price,
             None,
             None,
+            position.entry_fill_time,
             at,
         ));
     }
@@ -197,13 +207,15 @@ fn order(side: PaperSide, qty: Decimal, at: &str) -> PaperEvent {
 }
 
 /// A fill event. `realized_r` rides only an exit fill (the closed trade's
-/// R-multiple, spec §2); an entry fill carries `None`.
+/// R-multiple, spec §2); an entry fill carries `None`. `fill_time_ms` is the
+/// engine's own fill instant; `at` stays the runtime's poll instant (#303).
 fn fill(
     side: PaperSide,
     qty: Decimal,
     price: Decimal,
     exit_reason: Option<crate::domain::backtest::ExitReason>,
     realized_r: Option<Decimal>,
+    fill_time_ms: i64,
     at: &str,
 ) -> PaperEvent {
     PaperEvent::Fill {
@@ -214,6 +226,7 @@ fn fill(
         price,
         exit_reason,
         realized_r,
+        fill_time_ms: Some(fill_time_ms),
     }
 }
 

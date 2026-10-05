@@ -41,7 +41,8 @@ pub struct PaperPosition {
     pub qty: Decimal,
     /// The entry fill price.
     pub entry_price: Decimal,
-    /// The entry fill instant (the `fill` event's `at`).
+    /// The entry fill instant: the `fill` event's `fill_time_ms` (the
+    /// engine's fill time) when it has one, else its `at`.
     pub entry_fill_time: String,
 }
 
@@ -58,7 +59,8 @@ pub struct PaperClosedTrade {
     pub entry_fill_time: Option<String>,
     /// The exit fill price.
     pub exit_price: Decimal,
-    /// The exit fill instant (the closing `fill` event's `at`).
+    /// The exit fill instant: the closing `fill` event's `fill_time_ms` (the
+    /// engine's fill time) when it has one, else its `at`.
     pub exit_fill_time: String,
     /// Why the position closed.
     pub exit_reason: ExitReason,
@@ -198,30 +200,41 @@ impl PaperSessionState {
                 exit_reason,
                 at,
                 realized_r,
+                fill_time_ms,
                 ..
-            } => match exit_reason {
-                Some(exit_reason) => {
-                    let entry = self.open_position.take();
-                    self.closed_trades.push(PaperClosedTrade {
-                        side: *side,
-                        qty: *qty,
-                        entry_price: entry.as_ref().map(|p| p.entry_price),
-                        entry_fill_time: entry.as_ref().map(|p| p.entry_fill_time.clone()),
-                        exit_price: *price,
-                        exit_fill_time: at.clone(),
-                        exit_reason: *exit_reason,
-                        realized_r: *realized_r,
-                    });
+            } => {
+                // The engine's fill time when the event carries it; a
+                // pre-#303 event has none and reads as its row instant.
+                let fill_time = fill_time_ms
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map_or_else(
+                        || at.clone(),
+                        |dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    );
+                match exit_reason {
+                    Some(exit_reason) => {
+                        let entry = self.open_position.take();
+                        self.closed_trades.push(PaperClosedTrade {
+                            side: *side,
+                            qty: *qty,
+                            entry_price: entry.as_ref().map(|p| p.entry_price),
+                            entry_fill_time: entry.as_ref().map(|p| p.entry_fill_time.clone()),
+                            exit_price: *price,
+                            exit_fill_time: fill_time,
+                            exit_reason: *exit_reason,
+                            realized_r: *realized_r,
+                        });
+                    }
+                    None => {
+                        self.open_position = Some(PaperPosition {
+                            side: *side,
+                            qty: *qty,
+                            entry_price: *price,
+                            entry_fill_time: fill_time,
+                        });
+                    }
                 }
-                None => {
-                    self.open_position = Some(PaperPosition {
-                        side: *side,
-                        qty: *qty,
-                        entry_price: *price,
-                        entry_fill_time: at.clone(),
-                    });
-                }
-            },
+            }
             PaperEvent::Funding { amount, .. } => {
                 self.funding_total += *amount;
             }

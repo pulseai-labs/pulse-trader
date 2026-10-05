@@ -133,6 +133,7 @@ fn log_with_rs(rs: &[Decimal]) -> Vec<PaperEvent> {
             price: Decimal::from(60_000),
             exit_reason: None,
             realized_r: None,
+            fill_time_ms: None,
         });
         seq += 1;
         log.push(PaperEvent::Fill {
@@ -143,6 +144,7 @@ fn log_with_rs(rs: &[Decimal]) -> Vec<PaperEvent> {
             price: Decimal::from(60_100),
             exit_reason: Some(pulse::ExitReason::TakeProfit),
             realized_r: Some(*r),
+            fill_time_ms: None,
         });
         seq += 1;
     }

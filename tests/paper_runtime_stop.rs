@@ -648,6 +648,7 @@ async fn a_held_session_is_never_attached_and_is_still_stopped() {
                     price: rust_decimal::Decimal::new(100, 0),
                     exit_reason: Some(pulse::ExitReason::StopLoss),
                     realized_r: None,
+                    fill_time_ms: None,
                 }],
             )
             .await

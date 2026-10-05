@@ -23,7 +23,7 @@ use pulse::{
     BarRef, Candle, CandleStore, Db, EngineFingerprint, FakeClock, Graduation, NonEmptyLabel,
     NonEmptyReason, Pair, PaperEvent, PaperSession, PaperSessionId, PaperSessionRepository,
     PaperSessionState, PaperSessionStatus, PaperSide, ReplayError, SqlitePaperSessionRepo,
-    Timeframe, VersionId,
+    Timeframe, VersionId, session_trades,
 };
 use rust_decimal::Decimal;
 use support::mcp::migrated_db;
@@ -95,6 +95,7 @@ fn scripted_log() -> Vec<PaperEvent> {
             price: Decimal::from(60_000),
             exit_reason: None,
             realized_r: None,
+            fill_time_ms: None,
         },
         PaperEvent::Funding {
             seq: 3,
@@ -113,6 +114,7 @@ fn scripted_log() -> Vec<PaperEvent> {
             // The scripted log has no engine trade behind this fill, so its
             // true realized R is unknown — the w3-era shape.
             realized_r: None,
+            fill_time_ms: None,
         },
         PaperEvent::DataEvent {
             seq: 6,
@@ -185,6 +187,99 @@ async fn prefix_replay_equals_state_at_that_point() {
             "prefix {k} is the state at {k}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #303: fill times replay from the engine's `fill_time_ms`
+// ---------------------------------------------------------------------------
+
+/// The poll instant of every event: later than the engine's fill.
+const POLL_AT: &str = "2026-01-01T00:16:00.000Z";
+/// The engine's entry fill (2026-01-01T00:00:00Z) and exit fill (+15 min).
+const ENTRY_MS: i64 = 1_767_225_600_000;
+const EXIT_MS: i64 = 1_767_226_500_000;
+
+fn fill_event(
+    seq: i64,
+    exit_reason: Option<pulse::ExitReason>,
+    fill_time_ms: Option<i64>,
+) -> PaperEvent {
+    PaperEvent::Fill {
+        seq,
+        at: POLL_AT.to_owned(),
+        side: PaperSide::Long,
+        qty: Decimal::from(1),
+        price: Decimal::from(60_000),
+        exit_reason,
+        realized_r: None,
+        fill_time_ms,
+    }
+}
+
+#[test]
+fn replay_takes_fill_times_from_the_engines_fill_time() {
+    let log = [
+        fill_event(1, None, Some(ENTRY_MS)),
+        fill_event(2, Some(pulse::ExitReason::StopLoss), Some(EXIT_MS)),
+    ];
+    let session = session();
+    let open = PaperSessionState::replay(&session, &log[..1]).unwrap();
+    assert_eq!(
+        open.open_position.unwrap().entry_fill_time,
+        "2026-01-01T00:00:00.000Z",
+        "the entry fill time is the engine's, not the poll instant"
+    );
+    let closed = PaperSessionState::replay(&session, &log).unwrap();
+    let trade = &closed.closed_trades[0];
+    assert_eq!(
+        trade.entry_fill_time.as_deref(),
+        Some("2026-01-01T00:00:00.000Z")
+    );
+    assert_eq!(trade.exit_fill_time, "2026-01-01T00:15:00.000Z");
+}
+
+#[test]
+fn a_legacy_fill_replays_with_the_row_instant_as_before() {
+    let log = [
+        fill_event(1, None, None),
+        fill_event(2, Some(pulse::ExitReason::StopLoss), None),
+    ];
+    let closed = PaperSessionState::replay(&session(), &log).unwrap();
+    let trade = &closed.closed_trades[0];
+    assert_eq!(trade.entry_fill_time.as_deref(), Some(POLL_AT));
+    assert_eq!(trade.exit_fill_time, POLL_AT);
+    let open = PaperSessionState::replay(&session(), &log[..1]).unwrap();
+    assert_eq!(open.open_position.unwrap().entry_fill_time, POLL_AT);
+}
+
+/// The session read model (`SessionTrades`, what the UI and MCP show) takes
+/// the engine's fill times from the persisted log.
+#[tokio::test]
+async fn the_session_read_model_shows_the_engines_fill_times() {
+    let world = world_with_session().await;
+    let session_id = PaperSessionId::new("sess-1".to_owned());
+    world
+        .paper
+        .append_bar(
+            &session_id,
+            &[(Timeframe::M15, candle(ENTRY_MS), true)],
+            &[
+                fill_event(0, None, Some(ENTRY_MS)),
+                fill_event(0, Some(pulse::ExitReason::StopLoss), Some(EXIT_MS)),
+            ],
+        )
+        .await
+        .expect("the batch persists");
+    let trades = session_trades(&world.paper, &session_id)
+        .await
+        .expect("the read model")
+        .expect("the session exists");
+    let trade = &trades.closed_trades[0];
+    assert_eq!(
+        trade.entry_fill_time.as_deref(),
+        Some("2026-01-01T00:00:00.000Z")
+    );
+    assert_eq!(trade.exit_fill_time, "2026-01-01T00:15:00.000Z");
 }
 
 // ---------------------------------------------------------------------------
