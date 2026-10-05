@@ -97,6 +97,31 @@ pub trait MarketDataSource {
         end_ms: i64,
     ) -> impl Future<Output = Result<CandleSeries, DataError>> + Send;
 
+    /// [`fetch_historical`](Self::fetch_historical) for a caller that will cover
+    /// the **most recent** month of the range from [`fetch_incremental`](Self::fetch_incremental)
+    /// (#289): `publication_lag_month` names the one month the bulk archive may
+    /// not have published yet, and a source that supports it may leave that month
+    /// to the top-up when it is the range's final month.
+    ///
+    /// The default is fail-closed: it ignores the hint and behaves exactly as
+    /// [`fetch_historical`](Self::fetch_historical), so a source opts in by
+    /// overriding this method, never by default.
+    ///
+    /// # Errors
+    ///
+    /// As [`fetch_historical`](Self::fetch_historical).
+    fn fetch_historical_lagging(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        start_ms: i64,
+        end_ms: i64,
+        publication_lag_month: (i32, u32),
+    ) -> impl Future<Output = Result<CandleSeries, DataError>> + Send {
+        let _ = publication_lag_month;
+        self.fetch_historical(pair, tf, start_ms, end_ms)
+    }
+
     /// Fetch candles newer than `since_ms` for `(pair, tf)`.
     ///
     /// # Errors

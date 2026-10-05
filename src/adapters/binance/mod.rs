@@ -93,6 +93,10 @@ pub trait MonthSource {
 ///   transport already retried before the source returned `Absent`-vs-error,
 ///   so reaching here on an expected month is terminal).
 ///
+/// This function is fail-closed for every caller: it never skips a missing month
+/// after a loaded one. A caller that has a REST top-up to cover the most recent
+/// month opts in through [`ingest_window_with_lag`].
+///
 /// After accumulation: [`normalize`] sorts+dedups and reports gaps via `Ok`;
 /// [`stamp_funding`] applies the sparse half-open funding alignment.
 ///
@@ -107,11 +111,36 @@ pub async fn ingest_window<S: MonthSource + Sync>(
     version: &DataVersion,
     months: &[(i32, u32)],
 ) -> Result<(CandleSeries, Vec<Gap>), DataError> {
+    ingest_window_with_lag(source, pair, tf, version, months, None).await
+}
+
+/// [`ingest_window`] with one explicit opt-in: `publication_lag_month` names the
+/// single month the caller knows Binance may not have published yet and will
+/// cover from another source (the REST top-up, #289).
+///
+/// An `Absent` month after a loaded one is skipped **only** when it is the
+/// **final** month of `months` **and** equals `publication_lag_month`. Every other
+/// shape keeps the audit-C2 error, byte-identical to [`ingest_window`]: an
+/// `Absent` month followed by a `Loaded` one, two or more trailing `Absent`
+/// months (the error names the first), and a final `Absent` month that is not the
+/// named one. `None` is exactly [`ingest_window`].
+///
+/// # Errors
+///
+/// As [`ingest_window`].
+pub async fn ingest_window_with_lag<S: MonthSource + Sync>(
+    source: &S,
+    pair: &Pair,
+    tf: Timeframe,
+    version: &DataVersion,
+    months: &[(i32, u32)],
+    publication_lag_month: Option<(i32, u32)>,
+) -> Result<(CandleSeries, Vec<Gap>), DataError> {
     let mut all_candles: Vec<Candle> = Vec::new();
     let mut all_funding: Vec<FundingEvent> = Vec::new();
     let mut any_loaded = false;
 
-    for &(year, month) in months {
+    for (idx, &(year, month)) in months.iter().enumerate() {
         match source.load_month(pair, tf, year, month).await? {
             MonthOutcome::Loaded(data) => {
                 any_loaded = true;
@@ -119,7 +148,11 @@ pub async fn ingest_window<S: MonthSource + Sync>(
                 all_funding.extend(data.funding);
             }
             MonthOutcome::Absent => {
-                if any_loaded {
+                // The caller's one named month, when it ends the window, is left
+                // to its REST top-up (#289) instead of being called a hole.
+                let is_lag_month =
+                    idx + 1 == months.len() && publication_lag_month == Some((year, month));
+                if any_loaded && !is_lag_month {
                     // A month inside the listed range is missing: out-of-range
                     // disambiguation says this is a real coverage hole, not a
                     // pre-listing skip (audit C2).
@@ -367,7 +400,7 @@ impl MonthSource for BulkMonthSource {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        FundingEvent, MonthData, MonthOutcome, MonthSource, ingest_window,
+        FundingEvent, MonthData, MonthOutcome, MonthSource, ingest_window, ingest_window_with_lag,
         resolve_present_month_funding,
     };
     use crate::domain::DataVersion;
@@ -496,28 +529,129 @@ mod tests {
 
     // ---- AC-7: transient absence on an expected month surfaces Io ---------
 
+    fn loaded(open_time: i64) -> MonthOutcome {
+        MonthOutcome::Loaded(MonthData {
+            candles: vec![candle(open_time)],
+            funding: vec![],
+        })
+    }
+
+    fn c2_error(month: &str) -> DataError {
+        DataError::Io(format!(
+            "expected month {month} absent after the pair was listed"
+        ))
+    }
+
     #[tokio::test]
-    async fn absent_month_after_a_loaded_month_is_io_error() {
+    async fn interior_absent_month_between_loaded_months_is_io_error() {
         let mut script = HashMap::new();
-        script.insert(
-            (2024, 1),
-            Ok(MonthOutcome::Loaded(MonthData {
-                candles: vec![candle(0)],
-                funding: vec![],
-            })),
-        );
+        script.insert((2024, 1), Ok(loaded(0)));
         script.insert((2024, 2), Ok(MonthOutcome::Absent));
+        script.insert((2024, 3), Ok(loaded(14_400_000)));
         let source = ScriptedSource { script };
+        let months = [(2024, 1), (2024, 2), (2024, 3)];
         let err = ingest_window(
             &source,
             &Pair::new("BTCUSDT"),
             Timeframe::H4,
             &version(),
-            &[(2024, 1), (2024, 2)],
+            &months,
         )
         .await
         .expect_err("expected month absent after listing → Io");
-        assert!(matches!(err, DataError::Io(_)));
+        assert_eq!(err, c2_error("2024-02"));
+        // Naming the lag month does not exempt an interior hole.
+        let err = ingest_window_with_lag(
+            &source,
+            &Pair::new("BTCUSDT"),
+            Timeframe::H4,
+            &version(),
+            &months,
+            Some((2024, 2)),
+        )
+        .await
+        .expect_err("an interior hole is never the lag month");
+        assert_eq!(err, c2_error("2024-02"));
+    }
+
+    // ---- #289: the final month may be unpublished — only when the caller says so
+
+    fn trailing_absent_script() -> ScriptedSource {
+        let mut script = HashMap::new();
+        script.insert((2024, 1), Ok(loaded(0)));
+        script.insert((2024, 2), Ok(loaded(14_400_000)));
+        script.insert((2024, 3), Ok(MonthOutcome::Absent));
+        ScriptedSource { script }
+    }
+
+    const THREE_MONTHS: [(i32, u32); 3] = [(2024, 1), (2024, 2), (2024, 3)];
+
+    #[tokio::test]
+    async fn final_absent_month_without_opt_in_is_io_error() {
+        // ingest_window is fail-closed for every caller that does not opt in.
+        let err = ingest_window(
+            &trailing_absent_script(),
+            &Pair::new("BTCUSDT"),
+            Timeframe::H4,
+            &version(),
+            &THREE_MONTHS,
+        )
+        .await
+        .expect_err("no opt-in → the final absent month is a coverage hole");
+        assert_eq!(err, c2_error("2024-03"));
+    }
+
+    #[tokio::test]
+    async fn final_absent_month_named_as_the_lag_month_is_not_an_error() {
+        let (series, gaps) = ingest_window_with_lag(
+            &trailing_absent_script(),
+            &Pair::new("BTCUSDT"),
+            Timeframe::H4,
+            &version(),
+            &THREE_MONTHS,
+            Some((2024, 3)),
+        )
+        .await
+        .expect("an unpublished final month is left to the REST top-up");
+        assert_eq!(series.candles.len(), 2);
+        assert!(gaps.is_empty(), "the absent final month is NOT a gap");
+    }
+
+    #[tokio::test]
+    async fn final_absent_month_that_is_not_the_named_lag_month_is_io_error() {
+        for lag in [Some((2024, 4)), Some((2024, 2)), None] {
+            let err = ingest_window_with_lag(
+                &trailing_absent_script(),
+                &Pair::new("BTCUSDT"),
+                Timeframe::H4,
+                &version(),
+                &THREE_MONTHS,
+                lag,
+            )
+            .await
+            .expect_err("only the named month may be skipped");
+            assert_eq!(err, c2_error("2024-03"), "lag = {lag:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_trailing_absent_months_are_an_io_error_naming_the_first() {
+        let mut script = HashMap::new();
+        script.insert((2024, 1), Ok(loaded(0)));
+        script.insert((2024, 2), Ok(MonthOutcome::Absent));
+        script.insert((2024, 3), Ok(MonthOutcome::Absent));
+        let source = ScriptedSource { script };
+        let err = ingest_window_with_lag(
+            &source,
+            &Pair::new("BTCUSDT"),
+            Timeframe::H4,
+            &version(),
+            &THREE_MONTHS,
+            Some((2024, 3)),
+        )
+        .await
+        .expect_err("only the final month may be absent");
+        assert_eq!(err, c2_error("2024-02"));
     }
 
     #[tokio::test]

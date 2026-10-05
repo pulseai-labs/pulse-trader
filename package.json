@@ -1,7 +1,7 @@
 {
   "name": "pulsetrader-ui",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "PulseTrader desktop frontend (ADR-0020). r1.s1.w5 ports the design system (React + the tokens/shared.css chrome) into the shell r1.s1.w1 stood up.",
   "engines": {

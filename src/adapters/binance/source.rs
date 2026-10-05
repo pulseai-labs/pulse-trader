@@ -11,7 +11,9 @@
 //! never names the concrete type (AC-6 swap test).
 //!
 //! - [`MarketDataSource::fetch_historical`] → bulk over the month window via
-//!   [`ingest_window`].
+//!   [`ingest_window_with_lag`], fail-closed; [`MarketDataSource::fetch_historical_lagging`]
+//!   is the same with the caller's one named publication-lag month left to the
+//!   REST top-up (#289).
 //! - [`MarketDataSource::fetch_incremental`] → REST top-up via [`top_up_with`],
 //!   returning only the **new closed** candles (the merge onto the prior snapshot
 //!   is the orchestration's job, via [`crate::adapters::store::CandleStore`]).
@@ -25,7 +27,7 @@ use crate::domain::MarketDataSource;
 use crate::domain::{Candle, CandleSeries, Clock, DataError, DataVersion, Pair, Timeframe};
 
 use super::incremental::{RestPageSource, fetch_incremental_with};
-use super::{BulkMonthSource, MonthSource, PageSource, ingest_window};
+use super::{BulkMonthSource, MonthSource, PageSource, ingest_window_with_lag};
 
 /// A [`MarketDataSource`] backed by Binance USD-M Futures: bulk monthly archives
 /// (`M`) for history + REST pages (`P`) for the incremental top-up, with a
@@ -43,6 +45,43 @@ impl<M, P, C> BinanceDataSource<M, P, C> {
     #[must_use]
     pub fn new(bulk: M, pages: P, clock: C) -> Self {
         Self { bulk, pages, clock }
+    }
+}
+
+impl<M, P, C> BinanceDataSource<M, P, C>
+where
+    M: MonthSource + Sync,
+    P: PageSource + Sync,
+    C: Clock + Sync,
+{
+    /// The bulk window for `[start_ms, end_ms)`: a list of `(year, month)` months
+    /// ingested through [`ingest_window_with_lag`]. A placeholder version is
+    /// carried; the persist layer re-derives the content-hash `data_version`
+    /// (audit C1, WI-04). `publication_lag_month` is the caller's opt-in (#289);
+    /// `None` is the fail-closed audit-C2 behaviour.
+    fn bulk_window(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        start_ms: i64,
+        end_ms: i64,
+        publication_lag_month: Option<(i32, u32)>,
+    ) -> impl Future<Output = Result<CandleSeries, DataError>> + Send {
+        let months = months_in_range(start_ms, end_ms);
+        let version = DataVersion::new("pending");
+        let pair = pair.clone();
+        async move {
+            let (series, _gaps) = ingest_window_with_lag(
+                &self.bulk,
+                &pair,
+                tf,
+                &version,
+                &months,
+                publication_lag_month,
+            )
+            .await?;
+            Ok(series)
+        }
     }
 }
 
@@ -77,16 +116,18 @@ where
         start_ms: i64,
         end_ms: i64,
     ) -> impl Future<Output = Result<CandleSeries, DataError>> + Send {
-        // The bulk window is a list of (year, month) covering [start_ms, end_ms).
-        // A placeholder version is carried; the persist layer re-derives the
-        // content-hash `data_version` (audit C1, WI-04).
-        let months = months_in_range(start_ms, end_ms);
-        let version = DataVersion::new("pending");
-        let pair = pair.clone();
-        async move {
-            let (series, _gaps) = ingest_window(&self.bulk, &pair, tf, &version, &months).await?;
-            Ok(series)
-        }
+        self.bulk_window(pair, tf, start_ms, end_ms, None)
+    }
+
+    fn fetch_historical_lagging(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        start_ms: i64,
+        end_ms: i64,
+        publication_lag_month: (i32, u32),
+    ) -> impl Future<Output = Result<CandleSeries, DataError>> + Send {
+        self.bulk_window(pair, tf, start_ms, end_ms, Some(publication_lag_month))
     }
 
     fn fetch_incremental(
@@ -110,7 +151,7 @@ where
 
 /// Decompose a half-open `[start_ms, end_ms)` epoch-ms range into the ordered
 /// list of `(year, month)` calendar months it spans (UTC). The window is the
-/// unit [`ingest_window`] consults the [`MonthSource`] over.
+/// unit [`ingest_window_with_lag`] consults the [`MonthSource`] over.
 ///
 /// Months are produced inclusive of the month containing `start_ms` up to and
 /// including the month containing `end_ms - 1`. An empty or inverted range
