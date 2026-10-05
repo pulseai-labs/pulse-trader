@@ -67,13 +67,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`pulse fetch-data` no longer fails in the first days of a month (0.1.2).** The
   bulk phase asks for every complete month, which includes the month that just
   ended, and Binance publishes that month's archive a few days late. The loader read
-  that absent final month as a coverage hole and returned an error, so the REST
-  top-up that would cover it never ran, and no snapshot could be made for any pair
-  or timeframe. Now the final month of the bulk window may be absent and the REST
-  top-up covers it. Only the final month gets this: two or more trailing absent
-  months, or an absent month followed by a loaded one, are still reported as a
-  coverage hole, byte-identical to before. Closes
-  [#289](https://github.com/pulseai-labs/pulse-trader/issues/289).
+  that absent month as a coverage hole and returned an error, so the REST top-up
+  that would cover it never ran, and no snapshot could be made for any pair or
+  timeframe. Now `fetch-data`'s first run names the month before the current one as
+  the single month the bulk loader may leave to the REST top-up, and the top-up
+  covers it. The loader stays fail-closed for everything else: any other caller, any
+  other absent month, two or more trailing absent months, and an absent month
+  followed by a loaded one still return the same coverage-hole error. Closes
+  [#289](https://github.com/pulseai-labs/pulse-trader/issues/289). Known limits:
+  [#312](https://github.com/pulseai-labs/pulse-trader/issues/312) (a funding
+  archive or checksum that is also unpublished still fails),
+  [#313](https://github.com/pulseai-labs/pulse-trader/issues/313) (a month taken
+  from REST is never checksum-verified against its bulk archive).
 
 - **Paper `fill` events now carry the engine's fill time (0.1.1).** The log stamped
   each `fill` with the runtime's poll instant, so a replayed position, closed trade

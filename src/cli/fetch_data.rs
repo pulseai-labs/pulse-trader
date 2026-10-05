@@ -114,6 +114,20 @@ pub fn years_window_start_ms(now_ms: i64, n_years: u32) -> i64 {
         .map_or(now_ms, |dt| dt.timestamp_millis())
 }
 
+/// The `(year, month)` calendar month (UTC) immediately before the one `now_ms`
+/// falls in — the month Binance may not have published a bulk archive for yet.
+fn previous_month(now_ms: i64) -> (i32, u32) {
+    let now = Utc
+        .timestamp_millis_opt(now_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
+    if now.month() == 1 {
+        (now.year() - 1, 12)
+    } else {
+        (now.year(), now.month() - 1)
+    }
+}
+
 /// Ensure the snapshot for one `(pair, tf)`, returning a summary (or a failure
 /// entry on error — never panics; the caller aggregates exit status, AC-8).
 ///
@@ -185,8 +199,14 @@ where
     // original bug) made the bulk range include the current month → WI-02's
     // "expected month absent after listing" error on the live `--years 2` run.
     let bulk_end_ms = years_window_start_ms(now_ms, 0);
+    // The month that just ended can still be unpublished (#289): name it as the one
+    // month the bulk loader may leave to the REST top-up below, which covers it.
+    // Only that exact month is exempt — any other absent month is a coverage hole
+    // (audit C2), so a bulk range that wrongly reached the current month still
+    // fails (audit C5).
+    let lag_month = previous_month(now_ms);
     let mut series = source
-        .fetch_historical(pair, tf, start_ms, bulk_end_ms)
+        .fetch_historical_lagging(pair, tf, start_ms, bulk_end_ms, lag_month)
         .await?;
     // Immediate top-up to "now" (closed candles only) so the first snapshot is
     // current (grill). Empty bulk ⇒ anchor the top-up at the requested window
