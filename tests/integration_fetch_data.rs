@@ -532,6 +532,167 @@ async fn ac7_orphaned_snapshot_does_not_move_head_next_run_reads_prior() {
     );
 }
 
+// ---- #289: an unpublished month that just ended must not block fetch-data ----
+
+/// 2023-12-02 00:00:00 UTC — the second day of a month. With `years: 1` the bulk
+/// window is 2022-12 ..= 2023-11 and 2023-11 is the month that just ended.
+const EARLY_MONTH_NOW_MS: i64 = 1_701_475_200_000;
+
+/// A bulk source mimicking the publication lag: every month loads except the
+/// listed `absent` months, which are a `404`.
+struct LaggingBulk {
+    absent: Vec<(i32, u32)>,
+}
+
+impl MonthSource for LaggingBulk {
+    fn load_month(
+        &self,
+        _pair: &Pair,
+        _tf: Timeframe,
+        year: i32,
+        month: u32,
+    ) -> impl Future<Output = Result<MonthOutcome, DataError>> {
+        std::future::ready(if self.absent.contains(&(year, month)) {
+            Ok(MonthOutcome::Absent)
+        } else {
+            Ok(MonthOutcome::Loaded(MonthData {
+                candles: vec![
+                    bulk_candle(BULK_OPEN_0),
+                    bulk_candle(BULK_OPEN_1),
+                    bulk_candle(BULK_OPEN_2),
+                ],
+                funding: vec![],
+            }))
+        })
+    }
+}
+
+fn top_up_after_bulk() -> FixtureRest {
+    let mut m: HashMap<String, Vec<u8>> = HashMap::new();
+    m.insert(
+        format!("klines:{}", BULK_OPEN_2 + 1),
+        klines_json(&[
+            (NEW_CLOSED_1, NEW_CLOSED_1 + M15 - 1),
+            (NEW_CLOSED_2, NEW_CLOSED_2 + M15 - 1),
+        ]),
+    );
+    m.insert(format!("klines:{}", NEW_CLOSED_2 + 1), b"[]".to_vec());
+    m.insert(format!("funding:{}", BULK_OPEN_2 + 1), b"[]".to_vec());
+    FixtureRest { by_marker: m }
+}
+
+fn assert_failed_with(outcome: &TfOutcome, expected: &str) {
+    match outcome {
+        TfOutcome::Failed { error, .. } => {
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+        TfOutcome::Ok(_) => panic!("expected the run to fail with: {expected}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_289_unpublished_month_that_just_ended_is_covered_by_rest_top_up() {
+    // The month that just ended (2023-11) has no archive yet; every earlier
+    // month loads. The loader must not call that a coverage hole: the REST
+    // top-up covers the span and fetch-data still produces a snapshot.
+    let (store, _tmp) = store();
+    let source = BinanceDataSource::new(
+        LaggingBulk {
+            absent: vec![(2023, 11)],
+        },
+        top_up_after_bulk(),
+        FakeClock::at(EARLY_MONTH_NOW_MS),
+    );
+
+    run_fetch_data(
+        &source,
+        &store,
+        &FakeClock::at(EARLY_MONTH_NOW_MS),
+        &args(false),
+    )
+    .await
+    .expect("an unpublished final bulk month must not fail fetch-data (#289)");
+
+    let head = store
+        .read_head(&btc(), Timeframe::M15)
+        .expect("read HEAD")
+        .expect("HEAD set");
+    let series = store
+        .read_snapshot(&btc(), Timeframe::M15, &head)
+        .expect("read snapshot");
+    let opens: Vec<i64> = series.candles.iter().map(|c| c.open_time).collect();
+    assert_eq!(
+        opens,
+        vec![
+            BULK_OPEN_0,
+            BULK_OPEN_1,
+            BULK_OPEN_2,
+            NEW_CLOSED_1,
+            NEW_CLOSED_2
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_289_interior_hole_still_fails_fetch_data() {
+    // 2023-05 is absent but 2023-06.. load: a real coverage hole (audit C2).
+    let (store, _tmp) = store();
+    let source = BinanceDataSource::new(
+        LaggingBulk {
+            absent: vec![(2023, 5)],
+        },
+        top_up_after_bulk(),
+        FakeClock::at(EARLY_MONTH_NOW_MS),
+    );
+
+    let outcome = ensure_one_tf(
+        &source,
+        &store,
+        &FakeClock::at(EARLY_MONTH_NOW_MS),
+        &btc(),
+        Timeframe::M15,
+        1,
+    )
+    .await;
+    assert_failed_with(
+        &outcome,
+        "expected month 2023-05 absent after the pair was listed",
+    );
+    assert!(
+        store
+            .read_head(&btc(), Timeframe::M15)
+            .expect("read HEAD")
+            .is_none(),
+        "a failed run sets no HEAD"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_289_two_unpublished_trailing_months_still_fail_fetch_data() {
+    let (store, _tmp) = store();
+    let source = BinanceDataSource::new(
+        LaggingBulk {
+            absent: vec![(2023, 10), (2023, 11)],
+        },
+        top_up_after_bulk(),
+        FakeClock::at(EARLY_MONTH_NOW_MS),
+    );
+
+    let outcome = ensure_one_tf(
+        &source,
+        &store,
+        &FakeClock::at(EARLY_MONTH_NOW_MS),
+        &btc(),
+        Timeframe::M15,
+        1,
+    )
+    .await;
+    assert_failed_with(
+        &outcome,
+        "expected month 2023-10 absent after the pair was listed",
+    );
+}
+
 // ---- Regression: current incomplete month excluded from bulk (audit C5) -----
 
 /// A bulk [`MonthSource`] that mimics `data.binance.vision`: the **current

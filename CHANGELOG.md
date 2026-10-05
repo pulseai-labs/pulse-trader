@@ -64,6 +64,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`pulse fetch-data` no longer fails in the first days of a month (0.1.2).** The
+  bulk phase asks for every complete month, which includes the month that just
+  ended, and Binance publishes that month's archive a few days late. The loader read
+  that absent final month as a coverage hole and returned an error, so the REST
+  top-up that would cover it never ran, and no snapshot could be made for any pair
+  or timeframe. Now the final month of the bulk window may be absent and the REST
+  top-up covers it. Only the final month gets this: two or more trailing absent
+  months, or an absent month followed by a loaded one, are still reported as a
+  coverage hole, byte-identical to before. Closes
+  [#289](https://github.com/pulseai-labs/pulse-trader/issues/289).
+
 - **Paper `fill` events now carry the engine's fill time (0.1.1).** The log stamped
   each `fill` with the runtime's poll instant, so a replayed position, closed trade
   and session detail showed a fill time about one bar late (and the restart time
