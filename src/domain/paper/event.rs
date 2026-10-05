@@ -100,6 +100,13 @@ pub enum PaperEvent {
         /// comparison then does not count.
         #[serde(default)]
         realized_r: Option<Decimal>,
+        /// The engine's own fill instant (epoch ms): the `Trade`'s entry or
+        /// exit fill time, or the open position's entry fill time. `at` stays
+        /// the row's poll instant; replay reads fill times from this field
+        /// when present. `None` on every event written before the field
+        /// existed (`#[serde(default)]`), which replays with `at` as before.
+        #[serde(default)]
+        fill_time_ms: Option<i64>,
     },
     /// A funding payment accrued on the open position.
     Funding {
@@ -216,6 +223,7 @@ impl PaperEvent {
                 price,
                 exit_reason,
                 realized_r,
+                fill_time_ms,
                 ..
             } => Self::Fill {
                 seq,
@@ -225,6 +233,7 @@ impl PaperEvent {
                 price,
                 exit_reason,
                 realized_r,
+                fill_time_ms,
             },
             Self::Funding {
                 at, rate, amount, ..

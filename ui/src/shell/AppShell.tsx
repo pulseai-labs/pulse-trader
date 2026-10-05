@@ -286,7 +286,7 @@ export function Sidebar({ active }: SidebarProps) {
         </div>
         <div className="brand-text">
           <div className="brand-name">PulseTrader</div>
-          <div className="brand-ver">v0.1.0 · local</div>
+          <div className="brand-ver">v0.1.1 · local</div>
         </div>
       </div>
 

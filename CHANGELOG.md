@@ -64,6 +64,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Paper `fill` events now carry the engine's fill time (0.1.1).** The log stamped
+  each `fill` with the runtime's poll instant, so a replayed position, closed trade
+  and session detail showed a fill time about one bar late (and the restart time
+  after an outage). A `fill` event now carries an optional `fill_time_ms`, written
+  from the engine's entry or exit fill time, and replay reads the fill times from
+  it. `at` stays the row's instant, and an event written before the field existed
+  still reads and replays as before. Closes
+  [#303](https://github.com/pulseai-labs/pulse-trader/issues/303).
+
 - **A live paper session no longer stalls when Binance finalizes a bar after the
   poll.** The runtime polled 5 s past a bar's close and recorded the first kline it
   read, but Binance can still update a kline after that. The next re-fetch then

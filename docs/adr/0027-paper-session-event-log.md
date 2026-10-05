@@ -4,11 +4,11 @@ Date: 2026-10-02
 
 ## Status
 
-Proposed
+Accepted
 
 Refines [ADR-0025](0025-walk-forward-run-kind-and-certification-seam.md)'s
 certification seam into the paper-trading gate, and rides [ADR-0026](0026-client-server-split.md)'s
-always-on server (the session's runtime home). The spine close flips this to
+always-on server (the session's runtime home). The #303 patch flipped this to
 Accepted.
 
 ## Context
@@ -38,6 +38,13 @@ A live paper session is ONE immutable `paper_session` row plus an append-only
 written once, at promotion; the log appends and never rewrites (`0018`'s
 triggers enforce both in the schema, and a `stop` event makes the log
 read-only).
+
+A `fill` event carries two instants: `at`, the row's instant (the runtime's poll
+instant), and `fill_time_ms`, the engine's own fill time (epoch ms). Replay reads a
+position's and a closed trade's fill times from `fill_time_ms` when present and
+falls back to `at` for an event written before the field existed
+(`#[serde(default)]`; #303). The field is additive: the row stays immutable, the
+log stays append-only, and no event kind changes.
 
 **The two graduation variants** are the row's `graduation` sum, and each names
 exactly its own columns:

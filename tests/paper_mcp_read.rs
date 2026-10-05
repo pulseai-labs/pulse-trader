@@ -118,6 +118,7 @@ async fn seed_session(db: &Db, store_dir: &Path) -> PaperSessionId {
             price: Decimal::from(60_000),
             exit_reason: None,
             realized_r: None,
+            fill_time_ms: None,
         });
         seq += 1;
         events.push(PaperEvent::Fill {
@@ -128,6 +129,7 @@ async fn seed_session(db: &Db, store_dir: &Path) -> PaperSessionId {
             price: Decimal::from(60_100),
             exit_reason: Some(pulse::ExitReason::TakeProfit),
             realized_r: Some(r),
+            fill_time_ms: None,
         });
     }
     seq += 1;
