@@ -64,6 +64,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`pulse-serve.service` now gives up after repeated failed starts (0.1.3).** The
+  unit set no start limit, so systemd's default (5 starts in 10 s) applied. `pulse
+  serve` retries its bind for 120 s before it exits non-zero, and the unit waits
+  10 s between starts, so the limit never tripped and a server that always failed
+  restarted forever while looking up. Now the unit's `[Unit]` section sets
+  `StartLimitIntervalSec=900` and `StartLimitBurst=3`: three failed starts in 15
+  minutes (3 x 130 s = 390 s for a slow failure) leave the unit in the `failed`
+  state, visible to `systemctl --user --failed`. `Restart=on-failure` and
+  `RestartSec=10` are unchanged. Install needs only the unit copy and `systemctl
+  --user daemon-reload`; the `justfile` comment above `deploy` has the recovery
+  steps (`reset-failed`, then start). Closes
+  [#342](https://github.com/pulseai-labs/pulse-trader/issues/342). Known limit: no
+  push alert yet (moved to r4); `just deploy` restarts the service.
+
 - **`pulse fetch-data` no longer fails in the first days of a month (0.1.2).** The
   bulk phase asks for every complete month, which includes the month that just
   ended, and Binance publishes that month's archive a few days late. The loader read

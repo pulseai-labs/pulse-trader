@@ -123,6 +123,17 @@ check-serve-bind:
 # ~/.config/systemd/user/, then reload / enable / restart. THE CUTOVER STEP
 # (D7): an operator action at the release walk — never run by an item. Refuses
 # without a tag argument and refuses a tag that does not exist.
+#
+# The server unit gives up after 3 failed starts in 900 s (#342) and stays in the
+# systemd `failed` state. To see it: `systemctl --user --failed`, then
+# `systemctl --user status pulse-serve.service`. To recover: fix the cause, run
+# `systemctl --user reset-failed pulse-serve.service`, then
+# `systemctl --user start pulse-serve.service`.
+#
+# Installing only the 0.1.3 unit change on a live host (no restart): copy the
+# merged deploy/pulse-serve.service to ~/.config/systemd/user/ and run
+# `systemctl --user daemon-reload`. This `deploy` recipe does MORE: it restarts
+# pulse-serve.service, so do not use it for that change on a live host.
 deploy tag:
     #!/usr/bin/env bash
     set -euo pipefail

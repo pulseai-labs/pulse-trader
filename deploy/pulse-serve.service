@@ -10,6 +10,17 @@
 Description=PulseTrader always-on server (pulse serve)
 Wants=network-online.target
 After=network-online.target
+# #342 bounded restarts: give up after 3 failed starts in 900 s and stay in the
+# `failed` state, so `systemctl --user --failed` shows it. systemd's default
+# (5 starts in 10 s) never trips here: RestartSec=10 spaces starts too far
+# apart, and a slow failure (the full 120 s bind retry + RestartSec = 130 s per
+# cycle) is slower still. 3 x 130 s = 390 s < 900 s, so the limit trips for the
+# slow shape; a fast exit (about RestartSec per cycle) trips it sooner. A
+# tailnet outage longer than about 6.5 minutes at boot now ends `failed`:
+# recover with `systemctl --user reset-failed pulse-serve.service`, then start.
+# These keys belong in [Unit], not [Service].
+StartLimitIntervalSec=900
+StartLimitBurst=3
 
 [Service]
 ExecStart=%h/.local/share/pulse-serve/bin/pulse serve --bind 100.90.203.21:8420
