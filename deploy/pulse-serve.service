@@ -15,9 +15,12 @@ After=network-online.target
 # (5 starts in 10 s) never trips here: RestartSec=10 spaces starts too far
 # apart, and a slow failure (the full 120 s bind retry + RestartSec = 130 s per
 # cycle) is slower still. 3 x 130 s = 390 s < 900 s, so the limit trips for the
-# slow shape; a fast exit (about RestartSec per cycle) trips it sooner. A
-# tailnet outage longer than about 6.5 minutes at boot now ends `failed`:
-# recover with `systemctl --user reset-failed pulse-serve.service`, then start.
+# slow shape; a fast exit (about RestartSec per cycle) trips it sooner.
+# Consequences: a tailnet outage longer than about 6.5 minutes at boot ends
+# `failed`; so does a fast, non-retried bind failure such as a port conflict
+# (AddrInUse exits at once), where an unbounded unit would have self-healed.
+# The start limit also counts manual starts. The recovery runbook is in the
+# justfile, in the comment above the `deploy` recipe.
 # These keys belong in [Unit], not [Service].
 StartLimitIntervalSec=900
 StartLimitBurst=3
@@ -26,7 +29,7 @@ StartLimitBurst=3
 ExecStart=%h/.local/share/pulse-serve/bin/pulse serve --bind 100.90.203.21:8420
 # D6 boot-race contract (w1): the tailnet address may not be routable yet at
 # boot, so pulse serve retries the bind internally; systemd restarts the unit
-# on failure after 10 seconds.
+# on failure after 10 seconds, up to the start limit above.
 Restart=on-failure
 RestartSec=10
 

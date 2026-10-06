@@ -125,15 +125,19 @@ check-serve-bind:
 # without a tag argument and refuses a tag that does not exist.
 #
 # The server unit gives up after 3 failed starts in 900 s (#342) and stays in the
-# systemd `failed` state. To see it: `systemctl --user --failed`, then
-# `systemctl --user status pulse-serve.service`. To recover: fix the cause, run
-# `systemctl --user reset-failed pulse-serve.service`, then
-# `systemctl --user start pulse-serve.service`.
+# systemd `failed` state. To see it:
+#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user --failed
+#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user status pulse-serve.service
+# To recover: fix the cause, then
+#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-serve.service
+#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start pulse-serve.service
+# The start limit counts manual starts too, so the `deploy` and `restore` recipes
+# run `reset-failed` before they start or restart the unit.
 #
-# Installing only the 0.1.3 unit change on a live host (no restart): copy the
-# merged deploy/pulse-serve.service to ~/.config/systemd/user/ and run
-# `systemctl --user daemon-reload`. This `deploy` recipe does MORE: it restarts
-# pulse-serve.service, so do not use it for that change on a live host.
+# A change to deploy/pulse-serve.service alone installs on a live host by copying
+# the merged unit to ~/.config/systemd/user/ and running
+# `systemctl --user daemon-reload`, with no restart. This `deploy` recipe does
+# more: it restarts pulse-serve.service.
 deploy tag:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -160,6 +164,8 @@ deploy tag:
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user daemon-reload
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable --now pulse-backup.timer
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable pulse-serve.service
+    # The start limit counts manual starts: clear a latched `failed` state first.
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-serve.service || true
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pulse-serve.service
     "$HOME/.local/share/pulse-serve/bin/pulse" --version
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user is-active pulse-serve.service
@@ -229,6 +235,7 @@ restore file:
         --backup-dir "$HOME/pulse-backups" --replace
     RC=$?
     set -e
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-serve.service || true
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start pulse-serve.service
     if [ "$RC" -ne 0 ]; then
         echo "restore: RESTORE FAILED (rc=$RC) — pulse-serve restarted on the previous database" >&2

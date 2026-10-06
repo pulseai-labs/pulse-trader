@@ -74,9 +74,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   state, visible to `systemctl --user --failed`. `Restart=on-failure` and
   `RestartSec=10` are unchanged. Install needs only the unit copy and `systemctl
   --user daemon-reload`; the `justfile` comment above `deploy` has the recovery
-  steps (`reset-failed`, then start). Closes
-  [#342](https://github.com/pulseai-labs/pulse-trader/issues/342). Known limit: no
-  push alert yet (moved to r4); `just deploy` restarts the service.
+  steps (`reset-failed`, then start), and `just deploy` and `just restore` now run
+  `reset-failed` before they start the unit, because the start limit counts manual
+  starts. Closes
+  [#342](https://github.com/pulseai-labs/pulse-trader/issues/342). Known limits: no
+  push alert yet (moved to r4); `just deploy` restarts the service; and a fast,
+  non-retried bind failure such as a port conflict (`AddrInUse` exits at once) now
+  latches `failed` after three starts, where 0.1.2 restarted until it cleared.
 
 - **`pulse fetch-data` no longer fails in the first days of a month (0.1.2).** The
   bulk phase asks for every complete month, which includes the month that just

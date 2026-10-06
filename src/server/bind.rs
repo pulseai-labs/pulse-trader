@@ -153,6 +153,10 @@ pub struct RetryPolicy {
     /// Seconds between attempts after a transient failure.
     pub interval: Duration,
     /// Total budget; once the slept time reaches it, the next failure is final.
+    ///
+    /// `deploy/pulse-serve.service` sizes its start limit (`StartLimitIntervalSec`,
+    /// `StartLimitBurst`) against this budget, and `tests/deploy_units.rs` pins it
+    /// at 120 s. Change the budget only together with the unit.
     pub budget: Duration,
 }
 

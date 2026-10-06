@@ -37,11 +37,18 @@ fn section(name: &str) -> HashMap<String, String> {
     keys
 }
 
-fn unit_secs(unit: &HashMap<String, String>, key: &str) -> u64 {
+fn unit_number(unit: &HashMap<String, String>, key: &str) -> u64 {
     unit.get(key)
         .unwrap_or_else(|| panic!("[Unit] sets no {key}= (systemd's default 5 starts / 10 s never trips at this restart rate)"))
         .parse()
         .unwrap_or_else(|_| panic!("{key}= must be a plain number of seconds"))
+}
+
+/// `RestartSec` as plain seconds; both tests read it here so they agree.
+fn restart_sec(service: &HashMap<String, String>) -> u64 {
+    service["RestartSec"]
+        .parse()
+        .expect("RestartSec is plain seconds")
 }
 
 #[test]
@@ -52,18 +59,15 @@ fn unit_bounds_restarts_for_fast_and_slow_failures() {
         !service.contains_key("StartLimitIntervalSec") && !service.contains_key("StartLimitBurst"),
         "the start limit belongs in [Unit], not [Service]"
     );
-    let interval = unit_secs(&unit, "StartLimitIntervalSec");
-    let burst = unit_secs(&unit, "StartLimitBurst");
-    assert!(burst > 0, "StartLimitBurst=0 would disable the limit");
+    let interval = unit_number(&unit, "StartLimitIntervalSec");
+    let burst = unit_number(&unit, "StartLimitBurst");
+    assert_eq!(burst, 3, "the unit must allow three starts");
     assert!(
         interval > 0,
         "StartLimitIntervalSec=0 would disable the limit"
     );
 
-    let restart_sec: u64 = service["RestartSec"]
-        .trim_end_matches('s')
-        .parse()
-        .expect("RestartSec is plain seconds");
+    let restart_sec = restart_sec(&service);
     let bind_budget = RetryPolicy::default().budget.as_secs();
     assert_eq!(bind_budget, 120, "the unit's sizing comment assumes 120 s");
 
@@ -83,7 +87,7 @@ fn unit_bounds_restarts_for_fast_and_slow_failures() {
 fn unit_keeps_the_d6_boot_race_contract_and_the_tailnet_bind() {
     let service = section("Service");
     assert_eq!(service["Restart"], "on-failure");
-    assert_eq!(service["RestartSec"], "10");
+    assert_eq!(restart_sec(&service), 10);
     let exec = &service["ExecStart"];
     assert!(
         exec.ends_with("pulse serve --bind 100.90.203.21:8420"),
@@ -98,5 +102,10 @@ fn unit_keeps_the_d6_boot_race_contract_and_the_tailnet_bind() {
             .keys()
             .any(|k| k == "Environment" || k == "EnvironmentFile"),
         "the unit sets no credential"
+    );
+    assert_eq!(
+        section("Install")["WantedBy"],
+        "default.target",
+        "`just deploy` enables the unit for the default target"
     );
 }
