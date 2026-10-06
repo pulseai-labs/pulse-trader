@@ -17,12 +17,21 @@ never-tracked: **/.env, **/.env.*, **/*.pem, **/*.key, **/id_rsa*
 never-tracked: **/secrets/**, **/credentials.json
 never-tracked: **/SPEC.md, docs/planning/**
 never-tracked: **/.superpowers/**, **/.claude/**
-fixtures-must-be: synthetic
+fixtures-must-be: free of user and private data (public exchange market data allowed)
 
 **One known tracked exception, so the rejection is pre-written:** the env rule
 matches `.env.example`, which is tracked on purpose and holds variable *names*,
 never values — it is the "shape of every configurable input" this file
 sanctions below. A close that raises it rejects it in one sentence.
+
+**Known tracked fixtures built from public market data, so the rejection is
+pre-written:** `tests/fixtures/binance/**`, the parquet store under
+`tests/fixtures/btcusdt-1m-store/**`, `tests/fixtures/indicators/*.csv` and
+`tests/fixtures/frozen/*.frozen.json` hold real public Binance candles. They are
+allowed because determinism baselines and indicator cross-validation need real
+candles. They hold no user data, no private or negotiated prices, no prompts and
+nothing from the data overlay. A close that raises them rejects them in one
+sentence.
 
 ## Working-tree hygiene allowlist
 <!-- Classes of untracked sensitive files known to exist in local clones,
