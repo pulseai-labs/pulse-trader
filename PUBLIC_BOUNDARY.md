@@ -24,14 +24,29 @@ matches `.env.example`, which is tracked on purpose and holds variable *names*,
 never values — it is the "shape of every configurable input" this file
 sanctions below. A close that raises it rejects it in one sentence.
 
-**Known tracked fixtures built from public market data, so the rejection is
-pre-written:** `tests/fixtures/binance/**`, the parquet store under
-`tests/fixtures/btcusdt-1m-store/**`, `tests/fixtures/indicators/*.csv` and
-`tests/fixtures/frozen/*.frozen.json` hold real public Binance candles. They are
-allowed because determinism baselines and indicator cross-validation need real
-candles. They hold no user data, no private or negotiated prices, no prompts and
-nothing from the data overlay. A close that raises them rejects them in one
-sentence.
+**Known tracked fixtures, so the rejection is pre-written.** None holds user
+data, a private or negotiated price, a prompt or anything from the data overlay.
+Each group is one of three kinds:
+
+- **Real public Binance market data.** `tests/fixtures/btcusdt-1m-store/**`
+  holds the BTCUSDT M15 and H4 candles for January 2025, trimmed from a public
+  `pulse fetch-data` snapshot by `examples/make_candle_fixture.rs`. It is
+  tracked so the golden backtest and the determinism tests run offline on real
+  candles.
+- **Hand-shaped Binance-format payloads, synthetic.**
+  `tests/fixtures/binance/**` holds a few hand-shaped rows (round prices, a
+  timestamp near 2023-11-14, empty REST pages) in Binance's CSV, zip and REST
+  JSON shapes. The `BTCUSDT-*-2024-01.zip` names follow Binance's file naming;
+  the contents are not the January 2024 dump. They are tracked so the bulk and
+  incremental ingest tests replay without the network.
+- **Values derived from the real candles.**
+  `tests/fixtures/indicators/btcusdt-m15-reference.csv` holds pandas-ta
+  indicator columns that `gen_reference.py` computes over the January 2025 store.
+  `tests/fixtures/frozen/*.frozen.json` holds the backtest trade log that the
+  committed strategy produces on that store. They are tracked so the
+  cross-validation and frozen-golden tests have a fixed answer.
+
+A close that raises these rejects them in one sentence.
 
 ## Working-tree hygiene allowlist
 <!-- Classes of untracked sensitive files known to exist in local clones,
