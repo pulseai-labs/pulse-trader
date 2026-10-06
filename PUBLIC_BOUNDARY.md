@@ -17,12 +17,42 @@ never-tracked: **/.env, **/.env.*, **/*.pem, **/*.key, **/id_rsa*
 never-tracked: **/secrets/**, **/credentials.json
 never-tracked: **/SPEC.md, docs/planning/**
 never-tracked: **/.superpowers/**, **/.claude/**
-fixtures-must-be: synthetic
+fixtures-must-be: free of user and private data (public exchange market data allowed)
 
 **One known tracked exception, so the rejection is pre-written:** the env rule
 matches `.env.example`, which is tracked on purpose and holds variable *names*,
 never values — it is the "shape of every configurable input" this file
 sanctions below. A close that raises it rejects it in one sentence.
+
+**Known tracked fixtures, so the rejection is pre-written.** None holds user
+data, a private or negotiated price, a prompt or anything from the data overlay.
+Every tracked file under `tests/fixtures/` falls in exactly one of three kinds:
+
+- **Real public Binance market data.** `tests/fixtures/btcusdt-1m-store/**`
+  holds the BTCUSDT M15 and H4 candles for January 2025, trimmed from a public
+  `pulse fetch-data` snapshot by `examples/make_candle_fixture.rs`. It is
+  tracked so the golden backtest and the determinism tests run offline on real
+  candles.
+- **Hand-made synthetic data.**
+  `tests/fixtures/binance/**` holds a few hand-shaped rows (round prices, a
+  timestamp near 2023-11-14, empty REST pages) in Binance's CSV, zip and REST
+  JSON shapes. The `BTCUSDT-*-2024-01.zip` names follow Binance's file naming;
+  the contents are not the January 2024 dump. They are tracked so the bulk and
+  incremental ingest tests (`tests/binance_bulk.rs`,
+  `tests/binance_incremental.rs`) replay without the network.
+  `tests/fixtures/strategies/**` holds hand-authored strategy DSL documents
+  (`rsi-oversold-long.json`). They are tracked because `tests/dsl_render.rs`,
+  `tests/dsl_schema_1_1.rs`, `tests/dsl_schema_1_2.rs` and the golden backtest
+  tests compile and run them.
+- **Derived from the real candles, or the script that derives them.**
+  `tests/fixtures/indicators/btcusdt-m15-reference.csv` holds pandas-ta
+  indicator columns, and `tests/fixtures/indicators/gen_reference.py` is the
+  generator script that computes them over the January 2025 store (it is code,
+  not data). `tests/fixtures/frozen/*.frozen.json` holds the backtest trade log
+  that the committed strategy produces on that store. They are tracked so the
+  cross-validation and frozen-golden tests have a fixed answer.
+
+A close that raises these rejects them in one sentence.
 
 ## Working-tree hygiene allowlist
 <!-- Classes of untracked sensitive files known to exist in local clones,
