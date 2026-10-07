@@ -134,6 +134,7 @@ async fn run_one_pair<S, R>(
             from_ms: None,
             to_ms: None,
             k: Some(2),
+            rule: None,
         },
     )
     .await

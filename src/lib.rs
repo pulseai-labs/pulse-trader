@@ -559,10 +559,10 @@ pub use application::walk_forward::{
     WalkForwardAppError, WalkForwardOutcome, WalkForwardRequest, run_walk_forward,
 };
 pub use domain::{
-    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
-    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
-    WalkForwardRunDraft, WalkForwardRunId, WalkForwardRunRepository, Z, fold_windows,
-    folds_required,
+    FoldScheme, FoldVerdict, HOLDOUT_ALPHA, HoldoutVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN,
+    RunVerdict, VerdictRule, WalkForwardError, WalkForwardFold, WalkForwardFoldDraft,
+    WalkForwardMembership, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
+    WalkForwardRunRepository, Z, fold_windows, folds_required, holdout_test,
 };
 
 // r3.s4.w2 (ADR-0027): the certify-fixture surface — the deterministic

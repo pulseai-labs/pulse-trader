@@ -56,7 +56,7 @@ use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
     CompiledValue, DataError, DataVersion, EvalContext, ExchangeAdapter as _, MfeMaeAggregates,
     Pair, PaperSessionId, PersistedRun, Series, StrategyRepository, Timeframe, ValidationCode,
-    WalkForwardRunId, WalkForwardRunRepository,
+    VerdictRule, WalkForwardRunId, WalkForwardRunRepository,
 };
 
 use super::PulseMcp;
@@ -224,6 +224,12 @@ pub(crate) struct RunWalkForwardArgs {
     /// this decode).
     #[serde(default)]
     k: Option<i32>,
+    /// The verdict rule — `"wf-v1"` (the default) or `"wf-v2"` (r4.s1.w3). An
+    /// unknown value is a `field_error` naming `rule`, before any request is
+    /// resolved; omitted means `wf-v1`, exactly what every caller got before
+    /// wf-v2 existed.
+    #[serde(default)]
+    rule: Option<String>,
 }
 
 /// `get_walk_forward_run` args (r2.s3.w5).
@@ -289,6 +295,25 @@ fn apply_pair_override(
         *pair = override_pair.clone();
         *snapshots = None;
     }
+}
+
+/// Validate an optional MCP `rule` argument (r4.s1.w3) against the domain's own
+/// name mapping, and answer the rule it names.
+///
+/// `Ok(None)` when no `rule` was given — the run defaults to `wf-v1`, exactly
+/// what every caller got before wf-v2 existed. `Err(result)` is the
+/// ready-to-return `rule` field error: the value is not one of the two shipped
+/// rule names. The refusal runs no request.
+fn rule_arg(raw: Option<&str>) -> Result<Option<VerdictRule>, CallToolResult> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    VerdictRule::from_name(raw).map(Some).ok_or_else(|| {
+        field_error(
+            "rule",
+            format!("unknown rule {raw:?}: expected \"wf-v1\" or \"wf-v2\""),
+        )
+    })
 }
 
 /// One tool error in the `{"field", "message"}` shape.
@@ -1098,15 +1123,17 @@ impl PulseMcp {
     ///
     /// `from`/`to` are INDEPENDENT RFC 3339 bounds — either may be given alone:
     /// `from` defaults to the first fully-warm bar, `to` to the snapshot's last
-    /// candle's `close_time`. `k` defaults to `K_DEFAULT` (6). Pair, timeframes,
-    /// cost model and the exact snapshot pins resolve through the same
-    /// [`resolve_default_request`] seam `run_backtest` uses — the surfaces run a
-    /// version identically — and the answer is the one `WalkForwardRunDetail`
-    /// shape, built from the saved rows. An optional `pair` (r4.s1.w2) overrides
-    /// the inherited pair — validated through the run's own exchange adapter —
-    /// and clears the inherited snapshot pins when it differs.
+    /// candle's `close_time`. `k` defaults to `K_DEFAULT` (6), `rule` to
+    /// `wf-v1`. Pair, timeframes, cost model and the exact snapshot pins resolve
+    /// through the same [`resolve_default_request`] seam `run_backtest` uses —
+    /// the surfaces run a version identically — and the answer is the one
+    /// `WalkForwardRunDetail` shape, built from the saved rows. An optional
+    /// `pair` (r4.s1.w2) overrides the inherited pair — validated through the
+    /// run's own exchange adapter — and clears the inherited snapshot pins when
+    /// it differs. An optional `rule` (r4.s1.w3) is `wf-v1` or `wf-v2`; an
+    /// unknown value is refused naming `rule`.
     #[tool(
-        description = "Walk one strategy version forward: rolling-oos/v1 cuts the counted span into K contiguous out-of-sample folds (k in 2..=12, default 6) and judges the run under wf-v1. Each fold is an ordinary persisted windowed backtest run with full-history lead-in — visible through list_runs and get_run with its walk_forward membership. Optional from/to are RFC 3339 bounds given independently: `from` defaults to the first fully-warm bar, `to` to the snapshot's last close. Optional pair (e.g. SOLUSDT) overrides the inherited pair; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe."
+        description = "Walk one strategy version forward: rolling-oos/v1 cuts the counted span into K contiguous out-of-sample folds (k in 2..=12, default 6) and judges the run under `rule` — wf-v1 (the default: a fold holds on n >= 20 and a positive expectancy lower bound) or wf-v2 (a fold holds on n >= 20 and a positive mean); both require ceil(2K/3) holding folds and a positive pooled lower bound. Each fold is an ordinary persisted windowed backtest run with full-history lead-in — visible through list_runs and get_run with its walk_forward membership. Optional from/to are RFC 3339 bounds given independently: `from` defaults to the first fully-warm bar, `to` to the snapshot's last close. Optional pair (e.g. SOLUSDT) overrides the inherited pair; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe. An unknown rule is refused naming `rule`."
     )]
     async fn run_walk_forward(
         &self,
@@ -1118,6 +1145,11 @@ impl PulseMcp {
         };
         let to_ms = match parse_bound("to", args.to.as_deref()) {
             Ok(bound) => bound,
+            Err(result) => return Ok(result),
+        };
+        // r4.s1.w3: the optional `rule` argument — wf-v1 (default) or wf-v2.
+        let rule = match rule_arg(args.rule.as_deref()) {
+            Ok(rule) => rule,
             Err(result) => return Ok(result),
         };
 
@@ -1156,6 +1188,7 @@ impl PulseMcp {
             from_ms,
             to_ms,
             k: args.k,
+            rule,
         };
         let outcome = match run_walk_forward(
             &strategies,
@@ -1183,7 +1216,7 @@ impl PulseMcp {
     /// parent's provenance and verdict, plus each fold's run re-read through
     /// the ordinary run log (`get_run` per `backtest_run_id`, fail closed).
     #[tool(
-        description = "Fetch one walk-forward run by id: the same WalkForwardRunDetail shape run_walk_forward returns — scheme, rule, counted span, the wf-v1 verdict and one row per fold (window, fold verdict, and the fold's ordinary run summary)."
+        description = "Fetch one walk-forward run by id: the same WalkForwardRunDetail shape run_walk_forward returns — scheme, rule, counted span, the recorded verdict and one row per fold (window, fold verdict, and the fold's ordinary run summary)."
     )]
     async fn get_walk_forward_run(
         &self,

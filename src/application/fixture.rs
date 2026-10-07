@@ -373,6 +373,7 @@ where
         from_ms: None,
         to_ms: None,
         k: None,
+        rule: None,
     };
     let outcome = crate::application::walk_forward::run_walk_forward(
         strategies, snapshots, exchange, runs, &request,

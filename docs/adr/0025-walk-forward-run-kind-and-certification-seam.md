@@ -4,7 +4,9 @@ Date: 2026-09-20T00:00:00Z
 
 ## Status
 
-Accepted
+Accepted. Amended by [ADR-0028](0028-wf-v2-holdout-and-hypothesis-budget.md): `wf-v2` is a second
+rule name beside the unchanged `wf-v1`, and ADR-0028 freezes the rule, the C1 holdout test, the
+holdout start and the hypothesis budget H.
 
 ## Context
 

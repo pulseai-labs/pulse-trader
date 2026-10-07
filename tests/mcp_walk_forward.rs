@@ -27,7 +27,7 @@ use std::path::Path;
 
 use pulse::{
     BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleStore, Pair,
-    SqliteBacktestRunRepo, SymbolFilters, Timeframe,
+    SqliteBacktestRunRepo, SymbolFilters, Timeframe, WalkForwardRunRepository,
 };
 use rmcp::model::CallToolRequestParams;
 use rust_decimal::Decimal;
@@ -716,6 +716,90 @@ async fn pair_argument_without_a_snapshot_refuses_by_name() {
     let message = err["message"].as_str().expect("message");
     assert!(message.contains("XRPUSDT"), "names the pair: {err}");
     assert!(message.contains("15m"), "names the timeframe: {err}");
+
+    client.cancel().await.expect("cancel session");
+}
+
+// ---- r4.s1.w3: the optional `rule` argument --------------------------------
+
+/// `rule: "wf-v2"` judges the run under wf-v2: the detail names the rule, and
+/// the read tool answers the SAME detail for the persisted row — the rule is
+/// stored, not a request echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wf_v2_rule_argument_selects_the_rule() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    let detail = call(
+        &client,
+        "run_walk_forward",
+        json!({ "version_id": child.as_str(), "k": 2, "rule": "wf-v2" }),
+    )
+    .await;
+    assert_eq!(detail["rule"], "wf-v2", "{detail}");
+    assert_eq!(
+        detail["folds"].as_array().expect("folds").len(),
+        2,
+        "the fold shape is unchanged"
+    );
+
+    let run_id = detail["walk_forward_run_id"].as_str().expect("run id");
+    let reread = call(
+        &client,
+        "get_walk_forward_run",
+        json!({ "walk_forward_run_id": run_id }),
+    )
+    .await;
+    assert_eq!(reread, detail, "the stored rule round-trips");
+
+    // The persisted row decodes as wf-v2 through the domain type too.
+    let runs = SqliteBacktestRunRepo::new(fixture.db.pool().clone());
+    let stored = runs
+        .get_walk_forward_run(&pulse::WalkForwardRunId::new(run_id.to_owned()))
+        .await
+        .expect("get_walk_forward_run")
+        .expect("the run row exists");
+    assert_eq!(stored.rule, pulse::VerdictRule::WfV2);
+    assert_eq!(stored.rule.name(), "wf-v2");
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// An omitted `rule` judges the run under wf-v1 — every caller that does not
+/// name a rule behaves exactly as before wf-v2 existed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wf_v2_rule_arg_omitted_defaults_to_wf_v1() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    let detail = run_k2(&client, child.as_str()).await;
+    assert_eq!(detail["rule"], "wf-v1", "{detail}");
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// An unknown `rule` is a `field_error` naming `rule`, before any request is
+/// resolved — never a silent default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wf_v2_rule_arg_unknown_is_refused_naming_rule() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    for rule in ["wf-v9", "wf_v2", "WF-V2"] {
+        let err = call_err(
+            &client,
+            "run_walk_forward",
+            json!({ "version_id": child.as_str(), "k": 2, "rule": rule }),
+        )
+        .await;
+        assert_eq!(err["field"], "rule", "rule={rule} refuses on `rule`: {err}");
+        assert!(
+            err["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("wf-v1") && m.contains("wf-v2")),
+            "the refusal names both legal rules: {err}"
+        );
+    }
 
     client.cancel().await.expect("cancel session");
 }

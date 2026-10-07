@@ -249,8 +249,90 @@ fn fold_verdict_is_deterministic_to_the_bit() {
 }
 
 // ---------------------------------------------------------------------------
-// RunVerdict — ⌈2K/3⌉ folds AND a holding pooled bound
+// wf-v2 — the second rule name beside wf-v1 (r4.s1.w3, ADR-0028)
 // ---------------------------------------------------------------------------
+
+/// `wf-v2` is a NEW name, not a constant edit: a fold holds on a positive mean
+/// where `wf-v1` demands a positive lower bound, and the run verdict follows
+/// the folds it is handed while the pooled bound stays wf-v1's.
+#[test]
+fn wf_v2_name_and_fold_rule_are_pinned() {
+    assert_eq!(VerdictRule::WfV1.name(), "wf-v1");
+    assert_eq!(VerdictRule::WfV2.name(), "wf-v2");
+    assert_eq!(VerdictRule::from_name("wf-v1"), Some(VerdictRule::WfV1));
+    assert_eq!(VerdictRule::from_name("wf-v2"), Some(VerdictRule::WfV2));
+    assert_eq!(
+        VerdictRule::from_name("wf-v9"),
+        None,
+        "unknown names refuse"
+    );
+    assert_eq!(
+        serde_json::to_value(VerdictRule::WfV2).unwrap(),
+        serde_json::json!("wf-v2")
+    );
+    assert_eq!(
+        serde_json::from_value::<VerdictRule>(serde_json::json!("wf-v2")).unwrap(),
+        VerdictRule::WfV2
+    );
+
+    // The discriminating fold: nineteen −0.1R trades and one +2.1R trade give a
+    // positive mean (0.01R) and a lower bound under water — wf-v2 holds it,
+    // wf-v1 does not. n = 20 clears both rules' floor.
+    let mut rs = vec![Decimal::new(-1, 1); 19];
+    rs.push(Decimal::new(21, 1));
+    let v1 = VerdictRule::WfV1.assess_fold(&rs);
+    let v2 = VerdictRule::WfV2.assess_fold(&rs);
+    assert_eq!(v1.n, 20);
+    assert_eq!(v1.mean_r, v2.mean_r, "one arithmetic, two rules");
+    assert!(v1.mean_r > Decimal::ZERO, "mean {}", v1.mean_r);
+    assert_eq!(v1.lower_bound.to_bits(), v2.lower_bound.to_bits());
+    assert!(v1.lower_bound < 0.0, "lb {}", v1.lower_bound);
+    assert!(!v1.holds, "wf-v1 needs the bound strictly above zero");
+    assert!(v2.holds, "wf-v2 holds on a positive mean");
+    // Under N_MIN neither rule holds, whatever the mean says.
+    assert!(
+        !VerdictRule::WfV2
+            .assess_fold(&vec![Decimal::new(1, 0); 19])
+            .holds
+    );
+    // A mean of exactly zero does not hold under wf-v2 either.
+    assert!(
+        !VerdictRule::WfV2
+            .assess_fold(&vec![Decimal::new(0, 0); 20])
+            .holds
+    );
+
+    // The run-level discriminator over the SAME trades: two folds of
+    // ten +1.0R and ten −0.55R trades have a positive mean and a lower bound
+    // under water per fold (t ≈ 1.30), and the pooled bound over both folds
+    // holds — so the run passes under wf-v2 and fails under wf-v1.
+    let mut mixed = vec![Decimal::new(1, 0); 10];
+    mixed.extend(vec![Decimal::new(-55, 2); 10]);
+    let fold_v1 = VerdictRule::WfV1.assess_fold(&mixed);
+    let fold_v2 = VerdictRule::WfV2.assess_fold(&mixed);
+    assert!(fold_v1.mean_r > Decimal::ZERO);
+    assert!(fold_v1.lower_bound < 0.0, "lb {}", fold_v1.lower_bound);
+    assert!(!fold_v1.holds && fold_v2.holds);
+    let two_v1_folds = vec![fold_v1.clone(), fold_v1];
+    let two_v2_folds = vec![fold_v2.clone(), fold_v2];
+    let pooled: Vec<Decimal> = mixed.iter().chain(mixed.iter()).copied().collect();
+    let run_v1 = VerdictRule::WfV1.assess_run(&two_v1_folds, &pooled);
+    let run_v2 = VerdictRule::WfV2.assess_run(&two_v2_folds, &pooled);
+    assert_eq!(run_v2.folds_required, 2);
+    assert_eq!(run_v1.folds_holding, 0);
+    assert_eq!(run_v2.folds_holding, 2);
+    assert_eq!(
+        run_v1.pooled, run_v2.pooled,
+        "one pooled one-sided 95% bound for both rules"
+    );
+    assert!(
+        run_v2.pooled.holds,
+        "pooled lb {}",
+        run_v2.pooled.lower_bound
+    );
+    assert!(run_v2.pass, "wf-v2 passes the run");
+    assert!(!run_v1.pass, "wf-v1 refuses the same trades");
+}
 
 #[test]
 fn run_verdict_requires_both_enough_holding_folds_and_a_holding_pool() {

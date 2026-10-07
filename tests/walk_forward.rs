@@ -155,6 +155,7 @@ fn request(version: &VersionId) -> WalkForwardRequest {
         from_ms: None,
         to_ms: None,
         k: None,
+        rule: None,
     }
 }
 

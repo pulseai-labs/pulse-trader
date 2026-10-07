@@ -105,9 +105,10 @@ pub use backtest::{
 // Re-exported so `lib.rs` can curate the crate surface — an un-re-exported
 // public domain type is a `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{
-    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
-    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
-    WalkForwardRunDraft, WalkForwardRunId, Z, fold_windows, folds_required,
+    FoldScheme, FoldVerdict, HOLDOUT_ALPHA, HoldoutVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN,
+    RunVerdict, VerdictRule, WalkForwardError, WalkForwardFold, WalkForwardFoldDraft,
+    WalkForwardMembership, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId, Z, fold_windows,
+    folds_required, holdout_test,
 };
 pub use candle::Candle;
 pub use clock::Clock;

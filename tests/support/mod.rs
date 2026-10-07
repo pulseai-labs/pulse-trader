@@ -6,6 +6,9 @@
 //! `call_tool` plumbing — instead of forking it.
 
 pub mod mcp;
+// r4.s1.w3: the wf-v2 calibration's deterministic generator, shared by the
+// calibration test and the measurement harness so both draw one stream.
+pub mod rng;
 // r3.s4.w3: the live-runtime harness (migrated DB + real repositories + a
 // scripted `ClosedBarSource` + a hand-advanced clock) shared by the five
 // `paper_*` suites.

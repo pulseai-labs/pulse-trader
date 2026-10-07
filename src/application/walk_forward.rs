@@ -27,9 +27,8 @@ use crate::application::backtest::{
     prepare_over_loaded_series,
 };
 use crate::domain::backtest::{
-    CandleWindow, FoldScheme, FoldVerdict, K_DEFAULT, RunSummary, RunVerdict, VerdictRule,
-    WalkForwardError, WalkForwardFoldDraft, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
-    fold_windows,
+    CandleWindow, FoldScheme, K_DEFAULT, RunSummary, RunVerdict, VerdictRule, WalkForwardError,
+    WalkForwardFoldDraft, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId, fold_windows,
 };
 use crate::domain::strategy::VersionId;
 use crate::domain::{
@@ -74,6 +73,10 @@ pub struct WalkForwardRequest {
     /// in transport decoding. Widened to `i64` for that call below: the domain
     /// keeps the wider comparison so the refusal can name what was sent.
     pub k: Option<i32>,
+    /// The verdict rule (`wf-v1` | `wf-v2`); `None` defaults to
+    /// [`VerdictRule::WfV1`], so every caller that does not name a rule behaves
+    /// exactly as it did before wf-v2 existed (r4.s1.w3).
+    pub rule: Option<VerdictRule>,
 }
 
 /// The use case's answer — built from the saved rows, never the in-memory
@@ -291,8 +294,10 @@ fn resolve_counted_span(
 /// The K fold executions inside the blocking task: each fold gets a FRESH copy
 /// of the whole snapshot (the lead-in cut `prepare_over_loaded_series` makes is
 /// destructive), runs the shared prepare path, and contributes its trades to
-/// the pooled `wf-v1` bound. Asserts all folds share one engine fingerprint.
-/// Returns the shared fingerprint, the fold drafts, and the assessed verdict.
+/// the pooled bound. Each fold's verdict is assessed under `rule`, and the run
+/// verdict is that rule's `assess_run` over those folds. Asserts all folds
+/// share one engine fingerprint. Returns the shared fingerprint, the fold
+/// drafts, and the assessed verdict.
 #[allow(clippy::too_many_arguments)]
 fn execute_folds<E>(
     validated: &ValidatedDsl,
@@ -304,6 +309,7 @@ fn execute_folds<E>(
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
     d1: Option<&CandleSeries>,
+    rule: VerdictRule,
 ) -> Result<(String, Vec<WalkForwardFoldDraft>, RunVerdict), WalkForwardAppError>
 where
     E: ExchangeAdapter,
@@ -346,7 +352,7 @@ where
             .map(|t| t.realized_r)
             .collect();
         pooled_rs.extend_from_slice(&fold_rs);
-        fold_verdicts.push(FoldVerdict::from_rs(&fold_rs));
+        fold_verdicts.push(rule.assess_fold(&fold_rs));
         fold_drafts.push(WalkForwardFoldDraft {
             index: fold_index,
             window: w.clone(),
@@ -360,15 +366,16 @@ where
     Ok((
         fingerprint.unwrap_or_default(),
         fold_drafts,
-        RunVerdict::assess(&fold_verdicts, &pooled_rs),
+        rule.assess_run(&fold_verdicts, &pooled_rs),
     ))
 }
 
 /// The one blocking task's whole body (a13, #201): load the pinned snapshots
 /// once, resolve the counted span (refusing its boundary failures), cut the
 /// folds and refuse an empty one BEFORE any fold runs, then run each fold
-/// through the shared [`prepare_over_loaded_series`] and fold the `wf-v1`
-/// verdict. No I/O beyond the snapshot loads; nothing persists here.
+/// through the shared [`prepare_over_loaded_series`] and fold it into the run
+/// verdict under `rule`. No I/O beyond the snapshot loads; nothing persists
+/// here.
 #[allow(clippy::too_many_arguments)]
 fn run_walk_forward_blocking<C, E>(
     candles: &C,
@@ -383,6 +390,7 @@ fn run_walk_forward_blocking<C, E>(
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     scheme: FoldScheme,
+    rule: VerdictRule,
 ) -> Result<WalkForwardBlockingOutput, WalkForwardAppError>
 where
     C: CandleSeriesRepository,
@@ -469,11 +477,12 @@ where
         &primary,
         htf.as_ref(),
         d1.as_ref(),
+        rule,
     )?;
     Ok(WalkForwardBlockingOutput {
         draft: WalkForwardRunDraft {
             scheme,
-            rule: VerdictRule::WfV1,
+            rule,
             span,
             from_defaulted,
             engine_fingerprint: fingerprint,
@@ -511,6 +520,8 @@ pub(crate) struct WalkForwardUnpersistedParams {
     pub to_ms: Option<i64>,
     /// The fold scheme the span is cut under.
     pub scheme: FoldScheme,
+    /// The verdict rule the folds and the run are judged under (r4.s1.w3).
+    pub rule: VerdictRule,
 }
 
 /// The walk-forward computation with NO persistence — the one `spawn_blocking`
@@ -550,6 +561,7 @@ where
             params.from_ms,
             params.to_ms,
             params.scheme,
+            params.rule,
         )
     })
     .await
@@ -597,6 +609,9 @@ where
     // former private copy of the two checks is gone.
     check_request_shape(&compiled, request.primary_timeframe, request.htf_timeframe)?;
     let scheme = FoldScheme::rolling_oos(request.k.map_or(i64::from(K_DEFAULT), i64::from))?;
+    // The rule the whole run is judged under: an unnamed rule is wf-v1, exactly
+    // what every caller got before wf-v2 existed (r4.s1.w3).
+    let rule = request.rule.unwrap_or(VerdictRule::WfV1);
 
     // ONE blocking task for the snapshot loads, the warm-bar probe, the span
     // resolution, and all K fold runs (a13, #201) — the shared unpersisted
@@ -615,6 +630,7 @@ where
             from_ms: request.from_ms,
             to_ms: request.to_ms,
             scheme,
+            rule,
         },
     )
     .await?;
