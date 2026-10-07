@@ -174,9 +174,13 @@ pub(crate) fn decode_provenance(bytes: &[u8]) -> Result<SnapshotProvenance, Data
     serde_json::from_str(raw).map_err(|e| io_err("decode provenance", &e))
 }
 
-/// Normalize writer-version metadata so two writes from different writer versions
-/// can be byte-compared (audit C6). Clears the footer `created_by` string, which
-/// is the only writer-version-dependent field for our fixed schema + compression.
+/// Blank the footer `created_by` string so two writes from the SAME writer
+/// version can be byte-compared — the audit-C6 byte-stability check
+/// (`tests/parquet_roundtrip.rs`). It is deliberately NOT the store's snapshot
+/// equivalence rule: blanking a string in place only aligns two files whose
+/// `created_by` values have the same length, so a cross-writer-version
+/// comparison goes through `content_equivalent` (decoded candles + provenance)
+/// instead (#5).
 pub(crate) fn normalize_writer_metadata(bytes: &[u8]) -> Result<Vec<u8>, DataError> {
     // `created_by` is written verbatim into the footer; replacing its bytes with
     // a fixed-length sentinel yields a writer-version-independent byte image.
