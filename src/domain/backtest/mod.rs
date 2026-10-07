@@ -34,6 +34,9 @@ mod run;
 // r2.s3.w3: walk-forward as a run kind — `rolling-oos/v1` folds + the `wf-v1`
 // verdict rule, their constants, and the persisted-run projections (ADR-0025).
 mod walk_forward;
+// r4.s1.w3 (ADR-0028): the C1 holdout test — a one-sided lower confidence
+// bound on a holdout's expectancy at a family-wise 5% split over H.
+mod holdout;
 
 // Re-exports kept at the `domain::backtest` surface so `domain/mod.rs` + `lib.rs`
 // can curate them onto the crate's public API (an un-re-exported public domain
@@ -42,6 +45,7 @@ pub use collision::{IntraBarExit, resolve_intra_bar_exit};
 pub use cost::{Side, apply_slippage, funding_payment, realized_pnl, realized_r, taker_fee};
 pub use error::{BacktestError, SeriesRole};
 pub use feed::{AlignedBar, align};
+pub use holdout::{HOLDOUT_ALPHA, HoldoutVerdict, holdout_test};
 pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
 pub use run::{

@@ -948,3 +948,45 @@ async fn a_settled_accept_replays_after_the_parents_pointer_moves() {
         "nothing new was minted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// r4.s1.w3 — G4: the gate re-runs under the PARENT'S rule
+// ---------------------------------------------------------------------------
+
+/// The parent's certifying run is a wf-v2 one, so the gate re-runs the
+/// candidate under wf-v2 (G4) and the recorded failure names that rule — the
+/// gate never falls back to wf-v1 for a wf-v2 lineage. (The one-month fixture
+/// cannot pass either rule, so the RULE the gate used is what this pins: the
+/// message is built from the certifying run's own rule name, which is the value
+/// the re-run received.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wf_v2_parent_re_runs_the_gate_under_its_own_rule() {
+    let world = world().await;
+
+    // The same coherent draft `certify_parent` saves, judged under wf-v2.
+    let mut draft = passing_draft(&world.parent_inputs, fixture_span());
+    draft.rule = VerdictRule::WfV2;
+    SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(CERTIFY_MS))
+        .save_walk_forward_run(&world.version_id, &draft)
+        .await
+        .expect("the wf-v2 certifying run persists");
+
+    let outcome = decide(&world, CoachAction::Accept).await;
+    let CoachDecisionOutcome::AcceptFailed(proposal) = outcome else {
+        panic!("the one-month fixture cannot pass wf-v2 — expected AcceptFailed, got {outcome:?}");
+    };
+    let failure = proposal.accept_failure.expect("the failure is recorded");
+    assert_eq!(failure.stage, AcceptFailureStage::WalkForward);
+    assert!(
+        failure.message.contains("under wf-v2"),
+        "the gate re-runs under the parent's own rule: {}",
+        failure.message
+    );
+
+    // Nothing persisted: no child was minted.
+    assert_eq!(
+        world.table_count("strategy_version").await,
+        1,
+        "no child was minted"
+    );
+}

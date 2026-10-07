@@ -576,6 +576,10 @@ where
             from_ms: Some(certifying.span.from_ms),
             to_ms: Some(certifying.span.to_ms),
             scheme: certifying.scheme,
+            // G4: the gate re-runs the candidate under the RULE of the parent's
+            // own certifying run (r4.s1.w3) — a wf-v2 lineage is judged by
+            // wf-v2, a wf-v1 lineage exactly as before.
+            rule: certifying.rule,
         },
     )
     .await

@@ -732,6 +732,7 @@ async fn walk_forward_default_from_moves_with_the_lag() {
         from_ms: None,
         to_ms: None,
         k: None,
+        rule: None,
     };
 
     let lag5_outcome = run_walk_forward(

@@ -134,7 +134,7 @@ pub struct WalkForwardSpanWire {
     pub from_defaulted: bool,
 }
 
-/// One `wf-v1` verdict block — a fold's verdict and the pooled verdict share
+/// One recorded verdict block — a fold's verdict and the pooled verdict share
 /// this shape (`n` / `mean_r` / `lower_bound` / `holds`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FoldVerdictWire {
@@ -145,11 +145,13 @@ pub struct FoldVerdictWire {
     /// `mean − 1.645 · sqrt(var / n)` — the one-sided lower bound on the
     /// expectancy in R.
     pub lower_bound: f64,
-    /// `n >= 20 && lower_bound > 0` — `wf-v1`'s fold rule.
+    /// Whether the fold holds under the run's recorded rule: `n >= 20 &&
+    /// lower_bound > 0` under `wf-v1`, `n >= 20 && mean_r > 0` under `wf-v2`
+    /// (r4.s1.w3).
     pub holds: bool,
 }
 
-/// The `wf-v1` run verdict on the wire: the fold tallies plus the pooled bound.
+/// The recorded run verdict on the wire: the fold tallies plus the pooled bound.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunVerdictWire {
     /// `folds_holding >= folds_required && pooled.holds`.
@@ -173,14 +175,14 @@ pub struct WalkForwardFoldDetail {
     /// The persisted `backtest_run` id this fold ran as — the same id
     /// `get_run` / `list_runs` resolve.
     pub backtest_run_id: String,
-    /// The `wf-v1` verdict recorded on the fold row.
+    /// The verdict recorded on the fold row (under the run's own rule).
     pub verdict: FoldVerdictWire,
     /// The fold run's own catalog row — every [`RunSummary`] field.
     pub summary: RunSummary,
 }
 
 /// The ONE shape `run_walk_forward` and `get_walk_forward_run` both return
-/// (ruling (iv)): the persisted parent's provenance and `wf-v1` verdict plus
+/// (ruling (iv)): the persisted parent's provenance and recorded verdict plus
 /// one entry per fold.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WalkForwardRunDetail {
@@ -198,7 +200,7 @@ pub struct WalkForwardRunDetail {
     pub span: WalkForwardSpanWire,
     /// The engine fingerprint the fold runs share.
     pub engine_fingerprint: String,
-    /// The recorded `wf-v1` run verdict.
+    /// The recorded run verdict.
     pub verdict: RunVerdictWire,
     /// The folds in `fold_index` order.
     pub folds: Vec<WalkForwardFoldDetail>,

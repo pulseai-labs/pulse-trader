@@ -153,6 +153,7 @@ fn walk_forward_request(
         from_ms: None,
         to_ms: None,
         k: None,
+        rule: None,
     }
 }
 

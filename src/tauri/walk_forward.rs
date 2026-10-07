@@ -383,6 +383,9 @@ pub async fn run_walk_forward_version_core(
             from_ms,
             to_ms,
             k: request.k,
+            // ADR-0020: the Tauri command keeps its signature and stays on
+            // wf-v1 — the app's walk-forward is unchanged by r4.s1.w3.
+            rule: None,
         },
     )
     .await?;

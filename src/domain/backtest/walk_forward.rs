@@ -3,11 +3,12 @@
 //! A strategy version is **walked forward**: its counted span `[from, to)` is
 //! cut into K equal-length contiguous out-of-sample folds ([`fold_windows`]),
 //! each fold runs as an ordinary persisted windowed backtest with full-history
-//! lead-in, and the run is judged by the versioned rule [`VerdictRule::WfV1`]:
-//! a fold holds when it has at least [`N_MIN`] trades and its expectancy lower
-//! bound in R is strictly above zero; the run passes when at least
-//! `⌈2K/3⌉` folds hold and the pooled lower bound over every out-of-sample
-//! trade is above zero.
+//! lead-in, and the run is judged by one of two versioned rules
+//! ([`VerdictRule`]): `wf-v1` holds a fold when it has at least [`N_MIN`]
+//! trades and its expectancy lower bound in R is strictly above zero; `wf-v2`
+//! (ADR-0028) holds a fold on a positive mean expectancy instead. Both pass
+//! the run when at least `⌈2K/3⌉` folds hold and the pooled lower bound over
+//! every out-of-sample trade is above zero.
 //!
 //! **The constants are the rule.** `Z = 1.645`, `N_MIN = 20`,
 //! `folds_required(k) = ⌈2k/3⌉` are pinned by `tests/walk_forward_verdict.rs`;
@@ -90,14 +91,21 @@ impl FoldScheme {
     }
 }
 
-/// The verdict rule — how fold outcomes become a run verdict. `wf-v1` is the
-/// only rule: its constants are the rule, so a changed constant is a new name.
+/// The verdict rule — how fold outcomes become a run verdict. `wf-v1` and
+/// `wf-v2` are the two shipped rules: a rule's constants are the rule, so a
+/// changed constant is a new name, never an edit to an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerdictRule {
     /// `wf-v1` — `n >= 20` and `lower_bound > 0` per fold; `⌈2K/3⌉` folds and a
     /// positive pooled lower bound for the run.
     #[serde(rename = "wf-v1")]
     WfV1,
+    /// `wf-v2` (r4.s1.w3, ADR-0028) — the same fold count and the same pooled
+    /// one-sided 95% bound as `wf-v1`, but a fold holds on a positive **mean**
+    /// expectancy (`n >= 20 && mean_r > 0`) rather than a positive lower bound.
+    /// The bound is still computed and stored, for display only.
+    #[serde(rename = "wf-v2")]
+    WfV2,
 }
 
 impl VerdictRule {
@@ -106,6 +114,56 @@ impl VerdictRule {
     pub fn name(&self) -> &'static str {
         match self {
             Self::WfV1 => "wf-v1",
+            Self::WfV2 => "wf-v2",
+        }
+    }
+
+    /// The rule a persisted/serialized name denotes, or `None` for a name this
+    /// version does not know — the ONE name↔rule mapping the store decoder and
+    /// the MCP `rule` argument both use (an unknown name is corrupt on the read
+    /// path and a `field_error` on the request path).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "wf-v1" => Some(Self::WfV1),
+            "wf-v2" => Some(Self::WfV2),
+            _ => None,
+        }
+    }
+
+    /// Assess one fold's trades under this rule.
+    ///
+    /// `wf-v1` is [`FoldVerdict::from_rs`] verbatim: `n >= 20` and the one-sided
+    /// lower bound strictly above zero. `wf-v2` keeps the identical `Decimal`
+    /// arithmetic — `n`, `mean_r` and `lower_bound` come out byte-for-byte the
+    /// same, the bound retained for display — and holds the fold when
+    /// `n >= 20 && mean_r > 0`: a positive mean is enough, the variance no
+    /// longer decides.
+    #[must_use]
+    pub fn assess_fold(&self, rs: &[Decimal]) -> FoldVerdict {
+        let mut verdict = FoldVerdict::from_rs(rs);
+        match self {
+            Self::WfV1 => {}
+            Self::WfV2 => {
+                verdict.holds = verdict.n >= N_MIN && verdict.mean_r > Decimal::ZERO;
+            }
+        }
+        verdict
+    }
+
+    /// Assess a finished run's folds under this rule. `folds` is the per-fold
+    /// verdicts in fold order (assessed by [`VerdictRule::assess_fold`] under
+    /// THE SAME rule); `pooled_rs` is every fold's `realized_r` concatenated in
+    /// fold order (L5).
+    ///
+    /// Both rules share the run-level arithmetic — `⌈2K/3⌉` holding folds and
+    /// the same pooled one-sided 95% bound — so the two arms are one expression;
+    /// what the rule decides is which folds hold, and that decision is already
+    /// baked into the fold verdicts the tally counts.
+    #[must_use]
+    pub fn assess_run(&self, folds: &[FoldVerdict], pooled_rs: &[Decimal]) -> RunVerdict {
+        match self {
+            Self::WfV1 | Self::WfV2 => RunVerdict::assess(folds, pooled_rs),
         }
     }
 }
@@ -173,7 +231,10 @@ pub fn fold_windows(span: &CandleWindow, k: u8) -> Vec<CandleWindow> {
     folds
 }
 
-/// `wf-v1`'s per-fold verdict over one fold's `realized_r` series.
+/// `wf-v1`'s per-fold verdict over one fold's `realized_r` series. `wf-v2`
+/// verdicts carry the SAME shape and the same `n`/`mean_r`/`lower_bound`
+/// arithmetic — only `holds` reads `n >= 20 && mean_r > 0` there (see
+/// [`VerdictRule::assess_fold`]).
 ///
 /// `PartialEq` (not `Eq`): `lower_bound` is the single `f64` the money-math
 /// quarantine permits, exactly as `SummaryStats::sharpe`/`sortino` are.
@@ -187,8 +248,10 @@ pub struct FoldVerdict {
     /// expectancy in R. `0.0` when `n < 2` (the bound is undefined, and
     /// undefined does not hold).
     pub lower_bound: f64,
-    /// `n >= 20 && lower_bound > 0.0` — a lower bound of exactly zero does not
-    /// hold (the bound must be STRICTLY above zero).
+    /// `n >= 20 && lower_bound > 0.0` under `wf-v1` — a lower bound of exactly
+    /// zero does not hold (the bound must be STRICTLY above zero). Under
+    /// `wf-v2` the same field reads `n >= 20 && mean_r > 0.0`, a mean of exactly
+    /// zero likewise not holding.
     pub holds: bool,
 }
 

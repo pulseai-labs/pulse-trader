@@ -596,6 +596,7 @@ async fn standalone_and_fold_runs_persist_the_filters_the_engine_ran_under() {
         from_ms: None,
         to_ms: None,
         k: Some(2),
+        rule: None,
     };
     run_walk_forward(
         &world.strategies(),

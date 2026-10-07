@@ -25,6 +25,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   [#148](https://github.com/pulseai-labs/pulse-trader/issues/148),
   [#52](https://github.com/pulseai-labs/pulse-trader/issues/52).
 
+- **`wf-v2`, the C1 holdout test, and the frozen hypothesis budget (r4.s1.w3).** The walk-forward
+  gains a second named verdict rule beside the byte-identical `wf-v1`: **`wf-v2`** holds a fold on
+  a positive mean expectancy (`n >= 20`) instead of a positive lower bound, and keeps `wf-v1`'s
+  `⌈2K/3⌉` holding-fold requirement and pooled one-sided 95% bound. The rule is request-selectable
+  — the MCP `run_walk_forward` tool takes an optional `rule` argument (`wf-v1` by default; an
+  unknown value is refused naming `rule`), the store decoder accepts `wf-v2`, the save gate
+  re-derives every fold and the run verdict under the draft's own rule, and the coach's
+  certification gate re-runs a candidate under the parent's own rule. A new domain function
+  `holdout_test` implements the **C1 holdout test** — the one-sided lower confidence bound of a
+  holdout's expectancy at a family-wise 5% split over the hypothesis budget, `z = z(1 − 0.05/H)` —
+  with its power measured over seeds 1..=1000. `tests/wf_v2_calibration.rs` calibrates the rule (a
+  planted +0.25R edge passes on at least 19 of 20 seeds, a zero-edge series on at most 4, with the
+  exact counts pinned) and `tests/wf_v2_measurement.rs` re-derives ADR-0028's frozen α, power,
+  real-path-null and runtime numbers on demand. **ADR-0028** freezes the rule, the C1 test, the
+  holdout start (2025-07-01, all four pairs) and **H = 12**.
+
 ### Changed
 
 - **Engine-sensitive dependency bumps: `polars` 0.54.4, `zip` 8.6.0, `rust_decimal` 1.42.1.** The
