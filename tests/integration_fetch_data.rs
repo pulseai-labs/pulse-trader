@@ -22,15 +22,15 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::{Datelike, TimeZone, Utc};
 
 use pulse::{
     BinanceDataSource, Candle, CandleSeries, CandleStore, DataError, DataVersion, FakeClock,
     FetchArgs, FundingEvent, MarketDataSource, MonthData, MonthOutcome, MonthSource, PageSource,
-    Pair, TfOutcome, Timeframe, ensure_one_tf, run_fetch_data,
+    Pair, TfOutcome, Timeframe, ensure_one_tf, run_fetch_data, years_window_start_ms,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -229,8 +229,21 @@ fn args(json: bool) -> FetchArgs {
     FetchArgs {
         pair: "BTCUSDT".to_string(),
         tf: vec!["M15".to_string()],
-        years: 1,
+        years: Some(1),
+        from: None,
         json,
+    }
+}
+
+/// The same request through `--from <YYYY-MM-DD>` (r4.s1.w2): the run resolves
+/// its start as the month floor of the given date.
+fn from_args(date: &str) -> FetchArgs {
+    FetchArgs {
+        pair: "BTCUSDT".to_string(),
+        tf: vec!["M15".to_string()],
+        years: None,
+        from: Some(date.to_string()),
+        json: false,
     }
 }
 
@@ -418,7 +431,8 @@ async fn ac8_multi_tf_partial_failure_exits_non_zero_but_keeps_m15() {
     let args = FetchArgs {
         pair: "BTCUSDT".to_string(),
         tf: vec!["M15".to_string(), "H4".to_string()],
-        years: 1,
+        years: Some(1),
+        from: None,
         json: true,
     };
 
@@ -481,7 +495,15 @@ async fn fix4_no_data_first_run_reports_empty_path_and_writes_nothing() {
     let (store, tmp) = store();
     let clock = FakeClock::at(NOW_MS);
 
-    let outcome = ensure_one_tf(&EmptySource, &store, &clock, &btc(), Timeframe::M15, 0).await;
+    let outcome = ensure_one_tf(
+        &EmptySource,
+        &store,
+        &clock,
+        &btc(),
+        Timeframe::M15,
+        years_window_start_ms(NOW_MS, 0),
+    )
+    .await;
     let TfOutcome::Ok(summary) = outcome else {
         panic!("no-data first run must be Ok (up-to-date no-op), not a failure");
     };
@@ -735,7 +757,7 @@ async fn issue_289_interior_hole_still_fails_fetch_data() {
         &FakeClock::at(EARLY_MONTH_NOW_MS),
         &btc(),
         Timeframe::M15,
-        1,
+        years_window_start_ms(EARLY_MONTH_NOW_MS, 1),
     )
     .await;
     assert_failed_with(
@@ -766,7 +788,7 @@ async fn issue_289_two_unpublished_trailing_months_still_fail_fetch_data() {
         &FakeClock::at(EARLY_MONTH_NOW_MS),
         &btc(),
         Timeframe::M15,
-        1,
+        years_window_start_ms(EARLY_MONTH_NOW_MS, 1),
     )
     .await;
     assert_failed_with(
@@ -808,4 +830,238 @@ async fn regression_current_incomplete_month_excluded_from_bulk() {
         .expect("read HEAD")
         .expect("HEAD set");
     assert!(store.snapshot_exists(&btc(), Timeframe::M15, &head));
+}
+
+// ---- r4.s1.w2: `--from` and the backward backfill ---------------------------
+
+/// 2023-06-01T00:00:00Z — the first run's requested start (month-floored).
+const JUN_2023_MS: i64 = 1_685_577_600_000;
+/// 2021-01-01T00:00:00Z — the backfill's requested start.
+const JAN_2021_MS: i64 = 1_609_459_200_000;
+/// 2023-11-01T00:00:00Z — the first millisecond of `NOW_MS`'s UTC month, the
+/// bulk window's exclusive end for a first run at `NOW_MS` (audit C5).
+const NOV_2023_MS: i64 = 1_698_796_800_000;
+
+/// A scripted [`MarketDataSource`] that records every range/since it is asked
+/// for and answers from per-call FIFO queues — the offline bulk + top-up stub
+/// the `--from` backfill tests drive (never the network).
+struct ScriptedSource {
+    bulk_calls: Mutex<Vec<(i64, i64)>>,
+    incremental_calls: Mutex<Vec<i64>>,
+    bulk_replies: Mutex<std::collections::VecDeque<Vec<i64>>>,
+    incremental_replies: Mutex<std::collections::VecDeque<Vec<i64>>>,
+}
+
+impl ScriptedSource {
+    fn new(bulk_replies: Vec<Vec<i64>>, incremental_replies: Vec<Vec<i64>>) -> Self {
+        Self {
+            bulk_calls: Mutex::new(Vec::new()),
+            incremental_calls: Mutex::new(Vec::new()),
+            bulk_replies: Mutex::new(bulk_replies.into()),
+            incremental_replies: Mutex::new(incremental_replies.into()),
+        }
+    }
+
+    fn bulk_calls(&self) -> Vec<(i64, i64)> {
+        lock(&self.bulk_calls).clone()
+    }
+
+    fn incremental_calls(&self) -> Vec<i64> {
+        lock(&self.incremental_calls).clone()
+    }
+}
+
+/// Lock a test stub's queue, tolerating poisoning: a stub has no invariant to
+/// protect, and the canonical crate does not depend on `parking_lot`, so the
+/// guard is recovered rather than unwrapped (`rs-parking-lot`).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl MarketDataSource for ScriptedSource {
+    fn fetch_historical(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> impl Future<Output = Result<CandleSeries, DataError>> {
+        lock(&self.bulk_calls).push((start_ms, end_ms));
+        let opens = lock(&self.bulk_replies).pop_front().unwrap_or_default();
+        let series = CandleSeries {
+            pair: pair.clone(),
+            timeframe: tf,
+            version: DataVersion::new("scripted"),
+            candles: opens.into_iter().map(bulk_candle).collect(),
+        };
+        std::future::ready(Ok(series))
+    }
+
+    fn fetch_incremental(
+        &self,
+        _pair: &Pair,
+        _tf: Timeframe,
+        since_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> {
+        lock(&self.incremental_calls).push(since_ms);
+        let opens = lock(&self.incremental_replies)
+            .pop_front()
+            .unwrap_or_default();
+        std::future::ready(Ok(opens.into_iter().map(bulk_candle).collect()))
+    }
+}
+
+/// Count every `.parquet` file under `dir` (recursively) — "commits once" means
+/// exactly one new snapshot file beside the retained prior one.
+fn count_parquet(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                count_parquet(&path)
+            } else {
+                usize::from(path.extension().is_some_and(|e| e == "parquet"))
+            }
+        })
+        .sum()
+}
+
+/// AC-5 (r4.s1.w2): a `--from` earlier than HEAD's first candle backfills the
+/// missing earlier months through the same bulk path — the range ends at the
+/// prior first candle's month (`+ 1 ms`, so the inclusive-end month walk names
+/// that month) — tops up to now, and commits ONE new snapshot: HEAD moves to a
+/// new `data_version` and the prior file stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_from_backfills_the_missing_months_and_moves_head_once() {
+    let (store, tmp) = store();
+    let clock = FakeClock::at(NOW_MS);
+    let source = ScriptedSource::new(
+        vec![
+            // Run 1 (first run from 2023-06-01): the 2023-06 month.
+            vec![JUN_2023_MS, JUN_2023_MS + M15],
+            // Run 2 (backfill from 2021-01-01): the earlier months, ending on
+            // the prior first candle's own candle.
+            vec![JAN_2021_MS, JAN_2021_MS + M15, JUN_2023_MS],
+        ],
+        vec![vec![], vec![]],
+    );
+
+    run_fetch_data(&source, &store, &clock, &from_args("2023-06-01"))
+        .await
+        .expect("the first --from run writes its snapshot");
+    let head1 = store
+        .read_head(&btc(), Timeframe::M15)
+        .expect("read HEAD")
+        .expect("HEAD set after the first run");
+
+    // The backfill: `ensure_one_tf` answers the summary the `--json` renderer
+    // prints, so the action string is assertable here.
+    let outcome = ensure_one_tf(&source, &store, &clock, &btc(), Timeframe::M15, JAN_2021_MS).await;
+    let TfOutcome::Ok(summary) = outcome else {
+        panic!("the backfill run must succeed");
+    };
+
+    // The bulk ranges: run 1 = [2023-06-01, month start of now); run 2 = the
+    // requested start up to the prior first candle's month + 1 ms.
+    let bulk = source.bulk_calls();
+    assert_eq!(bulk.len(), 2, "one bulk call per run: {bulk:?}");
+    assert_eq!(
+        bulk[0],
+        (JUN_2023_MS, NOV_2023_MS),
+        "run 1's --from bulk window"
+    );
+    assert_eq!(
+        bulk[1],
+        (JAN_2021_MS, JUN_2023_MS + 1),
+        "the backfill bulk ends at the prior first candle's month + 1 ms"
+    );
+    // The backfill's top-up starts at the merged last candle (the prior
+    // snapshot's own tail), not at the requested start.
+    assert_eq!(
+        source.incremental_calls()[1],
+        JUN_2023_MS + M15,
+        "the backfill tops up to now from the merged series' last candle"
+    );
+
+    assert_eq!(summary.action, "backfill", "the action names the backfill");
+    assert_eq!(summary.first_open_ms, Some(JAN_2021_MS));
+
+    let head2 = store
+        .read_head(&btc(), Timeframe::M15)
+        .expect("read HEAD")
+        .expect("HEAD set after the backfill");
+    assert_ne!(head1, head2, "the backfill mints a new data_version");
+    assert!(
+        store.snapshot_exists(&btc(), Timeframe::M15, &head1),
+        "the prior snapshot file is kept (immutable)"
+    );
+    let series = store
+        .read_snapshot(&btc(), Timeframe::M15, &head2)
+        .expect("read backfilled snapshot");
+    let opens: Vec<i64> = series.candles.iter().map(|c| c.open_time).collect();
+    assert_eq!(
+        opens,
+        vec![
+            JAN_2021_MS,
+            JAN_2021_MS + M15,
+            JUN_2023_MS,
+            JUN_2023_MS + M15
+        ],
+        "the new snapshot covers the whole span, deduped on open_time"
+    );
+    assert_eq!(
+        count_parquet(&tmp.path().join("candles")),
+        2,
+        "exactly one new snapshot file beside the retained prior one"
+    );
+}
+
+/// AC-5's other half (reading 3): a `--from` that is **not** earlier than
+/// HEAD's first candle keeps today's incremental path — no bulk call, the
+/// top-up from the prior's last candle, and the `up-to-date` no-op when
+/// nothing newly closed (HEAD unchanged, no new version).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_from_later_than_head_stays_incremental() {
+    let (store, _tmp) = store();
+    let clock = FakeClock::at(NOW_MS);
+    let source = ScriptedSource::new(
+        vec![vec![JUN_2023_MS, JUN_2023_MS + M15]],
+        vec![vec![], vec![]],
+    );
+
+    run_fetch_data(&source, &store, &clock, &from_args("2023-06-01"))
+        .await
+        .expect("the first --from run");
+    let head1 = store
+        .read_head(&btc(), Timeframe::M15)
+        .expect("read HEAD")
+        .expect("HEAD set");
+
+    let outcome = ensure_one_tf(
+        &source,
+        &store,
+        &clock,
+        &btc(),
+        Timeframe::M15,
+        JUN_2023_MS + M15,
+    )
+    .await;
+    let TfOutcome::Ok(summary) = outcome else {
+        panic!("a later start keeps the incremental path");
+    };
+    assert_eq!(summary.action, "up-to-date", "nothing newly closed ⇒ no-op");
+    assert_eq!(
+        source.bulk_calls().len(),
+        1,
+        "a later start never calls the bulk source again"
+    );
+    assert_eq!(
+        store.read_head(&btc(), Timeframe::M15).expect("read HEAD"),
+        Some(head1),
+        "the no-op leaves HEAD unchanged"
+    );
 }

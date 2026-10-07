@@ -75,7 +75,8 @@ pub trait ExchangeAdapter {
     /// # Errors
     ///
     /// Returns [`ExchangeError::UnknownSymbol`] when the adapter has no filters
-    /// pinned for `pair` (v1's `BinanceAdapter` only knows `BTCUSDT`).
+    /// pinned for `pair` (v1's `BinanceAdapter` pins BTCUSDT, ETHUSDT, SOLUSDT
+    /// and XRPUSDT).
     fn symbol_filters(&self, pair: &Pair) -> Result<SymbolFilters, ExchangeError>;
 }
 

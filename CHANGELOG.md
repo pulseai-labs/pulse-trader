@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Four pairs, a start date for `fetch-data`, and pair-validated runs (r4.s1.w2).** ETHUSDT,
+  SOLUSDT and XRPUSDT now fetch, backtest and walk forward exactly as BTCUSDT does: the broker
+  adapter pins each pair's dated USD-M filters (`LOT_SIZE.stepSize`/`minQty`, `MIN_NOTIONAL`, the
+  top leverage tier) and its 8h funding interval beside BTCUSDT's unchanged values; the MCP
+  `run_backtest` and `run_walk_forward` tools take an optional `pair` argument (omitted = today's
+  inheritance; an unknown pair is refused naming `pair`; a known pair with no `HEAD` snapshot is
+  refused naming the pair and the timeframe); and `pulse fetch-data` takes
+  `--from <YYYY-MM-DD>` (UTC, floored to the first of its month, mutually exclusive with
+  `--years`). A `--from` earlier than the snapshot's first candle backfills the missing earlier
+  months through the same bulk + checksum path, tops up to now and commits ONE new snapshot — a
+  new `data_version` with `HEAD` moved and the prior file kept — reported as the `backfill`
+  action. `save_run` validates `inputs.pair` before writing (#148), so a path-hostile symbol can
+  no longer mint an unreadable run row, and the CLI's unknown-pair refusal is covered by a test
+  (#52). The engine fingerprint changes with the broker table, as expected. Refs
+  [#148](https://github.com/pulseai-labs/pulse-trader/issues/148),
+  [#52](https://github.com/pulseai-labs/pulse-trader/issues/52).
+
 ### Changed
 
 - **Safe dependency bumps (r4 chore).** GitHub Actions: `actions/checkout` 7.0.1, `cargo-deny-action` 2.1.1, `install-action` 2.86.8, `upload-artifact` 7.0.1, `download-artifact` 8.0.1. Cargo: `uuid` 1.24.0, `anyhow` 1.0.104, `quinn-proto` 0.11.17 (security). UI dev tooling: `vitest` ^5.0.0 (`vite` stays on ^6.4; the vite 8 move is deferred to r4.s5), plus lockfile-only `undici` 8.11.2 and `source-map-js` 1.2.2. Cargo also takes `xxhash-rust` 0.8.16. Together these clear 13 of the 14 open Dependabot alerts; `glib` (GTK/tauri stack) stays open. No product version bump; `rust_decimal`, `ta`, `polars` and `zip` are unchanged.

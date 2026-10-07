@@ -1230,8 +1230,9 @@ fn require_col<T>(column: &str, value: Option<T>) -> Result<T, DataError> {
 // by this file, and the accept path borrows it.
 // ---------------------------------------------------------------------------
 
-/// The two `DataVersion` tags a run names, checked for path safety BEFORE any
-/// transaction opens.
+/// The run's provenance identities that a consumer joins into store paths,
+/// checked BEFORE any transaction opens: the **pair** (#148, r4.s1.w2) and the
+/// two `DataVersion` tags.
 ///
 /// `DataVersion` is opaque by design but not arbitrary: the adapter joins a tag
 /// verbatim into `<base>/candles/<PAIR>/<TF>/<tag>.parquet`, and a consumer hands a
@@ -1239,10 +1240,19 @@ fn require_col<T>(column: &str, value: Option<T>) -> Result<T, DataError> {
 /// root. Same rule, same reason, as `Pair::parse`. Called before `begin()` so an
 /// unsafe tag persists nothing at all rather than aborting a partly-built write.
 ///
+/// The pair crosses that same boundary on replay: `<base>/candles/<PAIR>/…` is
+/// joined verbatim, and `decode_inputs` re-parses the stored symbol with
+/// `Pair::parse` — so a path-hostile symbol (reachable through the unchecked
+/// `Pair::new`) would leave an immutable row no read can ever decode, wedging
+/// the version's whole run history. `Pair::parse` refuses it up front, and the
+/// transaction never opens.
+///
 /// # Errors
 ///
-/// Returns the `DataError` `ensure_path_safe` raises for an unsafe tag.
+/// Returns the `DataError` `Pair::parse` / `ensure_path_safe` raises for an
+/// unsafe symbol or tag.
 pub(crate) fn check_inputs_path_safe(inputs: &BacktestInputs) -> Result<(), DataError> {
+    Pair::parse(inputs.pair.as_str().to_owned())?;
     inputs.primary.data_version.ensure_path_safe()?;
     if let Some(htf) = inputs.htf.as_ref() {
         htf.data_version.ensure_path_safe()?;
@@ -2129,6 +2139,47 @@ mod tests {
             .await
             .expect("count runs");
         assert_eq!(count, 0, "a rejected save must persist no run row");
+    }
+
+    // ---- #148: save_run validates inputs.pair BEFORE any write ---------------
+
+    /// A path-hostile pair minted through the trusted `Pair::new` (r4.s1.w2,
+    /// #148) must be refused with a typed error and persist NOTHING: `save_run`
+    /// stores `inputs.pair` verbatim, `decode_inputs` re-parses it with
+    /// `Pair::parse` on every read-back, and the symbol is joined into the
+    /// candle-store path on replay — an unvalidated symbol would leave an
+    /// immutable row that wedges every read for the version.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn save_run_refuses_invalid_pair() {
+        let (repo, pool, _tmp) = repo_at(1_700_000_000_000).await;
+        let mut inputs = sample_inputs();
+        inputs.pair = Pair::new("../escaped");
+
+        let trade = simple_trade();
+        let mut breakdown = RegimeBreakdown::new();
+        breakdown.record(trade.regime, trade.realized_pnl);
+        let (result, summary) = result_from(vec![trade], breakdown, SkippedEntryCounts::new());
+
+        let err = repo
+            .save_run(
+                &VersionId::new("ver-1"),
+                &inputs,
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
+            .await
+            .expect_err("a pair `Pair::parse` rejects must refuse the save");
+        assert!(
+            matches!(err, DataError::Parse(_)),
+            "the refusal is the typed parse error naming the symbol; got {err:?}"
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backtest_run")
+            .fetch_one(&pool)
+            .await
+            .expect("count runs");
+        assert_eq!(count, 0, "a refused save must persist no run row");
     }
 
     // ---- AC-4: latest_run_for_version orders by created_at DESC (#40) ---------

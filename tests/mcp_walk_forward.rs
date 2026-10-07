@@ -23,8 +23,14 @@
 
 mod support;
 
-use pulse::{CandleSeriesRepository, CandleStore, Pair, Timeframe};
+use std::path::Path;
+
+use pulse::{
+    BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleStore, Pair,
+    SqliteBacktestRunRepo, SymbolFilters, Timeframe,
+};
 use rmcp::model::CallToolRequestParams;
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use support::mcp::{
     FIXTURE_STORE, Fixture, arguments, call, call_err, copy_tree, manifest, migrated_db,
@@ -38,6 +44,35 @@ use tempfile::TempDir;
 /// since #36 (warm also requires a previous value; was `1_735_702_200_000`).
 const ORACLE_FIRST_WARM_MS: i64 = 1_735_703_100_000;
 
+/// Seed `pair`'s M15 + H4 snapshots into a fixture store copy by re-committing
+/// the fixture's own BTCUSDT series under the new symbol (r4.s1.w2). The store
+/// accepts any pair and the version is content-addressed, so the copy is exact
+/// and no network is touched.
+fn seed_pair_snapshots(store_dir: &Path, pair: &str) {
+    let store = CandleStore::with_base_dir(store_dir.to_path_buf());
+    for tf in [Timeframe::M15, Timeframe::H4] {
+        let candles = store
+            .load_head(&Pair::new("BTCUSDT"), tf)
+            .expect("load the fixture HEAD")
+            .expect("the fixture has a BTCUSDT HEAD")
+            .series
+            .candles;
+        store
+            .commit(&Pair::new(pair), tf, candles)
+            .unwrap_or_else(|e| panic!("commit {pair} {tf:?}: {e}"));
+    }
+}
+
+/// ETHUSDT's pinned filters (the r4.s1.w2 pin table, exchangeInfo 2026-10-07).
+fn ethusdt_filters() -> SymbolFilters {
+    SymbolFilters {
+        lot_step: Decimal::new(1, 3),
+        min_qty: Decimal::new(1, 3),
+        min_notional: Decimal::new(20, 0),
+        max_leverage: Decimal::new(150, 0),
+    }
+}
+
 /// The walk-forward fixture: the version tree PLUS a real run on the PARENT —
 /// the child's `run_walk_forward` resolves its snapshot pins off that row, the
 /// same inherit-first path `run_backtest` uses (the `mcp_write` fixture shape).
@@ -49,6 +84,9 @@ async fn wf_fixture() -> (Fixture, rmcp::service::RunningService<rmcp::RoleClien
     let tmp_store = TempDir::new().unwrap();
     let store_dir = tmp_store.path().join("store");
     copy_tree(&manifest(FIXTURE_STORE), &store_dir);
+    // r4.s1.w2: the `pair` argument's override case needs a non-BTCUSDT pair
+    // carrying real HEAD snapshots.
+    seed_pair_snapshots(&store_dir, "ETHUSDT");
 
     let parent_run = seed_real_run(&db, &store_dir, &parent).await;
 
@@ -514,6 +552,170 @@ async fn windowed_run_backtest_still_records_its_full_history_lead_in() {
         rfc3339_millis(first_open).as_str(),
         "a windowed run warms on the full snapshot — the recorded lead-in is its first candle"
     );
+
+    client.cancel().await.expect("cancel session");
+}
+
+// ---- r4.s1.w2: the optional `pair` argument --------------------------------
+
+/// The override runs the named pair: `run_backtest` with `pair: "ETHUSDT"`
+/// persists a run whose `inputs.pair` is ETHUSDT with ETHUSDT's pinned filters,
+/// even though the child inherits its lineage's BTCUSDT pairing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pair_argument_overrides_the_inherited_pair() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    let result = call(
+        &client,
+        "run_backtest",
+        json!({ "version_id": child.as_str(), "pair": "ETHUSDT" }),
+    )
+    .await;
+    assert_eq!(
+        result["run"]["inputs"]["pair"], "ETHUSDT",
+        "the run detail names the override: {result}"
+    );
+
+    let runs = SqliteBacktestRunRepo::new(fixture.db.pool().clone());
+    let run_id = result["run_id"].as_str().expect("run id");
+    let stored = runs
+        .get_run(&BacktestRunId::new(run_id.to_owned()))
+        .await
+        .expect("get_run")
+        .expect("the run row exists");
+    let inputs = stored.inputs.expect("a fresh run records its inputs");
+    assert_eq!(inputs.pair, Pair::new("ETHUSDT"));
+    assert_eq!(
+        inputs.symbol_filters,
+        Some(ethusdt_filters()),
+        "the run records ETHUSDT's pinned filters, read through the port"
+    );
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// The override reaches the walk-forward and every fold run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pair_argument_overrides_the_walk_forward_pair() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    let detail = call(
+        &client,
+        "run_walk_forward",
+        json!({ "version_id": child.as_str(), "pair": "ETHUSDT", "k": 2 }),
+    )
+    .await;
+    assert_detail_shape(&detail, 2);
+
+    let runs = SqliteBacktestRunRepo::new(fixture.db.pool().clone());
+    for fold in detail["folds"].as_array().expect("folds") {
+        let run_id = fold["backtest_run_id"].as_str().expect("fold run id");
+        let stored = runs
+            .get_run(&BacktestRunId::new(run_id.to_owned()))
+            .await
+            .expect("get_run")
+            .expect("the fold run exists");
+        let inputs = stored.inputs.expect("a fold records its inputs");
+        assert_eq!(inputs.pair, Pair::new("ETHUSDT"), "fold {run_id}");
+        assert_eq!(inputs.symbol_filters, Some(ethusdt_filters()));
+    }
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// An omitted `pair` changes nothing: the run inherits BTCUSDT from the
+/// version's run lineage exactly as before (r4.s1.w2's compatibility half).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omitted_pair_argument_inherits_as_before() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    let result = call(
+        &client,
+        "run_backtest",
+        json!({ "version_id": child.as_str() }),
+    )
+    .await;
+    assert_eq!(result["run"]["inputs"]["pair"], "BTCUSDT", "{result}");
+
+    let runs = SqliteBacktestRunRepo::new(fixture.db.pool().clone());
+    let run_id = result["run_id"].as_str().expect("run id");
+    let stored = runs
+        .get_run(&BacktestRunId::new(run_id.to_owned()))
+        .await
+        .expect("get_run")
+        .expect("the run row exists");
+    assert_eq!(
+        stored.inputs.expect("inputs").pair,
+        Pair::new("BTCUSDT"),
+        "no override ⇒ the inherited pair"
+    );
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// A pair the run's own exchange adapter does not know — or one that fails
+/// `Pair::parse` — is a `pair` field error naming the symbol, on both run
+/// tools, before any request is resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_pair_argument_is_a_field_error_naming_pair() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    for (pair, named) in [("DOGEUSDT", "DOGEUSDT"), ("ethusdt", "ethusdt")] {
+        let err = call_err(
+            &client,
+            "run_backtest",
+            json!({ "version_id": child.as_str(), "pair": pair }),
+        )
+        .await;
+        assert_eq!(err["field"], "pair", "{err}");
+        assert!(
+            err["message"].as_str().is_some_and(|m| m.contains(named)),
+            "the refusal names the symbol: {err}"
+        );
+    }
+
+    let err = call_err(
+        &client,
+        "run_walk_forward",
+        json!({ "version_id": child.as_str(), "pair": "DOGEUSDT", "k": 2 }),
+    )
+    .await;
+    assert_eq!(err["field"], "pair", "{err}");
+
+    client.cancel().await.expect("cancel session");
+}
+
+/// A KNOWN pair with no HEAD snapshot for a needed timeframe returns the
+/// existing missing-snapshot refusal, naming the pair and the timeframe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pair_argument_without_a_snapshot_refuses_by_name() {
+    let (fixture, client) = wf_fixture().await;
+    let (_parent, child, _run) = &fixture.seed;
+
+    // XRPUSDT is pinned by the adapter but the fixture store has no snapshot.
+    let err = call_err(
+        &client,
+        "run_backtest",
+        json!({ "version_id": child.as_str(), "pair": "XRPUSDT" }),
+    )
+    .await;
+    let message = err["message"].as_str().expect("message");
+    assert!(message.contains("XRPUSDT"), "names the pair: {err}");
+    assert!(message.contains("15m"), "names the timeframe: {err}");
+
+    let err = call_err(
+        &client,
+        "run_walk_forward",
+        json!({ "version_id": child.as_str(), "pair": "XRPUSDT", "k": 2 }),
+    )
+    .await;
+    let message = err["message"].as_str().expect("message");
+    assert!(message.contains("XRPUSDT"), "names the pair: {err}");
+    assert!(message.contains("15m"), "names the timeframe: {err}");
 
     client.cancel().await.expect("cancel session");
 }
