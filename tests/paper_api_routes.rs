@@ -280,7 +280,8 @@ async fn i_uncertified_and_empty_reason_refuse_without_writing() {
 
 /// Round 3 (Codex): an override naming a pair the exchange adapter does not
 /// know is 422 `validation`, and no row is written — the runtime could never
-/// attach it.
+/// attach it. r4.s1.w2 pinned ETHUSDT, so the still-unsupported symbol is
+/// DOGEUSDT.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i_an_override_with_an_unsupported_pair_refuses_without_writing() {
     let ts = paper_server().await;
@@ -292,7 +293,7 @@ async fn i_an_override_with_an_unsupported_pair_refuses_without_writing() {
             "version_id": version_id.as_str(),
             "override": {
                 "reason": "promoting early on purpose",
-                "pair": "ETHUSDT",
+                "pair": "DOGEUSDT",
                 "primary_timeframe": "15m",
                 "htf_timeframe": "4h",
                 "uses_d1": false,

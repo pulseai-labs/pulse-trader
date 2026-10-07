@@ -428,10 +428,13 @@ fn short_counted_span_still_refuses_an_unstamped_boundary_inside_it() {
 /// A pair with no pinned funding interval is refused with a named error rather
 /// than silently defaulted. The series itself is structurally sound and fully
 /// stamped, so the refusal that fires is the interval one.
+///
+/// r4.s1.w2: ETHUSDT is pinned now (the four-pair table), so the still-unknown
+/// symbol is DOGEUSDT — outside the adapter's table.
 #[test]
 fn unknown_pair_is_refused_with_a_named_error() {
     let primary = series_for(
-        "ETHUSDT",
+        "DOGEUSDT",
         vec![raw_m15(0), raw_m15(1), raw_m15(2), raw_m15(3)],
     );
     let err = run(&primary, None, None)
@@ -441,7 +444,7 @@ fn unknown_pair_is_refused_with_a_named_error() {
         "the refusal must be the typed unknown-interval error; got {err:?}"
     );
     assert!(
-        err.to_string().contains("ETHUSDT"),
+        err.to_string().contains("DOGEUSDT"),
         "the refusal must name the pair; got {err}"
     );
 }

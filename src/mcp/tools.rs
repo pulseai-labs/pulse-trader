@@ -32,11 +32,12 @@ use rmcp::{ErrorData as McpError, tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{RunReadFailure, SqliteBacktestRunRepo, SqliteStrategyRepo};
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
-    BacktestAppError, resolve_default_request, run_version_backtest,
+    BacktestAppError, SnapshotPins, resolve_default_request, run_version_backtest,
 };
 use crate::application::mcp_read::{
     parse_indicator_specs, run_detail, run_list_entry, strategy_entry, version_detail,
@@ -53,9 +54,9 @@ use crate::application::walk_forward_read::{
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
-    CompiledValue, DataError, DataVersion, EvalContext, MfeMaeAggregates, Pair, PaperSessionId,
-    PersistedRun, Series, StrategyRepository, Timeframe, ValidationCode, WalkForwardRunId,
-    WalkForwardRunRepository,
+    CompiledValue, DataError, DataVersion, EvalContext, ExchangeAdapter as _, MfeMaeAggregates,
+    Pair, PaperSessionId, PersistedRun, Series, StrategyRepository, Timeframe, ValidationCode,
+    WalkForwardRunId, WalkForwardRunRepository,
 };
 
 use super::PulseMcp;
@@ -168,12 +169,19 @@ pub(crate) struct SubmitStrategyVersionArgs {
 }
 
 /// `run_backtest` args (r2.s1.w3). `from`/`to` are RFC 3339 UTC timestamps —
-/// both or neither.
+/// both or neither. `pair` (r4.s1.w2) is an optional override of the pair the
+/// resolver would otherwise inherit.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunBacktestArgs {
     /// The strategy-version id to run.
     version_id: String,
+    /// Optional `Binance` pair symbol (e.g. `ETHUSDT`) overriding the pair the
+    /// version's run lineage would inherit. An unknown pair is refused naming
+    /// `pair`; a known pair with no `HEAD` snapshot refuses naming the pair and
+    /// the timeframe.
+    #[serde(default)]
+    pair: Option<String>,
     /// Inclusive window start, RFC 3339 (e.g. `2025-03-01T00:00:00Z`). Must be
     /// paired with `to`.
     #[serde(default)]
@@ -186,12 +194,18 @@ pub(crate) struct RunBacktestArgs {
 /// `run_walk_forward` args (r2.s3.w5). `from`/`to` are RFC 3339 UTC timestamps —
 /// **each independent**, unlike `run_backtest`'s both-or-neither window: an
 /// omitted `from` defaults to the first fully-warm bar, an omitted `to` to the
-/// snapshot's last candle's `close_time`.
+/// snapshot's last candle's `close_time`. `pair` (r4.s1.w2) is an optional
+/// override of the pair the resolver would otherwise inherit.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunWalkForwardArgs {
     /// The strategy-version id to walk forward.
     version_id: String,
+    /// Optional `Binance` pair symbol (e.g. `SOLUSDT`) overriding the inherited
+    /// pair. An unknown pair is refused naming `pair`; a known pair with no
+    /// `HEAD` snapshot refuses naming the pair and the timeframe.
+    #[serde(default)]
+    pair: Option<String>,
     /// The counted span's inclusive start, RFC 3339; omitted defaults to the
     /// first fully-warm bar.
     #[serde(default)]
@@ -232,6 +246,49 @@ pub(crate) struct ListPaperSessionsArgs {}
 pub(crate) struct PaperSessionArgs {
     /// The paper-session id.
     session_id: String,
+}
+
+/// Validate an optional MCP `pair` argument (r4.s1.w2) through the run's own
+/// exchange adapter, and answer the override it names.
+///
+/// `Ok(None)` when no `pair` was given — the resolver's inherited pairing
+/// stands. `Err(result)` is the ready-to-return `pair` field error: the symbol
+/// failed the `Pair::parse` shape check, or the adapter — [`PulseMcp`]'s
+/// `BinanceAdapter`, the same port the run resolves its filters through — has
+/// no pin for it. The refusal runs no request and touches no network.
+fn pair_override(
+    exchange: BinanceAdapter,
+    raw: Option<&str>,
+) -> Result<Option<Pair>, CallToolResult> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let pair = Pair::parse(raw.to_owned())
+        .map_err(|e| field_error("pair", format!("invalid pair {raw:?}: {e}")))?;
+    if let Err(e) = exchange.symbol_filters(&pair) {
+        return Err(field_error("pair", format!("cannot run {pair}: {e}")));
+    }
+    Ok(Some(pair))
+}
+
+/// Apply a validated `pair` override to a resolved request (r4.s1.w2).
+///
+/// A **differing** pair clears the inherited snapshot pins: the pins name the
+/// other pair's exact `data_version`s, and the new pair must resolve its own
+/// `HEAD` snapshots — a pin is only meaningful for the pair it was recorded
+/// under. An identical pair keeps the pins, so naming the inherited pair
+/// changes nothing.
+fn apply_pair_override(
+    pair: &mut Pair,
+    snapshots: &mut Option<SnapshotPins>,
+    override_pair: Option<&Pair>,
+) {
+    if let Some(override_pair) = override_pair
+        && override_pair != pair
+    {
+        *pair = override_pair.clone();
+        *snapshots = None;
+    }
 }
 
 /// One tool error in the `{"field", "message"}` shape.
@@ -443,6 +500,12 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
     match err {
         BacktestAppError::WindowEmpty { .. } => field_error("window", err),
         BacktestAppError::VersionNotFound(_) => field_error("version_id", err),
+        // The run's own exchange adapter does not know the pair (r4.s1.w2):
+        // the offending member is the `pair` argument (or the inherited pair
+        // the run's lineage names), so the refusal points there.
+        BacktestAppError::ExchangeFilters(crate::domain::ExchangeError::UnknownSymbol(_)) => {
+            field_error("pair", err)
+        }
         BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
             field_error("dsl", err)
         }
@@ -965,9 +1028,11 @@ impl PulseMcp {
     /// slice `[from, to)`: both series still load from the snapshot's start so
     /// the engines step every bar before `from` and arrive warm (r2.s3.w2);
     /// the window and the lead-in start record on the run's `inputs.window`
-    /// and `inputs.lead_in_from`.
+    /// and `inputs.lead_in_from`. An optional `pair` (r4.s1.w2) overrides the
+    /// inherited pair — validated through the run's own exchange adapter — and
+    /// clears the inherited snapshot pins when it differs.
     #[tool(
-        description = "Run a backtest of one strategy version. Optional from/to (RFC 3339, both or neither) count only the candles in [from, to) while indicators warm on the full history before `from`. Defaults resolve from the version's parent run, then its own latest run, then app defaults."
+        description = "Run a backtest of one strategy version. Optional from/to (RFC 3339, both or neither) count only the candles in [from, to) while indicators warm on the full history before `from`. Optional pair (e.g. ETHUSDT) overrides the pair the version's lineage would inherit; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe. Defaults resolve from the version's parent run, then its own latest run, then app defaults."
     )]
     async fn run_backtest(
         &self,
@@ -981,13 +1046,25 @@ impl PulseMcp {
         let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
         let version_id = VersionId::new(args.version_id);
-        let request = match resolve_default_request(&strategies, &runs, &version_id, window).await {
-            Ok(request) => request,
-            Err(e @ BacktestAppError::VersionNotFound(_)) => {
-                return Ok(field_error("version_id", e));
-            }
-            Err(e) => return Ok(backtest_error_result(&e)),
+        // r4.s1.w2: the optional `pair` override is validated first — the
+        // symbol's shape, then the run's own exchange adapter's pin table.
+        let override_pair = match pair_override(self.state.exchange, args.pair.as_deref()) {
+            Ok(pair) => pair,
+            Err(result) => return Ok(result),
         };
+        let mut request =
+            match resolve_default_request(&strategies, &runs, &version_id, window).await {
+                Ok(request) => request,
+                Err(e @ BacktestAppError::VersionNotFound(_)) => {
+                    return Ok(field_error("version_id", e));
+                }
+                Err(e) => return Ok(backtest_error_result(&e)),
+            };
+        apply_pair_override(
+            &mut request.pair,
+            &mut request.snapshots,
+            override_pair.as_ref(),
+        );
         let outcome = match run_version_backtest(
             &strategies,
             &self.state.candles,
@@ -1025,9 +1102,11 @@ impl PulseMcp {
     /// cost model and the exact snapshot pins resolve through the same
     /// [`resolve_default_request`] seam `run_backtest` uses — the surfaces run a
     /// version identically — and the answer is the one `WalkForwardRunDetail`
-    /// shape, built from the saved rows.
+    /// shape, built from the saved rows. An optional `pair` (r4.s1.w2) overrides
+    /// the inherited pair — validated through the run's own exchange adapter —
+    /// and clears the inherited snapshot pins when it differs.
     #[tool(
-        description = "Walk one strategy version forward: rolling-oos/v1 cuts the counted span into K contiguous out-of-sample folds (k in 2..=12, default 6) and judges the run under wf-v1. Each fold is an ordinary persisted windowed backtest run with full-history lead-in — visible through list_runs and get_run with its walk_forward membership. Optional from/to are RFC 3339 bounds given independently: `from` defaults to the first fully-warm bar, `to` to the snapshot's last close."
+        description = "Walk one strategy version forward: rolling-oos/v1 cuts the counted span into K contiguous out-of-sample folds (k in 2..=12, default 6) and judges the run under wf-v1. Each fold is an ordinary persisted windowed backtest run with full-history lead-in — visible through list_runs and get_run with its walk_forward membership. Optional from/to are RFC 3339 bounds given independently: `from` defaults to the first fully-warm bar, `to` to the snapshot's last close. Optional pair (e.g. SOLUSDT) overrides the inherited pair; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe."
     )]
     async fn run_walk_forward(
         &self,
@@ -1045,17 +1124,28 @@ impl PulseMcp {
         let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
         let version_id = VersionId::new(args.version_id);
+        // r4.s1.w2: the same validated `pair` override `run_backtest` takes.
+        let override_pair = match pair_override(self.state.exchange, args.pair.as_deref()) {
+            Ok(pair) => pair,
+            Err(result) => return Ok(result),
+        };
         // The shared resolver supplies pair, timeframes, costs and pins; the
         // walk-forward's own `from`/`to` are NOT its `window` (the backtest
         // window is a both-or-neither pair — these bounds are independent), so
         // `window` stays `None` here and the counted span resolves inside.
-        let resolved = match resolve_default_request(&strategies, &runs, &version_id, None).await {
-            Ok(request) => request,
-            Err(e @ BacktestAppError::VersionNotFound(_)) => {
-                return Ok(field_error("version_id", e));
-            }
-            Err(e) => return Ok(backtest_error_result(&e)),
-        };
+        let mut resolved =
+            match resolve_default_request(&strategies, &runs, &version_id, None).await {
+                Ok(request) => request,
+                Err(e @ BacktestAppError::VersionNotFound(_)) => {
+                    return Ok(field_error("version_id", e));
+                }
+                Err(e) => return Ok(backtest_error_result(&e)),
+            };
+        apply_pair_override(
+            &mut resolved.pair,
+            &mut resolved.snapshots,
+            override_pair.as_ref(),
+        );
         let request = WalkForwardRequest {
             version_id,
             pair: resolved.pair,

@@ -12,7 +12,10 @@
 //! `NoStopLoss`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::path::PathBuf;
 use std::process::Command;
+
+use pulse::{CandleSeriesRepository, CandleStore, Pair, Timeframe};
 
 /// A minimal, valid DSL document (serde JSON) — long RSI-oversold with a 5% stop
 /// (1R), a 2R take-profit, and 1% risk per trade. Decimals serialize as strings
@@ -280,5 +283,72 @@ fn d1_primary_timeframe_is_refused_before_any_store_read() {
     assert!(
         stderr.contains("must not be D1"),
         "the refusal must name the D1 primary; stderr was:\n{stderr}"
+    );
+}
+
+/// r4.s1.w2 (#52): `pulse backtest` on a pair the exchange adapter does not
+/// know exits non-zero with a message naming the pair — the refusal comes from
+/// the adapter port, offline — while the three new pairs (ETHUSDT, SOLUSDT,
+/// XRPUSDT) run the same fixture snapshot exactly as BTCUSDT does.
+#[test]
+fn backtest_cli_unknown_pair_is_refused_while_the_new_pairs_run() {
+    // A temp store seeded per pair from the committed BTCUSDT fixture — the
+    // store accepts any pair, so the three new pairs get real HEAD snapshots,
+    // and DOGEUSDT is seeded too so ITS refusal is the adapter's unknown symbol
+    // rather than a missing snapshot.
+    let fixture = CandleStore::with_base_dir(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/btcusdt-1m-store"),
+    );
+    let m15 = fixture
+        .load_head(&Pair::new("BTCUSDT"), Timeframe::M15)
+        .expect("load the fixture HEAD")
+        .expect("the fixture has a BTCUSDT M15 HEAD")
+        .series
+        .candles;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let store_dir = tmp.path().join("store");
+    let store = CandleStore::with_base_dir(store_dir.clone());
+    for pair in ["ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"] {
+        store
+            .commit(&Pair::new(pair), Timeframe::M15, m15.clone())
+            .unwrap_or_else(|e| panic!("commit {pair}: {e}"));
+    }
+    let store_arg = store_dir.to_str().expect("store path is utf8");
+
+    let (_dir, dsl_path) = write_minimal_dsl();
+
+    // The three new pairs take the ordinary path: exit 0 over their snapshots.
+    for pair in ["ETHUSDT", "SOLUSDT", "XRPUSDT"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
+            .args([
+                "backtest", "--dsl", &dsl_path, "--pair", pair, "--tf", "M15", "--store", store_arg,
+            ])
+            .output()
+            .expect("run pulse backtest");
+        assert!(
+            output.status.success(),
+            "{pair} must run like BTCUSDT does; status={:?}\nstderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The unknown pair is refused, naming the pair.
+    let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "backtest", "--dsl", &dsl_path, "--pair", "DOGEUSDT", "--tf", "M15", "--store",
+            store_arg,
+        ])
+        .output()
+        .expect("run pulse backtest on an unknown pair");
+    assert!(
+        !output.status.success(),
+        "an unknown pair must exit non-zero; stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("DOGEUSDT"),
+        "the refusal must name the pair; stderr was:\n{stderr}"
     );
 }
