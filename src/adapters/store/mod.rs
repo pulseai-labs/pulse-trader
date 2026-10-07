@@ -96,8 +96,9 @@ impl CandleStore {
         parquet::encode(series, CANDLE_SCHEMA_VERSION)
     }
 
-    /// Normalize writer-version footer metadata for a byte-stability comparison
-    /// (audit C6 / AC-2).
+    /// Blank the footer `created_by` string for a SAME-writer-version
+    /// byte-stability comparison (audit C6 / AC-2) — not the store's snapshot
+    /// equivalence rule, which is content-based (`content_equivalent`).
     ///
     /// # Errors
     ///
@@ -530,15 +531,28 @@ fn snapshot_version_of(path: &Path) -> Option<DataVersion> {
     DataVersion::parse(stem).ok()
 }
 
-/// Two snapshots are content-equivalent if their writer-normalized bytes match
-/// (audit C6). A non-Parquet tamper (which fails to parse) is treated as a
-/// difference, not an error, so the collision path (AC-4) is reached.
+/// Two snapshots are content-equivalent when they hold the same candles and the
+/// same embedded provenance. Writer-version-dependent footer metadata is
+/// deliberately NOT part of that comparison: the `created_by` string a writer
+/// embeds changes with the writer's version (and so does its length), and a byte
+/// image normalized by blanking that string cannot recognize a snapshot written
+/// by another writer version. A snapshot whose *content* is the same is the same
+/// snapshot — which is what makes a re-write after a Polars upgrade idempotent
+/// again (#5) — while a same-path file holding different candles is still a
+/// collision.
+///
+/// A non-Parquet tamper (which fails to decode) is treated as a difference, not
+/// an error, so the collision path (AC-4) is reached.
 fn content_equivalent(existing: &[u8], incoming: &[u8]) -> Result<bool, DataError> {
-    let Ok(norm_existing) = parquet::normalize_writer_metadata(existing) else {
+    let Ok(existing_candles) = parquet::decode_candles(existing) else {
         return Ok(false);
     };
-    let norm_incoming = parquet::normalize_writer_metadata(incoming)?;
-    Ok(norm_existing == norm_incoming)
+    let Ok(existing_provenance) = parquet::decode_provenance(existing) else {
+        return Ok(false);
+    };
+    let incoming_candles = parquet::decode_candles(incoming)?;
+    let incoming_provenance = parquet::decode_provenance(incoming)?;
+    Ok(existing_candles == incoming_candles && existing_provenance == incoming_provenance)
 }
 
 /// Build a `DataError::Io` from a context string and an error.

@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Engine-sensitive dependency bumps: `polars` 0.54.4, `zip` 8.6.0, `rust_decimal` 1.42.1.** The
+  three pins move together under the determinism gate: the determinism lanes, the golden fixture
+  and every `data_version` stay identical, and the engine fingerprint moves (it hashes
+  `Cargo.lock`, which is expected). `polars` 0.54.4 requires `chrono ^0.4.42` where 0.53 pinned
+  `<=0.4.41`, so `chrono` 0.4.41 → 0.4.45 rides along; `ta`, `sqlx` and every other direct pin are
+  unchanged. Refs [#59](https://github.com/pulseai-labs/pulse-trader/issues/59),
+  [#60](https://github.com/pulseai-labs/pulse-trader/issues/60),
+  [#61](https://github.com/pulseai-labs/pulse-trader/issues/61).
+
+- **The lockfile guard is a script CI runs.** `scripts/check-lockfile-guard.sh` checks
+  `build_support/lockfile-guard.txt` against `Cargo.lock` and fails — naming the crate — when a
+  listed crate's version differs, the crate appears twice, or it is missing. A bump of a guarded
+  crate (`polars` + `polars-*`, `rust_decimal`, `ta`, `zip`, `sqlx` + `sqlx-*`) now takes a visible
+  edit of the guard file.
+
+- **A snapshot re-write after a writer-version change is idempotent again**
+  ([#5](https://github.com/pulseai-labs/pulse-trader/issues/5)). `CandleStore::write_snapshot`
+  reconciles a re-write against the file at the same content-addressed path by comparing the
+  decoded candles and provenance instead of a byte image that carried the writer's `created_by`
+  string, so a snapshot written by a different Polars version no longer wrongly returns
+  `SnapshotExists`; a same-path file holding different candles is still refused.
+
 - **Safe dependency bumps (r4 chore).** GitHub Actions: `actions/checkout` 7.0.1, `cargo-deny-action` 2.1.1, `install-action` 2.86.8, `upload-artifact` 7.0.1, `download-artifact` 8.0.1. Cargo: `uuid` 1.24.0, `anyhow` 1.0.104, `quinn-proto` 0.11.17 (security). UI dev tooling: `vitest` ^5.0.0 (`vite` stays on ^6.4; the vite 8 move is deferred to r4.s5), plus lockfile-only `undici` 8.11.2 and `source-map-js` 1.2.2. Cargo also takes `xxhash-rust` 0.8.16. Together these clear 13 of the 14 open Dependabot alerts; `glib` (GTK/tauri stack) stays open. No product version bump; `rust_decimal`, `ta`, `polars` and `zip` are unchanged.
 
 - **The coach turn got its own output cap, transport timeout and temperature.** A

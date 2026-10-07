@@ -37,6 +37,14 @@ jobs:
       - name: Clippy (warnings as errors)
         run: cargo clippy --all-targets -- -D warnings
 
+      # r4.s1.w1: the OQ-C lockfile guard. The determinism-sensitive pins
+      # (`polars` + `polars-*`, `rust_decimal`, `ta`, `zip`, `sqlx` + `sqlx-*`)
+      # must match `build_support/lockfile-guard.txt` exactly, so bumping one is
+      # a visible edit of that file. Cheap (no toolchain work) and it fails by
+      # name, so it runs before the tests below.
+      - name: Lockfile guard (guarded crates must match build_support/lockfile-guard.txt)
+        run: bash scripts/check-lockfile-guard.sh
+
       - name: Tests (nextest)
         run: cargo nextest run
 
