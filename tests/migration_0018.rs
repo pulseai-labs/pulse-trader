@@ -571,7 +571,7 @@ async fn down_round_trips_when_empty() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(max, 19, "the re-run restores the embedded max");
+    assert_eq!(max, 20, "the re-run restores the embedded max");
     let present: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'paper_session'",
     )

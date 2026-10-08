@@ -827,3 +827,24 @@ pub use crate::tauri::{
 pub fn run() -> anyhow::Result<()> {
     cli::run()
 }
+
+// r4.s1.w5 (spec A4/C5): the app's full certification-record read — the wire
+// shapes and the transport-free core behind `POST /api/v1/certification-records`
+// and the `certification_records` bus command (ADR-0020: additive only).
+pub use crate::tauri::{
+    CertificationRecordDto, CertificationRecordsDto, CertificationRecordsRequest,
+    CertificationSelectionDto, certification_records_core,
+};
+
+// r4.s1.w5 (spec A2/A3, G7/C1/C4/C5): the certification step and its record.
+// The step is the ONE caller allowed to evaluate the holdout (grill Q4); its
+// store is the certification table's only writer. Surfaced for the MCP tool,
+// the app's read and the integration suites. REQUIRED under `deny(warnings)` +
+// `pub(crate) mod adapters`/`domain` — a new public type unused outside its
+// module is a `dead_code` build error, not a warning.
+pub use adapters::db::SqliteCertificationRepo;
+pub use application::certification::{CertifyOutcome, CertifyRequest, certify_version};
+pub use domain::{
+    CertificationDraft, CertificationInputs, CertificationRecord, CertificationRepository,
+    CertifyError, CertifyRefusal,
+};

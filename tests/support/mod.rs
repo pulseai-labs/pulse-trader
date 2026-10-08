@@ -6,6 +6,11 @@
 //! `call_tool` plumbing — instead of forking it.
 
 pub mod mcp;
+// r4.s1.w5: the certification suites' shared world — a migrated DB, a
+// synthetic candle store with `HEAD`, one version and an open H = 12 freeze,
+// driven by `tests/certification_holdout.rs` (AC-1) and
+// `tests/mcp_certify_version.rs` (AC-2) so the two cannot drift.
+pub mod certification;
 // r4.s1.w3: the wf-v2 calibration's deterministic generator, shared by the
 // calibration test and the measurement harness so both draw one stream.
 pub mod rng;

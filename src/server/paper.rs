@@ -39,7 +39,8 @@ use super::{ServerState, ops};
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
-    SqliteBacktestRunRepo, SqliteClientTokenRepo, SqlitePaperSessionRepo, SqliteStrategyRepo,
+    SqliteBacktestRunRepo, SqliteCertificationRepo, SqliteClientTokenRepo, SqlitePaperSessionRepo,
+    SqliteStrategyRepo,
 };
 use crate::adapters::store::CandleStore;
 use crate::application::paper::{OverrideRequest, PaperPromotionError, promote};
@@ -167,12 +168,14 @@ async fn promote_route(state: Arc<ServerState>, req: Request) -> Response {
     let strategies = SqliteStrategyRepo::new(state.db.pool().clone());
     let runs = SqliteBacktestRunRepo::new(state.db.pool().clone());
     let version_id = VersionId::new(body.version_id);
+    let certifications = SqliteCertificationRepo::new(state.db.pool().clone());
     match promote(
         &strategies,
         &runs,
         &runs,
         &paper,
         &SystemClock,
+        &certifications,
         &version_id,
         promotion_override.as_ref(),
         promoted_by,

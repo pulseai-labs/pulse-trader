@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COALESCE(MAX(hypothesis_index), 0) + 1 AS \"next!: i64\"\n               FROM certification WHERE freeze_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "next!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "25b2c8e937ce46b007c9dc78c6be2064edc70b19606b57f36f8847742c17a11f"
+}

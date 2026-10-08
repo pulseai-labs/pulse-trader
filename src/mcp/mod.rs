@@ -125,7 +125,11 @@ impl ServerHandler for PulseMcp {
              Walk-forward tools: run_walk_forward (walk a version over \
              rolling-oos/v1 folds judged by wf-v1, the default, or wf-v2) and \
              get_walk_forward_run \
-             (read one persisted walk-forward run back). The \
+             (read one persisted walk-forward run back). Certification tool: \
+             certify_version (one call = one hypothesis — walk a version \
+             forward under wf-v2 on the search span, judge its ONE holdout \
+             backtest with the C1 test at the open freeze's budget H, and \
+             record it; the answer carries no holdout number). The \
              pulse://dsl/schema resource carries the DSL grammar.",
         )
     }

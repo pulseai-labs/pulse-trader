@@ -12,15 +12,17 @@
 //! There is no route and no CLI verb: w4 wires the API surface. The gate's
 //! typed refusals travel out as [`PaperPromotionError::Refused`].
 
-use crate::domain::backtest::BacktestInputs;
+use crate::domain::backtest::{BacktestInputs, VerdictRule, WalkForwardRun};
+use crate::domain::certification::CertificationRecord;
 use crate::domain::paper::gate::{
     PromotionDraft, PromotionOverride, PromotionRefused, decide_promotion,
 };
 use crate::domain::paper::session::{Graduation, NonEmptyLabel, NonEmptyReason, PaperSession};
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestRunRepository, Clock, DataError, EngineFingerprint, Pair, PaperSessionRepository,
-    StrategyRepository, Timeframe, WalkForwardRunRepository, compile, validate,
+    BacktestRunRepository, CertificationRepository, Clock, DataError, EngineFingerprint, Pair,
+    PaperSessionRepository, StrategyRepository, Timeframe, WalkForwardRunRepository, compile,
+    validate,
 };
 
 /// Why a promotion could not complete. The gate's refusals are typed through;
@@ -84,12 +86,13 @@ pub struct OverrideRequest {
 /// [`PaperPromotionError::UnknownVersion`] for an absent version, and
 /// [`PaperPromotionError::Data`] for store failures.
 #[allow(clippy::too_many_arguments)] // the five injected ports + the request trio — every argument is a named seam, the engine.rs precedent
-pub async fn promote<S, W, R, P, C>(
+pub async fn promote<S, W, R, P, C, T>(
     strategies: &S,
     walk_forwards: &W,
     runs: &R,
     paper: &P,
     clock: &C,
+    certifications: &T,
     version_id: &VersionId,
     promotion_override: Option<&OverrideRequest>,
     promoted_by: NonEmptyLabel,
@@ -100,6 +103,7 @@ where
     R: BacktestRunRepository,
     P: PaperSessionRepository,
     C: Clock,
+    T: CertificationRepository,
 {
     let version = strategies
         .get_version(version_id)
@@ -107,13 +111,15 @@ where
         .map_err(PaperPromotionError::Data)?
         .ok_or_else(|| PaperPromotionError::UnknownVersion(version_id.clone()))?;
 
-    let certifying_run = match &version.latest_walk_forward_run_id {
+    let latest_run = match &version.latest_walk_forward_run_id {
         Some(run_id) => walk_forwards
             .get_walk_forward_run(run_id)
             .await
             .map_err(PaperPromotionError::Data)?,
         None => None,
     };
+    let (certifying_run, certification) =
+        certifying_run(walk_forwards, certifications, version_id, latest_run).await?;
 
     // The fold runs' recorded inputs, in fold order — the certification's
     // data provenance. A fold run that cannot be read, or one whose `inputs`
@@ -148,6 +154,7 @@ where
     let draft: PromotionDraft = decide_promotion(
         &version,
         certifying_run.as_ref(),
+        certification.as_ref(),
         &fold_inputs,
         &EngineFingerprint::current(),
         override_input,
@@ -205,6 +212,43 @@ where
         })
         .await
         .map_err(PaperPromotionError::Data)
+}
+
+/// The run that certifies `version` (r4.s1.w5, spec A5), with the version's
+/// certified record beside it — the gate reads both.
+///
+/// The latest walk-forward run is the certification — EXCEPT when that run is
+/// `wf-v2`: its pass is a SEARCH-span verdict the campaign tunes candidates
+/// towards, so it certifies nothing by itself. Then the run that certifies is
+/// the RECORD's `search_walk_forward_run_id` (that run's folds are the
+/// certification's provenance and its fingerprint is the one checked), and a
+/// `wf-v2` pointer run with no such record is handed back unchanged — the gate
+/// refuses it as `Uncertified`, and an override still covers it.
+async fn certifying_run<W, T>(
+    walk_forwards: &W,
+    certifications: &T,
+    version_id: &VersionId,
+    latest_run: Option<WalkForwardRun>,
+) -> Result<(Option<WalkForwardRun>, Option<CertificationRecord>), PaperPromotionError>
+where
+    W: WalkForwardRunRepository,
+    T: CertificationRepository,
+{
+    let certification = certifications
+        .latest_certified(version_id)
+        .await
+        .map_err(PaperPromotionError::Data)?;
+    let certifying = match latest_run {
+        Some(run) if run.rule == VerdictRule::WfV2 => match &certification {
+            Some(record) if record.certified => walk_forwards
+                .get_walk_forward_run(&record.search_walk_forward_run_id)
+                .await
+                .map_err(PaperPromotionError::Data)?,
+            _ => Some(run),
+        },
+        other => other,
+    };
+    Ok((certifying, certification))
 }
 
 /// The injected clock's instant, as RFC3339 UTC text.

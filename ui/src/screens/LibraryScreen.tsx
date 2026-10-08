@@ -24,7 +24,13 @@ import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 
 import { commands } from "../bindings";
-import type { LibraryOverview, LibraryStrategy, LibraryVersion, VersionStats } from "../bindings";
+import type {
+  CertificationRecordDto,
+  LibraryOverview,
+  LibraryStrategy,
+  LibraryVersion,
+  VersionStats,
+} from "../bindings";
 import { CertBadge } from "../components/CertBadge";
 import { PromoteSheet } from "../components/PromoteSheet";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
@@ -491,6 +497,74 @@ function VersionNode({
 }
 
 // ---------------------------------------------------------------------------
+// The certification records (r4.s1.w5, spec A4/C5)
+// ---------------------------------------------------------------------------
+
+/** What the pane has from the `certification_records` read. */
+type CertificationRows =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "loaded"; records: readonly CertificationRecordDto[] };
+
+/**
+ * One version's certification records, read on selection. Every number comes
+ * from the record — the holdout's window, its trade count, its mean in R and
+ * the one-sided lower bound the C1 test judged it by — so nothing on this pane
+ * is invented, and a version with no records says so.
+ */
+function CertificationRecords({ versionId }: { versionId: string }) {
+  const [rows, setRows] = useState<CertificationRows>({ kind: "loading" });
+
+  useEffect(() => {
+    let alive = true;
+    setRows({ kind: "loading" });
+    void commands
+      .certificationRecords({ versionId })
+      .then((result) => {
+        if (!alive) return;
+        setRows(
+          result.status === "ok"
+            ? { kind: "loaded", records: result.data.records }
+            : { kind: "error", message: result.error.message },
+        );
+      })
+      .catch(() => {
+        if (alive) {
+          setRows({
+            kind: "error",
+            message: "The certification records could not be read.",
+          });
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [versionId]);
+
+  if (rows.kind === "loading") return <div className="bt-none dim">Reading…</div>;
+  if (rows.kind === "error") return <div className="bt-none dim">{rows.message}</div>;
+  if (rows.records.length === 0) return <div className="bt-none dim">None yet.</div>;
+  return (
+    <div className="bt-list">
+      {rows.records.map((record) => (
+        <div key={record.id} className="cert-rec">
+          <span className="bt-id mono">{`#${record.hypothesisIndex}`}</span>
+          <CertBadge kind={record.certified ? "certified" : "uncertified"} />
+          <span className="mono">{record.pair}</span>
+          <span className="bt-spacer" />
+          <span className="mono dim">{`${record.holdoutStart} → ${record.holdoutEnd}`}</span>
+          <span className="mono">{`${record.holdoutN}t`}</span>
+          <span className="mono">{record.holdoutMeanR}</span>
+          <span className="mono dim">
+            {record.holdoutLowerBound === null ? EM_DASH : record.holdoutLowerBound.toFixed(3)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Details pane (portaled into the shell's third track)
 // ---------------------------------------------------------------------------
 
@@ -557,6 +631,16 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
             <span className="d-cert-run mono">{version.latestWalkForwardRunId}</span>
           )}
         </div>
+      </section>
+
+      {/* r4.s1.w5 (spec A4/C5): the FULL certification record — the holdout's
+          window, trade count, mean and lower bound — read through the app-scope
+          `certification_records` route. The agent's `certify_version` answer
+          never carries these numbers (grill Q5); this pane is where they live.
+          One row per hypothesis, newest first, or an honest "None yet." */}
+      <section className="d-section">
+        <h4 className="dsl-h">Certification records</h4>
+        <CertificationRecords versionId={version.id} />
       </section>
 
       {/* r3.s4.w5: the promote row (spec §2's first entry point) — after the

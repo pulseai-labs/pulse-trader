@@ -36,15 +36,16 @@ async fn tools_and_dsl_schema_resource_are_served() {
     copy_tree(&manifest(FIXTURE_STORE), &store_dir);
     let client = spawn_client(&db_path, &store_dir).await;
 
-    // Exactly the fifteen declared tools — the eleven read tools (w2's seven,
-    // r3.s4.w4's four paper reads), w3's two write tools, and r2.s3.w5's two
-    // walk-forward tools — no more, no fewer.
+    // Exactly the sixteen declared tools — the eleven read tools (w2's seven,
+    // r3.s4.w4's four paper reads), w3's two write tools, r2.s3.w5's two
+    // walk-forward tools, and r4.s1.w5's certification tool — no more, no fewer.
     let tools = client.list_tools(None).await.expect("tools/list").tools;
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     names.sort_unstable();
     assert_eq!(
         names,
         [
+            "certify_version",
             "export_candles",
             "export_indicators",
             "export_trades",
@@ -61,7 +62,7 @@ async fn tools_and_dsl_schema_resource_are_served() {
             "run_walk_forward",
             "submit_strategy_version",
         ],
-        "the advertised tool set is exactly the fifteen declared tools"
+        "the advertised tool set is exactly the sixteen declared tools"
     );
 
     // The one advertised resource, then its document body.
