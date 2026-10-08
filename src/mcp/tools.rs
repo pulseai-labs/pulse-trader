@@ -42,7 +42,7 @@ use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
     BacktestAppError, SnapshotPins, resolve_default_request, run_version_backtest,
 };
-use crate::application::certification::{CertifyRequest, certify_version};
+use crate::application::certification::{CertifyError, CertifyRequest, certify_version};
 use crate::application::mcp_read::{
     parse_indicator_specs, run_detail, run_list_entry, strategy_entry, version_detail,
     version_entry,
@@ -55,7 +55,7 @@ use crate::application::walk_forward::{WalkForwardAppError, WalkForwardRequest, 
 use crate::application::walk_forward_read::{
     load_fold_runs, rfc3339_secs, run_summary_of, walk_forward_run_detail,
 };
-use crate::domain::certification::{CertifyError, CertifyRefusal};
+use crate::domain::certification::CertifyRefusal;
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,

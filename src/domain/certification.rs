@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::backtest::SnapshotSelection;
 use crate::domain::strategy::VersionId;
-use crate::domain::{DataError, Pair, WalkForwardRunId};
+use crate::domain::{Pair, WalkForwardRunId};
 
 /// One side's recorded `(timeframe, data_version)` selections — the search
 /// span's or the holdout's. Each side names its own triple because the two runs
@@ -196,32 +196,4 @@ pub enum CertifyRefusal {
         /// The freeze's budget `H`.
         h: u8,
     },
-}
-
-/// The certification step's errors: a typed refusal, a missing version, or a
-/// failure from one of the use cases it composes. Every arm means **nothing was
-/// written and no hypothesis was spent** — the record write is the step's last
-/// action.
-#[derive(Debug, thiserror::Error)]
-pub enum CertifyError {
-    /// One of the step's typed refusals (C4, Q2).
-    #[error(transparent)]
-    Refused(#[from] CertifyRefusal),
-    /// No such version.
-    #[error("no such strategy version `{}`", .0.as_str())]
-    VersionNotFound(VersionId),
-    /// A repository read or the record write failed.
-    #[error(transparent)]
-    Store(#[from] DataError),
-    /// The search-span walk-forward failed (a missing snapshot, a gapped
-    /// series, an engine error): nothing was written and nothing counts.
-    #[error("the search-span walk-forward failed before any record was written: {0}")]
-    WalkForward(#[from] crate::application::walk_forward::WalkForwardAppError),
-    /// The holdout backtest failed (a missing snapshot, a gapped series, an
-    /// engine error): nothing was written and nothing counts.
-    #[error("the holdout backtest failed before any record was written: {0}")]
-    Backtest(#[from] crate::application::backtest::BacktestAppError),
-    /// A defect in this layer (a lineage cycle, a failed task join).
-    #[error("internal: {0}")]
-    Internal(String),
 }

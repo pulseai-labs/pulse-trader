@@ -126,11 +126,12 @@ pub use clock::Clock;
 // `dead_code` BUILD error under `deny(warnings)`.
 pub use freeze::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeRequest};
 // r4.s1.w5 (G7, C1, C4, C5): the certification record's surface — the row, its
-// draft and the two error vocabularies. Re-exported so `lib.rs` can curate the
+// draft and the refusal vocabulary. Re-exported so `lib.rs` can curate the
 // crate surface — an un-re-exported public domain type is a `dead_code` BUILD
-// error under `deny(warnings)`.
+// error under `deny(warnings)`. (The step's error enum lives in
+// `application::certification`, close R2: it carries application-ring errors.)
 pub use certification::{
-    CertificationDraft, CertificationInputs, CertificationRecord, CertifyError, CertifyRefusal,
+    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
 };
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
 // concrete indicator adapter implements and the backtester reads through.

@@ -843,8 +843,10 @@ pub use crate::tauri::{
 // `pub(crate) mod adapters`/`domain` — a new public type unused outside its
 // module is a `dead_code` build error, not a warning.
 pub use adapters::db::SqliteCertificationRepo;
-pub use application::certification::{CertifyOutcome, CertifyRequest, certify_version};
+pub use application::certification::{
+    CertifyError, CertifyOutcome, CertifyRequest, certify_version,
+};
 pub use domain::{
     CertificationDraft, CertificationInputs, CertificationRecord, CertificationRepository,
-    CertifyError, CertifyRefusal,
+    CertifyRefusal,
 };

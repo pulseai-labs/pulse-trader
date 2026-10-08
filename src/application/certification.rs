@@ -45,10 +45,10 @@ use crate::application::backtest::{
     BacktestAppError, BacktestRequest, PreSaveStage, SnapshotPins, load_series,
     prepare_over_loaded_series, resolve_default_request,
 };
-use crate::application::walk_forward::{WalkForwardRequest, run_walk_forward};
+use crate::application::walk_forward::{WalkForwardAppError, WalkForwardRequest, run_walk_forward};
 use crate::domain::backtest::{BacktestInputs, RunVerdict, VerdictRule, WalkForwardRun};
 use crate::domain::certification::{
-    CertificationDraft, CertificationInputs, CertificationRecord, CertifyError, CertifyRefusal,
+    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
 };
 use crate::domain::dsl::CompiledStrategy;
 use crate::domain::strategy::{StrategyVersion, VersionId};
@@ -68,6 +68,39 @@ const LINEAGE_MAX_HOPS: usize = 10_000;
 /// forward under wf-v2"). Recorded verbatim on the record, so the row says
 /// which rule judged it rather than assuming today's.
 const CERTIFY_RULE: VerdictRule = VerdictRule::WfV2;
+
+/// The certification step's errors: a typed refusal, a missing version, or a
+/// failure from one of the use cases it composes. Every arm means **nothing was
+/// written and no hypothesis was spent** — the record write is the step's last
+/// action.
+///
+/// It lives here, in the application ring (close R2): the two composed arms
+/// carry [`WalkForwardAppError`] and [`BacktestAppError`], so a domain home
+/// would make a pure domain type compile only together with the application
+/// ring. The domain keeps the refusal vocabulary, [`CertifyRefusal`].
+#[derive(Debug, thiserror::Error)]
+pub enum CertifyError {
+    /// One of the step's typed refusals (C4, Q2).
+    #[error(transparent)]
+    Refused(#[from] CertifyRefusal),
+    /// No such version.
+    #[error("no such strategy version `{}`", .0.as_str())]
+    VersionNotFound(VersionId),
+    /// A repository read or the record write failed.
+    #[error(transparent)]
+    Store(#[from] DataError),
+    /// The search-span walk-forward failed (a missing snapshot, a gapped
+    /// series, an engine error): nothing was written and nothing counts.
+    #[error("the search-span walk-forward failed before any record was written: {0}")]
+    WalkForward(#[from] WalkForwardAppError),
+    /// The holdout backtest failed (a missing snapshot, a gapped series, an
+    /// engine error): nothing was written and nothing counts.
+    #[error("the holdout backtest failed before any record was written: {0}")]
+    Backtest(#[from] BacktestAppError),
+    /// A defect in this layer (a lineage cycle, a failed task join).
+    #[error("internal: {0}")]
+    Internal(String),
+}
 
 /// What the certification step is asked for: one persisted version, an
 /// optional **already-validated** pair override, and the calling label.
