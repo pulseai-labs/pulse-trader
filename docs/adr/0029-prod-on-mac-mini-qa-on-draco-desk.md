@@ -143,9 +143,30 @@ key, with a restore drill against the pulled copy. "Off-box" is the same home
 LAN — a known limit recorded at planning (C6); an off-site copy is a later
 candidate.
 
-**draco-desk is QA.** It runs its own database and its own data dir, and QA and
-prod refuse each other's data (w3's role marker). Builds, walks and patches run
-there against QA only; prod's data is touched by nothing but the cutover.
+**draco-desk is QA (w3).** It runs its own database and its own data dir, and QA
+and prod refuse each other's data. `pulse serve --role <prod|qa>` pins a data
+dir in `<data dir>/server-role` (one line, mode 0600): an unmarked dir is marked,
+the same role continues, and the other role is refused by name BEFORE the
+database is opened — a QA server started with prod's `--db` by mistake creates no
+database file, no instance lock, no start-log entry and no marker change. With
+`--role`, the database must sit inside the data dir. The Mini's plist passes
+`--role prod`; `deploy/pulse-qa.service` runs `pulse serve --role qa --bind
+100.90.203.21:8421 --db %h/.local/share/pulse-qa/pulse.db --data-dir
+%h/.local/share/pulse-qa` with the same restart settings as the systemd prod
+unit, on port 8421 so it can run BESIDE draco-desk's current prod until the
+cutover retires that unit. `just deploy <tag>` targets QA only — it installs and
+restarts `pulse-qa.service`, creates `~/.local/share/pulse-qa` mode 0700, and
+refuses without `Linger=yes` before it builds (#248) — and touches neither
+`pulse-serve.service` nor the backup units (G2). `pulse qa-seed --db <path>
+--data-dir <path>` (C5) revokes EVERY token the copied prod database carries
+(each revoke audited exactly like any other) and issues the two fresh QA tokens
+(`qa-app`, `qa-agent`) in one transaction, then writes the `qa` marker and prints
+the tokens once on stdout; it refuses a prod-marked dir and a database a live
+server holds. The handshake gains an ADDITIVE optional `role` field (`prod` /
+`qa`), and the app's status strip shows a QA badge when the connected server
+reports `qa`, so a stale URL can no longer pass for prod unnoticed. Builds, walks
+and patches run there against QA only; prod's data is touched by nothing but the
+cutover.
 
 **What does NOT change.** ADR-0026's access model (tailnet-only bind, per-client
 revocable `app`/`agent` tokens, the append-only `token_audit`, the server

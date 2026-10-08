@@ -174,6 +174,7 @@ function up(fingerprint: string) {
     binary_version: "0.3.0",
     engine_fingerprint: fingerprint,
     reason: null,
+    role: null,
   });
 }
 

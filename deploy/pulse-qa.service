@@ -1,0 +1,35 @@
+# draco-desk's QA server (r4.s2.w3, C5 / ADR-0029) as a systemd USER unit. QA
+# runs BESIDE the current prod (8420) until the cutover retires
+# `pulse-serve.service`, so it has its own port, database and data dir — and the
+# `server-role` marker in that data dir is what makes a QA server and a prod
+# server refuse each other's data by name. The tailnet address and port live
+# HERE only; the server must never listen on a wildcard.
+#
+# The environment sets no credential: the credential file is the operator's,
+# resolved by `pulse serve` itself from the data dir's 0600 `.env`. No token
+# ever appears in this unit, in its logs, or in any recipe.
+[Unit]
+Description=PulseTrader QA server (pulse serve --role qa)
+Wants=network-online.target
+After=network-online.target
+# #342's arithmetic, the same as `pulse-serve.service`: give up after 3 failed
+# starts in 900 s and stay in the `failed` state, so `systemctl --user --failed`
+# shows it. systemd's default (5 starts in 10 s) never trips here: RestartSec=10
+# spaces starts too far apart, and a slow failure (the full 120 s bind retry +
+# RestartSec = 130 s per cycle) is slower still. 3 x 130 s = 390 s < 900 s, so
+# the limit trips for the slow shape; a fast exit trips it sooner. The recovery
+# runbook is in the justfile, in the comment above the `deploy` recipe.
+# These keys belong in [Unit], not [Service].
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+ExecStart=%h/.local/share/pulse-qa/bin/pulse serve --role qa --bind 100.90.203.21:8421 --db %h/.local/share/pulse-qa/pulse.db --data-dir %h/.local/share/pulse-qa
+# D6 boot-race contract (w1): the tailnet address may not be routable yet at
+# boot, so pulse serve retries the bind internally; systemd restarts the unit
+# on failure after 10 seconds, up to the start limit above.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

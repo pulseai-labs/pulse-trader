@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **draco-desk becomes QA: the data-dir role marker, the QA unit on 8421, `just deploy` retargeted,
+  QA seeding with token revocation, the handshake's `role` field and the app's QA badge (r4.s2.w3).**
+  `pulse serve --role <prod|qa>` pins a data dir in `<data dir>/server-role` (one line, mode 0600):
+  an unmarked dir is marked, the same role continues, and the other role is refused by name — before
+  the database is opened, so a refused start creates no database file, no instance lock, no
+  start-log entry and no marker change; with `--role`, the database must sit inside the data dir.
+  The Mini's plist gains `--role prod`; the new `deploy/pulse-qa.service` runs `pulse serve --role qa
+  --bind 100.90.203.21:8421 --db %h/.local/share/pulse-qa/pulse.db --data-dir
+  %h/.local/share/pulse-qa` with the same 3-starts-in-900-s bound as prod's unit, on 8421 so QA can
+  run beside draco-desk's current prod until the cutover. `just deploy <tag>` now installs and
+  restarts QA only (prod's unit and the backup units are untouched, G2), creates
+  `~/.local/share/pulse-qa` mode 0700, and refuses without `Linger=yes` before it builds (#248);
+  `just deploy-check` rehearses the QA unit. `pulse qa-seed --db <path> --data-dir <path>` revokes
+  every token a copied prod database carries (each revoke audited exactly like any other) and issues
+  the two fresh QA tokens (`qa-app`, `qa-agent`) in one transaction, then writes the `qa` marker and
+  prints the two tokens once on stdout — refusing a `prod`-marked data dir and a database a live
+  server holds. The handshake gains an ADDITIVE optional `role` field, and the app's status strip
+  shows a QA badge when the connected server reports `qa`, so a stale URL cannot pass for prod
+  unnoticed. `tests/data_dir_role.rs` drives the real binary through the refusals, the marker, the
+  seed and the handshake (demo line d70). Refs
+  [#248](https://github.com/pulseai-labs/pulse-trader/issues/248).
+
 - **Prod's service on the Mac Mini: a launchd LaunchAgent with bounded restarts, `just deploy-mac`,
   a real deploy health gate, and ADR-0029 (r4.s2.w1).** The always-on server gains a launchd home:
   `deploy/com.pulsetrader.serve.plist` runs `pulse serve --bind 100.103.30.74:8420` from the

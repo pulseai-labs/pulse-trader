@@ -41,6 +41,7 @@ function ok(status: {
   binary_version: string | null;
   engine_fingerprint: string | null;
   reason: string | null;
+  role: string | null;
 }) {
   return { status: "ok", data: status };
 }
@@ -51,6 +52,7 @@ function notConnected() {
     binary_version: null,
     engine_fingerprint: null,
     reason: null,
+    role: null,
   });
 }
 
@@ -60,6 +62,7 @@ function down() {
     binary_version: null,
     engine_fingerprint: null,
     reason: null,
+    role: null,
   });
 }
 
@@ -85,6 +88,7 @@ describe("the Connect gate", () => {
         binary_version: null,
         engine_fingerprint: null,
         reason: "the server refused this token (HTTP 401 Unauthorized)",
+        role: null,
       }),
     );
     render(<App />);
@@ -102,6 +106,7 @@ describe("the Connect gate", () => {
           binary_version: null,
           engine_fingerprint: null,
           reason: "the server refused this token (HTTP 401 Unauthorized)",
+          role: null,
         }),
       ),
     );
@@ -159,6 +164,7 @@ describe("the Connect gate", () => {
         binary_version: "0.1.0",
         engine_fingerprint: "f0dbdf5748d38d5c",
         reason: null,
+        role: null,
       }),
     );
     const { container } = render(<App />);

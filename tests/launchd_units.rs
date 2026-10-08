@@ -308,6 +308,15 @@ fn serve_plist_binds_the_tailnet_and_bounds_restarts() {
         .expect("--start-limit is in ProgramArguments");
     assert_eq!(args[limit_at + 1], "3/900");
 
+    // r4.s2.w3 (C5): the Mini's server is PROD, pinned by the role marker it
+    // writes into its data dir — with the database inside that dir, a QA
+    // server and a prod server refuse each other's data by name.
+    let role_at = args
+        .iter()
+        .position(|arg| *arg == "--role")
+        .expect("--role is in ProgramArguments");
+    assert_eq!(args[role_at + 1], "prod", "the Mini's server is prod");
+
     assert!(plist.get("RunAtLoad").bool_value());
     assert_eq!(
         plist.get("KeepAlive").dict().get("SuccessfulExit"),

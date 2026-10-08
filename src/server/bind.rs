@@ -15,11 +15,15 @@
 //! at once. The retry clock and sleeper are injectable, so the tests run the
 //! full 120s budget instantly.
 //!
-//! **Startup order** (one stderr line per step, through the state's sink):
-//! migrate-then-open the DB (step 1, the composition root), resolve the data
-//! dir (step 2), the start guard (step 2b, r4.s2.w1 — a refused start exits 0
-//! here, before the credential, the bind and anything else),
-//! *credential resolution (step 3 — the w3 seam, marked below)*,
+//! **Startup order.** The composition root (`cli/serve.rs`) resolves the db and
+//! data-dir paths and, when `--role` is passed, applies the data dir's role
+//! marker BEFORE the database is opened (step 0, r4.s2.w3 — a refused start
+//! touches nothing: no database file created or migrated, no lock, no start-log
+//! entry, no marker change). It then migrate-then-opens the DB (step 1) and
+//! hands the [`ServeConfig`] here, where the rest run in order, one stderr line
+//! per step through the state's sink: the start guard (step 2b, r4.s2.w1 — a
+//! refused start exits 0 here, before the credential, the bind and anything
+//! else), *credential resolution (step 3 — the w3 seam, marked below)*,
 //! `check_bind` (step 4), retrying bind (step 5), the one `listening on` line
 //! (step 6), serve until SIGTERM/SIGINT (step 7), then the shutdown line.
 //!
@@ -267,6 +271,11 @@ pub struct ServeConfig {
     /// launchd has none, so there the server counts, and a refused start exits 0
     /// before the credential and the bind.
     pub start_limit: Option<StartLimit>,
+    /// The role this server runs as (r4.s2.w3, C5) — `Some` only when `--role`
+    /// was passed. The composition root has already applied the data dir's
+    /// marker before the database was opened; this is the value the handshake
+    /// reports (and what the app's QA badge reads).
+    pub role: Option<super::role::ServerRole>,
 }
 
 /// The default polling grace: five seconds past each bar's close.
@@ -349,7 +358,9 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     // The state takes the data dir by value; the start guard below reads it too
     // (one PathBuf clone at startup, before anything serves).
     let state = Arc::new(
-        ServerState::new(config.db, config.data_dir.clone()).with_paper_control(paper_control),
+        ServerState::new(config.db, config.data_dir.clone())
+            .with_paper_control(paper_control)
+            .with_role(config.role),
     );
     let sink = state.log().clone();
 

@@ -1,8 +1,9 @@
 //! `pulse serve` — the composition root of the always-on server (r3.s3.w1,
 //! ADR-0026). Thin by design: the ordered startup steps, the bind policy and
 //! the retry loop live in `server::bind` where the tests drive them; this
-//! module only parses the flags, opens the migrated DB, resolves the data dir
-//! and hands the [`ServeConfig`] over.
+//! module parses the flags, applies the data-dir role marker (`--role`,
+//! r4.s2.w3) BEFORE the database is opened, opens the migrated DB, resolves the
+//! data dir and hands the [`ServeConfig`] over.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,9 +11,11 @@ use std::str::FromStr;
 
 use clap::Args;
 
+use crate::adapters::db::default_db_path;
 use crate::adapters::store::default_base_dir;
 use crate::application::paper_control::DEFAULT_PAPER_REPLY_TIMEOUT_MS;
 use crate::server::bind::{DEFAULT_POLL_GRACE_MS, ServeConfig};
+use crate::server::role::{self, ServerRole};
 use crate::server::start_limit::StartLimit;
 
 /// `pulse serve --bind <ip:port>` — run the server on this host until
@@ -41,6 +44,14 @@ pub struct ServeArgs {
     /// systemd unit bounds its own starts and passes nothing).
     #[arg(long, value_name = "N/SECONDS")]
     start_limit: Option<String>,
+    /// The role this data dir is for, `prod` or `qa` (r4.s2.w3, C5). With
+    /// `--role`, the database must sit inside `--data-dir`, and
+    /// `<data dir>/server-role` is applied BEFORE the database is opened: an
+    /// unmarked dir is marked with this role, the same role continues, and the
+    /// other role is refused by name (never starting on the other role's
+    /// data). Without `--role` nothing is checked or written.
+    #[arg(long, value_name = "prod|qa")]
+    role: Option<String>,
 }
 
 /// Run the server. Errors surface as named non-zero exits (bind policy
@@ -60,13 +71,25 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
         ),
         None => None,
     };
+    // ---- Step 0b (r4.s2.w3, C5): the role marker, applied BEFORE the database
+    // is opened. A refused start must touch NOTHING at all — no database file
+    // created or migrated, no instance lock, no start-log entry, no marker
+    // change — so a QA server started with prod's `--db` by mistake never opens
+    // prod's database. The two paths read here are the same ones `open_db` and
+    // the server below resolve.
+    let role = match &args.role {
+        Some(raw) => {
+            Some(ServerRole::parse(raw).map_err(|error| anyhow::anyhow!("--role: {error}"))?)
+        }
+        None => None,
+    };
+    let data_dir = resolved_data_dir(args)?;
+    if let Some(role) = role {
+        role::check(&data_dir, &resolved_db_path(args)?, role)
+            .map_err(|error| anyhow::anyhow!("pulse serve: refusing to serve: {error}"))?;
+    }
     // ---- Step 1: the migrated DB (the one migrate-then-open every arm uses).
     let db = super::open_db(args.db.as_deref()).await?;
-    // ---- Step 2: the data dir (mirror `pulse mcp`).
-    let data_dir = match &args.data_dir {
-        Some(path) => path.clone(),
-        None => default_base_dir().map_err(|e| anyhow::anyhow!("resolve data dir: {e}"))?,
-    };
     crate::server::bind::serve(ServeConfig {
         bind: args.bind,
         dev_loopback: args.dev_loopback,
@@ -75,7 +98,26 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
         poll_grace_ms: DEFAULT_POLL_GRACE_MS,
         paper_reply_timeout_ms: DEFAULT_PAPER_REPLY_TIMEOUT_MS,
         start_limit,
+        role,
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The database `pulse serve` opens: `--db`, or the platform default — the same
+/// path the role check reads, resolved once.
+fn resolved_db_path(args: &ServeArgs) -> anyhow::Result<PathBuf> {
+    match &args.db {
+        Some(path) => Ok(path.clone()),
+        None => default_db_path().map_err(|e| anyhow::anyhow!("resolve db path: {e}")),
+    }
+}
+
+/// The data dir the server runs on (mirror `pulse mcp`): `--data-dir`, or the
+/// platform default.
+fn resolved_data_dir(args: &ServeArgs) -> anyhow::Result<PathBuf> {
+    match &args.data_dir {
+        Some(path) => Ok(path.clone()),
+        None => default_base_dir().map_err(|e| anyhow::anyhow!("resolve data dir: {e}")),
+    }
 }

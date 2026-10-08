@@ -29,7 +29,7 @@
 //! bound (mirror `SqliteLlmCallRepo`).
 
 use chrono::{DateTime, SecondsFormat};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::adapters::clock::SystemClock;
@@ -53,6 +53,18 @@ pub struct ClientToken {
     pub created_at: String,
     /// When the token was revoked, if it was (RFC3339 UTC).
     pub revoked_at: Option<String>,
+}
+
+/// A freshly minted token's row material for
+/// [`SqliteClientTokenRepo::replace_all_with`]: everything EXCEPT the token
+/// itself — the store keeps only its SHA-256 hex.
+pub struct NewToken<'a> {
+    /// The unique label (never reused, even after a revoke).
+    pub label: &'a str,
+    /// The scope the token carries (`app` or `agent`).
+    pub scope: &'a str,
+    /// The SHA-256 hex of the full token string.
+    pub token_sha256: &'a str,
 }
 
 /// The `find_by_hash` projection: the client-token columns PLUS the row-schema
@@ -141,9 +153,6 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
         created_by: &str,
     ) -> Result<ClientToken, TokenStoreError> {
         let now = self.now_rfc3339()?;
-        let id = Uuid::new_v4().to_string();
-        let audit_id = Uuid::new_v4().to_string();
-        let schema_version = CLIENT_TOKEN_SCHEMA_VERSION.to_owned();
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -160,35 +169,17 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
             return Err(TokenStoreError::LabelExists(label.to_owned()));
         }
 
-        sqlx::query!(
-            "INSERT INTO client_token \
-             (id, label, scope, token_sha256, created_at, revoked_at, created_by, schema_version) \
-             VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
-            id,
-            label,
-            scope,
-            token_sha256,
-            now,
+        let id = Self::insert_issued_row(
+            &mut tx,
+            NewToken {
+                label,
+                scope,
+                token_sha256,
+            },
             created_by,
-            schema_version,
+            &now,
         )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DataError::Db(format!("insert client_token: {e}")))?;
-
-        sqlx::query!(
-            "INSERT INTO token_audit \
-             (id, at, event, token_id, label, reason, route, peer, schema_version) \
-             VALUES (?, ?, 'issued', ?, ?, NULL, NULL, NULL, ?)",
-            audit_id,
-            now,
-            id,
-            label,
-            schema_version,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DataError::Db(format!("insert issued audit: {e}")))?;
+        .await?;
 
         tx.commit()
             .await
@@ -212,8 +203,6 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
     /// (the migration trigger refuses the second write regardless).
     pub async fn revoke(&self, label: &str) -> Result<ClientToken, TokenStoreError> {
         let now = self.now_rfc3339()?;
-        let audit_id = Uuid::new_v4().to_string();
-        let schema_version = CLIENT_TOKEN_SCHEMA_VERSION.to_owned();
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -236,33 +225,7 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
             return Err(TokenStoreError::AlreadyRevoked(label.to_owned()));
         }
 
-        let applied = sqlx::query!(
-            "UPDATE client_token SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
-            now,
-            found.id,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DataError::Db(format!("revoke update: {e}")))?;
-        if applied.rows_affected() != 1 {
-            // The trigger refused or another writer got there first — the named
-            // error is the same either way.
-            return Err(TokenStoreError::AlreadyRevoked(label.to_owned()));
-        }
-
-        sqlx::query!(
-            "INSERT INTO token_audit \
-             (id, at, event, token_id, label, reason, route, peer, schema_version) \
-             VALUES (?, ?, 'revoked', ?, ?, NULL, NULL, NULL, ?)",
-            audit_id,
-            now,
-            found.id,
-            label,
-            schema_version,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DataError::Db(format!("insert revoked audit: {e}")))?;
+        Self::revoke_found_row(&mut tx, &found, &now).await?;
 
         tx.commit()
             .await
@@ -274,6 +237,155 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
             created_at: found.created_at,
             revoked_at: Some(now),
         })
+    }
+
+    /// Revoke EVERY active token and issue `fresh` — all in ONE write-first
+    /// transaction (r4.s2.w3, C5's QA seed).
+    ///
+    /// A database copied from prod carries prod's tokens; QA seeding must
+    /// revoke every one of them — each revoke audited exactly like any other —
+    /// and leave exactly the fresh QA tokens. One transaction, so a failure
+    /// leaves the token set exactly as it was: never a half-revoked copy.
+    /// Returns the revoked rows, label-ordered.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenStoreError::LabelExists`] when a fresh label is taken (labels are
+    /// never reused, even revoked ones); [`TokenStoreError::Db`] on a database
+    /// failure.
+    pub async fn replace_all_with(
+        &self,
+        fresh: &[NewToken<'_>],
+        created_by: &str,
+    ) -> Result<Vec<ClientToken>, TokenStoreError> {
+        let now = self.now_rfc3339()?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| DataError::Db(format!("begin replace tx: {e}")))?;
+
+        let active = sqlx::query_as!(
+            FoundTokenRow,
+            "SELECT id, label, scope, created_at, revoked_at, schema_version \
+             FROM client_token WHERE revoked_at IS NULL ORDER BY label"
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(format!("select active tokens: {e}")))?;
+
+        let mut revoked = Vec::with_capacity(active.len());
+        for found in active {
+            Self::revoke_found_row(&mut tx, &found, &now).await?;
+            revoked.push(ClientToken {
+                id: found.id,
+                label: found.label,
+                scope: found.scope,
+                created_at: found.created_at,
+                revoked_at: Some(now.clone()),
+            });
+        }
+
+        for token in fresh {
+            let taken =
+                sqlx::query_scalar!("SELECT id FROM client_token WHERE label = ?", token.label)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| DataError::Db(format!("label pre-check: {e}")))?;
+            if taken.is_some() {
+                return Err(TokenStoreError::LabelExists(token.label.to_owned()));
+            }
+            Self::insert_issued_row(&mut tx, NewToken { ..*token }, created_by, &now).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(format!("commit replace: {e}")))?;
+        Ok(revoked)
+    }
+
+    /// Insert one `client_token` row plus its `issued` audit row INSIDE the
+    /// caller's transaction, returning the new row id. One home for the two INSERT
+    /// shapes every issuing path writes (`issue` and `replace_all_with`).
+    async fn insert_issued_row(
+        conn: &mut SqliteConnection,
+        token: NewToken<'_>,
+        created_by: &str,
+        now: &str,
+    ) -> Result<String, TokenStoreError> {
+        let id = Uuid::new_v4().to_string();
+        let audit_id = Uuid::new_v4().to_string();
+        let schema_version = CLIENT_TOKEN_SCHEMA_VERSION.to_owned();
+        sqlx::query!(
+            "INSERT INTO client_token \
+         (id, label, scope, token_sha256, created_at, revoked_at, created_by, schema_version) \
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+            id,
+            token.label,
+            token.scope,
+            token.token_sha256,
+            now,
+            created_by,
+            schema_version,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| DataError::Db(format!("insert client_token: {e}")))?;
+
+        sqlx::query!(
+            "INSERT INTO token_audit \
+         (id, at, event, token_id, label, reason, route, peer, schema_version) \
+         VALUES (?, ?, 'issued', ?, ?, NULL, NULL, NULL, ?)",
+            audit_id,
+            now,
+            id,
+            token.label,
+            schema_version,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| DataError::Db(format!("insert issued audit: {e}")))?;
+        Ok(id)
+    }
+
+    /// Set one row's `revoked_at` (a first and only transition) plus its `revoked`
+    /// audit row INSIDE the caller's transaction. A row already revoked reaches
+    /// [`TokenStoreError::AlreadyRevoked`] — the migration trigger refuses the
+    /// second write regardless.
+    async fn revoke_found_row(
+        conn: &mut SqliteConnection,
+        found: &FoundTokenRow,
+        now: &str,
+    ) -> Result<(), TokenStoreError> {
+        let applied = sqlx::query!(
+            "UPDATE client_token SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            now,
+            found.id,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| DataError::Db(format!("revoke update: {e}")))?;
+        if applied.rows_affected() != 1 {
+            // The trigger refused or another writer got there first — the named
+            // error is the same either way.
+            return Err(TokenStoreError::AlreadyRevoked(found.label.clone()));
+        }
+
+        let audit_id = Uuid::new_v4().to_string();
+        sqlx::query!(
+            "INSERT INTO token_audit \
+         (id, at, event, token_id, label, reason, route, peer, schema_version) \
+         VALUES (?, ?, 'revoked', ?, ?, NULL, NULL, NULL, ?)",
+            audit_id,
+            now,
+            found.id,
+            found.label,
+            CLIENT_TOKEN_SCHEMA_VERSION,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| DataError::Db(format!("insert revoked audit: {e}")))?;
+        Ok(())
     }
 
     /// Resolve a presented token by its SHA-256 hex. Returns the row regardless

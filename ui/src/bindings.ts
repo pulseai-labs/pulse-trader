@@ -1601,7 +1601,9 @@ export type RunId = string;
 
 /**
  *  What the status strip renders (spec: `state: up | down | not_connected |
- *  refused`, with the server's version and fingerprint when known).
+ *  refused`, with the server's version and fingerprint when known — and, since
+ *  r4.s2.w3, the role the server reported, which the strip renders as the QA
+ *  badge).
  */
 export type ServerStatus = {
 	/**  The connection state. */
@@ -1615,6 +1617,14 @@ export type ServerStatus = {
 	 *  "reason for the last refusal" comes from here.
 	 */
 	reason: string | null,
+	/**
+	 *  The role the server reported (`prod` or `qa`), when it answered with
+	 *  one. ADDITIVE (r4.s2.w3, C5): `None` — an older server, or one started
+	 *  without `--role` — renders nothing new. `Some("qa")` is the QA badge:
+	 *  QA's database is a copy of prod's, so a stale URL landing on QA must be
+	 *  visible at a glance.
+	 */
+	role: string | null,
 };
 
 /**

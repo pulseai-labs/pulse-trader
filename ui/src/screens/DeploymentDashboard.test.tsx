@@ -106,7 +106,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   detailsHost();
   serverStatusMock.mockResolvedValue(
-    ok({ state: "up", binary_version: "0.3.0", engine_fingerprint: ENGINE, reason: null }),
+    ok({ state: "up", binary_version: "0.3.0", engine_fingerprint: ENGINE, reason: null, role: null }),
   );
   paperSessionMock.mockImplementation((id: string) =>
     Promise.resolve(ok(session({ id }))),

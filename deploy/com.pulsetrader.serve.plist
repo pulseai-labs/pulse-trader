@@ -18,6 +18,11 @@
   The environment carries NO credential (G7): only the installed config dir, so
   `pulse serve` resolves credentials from the data dir's 0600 .env — never
   from the checkout's build tree.
+
+  r4.s2.w3 (C5): the server is started with the role flag, so this agent is
+  pinned to PROD's data dir. The flag writes/reads <data dir>/server-role and a
+  server of the other role refuses that data by name — draco-desk is QA, and the
+  two must never serve each other's library.
 -->
 <plist version="1.0">
 <dict>
@@ -31,6 +36,8 @@
 		<string>100.103.30.74:8420</string>
 		<string>--start-limit</string>
 		<string>3/900</string>
+		<string>--role</string>
+		<string>prod</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>

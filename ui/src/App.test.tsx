@@ -23,7 +23,7 @@ vi.mock("./bindings", () => ({
     // assert exactly where it was.
     serverStatus: vi.fn().mockResolvedValue({
       status: "ok",
-      data: { state: "up", binary_version: "0.0.0", engine_fingerprint: null, reason: null },
+      data: { state: "up", binary_version: "0.0.0", engine_fingerprint: null, reason: null, role: null },
     }),
     // r1.s1.w3: the default landing is now the Library screen, which reads
     // `libraryOverview` on mount — mocked to an empty payload so these shell
@@ -58,11 +58,12 @@ function up(): ServerStatus {
     binary_version: "0.1.0",
     engine_fingerprint: null,
     reason: null,
+    role: null,
   };
 }
 
 function down(): ServerStatus {
-  return { state: "down", binary_version: null, engine_fingerprint: null, reason: null };
+  return { state: "down", binary_version: null, engine_fingerprint: null, reason: null, role: null };
 }
 
 function setHash(hash: string) {
