@@ -477,6 +477,20 @@ pub use server::{API_VERSION, ServerState, mount_scoped, router};
 // lib boundary.
 pub use server::ops::{ComposeRunCtx, ComposeRunner, SweepConfig};
 
+// r4.s2.w4 (Q2/C3/C4): the off-box watcher's one-cycle surface. `run_once` is
+// the pure-over-seams cycle, `WatchSeams` carries one dependency per thing the
+// process cannot do in a test, and `HttpProbe`/`NtfyNotifier` are the real
+// probe and push the live check drives. `tests/healthz_watch.rs` drives every
+// branch through this surface (a scripted probe/host/marker/clock/log, plus a
+// local fake ntfy listener for the real notifier). REQUIRED under
+// `deny(warnings)` — the items are `pub` in a private module and unused
+// in-crate otherwise.
+pub use cli::watch::{
+    ALERT_AFTER_FAILURES, ClockSeam, HostSeam, HttpProbe, LogSeam, MarkerReport, MarkerSeam,
+    NotifySeam, NtfyNotifier, ProbeReport, ProbeSeam, STILL_DOWN_REMINDER_SECS, WatchConfig,
+    WatchErrorKind, WatchFuture, WatchSeams, run_once,
+};
+
 // VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,
 // BACKLOG-4). The trade-record entities (`Trade`/`Fill`/`ExitReason`/
 // `TradeSource`), the run aggregate (`BacktestResult`), the error taxonomy

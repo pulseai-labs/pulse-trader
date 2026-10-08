@@ -7,6 +7,12 @@
 //! Every response (refusals and 404s included) carries
 //! `X-Pulse-Api-Version: 1`, stamped by the outermost middleware.
 //!
+//! **`/healthz`** (r4.s2.w4, Q1; ADR-0029) is the ONE route outside the auth
+//! middleware — the deploy gate (`scripts/wait-healthy.sh`) and the off-box
+//! watcher read it without a token. It is mounted on the base router, so it
+//! keeps the router-level request-log and API-version layers and nothing else:
+//! no auth pass, no token, no `token_audit` row, no table touched.
+//!
 //! **Module layout:** `auth` carries the scope vocabulary, token minting and
 //! the auth middleware; `log` carries the request-log layer and the injectable
 //! sink; `routes` mounts the command surface through `mount_scoped`; `ops`
@@ -235,6 +241,34 @@ fn handshake_route(state: &Arc<ServerState>, middleware_state: Arc<ServerState>)
     ))
 }
 
+/// The `/healthz` body (Q1): exactly two keys. `degraded` means the paper
+/// runtime is not running — the response is 200 either way, because the route
+/// answers "is the server there and what is its state", and the deploy gate
+/// waits for `ok` specifically.
+#[derive(Serialize)]
+struct HealthzBody {
+    /// `ok` or `degraded`.
+    status: &'static str,
+    /// The API version this server speaks.
+    api_version: u32,
+}
+
+/// `GET /healthz` (Q1, r4.s2.w4; ADR-0029) — the ONE route outside the auth
+/// middleware. Its body is only `{"status":"ok"|"degraded","api_version":N}`:
+/// no token, no version string, no path, no session data. It writes no
+/// `token_audit` row and touches no table, and it is reachable only on the
+/// server's existing bind.
+fn healthz_body(state: &Arc<ServerState>) -> Json<HealthzBody> {
+    let status = match &state.paper_control {
+        Some(control) if control.is_available() => "ok",
+        _ => "degraded",
+    };
+    Json(HealthzBody {
+        status,
+        api_version: API_VERSION,
+    })
+}
+
 /// Build the server router: the handshake under `Any` scope, the command
 /// routes (r3.s3.w2), the request-log layer and the API-version layer wrapped
 /// around EVERYTHING (refusals and 404s included — router-level layers wrap
@@ -251,8 +285,18 @@ pub fn router(state: Arc<ServerState>) -> axum::Router {
     // a `move` closure must capture an owned handle, never a borrow.
     let handshake_state = state.clone();
     let handshake = handshake_route(&state, handshake_state);
+    // r4.s2.w4 (Q1): `/healthz` — the ONE route with no auth middleware. It is
+    // mounted on the base router BEFORE the router-level `.layer` pair below, so
+    // the request-log and API-version layers wrap it (and nothing else does).
+    let healthz_state = state.clone();
+    let healthz = get(move || {
+        let state = healthz_state.clone();
+        async move { healthz_body(&state) }
+    });
     let base = routes::mount_all(
-        axum::Router::new().route("/api/v1/handshake", handshake),
+        axum::Router::new()
+            .route("/healthz", healthz)
+            .route("/api/v1/handshake", handshake),
         &state,
     );
     // r3.s3.w5 (AC-2): MCP over HTTP — the same `PulseMcp` the stdio transport

@@ -148,6 +148,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   real-path-null and runtime numbers on demand. **ADR-0028** freezes the rule, the C1 test, the
   holdout start (2025-07-01, all four pairs) and **H = 12**.
 
+- **The prod watcher and its push alert: an unauthenticated `/healthz` and `pulse watch` (r4.s2.w4).**
+  `GET /healthz` is the ONE route outside the auth middleware (ADR-0029's Q1): 200 with exactly
+  `{"status":"ok"|"degraded","api_version":1}` — `degraded` means the paper runtime is not running —
+  keeping the request-log and API-version layers, writing no `token_audit` row and touching no table,
+  so the deploy gate (`scripts/wait-healthy.sh`) and an off-box watcher read it with no token.
+  `pulse watch` (`--url`, `--ssh-host`, `--topic-file`, `--state-file`, `--ntfy-url`) is one probe
+  cycle, meant for `deploy/pulse-watch.timer` on draco-desk (every 60 s): it probes
+  `<url>/healthz`, and on failure tells "service down" (the host answers on port 22) from "Mini
+  unreachable — it may need a FileVault unlock", and checks the start-limit marker over the dedicated
+  forced-command key — alerting **at once** when the marker is present ("start limit reached on prod
+  — run just prod-reset"). It alerts after 3 failed probes, de-duplicates to one alert per incident,
+  sends one "recovered", reminds every 6 hours while the outage lasts, and pushes one "watcher error"
+  per distinct error (missing or non-0600 topic file, unwritable 0600 state file, missing key,
+  malformed `--url`) and exits non-zero. Nothing it sends or logs carries a token, a credential URL,
+  the topic or session data. `deploy/pulse-watch.{service,timer}` are parsed by `tests/deploy_units.rs`,
+  and the whole behaviour is pinned by `tests/healthz_watch.rs` (demo line d71), which drives the real
+  probe and the real notifier against a local fake listener — never the real ntfy.sh — and closes the
+  known limit "a failed unit raises no push alert".
+
 ### Changed
 
 - **Engine-sensitive dependency bumps: `polars` 0.54.4, `zip` 8.6.0, `rust_decimal` 1.42.1.** The

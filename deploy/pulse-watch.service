@@ -1,0 +1,12 @@
+# The PulseTrader prod watcher (r4.s2.w4, Q2): one `pulse watch` probe cycle.
+# Started by pulse-watch.timer every 60 seconds. The topic file and the watcher
+# key are the operator's (cutover, SPINE.md step 6): ~/.config/pulse-watch/topic
+# (0600) and ~/.ssh/pulse_watch_ed25519. No credential is set in the environment:
+# `pulse watch` holds no token, and nothing it sends or logs carries a token, a
+# credential URL, the topic or session data.
+[Unit]
+Description=PulseTrader prod watcher (pulse watch)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/pulse-serve/bin/pulse watch --url http://100.103.30.74:8420 --ssh-host macmini --topic-file %h/.config/pulse-watch/topic --state-file %h/.local/state/pulse-watch/state

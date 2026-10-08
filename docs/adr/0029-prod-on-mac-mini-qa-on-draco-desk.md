@@ -124,12 +124,15 @@ back. Planned restarts use `fdesetup authrestart`. An unattended reboot is
 therefore NOT a supported recovery path, which is why an off-box watcher (below)
 is what tells the operator prod is down.
 
-**`/healthz` (Q1) — recorded here, implemented by w4.** One route outside the
-auth middleware, reachable only through the tailnet bind, answering only
+**`/healthz` (Q1) — landed by w4.** One route outside the auth middleware,
+reachable only through the tailnet bind, answering only
 `{"status":"ok"|"degraded","api_version":N}` (`degraded` = the paper runtime is
-not running), writing no `token_audit` row. It is the monitoring surface the
-watcher and the deploy gate read, and its shape is pinned by w4's test. This ADR
-records the exemption; w4 lands it.
+not running) — status 200 in both states, since the route reports the server's
+own state and the deploy gate waits for `ok` specifically — writing no
+`token_audit` row and touching no table. It keeps the router-level request-log
+and API-version layers and nothing else, so it is also the one route with no
+auth pass. It is the monitoring surface the watcher and the deploy gate read,
+and its contract is pinned by `tests/healthz_watch.rs` (demo line d71).
 
 **The off-box watcher and the backup pull (Q2) — recorded here, implemented by
 w4 and w5.** `pulse watch` runs from a draco-desk systemd timer, probes every 60
