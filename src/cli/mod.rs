@@ -38,7 +38,10 @@ pub(crate) mod publish;
 pub(crate) mod runs;
 // r3.s3.w1 (ADR-0026): the always-on server composition root.
 pub(crate) mod serve;
+// r4.s2.w4 (Q2): the off-box watcher — one probe cycle per timer run, pushing
+// to ntfy only when prod is down (or the start limit tripped).
 pub(crate) mod strategy;
+pub(crate) mod watch;
 // r3.s3.w1: the operator's local token administration (the one sanctioned
 // second writer beside a running server — ADR-0026).
 pub(crate) mod token;
@@ -71,6 +74,7 @@ use runs::{RunsArgs, run_runs};
 use serve::{ServeArgs, run_serve};
 use strategy::{StrategyArgs, run_strategy};
 use token::{TokenArgs, run_token};
+use watch::{WatchArgs, run_watch};
 
 /// `pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI `PoC`).
 #[derive(Debug, Parser)]
@@ -126,6 +130,12 @@ pub enum Command {
     /// serve `/api/v1` until SIGTERM/SIGINT. One stderr line per request and
     /// per startup step; stdout stays empty.
     Serve(ServeArgs),
+    /// Probe prod once and alert the operator's phone when it is down
+    /// (r4.s2.w4, Q2): `pulse watch` runs from `deploy/pulse-watch.timer` every
+    /// 60 seconds. One run = one probe cycle; it exits non-zero on a watcher
+    /// error. Nothing it sends or logs carries a token, a credential URL, the
+    /// topic or session data.
+    Watch(WatchArgs),
     /// Stamp the certify fixture (r3.s4.w2, ADR-0027 / E4): synthetic
     /// BTCUSDT snapshots + `fixture_snapshot` rows + the fixture
     /// strategy/version + one walk-forward certification per build. Never
@@ -278,6 +288,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // r3.s3.w1 (ADR-0026): the server arm — the D6 bind policy gates it,
         // then the retrying bind, then serve until SIGTERM/SIGINT.
         Command::Serve(args) => run_serve(&args).await,
+        // r4.s2.w4 (Q2): one watcher cycle — probe, alert, de-duplicate.
+        Command::Watch(args) => run_watch(&args).await,
         // r3.s3.w4 (D7): the verified import — copy, migrate forward, verify
         // everything, then install atomically; refusals leave the target
         // exactly as it was.
