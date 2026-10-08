@@ -2,8 +2,9 @@
 # r4.s2.w1 (G9) — the daily rotation of the Mac Mini's prod server logs.
 #
 # Run by the launchd calendar job deploy/com.pulsetrader.logrotate.plist, as
-# draco. It copy-truncates `serve.log` and `serve.err` into dated files and
-# deletes dated files older than 7 days.
+# draco. It copy-truncates the launchd jobs' logs under this directory —
+# `serve.log`, `serve.err` (r4.s2.w1) and `backup.log`, `backup.err` (r4.s2.w5)
+# — into dated files and deletes dated files older than 7 days.
 #
 # COPY-then-truncate, never move: launchd holds the live files open and keeps
 # appending to the inodes — a `mv` would leave the server writing to the moved
@@ -11,7 +12,7 @@
 # resets the size while launchd's descriptor keeps working.
 #
 # It deletes ONLY under ~/Library/Logs/PulseTrader/, and only files matching
-# the two dated patterns; `-maxdepth 1` plus the fixed LOG_DIR keep it there.
+# the four dated patterns; `-maxdepth 1` plus the fixed LOG_DIR keep it there.
 #
 # bash 3.2-compatible: this also runs on macOS's /bin/bash.
 set -euo pipefail
@@ -24,7 +25,7 @@ KEEP_DAYS=7
 
 STAMP="$(date +%Y-%m-%d)"
 
-for name in serve.log serve.err; do
+for name in serve.log serve.err backup.log backup.err; do
   file="$LOG_DIR/$name"
   [ -f "$file" ] || continue
   # An empty live file rotates to nothing.
@@ -40,5 +41,6 @@ for name in serve.log serve.err; do
 done
 
 # The dated copies older than KEEP_DAYS days.
-find "$LOG_DIR" -maxdepth 1 -type f \( -name 'serve.log.*' -o -name 'serve.err.*' \) \
+find "$LOG_DIR" -maxdepth 1 -type f \( -name 'serve.log.*' -o -name 'serve.err.*' \
+  -o -name 'backup.log.*' -o -name 'backup.err.*' \) \
   -mtime "+$KEEP_DAYS" -delete

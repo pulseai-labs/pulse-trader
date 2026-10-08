@@ -63,7 +63,9 @@ use crate::adapters::store::CandleStore;
 use crate::domain::{CandleSeriesRepository, Pair, Timeframe};
 
 use backtest::{BacktestArgs, run_backtest_cli};
-use backup::{BackupArgs, RestoreArgs, run_backup, run_restore};
+use backup::{
+    BackupArgs, BackupVerifyArgs, RestoreArgs, run_backup, run_backup_verify, run_restore,
+};
 use certify::{CertifyArgs, run_certify};
 use coach::{CoachArgs, run_coach};
 use compose::{ComposeArgs, run_compose};
@@ -158,6 +160,11 @@ pub enum Command {
     /// Online-backup the local database + snapshots into `~/pulse-backups`
     /// (r3.s3.w4, D12) — consistent while `pulse serve` holds the database.
     Backup(BackupArgs),
+    /// Verify one backup artifact in place (r4.s2.w5) — read-only: the
+    /// backup's own manifest, the snapshots it names, and every version and
+    /// run reading back. The off-box pull runs it on the copy it just
+    /// fetched, beside a live server.
+    BackupVerify(BackupVerifyArgs),
     /// Restore a verified backup over the local database (r3.s3.w4, D12).
     /// Precondition: the server must be stopped.
     Restore(RestoreArgs),
@@ -308,6 +315,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // r3.s3.w4 (D12): the online backup and the verified restore (the
         // restore reuses import's verified-copy engine).
         Command::Backup(args) => run_backup(&args).await,
+        // r4.s2.w5 (C3): the read-only verify of one backup artifact — what
+        // the off-box pull runs on the copy it just fetched.
+        Command::BackupVerify(args) => run_backup_verify(&args).await,
         Command::Restore(args) => run_restore(&args).await,
         // r4.s2.w3 (C5): the QA seed — refusals first, then one transaction,
         // the marker, and the two tokens on stdout.

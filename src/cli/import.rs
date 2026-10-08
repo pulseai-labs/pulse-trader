@@ -173,7 +173,12 @@ pub(crate) struct Mismatch {
 }
 
 impl Mismatch {
-    fn new(table: &str, id: impl Into<String>, field: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        table: &str,
+        id: impl Into<String>,
+        field: &str,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             table: table.to_owned(),
             id: id.into(),
@@ -843,7 +848,7 @@ async fn step_paper_digests(
 /// Step 5c: every version and every run reads back through its repository on
 /// the COPY — the tamper defenses (`version_hash` re-derived on read; #39's
 /// `result_content_hash` re-derived from the trades).
-async fn step_repository_reads(
+pub(crate) async fn step_repository_reads(
     copy_pool: &sqlx::SqlitePool,
     mismatches: &mut Vec<Mismatch>,
 ) -> Result<(usize, usize), anyhow::Error> {
@@ -896,7 +901,7 @@ async fn step_repository_reads(
 
 /// Step 5d: every copied snapshot reads back through `CandleStore` in the
 /// TARGET (embedded provenance plus the re-derived `data_version`).
-fn step_snapshot_reads(
+pub(crate) fn step_snapshot_reads(
     target_store: &CandleStore,
     source_snapshots: &[SourceSnapshot],
     mismatches: &mut Vec<Mismatch>,
@@ -919,7 +924,7 @@ fn step_snapshot_reads(
 
 /// Step 5e: every `data_version` a run references (primary and HTF) exists as
 /// a verified snapshot in the target.
-async fn step_referenced_snapshots(
+pub(crate) async fn step_referenced_snapshots(
     target_store: &CandleStore,
     copy_pool: &sqlx::SqlitePool,
     mismatches: &mut Vec<Mismatch>,
@@ -2452,7 +2457,7 @@ fn set_read_only(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Print every mismatch, up to [`MAX_NAMED_MISMATCHES`], then "…and N more".
-fn print_refusal(label: &str, mismatches: &[Mismatch]) {
+pub(crate) fn print_refusal(label: &str, mismatches: &[Mismatch]) {
     eprintln!(
         "{label}: REFUSED — {} verification mismatch(es):",
         mismatches.len()

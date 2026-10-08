@@ -1,0 +1,21 @@
+# r4.s2.w5 (C3, spec §Approach 4) — the off-box backup pull: one `rsync` from
+# the Mini's backup directory into draco-desk's own, then the read-only
+# `pulse backup-verify` on the newest copy. Started by
+# pulse-backup-pull.timer, or on demand by
+# `XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start pulse-backup-pull.service`.
+#
+# The source is the ssh target, an ABSOLUTE remote path: on the Mini the
+# dedicated key is forced to deploy/pulse-backup-serve.sh, which expands no
+# `~`. The key (~/.ssh/pulse_backup_ed25519), the destination
+# (~/pulse-backups-offbox/mini) and the verify binary
+# (~/.local/share/pulse-qa/bin/pulse) are the script's defaults; no credential
+# is set here, and nothing the pull prints carries one.
+#
+# Installing this unit, the script and the key is the cutover's (SPINE.md step
+# 6, a credential stop).
+[Unit]
+Description=Off-box backup pull from the Mac Mini (pulse backup)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/pulse-qa/deploy/pulse-backup-pull.sh macmini:/Users/draco/pulse-backups

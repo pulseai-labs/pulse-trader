@@ -1,0 +1,13 @@
+# r4.s2.w5 (C3, spec §Approach 4) — the nightly off-box backup pull: daily
+# 04:30 local, an hour after the Mini's own 03:30 backup, with Persistent=true
+# so a powered-off draco-desk runs the missed pull at boot. Enabling it is the
+# cutover's (SPINE.md step 6).
+[Unit]
+Description=Nightly off-box backup pull at 04:30 local
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

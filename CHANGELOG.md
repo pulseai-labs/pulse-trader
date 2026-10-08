@@ -8,6 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Off-box backup: the Mini's nightly `pulse backup` as a launchd calendar job, a read-only pull to
+  draco-desk over a dedicated forced-command key, and a restore drill from the pulled copy (r4.s2.w5).**
+  `deploy/com.pulsetrader.backup.plist` runs the installed binary's `backup` (defaults: the platform
+  data dir, `~/pulse-backups`, keep 14) at 03:30 local, with its logs under `~/Library/Logs/PulseTrader/`
+  and no credential in the plist; `just deploy-mac` installs and loads it beside the serve agent.
+  `deploy/pulse-backup-pull.{sh,service,timer}` pulls at 04:30 (`Persistent=true`) with the dedicated
+  key `~/.ssh/pulse_backup_ed25519`: `rsync -a --ignore-existing` and never `--delete`, so a backup
+  deleted or corrupted on the Mini cannot erase the off-box copy. The newest pulled backup is then
+  verified in place by the new read-only `pulse backup-verify <file>` — the backup's own `.heads.json`
+  manifest, every snapshot it names, and every version and run reading back — exiting non-zero on a
+  mismatch before any pruning; retention keeps the newest 30 databases with their manifests and never
+  prunes `candles/`. The Mini's rsync is openrsync with no `rrsync` (checked read-only), so the key's
+  `authorized_keys` line forces `deploy/pulse-backup-serve.sh`, which serves only an rsync sender
+  invocation rooted at `~/pulse-backups` and refuses a write, a delete, a `..` path, a shell and any
+  path outside the root by name. `just restore-drill <file>` restores a pulled backup into a fresh
+  scratch directory, serves it on loopback, checks `/healthz` and the tokenless handshake, then removes
+  the scratch; the daily log rotation now covers the backup job's logs too. `pulse backup --keep 0` is
+  refused at parse time (#240 — it used to prune the backup it had just made and then fail).
+  `tests/backup_offbox_restore.rs` drives the whole line, the forced-command refusals included (demo
+  line d72). Refs [#240](https://github.com/pulseai-labs/pulse-trader/issues/240).
+
 - **draco-desk becomes QA: the data-dir role marker, the QA unit on 8421, `just deploy` retargeted,
   QA seeding with token revocation, the handshake's `role` field and the app's QA badge (r4.s2.w3).**
   `pulse serve --role <prod|qa>` pins a data dir in `<data dir>/server-role` (one line, mode 0600):
