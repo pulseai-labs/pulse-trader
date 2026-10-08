@@ -128,6 +128,12 @@ operator's to weigh at the freeze; H is never raised and never changed after a c
 - **The power figure itself.** At H = 12 and the campaign's plausible holdout trade counts the test
   is below 50% power against the planted edge; a negative result is expected roughly half the time
   for a genuine +0.25R strategy.
+- **The CLI `pulse backtest --dsl` path is unguarded** (accepted at the round-2 plan gate). It opens
+  no database by design (README C7), so it has no freeze record to read; the `--version` path is
+  guarded. Recorded in w4's report §10.
+- **The MCP parquet export is refused while a freeze is open** (accepted at the round-2 plan gate).
+  A byte copy of the stored snapshot cannot be cut at the holdout start; the CSV export is cut and
+  says so. Recorded in w4's report §10.
 
 ## Consequences
 
