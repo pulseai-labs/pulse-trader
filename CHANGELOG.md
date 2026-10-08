@@ -8,6 +8,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Prod's service on the Mac Mini: a launchd LaunchAgent with bounded restarts, `just deploy-mac`,
+  a real deploy health gate, and ADR-0029 (r4.s2.w1).** The always-on server gains a launchd home:
+  `deploy/com.pulsetrader.serve.plist` runs `pulse serve --bind 100.103.30.74:8420` from the
+  installed binary in `draco`'s `gui/` domain with `RunAtLoad`, `KeepAlive { SuccessfulExit =
+  false }` and the ONE environment entry `PULSE_CONFIG_DIR` — no credential in the plist (G7) — and
+  launchd's stdout/stderr under `~/Library/Logs/PulseTrader/`, rotated daily into dated files by
+  `deploy/com.pulsetrader.logrotate.plist` + `deploy/pulse-logrotate.sh` (7 days kept, G9). launchd
+  has no start limit, so the bound moves into the server: `pulse serve --start-limit <N>/<SECONDS>`
+  counts starts in a sliding window in `<data dir>/serve-starts` and, when a start would exceed it,
+  writes `<data dir>/serve-start-limit` and exits 0 before binding — `KeepAlive {
+  SuccessfulExit = false }` then stops relaunching (#342's parity; `just prod-reset` clears the
+  marker and the start log and kickstarts the agent). `just deploy-mac <tag>` ships the tagged
+  source over ssh (`git archive`, no GitHub credential on the Mini) and builds there with
+  `PULSE_ALLOW_PLACEHOLDER_DIST=1` (#314: the server never serves the embedded frontend), checks
+  G10 (data dir 0700, `.env` 0600 and owned by `draco` — contents never printed), (re)bootstraps
+  both agents, and only reports success once the tailnet address answers. That gate is the new
+  `scripts/wait-healthy.sh` (#346): it polls `/healthz` for a 200 with `"status":"ok"` and, until
+  w4 lands the route, accepts a 401 from `/api/v1/handshake` carrying `X-Pulse-Api-Version` —
+  `just deploy` on draco-desk uses it in place of `systemctl is-active`, which read `active`
+  through the whole 120-second bind retry. ADR-0029 amends ADR-0026's operations: prod on the Mini,
+  draco-desk becomes QA. `tests/launchd_units.rs` parses both plists and drives the counter with an
+  injected clock and the real binary's exit 0 (demo line d68). Refs
+  [#346](https://github.com/pulseai-labs/pulse-trader/issues/346),
+  [#314](https://github.com/pulseai-labs/pulse-trader/issues/314),
+  [#342](https://github.com/pulseai-labs/pulse-trader/issues/342).
+
 - **The certification step: one hypothesis, one holdout, one immutable record, and `certify_version`
   (r4.s1.w5).** While a freeze is open, certifying a version walks it forward under `wf-v2` on the
   search span — the guard clamps the span's end to the holdout start — runs ONE backtest over the

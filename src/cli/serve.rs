@@ -6,12 +6,14 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Args;
 
 use crate::adapters::store::default_base_dir;
 use crate::application::paper_control::DEFAULT_PAPER_REPLY_TIMEOUT_MS;
 use crate::server::bind::{DEFAULT_POLL_GRACE_MS, ServeConfig};
+use crate::server::start_limit::StartLimit;
 
 /// `pulse serve --bind <ip:port>` — run the server on this host until
 /// SIGTERM/SIGINT.
@@ -31,6 +33,14 @@ pub struct ServeArgs {
     /// locally running server without Tailscale in the path).
     #[arg(long, default_value_t = false)]
     dev_loopback: bool,
+    /// Bound repeated starts, `<N>/<SECONDS>` (e.g. `3/900`). launchd has no
+    /// start limit of its own, so the Mini's `LaunchAgent` passes this: when
+    /// this start makes more than N starts inside the window, the server writes
+    /// `<data dir>/serve-start-limit` and exits 0 — `KeepAlive { SuccessfulExit
+    /// = false }` then stops relaunching — before binding. Off by default (the
+    /// systemd unit bounds its own starts and passes nothing).
+    #[arg(long, value_name = "N/SECONDS")]
+    start_limit: Option<String>,
 }
 
 /// Run the server. Errors surface as named non-zero exits (bind policy
@@ -41,6 +51,15 @@ pub struct ServeArgs {
 /// Returns an [`anyhow::Error`] when the DB fails migrate-then-open, the data
 /// dir cannot be resolved, or the server start/serve fails.
 pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
+    // ---- Step 0: the start bound's grammar (r4.s2.w1, G5). A malformed
+    // `--start-limit` is a startup refusal, before the DB is opened.
+    let start_limit = match &args.start_limit {
+        Some(value) => Some(
+            StartLimit::from_str(value)
+                .map_err(|error| anyhow::anyhow!("--start-limit: {error}"))?,
+        ),
+        None => None,
+    };
     // ---- Step 1: the migrated DB (the one migrate-then-open every arm uses).
     let db = super::open_db(args.db.as_deref()).await?;
     // ---- Step 2: the data dir (mirror `pulse mcp`).
@@ -55,6 +74,7 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
         data_dir,
         poll_grace_ms: DEFAULT_POLL_GRACE_MS,
         paper_reply_timeout_ms: DEFAULT_PAPER_REPLY_TIMEOUT_MS,
+        start_limit,
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))

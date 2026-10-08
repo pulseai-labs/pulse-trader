@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  r4.s2.w1 (G5, G6, G7, G9, G10) — the always-on PulseTrader server as a
+  launchd LaunchAgent in draco's gui/ domain on the Mac Mini (ADR-0029).
+
+  Installed by `just deploy-mac <tag>` into ~/Library/LaunchAgents/ and loaded
+  with `launchctl bootstrap gui/$(id -u)`. launchd expands no `~`, so every
+  path is absolute; the Mini's user is draco.
+
+  launchd has no start limit: KeepAlive relaunches forever. The bound rides in
+  the server itself (its 3/900 start-limit flag, #342's parity) and the exit
+  code: `KeepAlive { SuccessfulExit = false }` means launchd does NOT relaunch
+  after an exit 0, and a refused start exits 0 after writing
+  <data dir>/serve-start-limit. `just prod-reset` clears the marker and the
+  start log, then kickstarts the agent.
+
+  The environment carries NO credential (G7): only the installed config dir, so
+  `pulse serve` resolves credentials from the data dir's 0600 .env — never
+  from the checkout's build tree.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.pulsetrader.serve</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/draco/.local/share/pulse-serve/bin/pulse</string>
+		<string>serve</string>
+		<string>--bind</string>
+		<string>100.103.30.74:8420</string>
+		<string>--start-limit</string>
+		<string>3/900</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PULSE_CONFIG_DIR</key>
+		<string>/Users/draco/.local/share/pulse-serve/config</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/draco/Library/Logs/PulseTrader/serve.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/draco/Library/Logs/PulseTrader/serve.err</string>
+</dict>
+</plist>

@@ -17,7 +17,9 @@
 //!
 //! **Startup order** (one stderr line per step, through the state's sink):
 //! migrate-then-open the DB (step 1, the composition root), resolve the data
-//! dir (step 2), *credential resolution (step 3 — the w3 seam, marked below)*,
+//! dir (step 2), the start guard (step 2b, r4.s2.w1 — a refused start exits 0
+//! here, before the credential, the bind and anything else),
+//! *credential resolution (step 3 — the w3 seam, marked below)*,
 //! `check_bind` (step 4), retrying bind (step 5), the one `listening on` line
 //! (step 6), serve until SIGTERM/SIGINT (step 7), then the shutdown line.
 //!
@@ -49,6 +51,7 @@ use crate::domain::{
 };
 
 use super::log::RequestLog;
+use super::start_limit::{self, StartGuard, StartLimit};
 use super::{ServerState, router};
 
 /// The Tailscale CGNAT range `100.64.0.0/10` — the first accepted octet pair
@@ -248,6 +251,11 @@ pub struct ServeConfig {
     /// How long a paper control request waits for its reply (r3.s4.w4, spec
     /// §1). Thirty seconds by default.
     pub paper_reply_timeout_ms: u64,
+    /// The launchd start bound (r4.s2.w1, G5) — `Some` when `--start-limit` was
+    /// passed. systemd enforces its own limit (the unit passes no such flag);
+    /// launchd has none, so there the server counts, and a refused start exits 0
+    /// before the credential and the bind.
+    pub start_limit: Option<StartLimit>,
 }
 
 /// The default polling grace: five seconds past each bar's close.
@@ -268,6 +276,44 @@ fn credential_source_label(source: CredentialSource) -> &'static str {
     }
 }
 
+/// Apply the launchd start bound (r4.s2.w1, G5): record this start, and, when
+/// it is refused, write the named line through the same sink every startup line
+/// uses. Returns whether the server may proceed to serve.
+///
+/// An IO failure fails OPEN — one named line, then serve — because refusing to
+/// serve would not stop the relaunch loop either (a non-zero exit relaunches
+/// under `KeepAlive { SuccessfulExit = false }`) and would take a healthy
+/// server down for a counter file. See [`start_limit`]'s module docs.
+fn start_guard(data_dir: &std::path::Path, limit: StartLimit, sink: &Arc<dyn RequestLog>) -> bool {
+    match start_limit::record_start(data_dir, limit, start_limit::now_unix_secs()) {
+        Ok(StartGuard::Proceed) => true,
+        Ok(StartGuard::Limited {
+            count,
+            marker_written,
+        }) => {
+            let marker = if marker_written {
+                format!(
+                    "; marker at {}",
+                    data_dir.join(start_limit::START_MARKER_NAME).display()
+                )
+            } else {
+                "; the marker could not be written".to_owned()
+            };
+            sink.write(format!(
+                "pulse serve: start limit reached - {count} starts in {}s (limit {}){marker}; exiting 0 so launchd stops relaunching",
+                limit.window_secs, limit.starts
+            ));
+            false
+        }
+        Err(error) => {
+            sink.write(format!(
+                "pulse serve: start-limit: cannot record this start ({error}); continuing without the bound"
+            ));
+            true
+        }
+    }
+}
+
 /// Run the server until SIGTERM/SIGINT. See the module docs for the ordered
 /// startup steps and the w3 seam.
 ///
@@ -280,9 +326,24 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     // routes' handle and the runtime's receiver come from one pair.
     let (paper_control, paper_commands) =
         crate::application::paper_control::PaperControl::channel(config.paper_reply_timeout_ms);
-    let state =
-        Arc::new(ServerState::new(config.db, config.data_dir).with_paper_control(paper_control));
+    // The state takes the data dir by value; the start guard below reads it too
+    // (one PathBuf clone at startup, before anything serves).
+    let state = Arc::new(
+        ServerState::new(config.db, config.data_dir.clone()).with_paper_control(paper_control),
+    );
     let sink = state.log().clone();
+
+    // ---- Step 2b: the start guard (r4.s2.w1, G5) ---------------------------
+    // launchd has no start limit of its own, so the bound rides here — before
+    // the credential and the bind, so a refused start touches nothing else, and
+    // through the sink, so the named line lands where every startup line does.
+    // `Ok(())` is exit 0: with `KeepAlive { SuccessfulExit = false }` that is
+    // exactly what stops launchd relaunching.
+    if let Some(limit) = config.start_limit
+        && !start_guard(&config.data_dir, limit, &sink)
+    {
+        return Ok(());
+    }
 
     // ---- Step 3: CREDENTIAL RESOLUTION — THE w3 SEAM (r3.s3.w3) ------------
     // The server credential profile (R3): this process resolves the LLM

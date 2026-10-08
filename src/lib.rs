@@ -461,7 +461,11 @@ pub use server::bind::{
     BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, WakeTrigger,
     bind_with_retry, check_bind, run_paper_runtime,
 };
+// r4.s2.w1 (G5): the launchd start bound the `pulse serve` startup applies, and
+// the integration test's direct handle on it (an injected clock plus a
+// temporary data dir, no server, no launchd).
 pub use server::log::{CaptureLog, RequestLog};
+pub use server::start_limit::{StartGuard, StartLimit, record_start};
 pub use server::{API_VERSION, ServerState, mount_scoped, router};
 // r3.s3.w2: the operation registry's public seam. `SweepConfig` is the
 // injectable retention the spec requires ("tests use milliseconds");
