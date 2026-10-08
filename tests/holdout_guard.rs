@@ -998,3 +998,43 @@ async fn persisted_run_reads_withhold_holdout_results() {
     assert!(list.get("withheld_for_holdout").is_none());
     client.cancel().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coach_refuses_parent_window_before_snapshot_load() {
+    let gate_world = coach_gate_support::world_with_window(Some(
+        pulse::CandleWindow::new(FIXTURE_FIRST_OPEN_MS, HOLDOUT_MS + 900_000).unwrap(),
+    ))
+    .await;
+    let before = gate_world.table_count("backtest_run").await;
+    // A missing pinned snapshot would fail at LoadSnapshots if preparation ran.
+    let missing = TempDir::new().unwrap();
+    let missing_store = pulse::CandleStore::with_base_dir(missing.path().join("missing"));
+    let outcome = pulse::run_coach_decision(
+        &gate_world.strategies(),
+        &missing_store,
+        &pulse::BinanceAdapter::new(),
+        &gate_world.runs(),
+        &gate_world.acceptance(),
+        &gate_world.sessions(),
+        pulse::CoachDecisionRequest {
+            session_id: gate_world.session_id.clone(),
+            action: CoachAction::Accept,
+        },
+        Some(HoldoutFreeze {
+            holdout_start_ms: HOLDOUT_MS,
+        }),
+    )
+    .await
+    .unwrap();
+    match outcome {
+        CoachDecisionOutcome::AcceptFailed(proposal) => {
+            let failure = proposal.accept_failure.unwrap();
+            assert_eq!(failure.stage, AcceptFailureStage::WalkForward);
+            assert!(failure.message.contains("BTCUSDT"));
+            assert!(failure.message.contains("2025-01-16"));
+        }
+        other => panic!("expected staged refusal, got {other:?}"),
+    }
+    assert_eq!(gate_world.table_count("backtest_run").await, before);
+    assert_eq!(gate_world.table_count("strategy_version").await, 1);
+}

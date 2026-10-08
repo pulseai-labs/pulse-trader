@@ -134,6 +134,10 @@ impl World {
     }
 }
 pub async fn world() -> World {
+    world_with_window(None).await
+}
+
+pub async fn world_with_window(window: Option<CandleWindow>) -> World {
     let tmp = TempDir::new().unwrap();
     let db = pulse::Db::with_path(&tmp.path().join("pulse.db"))
         .await
@@ -176,7 +180,7 @@ pub async fn world() -> World {
             htf_timeframe: Some(Timeframe::H4),
             config: BacktestConfig::default(),
             snapshots: None,
-            window: None,
+            window,
         },
         None,
     )
