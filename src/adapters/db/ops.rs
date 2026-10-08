@@ -15,6 +15,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -306,12 +308,247 @@ async fn read_target_contents(pool: &SqlitePool) -> Result<TargetContents, DataE
     Ok(contents)
 }
 
+// ---------------------------------------------------------------------------
+// r4.s2.w2: the paper tables' content digests (the move made safe)
+// ---------------------------------------------------------------------------
+
+/// The three paper tables the import verifies by content digest, each with the
+/// key its rows are read in: `paper_session`'s primary key, and the UNIQUE keys
+/// `paper_event` (`session_id`, `seq`) and `paper_bar` (`session_id`,
+/// `timeframe`, `open_time`) carry in its place (migration `0018`). This order
+/// is the order the summary prints and the refusal walks.
+pub const PAPER_TABLES: [(&str, &[&str]); 3] = [
+    ("paper_session", &["id"]),
+    ("paper_event", &["session_id", "seq"]),
+    ("paper_bar", &["session_id", "timeframe", "open_time"]),
+];
+
+/// The key columns of one paper table, or `None` for any other name.
+#[must_use]
+pub fn paper_table_keys(table: &str) -> Option<&'static [&'static str]> {
+    PAPER_TABLES
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, keys)| *keys)
+}
+
+/// One paper table's digest comparison between a source and its copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperTableDigest {
+    /// The table.
+    pub table: String,
+    /// The source's row count.
+    pub rows: i64,
+    /// SHA-256 (hex) over every source row's columns, in key order.
+    pub source_digest: String,
+    /// SHA-256 (hex) over every copy row's columns, in key order.
+    pub target_digest: String,
+    /// The first key whose row differs, when one does — the refusal's `id`.
+    pub first_difference: Option<String>,
+}
+
+/// Compare one paper table between `source` and `target` by content digest:
+/// SHA-256 over every row's columns in key order, each value length-prefixed
+/// (`u64` little-endian length, then the UTF-8 bytes; a NULL is the `u64::MAX`
+/// length marker, a length no value can have). The columns come from the schema
+/// itself (`PRAGMA table_info`, in declared order) and the column NAMES are
+/// folded in too, so a migration that adds, removes or reorders a column
+/// changes the digest rather than hiding behind it — a difference the refusal
+/// names on the first key like any other.
+///
+/// This is the check behind "the paper state moved exactly" (r4.s2.w2, spec
+/// §Approach 3): row counts alone cannot see a changed column, and this can.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] when either side's schema or rows cannot be read,
+/// or when `table` is not one of [`PAPER_TABLES`].
+pub async fn paper_table_digest(
+    source: &SqlitePool,
+    target: &SqlitePool,
+    table: &str,
+) -> Result<PaperTableDigest, DataError> {
+    let keys = paper_table_keys(table)
+        .ok_or_else(|| DataError::Db(format!("{table} is not a paper table")))?;
+    let source_columns = paper_columns(source, table).await?;
+    let target_columns = paper_columns(target, table).await?;
+    let source_rows = paper_rows(source, table, &source_columns, keys).await?;
+    let target_rows = paper_rows(target, table, &target_columns, keys).await?;
+    let first_difference = first_difference(
+        &source_columns,
+        &target_columns,
+        keys,
+        &source_rows,
+        &target_rows,
+    );
+    Ok(PaperTableDigest {
+        table: table.to_owned(),
+        rows: i64::try_from(source_rows.len()).unwrap_or(i64::MAX),
+        source_digest: hex::encode(sha256_of(&source_columns, &source_rows)),
+        target_digest: hex::encode(sha256_of(&target_columns, &target_rows)),
+        first_difference,
+    })
+}
+
+/// One table's column names, in schema order.
+async fn paper_columns(pool: &SqlitePool, table: &str) -> Result<Vec<String>, DataError> {
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| DataError::Db(format!("read {table}'s columns: {e}")))?;
+    if columns.is_empty() {
+        return Err(DataError::Db(format!(
+            "{table} holds no columns (is the table there?)"
+        )));
+    }
+    Ok(columns)
+}
+
+/// Every row of one table, in key order, each column read as its text
+/// rendering (`NULL` stays `None`) — the digest's input.
+///
+/// Every column is `CAST(… AS TEXT)` in the query: SQLite's own rendering is
+/// the canonical form (an INTEGER `seq` reads as its decimal digits), and it is
+/// what lets a typed column be read as one `Option<String>` whatever its
+/// declared type — the alternative (one decode per declared type) would encode
+/// the same values differently per column type for no gain.
+async fn paper_rows(
+    pool: &SqlitePool,
+    table: &str,
+    columns: &[String],
+    keys: &[&str],
+) -> Result<Vec<Vec<Option<String>>>, DataError> {
+    let column_list = columns
+        .iter()
+        .map(|column| format!("CAST({} AS TEXT)", quote_ident(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_list = keys
+        .iter()
+        .map(|key| quote_ident(key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {column_list} FROM {} ORDER BY {key_list}",
+        quote_ident(table)
+    );
+    let rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DataError::Db(format!("read {table} rows for the digest: {e}")))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut values = Vec::with_capacity(columns.len());
+        for (index, column) in columns.iter().enumerate() {
+            let value: Option<String> = row
+                .try_get(index)
+                .map_err(|e| DataError::Db(format!("read {table}.{column} for the digest: {e}")))?;
+            values.push(value);
+        }
+        out.push(values);
+    }
+    Ok(out)
+}
+
+/// A SQLite identifier quoted for a statement this module builds. Every name
+/// comes from the schema or the fixed [`PAPER_TABLES`] table, never from input.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// One table's digest: the column names, then every row in key order, each row
+/// encoded as below.
+fn sha256_of(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(
+        u64::try_from(columns.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for column in columns {
+        hasher.update(
+            u64::try_from(column.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(column.as_bytes());
+    }
+    for row in rows {
+        hasher.update(encode_row(row));
+    }
+    hasher.finalize().to_vec()
+}
+
+/// One row's canonical encoding: every column length-prefixed, in order. A
+/// NULL is `u64::MAX` — a length no value can have, so a NULL can never be
+/// confused with an empty string.
+fn encode_row(values: &[Option<String>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for value in values {
+        match value {
+            Some(text) => {
+                let bytes = text.as_bytes();
+                out.extend_from_slice(
+                    &u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes(),
+                );
+                out.extend_from_slice(bytes);
+            }
+            None => out.extend_from_slice(&u64::MAX.to_le_bytes()),
+        }
+    }
+    out
+}
+
+/// The first key whose row differs. Both sides are read in the same key order,
+/// so the first index whose encodings differ — or where only one side has a row
+/// — names it.
+fn first_difference(
+    source_columns: &[String],
+    target_columns: &[String],
+    keys: &[&str],
+    source_rows: &[Vec<Option<String>>],
+    target_rows: &[Vec<Option<String>>],
+) -> Option<String> {
+    for index in 0..source_rows.len().max(target_rows.len()) {
+        let left = source_rows.get(index);
+        let right = target_rows.get(index);
+        let equal = matches!(
+            (left, right),
+            (Some(left), Some(right)) if encode_row(left) == encode_row(right)
+        );
+        if !equal {
+            return left.map_or_else(
+                || right.map(|row| key_of(target_columns, keys, row)),
+                |row| Some(key_of(source_columns, keys, row)),
+            );
+        }
+    }
+    None
+}
+
+/// One row's key, rendered as `column=value` pairs in the table's key order —
+/// the refusal's `id`.
+fn key_of(columns: &[String], keys: &[&str], row: &[Option<String>]) -> String {
+    let mut parts = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = columns
+            .iter()
+            .position(|column| column.as_str() == *key)
+            .and_then(|index| row.get(index).cloned().flatten())
+            .unwrap_or_else(|| "(absent)".to_owned());
+        parts.push(format!("{key}={value}"));
+    }
+    parts.join(" ")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        open_read_only, read_target_contents, table_count, table_names, target_row_counts,
-        vacuum_into_copy,
+        PAPER_TABLES, open_read_only, paper_table_digest, paper_table_keys, read_target_contents,
+        table_count, table_names, target_row_counts, vacuum_into_copy,
     };
     use crate::adapters::db::open_migrated;
     use std::path::Path;
@@ -501,5 +738,113 @@ mod tests {
             "the migration bookkeeping is excluded: {contents:?}"
         );
         assert!(!contents.is_empty());
+    }
+
+    /// r4.s2.w2: the paper digest compares every column — equal tables agree,
+    /// one changed column names the table and the first differing key, and a
+    /// row only one side has is named too.
+    #[tokio::test]
+    async fn paper_table_digest_names_the_first_differing_key() {
+        let tmp = TempDir::new().unwrap();
+        let source = open_migrated(&tmp.path().join("source.db")).await.unwrap();
+        let target = open_migrated(&tmp.path().join("target.db")).await.unwrap();
+        for pool in [source.pool(), target.pool()] {
+            sqlx::query(
+                "INSERT INTO strategy (id, name, created_at) \
+                 VALUES ('st-1', 'digest', '2026-01-01T00:00:00.000Z')",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO strategy_version \
+                 (id, strategy_id, dsl_schema_version, dsl, dsl_original, version_hash, \
+                  created_by, created_at) \
+                 VALUES ('ver-1', 'st-1', '1.0.0', '{}', '{}', 'h', 'human', \
+                         '2026-01-01T00:00:00.000Z')",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO paper_session \
+                 (id, seq, strategy_version_id, created_at, pair, primary_timeframe, \
+                  htf_timeframe, uses_d1, starting_equity, taker_fee_bps, slippage_bps, \
+                  engine_fingerprint, graduation, walk_forward_run_id, override_reason, \
+                  override_at, certified_data_versions, fixture, min_trades, promoted_by) \
+                 VALUES ('sess-1', 1, 'ver-1', '2026-01-01T00:00:00.000Z', 'BTCUSDT', '15m', NULL, \
+                         0, '10000', '4', '1', 'fp', 'override', NULL, 'digest', \
+                         '2026-01-01T00:00:00.000Z', '[]', 0, 1, 'operator-token')",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            for seq in [1_i64, 2] {
+                sqlx::query(
+                    "INSERT INTO paper_event (session_id, seq, at, kind, payload) \
+                     VALUES ('sess-1', ?1, '2026-01-01T00:00:00.000Z', 'bar_processed', ?2)",
+                )
+                .bind(seq)
+                .bind(format!("payload-{seq}"))
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let digest = paper_table_digest(source.pool(), target.pool(), "paper_event")
+            .await
+            .unwrap();
+        assert_eq!(digest.rows, 2);
+        assert_eq!(digest.first_difference, None, "equal tables agree");
+        assert_eq!(digest.source_digest, digest.target_digest);
+        assert_eq!(digest.source_digest.len(), 64, "SHA-256, hex");
+
+        // One changed column: the table and the exact key are named.
+        sqlx::query("DROP TRIGGER paper_event_no_update")
+            .execute(target.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE paper_event SET payload = 'changed' WHERE seq = 2")
+            .execute(target.pool())
+            .await
+            .unwrap();
+        let digest = paper_table_digest(source.pool(), target.pool(), "paper_event")
+            .await
+            .unwrap();
+        assert_eq!(
+            digest.first_difference.as_deref(),
+            Some("session_id=sess-1 seq=2"),
+            "the changed row's key is named"
+        );
+        assert_ne!(digest.source_digest, digest.target_digest);
+
+        // A row only one side has: the first unmatched key is named.
+        sqlx::query("DROP TRIGGER paper_event_no_delete")
+            .execute(target.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM paper_event WHERE seq = 1")
+            .execute(target.pool())
+            .await
+            .unwrap();
+        let digest = paper_table_digest(source.pool(), target.pool(), "paper_event")
+            .await
+            .unwrap();
+        assert_eq!(
+            digest.first_difference.as_deref(),
+            Some("session_id=sess-1 seq=1"),
+            "the missing row's key is named"
+        );
+
+        // Every paper table's keys are declared, and nothing else is a paper
+        // table.
+        for (table, keys) in PAPER_TABLES {
+            assert_eq!(paper_table_keys(table), Some(keys), "{table}");
+        }
+        assert_eq!(paper_table_keys("backtest_run"), None);
+
+        source.pool().close().await;
+        target.pool().close().await;
     }
 }

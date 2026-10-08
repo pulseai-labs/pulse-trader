@@ -40,7 +40,9 @@ use tokio::net::TcpListener;
 use crate::adapters::binance::RestClosedBars;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{SqlitePaperSessionRepo, SqliteStrategyRepo};
+use crate::adapters::db::{
+    SqlitePaperSessionRepo, SqliteStrategyRepo, instance_lock::InstanceLock,
+};
 use crate::adapters::secrets::{self, CredentialProfile, StartupCredential};
 use crate::adapters::store::CandleStore;
 use crate::application::paper_runtime::{
@@ -106,6 +108,15 @@ pub enum ServeError {
         /// Which file, and why — the owner/mode/open/read failure
         /// ([`CredentialFileRefusal`]'s one-line rendering), worded for the
         /// operator.
+        reason: String,
+    },
+    /// The database's instance lock is held (#250, r4.s2.w2): another
+    /// `pulse serve` runs against this database, or an import/restore has it
+    /// held until its install completes. The refusal names the database and the
+    /// lock file.
+    #[error("pulse serve: refusing to start: {reason}")]
+    InstanceLockHeld {
+        /// The lock refusal's words, naming the database and the lock file.
         reason: String,
     },
 }
@@ -322,6 +333,15 @@ fn start_guard(data_dir: &std::path::Path, limit: StartLimit, sink: &Arc<dyn Req
 /// [`ServeError`] on any refused bind, exhausted retry budget, bind failure or
 /// serve-loop failure.
 pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
+    // ---- Step 0 (#250, r4.s2.w2): the database's instance lock, held for this
+    // process's lifetime. A second server — or an in-flight import/restore that
+    // holds the target until its install completes — refuses this one by name,
+    // before anything touches the database.
+    let _instance_lock =
+        InstanceLock::acquire(config.db.path()).map_err(|error| ServeError::InstanceLockHeld {
+            reason: error.to_string(),
+        })?;
+
     // r3.s4.w4: the control channel is created BEFORE the state, so the
     // routes' handle and the runtime's receiver come from one pair.
     let (paper_control, paper_commands) =

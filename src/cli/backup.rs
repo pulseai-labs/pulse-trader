@@ -17,9 +17,10 @@
 //! import contract) on the backup into a temporary file beside the target,
 //! refuses a non-empty target without `--replace` (backing the target up
 //! first when it replaces), then performs the same atomic rename and prints a
-//! summary. Its precondition — the server must be stopped — is stated in
-//! `--help`; the `just restore` recipe stops the unit, restores, then starts
-//! it again.
+//! summary — the three paper digests included (r4.s2.w2). Its precondition —
+//! the server must be stopped — is ENFORCED by the target's instance lock
+//! (#250), taken before any write; the `just restore` recipe stops the unit,
+//! restores, then starts it again.
 //!
 //! [`backup_target`] is the one full-backup body — database + the source data
 //! dir's snapshots — that `pulse backup` and BOTH `--replace` safety backups
@@ -68,8 +69,10 @@ pub struct BackupArgs {
 /// `pulse restore <backup.db> --backup-dir <dir holding its candles/>
 /// [--db <target>] [--data-dir <target>] --replace`.
 ///
-/// **Precondition: the server must be stopped.** Restore does not check the
-/// process; the `just restore` recipe stops `pulse-serve`, restores, then
+/// **Precondition: the server must be stopped — and this command enforces it
+/// (#250).** The target's instance lock is taken before any write and held
+/// until the install completes, so a running `pulse serve` refuses this run by
+/// name; the `just restore` recipe still stops `pulse-serve`, restores, then
 /// starts it again.
 #[derive(Debug, Args)]
 pub struct RestoreArgs {

@@ -114,6 +114,11 @@ pub use certification_freeze_repo::SqliteCertificationFreezeRepo;
 pub mod certification_repo;
 pub use certification_repo::SqliteCertificationRepo;
 
+// r4.s2.w2 (#250): the per-database instance lock — `pulse serve` holds it for
+// its process lifetime and the data-ops verbs take it on their target. Not
+// re-exported (the cli verbs and `server::bind` are its only callers).
+pub(crate) mod instance_lock;
+
 // r3.s3.w4 (D7/D12, ADR-0026): the small copy/verify helper set the data-ops
 // verbs compose — the read-only source open, the VACUUM INTO copy, count/hash/
 // id reads and the referenced-snapshot projection. Raw `query`/`query_scalar`
@@ -150,7 +155,7 @@ pub(crate) use migrate::{
 #[cfg(test)]
 pub(crate) use migrate::{InterruptedInstall, QuarantineOwner, orphaned_quarantines};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -184,6 +189,12 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: SqlitePool,
+    /// The database file this pool was opened at — the instance lock's target
+    /// (r4.s2.w2: `pulse serve` locks the file it opened, and the data-ops
+    /// verbs lock the file they are about to replace). Kept so the lock path
+    /// is derived from the ONE resolution that opened the pool, never a second
+    /// invented one.
+    path: PathBuf,
 }
 
 impl Db {
@@ -250,7 +261,10 @@ impl Db {
             .connect_with(opts)
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Open the pool at the platform-default `pulse.db` path
@@ -269,6 +283,13 @@ impl Db {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// The database file this pool was opened at (r4.s2.w2: the file the
+    /// instance lock is taken on).
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
