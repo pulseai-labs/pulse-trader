@@ -46,7 +46,7 @@ const FAPI_BASE: &str = "https://fapi.binance.com";
 const KLINES_LIMIT: u32 = 1500;
 
 /// Max funding rows per `/fapi/v1/fundingRate` page (API cap is 1000).
-const FUNDING_LIMIT: u32 = 1000;
+const FUNDING_LIMIT: usize = 1000;
 
 /// A source of raw REST response bodies, keyed by URL. The production impl is a
 /// thin wrapper over WI-02's [`BinanceClient`]; tests inject scripted pages so
@@ -373,6 +373,39 @@ where
     decode_funding(&body)
 }
 
+/// Walk full funding pages for a bounded historical gap. The ordinary
+/// unbounded top-up retains its single-page behavior.
+async fn fetch_bounded_funding<S>(
+    source: &S,
+    pair: &Pair,
+    mut start_ms: i64,
+    until_ms: i64,
+) -> Result<Vec<FundingEvent>, DataError>
+where
+    S: PageSource + Sync,
+{
+    let mut events = Vec::new();
+    while start_ms < until_ms {
+        let page = fetch_new_funding(source, pair, start_ms).await?;
+        let full = page.len() == FUNDING_LIMIT;
+        let last = page.last().map(|event| event.calc_time);
+        events.extend(page.into_iter().filter(|event| event.calc_time < until_ms));
+        let Some(last) = last else {
+            break;
+        };
+        if !full || last >= until_ms {
+            break;
+        }
+        if last < start_ms {
+            return Err(DataError::Parse(
+                "funding pagination did not advance".to_owned(),
+            ));
+        }
+        start_ms = last + 1;
+    }
+    Ok(events)
+}
+
 /// Fetch the incremental top-up: candles newer than `since_ms` (closed only) for
 /// `(pair, tf)`, with funding fetched from `funding_since_ms` and stamped onto
 /// the **new candles only** (grill — no double-application at the boundary).
@@ -427,7 +460,10 @@ where
     if candles.is_empty() {
         return Ok(candles);
     }
-    let funding = fetch_new_funding(source, pair, funding_since_ms).await?;
+    let funding = match until_ms {
+        Some(until) => fetch_bounded_funding(source, pair, funding_since_ms, until).await?,
+        None => fetch_new_funding(source, pair, funding_since_ms).await?,
+    };
     // Stamp funding on the NEW candles only (WI-02 sparse half-open rule).
     stamp_funding(&mut candles, &funding);
     Ok(candles)
@@ -726,5 +762,53 @@ mod tests {
             funding_rate: None,
         };
         assert_eq!(c.close_time, M15 - 1);
+    }
+    #[tokio::test]
+    async fn bounded_gap_fetch_stamps_funding_from_two_full_pages() {
+        let until = 2001 * M15;
+        let first: Vec<_> = (1..=1000).map(|i| (i * M15, "0.1")).collect();
+        let second: Vec<_> = (1001..=2000).map(|i| (i * M15, "0.2")).collect();
+        let mut pages = HashMap::new();
+        pages.insert(
+            super::klines_url_until(&btc(), Timeframe::M15, 1, Some(until)),
+            klines_json(&first),
+        );
+        pages.insert(
+            super::klines_url_until(&btc(), Timeframe::M15, 1000 * M15 + 1, Some(until)),
+            klines_json(&second),
+        );
+        pages.insert(
+            super::klines_url_until(&btc(), Timeframe::M15, 2000 * M15 + 1, Some(until)),
+            empty_klines_json(),
+        );
+        pages.insert(funding_url(&btc(), 1), funding_json(&first));
+        pages.insert(funding_url(&btc(), 1000 * M15 + 1), funding_json(&second));
+        pages.insert(
+            funding_url(&btc(), 2000 * M15 + 1),
+            funding_json(&[(until, "0.9")]),
+        );
+        let source = ScriptedPages::new(pages);
+        let candles = super::fetch_incremental_bounded_with(
+            &source,
+            &FakeClock::at(3000 * M15),
+            &btc(),
+            Timeframe::M15,
+            0,
+            Some(until),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(candles.len(), 2000);
+        assert!(
+            candles[..1000]
+                .iter()
+                .all(|c| c.funding_rate == Some(dec("0.1")))
+        );
+        assert!(
+            candles[1000..]
+                .iter()
+                .all(|c| c.funding_rate == Some(dec("0.2")))
+        );
     }
 }

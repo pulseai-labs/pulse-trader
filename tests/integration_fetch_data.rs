@@ -847,6 +847,7 @@ const NOV_2023_MS: i64 = 1_698_796_800_000;
 /// for and answers from per-call FIFO queues — the offline bulk + top-up stub
 /// the `--from` backfill tests drive (never the network).
 struct ScriptedSource {
+    bulk_end_limit: Option<i64>,
     bulk_calls: Mutex<Vec<(i64, i64)>>,
     incremental_calls: Mutex<Vec<i64>>,
     bulk_replies: Mutex<std::collections::VecDeque<Vec<i64>>>,
@@ -856,6 +857,7 @@ struct ScriptedSource {
 impl ScriptedSource {
     fn new(bulk_replies: Vec<Vec<i64>>, incremental_replies: Vec<Vec<i64>>) -> Self {
         Self {
+            bulk_end_limit: None,
             bulk_calls: Mutex::new(Vec::new()),
             incremental_calls: Mutex::new(Vec::new()),
             bulk_replies: Mutex::new(bulk_replies.into()),
@@ -888,6 +890,9 @@ impl MarketDataSource for ScriptedSource {
         end_ms: i64,
     ) -> impl Future<Output = Result<CandleSeries, DataError>> {
         lock(&self.bulk_calls).push((start_ms, end_ms));
+        if self.bulk_end_limit.is_some_and(|limit| end_ms > limit) {
+            return std::future::ready(Err(DataError::Io("unpublished bulk month".to_owned())));
+        }
         let opens = lock(&self.bulk_replies).pop_front().unwrap_or_default();
         let series = CandleSeries {
             pair: pair.clone(),
@@ -1289,4 +1294,70 @@ async fn fetch_leaves_an_unfillable_interior_gap_reported() {
         gap_open(3),
         "and it is the right hole"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_head_in_current_month_avoids_unpublished_archives() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    // now = 2023-11-14; October and November are unpublished.
+    let october = 1_696_118_400_000;
+    let november = 1_698_796_800_000;
+    let start = october - M15;
+    let first = november + 2 * M15;
+    store
+        .commit(&pair, Timeframe::M15, vec![bulk_candle(first)])
+        .unwrap();
+    let gap: Vec<i64> = (october..first)
+        .step_by(usize::try_from(M15).unwrap())
+        .collect();
+    let mut source = ScriptedSource::new(vec![vec![start]], vec![vec![], gap]);
+    source.bulk_end_limit = Some(october);
+    let outcome = ensure_one_tf(
+        &source,
+        &store,
+        &FakeClock::at(NOW_MS),
+        &pair,
+        Timeframe::M15,
+        start,
+    )
+    .await;
+    let TfOutcome::Ok(summary) = outcome else {
+        panic!("backfill must leave unpublished months to REST");
+    };
+    assert_eq!(summary.gap_count, 0);
+    let head = store.load_head(&pair, Timeframe::M15).unwrap().unwrap();
+    assert_eq!(head.series.candles.first().unwrap().open_time, start);
+    assert_eq!(head.series.candles.last().unwrap().open_time, first);
+    assert!(head.series.candles.iter().any(|c| c.open_time == november));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_with_only_unpublished_months_uses_bounded_rest_prefix() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    let november = 1_698_796_800_000;
+    let first = november + 2 * M15;
+    store
+        .commit(&pair, Timeframe::M15, vec![bulk_candle(first)])
+        .unwrap();
+    let mut source = ScriptedSource::new(vec![], vec![vec![november, november + M15], vec![]]);
+    source.bulk_end_limit = Some(1_696_118_400_000);
+    let outcome = ensure_one_tf(
+        &source,
+        &store,
+        &FakeClock::at(NOW_MS),
+        &pair,
+        Timeframe::M15,
+        november,
+    )
+    .await;
+    let TfOutcome::Ok(summary) = outcome else {
+        panic!("the unpublished prefix must use REST");
+    };
+    assert_eq!(summary.candle_count, 3);
+    assert_eq!(summary.gap_count, 0);
+    assert!(source.bulk_calls().is_empty());
+    let head = store.load_head(&pair, Timeframe::M15).unwrap().unwrap();
+    assert_eq!(head.series.candles.first().unwrap().open_time, november);
 }

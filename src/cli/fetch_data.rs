@@ -220,7 +220,7 @@ where
             // top-up (grill Q1 — prod's BTCUSDT starts 2024-06 and must reach
             // 2021-01-01).
             Some(prior_first) if start_ms < prior_first => {
-                backfill_run(source, repo, pair, tf, prior, start_ms).await
+                backfill_run(source, repo, pair, tf, prior, start_ms, now_ms).await
             }
             _ => subsequent_run(source, repo, pair, tf, prior).await,
         },
@@ -324,7 +324,9 @@ where
 /// making `months_in_range`'s inclusive `end - 1` naming name the prior first
 /// candle's own month (whose early days the snapshot lacks) — and are merged
 /// onto the prior snapshot (dedup on `open_time`, the freshly-fetched copy
-/// winning). The merged span is then topped up to now, every other month's
+/// winning). The bulk range ends before the publication-lag month; bounded
+/// REST fills the gap to HEAD, or the whole prefix when no published month is
+/// requested. The merged span is then topped up to now, every other month's
 /// publication lag included, and ONE new snapshot is committed: a new
 /// content-hash `data_version`, `HEAD` moves, and the prior snapshot file stays
 /// on disk (ADR-0018 — existing runs keep pointing at their own data versions).
@@ -340,6 +342,7 @@ async fn backfill_run<S, R>(
     tf: Timeframe,
     prior: StoredCandleSeries,
     start_ms: i64,
+    now_ms: i64,
 ) -> Result<TfSummary, DataError>
 where
     S: MarketDataSource + Sync,
@@ -350,11 +353,28 @@ where
         // treat headless content like today's incremental path.
         return subsequent_run(source, repo, pair, tf, prior).await;
     };
-    let bulk_end_ms = month_start_ms(prior_first) + 1;
-    let bulk = source
-        .fetch_historical(pair, tf, start_ms, bulk_end_ms)
-        .await?;
-    let (merged, _gaps) = crate::adapters::binance::merge::merge_new(&prior.series, bulk.candles)?;
+    // Neither the current month nor the publication-lag month is guaranteed
+    // to have an archive. Stop before both; the interior-gap fill bridges the
+    // published history to HEAD through bounded REST.
+    let (year, month) = previous_month(now_ms);
+    let unpublished_start_ms = Utc
+        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .single()
+        .map_or(now_ms, |dt| dt.timestamp_millis());
+    let bulk_end_ms = (month_start_ms(prior_first) + 1).min(unpublished_start_ms);
+    let earlier = if start_ms < bulk_end_ms {
+        source
+            .fetch_historical(pair, tf, start_ms, bulk_end_ms)
+            .await?
+            .candles
+    } else {
+        // No published month in the requested prefix: there is no earlier
+        // archive candle to anchor an interior gap, so fetch the prefix itself.
+        source
+            .fetch_incremental_until(pair, tf, start_ms - 1, prior_first)
+            .await?
+    };
+    let (merged, _gaps) = crate::adapters::binance::merge::merge_new(&prior.series, earlier)?;
     // Top up to now from the merged series' last candle — the backfill also
     // closes the span up to the clock cutoff, in the same commit (r4.s1.w2).
     let since = merged.candles.last().map_or(start_ms - 1, |c| c.open_time);
