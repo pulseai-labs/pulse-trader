@@ -24,6 +24,8 @@
 //! describes the dir the data lives in; a database outside it would make the
 //! marker meaningless, so the containment check refuses by name first, and it
 //! is pure (no writes) — a start refused for its paths leaves no marker behind.
+//! [`ensure_db_inside_data_dir`] is the one copy of that rule; `pulse qa-seed`
+//! reuses it (r4.s2 close-review F3).
 //!
 //! A marker this build cannot read (empty, torn, hand-edited) is a REFUSAL,
 //! never an overwrite: the one thing a safety marker must not do is let a
@@ -203,14 +205,14 @@ pub fn write(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
     Ok(())
 }
 
-/// Apply the marker for a `--role {role}` start: refuse a database outside the
-/// data dir, refuse a dir marked with the other role, write the marker when it
-/// is absent, and continue on the same role.
+/// The containment rule: the database must sit inside the data dir, because the
+/// marker describes the data dir's data. Pure — a refusal writes nothing.
 ///
 /// # Errors
 ///
-/// [`RoleRefused`] — and NOTHING is written on any refusal.
-pub fn check(data_dir: &Path, db: &Path, role: ServerRole) -> Result<(), RoleRefused> {
+/// [`RoleRefused::DbOutsideDataDir`] when `db` is not inside `data_dir`, and
+/// [`RoleRefused::PathUnresolved`] when either path cannot be resolved.
+pub(crate) fn ensure_db_inside_data_dir(data_dir: &Path, db: &Path) -> Result<(), RoleRefused> {
     let db_resolved = resolve(db)?;
     let dir_resolved = resolve(data_dir)?;
     if !db_resolved.starts_with(&dir_resolved) {
@@ -219,6 +221,18 @@ pub fn check(data_dir: &Path, db: &Path, role: ServerRole) -> Result<(), RoleRef
             data_dir: data_dir.to_path_buf(),
         });
     }
+    Ok(())
+}
+
+/// Apply the marker for a `--role {role}` start: refuse a database outside the
+/// data dir, refuse a dir marked with the other role, write the marker when it
+/// is absent, and continue on the same role.
+///
+/// # Errors
+///
+/// [`RoleRefused`] — and NOTHING is written on any refusal.
+pub fn check(data_dir: &Path, db: &Path, role: ServerRole) -> Result<(), RoleRefused> {
+    ensure_db_inside_data_dir(data_dir, db)?;
     match read(data_dir)? {
         None => write(data_dir, role),
         Some(marked) if marked == role => Ok(()),

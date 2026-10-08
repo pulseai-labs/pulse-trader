@@ -8,10 +8,12 @@
 //! two tokens once on stdout. Everything else goes to stderr, and no token ever
 //! reaches a log line or the report.
 //!
-//! **Refusals.** A data dir marked `prod` is never seeded, and a database a
-//! live server (or an in-flight import/restore) holds is refused by name
-//! through w2's instance lock (#250) — the lock is taken before any write and
-//! held for the run.
+//! **Refusals.** A data dir marked `prod` is never seeded; a database outside
+//! the data dir is refused by name (the rule `pulse serve --role` applies — one
+//! copy of it, in `server::role`); and a database a live server (or an in-flight
+//! import/restore) holds is refused by name through w2's instance lock (#250) —
+//! the lock is taken before any write and held for the run. The first two are
+//! pure, and both land before the lock.
 //!
 //! **Stdout discipline** (mirror `pulse token issue`): the two tokens are the
 //! ONLY stdout lines, written CHECKED, in label order (`qa-app`, then
@@ -67,8 +69,17 @@ struct FreshToken {
 /// or a failure to write the marker or print the tokens (in which case the two
 /// fresh tokens are best-effort revoked first).
 pub(crate) async fn run_qa_seed(args: &QaSeedArgs) -> anyhow::Result<()> {
-    // ---- The marker: a prod-marked dir is never seeded (C5). Read first, so
-    // the refusal lands before the lock file or any write.
+    // ---- The containment rule first (`serve --role`'s own, one copy of it):
+    // the marker describes the data dir's data, so a `--db` outside `--data-dir`
+    // is refused by name. This is the cutover's own accident: draco-desk's old
+    // prod db is a rollback that sits in the old data dir and is unlocked once
+    // prod stops there, and the seed would revoke every token in it (F3). Pure,
+    // so it lands before the lock file and before any write.
+    role::ensure_db_inside_data_dir(&args.data_dir, &args.db)
+        .map_err(|error| anyhow::anyhow!("qa-seed: refusing: {error}"))?;
+
+    // ---- The marker: a prod-marked dir is never seeded (C5). Read next, still
+    // before the lock file or any write.
     match role::read(&args.data_dir)
         .map_err(|error| anyhow::anyhow!("qa-seed: refusing: {error}"))?
     {

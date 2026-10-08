@@ -700,3 +700,57 @@ fn qa_seed_refuses_a_dir_marked_prod() {
         db.display()
     );
 }
+
+#[test]
+fn qa_seed_refuses_a_database_outside_the_data_dir() {
+    let (root, home) = scratch();
+    let data = root.path().join("qa-data");
+    let elsewhere = root.path().join("old-prod-data");
+    fs::create_dir_all(&data).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    let db = elsewhere.join("pulse.db");
+    // The database the cutover leaves where it is: draco-desk's old prod db is
+    // the rollback, it sits OUTSIDE QA's data dir, and it carries prod's copied
+    // tokens. A seed pointed at it must revoke none of them.
+    for (index, label) in ["copied-app", "copied-agent"].iter().enumerate() {
+        let scope = if index == 1 { "agent" } else { "app" };
+        let _ = token_issue(&home, &db, scope, label);
+    }
+    let before = token_list(&home, &db);
+
+    let out = run_refused(
+        &home,
+        &[
+            "qa-seed",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+    let text = text(&out);
+    assert!(
+        !out.status.success(),
+        "a database outside the data dir must be refused: {text}"
+    );
+    assert!(
+        text.contains(db.to_str().unwrap()) && text.contains(data.to_str().unwrap()),
+        "the refusal names the database and the data dir: {text}"
+    );
+
+    // The token set is exactly as it was: nothing revoked, nothing issued — the
+    // one transaction never ran.
+    assert_eq!(
+        token_list(&home, &db),
+        before,
+        "a refused seed leaves every token in the database alone"
+    );
+    assert!(
+        !data.join("server-role").exists(),
+        "a refused seed writes no marker"
+    );
+    assert!(
+        !elsewhere.join("pulse.db.serve.lock").exists(),
+        "the refusal lands before the instance lock"
+    );
+}
