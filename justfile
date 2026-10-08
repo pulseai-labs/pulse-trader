@@ -153,7 +153,12 @@ deploy tag:
     rm -rf "$SRC"
     git worktree prune
     git worktree add --detach "$SRC" "refs/tags/{{ tag }}"
-    (cd "$SRC" && cargo build --release --bin pulse)
+    # #314 (r4.s2.w1): the server never serves the embedded frontend — its
+    # router mounts only /api/v1 routes and /mcp; there is no static handler
+    # under src/server/ — so the placeholder dist is the DELIBERATE setting of
+    # this release build (and of deploy-mac's): the deploy must not refuse on,
+    # or depend on, a frontend bundle the server never reads.
+    (cd "$SRC" && PULSE_ALLOW_PLACEHOLDER_DIST=1 cargo build --release --bin pulse)
     mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.config/systemd/user"
     install -m 0755 "$SRC/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
     # The THREE UNITS come from the tag too, like the binary above: installing
@@ -168,7 +173,13 @@ deploy tag:
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-serve.service || true
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pulse-serve.service
     "$HOME/.local/share/pulse-serve/bin/pulse" --version
-    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user is-active pulse-serve.service
+    # #346 (r4.s2.w1): `systemctl is-active` reads `active` for the whole
+    # 120-second bind retry, so a deploy whose bind never succeeded still
+    # reported success. The gate is now a real health probe. It runs the
+    # CALLER checkout's copy (justfile and script come from one checkout, so an
+    # old tag stays deployable); w4 lands the /healthz route, and until then
+    # the script's handshake fallback stands in.
+    bash scripts/wait-healthy.sh "http://100.90.203.21:8420" 150
 
 # The SAFE rehearsal for `deploy` (r3.s3.w4 AC-2): it installs nothing, starts
 # nothing and builds nothing. It verifies the three units with
@@ -242,6 +253,106 @@ restore file:
         exit "$RC"
     fi
     echo "restore: ok — pulse-serve restarted on the restored database"
+
+# --- the Mac Mini prod service (r4.s2.w1, G5/G6/G7/G9/G10, ADR-0029) ---------
+
+# Build a TAGGED commit ON the Mac Mini and install it as prod's always-on
+# service: a launchd LaunchAgent in draco's gui/ domain, restarts bounded at 3
+# in 15 minutes by the server's own start counter (launchd has no start limit).
+#
+# Runs HERE, on draco-desk, and drives the Mini over ssh (`Host macmini` in
+# ~/.ssh/config). The cutover step of ADR-0029 — an operator action, never run
+# by an item against the real service. The Mini gets SOURCE, never a GitHub
+# credential (G6): `git archive <tag>` over ssh. It has no `just` and no Node,
+# so the build happens there with cargo from rustup, and the placeholder dist
+# is deliberate (#314, see `deploy` above: the server never serves the
+# frontend).
+#
+# Before it loads anything it checks the host's permissions (G10): the data
+# directory is mode 0700, and `<data dir>/.env`, if present, is 0600 and owned
+# by draco — refused by name otherwise. The .env's CONTENTS are never read,
+# printed or copied; only its mode and owner are.
+#
+# It clears the start limit (the marker and the start log, as `prod-reset`
+# does), (re)loads the two agents, kickstarts the server, and only then reports
+# success — through the SAME health gate as `deploy` (#346): the tailnet
+# address has to answer, not just exist. If that gate fails, the agent is left
+# loaded for inspection and the recipe exits non-zero.
+deploy-mac tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{ tag }}" ]; then
+        echo "deploy-mac: a tag argument is required (e.g. just deploy-mac r4)" >&2
+        exit 1
+    fi
+    if ! git rev-parse -q --verify "refs/tags/{{ tag }}" >/dev/null; then
+        echo "deploy-mac: tag '{{ tag }}' does not exist in this repository" >&2
+        exit 1
+    fi
+    # 1. The tag's source to the Mini (G6). The remote dir is cleared first.
+    git archive "{{ tag }}" | ssh macmini 'rm -rf "$HOME/.cache/pulse-deploy/src" && mkdir -p "$HOME/.cache/pulse-deploy/src" && tar -x -C "$HOME/.cache/pulse-deploy/src"'
+    # 2. Build there (`$HOME/.cargo/bin` because a non-interactive ssh gets no
+    #    login PATH). #314: no Node on the Mini, and the server never reads the
+    #    bundle — the placeholder dist is the deliberate setting.
+    ssh macmini 'export PATH="$HOME/.cargo/bin:$PATH"; cd "$HOME/.cache/pulse-deploy/src" && PULSE_ALLOW_PLACEHOLDER_DIST=1 cargo build --release --bin pulse'
+    # 3. Install the binary, the config dir, the log-rotation script and the
+    #    two plists. A rollback to an old tag installs that tag's artifacts,
+    #    so everything comes from $SRC on the Mini.
+    ssh macmini 'set -e
+        mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.local/share/pulse-serve/deploy" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/PulseTrader"
+        install -m 0755 "$HOME/.cache/pulse-deploy/src/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
+        rm -rf "$HOME/.local/share/pulse-serve/config"
+        mkdir -p "$HOME/.local/share/pulse-serve/config"
+        cp -R "$HOME/.cache/pulse-deploy/src/config/." "$HOME/.local/share/pulse-serve/config/"
+        install -m 0755 "$HOME/.cache/pulse-deploy/src/deploy/pulse-logrotate.sh" "$HOME/.local/share/pulse-serve/deploy/pulse-logrotate.sh"
+        install -m 0644 "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.serve.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.logrotate.plist" "$HOME/Library/LaunchAgents/"'
+    # 4. Permissions (G10). Names and modes only — the file is never printed.
+    ssh macmini 'set -e
+        DATA="$HOME/Library/Application Support/PulseTrader"
+        if [ -d "$DATA" ]; then
+            mode="$(stat -f %Lp "$DATA")"
+            if [ "$mode" != "700" ]; then
+                echo "deploy-mac: $DATA is mode $mode, want 0700 (G10) - refusing" >&2
+                exit 1
+            fi
+        else
+            echo "deploy-mac: $DATA does not exist yet; nothing to check (the server creates it on first start)" >&2
+        fi
+        if [ -f "$DATA/.env" ]; then
+            mode="$(stat -f %Lp "$DATA/.env")"
+            owner="$(stat -f %Su "$DATA/.env")"
+            if [ "$mode" != "600" ]; then
+                echo "deploy-mac: $DATA/.env is mode $mode, want 0600 (G10) - refusing (contents never printed)" >&2
+                exit 1
+            fi
+            if [ "$owner" != "draco" ]; then
+                echo "deploy-mac: $DATA/.env is owned by $owner, want draco (G10) - refusing (contents never printed)" >&2
+                exit 1
+            fi
+        fi'
+    # 5. Clear the start limit, (re)load both agents, kickstart the server.
+    ssh macmini 'set -e
+        DATA="$HOME/Library/Application Support/PulseTrader"
+        rm -f "$DATA/serve-start-limit" "$DATA/serve-starts"
+        launchctl bootout "gui/$(id -u)/com.pulsetrader.serve" 2>/dev/null || true
+        launchctl bootout "gui/$(id -u)/com.pulsetrader.logrotate" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.pulsetrader.serve.plist"
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.pulsetrader.logrotate.plist"
+        launchctl kickstart -k "gui/$(id -u)/com.pulsetrader.serve"'
+    # 6. The real health gate (#346), from here: the Mini's tailnet address has
+    #    to answer, not just exist. 150 s covers the 120-second bind retry.
+    bash scripts/wait-healthy.sh "http://100.103.30.74:8420" 150
+    ssh macmini '"$HOME/.local/share/pulse-serve/bin/pulse" --version'
+
+# Clear the Mini's start limit and restart its agent: the recovery for a tripped
+# `--start-limit 3/900` (G5, #342's parity — systemd's equivalent here is
+# `systemctl --user reset-failed pulse-serve.service`). It removes ONLY the
+# marker and the start log in the data dir, then kickstarts.
+prod-reset:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ssh macmini 'rm -f "$HOME/Library/Application Support/PulseTrader/serve-start-limit" "$HOME/Library/Application Support/PulseTrader/serve-starts"'
+    ssh macmini 'launchctl kickstart -k "gui/$(id -u)/com.pulsetrader.serve"'
 
 # --- desktop bundle (r1.s1.w1) ----------------------------------------------
 

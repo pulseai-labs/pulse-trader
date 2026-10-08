@@ -7,7 +7,11 @@ Date: 2026-09-24
 Accepted. Refines [ADR-0015](0015-system-shape-modular-monolith-hexagonal-one-artifact.md) to "one crate, one binary, two targets,
 one database — on the server host", and supersedes the MASTER-SPEC's local-database and
 Keychain-only statements (the app no longer owns a local `pulse.db`; secrets that were Keychain
-material move behind the server credential profile, r3.s3.w3).
+material move behind the server credential profile, r3.s3.w3). Amended by
+[ADR-0029](0029-prod-on-mac-mini-qa-on-draco-desk.md): the always-on server moves from
+draco-desk's systemd user manager to a launchd LaunchAgent on the Mac Mini, and draco-desk
+becomes QA — the access model above (tailnet-only bind, tokens, audit, credential profile,
+one writer) is unchanged.
 
 ## Context
 
@@ -74,7 +78,16 @@ The access model:
 - Touch surfaces for registration at spine close: `src/server/**`, `src/cli/serve.rs`,
   `src/cli/token.rs`, `src/cli/import.rs`, `src/adapters/db/client_token_repo.rs`, `deploy/**`.
 
-## Operations (r3.s3.w4)
+## Operations (r3.s3.w4) — amended by [ADR-0029](0029-prod-on-mac-mini-qa-on-draco-desk.md)
+
+**Prod now runs on the Mac Mini, not draco-desk.** The section below records the
+draco-desk systemd deployment as it shipped in r3.s3.w4; ADR-0029 amends its
+topology — a launchd LaunchAgent in `draco`'s `gui/` domain on the Mini
+(`deploy/com.pulsetrader.serve.plist`, installed by `just deploy-mac <tag>`,
+with the server's own `--start-limit 3/900` in place of systemd's start limit) —
+while draco-desk becomes QA with its own database. The systemd unit and
+`just deploy` stay for QA; the bind policy, tokens, audit and credential rules
+above are unchanged.
 
 draco-desk runs the server under systemd's user manager: `deploy/pulse-serve.service` execs
 `~/.local/share/pulse-serve/bin/pulse serve --bind 100.90.203.21:8420` — the tailnet address and
