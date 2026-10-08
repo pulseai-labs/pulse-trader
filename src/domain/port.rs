@@ -705,9 +705,12 @@ pub trait WalkForwardRunRepository {
 ///
 /// **Rows are create + read only** — a certification is written once, whatever
 /// its outcome, and is never updated or deleted: it is the audit trail's atom.
-/// The adapter derives the `hypothesis_index` inside the write transaction
-/// (`MAX(index)+1` under that freeze), which is what makes the hypothesis
-/// budget race-free beside `0020`'s unique index.
+/// The adapter derives the `hypothesis_index` inside the same `BEGIN IMMEDIATE`
+/// transaction that inserts the row, reads the freeze's own `h` there and
+/// refuses the write when the index would exceed it
+/// ([`DataError::HypothesisBudgetSpent`]) — that write-side check is what makes
+/// the hypothesis budget race-free; `0020`'s unique index and budget trigger
+/// are the backstops a raw INSERT runs into, not the mechanism.
 pub trait CertificationRepository {
     /// A version's certification records, **newest first** (`hypothesis_index`
     /// descending), fail-closed like every sibling read.
@@ -745,14 +748,16 @@ pub trait CertificationRepository {
 
     /// Persist one record in ONE `BEGIN IMMEDIATE` transaction: the adapter
     /// mints the id and `created_at` (injected [`Clock`]), derives
-    /// `hypothesis_index = MAX(index)+1` under the draft's freeze, and derives
+    /// `hypothesis_index = MAX(index)+1` under the draft's freeze, compares it
+    /// with the freeze's own `h` — both INSIDE that transaction — and derives
     /// the `certified` cell from the draft's halves (the schema's CHECK holds
     /// the same law against a raw INSERT).
     ///
     /// # Errors
     ///
-    /// Returns [`DataError::Db`] when the version or freeze does not exist or
-    /// the store fails.
+    /// Returns [`DataError::HypothesisBudgetSpent`] when the derived index
+    /// would exceed the freeze's budget; [`DataError::Db`] when the version or
+    /// freeze does not exist or the store fails.
     fn insert(
         &self,
         draft: &CertificationDraft,

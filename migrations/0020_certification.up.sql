@@ -8,10 +8,15 @@
 -- and a refused or errored call writes NOTHING (so the budget it counts cannot
 -- drift from the calls that actually ran).
 --
--- THE BUDGET CANNOT RACE — `certification_freeze_index`, a UNIQUE index over
--- `(freeze_id, hypothesis_index)`. The step mints the next index inside the
--- same `BEGIN IMMEDIATE` transaction that inserts the row, so a concurrent
--- second call either waits or collides; it can never mint the index twice.
+-- THE BUDGET IS ENFORCED IN THE WRITE TRANSACTION, AND THE SCHEMA HOLDS THE
+-- SAME LAW AS A BACKSTOP. The adapter mints the next index AND reads the
+-- freeze's `h` inside the same `BEGIN IMMEDIATE` transaction that inserts the
+-- row, refusing the write when the index would exceed the budget — a
+-- concurrent second call waits for the write lock, sees its predecessor's row
+-- and refuses rather than overrunning. For a raw INSERT:
+-- `certification_freeze_index` (UNIQUE) refuses a duplicate position, and
+-- `certification_hypothesis_budget` refuses any index above the freeze's
+-- recorded `h`.
 --
 -- ONE LAW THE SCHEMA HOLDS ITSELF: `certified` is `search_pass AND
 -- holdout_passes`, both halves recorded — a stored `certified` that disagrees
@@ -66,9 +71,18 @@ CREATE TRIGGER certification_no_update BEFORE UPDATE ON certification
 CREATE TRIGGER certification_no_delete BEFORE DELETE ON certification
   BEGIN SELECT RAISE(ABORT, 'certification records are never deleted'); END;
 
--- One hypothesis index per freeze, and the anti-race backstop: the step mints
--- the index inside its write transaction, and this index makes a second row at
--- the same position impossible even under a raw INSERT.
+-- The budget backstop (the adapter's write transaction is the mechanism): a raw
+-- INSERT past the freeze's H aborts by name, exactly as the adapter refuses it.
+CREATE TRIGGER certification_hypothesis_budget BEFORE INSERT ON certification
+  WHEN NEW.hypothesis_index > (SELECT h FROM certification_freeze WHERE id = NEW.freeze_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'the freeze''s hypothesis budget is spent: hypothesis_index would exceed h');
+  END;
+
+-- One hypothesis index per freeze: a second row at the same position is
+-- impossible even under a raw INSERT (an index ABOVE the budget is refused by
+-- `certification_hypothesis_budget` above, and by the adapter's write
+-- transaction, which is the mechanism).
 CREATE UNIQUE INDEX certification_freeze_index
   ON certification (freeze_id, hypothesis_index);
 

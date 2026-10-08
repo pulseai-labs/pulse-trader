@@ -15,8 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   at the freeze's H, then writes one immutable `certification` record (migration `0020`) whatever the
   outcome: the search verdict, the pair, the per-timeframe data versions, the holdout's window, trade
   count, mean and bound, the engine fingerprint and the calling client's label. The record is
-  immutable by trigger, `(freeze_id, hypothesis_index)` is unique so the budget cannot race, and a
-  refused or errored call writes nothing. The step refuses typed and by name — no open freeze, a
+  immutable by trigger, and the write transaction refuses a call that would take the freeze past its
+  H hypotheses (the unique `(freeze_id, hypothesis_index)` index and a new budget trigger hold the
+  same law in the schema), so two overlapping calls cannot overrun the budget; a refused or errored
+  call writes nothing. The step refuses typed and by name — no open freeze, a
   lineage root created before the freeze (C4), and the (H+1)th hypothesis — and MCP gains
   `certify_version` (agent scope): one call is one hypothesis, and the answer carries the
   certification's id, its pass/fail, the search-span verdict, `holdout_passed` and the hypotheses

@@ -54,8 +54,8 @@ use crate::domain::dsl::CompiledStrategy;
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestRunRepository, CandleSeriesRepository, CandleWindow, CertificationRepository,
-    ExchangeAdapter, FreezeRecord, Pair, SnapshotSelection, StrategyRepository, Timeframe,
-    ValidatedDsl, WalkForwardRunRepository, compile, holdout_test, validate,
+    DataError, ExchangeAdapter, FreezeRecord, Pair, SnapshotSelection, StrategyRepository,
+    Timeframe, ValidatedDsl, WalkForwardRunRepository, compile, holdout_test, validate,
 };
 
 /// The longest `parent_version_id` chain this walk will follow before calling
@@ -156,9 +156,10 @@ where
     }
 
     // 3. The budget: H hypotheses per freeze, counted from the records
-    //    themselves (Q2). The write re-derives the index inside its own
-    //    transaction, and 0020's unique index is the backstop, so the count
-    //    here is a refusal check, not the accounting.
+    //    themselves (Q2). This is the cheap refusal — the write transaction
+    //    re-derives the index and reads the freeze's own H under the write
+    //    lock, and THAT is the enforcement (close R1): two calls that overlap
+    //    here at `H - 1` cannot both write.
     let used_before = certifications
         .count_for_freeze(&freeze.id)
         .await
@@ -247,12 +248,22 @@ where
         holdout_run,
         &request.called_by,
     );
-    let record = certifications
-        .insert(&draft)
-        .await
-        .map_err(CertifyError::Store)?;
+    let record = match certifications.insert(&draft).await {
+        Ok(record) => record,
+        // The write transaction's own refusal (close R1): a call that took the
+        // budget's last index between the pre-check above and this write. The
+        // loser of that overlap wrote nothing, exactly like the loser of the
+        // pre-check.
+        Err(DataError::HypothesisBudgetSpent { h }) => {
+            return Err(CertifyRefusal::HypothesisBudgetSpent { h }.into());
+        }
+        Err(e) => return Err(CertifyError::Store(e)),
+    };
 
-    let hypotheses_used = used_before.saturating_add(1);
+    // The record's index IS the budget count (the store minted it under the
+    // write lock), so a concurrent call beside this one cannot leave the
+    // answer stale. `used_before` above is the pre-check's read only.
+    let hypotheses_used = record.hypothesis_index;
     Ok(CertifyOutcome {
         hypotheses_left: record.hypotheses_left(freeze.h),
         hypotheses_used,

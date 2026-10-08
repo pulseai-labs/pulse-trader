@@ -8,12 +8,15 @@
 //! **One write path, one law.** `insert` is the only writer: it mints the id,
 //! takes `created_at` from the injected [`Clock`], derives
 //! `hypothesis_index = MAX(hypothesis_index) + 1` **inside one
-//! `BEGIN IMMEDIATE` transaction** and writes the row in that same transaction —
-//! so the hypothesis budget cannot race (the `0020` unique index over
-//! `(freeze_id, hypothesis_index)` is the backstop, not the mechanism), and a
-//! concurrent second call waits or collides rather than minting an index twice.
-//! The `certified` cell is derived from the draft's halves; the schema's CHECK
-//! refuses a raw INSERT that disagrees.
+//! `BEGIN IMMEDIATE` transaction**, reads the freeze's own `h` in that same
+//! transaction and writes the row only when the derived index is within the
+//! budget — so a concurrent second call waits for the write lock, sees its
+//! predecessor's row and **refuses by name**
+//! ([`DataError::HypothesisBudgetSpent`]) rather than minting `H + 1`. The
+//! backstops a raw INSERT runs into are `0020`'s unique index (a duplicate
+//! position) and its budget trigger (an index above `h`); they are not the
+//! mechanism. The `certified` cell is derived from the draft's halves; the
+//! schema's CHECK refuses a raw INSERT that disagrees.
 //!
 //! **Records are create + read only.** `0020`'s `BEFORE UPDATE` / `BEFORE
 //! DELETE` triggers refuse an edit and a delete alike; this adapter offers no
@@ -331,6 +334,28 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| DataError::Db(e.to_string()))?;
+
+        // The budget law, decided here INSIDE the transaction (close R1): the
+        // freeze's own `h`, read from the immutable row the record's key points
+        // at — never from a caller-supplied value — refuses the write before it
+        // mints an index past the budget. A missing freeze row (None) falls
+        // through to the INSERT's foreign key, which raises exactly as it did
+        // before this check existed.
+        let freeze_h = sqlx::query_scalar!(
+            r#"SELECT h AS "h!: i64" FROM certification_freeze WHERE id = ?1"#,
+            freeze_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+        if let Some(freeze_h) = freeze_h {
+            let h = u8::try_from(freeze_h)
+                .map_err(|e| DataError::Db(format!("certification_freeze.h {freeze_h}: {e}")))?;
+            if next > i64::from(h) {
+                return Err(DataError::HypothesisBudgetSpent { h });
+            }
+        }
+
         let hypothesis_index = u32::try_from(next).map_err(|e| {
             DataError::Db(format!(
                 "certification index {next} under freeze `{freeze_id}` exceeds u32: {e}"

@@ -9,6 +9,8 @@
 //!   holdout test passes), and its record names its pair and its data versions;
 //! - a version with no edge is recorded `certified = false` and still counts;
 //! - the 13th call is refused by name and writes nothing;
+//! - two inserts that overlap on the last budget slot write ONE record and
+//!   refuse the other inside the write transaction (close R1);
 //! - with no open freeze it refuses;
 //! - a version whose lineage root predates the freeze refuses;
 //! - the app reads the full record, and the route that serves it is `app`-scope;
@@ -19,10 +21,10 @@
 mod support;
 
 use pulse::{
-    BacktestRunRepository, CertificationRepository, CertifyRefusal, FakeClock, OpenFreezeRequest,
-    Pair, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
-    SqliteStrategyRepo, StrategyRepository, VerdictRule, WalkForwardRunRepository,
-    fixture_strategy_dsl,
+    BacktestRunRepository, CertificationRepository, CertifyRefusal, DataError, FakeClock,
+    OpenFreezeRequest, Pair, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo,
+    SqliteCertificationRepo, SqliteStrategyRepo, StrategyRepository, VerdictRule,
+    WalkForwardRunRepository, fixture_strategy_dsl,
 };
 use support::certification::{
     BARS, FREEZE_OPENED_MS, H, Probe, SEED, World, certifications, certify, certify_with_pair,
@@ -482,6 +484,70 @@ async fn certification_refuses_the_thirteenth_call_and_writes_nothing() {
         walk_forward_run_count(&world).await,
         walk_forwards_before,
         "a refused call runs nothing"
+    );
+}
+
+/// (c2, close R1) Two writes that overlap at `used = H - 1` land exactly ONE
+/// record: the write transaction derives the index and refuses the loser by
+/// name, so the budget cannot be overrun.
+///
+/// The overlap is real — both calls start from `used = H - 1` and interleave on
+/// the pool's two `BEGIN IMMEDIATE` writers — but the assertion is
+/// deterministic: the write lock serializes the two, so every interleaving
+/// gives one record at index `H` and one `HypothesisBudgetSpent`. No sleep
+/// creates a window; whoever takes the lock second derives `H + 1` and refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_overlapping_inserts_write_one_record_and_refuse_the_other() {
+    let world = world().await;
+    let run_id = seed_search_run(&world).await;
+    for _ in 1..u32::from(H) {
+        certifications(&world)
+            .insert(&seeded_draft(&world, &run_id))
+            .await
+            .expect("the seeded hypothesis persists");
+    }
+    assert_eq!(
+        certifications(&world)
+            .count_for_freeze(&world.freeze.id)
+            .await
+            .unwrap(),
+        u32::from(H) - 1,
+        "the freeze stands one hypothesis from its budget"
+    );
+
+    // Both calls derive their index from `used = H - 1`; the loser's write
+    // transaction must refuse it rather than mint `H + 1`.
+    let draft = seeded_draft(&world, &run_id);
+    let first_writer = certifications(&world);
+    let second_writer = certifications(&world);
+    let (first, second) = tokio::join!(first_writer.insert(&draft), second_writer.insert(&draft),);
+
+    let mut written = Vec::new();
+    let mut refused = 0_u32;
+    for result in [first, second] {
+        match result {
+            Ok(record) => written.push(record),
+            Err(DataError::HypothesisBudgetSpent { h }) => {
+                assert_eq!(h, H, "the refusal names the freeze's budget");
+                refused += 1;
+            }
+            Err(other) => panic!("an insert writes or refuses by name, never {other:?}"),
+        }
+    }
+    assert_eq!(written.len(), 1, "exactly one overlapping insert writes");
+    assert_eq!(refused, 1, "and exactly one refuses by name");
+    assert_eq!(
+        written[0].hypothesis_index,
+        u32::from(H),
+        "the one record takes the freeze's last index"
+    );
+    assert_eq!(
+        certifications(&world)
+            .count_for_freeze(&world.freeze.id)
+            .await
+            .unwrap(),
+        u32::from(H),
+        "the freeze's budget is exactly spent, never overrun"
     );
 }
 

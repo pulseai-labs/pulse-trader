@@ -655,6 +655,10 @@ async fn migration_0020_certification_roundtrip() {
         object_present(db.pool(), "index", "certification_freeze_index").await,
         "the (freeze_id, hypothesis_index) unique index exists after up"
     );
+    assert!(
+        object_present(db.pool(), "trigger", "certification_hypothesis_budget").await,
+        "the budget trigger exists after up"
+    );
 
     // (b) Empty: the down restores 0019 exactly — the table is gone, max 19.
     undo_to(db.pool(), 19)
@@ -676,6 +680,42 @@ async fn migration_0020_certification_roundtrip() {
         object_present(db.pool(), "table", "certification").await,
         "after re-run, certification is back"
     );
+}
+
+/// r4.s1.w5 / AC-5 + close R1: `0020`'s budget trigger refuses a raw INSERT
+/// whose `hypothesis_index` would take the freeze past its `h`. The adapter's
+/// write transaction is the mechanism; this trigger is the schema backstop,
+/// and it aborts by name without writing the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0020_budget_trigger_refuses_an_overrun() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+    // One row at index 1 under the H = 12 freeze `seed_certification` writes.
+    seed_certification(db.pool()).await;
+
+    let selections = "{\"primary\":{\"timeframe\":\"15m\",\"data_version\":\"v-primary\"},\"htf\":null,\"d1\":null}";
+    let err = sqlx::query(
+        "INSERT INTO certification          (id, version_id, freeze_id, hypothesis_index, rule, pair, search_walk_forward_run_id,           search_pass, holdout_start_ms, holdout_end_ms, holdout_n, holdout_mean_r, holdout_z,           holdout_lower_bound, holdout_passes, certified, search_inputs, holdout_inputs,           engine_fingerprint, created_at, called_by)          VALUES ('cert-over', 'ver-1', 'freeze-1', 13, 'wf-v2', 'BTCUSDT', 'wf-1', 1,                  1751328000000, 1754006400000, 200, '0.4', 2.64, 0.2, 1, 1, ?1, ?1,                  'fp', '2026-06-30T00:00:00.000Z', 'test-agent')",
+    )
+    .bind(selections)
+    .execute(db.pool())
+    .await
+    .expect_err("an index above the freeze's h is refused");
+    assert!(
+        err.to_string().contains("budget"),
+        "the refusal names the budget: {err}"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM certification")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the refused INSERT wrote no row");
 }
 
 /// r4.s1.w5 / AC-5: the `0020` down REFUSES over a certification row — 0019

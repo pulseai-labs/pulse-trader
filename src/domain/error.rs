@@ -91,6 +91,18 @@ pub enum DataError {
     /// lost yet, move them back" from "the database is unreadable".
     #[error("{0}")]
     OrphanedQuarantines(String),
+
+    /// A `certification` write would take the freeze past its hypothesis budget
+    /// (r4.s1.w5, Q2): the write transaction derived a `hypothesis_index` above
+    /// the freeze's `h` and refused the write. The refusal is decided inside the
+    /// write transaction under the write lock — an atomic re-check, not a
+    /// `count_for_freeze` pre-read two overlapping calls could interleave with
+    /// (the `StrategyNameTaken` pattern).
+    #[error("the freeze's hypothesis budget is spent: all {h} hypotheses are recorded")]
+    HypothesisBudgetSpent {
+        /// The freeze's budget `H`.
+        h: u8,
+    },
 }
 
 /// The specific kinds of structural corruption a `CandleSeries` can exhibit.
