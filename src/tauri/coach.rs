@@ -921,6 +921,11 @@ pub async fn coach_decide_core(
 
     let action = decode_action(&sessions, &session_id, request.action).await?;
 
+    // r4.s1.w4 (Q4): the accept's certification gate walks the parent's
+    // certifying span — an explicit, recorded bound, so while a freeze is open
+    // a span reaching into the holdout refuses the accept (recorded at the
+    // `walk_forward` stage) instead of evaluating holdout data.
+    let holdout = state.open_holdout().await?;
     let outcome = run_coach_decision(
         &state.strategy_repo(),
         &state.candles(),
@@ -932,6 +937,7 @@ pub async fn coach_decide_core(
             session_id: session_id.clone(),
             action,
         },
+        holdout,
     )
     .await
     .map_err(|e| decision_failure(&e))?;

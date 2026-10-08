@@ -102,6 +102,12 @@ pub mod client_token_repo;
 // module tree names it (callers map it into their own error vocabulary).
 pub use client_token_repo::{ClientToken, SqliteClientTokenRepo};
 
+// r4.s1.w4 (F1/C4): the certification-freeze store — `certification_freeze`
+// rows, opened once and closed once. `query!` macros for this table are
+// confined here (the `.sqlx` cache is keyed to this file).
+pub mod certification_freeze_repo;
+pub use certification_freeze_repo::SqliteCertificationFreezeRepo;
+
 // r3.s3.w4 (D7/D12, ADR-0026): the small copy/verify helper set the data-ops
 // verbs compose — the read-only source open, the VACUUM INTO copy, count/hash/
 // id reads and the referenced-snapshot projection. Raw `query`/`query_scalar`

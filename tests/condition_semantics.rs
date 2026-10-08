@@ -845,6 +845,7 @@ async fn persisted_impossible_version_lists_but_is_refused_at_run() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect_err("the persisted impossible version is refused at run");
@@ -1061,6 +1062,7 @@ async fn determinism_two_cold_runs_of_a_not_entry_are_identical() {
         &BinanceAdapter::new(),
         &world.runs,
         &request,
+        None,
     )
     .await
     .expect("the first cold run");
@@ -1070,6 +1072,7 @@ async fn determinism_two_cold_runs_of_a_not_entry_are_identical() {
         &BinanceAdapter::new(),
         &world.runs,
         &request,
+        None,
     )
     .await
     .expect("the second cold run");

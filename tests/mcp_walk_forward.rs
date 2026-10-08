@@ -259,16 +259,30 @@ async fn run_walk_forward_returns_the_detail_and_get_reads_it_back_identically()
         );
     }
 
-    // The same run read back: one shape, byte-identical JSON.
+    // The same run read back: one shape, byte-identical JSON — apart from the
+    // run result's `effective_window` echo (r4.s1.w4, #327), which is run-only
+    // control metadata: the read path has no request to echo (a defaulted or
+    // clamped bound is a property of the call, not of the stored span). Strip
+    // it and assert the persisted detail is identical, and that the echo is the
+    // ONLY difference.
     let fetched = call(
         &client,
         "get_walk_forward_run",
         json!({ "walk_forward_run_id": detail["walk_forward_run_id"] }),
     )
     .await;
+    let mut detail_without_echo = detail.clone();
+    let echo = detail_without_echo
+        .as_object_mut()
+        .expect("the detail is an object")
+        .remove("effective_window");
+    assert!(
+        echo.is_some(),
+        "the run result carries the effective-window echo: {detail}"
+    );
     assert_eq!(
         serde_json::to_string(&fetched).expect("fetched serializes"),
-        serde_json::to_string(&detail).expect("detail serializes"),
+        serde_json::to_string(&detail_without_echo).expect("detail serializes"),
         "get_walk_forward_run reads back the run_walk_forward detail verbatim"
     );
 

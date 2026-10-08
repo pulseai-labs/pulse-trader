@@ -28,6 +28,10 @@ mod error;
 // `PULSE_TARGET_TRIPLE`) plus the FR-7 `compare()` warning mechanism (built but
 // unwired this slice — VS-1.2.4 surfaces it).
 mod fingerprint;
+// r4.s1.w4 (F1, C4): the certification-freeze value types — the freeze record,
+// its store's typed refusals, and the holdout guard's view of an open freeze.
+// Pure + zero-I/O; the SQLite store is `adapters::db::certification_freeze_repo`.
+mod freeze;
 // r1.s4.w4: the `IdSource` port — "a fresh opaque row id" as an injected
 // dependency, so the coach accept's transaction-minted child/run ids are
 // deterministic under test the way `Clock` made `created_at` deterministic.
@@ -111,6 +115,10 @@ pub use backtest::{
 };
 pub use candle::Candle;
 pub use clock::Clock;
+// r4.s1.w4 (F1, C4): the certification-freeze surface. Re-exported so `lib.rs`
+// can curate the crate surface — an un-re-exported public domain type is a
+// `dead_code` BUILD error under `deny(warnings)`.
+pub use freeze::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeRequest};
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
 // concrete indicator adapter implements and the backtester reads through.
 pub use dsl::{

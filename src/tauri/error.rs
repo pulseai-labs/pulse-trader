@@ -302,7 +302,12 @@ impl From<BacktestAppError> for BusError {
                 | BacktestError::D1PairMismatch { .. }
                 | BacktestError::D1CoverageShort { .. },
             )
-            | BacktestAppError::WindowEmpty { .. } => BusErrorCode::Validation,
+            | BacktestAppError::WindowEmpty { .. }
+            // r4.s1.w4 (Q4/G1): the holdout guard's refusal joins the same
+            // caller-correctable family — `validation`, and its message cites
+            // the pair, the offending bound and the holdout start (the MCP
+            // surface reports it as a `from`/`to` field error).
+            | BacktestAppError::HoldoutRefused(_) => BusErrorCode::Validation,
             BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
             BacktestAppError::Engine(_) => BusErrorCode::Backtest,
             BacktestAppError::Internal(_) => BusErrorCode::Internal,

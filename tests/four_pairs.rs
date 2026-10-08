@@ -95,9 +95,16 @@ async fn run_one_pair<S, R>(
         snapshots: None,
         window: None,
     };
-    let outcome = run_version_backtest(strategies, store, &BinanceAdapter::new(), runs, &request)
-        .await
-        .unwrap_or_else(|e| panic!("{name}: a backtest must run exactly as BTCUSDT does: {e}"));
+    let outcome = run_version_backtest(
+        strategies,
+        store,
+        &BinanceAdapter::new(),
+        runs,
+        &request,
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{name}: a backtest must run exactly as BTCUSDT does: {e}"));
     assert!(
         !outcome.trades.is_empty(),
         "{name}: the fixture strategy trades on the fixture series"
@@ -135,6 +142,7 @@ async fn run_one_pair<S, R>(
             to_ms: None,
             k: Some(2),
         },
+        None,
     )
     .await
     .unwrap_or_else(|e| panic!("{name}: a walk-forward must run exactly as BTCUSDT does: {e}"));

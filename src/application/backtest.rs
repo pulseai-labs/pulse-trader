@@ -50,9 +50,9 @@ use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
     CandleSeriesRepository, CandleWindow, DataError, DataVersion, EngineFingerprint,
-    ExchangeAdapter, ExchangeError, FundingConfig, Pair, PersistedRun, PreparedBacktest, SeriesEnd,
-    SnapshotSelection, StrategyRepository, SymbolFilters, Timeframe, Trade, ValidatedDsl,
-    ValidationErrors, compile, validate,
+    ExchangeAdapter, ExchangeError, FundingConfig, HoldoutFreeze, Pair, PersistedRun,
+    PreparedBacktest, SeriesEnd, SnapshotSelection, StrategyRepository, SymbolFilters, Timeframe,
+    Trade, ValidatedDsl, ValidationErrors, compile, validate,
 };
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
@@ -286,6 +286,13 @@ pub enum BacktestAppError {
     /// Symbol filters could not be resolved.
     #[error("resolve exchange filters: {0}")]
     ExchangeFilters(#[from] ExchangeError),
+
+    /// The holdout guard refused the run: its window reaches into the frozen
+    /// holdout (r4.s1.w4, Q4/G1). Carries the guard's refusal verbatim — the
+    /// pair, the offending bound and the holdout start — so MCP maps it to a
+    /// `from`/`to` field error and the app to its existing error shape.
+    #[error("{0}")]
+    HoldoutRefused(crate::application::holdout::HoldoutRefusal),
 
     /// The engine refused the run.
     #[error("backtest failed: {0}")]
@@ -782,6 +789,11 @@ pub fn check_request_shape(
 
 /// Run one persisted strategy version and answer from the saved row.
 ///
+/// `holdout` is the open freeze's holdout start (r4.s1.w4, Q4): `Some` wires the
+/// holdout guard in (an explicit window into the holdout is refused, a
+/// defaulted whole-snapshot run is clamped to the search span), `None` — no
+/// freeze open, or an exempt caller — leaves every behaviour byte-identical.
+///
 /// # Errors
 ///
 /// Returns a [`BacktestAppError`]. Anything after `save_run` returns is
@@ -793,6 +805,7 @@ pub async fn run_version_backtest<S, C, E, R>(
     exchange: &E,
     runs: &R,
     request: &BacktestRequest,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<BacktestOutcome, BacktestAppError>
 where
     S: StrategyRepository,
@@ -838,6 +851,7 @@ where
         validated,
         request,
         compiled.needs_d1(),
+        holdout,
     )
     .await?;
 
@@ -1043,6 +1057,7 @@ async fn run_engine_offthread<C, E>(
     validated: ValidatedDsl,
     request: &BacktestRequest,
     needs_d1: bool,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<EngineOutput, BacktestAppError>
 where
     C: CandleSeriesRepository + Send + 'static,
@@ -1100,6 +1115,44 @@ where
             )
         } else {
             None
+        };
+        // r4.s1.w4 (Q4/G1): the holdout guard runs HERE — after the series
+        // load (the clamp needs the snapshot's own last candle) and before any
+        // evaluation. An explicit window into the holdout is refused by name;
+        // a defaulted whole-snapshot run is clamped to
+        // `[snapshot_first_open, holdout_start)` so the run ends at the search
+        // span's edge (a position still open there is a window-edge mark, not
+        // an end-of-data close). With no freeze open the decision is `Pass` and
+        // `window` is the caller's, unchanged.
+        let window = match crate::application::holdout::guard_backtest_window(
+            holdout,
+            &pair,
+            window.as_ref(),
+            primary.candles.last().map(|c| c.open_time),
+        )
+        .map_err(BacktestAppError::HoldoutRefused)?
+        {
+            crate::application::holdout::WindowDecision::Pass => window,
+            crate::application::holdout::WindowDecision::ClampToHoldoutStart {
+                holdout_start_ms,
+            } => match primary.candles.first().map(|c| c.open_time) {
+                Some(first) if first < holdout_start_ms => Some(CandleWindow {
+                    from_ms: first,
+                    to_ms: holdout_start_ms,
+                }),
+                // The snapshot's whole extent lies inside the holdout: there is
+                // nothing to run outside it, so the guard refuses rather than
+                // minting an empty window.
+                _ => {
+                    return Err(BacktestAppError::HoldoutRefused(
+                        crate::application::holdout::HoldoutRefusal {
+                            pair: pair.clone(),
+                            field: "from",
+                            holdout_start_ms,
+                        },
+                    ));
+                }
+            },
         };
         let prepared = prepare_over_loaded_series(
             &validated,

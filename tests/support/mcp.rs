@@ -417,6 +417,7 @@ pub async fn seed_real_run(db: &Db, store_dir: &Path, version_id: &VersionId) ->
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect("the seeded real run completes over the fixture")
@@ -450,6 +451,7 @@ pub async fn seed_real_run_primary_only(
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect("the seeded M15-only run completes over the fixture")

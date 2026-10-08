@@ -588,6 +588,7 @@ async fn htf_strategy_without_htf_snapshot_is_refused_with_htf_required() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect_err("an htf operand with no H4 snapshot must refuse");
@@ -614,6 +615,7 @@ async fn htf_strategy_without_htf_snapshot_is_refused_with_htf_required() {
 /// snapshot can no longer mask the field error. The valid M15→H4 pair still
 /// runs end-to-end over the fixture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // three request arms, each with its own refusal match
 async fn non_higher_htf_selection_is_refused_at_the_request_boundary() {
     let tmp = TempDir::new().expect("tempdir");
     let db = Db::with_path(&tmp.path().join("pulse.db"))
@@ -666,6 +668,8 @@ async fn non_higher_htf_selection_is_refused_at_the_request_boundary() {
         window: None,
     };
 
+    // One call shape for the three arms below (r4.s1.w4's `holdout: None` is
+    // the same on all of them).
     // Equal timeframe: `M15 --htf M15`.
     let err = run_version_backtest(
         &strategies,
@@ -673,6 +677,7 @@ async fn non_higher_htf_selection_is_refused_at_the_request_boundary() {
         &BinanceAdapter::new(),
         &runs,
         &request("NOPEUSDT", Timeframe::M15, Some(Timeframe::M15)),
+        None,
     )
     .await
     .expect_err("an equal-timeframe htf selection must refuse");
@@ -695,6 +700,7 @@ async fn non_higher_htf_selection_is_refused_at_the_request_boundary() {
         &BinanceAdapter::new(),
         &runs,
         &request("NOPEUSDT", Timeframe::H4, Some(Timeframe::M15)),
+        None,
     )
     .await
     .expect_err("a lower-timeframe htf selection must refuse");
@@ -717,6 +723,7 @@ async fn non_higher_htf_selection_is_refused_at_the_request_boundary() {
         &BinanceAdapter::new(),
         &runs,
         &request("BTCUSDT", Timeframe::M15, Some(Timeframe::H4)),
+        None,
     )
     .await
     .expect("a strictly-higher htf selection runs");
@@ -936,10 +943,16 @@ async fn two_cold_htf_atr_runs_persist_identical_hashes() {
     };
 
     // Two cold end-to-end runs (fresh engine + fresh store handle each time).
-    let run_one =
-        run_version_backtest(&strategies, &store, &BinanceAdapter::new(), &runs, &request)
-            .await
-            .expect("run one");
+    let run_one = run_version_backtest(
+        &strategies,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &request,
+        None,
+    )
+    .await
+    .expect("run one");
     let store_two = CandleStore::with_base_dir(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/btcusdt-1m-store"),
     );
@@ -949,6 +962,7 @@ async fn two_cold_htf_atr_runs_persist_identical_hashes() {
         &BinanceAdapter::new(),
         &runs,
         &request,
+        None,
     )
     .await
     .expect("run two");
@@ -1501,6 +1515,7 @@ async fn htf_coverage_ending_early_is_a_typed_refusal_on_the_versioned_path() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect_err("an HTF series ending more than one interval early must refuse");
@@ -1676,6 +1691,7 @@ async fn primary_only_strategy_with_a_stale_unused_htf_series_still_runs() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect("a primary-only strategy must run over a stale, unused H4 series");

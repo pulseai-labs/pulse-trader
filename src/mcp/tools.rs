@@ -34,7 +34,9 @@ use serde_json::json;
 
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{RunReadFailure, SqliteBacktestRunRepo, SqliteStrategyRepo};
+use crate::adapters::db::{
+    RunReadFailure, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteStrategyRepo,
+};
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
     BacktestAppError, SnapshotPins, resolve_default_request, run_version_backtest,
@@ -54,9 +56,9 @@ use crate::application::walk_forward_read::{
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
-    CompiledValue, DataError, DataVersion, EvalContext, ExchangeAdapter as _, MfeMaeAggregates,
-    Pair, PaperSessionId, PersistedRun, Series, StrategyRepository, Timeframe, ValidationCode,
-    WalkForwardRunId, WalkForwardRunRepository,
+    CompiledValue, DataError, DataVersion, EvalContext, ExchangeAdapter as _, HoldoutFreeze,
+    MfeMaeAggregates, Pair, PaperSessionId, PersistedRun, Series, StrategyRepository, Timeframe,
+    ValidationCode, WalkForwardRunId, WalkForwardRunRepository,
 };
 
 use super::PulseMcp;
@@ -509,6 +511,10 @@ fn backtest_error_result(err: &BacktestAppError) -> CallToolResult {
         BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
             field_error("dsl", err)
         }
+        // r4.s1.w4 (Q4/G1): the holdout guard's refusal names the offending
+        // bound (`from`/`to`) itself, and its prose cites the pair and the
+        // holdout start — the "refused by name" the spec asks for.
+        BacktestAppError::HoldoutRefused(refusal) => field_error(refusal.field, err),
         // Every "supply the missing series / clear a bad selection" refusal
         // carries the member to fix in its own `field` — `"inputs.htf"` for the
         // two HTF variants (r2.s2.w2, round-1 fix F1), `"inputs.d1"` for a
@@ -593,6 +599,58 @@ fn walk_forward_error_result(err: &WalkForwardAppError) -> CallToolResult {
         // what they are in prose.
         _ => tool_error(err),
     }
+}
+
+/// The open freeze's holdout start, read once per tool call (r4.s1.w4, Q4) —
+/// the guard's input on every run and export surface. `None` means no freeze is
+/// open, which leaves every surface byte-identical to before this item.
+///
+/// A read failure is a tool error, never a silent `None`: an unreadable freeze
+/// table must not quietly disable the guard.
+async fn open_holdout(state: &super::McpState) -> Result<Option<HoldoutFreeze>, CallToolResult> {
+    let repo = SqliteCertificationFreezeRepo::new(state.db.pool().clone());
+    repo.open_freeze()
+        .await
+        .map(|record| record.map(|r| r.holdout()))
+        .map_err(tool_error)
+}
+
+/// An epoch-ms instant as RFC 3339 UTC **milliseconds** — the effective-window
+/// echo's bound shape (r4.s1.w4, #327). The window bounds are millisecond
+/// values (a snapshot's last candle closes at `…:59.999`), so the echo renders
+/// them at full precision rather than truncating to seconds.
+fn window_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map_or_else(
+        || format!("{ms} ms"),
+        |dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+}
+
+/// Withhold every candle opening at/after the open freeze's holdout start
+/// (r4.s1.w4, Q4) and report how many rows were withheld. With no freeze open
+/// the series is untouched and the count is zero.
+fn withhold_holdout_candles(
+    series: &mut crate::domain::CandleSeries,
+    holdout: Option<HoldoutFreeze>,
+) -> usize {
+    let Some(freeze) = holdout else { return 0 };
+    let before = series.candles.len();
+    series
+        .candles
+        .retain(|candle| candle.open_time < freeze.holdout_start_ms);
+    before - series.candles.len()
+}
+
+/// The export result's note that a freeze cut it (r4.s1.w4, Q4): `None` when no
+/// freeze is open, else the holdout start and the withheld row count — the
+/// result "says so" instead of silently returning fewer rows.
+fn holdout_note(holdout: Option<HoldoutFreeze>, rows_withheld: usize) -> Option<serde_json::Value> {
+    holdout.map(|freeze| {
+        json!({
+            "holdout_start": window_ms(freeze.holdout_start_ms),
+            "rows_withheld": rows_withheld,
+        })
+    })
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -790,6 +848,12 @@ impl PulseMcp {
             Ok(v) => v,
             Err(e) => return Ok(field_error("data_version", e)),
         };
+        // r4.s1.w4 (Q4): the open freeze, read once — while one is open this
+        // export stops at the holdout start.
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let store = self.state.candles.clone();
         let loaded = match tokio::task::spawn_blocking(move || match &version {
             Some(v) => store.load_version(&pair, tf, v),
@@ -806,8 +870,12 @@ impl PulseMcp {
             Ok(Err(e)) => return Ok(tool_error(e)),
             Err(e) => return Ok(tool_error(format!("export_candles worker failed: {e}"))),
         };
-        let series = loaded.series;
+        let mut series = loaded.series;
         let data_version = series.version.as_str().to_owned();
+        // r4.s1.w4 (Q4): while a freeze is open, an agent export stops at the
+        // holdout start — every candle opening at/after it is withheld, and the
+        // result says so.
+        let withheld = withhold_holdout_candles(&mut series, holdout);
         let subject = format!("{}-{}", series.pair, tf.binance_interval());
         match args.format {
             CandleExportFormat::Csv => {
@@ -819,19 +887,37 @@ impl PulseMcp {
                     .write_csv("export_candles", &subject, &csv)
                 {
                     Ok(path) => match export::path_json(&path) {
-                        Ok(path_value) => Ok(CallToolResult::structured(json!({
-                            "path": path_value,
-                            "rows": rows,
-                            "data_version": data_version,
-                            "timeframe": tf.binance_interval(),
-                            "pair": series.pair.to_string(),
-                        }))),
+                        Ok(path_value) => {
+                            let mut payload = json!({
+                                "path": path_value,
+                                "rows": rows,
+                                "data_version": data_version,
+                                "timeframe": tf.binance_interval(),
+                                "pair": series.pair.to_string(),
+                            });
+                            if let Some(note) = holdout_note(holdout, withheld) {
+                                payload["holdout"] = note;
+                            }
+                            Ok(CallToolResult::structured(payload))
+                        }
                         Err(message) => Ok(tool_error(message)),
                     },
                     Err(e) => Ok(tool_error(e)),
                 }
             }
             CandleExportFormat::Parquet => {
+                // A byte copy of the immutable snapshot file cannot be cut at
+                // the holdout start, so while a freeze is open the parquet
+                // format is refused by name rather than handing out the
+                // holdout (r4.s1.w4, Q4; the accepted known limit).
+                if let Some(freeze) = holdout {
+                    return Ok(tool_error(format!(
+                        "export_candles parquet is refused while a freeze is open: a byte copy \
+                         of the snapshot cannot be cut at the holdout start {} — use \
+                         format csv",
+                        rfc3339_secs(freeze.holdout_start_ms),
+                    )));
+                }
                 // Byte copy of the immutable snapshot file — no re-encode.
                 let snapshot_path =
                     self.state
@@ -891,9 +977,15 @@ impl PulseMcp {
             Ok(c) => c,
             Err(e) => return Ok(field_error("indicators", e)),
         };
+        // r4.s1.w4 (Q4): the open freeze, read once — while one is open this
+        // export stops at the holdout start.
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let store = self.state.candles.clone();
         let specs: Vec<_> = columns.iter().map(|c| c.spec.clone()).collect();
-        let (series, rows) = match tokio::task::spawn_blocking(move || {
+        let (series, rows, withheld) = match tokio::task::spawn_blocking(move || {
             let stored = match &version {
                 Some(v) => store.load_version(&pair, tf, v),
                 None => store.load_head(&pair, tf)?.ok_or_else(|| {
@@ -903,7 +995,10 @@ impl PulseMcp {
                     ))
                 }),
             }?;
-            let series = stored.series;
+            let mut series = stored.series;
+            // r4.s1.w4 (Q4): the cut happens before the engine steps, so no
+            // holdout candle reaches the CSV.
+            let withheld = withhold_holdout_candles(&mut series, holdout);
             let mut engine =
                 IndicatorEngine::from_specs(&specs).map_err(|e| DataError::Io(e.to_string()))?;
             let mut rows = Vec::with_capacity(series.candles.len());
@@ -922,7 +1017,7 @@ impl PulseMcp {
                         .collect::<Vec<_>>(),
                 );
             }
-            Ok::<_, DataError>((series, rows))
+            Ok::<_, DataError>((series, rows, withheld))
         })
         .await
         {
@@ -939,14 +1034,20 @@ impl PulseMcp {
             .write_csv("export_indicators", &subject, &csv)
         {
             Ok(path) => match export::path_json(&path) {
-                Ok(path_value) => Ok(CallToolResult::structured(json!({
-                    "path": path_value,
-                    "rows": series.candles.len(),
-                    "data_version": series.version.as_str(),
-                    "timeframe": tf.binance_interval(),
-                    "pair": series.pair.to_string(),
-                    "columns": labels,
-                }))),
+                Ok(path_value) => {
+                    let mut payload = json!({
+                        "path": path_value,
+                        "rows": series.candles.len(),
+                        "data_version": series.version.as_str(),
+                        "timeframe": tf.binance_interval(),
+                        "pair": series.pair.to_string(),
+                        "columns": labels,
+                    });
+                    if let Some(note) = holdout_note(holdout, withheld) {
+                        payload["holdout"] = note;
+                    }
+                    Ok(CallToolResult::structured(payload))
+                }
                 Err(message) => Ok(tool_error(message)),
             },
             Err(e) => Ok(tool_error(e)),
@@ -1032,7 +1133,7 @@ impl PulseMcp {
     /// inherited pair — validated through the run's own exchange adapter — and
     /// clears the inherited snapshot pins when it differs.
     #[tool(
-        description = "Run a backtest of one strategy version. Optional from/to (RFC 3339, both or neither) count only the candles in [from, to) while indicators warm on the full history before `from`. Optional pair (e.g. ETHUSDT) overrides the pair the version's lineage would inherit; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe. Defaults resolve from the version's parent run, then its own latest run, then app defaults."
+        description = "Run a backtest of one strategy version. Optional from/to (RFC 3339, both or neither) count only the candles in [from, to) — `from` is inclusive and `to` is exclusive — while indicators warm on the full history before `from`. Optional pair (e.g. ETHUSDT) overrides the pair the version's lineage would inherit; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe. Defaults resolve from the version's parent run, then its own latest run, then app defaults. Every result echoes the effective window under `effective_window`. While a certification freeze is open, a window reaching into the holdout is refused by name and a defaulted window is clamped to the holdout start."
     )]
     async fn run_backtest(
         &self,
@@ -1040,6 +1141,11 @@ impl PulseMcp {
     ) -> Result<CallToolResult, McpError> {
         let window = match parse_window(args.from.as_deref(), args.to.as_deref()) {
             Ok(window) => window,
+            Err(result) => return Ok(result),
+        };
+        // r4.s1.w4 (Q4): the open freeze, read once — the guard's input.
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
             Err(result) => return Ok(result),
         };
 
@@ -1071,6 +1177,7 @@ impl PulseMcp {
             &self.state.exchange,
             &runs,
             &request,
+            holdout,
         )
         .await
         {
@@ -1086,6 +1193,36 @@ impl PulseMcp {
                 &MfeMaeAggregates::from_trades(&outcome.trades),
             ))
             .unwrap_or_else(|_| json!({})),
+        });
+        // r4.s1.w4 (#327): the effective window, echoed on every run result —
+        // the bounds actually evaluated (`from` inclusive, `to` exclusive) plus,
+        // per bound, whether it was defaulted and whether the holdout guard
+        // clamped it.
+        //
+        // A caller who passed no window gets exactly one of two shapes: the
+        // whole snapshot (`inputs.window` is `None` — the effective bounds are
+        // the reloaded primary series' own first open and last close) or the
+        // guard's clamp (`inputs.window` is `Some([snapshot_first_open,
+        // holdout_start))`). Nothing else writes a window there, so `clamped`
+        // cannot be faked.
+        let (from_ms, to_ms, to_clamped) = match &outcome.inputs.window {
+            Some(w) => (
+                w.from_ms,
+                w.to_ms,
+                holdout.is_some() && args.from.is_none() && args.to.is_none(),
+            ),
+            None => (
+                outcome.primary.candles.first().map_or(0, |c| c.open_time),
+                outcome.primary.candles.last().map_or(0, |c| c.close_time),
+                false,
+            ),
+        };
+        payload["effective_window"] = json!({
+            "from": window_ms(from_ms),
+            "to": window_ms(to_ms),
+            "from_defaulted": args.from.is_none(),
+            "to_defaulted": args.to.is_none(),
+            "to_clamped": to_clamped,
         });
         // Only when Some — the wire never carries a null warning slot.
         if let Some(warning) = outcome.fingerprint_warning.as_ref() {
@@ -1106,7 +1243,7 @@ impl PulseMcp {
     /// the inherited pair — validated through the run's own exchange adapter —
     /// and clears the inherited snapshot pins when it differs.
     #[tool(
-        description = "Walk one strategy version forward: rolling-oos/v1 cuts the counted span into K contiguous out-of-sample folds (k in 2..=12, default 6) and judges the run under wf-v1. Each fold is an ordinary persisted windowed backtest run with full-history lead-in — visible through list_runs and get_run with its walk_forward membership. Optional from/to are RFC 3339 bounds given independently: `from` defaults to the first fully-warm bar, `to` to the snapshot's last close. Optional pair (e.g. SOLUSDT) overrides the inherited pair; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe."
+        description = "Walk one strategy version forward: rolling-oos/v1 cuts the counted span into K contiguous out-of-sample folds (k in 2..=12, default 6) and judges the run under wf-v1. Each fold is an ordinary persisted windowed backtest run with full-history lead-in — visible through list_runs and get_run with its walk_forward membership. Optional from/to are RFC 3339 bounds given independently — `from` is inclusive and `to` is exclusive: `from` defaults to the first fully-warm bar, `to` to the snapshot's last close. Optional pair (e.g. SOLUSDT) overrides the inherited pair; an unknown pair is refused naming `pair`, and a pair with no HEAD snapshot is refused naming the pair and the timeframe. Every result echoes the effective span under `effective_window`. While a certification freeze is open, a span reaching into the holdout is refused by name and a defaulted `to` is clamped to the holdout start."
     )]
     async fn run_walk_forward(
         &self,
@@ -1118,6 +1255,11 @@ impl PulseMcp {
         };
         let to_ms = match parse_bound("to", args.to.as_deref()) {
             Ok(bound) => bound,
+            Err(result) => return Ok(result),
+        };
+        // r4.s1.w4 (Q4): the open freeze, read once — the guard's input.
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
             Err(result) => return Ok(result),
         };
 
@@ -1163,6 +1305,7 @@ impl PulseMcp {
             &self.state.exchange,
             &runs,
             &request,
+            holdout,
         )
         .await
         {
@@ -1173,9 +1316,27 @@ impl PulseMcp {
             Ok(detail) => detail,
             Err(e) => return Ok(walk_forward_error_result(&e)),
         };
-        Ok(CallToolResult::structured(
-            serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
-        ))
+        let mut payload = serde_json::to_value(detail).unwrap_or_else(|_| json!({}));
+        // r4.s1.w4 (#327): the effective span, echoed on every run result — the
+        // bounds actually evaluated (`from` inclusive, `to` exclusive) plus,
+        // per bound, whether it was defaulted and whether the holdout guard
+        // clamped it.
+        //
+        // A defaulted `to` is the snapshot's last candle's `close_time`, and
+        // the freeze command floors `--holdout-start` to a UTC midnight — which
+        // is never a candle `close_time` (`close_time = open_time + step - 1`
+        // ms) — so a defaulted `to` equal to the holdout start can only be the
+        // guard's clamp.
+        let to_clamped = args.to.is_none()
+            && holdout.is_some_and(|h| h.holdout_start_ms == outcome.run.span.to_ms);
+        payload["effective_window"] = json!({
+            "from": window_ms(outcome.run.span.from_ms),
+            "to": window_ms(outcome.run.span.to_ms),
+            "from_defaulted": outcome.run.from_defaulted,
+            "to_defaulted": args.to.is_none(),
+            "to_clamped": to_clamped,
+        });
+        Ok(CallToolResult::structured(payload))
     }
 
     /// Fetch one persisted walk-forward run — the SAME `WalkForwardRunDetail`

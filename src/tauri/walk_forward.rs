@@ -368,6 +368,9 @@ pub async fn run_walk_forward_version_core(
         None,
     )
     .await?;
+    // r4.s1.w4 (Q4): while a freeze is open an explicit bound into the holdout
+    // refuses the run by name and a defaulted `to` stops at the holdout start.
+    let holdout = state.open_holdout().await?;
     let outcome = run_walk_forward(
         &strategies,
         &state.candles(),
@@ -384,6 +387,7 @@ pub async fn run_walk_forward_version_core(
             to_ms,
             k: request.k,
         },
+        holdout,
     )
     .await?;
     // The DTO's per-fold stats come from the fold's own persisted run — its

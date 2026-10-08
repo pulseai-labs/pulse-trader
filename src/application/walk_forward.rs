@@ -34,8 +34,8 @@ use crate::domain::backtest::{
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestRunRepository, CandleSeries, CandleSeriesRepository, CompiledStrategy, DataError,
-    ExchangeAdapter, Pair, PreparedBacktest, StrategyRepository, Timeframe, ValidatedDsl,
-    WalkForwardRunRepository, compile, validate,
+    ExchangeAdapter, HoldoutFreeze, Pair, PreparedBacktest, StrategyRepository, Timeframe,
+    ValidatedDsl, WalkForwardRunRepository, compile, validate,
 };
 
 // ---------------------------------------------------------------------------
@@ -228,6 +228,13 @@ pub(crate) struct WalkForwardBlockingOutput {
 /// explicit `from` earlier than that refuses, field-pathed, and `from >= to`
 /// refuses an empty-by-construction span. Returns the proven `from < to`
 /// window plus whether `from` was defaulted.
+///
+/// `holdout` is the open freeze (r4.s1.w4, Q4/G1): the guard runs here, where
+/// the requested bounds and the snapshot's own end are both known — an explicit
+/// bound into the holdout is refused by name, and a defaulted `to` is clamped
+/// to the holdout start (only when the snapshot's end actually reaches past
+/// it, so a snapshot already inside the search span is left alone).
+#[allow(clippy::too_many_arguments)]
 fn resolve_counted_span(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -235,12 +242,27 @@ fn resolve_counted_span(
     d1: Option<&CandleSeries>,
     from_ms: Option<i64>,
     to_ms: Option<i64>,
+    holdout: Option<HoldoutFreeze>,
+    pair: &Pair,
 ) -> Result<(CandleWindow, bool), WalkForwardAppError> {
     let first_warm = first_fully_warm_bar_ms(compiled, primary, htf, d1)
         .ok_or(WalkForwardAppError::NeverWarm)?;
     // The snapshot's real end: the last candle's close, or the first warm bar on
     // a snapshot too short to have one.
     let snapshot_end = primary.candles.last().map_or(first_warm, |c| c.close_time);
+    // r4.s1.w4: the holdout guard, BEFORE the snapshot-end and warm-bar
+    // refusals — a window reaching into the frozen holdout is the campaign's
+    // refusal, and it must not be masked by an unrelated bound error.
+    let clamped_to =
+        match crate::application::holdout::guard_span(holdout, pair, from_ms, to_ms, snapshot_end)
+            .map_err(|refusal| {
+            WalkForwardAppError::Shared(BacktestAppError::HoldoutRefused(refusal))
+        })? {
+            crate::application::holdout::SpanDecision::Pass => None,
+            crate::application::holdout::SpanDecision::ClampToHoldoutStart { holdout_start_ms } => {
+                Some(holdout_start_ms)
+            }
+        };
     // An explicit `to` may not reach PAST that end (R8): every fold would still
     // hold a candle, so the empty-fold check below cannot catch it, and the last
     // fold would run only through the snapshot's real end while the persisted
@@ -256,7 +278,7 @@ fn resolve_counted_span(
             latest_allowed_ms: snapshot_end,
         });
     }
-    let resolved_to = to_ms.unwrap_or(snapshot_end);
+    let resolved_to = to_ms.unwrap_or_else(|| clamped_to.unwrap_or(snapshot_end));
     let (resolved_from, from_defaulted) = match from_ms {
         Some(explicit) => {
             if explicit < first_warm {
@@ -383,6 +405,7 @@ fn run_walk_forward_blocking<C, E>(
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     scheme: FoldScheme,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<WalkForwardBlockingOutput, WalkForwardAppError>
 where
     C: CandleSeriesRepository,
@@ -433,7 +456,10 @@ where
     };
 
     // The counted span: `to` defaults to the snapshot's last candle's
-    // close_time (L3); `from` defaults to the first fully-warm bar.
+    // close_time (L3); `from` defaults to the first fully-warm bar. With a
+    // freeze open, the holdout guard runs inside the resolution (r4.s1.w4):
+    // an explicit bound into the holdout refuses, a defaulted `to` clamps to
+    // the holdout start.
     let (span, from_defaulted) = resolve_counted_span(
         compiled,
         &primary,
@@ -441,6 +467,8 @@ where
         d1.as_ref(),
         from_ms,
         to_ms,
+        holdout,
+        pair,
     )?;
     let folds = fold_windows(&span, scheme.k());
     // Refuse an empty fold BEFORE any fold runs (a6): the counted slice is
@@ -511,6 +539,11 @@ pub(crate) struct WalkForwardUnpersistedParams {
     pub to_ms: Option<i64>,
     /// The fold scheme the span is cut under.
     pub scheme: FoldScheme,
+    /// The open freeze's holdout start (r4.s1.w4, Q4): `Some` wires the holdout
+    /// guard into the span resolution (an explicit bound into the holdout is
+    /// refused, a defaulted `to` clamps to the holdout start), `None` leaves
+    /// the span exactly as before.
+    pub holdout: Option<HoldoutFreeze>,
 }
 
 /// The walk-forward computation with NO persistence — the one `spawn_blocking`
@@ -550,6 +583,7 @@ where
             params.from_ms,
             params.to_ms,
             params.scheme,
+            params.holdout,
         )
     })
     .await
@@ -560,6 +594,12 @@ where
 
 /// Run one persisted strategy version's walk-forward and answer from the saved
 /// rows.
+///
+/// `holdout` is the open freeze's holdout start (r4.s1.w4, Q4): `Some` wires the
+/// holdout guard into the span resolution (an explicit bound into the holdout is
+/// refused, a defaulted `to` is clamped to the holdout start), `None` — no
+/// freeze open, or an exempt caller (the certify-fixture seed) — leaves every
+/// behaviour byte-identical.
 ///
 /// # Errors
 ///
@@ -572,6 +612,7 @@ pub async fn run_walk_forward<S, C, E, R>(
     exchange: &E,
     runs: &R,
     request: &WalkForwardRequest,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<WalkForwardOutcome, WalkForwardAppError>
 where
     S: StrategyRepository,
@@ -615,6 +656,7 @@ where
             from_ms: request.from_ms,
             to_ms: request.to_ms,
             scheme,
+            holdout,
         },
     )
     .await?;

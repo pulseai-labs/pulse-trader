@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The holdout the tools enforce: the certification freeze, its guard, #327's echo, and the
+  archive-hole fill (r4.s1.w4).** `pulse certify freeze --holdout-start <YYYY-MM-DD> --h <N>
+  --alpha <decimal> --test <name>` opens ONE immutable freeze record (migration `0019`:
+  `certification_freeze`, immutable by trigger, at most one open, a new holdout strictly after
+  the last close — a spent holdout is never reused), `pulse certify close-freeze` closes it once,
+  and `pulse certify status` prints the open freeze or `no open freeze`. While a freeze is open,
+  ONE application-layer guard covers every entry point (MCP `run_backtest`/`run_walk_forward`,
+  the app's backtest and walk-forward, the coach's certification gate, and `pulse backtest`): a
+  window reaching into the holdout is refused by name — the pair and the holdout start — and a
+  defaulted end is clamped to the holdout start (the app and CLI's whole-snapshot runs stop
+  there, and the run records the clamped window). MCP `export_candles`/`export_indicators` return
+  only candles before the holdout start and say how many rows were withheld (the parquet byte
+  copy is refused while a freeze is open: it cannot be cut). Every MCP run result now echoes its
+  effective window under `effective_window` (`from` inclusive, `to` exclusive, per-bound
+  `defaulted`/`clamped`) — #327's settled echo — and both run-tool descriptions state the
+  exclusive bound. `pulse fetch-data` fills interior archive holes (the SOLUSDT/XRPUSDT
+  2022-02/2022-04 gaps) from the REST klines endpoint through the bounded incremental path —
+  funding included, one new snapshot, the prior file kept — and the summary reports
+  `filled_candle_count` beside the `gap_count` that remains. The certification step, the
+  certify-fixture seed and paper sessions are exempt by name (grill Q4). Refs
+  [#327](https://github.com/pulseai-labs/pulse-trader/issues/327).
+
 - **Four pairs, a start date for `fetch-data`, and pair-validated runs (r4.s1.w2).** ETHUSDT,
   SOLUSDT and XRPUSDT now fetch, backtest and walk forward exactly as BTCUSDT does: the broker
   adapter pins each pair's dated USD-M filters (`LOT_SIZE.stepSize`/`minQty`, `MIN_NOTIONAL`, the

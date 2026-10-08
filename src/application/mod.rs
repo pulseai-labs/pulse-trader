@@ -57,6 +57,11 @@ pub(crate) mod fixture;
 
 pub(crate) mod backtest;
 
+// r4.s1.w4 (Q4/G1/F1): the holdout guard — the one application-layer decision
+// (refuse an explicit window into the frozen holdout, clamp a defaulted one)
+// every entry point routes through while a freeze is open.
+pub(crate) mod holdout;
+
 // r1.s4.w1 (#131 / #132, ADR-0015): the SEALED coach turn. One crate-private entry
 // point that takes IDENTIFIERS and ports — a session id and a run id — claims the
 // session before any provider I/O, makes exactly one attributed call, and settles

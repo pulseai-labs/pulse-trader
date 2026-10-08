@@ -120,6 +120,7 @@ async fn i_fixture_walk_forward_is_a_real_wf_v1_pass_on_this_build() {
         &BinanceAdapter::new(),
         &runs,
         &fixture_walk_forward_request(version_id, m15_version, h4_version),
+        None,
     )
     .await
     .expect("the fixture walk-forward runs on this build");

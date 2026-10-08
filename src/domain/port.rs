@@ -134,6 +134,37 @@ pub trait MarketDataSource {
         tf: Timeframe,
         since_ms: i64,
     ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
+
+    /// Fetch candles in `(since_ms, until_ms)` for `(pair, tf)` — the
+    /// interior-gap fill's bounded top-up (r4.s1.w4).
+    ///
+    /// Returns only candles strictly newer than `since_ms` and strictly older
+    /// than `until_ms`, with funding stamped exactly as
+    /// [`fetch_incremental`](Self::fetch_incremental) stamps it. The default is
+    /// the unbounded top-up filtered to the range — correct for any source, and
+    /// what the in-memory test doubles use; the `Binance` adapter overrides it
+    /// with a genuinely bounded REST page walk (`endTime`), so a fill does not
+    /// download the years of candles after the gap to throw them away.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] if the underlying source fails (I/O, parse).
+    fn fetch_incremental_until(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send
+    where
+        Self: Sync,
+    {
+        async move {
+            let mut candles = self.fetch_incremental(pair, tf, since_ms).await?;
+            candles.retain(|candle| candle.open_time < until_ms);
+            Ok(candles)
+        }
+    }
 }
 
 /// The candle-snapshot persistence port (r1.s3.w1, #112).

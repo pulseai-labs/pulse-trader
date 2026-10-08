@@ -165,6 +165,7 @@ async fn run(world: &World, request: &WalkForwardRequest) -> WalkForwardOutcome 
         &BinanceAdapter::new(),
         &world.runs,
         request,
+        None,
     )
     .await
     .expect("the walk-forward completes over the fixture")
@@ -459,6 +460,7 @@ async fn from_before_warm_is_refused_naming_the_earliest_allowed() {
         &BinanceAdapter::new(),
         &world.runs,
         &req,
+        None,
     )
     .await
     .expect_err("from before the first warm bar must refuse");
@@ -490,6 +492,7 @@ async fn k_out_of_range_is_refused() {
             &BinanceAdapter::new(),
             &world.runs,
             &req,
+            None,
         )
         .await
         .expect_err("K outside 2..=12 must refuse");
@@ -534,6 +537,7 @@ async fn a_fold_with_no_counted_candle_refuses_before_any_persist() {
         &BinanceAdapter::new(),
         &world.runs,
         &req,
+        None,
     )
     .await
     .expect_err("a fold with no counted candle must refuse");
@@ -944,6 +948,7 @@ async fn a_walk_forward_does_not_displace_the_versions_latest_run() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect("the ordinary run persists");
@@ -961,6 +966,7 @@ async fn a_walk_forward_does_not_displace_the_versions_latest_run() {
         &BinanceAdapter::new(),
         &late,
         &request(&version),
+        None,
     )
     .await
     .expect("the walk-forward completes over the fixture");
@@ -1082,6 +1088,7 @@ async fn to_past_the_snapshot_is_refused_naming_the_latest_allowed() {
         &BinanceAdapter::new(),
         &world.runs,
         &req,
+        None,
     )
     .await
     .expect_err("a span reaching past the snapshot must refuse");

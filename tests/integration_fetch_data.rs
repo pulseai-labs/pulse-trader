@@ -28,9 +28,10 @@ use std::sync::{Arc, Mutex};
 use chrono::{Datelike, TimeZone, Utc};
 
 use pulse::{
-    BinanceDataSource, Candle, CandleSeries, CandleStore, DataError, DataVersion, FakeClock,
-    FetchArgs, FundingEvent, MarketDataSource, MonthData, MonthOutcome, MonthSource, PageSource,
-    Pair, TfOutcome, Timeframe, ensure_one_tf, run_fetch_data, years_window_start_ms,
+    BinanceDataSource, Candle, CandleSeries, CandleSeriesRepository, CandleStore, DataError,
+    DataVersion, FakeClock, FetchArgs, FundingEvent, MarketDataSource, MonthData, MonthOutcome,
+    MonthSource, PageSource, Pair, TfOutcome, Timeframe, ensure_one_tf, run_fetch_data,
+    years_window_start_ms,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -1063,5 +1064,229 @@ async fn fetch_from_later_than_head_stays_incremental() {
         store.read_head(&btc(), Timeframe::M15).expect("read HEAD"),
         Some(head1),
         "the no-op leaves HEAD unchanged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// r4.s1.w4 / AC-3: `fetch_fills_interior_gaps_*` — the archive-hole fill
+// ---------------------------------------------------------------------------
+
+/// The gapped prior snapshot's base instant: six M15 candles at `base + k·M15`
+/// for `k ∈ {0,1,2,5,7}`, i.e. TWO interior holes — `[3, 5)` (two candles) and
+/// `[6, 7)` (one) — exactly the SOL/XRP archive-hole shape.
+const GAP_BASE_MS: i64 = 1_699_900_000_000;
+
+fn gap_open(k: i64) -> i64 {
+    GAP_BASE_MS + k * M15
+}
+
+/// A scripted REST stub keyed by the `FixtureRest` marker (`klines:<startTime>`
+/// / `funding:<startTime>`), with the caller's own page set — the fill's bounded
+/// walk carries `endTime`, which the marker parser ignores, so one page per
+/// range is all it needs.
+struct FillRest {
+    by_marker: HashMap<String, Vec<u8>>,
+}
+
+impl FillRest {
+    /// The top-up is caught up (nothing newly closed) and each hole's bounded
+    /// fetch is served at its own marker, with funding on the first filled
+    /// candle.
+    fn with_two_holes() -> Self {
+        let mut m: HashMap<String, Vec<u8>> = HashMap::new();
+        // The incremental top-up: nothing newer than the prior's last candle.
+        m.insert(format!("klines:{}", gap_open(7) + 1), b"[]".to_vec());
+        // Hole 1: the candles at k = 3 and 4, with a funding event on k = 3.
+        m.insert(
+            format!("klines:{}", gap_open(3)),
+            klines_json(&[
+                (gap_open(3), gap_open(3) + M15 - 1),
+                (gap_open(4), gap_open(4) + M15 - 1),
+            ]),
+        );
+        m.insert(
+            format!("funding:{}", gap_open(3)),
+            funding_json(&[(gap_open(3), "0.00012500")]),
+        );
+        // The bounded walk's follow-up page for hole 1: nothing left before the
+        // bound (what the endpoint answers once the last in-range candle is
+        // behind the walk).
+        m.insert(format!("klines:{}", gap_open(4) + 1), b"[]".to_vec());
+        // Hole 2: the candle at k = 6, no funding.
+        m.insert(
+            format!("klines:{}", gap_open(6)),
+            klines_json(&[(gap_open(6), gap_open(6) + M15 - 1)]),
+        );
+        m.insert(format!("klines:{}", gap_open(6) + 1), b"[]".to_vec());
+        m.insert(format!("funding:{}", gap_open(6)), b"[]".to_vec());
+        Self { by_marker: m }
+    }
+}
+
+impl PageSource for FillRest {
+    fn get(&self, url: &str) -> impl Future<Output = Result<Vec<u8>, DataError>> + Send {
+        let body = self.by_marker.get(&FixtureRest::marker_for(url)).cloned();
+        async move { body.ok_or_else(|| DataError::Io(format!("unscripted REST URL: {url}"))) }
+    }
+}
+
+/// r4.s1.w4 / AC-3: a snapshot with two interior archive holes is filled from
+/// REST — one bounded incremental fetch per range — into ONE new snapshot: the
+/// new `data_version` becomes `HEAD`, the old snapshot file stays untouched (and
+/// still carries its holes), the summary reports the filled count, and
+/// `gap_count` reports what is left (zero). The stub is local; no network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_fills_interior_gaps_from_rest_into_one_new_snapshot() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    let clock = FakeClock::at(NOW_MS);
+
+    // The gapped prior: k ∈ {0,1,2,5,7}.
+    let prior_candles: Vec<Candle> = [0, 1, 2, 5, 7]
+        .iter()
+        .map(|k| bulk_candle(gap_open(*k)))
+        .collect();
+    let prior = store
+        .commit(&pair, Timeframe::M15, prior_candles)
+        .expect("a gapped prior commits (gaps are reported, not rejected)");
+    let prior_version = prior.series.version.clone();
+    let prior_path = prior
+        .storage_location
+        .clone()
+        .expect("the prior has a path");
+    assert_eq!(
+        prior.series.validate().expect("the prior validates").len(),
+        2,
+        "the fixture starts with exactly two interior holes"
+    );
+
+    let source = BinanceDataSource::new(
+        FixtureBulk,
+        FillRest::with_two_holes(),
+        FakeClock::at(NOW_MS),
+    );
+    let outcome = ensure_one_tf(&source, &store, &clock, &pair, Timeframe::M15, gap_open(0)).await;
+    let TfOutcome::Ok(summary) = outcome else {
+        panic!("the fill run succeeds");
+    };
+
+    assert_eq!(summary.filled_candle_count, 3, "two + one candles filled");
+    assert_eq!(summary.gap_count, 0, "nothing is left to report");
+    assert_eq!(summary.candle_count, 8, "five prior + three filled");
+    assert_eq!(summary.action, "backfill", "the fill wrote a new snapshot");
+    assert_ne!(
+        summary.data_version,
+        prior_version.as_str(),
+        "the fill wrote a new content-hashed version"
+    );
+
+    // HEAD moved to the filled snapshot, which is contiguous.
+    let head = store
+        .load_head(&pair, Timeframe::M15)
+        .expect("read HEAD")
+        .expect("HEAD set");
+    assert_eq!(head.series.version.as_str(), summary.data_version);
+    assert!(
+        head.series
+            .validate()
+            .expect("the filled series validates")
+            .is_empty(),
+        "the filled snapshot is gap-free"
+    );
+    assert_eq!(head.series.candles.len(), 8);
+
+    // The filled candles carry their funding (the fill goes through the
+    // funding-aware incremental path).
+    let filled = head
+        .series
+        .candles
+        .iter()
+        .find(|c| c.open_time == gap_open(3))
+        .expect("the first filled candle is present");
+    assert_eq!(
+        filled.funding_rate,
+        Some(dec("0.00012500")),
+        "the fill stamps funding on the filled candles"
+    );
+
+    // The old snapshot file stays, and the old version still reads back with
+    // its holes — a stored snapshot is never mutated.
+    assert!(
+        std::path::Path::new(&prior_path).exists(),
+        "the prior snapshot file stays on disk"
+    );
+    let old = store
+        .load_version(&pair, Timeframe::M15, &prior_version)
+        .expect("the prior version still loads");
+    assert_eq!(
+        old.series.candles.len(),
+        5,
+        "the prior content is untouched"
+    );
+    assert_eq!(
+        old.series
+            .validate()
+            .expect("the prior still validates")
+            .len(),
+        2,
+        "the prior still carries its two holes"
+    );
+}
+
+/// r4.s1.w4 / AC-3: a gap REST cannot fill stays a gap — reported, never
+/// invented — while the rest of the run still lands: one hole filled, one left,
+/// `gap_count` 1, and the snapshot still refuses at `load_series`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_leaves_an_unfillable_interior_gap_reported() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    let clock = FakeClock::at(NOW_MS);
+
+    let prior_candles: Vec<Candle> = [0, 1, 2, 5, 7]
+        .iter()
+        .map(|k| bulk_candle(gap_open(*k)))
+        .collect();
+    store
+        .commit(&pair, Timeframe::M15, prior_candles)
+        .expect("a gapped prior commits");
+
+    // Hole 1's range answers with an EMPTY page (REST has nothing there); hole
+    // 2 is served normally.
+    let mut m: HashMap<String, Vec<u8>> = HashMap::new();
+    m.insert(format!("klines:{}", gap_open(7) + 1), b"[]".to_vec());
+    m.insert(format!("klines:{}", gap_open(3)), b"[]".to_vec());
+    m.insert(
+        format!("klines:{}", gap_open(6)),
+        klines_json(&[(gap_open(6), gap_open(6) + M15 - 1)]),
+    );
+    m.insert(format!("klines:{}", gap_open(6) + 1), b"[]".to_vec());
+    m.insert(format!("funding:{}", gap_open(6)), b"[]".to_vec());
+    let source = BinanceDataSource::new(
+        FixtureBulk,
+        FillRest { by_marker: m },
+        FakeClock::at(NOW_MS),
+    );
+
+    let outcome = ensure_one_tf(&source, &store, &clock, &pair, Timeframe::M15, gap_open(0)).await;
+    let TfOutcome::Ok(summary) = outcome else {
+        panic!("the run still succeeds around an unfillable hole");
+    };
+    assert_eq!(summary.filled_candle_count, 1, "only hole 2 was fillable");
+    assert_eq!(
+        summary.gap_count, 1,
+        "the unfillable hole is still reported"
+    );
+    assert_eq!(summary.candle_count, 6, "five prior + one filled");
+
+    let head = store
+        .load_head(&pair, Timeframe::M15)
+        .expect("read HEAD")
+        .expect("HEAD set");
+    let remaining = head.series.validate().expect("the series validates");
+    assert_eq!(remaining.len(), 1, "the hole stays in the written snapshot");
+    assert_eq!(
+        remaining[0].expected,
+        gap_open(3),
+        "and it is the right hole"
     );
 }

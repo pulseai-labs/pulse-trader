@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE certification_freeze SET closed_at_ms = ? WHERE id = ? AND closed_at_ms IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "e71e70fb8bb847c11f4ad92397be04344ba0a39bdc6d39f796b97e8b0aacf31a"
+}

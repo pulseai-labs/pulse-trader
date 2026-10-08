@@ -740,6 +740,7 @@ async fn walk_forward_default_from_moves_with_the_lag() {
         &BinanceAdapter::new(),
         &runs,
         &request(lag5_version),
+        None,
     )
     .await
     .expect("lag walk-forward completes");
@@ -749,6 +750,7 @@ async fn walk_forward_default_from_moves_with_the_lag() {
         &BinanceAdapter::new(),
         &runs,
         &request(no_lag_version),
+        None,
     )
     .await
     .expect("no-lag walk-forward completes");
@@ -1256,6 +1258,7 @@ async fn two_cold_value_expression_runs_persist_identical_hashes() {
         &BinanceAdapter::new(),
         &runs,
         &request,
+        None,
     )
     .await
     .expect("run one");
@@ -1266,6 +1269,7 @@ async fn two_cold_value_expression_runs_persist_identical_hashes() {
         &BinanceAdapter::new(),
         &runs,
         &request,
+        None,
     )
     .await
     .expect("run two");

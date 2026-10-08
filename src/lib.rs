@@ -388,6 +388,13 @@ pub use adapters::db::SqliteStrategyRepo;
 // (revoking a token must end an open stream), so it is surfaced like the
 // other SQLite adapters.
 pub use adapters::db::SqliteClientTokenRepo;
+// r4.s1.w4 (F1/C4): the certification-freeze store and its value types. The
+// store is the ONLY writer of `certification_freeze` (the two operator commands
+// and the guard's read), and the tests drive it directly over a temp DB.
+// REQUIRED under `deny(warnings)` + `pub(crate) mod adapters`/`domain` — a new
+// public type unused outside its module is a `dead_code` build error.
+pub use adapters::db::SqliteCertificationFreezeRepo;
+pub use domain::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeRequest};
 // VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter. `SqliteBacktestRunRepo`
 // implements the FR-6 persisted-run surface over `query!`/`query_as!` (the
 // committed `.sqlx/` cache). REQUIRED under `deny(warnings)` + `pub(crate) mod

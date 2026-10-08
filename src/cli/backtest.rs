@@ -257,6 +257,14 @@ where
 {
     let strategies = SqliteStrategyRepo::new(db.pool().clone());
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    // r4.s1.w4 (Q4): while a freeze is open the CLI's whole-snapshot run is
+    // clamped to the search span (it has no window surface of its own). The
+    // `--dsl` path opens no database by design and stays outside the guard.
+    let holdout = crate::adapters::db::SqliteCertificationFreezeRepo::new(db.pool().clone())
+        .open_freeze()
+        .await
+        .map_err(|e| anyhow::anyhow!("read the open freeze: {e}"))?
+        .map(|record| record.holdout());
     let request = BacktestRequest {
         version_id: VersionId::new(version.to_owned()),
         pair: pair.clone(),
@@ -269,9 +277,16 @@ where
         snapshots: None,
         window: None,
     };
-    let outcome = run_version_backtest(&strategies, repo, &BinanceAdapter::new(), &runs, &request)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let outcome = run_version_backtest(
+        &strategies,
+        repo,
+        &BinanceAdapter::new(),
+        &runs,
+        &request,
+        holdout,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // STDERR only (D4): stdout carries the byte-pinned footer/JSON.
     if let Some(warning) = outcome.fingerprint_warning.as_ref() {
