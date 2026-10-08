@@ -715,3 +715,105 @@ async fn certified_flag_stays_unset_for_a_failed_record() {
         "the pointer is set — the flag is about the RECORD, not the pointer"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certification_refuses_a_root_on_the_freeze_opening_millisecond() {
+    let world = world_with_clocks(fixture_strategy_dsl(), FREEZE_OPENED_MS, FREEZE_OPENED_MS).await;
+    let error = certify(&world, Some(&world.freeze))
+        .await
+        .expect_err("same-ms roots are refused");
+    assert!(matches!(
+        error,
+        pulse::CertifyError::Refused(CertifyRefusal::PreFreezeLineage { .. })
+    ));
+    assert_eq!(walk_forward_run_count(&world).await, 0);
+    assert_eq!(
+        certifications(&world)
+            .count_for_freeze(&world.freeze.id)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certification_refuses_a_freeze_closed_after_the_caller_read() {
+    let world = world().await;
+    // The caller already read world.freeze. Close before its eventual insert.
+    SqliteCertificationFreezeRepo::with_deps(
+        world.db.pool().clone(),
+        FakeClock::at(FREEZE_OPENED_MS + 1),
+    )
+    .close()
+    .await
+    .unwrap();
+    let error = certify(&world, Some(&world.freeze))
+        .await
+        .expect_err("the write rechecks closure");
+    assert!(
+        matches!(
+            error,
+            pulse::CertifyError::Refused(CertifyRefusal::NoOpenFreeze)
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        certifications(&world)
+            .count_for_freeze(&world.freeze.id)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certification_reads_order_by_freeze_before_hypothesis_index() {
+    let world = world().await;
+    let run_id = seed_search_run(&world).await;
+    let draft = seeded_draft(&world, &run_id);
+    certifications(&world).insert(&draft).await.unwrap();
+    let old = certifications(&world).insert(&draft).await.unwrap();
+    assert_eq!(old.hypothesis_index, 2);
+    SqliteCertificationFreezeRepo::with_deps(
+        world.db.pool().clone(),
+        FakeClock::at(FREEZE_OPENED_MS + 1),
+    )
+    .close()
+    .await
+    .unwrap();
+    let newer_freeze = SqliteCertificationFreezeRepo::with_deps(
+        world.db.pool().clone(),
+        FakeClock::at(FREEZE_OPENED_MS + 2),
+    )
+    .open(&OpenFreezeRequest {
+        holdout_start_ms: FREEZE_OPENED_MS + 3,
+        h: H,
+        alpha: "0.05".to_owned(),
+        holdout_test: "C1".to_owned(),
+    })
+    .await
+    .unwrap();
+    let mut draft = draft;
+    draft.freeze_id = newer_freeze.id;
+    draft.holdout_start_ms = FREEZE_OPENED_MS + 3;
+    draft.holdout_end_ms = FREEZE_OPENED_MS + 10;
+    let newer = certifications(&world).insert(&draft).await.unwrap();
+    assert_eq!(newer.hypothesis_index, 1);
+    assert_eq!(
+        certifications(&world)
+            .latest_certified(&world.version)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        newer.id
+    );
+    let rows = certifications(&world)
+        .list_for_version(&world.version)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].id, newer.id);
+    assert_eq!(rows[1].id, old.id);
+    assert_eq!(rows[2].hypothesis_index, 1);
+}

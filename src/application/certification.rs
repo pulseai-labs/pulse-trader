@@ -24,9 +24,10 @@
 //!    with the next `hypothesis_index`. A failed or uncertified attempt still
 //!    counts and is still recorded.
 //!
-//! An error before step 7 (a missing snapshot, a gapped series, an engine
-//! error) writes nothing and counts nothing — every [`CertifyError`] arm says
-//! so.
+//! An error writes no certification record and spends no hypothesis. Once
+//! step 5 persists the search walk-forward, a later failure leaves that run
+//! and the version's `latest_walk_forward_run_id` pointing to it, exactly as
+//! an ordinary `run_walk_forward` call would.
 //!
 //! The step composes the existing use cases rather than re-implementing them:
 //! [`run_walk_forward`] for the search span and the shared
@@ -70,9 +71,10 @@ const LINEAGE_MAX_HOPS: usize = 10_000;
 const CERTIFY_RULE: VerdictRule = VerdictRule::WfV2;
 
 /// The certification step's errors: a typed refusal, a missing version, or a
-/// failure from one of the use cases it composes. Every arm means **nothing was
-/// written and no hypothesis was spent** — the record write is the step's last
-/// action.
+/// failure from one of the use cases it composes. Every arm means **no
+/// certification record was written and no hypothesis was spent**. A search
+/// run persisted before the error remains, with the version's walk-forward
+/// pointer on it.
 ///
 /// It lives here, in the application ring (close R2): the two composed arms
 /// carry [`WalkForwardAppError`] and [`BacktestAppError`], so a domain home
@@ -90,11 +92,13 @@ pub enum CertifyError {
     #[error(transparent)]
     Store(#[from] DataError),
     /// The search-span walk-forward failed (a missing snapshot, a gapped
-    /// series, an engine error): nothing was written and nothing counts.
+    /// series, an engine error): no certification record or hypothesis; a
+    /// saved-but-unreadable search run can remain persisted.
     #[error("the search-span walk-forward failed before any record was written: {0}")]
     WalkForward(#[from] WalkForwardAppError),
     /// The holdout backtest failed (a missing snapshot, a gapped series, an
-    /// engine error): nothing was written and nothing counts.
+    /// engine error): no certification record or hypothesis; the search run
+    /// and the version's walk-forward pointer on it remain persisted.
     #[error("the holdout backtest failed before any record was written: {0}")]
     Backtest(#[from] BacktestAppError),
     /// A defect in this layer (a lineage cycle, a failed task join).
@@ -178,7 +182,7 @@ where
         .ok_or_else(|| CertifyError::VersionNotFound(request.version_id.clone()))?;
     let root = lineage_root(strategies, &version).await?;
     let root_created_at_ms = root.created_at.timestamp_millis();
-    if root_created_at_ms < freeze.opened_at_ms {
+    if root_created_at_ms <= freeze.opened_at_ms {
         return Err(CertifyRefusal::PreFreezeLineage {
             version_id: version.id.clone(),
             root_version_id: root.id.clone(),
@@ -280,17 +284,10 @@ where
         holdout_run,
         &request.called_by,
     );
-    let record = match certifications.insert(&draft).await {
-        Ok(record) => record,
-        // The write transaction's own refusal (close R1): a call that took the
-        // budget's last index between the pre-check above and this write. The
-        // loser of that overlap wrote nothing, exactly like the loser of the
-        // pre-check.
-        Err(DataError::HypothesisBudgetSpent { h }) => {
-            return Err(CertifyRefusal::HypothesisBudgetSpent { h }.into());
-        }
-        Err(e) => return Err(CertifyError::Store(e)),
-    };
+    let record = certifications
+        .insert(&draft)
+        .await
+        .map_err(certification_write_error)?;
 
     // The record's index IS the budget count (the store minted it under the
     // write lock), so a concurrent call beside this one cannot leave the
@@ -302,6 +299,17 @@ where
         search_verdict: search.run.verdict.clone(),
         record,
     })
+}
+
+/// Map atomic write-time rechecks to the same refusals as the pre-checks.
+fn certification_write_error(error: DataError) -> CertifyError {
+    match error {
+        DataError::CertificationFreezeClosed => CertifyRefusal::NoOpenFreeze.into(),
+        DataError::HypothesisBudgetSpent { h } => {
+            CertifyRefusal::HypothesisBudgetSpent { h }.into()
+        }
+        other => CertifyError::Store(other),
+    }
 }
 
 /// The search side's recorded data versions (spec A1): the FIRST fold's

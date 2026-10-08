@@ -92,6 +92,10 @@ pub enum DataError {
     #[error("{0}")]
     OrphanedQuarantines(String),
 
+    /// A certification write found that its freeze closed after the caller read it.
+    #[error("no certification freeze is open")]
+    CertificationFreezeClosed,
+
     /// A `certification` write would take the freeze past its hypothesis budget
     /// (r4.s1.w5, Q2): the write transaction derived a `hypothesis_index` above
     /// the freeze's `h` and refused the write. The refusal is decided inside the

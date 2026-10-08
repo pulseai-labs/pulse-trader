@@ -134,11 +134,11 @@ operator's to weigh at the freeze; H is never raised and never changed after a c
 - **The MCP parquet export is refused while a freeze is open** (accepted at the round-2 plan gate).
   A byte copy of the stored snapshot cannot be cut at the holdout start; the CSV export is cut and
   says so. Recorded in w4's report §10.
-- **An errored `certify_version` call writes no record.** A call that fails with an engine or data
-  error (a missing snapshot, a gapped series, an engine failure) before the write spends no
-  hypothesis and leaves only the per-request log line; the token audit trail (grill Q5) sees the
-  call, but the `certification` table has no row for it, so the call is not in the record trail.
-  Recorded at the close review (top amendment 3c).
+- **An errored `certify_version` call writes no certification record and spends no hypothesis.**
+  A failure after the search step leaves its wf-v2 search run persisted and the version's
+  `latest_walk_forward_run_id` pointing to it, exactly as a `run_walk_forward` call would.
+  The token audit trail (grill Q5) sees the call, but the `certification` table has no row for it.
+  Recorded at the close review (top amendment 3c) and PR #352 fix round 1.
 
 ## Consequences
 

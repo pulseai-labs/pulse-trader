@@ -8,7 +8,7 @@
 //! **One write path, one law.** `insert` is the only writer: it mints the id,
 //! takes `created_at` from the injected [`Clock`], derives
 //! `hypothesis_index = MAX(hypothesis_index) + 1` **inside one
-//! `BEGIN IMMEDIATE` transaction**, reads the freeze's own `h` in that same
+//! `BEGIN IMMEDIATE` transaction**, reads the freeze's own `h` and closure state in that same
 //! transaction and writes the row only when the derived index is within the
 //! budget — so a concurrent second call waits for the write lock, sees its
 //! predecessor's row and **refuses by name**
@@ -155,7 +155,7 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
         let version_id_str = version_id.as_str();
         let rows = sqlx::query!(
             r#"SELECT
-                 id                         AS "id!: String",
+                 certification.id           AS "id!: String",
                  version_id                 AS "version_id!: String",
                  freeze_id                  AS "freeze_id!: String",
                  hypothesis_index           AS "hypothesis_index!: i64",
@@ -163,7 +163,7 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
                  pair                       AS "pair!: String",
                  search_walk_forward_run_id AS "search_walk_forward_run_id!: String",
                  search_pass                AS "search_pass!: i64",
-                 holdout_start_ms           AS "holdout_start_ms!: i64",
+                 certification.holdout_start_ms AS "holdout_start_ms!: i64",
                  holdout_end_ms             AS "holdout_end_ms!: i64",
                  holdout_n                  AS "holdout_n!: i64",
                  holdout_mean_r             AS "holdout_mean_r!: String",
@@ -176,8 +176,10 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
                  engine_fingerprint         AS "engine_fingerprint!: String",
                  created_at                 AS "created_at!: String",
                  called_by                  AS "called_by!: String"
-               FROM certification WHERE version_id = ?1
-               ORDER BY hypothesis_index DESC"#,
+               FROM certification
+               JOIN certification_freeze ON certification_freeze.id = certification.freeze_id
+               WHERE version_id = ?1
+               ORDER BY certification_freeze.opened_at_ms DESC, hypothesis_index DESC"#,
             version_id_str,
         )
         .fetch_all(&self.pool)
@@ -220,7 +222,7 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
         let version_id_str = version_id.as_str();
         let row = sqlx::query!(
             r#"SELECT
-                 id                         AS "id!: String",
+                 certification.id           AS "id!: String",
                  version_id                 AS "version_id!: String",
                  freeze_id                  AS "freeze_id!: String",
                  hypothesis_index           AS "hypothesis_index!: i64",
@@ -228,7 +230,7 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
                  pair                       AS "pair!: String",
                  search_walk_forward_run_id AS "search_walk_forward_run_id!: String",
                  search_pass                AS "search_pass!: i64",
-                 holdout_start_ms           AS "holdout_start_ms!: i64",
+                 certification.holdout_start_ms AS "holdout_start_ms!: i64",
                  holdout_end_ms             AS "holdout_end_ms!: i64",
                  holdout_n                  AS "holdout_n!: i64",
                  holdout_mean_r             AS "holdout_mean_r!: String",
@@ -241,8 +243,10 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
                  engine_fingerprint         AS "engine_fingerprint!: String",
                  created_at                 AS "created_at!: String",
                  called_by                  AS "called_by!: String"
-               FROM certification WHERE version_id = ?1 AND certified = 1
-               ORDER BY hypothesis_index DESC LIMIT 1"#,
+               FROM certification
+               JOIN certification_freeze ON certification_freeze.id = certification.freeze_id
+               WHERE version_id = ?1 AND certified = 1
+               ORDER BY certification_freeze.opened_at_ms DESC, hypothesis_index DESC LIMIT 1"#,
             version_id_str,
         )
         .fetch_optional(&self.pool)
@@ -336,21 +340,24 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
         .map_err(|e| DataError::Db(e.to_string()))?;
 
         // The budget law, decided here INSIDE the transaction (close R1): the
-        // freeze's own `h`, read from the immutable row the record's key points
+        // freeze's own closure state and `h`, read from the row the record's key points
         // at — never from a caller-supplied value — refuses the write before it
         // mints an index past the budget. A missing freeze row (None) falls
         // through to the INSERT's foreign key, which raises exactly as it did
         // before this check existed.
-        let freeze_h = sqlx::query_scalar!(
-            r#"SELECT h AS "h!: i64" FROM certification_freeze WHERE id = ?1"#,
+        let freeze = sqlx::query!(
+            r#"SELECT h AS "h!: i64", closed_at_ms FROM certification_freeze WHERE id = ?1"#,
             freeze_id,
         )
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| DataError::Db(e.to_string()))?;
-        if let Some(freeze_h) = freeze_h {
-            let h = u8::try_from(freeze_h)
-                .map_err(|e| DataError::Db(format!("certification_freeze.h {freeze_h}: {e}")))?;
+        if let Some(freeze) = freeze {
+            if freeze.closed_at_ms.is_some() {
+                return Err(DataError::CertificationFreezeClosed);
+            }
+            let h = u8::try_from(freeze.h)
+                .map_err(|e| DataError::Db(format!("certification_freeze.h {}: {e}", freeze.h)))?;
             if next > i64::from(h) {
                 return Err(DataError::HypothesisBudgetSpent { h });
             }
