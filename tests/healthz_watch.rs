@@ -18,13 +18,14 @@
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pulse::{
     ALERT_AFTER_FAILURES, ClockSeam, Db, HostSeam, HttpProbe, LogSeam, MarkerReport, MarkerSeam,
-    NotifySeam, NtfyNotifier, ProbeReport, ProbeSeam, STILL_DOWN_REMINDER_SECS, WatchConfig,
-    WatchErrorKind, WatchFuture, WatchSeams, run_once,
+    NotifySeam, NtfyNotifier, ProbeReport, ProbeSeam, STILL_DOWN_REMINDER_SECS, SshMarker,
+    WatchConfig, WatchErrorKind, WatchFuture, WatchSeams, run_once,
 };
 use serde_json::Value;
 use support::server::{ServerOptions, spawn_server};
@@ -734,4 +735,177 @@ async fn the_real_push_is_one_line_and_nothing_leaks() {
         "the state file is 0600"
     );
     assert_no_secret(&std::fs::read_to_string(&config.state_file).expect("state file"));
+}
+
+// ---------------------------------------------------------------------------
+// The marker check's ssh (r4.s2 close-review F2). Two rules:
+//
+// 1. the check PINNS the dedicated key with `-o IdentitiesOnly=yes`, so no
+//    agent key and no `~/.ssh/config` IdentityFile for the same host can
+//    authenticate first — that would bypass the key's forced command and hand a
+//    timer an unrestricted session;
+// 2. only the forced command's two answers are read: the marker `pulse serve`
+//    writes at `<data dir>/serve-start-limit` is `Present`, the literal `none` is
+//    `Absent`. Everything else — an ssh banner, an error text, empty output, a
+//    truncated marker — is `Failed`, an alert that names a failed check, and is
+//    NEVER `Present`. A false "start limit reached — run just prod-reset" push
+//    costs more than an unanswered check.
+//
+// The ssh is a fake on this process's PATH, and every call asserts the fake ran
+// (r4.s2.w5's incident: a fake ssh without the executable bit let a real
+// `ssh macmini` run from a test). The host name cannot resolve, so even a run
+// that escaped the fake reaches no machine.
+// ---------------------------------------------------------------------------
+
+/// The marker `pulse serve` writes at `<data dir>/serve-start-limit`: five
+/// `key=value` lines, in the order `server::start_limit` writes them.
+const MARKER_LINE: &str =
+    "utc=2026-10-09T00:00:00Z\nunix=1760000000\nstarts=3\nwindow_seconds=900\nlimit=3\n";
+
+/// A temp `ssh` that records each run's argv and prints the marker fixture's
+/// bytes. It sits FIRST on this process's `PATH`.
+struct FakeSsh {
+    dir: TempDir,
+    log: PathBuf,
+    fixture: PathBuf,
+}
+
+impl FakeSsh {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().expect("a temp dir for the fake ssh");
+        let log = dir.path().join("ssh-runs.log");
+        let fixture = dir.path().join("stdout");
+        let script = dir.path().join("ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\n\
+                 set -euo pipefail\n\
+                 printf 'run\\n' >> '{log}'\n\
+                 printf '%s\\n' \"$@\" >> '{log}'\n\
+                 cat '{fixture}'\n",
+                log = log.display(),
+                fixture = fixture.display(),
+            ),
+        )
+        .expect("write the fake ssh");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make the fake ssh executable");
+        Self { dir, log, fixture }
+    }
+
+    /// What the next check's ssh prints on stdout.
+    fn prints(&self, stdout: &str) {
+        std::fs::write(&self.fixture, stdout).expect("write the marker fixture");
+    }
+
+    /// How many runs the log holds. One run writes one `run` line, so a call that
+    /// ran something else is caught by the caller's count assertion.
+    fn runs(&self) -> usize {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "run")
+            .count()
+    }
+
+    /// The words of the LAST run, one per line.
+    fn argv(&self) -> Vec<String> {
+        let mut runs: Vec<Vec<String>> = Vec::new();
+        for line in std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+        {
+            if line == "run" {
+                runs.push(Vec::new());
+            } else if let Some(last) = runs.last_mut() {
+                last.push(line.to_owned());
+            }
+        }
+        runs.pop().unwrap_or_default()
+    }
+}
+
+/// Whether `flag` is immediately followed by `value` in an argv.
+fn arg_pair(argv: &[String], flag: &str, value: &str) -> bool {
+    argv.windows(2)
+        .any(|pair| pair[0] == flag && pair[1] == value)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_marker_check_pins_the_key_and_reads_only_the_forced_commands_two_answers() {
+    let ssh = FakeSsh::new();
+    let key_dir = TempDir::new().expect("a temp dir for the key");
+    let key = key_dir.path().join("pulse_watch_ed25519");
+    std::fs::write(&key, "a stub key").expect("write the key");
+    let key_arg = key.display().to_string();
+    // An alias that cannot resolve: a run that escaped the fake still reaches no
+    // machine, and the Mini is never its target.
+    let host = "pulse-marker-fake.invalid";
+
+    // SAFETY: nextest runs one test per process, so this process's PATH is this
+    // test's alone; no other thread can be inside an env window. The value is
+    // left set — the process ends with the test.
+    let previous = std::env::var("PATH").unwrap_or_default();
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{previous}", ssh.dir.path().display()));
+    }
+
+    let marker = SshMarker::new(key.clone());
+    let cases = [
+        (
+            MARKER_LINE,
+            MarkerReport::Present,
+            "the marker the server writes",
+        ),
+        (
+            "none\n",
+            MarkerReport::Absent,
+            "the forced command's no-trip answer",
+        ),
+        (
+            "ssh: connect to host pulse-marker-fake.invalid port 22: Connection refused\n",
+            MarkerReport::Failed,
+            "an ssh error text",
+        ),
+        ("", MarkerReport::Failed, "empty stdout"),
+        (
+            "utc=2026-10-09T00:00:00Z\nstarts=3\n",
+            MarkerReport::Failed,
+            "a truncated marker",
+        ),
+        (
+            "none\nlimit=3\n",
+            MarkerReport::Failed,
+            "more than the two answers",
+        ),
+    ];
+    for (index, (stdout, expected, what)) in cases.iter().enumerate() {
+        ssh.prints(stdout);
+        let report = marker.marker(host.to_owned()).await;
+        assert_eq!(report, *expected, "{what} — stdout {stdout:?}");
+        assert_eq!(
+            ssh.runs(),
+            index + 1,
+            "the fake ssh ran, never a real one: {what}"
+        );
+        let argv = ssh.argv();
+        assert!(
+            arg_pair(&argv, "-o", "IdentitiesOnly=yes"),
+            "the check offers only the key it was given, so no other key can \
+             authenticate first and bypass the forced command: {what}: {argv:?}"
+        );
+        assert!(
+            arg_pair(&argv, "-o", "BatchMode=yes"),
+            "the check never prompts (the spec's literal command): {what}: {argv:?}"
+        );
+        let host_arg = host.to_owned();
+        assert!(
+            argv.contains(&key_arg) && argv.contains(&host_arg),
+            "the key and the host travel: {what}: {argv:?}"
+        );
+    }
 }

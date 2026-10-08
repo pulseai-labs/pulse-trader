@@ -487,8 +487,8 @@ pub use server::ops::{ComposeRunCtx, ComposeRunner, SweepConfig};
 // in-crate otherwise.
 pub use cli::watch::{
     ALERT_AFTER_FAILURES, ClockSeam, HostSeam, HttpProbe, LogSeam, MarkerReport, MarkerSeam,
-    NotifySeam, NtfyNotifier, ProbeReport, ProbeSeam, STILL_DOWN_REMINDER_SECS, WatchConfig,
-    WatchErrorKind, WatchFuture, WatchSeams, run_once,
+    NotifySeam, NtfyNotifier, ProbeReport, ProbeSeam, STILL_DOWN_REMINDER_SECS, SshMarker,
+    WatchConfig, WatchErrorKind, WatchFuture, WatchSeams, run_once,
 };
 
 // VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,

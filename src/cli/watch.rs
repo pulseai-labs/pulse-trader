@@ -818,6 +818,12 @@ fn resolve_ssh_host(ssh_host: &str) -> String {
 
 /// The production marker check (C3): the dedicated watcher key against the
 /// Mini's forced command, which prints the marker or `none` and nothing else.
+///
+/// The key is PINNED with `-o IdentitiesOnly=yes` — the same option w5's pull
+/// passes (`deploy/pulse-backup-pull.sh`). Without it ssh also offers the
+/// agent's keys and the `~/.ssh/config` `IdentityFile` for the same host, and a
+/// session that authenticates with one of those bypasses the key's forced
+/// command (r4.s2 close-review F2).
 pub struct SshMarker {
     key: PathBuf,
 }
@@ -828,6 +834,34 @@ impl SshMarker {
     pub fn new(key: PathBuf) -> Self {
         Self { key }
     }
+}
+
+/// The marker file's line keys, in the order `server::start_limit` writes them.
+const MARKER_LINE_KEYS: [&str; 5] = ["utc", "unix", "starts", "window_seconds", "limit"];
+
+/// Classify the forced command's stdout: `Absent` for the literal `none`,
+/// `Present` for exactly the marker `pulse serve` writes (five `key=value`
+/// lines, in order — `<data dir>/serve-start-limit`), and `None` for everything
+/// else: an ssh banner, an error text, empty output, a truncated or hand-edited
+/// file. The caller maps `None` to [`MarkerReport::Failed`], never to `Present`
+/// — a false "start limit reached — run just prod-reset" push costs more than a
+/// check that reports itself failed.
+fn marker_line(stdout: &str) -> Option<MarkerReport> {
+    let text = stdout.trim();
+    if text == "none" {
+        return Some(MarkerReport::Absent);
+    }
+    let mut lines = text.lines();
+    for key in MARKER_LINE_KEYS {
+        let (name, value) = lines.next()?.trim().split_once('=')?;
+        if name != key || value.is_empty() {
+            return None;
+        }
+    }
+    if lines.next().is_some() {
+        return None;
+    }
+    Some(MarkerReport::Present)
 }
 
 impl MarkerSeam for SshMarker {
@@ -844,6 +878,8 @@ impl MarkerSeam for SshMarker {
                     .arg("-o")
                     .arg("BatchMode=yes")
                     .arg("-o")
+                    .arg("IdentitiesOnly=yes")
+                    .arg("-o")
                     .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
                     .arg(&ssh_host)
                     .output()
@@ -852,11 +888,7 @@ impl MarkerSeam for SshMarker {
             match run {
                 Ok(Ok(output)) if output.status.success() => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    match stdout.trim() {
-                        "" => MarkerReport::Failed,
-                        "none" => MarkerReport::Absent,
-                        _ => MarkerReport::Present,
-                    }
+                    marker_line(&stdout).unwrap_or(MarkerReport::Failed)
                 }
                 _ => MarkerReport::Failed,
             }
