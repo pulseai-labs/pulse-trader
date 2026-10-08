@@ -77,8 +77,8 @@ use super::walk_forward::{
 };
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
-    Db, SqliteBacktestRunRepo, SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path,
-    open_migrated,
+    Db, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteLlmCallRepo,
+    SqliteStrategyRepo, default_db_path, open_migrated,
 };
 // r3.s3.w5: the thin-client state every proxied command speaks through.
 use crate::agent::ComposerEvent;
@@ -90,8 +90,9 @@ use crate::domain::dsl::render;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
     BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, Clock, CredentialStatus,
-    DataError, EngineFingerprint, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse,
-    Message, SnapshotSelection, StrategyDsl, StrategyRepository, ToolDefinition,
+    DataError, EngineFingerprint, HoldoutFreeze, LlmCallRepository, LlmConfig, LlmError,
+    LlmProvider, LlmResponse, Message, SnapshotSelection, StrategyDsl, StrategyRepository,
+    ToolDefinition,
 };
 
 // ---------------------------------------------------------------------------
@@ -394,6 +395,32 @@ impl DesktopState {
     #[must_use]
     pub fn backtest_run_repo(&self) -> SqliteBacktestRunRepo<SystemClock> {
         SqliteBacktestRunRepo::new(self.db.pool().clone())
+    }
+
+    /// The certification-freeze store over the shared pool (r4.s1.w4, Q4) — the
+    /// app's read of the open freeze, which it passes to the holdout guard so a
+    /// run or walk-forward stops at the holdout start. Same cheap-wrapper
+    /// pattern as [`DesktopState::strategy_repo`].
+    #[must_use]
+    pub fn freeze_repo(&self) -> SqliteCertificationFreezeRepo<SystemClock> {
+        SqliteCertificationFreezeRepo::new(self.db.pool().clone())
+    }
+
+    /// The open freeze's holdout start (r4.s1.w4, Q4), read once per app call —
+    /// the holdout guard's input on the backtest and walk-forward cores. `None`
+    /// means no freeze is open, which leaves both cores byte-identical to
+    /// before this item. A read failure is an error, never a silent `None`: an
+    /// unreadable freeze table must not quietly disable the guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BusError`] when the freeze table cannot be read.
+    pub async fn open_holdout(&self) -> Result<Option<HoldoutFreeze>, BusError> {
+        self.freeze_repo()
+            .open_freeze()
+            .await
+            .map(|record| record.map(|r| r.holdout()))
+            .map_err(BusError::from)
     }
 
     /// An `LlmCall` ledger repository over the shared pool (r1.s1.w4) — the
@@ -1361,12 +1388,16 @@ pub async fn run_backtest_version_core(
     // surface, so a pinned snapshot runs in full.
     let version_id = VersionId::new(&request.version_id);
     let app_request = resolve_default_request(&strategies, &runs, &version_id, None).await?;
+    // r4.s1.w4 (Q4): while a freeze is open the desktop's whole-snapshot run is
+    // clamped to the search span (the Lab shows the run's recorded window).
+    let holdout = state.open_holdout().await?;
     let outcome = run_version_backtest(
         &strategies,
         &candles,
         &BinanceAdapter::new(),
         &runs,
         &app_request,
+        holdout,
     )
     .await?;
     // The projection is fallible on purpose: a saved value that will not fit the wire

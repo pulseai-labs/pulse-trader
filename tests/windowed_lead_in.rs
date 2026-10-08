@@ -236,6 +236,7 @@ async fn run(
             snapshots: None,
             window,
         },
+        None,
     )
     .await
     .expect("the run completes over the fixture")

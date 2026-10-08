@@ -184,6 +184,7 @@ async fn certified_version_over(
         &BinanceAdapter::new(),
         &world.runs,
         &walk_forward_request(version_id.clone(), m15_version, h4_version),
+        None,
     )
     .await
     .unwrap();
@@ -261,6 +262,7 @@ impl RunScenario {
             &BinanceAdapter::new(),
             &world.runs,
             &backtest_request(&version_id, m15_version, h4_version),
+            None,
         )
         .await
         .unwrap();
@@ -1202,6 +1204,7 @@ async fn failing_latest_run_version(world: &World, name: &str) -> pulse::Version
         &BinanceAdapter::new(),
         &world.runs,
         &walk_forward_request(version_id.clone(), m15_version.clone(), h4_version.clone()),
+        None,
     )
     .await
     .unwrap();

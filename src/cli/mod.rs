@@ -11,6 +11,9 @@
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
 pub(crate) mod backtest;
+// r4.s1.w4 (F1/C4): `pulse certify freeze` / `close-freeze` / `status` — the
+// operator's local freeze administration on the server host, like `pulse token`.
+pub(crate) mod certify;
 // r3.s3.w4 (D12, ADR-0026): `pulse backup` / `pulse restore` — the online
 // backup + the verified restore (restore reuses import's engine).
 pub(crate) mod backup;
@@ -54,6 +57,7 @@ use crate::domain::{CandleSeriesRepository, Pair, Timeframe};
 
 use backtest::{BacktestArgs, run_backtest_cli};
 use backup::{BackupArgs, RestoreArgs, run_backup, run_restore};
+use certify::{CertifyArgs, run_certify};
 use coach::{CoachArgs, run_coach};
 use compose::{ComposeArgs, run_compose};
 use fetch_data::{
@@ -112,6 +116,11 @@ pub enum Command {
     /// local administration on the server host. `issue` prints the token once
     /// on stdout; everything else goes to stderr.
     Token(TokenArgs),
+    /// Open / close / inspect the certification freeze (r4.s1.w4, F1/C4) —
+    /// the operator's local freeze administration on the server host. The
+    /// freeze record is what the holdout guard reads: while one is open, every
+    /// run and export stops at its holdout start.
+    Certify(CertifyArgs),
     /// Run the always-on server (r3.s3.w1, ADR-0026): bind the tailnet
     /// address (the D6 policy — or loopback under `--dev-loopback`), then
     /// serve `/api/v1` until SIGTERM/SIGINT. One stderr line per request and
@@ -256,6 +265,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // r3.s3.w1: the token administration arm. The migrated-db open is the
         // same migrate-then-open every other DB-using arm uses.
         Command::Token(args) => run_token(&args).await,
+        // r4.s1.w4 (F1/C4): the freeze administration arm — the same
+        // migrate-then-open every other DB-using arm uses.
+        Command::Certify(args) => run_certify(&args).await,
         // r3.s4.w2 (E4): the certify-fixture seed arm — the migrated-db open
         // is the same migrate-then-open every other DB-using arm uses.
         Command::Fixture(args) => match args.command {
@@ -316,7 +328,7 @@ pub async fn run_fetch_data<S, C, R>(
     args: &FetchArgs,
 ) -> anyhow::Result<()>
 where
-    S: crate::domain::MarketDataSource,
+    S: crate::domain::MarketDataSource + Sync,
     C: crate::domain::Clock,
     R: CandleSeriesRepository,
 {
@@ -459,8 +471,15 @@ fn render(summaries: &[TfSummary], failures: &[(String, String)], json: bool) {
         let bold = ansi_emphasis();
         let reset = if bold.is_empty() { "" } else { "\x1b[0m" };
         for summary in summaries {
+            // The filled count is appended only when the run filled something,
+            // so every pre-w4 line stays byte-identical (r4.s1.w4).
+            let filled = if summary.filled_candle_count > 0 {
+                format!(", {} filled", summary.filled_candle_count)
+            } else {
+                String::new()
+            };
             println!(
-                "{bold}{} {}{reset}: {} ({} candles, {} gaps) -> {}",
+                "{bold}{} {}{reset}: {} ({} candles, {} gaps{filled}) -> {}",
                 summary.pair,
                 summary.timeframe,
                 summary.action,

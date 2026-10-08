@@ -197,6 +197,7 @@ async fn wf_v2_does_not_change_persisted_wf_v1_verdicts() {
             k: Some(i32::from(K_DEFAULT)),
             rule: None,
         },
+        None,
     )
     .await
     .expect("the wf-v1 walk-forward completes over the fixture");

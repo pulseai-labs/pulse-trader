@@ -54,7 +54,7 @@ use crate::domain::{
     AcceptFailureStage, BacktestRunId, BacktestRunRepository, CandidateDsl, CandleSeries,
     CandleSeriesRepository, CoachAcceptFailure, CoachAcceptanceRepository, CoachingRepository,
     CoachingSession, CoachingSessionId, DataError, Disposition, DispositionKind, EngineFingerprint,
-    ExchangeAdapter, Mutation, MutationError, PersistedRun, PreparedBacktest,
+    ExchangeAdapter, HoldoutFreeze, Mutation, MutationError, PersistedRun, PreparedBacktest,
     PreparedCoachAcceptance, Proposal, SeriesEnd, SessionOutcome, StrategyRepository,
     SymbolFilters, ValidatedDsl, WalkForwardRunRepository, apply, compile,
 };
@@ -254,6 +254,7 @@ pub enum CoachDecisionError {
 /// version has vanished, when a modify's mutation does not apply, or when the store
 /// fails. A failed ACCEPT is not an error — see
 /// [`CoachDecisionOutcome::AcceptFailed`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_coach_decision<S, C, E, R, A, Q>(
     strategies: &S,
     candles: &C,
@@ -262,6 +263,7 @@ pub async fn run_coach_decision<S, C, E, R, A, Q>(
     acceptance: &A,
     sessions: &Q,
     request: CoachDecisionRequest,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<CoachDecisionOutcome, CoachDecisionError>
 where
     S: StrategyRepository,
@@ -292,7 +294,7 @@ where
         CoachAction::Reject => reject(sessions, &session_id, &proposal).await,
         CoachAction::Accept => {
             accept(
-                strategies, candles, exchange, runs, acceptance, &session, &proposal,
+                strategies, candles, exchange, runs, acceptance, &session, &proposal, holdout,
             )
             .await
         }
@@ -374,6 +376,13 @@ where
 // ---------------------------------------------------------------------------
 
 /// The seven-step accept (spec §Accept), each step's failure recorded as its stage.
+///
+/// `holdout` is the open freeze (r4.s1.w4, Q4): it reaches the certification
+/// gate, whose span is the parent's certifying run's span — an explicit,
+/// recorded bound, so the guard refuses the accept (at the `walk_forward`
+/// stage) when that span reaches into the frozen holdout, rather than
+/// evaluating it.
+#[allow(clippy::too_many_arguments)]
 async fn accept<S, C, E, R, A>(
     strategies: &S,
     candles: &C,
@@ -382,6 +391,7 @@ async fn accept<S, C, E, R, A>(
     acceptance: &A,
     session: &CoachingSession,
     proposal: &Proposal,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<CoachDecisionOutcome, CoachDecisionError>
 where
     S: StrategyRepository,
@@ -461,6 +471,7 @@ where
         &parent_run,
         &prepared,
         candidate.validated(),
+        holdout,
     )
     .await
     {
@@ -523,6 +534,7 @@ where
 /// `k` and the counted span from the certifying run's row, the pair/timeframes/
 /// cost config/snapshot pins from the parent run's recorded inputs (the same
 /// values `prepare_offthread` just replayed, read back off `prepared`).
+#[allow(clippy::too_many_arguments)]
 async fn certify_gate<C, E, R>(
     candles: &C,
     exchange: &E,
@@ -531,6 +543,7 @@ async fn certify_gate<C, E, R>(
     parent_run: &PersistedRun,
     prepared: &PreparedBacktest,
     candidate: &ValidatedDsl,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<Option<WalkForwardRunDraft>, StagedFailure>
 where
     C: CandleSeriesRepository + Clone + Send + 'static,
@@ -580,6 +593,11 @@ where
             // own certifying run (r4.s1.w3) — a wf-v2 lineage is judged by
             // wf-v2, a wf-v1 lineage exactly as before.
             rule: certifying.rule,
+            // r4.s1.w4 (Q4): the gate's span is the parent's certifying run's
+            // recorded span — an explicit bound, so the guard refuses the
+            // accept (at the `walk_forward` stage, by name) when it reaches
+            // into the frozen holdout rather than evaluating holdout data.
+            holdout,
         },
     )
     .await

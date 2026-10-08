@@ -705,6 +705,7 @@ async fn the_versioned_route_refuses_through_the_same_guard() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect_err("an HTF-needing request without an HTF is refused");

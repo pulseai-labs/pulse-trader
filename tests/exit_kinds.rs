@@ -678,6 +678,7 @@ async fn two_cold_runs_persist_identical_results() {
         &BinanceAdapter::new(),
         &runs,
         &request,
+        None,
     )
     .await
     .expect("run one");
@@ -688,6 +689,7 @@ async fn two_cold_runs_persist_identical_results() {
         &BinanceAdapter::new(),
         &runs,
         &request,
+        None,
     )
     .await
     .expect("run two");
@@ -936,9 +938,16 @@ async fn composed_exit_rules_run_and_label_their_exits() {
         snapshots: None,
         window: None,
     };
-    let outcome = run_version_backtest(&reader, &store, &BinanceAdapter::new(), &runs, &request)
-        .await
-        .expect("the composed version runs");
+    let outcome = run_version_backtest(
+        &reader,
+        &store,
+        &BinanceAdapter::new(),
+        &runs,
+        &request,
+        None,
+    )
+    .await
+    .expect("the composed version runs");
     assert!(
         !outcome.trades.is_empty(),
         "the fixture produces trades for the composed strategy"

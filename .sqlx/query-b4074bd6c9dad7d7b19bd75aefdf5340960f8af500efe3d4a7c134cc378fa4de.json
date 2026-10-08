@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT opened_at_ms FROM certification_freeze WHERE closed_at_ms IS NULL LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "opened_at_ms",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b4074bd6c9dad7d7b19bd75aefdf5340960f8af500efe3d4a7c134cc378fa4de"
+}

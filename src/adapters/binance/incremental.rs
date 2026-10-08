@@ -161,6 +161,23 @@ fn klines_url(pair: &Pair, tf: Timeframe, start_ms: i64) -> String {
     )
 }
 
+/// Build the `/fapi/v1/klines` page URL for `pair` starting at `start_ms` and
+/// bounded at `until_ms` when given (r4.s1.w4): the endpoint's `endTime` is
+/// **inclusive**, so the bound is `until_ms - 1` — the page can then never
+/// return a candle opening at or after the exclusive bound. `None` keeps the
+/// unbounded top-up URL verbatim.
+fn klines_url_until(pair: &Pair, tf: Timeframe, start_ms: i64, until_ms: Option<i64>) -> String {
+    match until_ms {
+        Some(until) => format!(
+            "{FAPI_BASE}/fapi/v1/klines?symbol={}&interval={}&startTime={start_ms}&endTime={}&limit={KLINES_LIMIT}",
+            pair.as_str(),
+            tf.binance_interval(),
+            until - 1,
+        ),
+        None => klines_url(pair, tf, start_ms),
+    }
+}
+
 /// Build the `/fapi/v1/fundingRate` page URL for `pair` starting at `start_ms`.
 fn funding_url(pair: &Pair, start_ms: i64) -> String {
     format!(
@@ -261,6 +278,11 @@ fn decode_funding(body: &[u8]) -> Result<Vec<FundingEvent>, DataError> {
 /// an `open_time > last_seen` (caught up). Klines whose `close_time >= now_ms`
 /// (the still-forming final kline) are dropped, never persisted.
 ///
+/// `until_ms` bounds the walk (r4.s1.w4): the page URL carries `endTime` and
+/// only candles opening strictly before it are collected, so the interior-gap
+/// fill downloads the gap rather than the years of candles after it. `None`
+/// keeps the unbounded top-up exactly as it was.
+///
 /// # Errors
 ///
 /// [`DataError`] from the transport (mapped by WI-02's client) or a JSON decode
@@ -271,6 +293,7 @@ async fn fetch_new_klines<S, C>(
     pair: &Pair,
     tf: Timeframe,
     since_ms: i64,
+    until_ms: Option<i64>,
 ) -> Result<Vec<Candle>, DataError>
 where
     S: PageSource + Sync,
@@ -282,7 +305,9 @@ where
     let mut start_ms = since_ms + 1;
 
     loop {
-        let body = source.get(&klines_url(pair, tf, start_ms)).await?;
+        let body = source
+            .get(&klines_url_until(pair, tf, start_ms, until_ms))
+            .await?;
         let page = decode_klines(&body, tf)?;
 
         // The greatest open_time on this page; pagination terminates when no
@@ -295,6 +320,11 @@ where
         for candle in page {
             if candle.open_time <= since_ms {
                 continue; // already in the snapshot.
+            }
+            if let Some(until) = until_ms
+                && candle.open_time >= until
+            {
+                continue; // at/past the exclusive bound → not this range.
             }
             advanced = true;
             // Closed-candle cutoff (grill / audit C5): drop the still-forming
@@ -311,6 +341,11 @@ where
         let next_start = max_open + 1;
         if next_start <= start_ms {
             break; // defensive: no forward progress.
+        }
+        if let Some(until) = until_ms
+            && next_start >= until
+        {
+            break; // the whole bounded range has been walked.
         }
         start_ms = next_start;
     }
@@ -361,7 +396,31 @@ where
     S: PageSource + Sync,
     C: Clock + Sync,
 {
-    let mut candles = fetch_new_klines(source, clock, pair, tf, since_ms).await?;
+    fetch_incremental_bounded_with(source, clock, pair, tf, since_ms, None, funding_since_ms).await
+}
+
+/// [`fetch_incremental_with`] bounded to `(since_ms, until_ms)` — the
+/// interior-gap fill's fetch (r4.s1.w4). `until_ms` is exclusive and bounds both
+/// the REST walk (`endTime`) and the collected candles; `None` is the unbounded
+/// top-up, byte-for-byte the original path.
+///
+/// # Errors
+///
+/// [`DataError`] from the transport (WI-02 mapping) or a JSON decode failure.
+pub(crate) async fn fetch_incremental_bounded_with<S, C>(
+    source: &S,
+    clock: &C,
+    pair: &Pair,
+    tf: Timeframe,
+    since_ms: i64,
+    until_ms: Option<i64>,
+    funding_since_ms: i64,
+) -> Result<Vec<Candle>, DataError>
+where
+    S: PageSource + Sync,
+    C: Clock + Sync,
+{
+    let mut candles = fetch_new_klines(source, clock, pair, tf, since_ms, until_ms).await?;
     // No newly-closed candles ⇒ a no-op: skip the funding fetch entirely so a
     // transient funding-endpoint error cannot turn an up-to-date run into a
     // failure (cross-confirmed by Codex + CodeRabbit). Nothing to stamp anyway.
@@ -512,7 +571,7 @@ mod tests {
         // 3*M15 - 1 > now) is dropped; the closed one (close_time < now) kept.
         let clock = FakeClock::at(forming_open);
 
-        let new = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, since)
+        let new = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, since, None)
             .await
             .expect("fetch new klines");
         assert_eq!(new.len(), 1, "only the closed candle is persisted");
@@ -538,7 +597,7 @@ mod tests {
         let source = ScriptedPages::new(pages);
         let clock = FakeClock::at(forming_open); // the lone candle is still forming.
 
-        let new = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, since)
+        let new = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, since, None)
             .await
             .expect("fetch");
         assert!(new.is_empty(), "only-forming case ⇒ zero persisted candles");
@@ -565,7 +624,7 @@ mod tests {
         let source = ScriptedPages::new(pages);
         let clock = FakeClock::at(100 * M15);
 
-        let new = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, since)
+        let new = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, since, None)
             .await
             .expect("fetch");
         let times: Vec<i64> = new.iter().map(|c| c.open_time).collect();
@@ -582,7 +641,7 @@ mod tests {
         // No pages scripted → the first GET errors (Io).
         let source = ScriptedPages::new(HashMap::new());
         let clock = FakeClock::at(100 * M15);
-        let err = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, 0)
+        let err = fetch_new_klines(&source, &clock, &btc(), Timeframe::M15, 0, None)
             .await
             .expect_err("unscripted URL errors");
         assert!(matches!(err, DataError::Io(_)));

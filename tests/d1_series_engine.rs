@@ -817,6 +817,7 @@ async fn missing_d1_snapshot_refuses_d1_required() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect_err("a d1 strategy without a D1 snapshot must refuse");
@@ -874,6 +875,7 @@ async fn d1_as_the_htf_refuses_before_any_io() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect_err("a D1 HTF selection must refuse");
@@ -922,6 +924,7 @@ async fn d1_as_the_primary_refuses_before_any_io() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect_err("a D1 primary timeframe must refuse");
@@ -966,6 +969,7 @@ async fn strategy_without_d1_records_no_d1_selection() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect("a primary-only strategy runs without any D1 snapshot");
@@ -1020,6 +1024,7 @@ async fn d1_run_records_and_pins_its_snapshot() {
             snapshots: None,
             window: None,
         },
+        None,
     )
     .await
     .expect("the d1 run completes over the seeded store");
@@ -1098,6 +1103,7 @@ async fn two_cold_runs_persist_identical_content_hashes() {
                 snapshots: None,
                 window: None,
             },
+            None,
         )
         .await
         .expect("the gated run completes");

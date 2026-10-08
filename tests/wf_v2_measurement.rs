@@ -346,6 +346,7 @@ async fn runtime_of_one_wf_v2_walk_forward() {
             k: Some(i32::from(CALIBRATION_K)),
             rule: Some(VerdictRule::WfV2),
         },
+        None,
     )
     .await
     .expect("the wf-v2 walk-forward completes over the real search span");

@@ -73,7 +73,9 @@ impl Action {
 ///
 /// Schema (spec §3, grill-locked): `{pair, timeframe, data_version, action,
 /// candle_count, first_open_ms, last_open_ms, path, gap_count}`. Stable field
-/// names + order so downstream tooling can depend on it.
+/// names + order so downstream tooling can depend on it. r4.s1.w4 adds
+/// `filled_candle_count`: the candles this run filled into interior archive
+/// holes from REST (0 when nothing was filled).
 #[derive(Debug, Clone, Serialize)]
 pub struct TfSummary {
     /// Trading pair symbol.
@@ -94,6 +96,8 @@ pub struct TfSummary {
     pub path: String,
     /// Number of detected spacing gaps (reported, not rejected — audit C2).
     pub gap_count: usize,
+    /// The candles this run filled into interior gaps from REST (r4.s1.w4).
+    pub filled_candle_count: usize,
 }
 
 /// The outcome of one tf's orchestration: a summary on success, or the error on
@@ -178,7 +182,7 @@ pub async fn ensure_one_tf<S, C, R>(
     start_ms: i64,
 ) -> TfOutcome
 where
-    S: MarketDataSource,
+    S: MarketDataSource + Sync,
     C: Clock,
     R: CandleSeriesRepository,
 {
@@ -202,7 +206,7 @@ async fn ensure_inner<S, R>(
     now_ms: i64,
 ) -> Result<TfSummary, DataError>
 where
-    S: MarketDataSource,
+    S: MarketDataSource + Sync,
     R: CandleSeriesRepository,
 {
     // ONE port call resolves HEAD and the snapshot it names. A broken pointer is
@@ -234,7 +238,7 @@ async fn first_run<S, R>(
     now_ms: i64,
 ) -> Result<TfSummary, DataError>
 where
-    S: MarketDataSource,
+    S: MarketDataSource + Sync,
     R: CandleSeriesRepository,
 {
     // Bulk covers COMPLETE months only — exclude the current (incomplete) month,
@@ -272,9 +276,12 @@ where
         // with NO locator, so the reported `path` is empty rather than naming a
         // Parquet that does not exist (Codex P2).
         let stored = repo.commit(pair, tf, series.candles)?;
-        return summarize(&stored, Action::UpToDate);
+        return summarize(&stored, Action::UpToDate, 0);
     }
-    persist(repo, pair, tf, series, Action::Bulk)
+    // r4.s1.w4: fill the interior holes the archive left (the SOL/XRP case),
+    // bounded to each gap's range, before the one snapshot is written.
+    let (series, filled) = with_interior_gaps_filled(source, pair, tf, series).await?;
+    persist(repo, pair, tf, series, Action::Bulk, filled)
 }
 
 /// Subsequent run: read the prior snapshot, top up only newly-closed candles.
@@ -286,18 +293,27 @@ async fn subsequent_run<S, R>(
     prior: StoredCandleSeries,
 ) -> Result<TfSummary, DataError>
 where
-    S: MarketDataSource,
+    S: MarketDataSource + Sync,
     R: CandleSeriesRepository,
 {
     let since = prior.series.candles.last().map_or(-1, |c| c.open_time);
     let new = source.fetch_incremental(pair, tf, since).await?;
     if new.is_empty() {
-        // Nothing newly closed ⇒ up-to-date no-op (NOT an error). HEAD unchanged,
-        // and the reported `path` is the locator HEAD was already resolved through.
-        return summarize(&prior, Action::UpToDate);
+        // Nothing newly closed: still look for interior gaps in HEAD (r4.s1.w4)
+        // — an archive hole does not heal itself, and the run that only fills
+        // one writes the one new snapshot. Otherwise the up-to-date no-op
+        // (NOT an error), HEAD unchanged, and the reported `path` is the
+        // locator HEAD was already resolved through.
+        let (series, filled) =
+            with_interior_gaps_filled(source, pair, tf, prior.series.clone()).await?;
+        if filled == 0 {
+            return summarize(&prior, Action::UpToDate, 0);
+        }
+        return persist(repo, pair, tf, series, Action::Backfill, filled);
     }
     let (merged, _gaps) = crate::adapters::binance::merge::merge_new(&prior.series, new)?;
-    persist(repo, pair, tf, merged, Action::Incremental)
+    let (merged, filled) = with_interior_gaps_filled(source, pair, tf, merged).await?;
+    persist(repo, pair, tf, merged, Action::Incremental, filled)
 }
 
 /// Backfill run (r4.s1.w2): the requested start is EARLIER than `HEAD`'s first
@@ -326,7 +342,7 @@ async fn backfill_run<S, R>(
     start_ms: i64,
 ) -> Result<TfSummary, DataError>
 where
-    S: MarketDataSource,
+    S: MarketDataSource + Sync,
     R: CandleSeriesRepository,
 {
     let Some(prior_first) = prior.series.candles.first().map(|c| c.open_time) else {
@@ -349,9 +365,12 @@ where
         crate::adapters::binance::merge::merge_new(&merged, new)?.0
     };
     if merged.candles == prior.series.candles {
-        return summarize(&prior, Action::UpToDate);
+        return summarize(&prior, Action::UpToDate, 0);
     }
-    persist(repo, pair, tf, merged, Action::Backfill)
+    // r4.s1.w4: the same interior-hole fill the other two paths run — a
+    // backfill that lands months around a hole still leaves the hole.
+    let (merged, filled) = with_interior_gaps_filled(source, pair, tf, merged).await?;
+    persist(repo, pair, tf, merged, Action::Backfill, filled)
 }
 
 /// The first millisecond of `ms`'s UTC calendar month — the monthly bulk
@@ -376,21 +395,27 @@ fn persist<R>(
     tf: Timeframe,
     series: crate::domain::CandleSeries,
     action: Action,
+    filled: usize,
 ) -> Result<TfSummary, DataError>
 where
     R: CandleSeriesRepository,
 {
     let stored = repo.commit(pair, tf, series.candles)?;
-    summarize(&stored, action)
+    summarize(&stored, action, filled)
 }
 
 /// Build the `--json`/human summary from a stored series.
 ///
-/// The grill-locked field set/types are unchanged. `path` is the repository's
-/// display locator — the snapshot's absolute path for a persisted series, and the
-/// empty string for the zero-candle outcome, where no snapshot exists and naming
-/// one would point at a Parquet that was never written (Codex P2).
-fn summarize(stored: &StoredCandleSeries, action: Action) -> Result<TfSummary, DataError> {
+/// The grill-locked field set/types are unchanged (r4.s1.w4 adds
+/// `filled_candle_count`). `path` is the repository's display locator — the
+/// snapshot's absolute path for a persisted series, and the empty string for the
+/// zero-candle outcome, where no snapshot exists and naming one would point at a
+/// Parquet that was never written (Codex P2).
+fn summarize(
+    stored: &StoredCandleSeries,
+    action: Action,
+    filled: usize,
+) -> Result<TfSummary, DataError> {
     let series = &stored.series;
     let gaps = series.validate()?;
     Ok(TfSummary {
@@ -403,7 +428,75 @@ fn summarize(stored: &StoredCandleSeries, action: Action) -> Result<TfSummary, D
         last_open_ms: series.candles.last().map(|c| c.open_time),
         path: stored.storage_location.clone().unwrap_or_default(),
         gap_count: gaps.len(),
+        filled_candle_count: filled,
     })
+}
+
+// ---------------------------------------------------------------------------
+// r4.s1.w4: the interior-gap fill
+// ---------------------------------------------------------------------------
+
+/// Fill `series`' interior gaps from the REST klines endpoint, one bounded
+/// incremental fetch per gap, and report how many candles were filled.
+///
+/// A "gap" is a spacing discontinuity `validate()` reports between two adjacent
+/// candles: the missing candles are `[gap.expected, gap.found)`, so the fetch
+/// starts at `gap.expected - 1` (the endpoint returns candles strictly newer)
+/// and is bounded at `gap.found`. The fetch is the ordinary incremental path —
+/// funding included — and only its in-range candles are kept. A gap REST cannot
+/// fill stays: `validate()` still reports it, the summary says so, and
+/// `load_series` keeps refusing the snapshot.
+///
+/// # Errors
+///
+/// Returns [`DataError`] from the transport or a JSON decode failure.
+async fn fill_interior_gaps<S>(
+    source: &S,
+    pair: &Pair,
+    tf: Timeframe,
+    series: &crate::domain::CandleSeries,
+) -> Result<(Vec<crate::domain::Candle>, usize), DataError>
+where
+    S: MarketDataSource + Sync,
+{
+    let gaps = series.validate()?;
+    if gaps.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let mut filled = Vec::new();
+    for gap in gaps {
+        let candles = source
+            .fetch_incremental_until(pair, tf, gap.expected - 1, gap.found)
+            .await?;
+        filled.extend(candles);
+    }
+    let count = filled.len();
+    Ok((filled, count))
+}
+
+/// [`fill_interior_gaps`] applied to the series about to be written: merges the
+/// filled candles in (dedup on `open_time`, the freshly-fetched copy winning)
+/// and returns the series plus the filled count. Nothing filled ⇒ the series is
+/// returned untouched, so the caller's no-op branch stays exact.
+///
+/// # Errors
+///
+/// As [`fill_interior_gaps`], plus a merge failure.
+async fn with_interior_gaps_filled<S>(
+    source: &S,
+    pair: &Pair,
+    tf: Timeframe,
+    series: crate::domain::CandleSeries,
+) -> Result<(crate::domain::CandleSeries, usize), DataError>
+where
+    S: MarketDataSource + Sync,
+{
+    let (filled, count) = fill_interior_gaps(source, pair, tf, &series).await?;
+    if filled.is_empty() {
+        return Ok((series, 0));
+    }
+    let (merged, _gaps) = crate::adapters::binance::merge::merge_new(&series, filled)?;
+    Ok((merged, count))
 }
 
 #[cfg(test)]
@@ -479,6 +572,7 @@ mod tests {
             last_open_ms: Some(1_800_000),
             path: "/tmp/candles/BTCUSDT/15m/deadbeefcafef00d.parquet".to_string(),
             gap_count: 0,
+            filled_candle_count: 0,
         };
         let json = serde_json::to_value(&summary).expect("serialize");
         // Every grill-locked field is present under its exact name.
