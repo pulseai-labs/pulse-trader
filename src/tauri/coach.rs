@@ -865,7 +865,8 @@ where
             .with_prompt_version(prompt_version.clone());
     let attributed = AttributedProvider::new(decorated, captured);
 
-    let source = SqliteCoachTurnSource::new(state.db().pool().clone());
+    let source =
+        SqliteCoachTurnSource::new(state.db().pool().clone()).with_candles(state.candles());
     let sessions = SqliteCoachingRepo::with_deps(state.db().pool().clone(), SystemClock);
     let settings = CoachTurnSettings {
         prompt,
