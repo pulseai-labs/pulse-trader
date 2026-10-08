@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The move made safe: the instance lock, a source that is the target refused, and the paper tables
+  verified by digest (r4.s2.w2).** `pulse serve` takes a non-blocking instance lock on its database
+  (`<db>.serve.lock`) and holds it for its process lifetime; `pulse import` and `pulse restore` take
+  the same lock on their target before any write and hold it until the install completes, so a data
+  op against a database a live server holds refuses by name ("a running pulse serve holds it") and a
+  second server on a held database refuses too (#250). An import refuses a source database or data
+  dir that resolves to the target — the path itself, a symlink to it, a hard link (#264) — before
+  anything is touched. `paper_session`, `paper_event` and `paper_bar` are compared by SHA-256
+  content digest (every row's columns, primary-key order, length-prefixed) between the source and
+  the copy: a changed column, a missing row or a schema difference refuses the import naming the
+  table and the first differing key, the verification summary prints the three digests, and
+  `pulse restore` runs the same check through the shared engine. CI's determinism matrix gains an
+  `arm64-darwin` (`macos-latest`) lane whose hash is compared with both Linux arches (#62), and a
+  new pinned `paper_replay_golden` suite replays a committed fixture of recorded bars and events —
+  the certify fixture's synthetic BTCUSDT series — so a darwin engine difference fails the
+  `macos-latest` job.
+
 - **The certification step: one hypothesis, one holdout, one immutable record, and `certify_version`
   (r4.s1.w5).** While a freeze is open, certifying a version walks it forward under `wf-v2` on the
   search span — the guard clamps the span's end to the holdout start — runs ONE backtest over the
