@@ -35,6 +35,10 @@ pub(crate) mod mcp;
 // rename that makes a file visible is followed by an fsync of the directory it
 // landed in.
 pub(crate) mod publish;
+// r4.s2.w3 (C5/ADR-0029): `pulse qa-seed` — QA's database seeded from a copy
+// of prod's: every copied token revoked, the two fresh QA tokens issued, the
+// `qa` marker written.
+pub(crate) mod qa_seed;
 pub(crate) mod runs;
 // r3.s3.w1 (ADR-0026): the always-on server composition root.
 pub(crate) mod serve;
@@ -67,6 +71,7 @@ use import::{ImportArgs, run_import};
 use indicators::{IndicatorsArgs, run_indicators};
 use llm::{LlmArgs, run_llm_check};
 use mcp::{McpArgs, run_mcp};
+use qa_seed::{QaSeedArgs, run_qa_seed};
 use runs::{RunsArgs, run_runs};
 use serve::{ServeArgs, run_serve};
 use strategy::{StrategyArgs, run_strategy};
@@ -146,6 +151,12 @@ pub enum Command {
     /// Restore a verified backup over the local database (r3.s3.w4, D12).
     /// Precondition: the server must be stopped.
     Restore(RestoreArgs),
+    /// Seed QA's database from a copy of prod's (r4.s2.w3, C5/ADR-0029): revoke
+    /// every copied token (each revoke audited), issue the two fresh QA tokens
+    /// (`qa-app`, `qa-agent`), write the `qa` marker, and print the two tokens
+    /// once on stdout. Refuses a `prod`-marked data dir and a database a live
+    /// server holds. Run it after the backup is restored into QA's data dir.
+    QaSeed(QaSeedArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> (--years <N> | --from <YYYY-MM-DD>) [--json]`.
@@ -286,6 +297,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // restore reuses import's verified-copy engine).
         Command::Backup(args) => run_backup(&args).await,
         Command::Restore(args) => run_restore(&args).await,
+        // r4.s2.w3 (C5): the QA seed — refusals first, then one transaction,
+        // the marker, and the two tokens on stdout.
+        Command::QaSeed(args) => run_qa_seed(&args).await,
     }
 }
 

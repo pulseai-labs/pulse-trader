@@ -126,7 +126,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   streamChannel = null;
   serverStatusMock.mockResolvedValue(
-    ok({ state: "up", binary_version: "0.3.0", engine_fingerprint: ENGINE, reason: null }),
+    ok({ state: "up", binary_version: "0.3.0", engine_fingerprint: ENGINE, reason: null, role: null }),
   );
   paperSessionTradesMock.mockResolvedValue(ok(TRADES));
   paperShadowCheckMock.mockResolvedValue(

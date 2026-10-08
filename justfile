@@ -114,30 +114,37 @@ check-serve-bind:
     cargo build
     bash scripts/check-serve-bind.sh
 
-# --- deploy / backup / restore (r3.s3.w4, D6/D7/D12, ADR-0026) --------------
+# --- deploy (draco-desk QA) / backup / restore (D6/D7/D12, ADR-0026/0029) ---
 
-# Build a tagged commit and install it as the always-on server: a fresh git
-# worktree of `tag` in ~/.cache/pulse-deploy/src (NEVER /tmp), `cargo build
-# --release --bin pulse` there, the binary into ~/.local/share/pulse-serve/bin
-# (not on PATH — it never shadows a developer's `pulse`), the three units into
-# ~/.config/systemd/user/, then reload / enable / restart. THE CUTOVER STEP
-# (D7): an operator action at the release walk — never run by an item. Refuses
-# without a tag argument and refuses a tag that does not exist.
+# Build a tagged commit and install it as DRACO-DESK'S QA SERVER (r4.s2.w3, C5 /
+# ADR-0029): a fresh git worktree of `tag` in ~/.cache/pulse-deploy/src (NEVER
+# /tmp), `cargo build --release --bin pulse` there, the binary into
+# ~/.local/share/pulse-qa/bin (not on PATH — it never shadows a developer's
+# `pulse`), the QA unit into ~/.config/systemd/user/, ~/.local/share/pulse-qa
+# created 0700, then daemon-reload / enable / restart pulse-qa.service and a
+# real health gate on the QA port.
 #
-# The server unit gives up after 3 failed starts in 900 s (#342) and stays in the
+# It touches NEITHER pulse-serve.service NOR the backup units (G2): draco-desk's
+# prod service is frozen until the cutover retires it, prod's backup is the
+# Mini's launchd job (w1/w5), and nothing here writes prod's data. QA runs
+# BESIDE the current prod: port 8421, its own database and data dir under
+# ~/.local/share/pulse-qa, and the `server-role` marker makes a QA server and a
+# prod server refuse each other's data by name.
+#
+# #248: a systemd USER unit is only always-on while lingering is enabled, so the
+# recipe refuses — by name, before it builds anything — unless
+# `loginctl show-user "$USER" -p Linger` answers `Linger=yes`. If it does not:
+#   loginctl enable-linger "$USER"
+#
+# The QA unit gives up after 3 failed starts in 900 s (#342) and stays in the
 # systemd `failed` state. To see it:
 #   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user --failed
-#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user status pulse-serve.service
+#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user status pulse-qa.service
 # To recover: fix the cause, then
-#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-serve.service
-#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start pulse-serve.service
-# The start limit counts manual starts too, so the `deploy` and `restore` recipes
-# run `reset-failed` before they start or restart the unit.
-#
-# A change to deploy/pulse-serve.service alone installs on a live host by copying
-# the merged unit to ~/.config/systemd/user/ and running
-# `systemctl --user daemon-reload`, with no restart. This `deploy` recipe does
-# more: it restarts pulse-serve.service.
+#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-qa.service
+#   XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start pulse-qa.service
+# The start limit counts manual starts too, so the `deploy` recipe runs
+# `reset-failed` before it restarts the unit.
 deploy tag:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -147,6 +154,11 @@ deploy tag:
     fi
     if ! git rev-parse -q --verify "refs/tags/{{ tag }}" >/dev/null; then
         echo "deploy: tag '{{ tag }}' does not exist in this repository" >&2
+        exit 1
+    fi
+    # #248: a user unit stops at logout unless lingering is enabled.
+    if [ "$(loginctl show-user "$USER" -p Linger --value)" != "yes" ]; then
+        echo "deploy: Linger is not enabled for $USER - pulse-qa.service would stop at logout; run 'loginctl enable-linger $USER' first (#248)" >&2
         exit 1
     fi
     SRC="$HOME/.cache/pulse-deploy/src"
@@ -159,34 +171,32 @@ deploy tag:
     # this release build (and of deploy-mac's): the deploy must not refuse on,
     # or depend on, a frontend bundle the server never reads.
     (cd "$SRC" && PULSE_ALLOW_PLACEHOLDER_DIST=1 cargo build --release --bin pulse)
-    mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.config/systemd/user"
-    install -m 0755 "$SRC/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
-    # The THREE UNITS come from the tag too, like the binary above: installing
-    # the caller's working-tree units beside a tagged binary is a mixed release
-    # (and a rollback to an old tag would install new units).
-    install -m 0644 "$SRC/deploy/pulse-serve.service" "$SRC/deploy/pulse-backup.service" \
-        "$SRC/deploy/pulse-backup.timer" "$HOME/.config/systemd/user/"
+    # The unit comes from the tag too, like the binary above: installing the
+    # caller's working-tree unit beside a tagged binary is a mixed release (and
+    # a rollback to an old tag would install a new unit).
+    install -d -m 0700 "$HOME/.local/share/pulse-qa"
+    mkdir -p "$HOME/.local/share/pulse-qa/bin" "$HOME/.config/systemd/user"
+    install -m 0755 "$SRC/target/release/pulse" "$HOME/.local/share/pulse-qa/bin/pulse"
+    install -m 0644 "$SRC/deploy/pulse-qa.service" "$HOME/.config/systemd/user/"
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user daemon-reload
-    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable --now pulse-backup.timer
-    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable pulse-serve.service
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable pulse-qa.service
     # The start limit counts manual starts: clear a latched `failed` state first.
-    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-serve.service || true
-    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pulse-serve.service
-    "$HOME/.local/share/pulse-serve/bin/pulse" --version
-    # #346 (r4.s2.w1): `systemctl is-active` reads `active` for the whole
-    # 120-second bind retry, so a deploy whose bind never succeeded still
-    # reported success. The gate is now a real health probe. It runs the
-    # CALLER checkout's copy (justfile and script come from one checkout, so an
-    # old tag stays deployable); w4 lands the /healthz route, and until then
-    # the script's handshake fallback stands in.
-    bash scripts/wait-healthy.sh "http://100.90.203.21:8420" 150
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user reset-failed pulse-qa.service || true
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user restart pulse-qa.service
+    "$HOME/.local/share/pulse-qa/bin/pulse" --version
+    # #346 (r4.s2.w1): a real health probe on the QA port in place of
+    # `systemctl is-active`, which read `active` for the whole 120-second bind
+    # retry. It runs the CALLER checkout's copy (justfile and script come from
+    # one checkout, so an old tag stays deployable); w4 lands the /healthz
+    # route, and until then the script's handshake fallback stands in.
+    bash scripts/wait-healthy.sh "http://100.90.203.21:8421" 150
 
-# The SAFE rehearsal for `deploy` (r3.s3.w4 AC-2): it installs nothing, starts
-# nothing and builds nothing. It verifies the three units with
+# The SAFE rehearsal for `deploy` (r3.s3.w4 AC-2, r4.s2.w3): it installs
+# nothing, starts nothing and builds nothing. It verifies the QA unit with
 # `systemd-analyze --user verify`, rendered into a scratch dir under
 # ~/.cache/pulse-scratch/ with ONLY the ExecStart binary swapped to an
 # existing placeholder (the real binary must not exist yet — installing it is
-# deploy's job); every other byte of each unit is verbatim. Then it dry-runs
+# deploy's job); every other byte of the unit is verbatim. Then it dry-runs
 # the deploy steps against a real tag and asserts the live systemd/user paths
 # are byte-for-byte untouched.
 deploy-check tag="r2":
@@ -204,18 +214,18 @@ deploy-check tag="r2":
         {
             ls -A "$HOME/.config/systemd/user" 2>/dev/null || true
             echo "--"
+            ls -AR "$HOME/.local/share/pulse-qa" 2>/dev/null || true
+            echo "--"
             ls -AR "$HOME/.local/share/pulse-serve" 2>/dev/null || true
         } | sort
     }
     BEFORE="$(list_live)"
-    for unit in deploy/pulse-serve.service deploy/pulse-backup.service deploy/pulse-backup.timer; do
+    for unit in deploy/pulse-qa.service; do
         sed -E 's|^(ExecStart=).*pulse |ExecStart=/usr/bin/true |' "$unit" \
             > "$SCRATCH/units/$(basename "$unit")"
     done
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-analyze --user verify \
-        "$SCRATCH/units/pulse-serve.service" \
-        "$SCRATCH/units/pulse-backup.service" \
-        "$SCRATCH/units/pulse-backup.timer"
+        "$SCRATCH/units/pulse-qa.service"
     just --dry-run "deploy" "{{ tag }}" >/dev/null
     AFTER="$(list_live)"
     if [ "$BEFORE" != "$AFTER" ]; then
@@ -223,7 +233,7 @@ deploy-check tag="r2":
         diff <(printf '%s\n' "$BEFORE") <(printf '%s\n' "$AFTER") >&2 || true
         exit 1
     fi
-    echo "deploy-check: rehearsal passed — units verified, deploy dry-run only; nothing installed, nothing started"
+    echo "deploy-check: rehearsal passed — the QA unit verified, deploy dry-run only; nothing installed, nothing started"
 
 # Run one backup now, through the timer's service unit (D12).
 backup-now:

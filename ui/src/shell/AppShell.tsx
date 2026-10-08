@@ -541,6 +541,14 @@ export function WindowChrome({
             <span className="title-status">
               <span className="dot" data-state={serverStatus.state} />
               {serverStatusText(serverStatus)}
+              {/* r4.s2.w3 (C5): QA's database is a copy of prod's, so a stale
+                  URL landing on QA must be visible at a glance. `prod` and an
+                  absent role (an older server) render nothing new. */}
+              {serverStatus.role === "qa" && (
+                <span className="qa-badge" title="Connected to a QA server">
+                  QA
+                </span>
+              )}
             </span>
           )}
           {paperRunning !== undefined && (
