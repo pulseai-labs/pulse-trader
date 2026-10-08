@@ -12,7 +12,7 @@
 //! There is no route and no CLI verb: w4 wires the API surface. The gate's
 //! typed refusals travel out as [`PaperPromotionError::Refused`].
 
-use crate::domain::backtest::{BacktestInputs, VerdictRule, WalkForwardRun};
+use crate::domain::backtest::{BacktestInputs, WalkForwardRun};
 use crate::domain::certification::CertificationRecord;
 use crate::domain::paper::gate::{
     PromotionDraft, PromotionOverride, PromotionRefused, decide_promotion,
@@ -217,13 +217,10 @@ where
 /// The run that certifies `version` (r4.s1.w5, spec A5), with the version's
 /// certified record beside it — the gate reads both.
 ///
-/// The latest walk-forward run is the certification — EXCEPT when that run is
-/// `wf-v2`: its pass is a SEARCH-span verdict the campaign tunes candidates
-/// towards, so it certifies nothing by itself. Then the run that certifies is
-/// the RECORD's `search_walk_forward_run_id` (that run's folds are the
-/// certification's provenance and its fingerprint is the one checked), and a
-/// `wf-v2` pointer run with no such record is handed back unchanged — the gate
-/// refuses it as `Uncertified`, and an override still covers it.
+/// A certified record selects its `search_walk_forward_run_id` regardless of
+/// the latest pointer run's rule or verdict, matching the version's derived
+/// certified flag. Without a certified record the pointer run is unchanged:
+/// a passing wf-v1 can certify, while a wf-v2 search verdict alone cannot.
 async fn certifying_run<W, T>(
     walk_forwards: &W,
     certifications: &T,
@@ -238,15 +235,12 @@ where
         .latest_certified(version_id)
         .await
         .map_err(PaperPromotionError::Data)?;
-    let certifying = match latest_run {
-        Some(run) if run.rule == VerdictRule::WfV2 => match &certification {
-            Some(record) if record.certified => walk_forwards
-                .get_walk_forward_run(&record.search_walk_forward_run_id)
-                .await
-                .map_err(PaperPromotionError::Data)?,
-            _ => Some(run),
-        },
-        other => other,
+    let certifying = match &certification {
+        Some(record) => walk_forwards
+            .get_walk_forward_run(&record.search_walk_forward_run_id)
+            .await
+            .map_err(PaperPromotionError::Data)?,
+        None => latest_run,
     };
     Ok((certifying, certification))
 }

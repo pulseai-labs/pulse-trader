@@ -282,3 +282,42 @@ async fn promotion_reads_certification_keeps_the_override_path() {
     );
     assert_eq!(session.strategy_version_id, world.version);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certified_record_promotes_after_a_later_failed_wf_v1_pointer() {
+    let world = world().await;
+    let outcome = support::certification::certify(&world, Some(&world.freeze))
+        .await
+        .unwrap();
+    let later = pulse::WalkForwardRunRepository::save_walk_forward_run(
+        &runs(&world),
+        &world.version,
+        &support::mcp::seeded_walk_forward_draft(false),
+    )
+    .await
+    .unwrap();
+    let version = pulse::SqliteStrategyRepo::new(world.db.pool().clone())
+        .get_version(&world.version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        version.certified,
+        "the library badge is backed by the record"
+    );
+    assert_eq!(version.latest_walk_forward_run_id, Some(later));
+    let session = promote_version(&world, &world.version)
+        .await
+        .expect("the badge and gate agree");
+    let Graduation::Certified {
+        walk_forward_run_id,
+        ..
+    } = session.graduation
+    else {
+        panic!("a certified record promotes without override");
+    };
+    assert_eq!(
+        walk_forward_run_id,
+        outcome.record.search_walk_forward_run_id
+    );
+}
