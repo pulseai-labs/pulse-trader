@@ -251,8 +251,9 @@ fn watch_service_is_one_probe_cycle_with_the_operator_paths() {
     );
     let exec = &service["ExecStart"];
     assert!(
-        exec.starts_with("%h/.local/share/pulse-serve/bin/pulse watch"),
-        "the installed binary runs `pulse watch`: {exec}"
+        exec.starts_with("%h/.local/share/pulse-qa/bin/pulse watch"),
+        "the installed binary runs `pulse watch` — the one `just deploy` installs into \
+         ~/.local/share/pulse-qa/bin, the same binary the pull unit verifies with: {exec}"
     );
     for argument in [
         "--url http://100.103.30.74:8420",
