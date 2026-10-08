@@ -40,9 +40,11 @@ use crate::adapters::db::{
 };
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
-    BacktestAppError, SnapshotPins, resolve_default_request, run_version_backtest,
+    BacktestAppError, resolve_default_request, run_version_backtest,
 };
-use crate::application::certification::{CertifyError, CertifyRequest, certify_version};
+use crate::application::certification::{
+    CertifyError, CertifyRequest, apply_pair_override, certify_version,
+};
 use crate::application::mcp_read::{
     parse_indicator_specs, run_detail, run_list_entry, strategy_entry, version_detail,
     version_entry,
@@ -294,26 +296,6 @@ fn pair_override(
         return Err(field_error("pair", format!("cannot run {pair}: {e}")));
     }
     Ok(Some(pair))
-}
-
-/// Apply a validated `pair` override to a resolved request (r4.s1.w2).
-///
-/// A **differing** pair clears the inherited snapshot pins: the pins name the
-/// other pair's exact `data_version`s, and the new pair must resolve its own
-/// `HEAD` snapshots — a pin is only meaningful for the pair it was recorded
-/// under. An identical pair keeps the pins, so naming the inherited pair
-/// changes nothing.
-fn apply_pair_override(
-    pair: &mut Pair,
-    snapshots: &mut Option<SnapshotPins>,
-    override_pair: Option<&Pair>,
-) {
-    if let Some(override_pair) = override_pair
-        && override_pair != pair
-    {
-        *pair = override_pair.clone();
-        *snapshots = None;
-    }
 }
 
 /// Validate an optional MCP `rule` argument (r4.s1.w3) against the domain's own

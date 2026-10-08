@@ -204,9 +204,8 @@ where
     // 4. The pair and timeframes, resolved exactly as the run tools resolve
     //    them: the version's parent's latest run, then its own, then the app
     //    defaults (BTCUSDT, M15 + H4, HEAD). The override then replaces the pair
-    //    and clears the inherited pins — the mirror of the MCP tools'
-    //    `apply_pair_override`, which lives in the MCP ring and cannot be
-    //    imported here (the ring boundary).
+    //    and clears the inherited pins, through the ONE `apply_pair_override`
+    //    the MCP run tools import too (close R3).
     let mut resolved = resolve_default_request(strategies, runs, &request.version_id, None)
         .await
         .map_err(CertifyError::Backtest)?;
@@ -406,12 +405,18 @@ where
     Ok(current)
 }
 
-/// Apply a validated `pair` override to a resolved request — the mirror of the
-/// MCP tools' `apply_pair_override` (r4.s1.w2). A **differing** pair clears the
-/// inherited snapshot pins: the pins name the other pair's exact
-/// `data_version`s and the new pair must resolve its own `HEAD` snapshots. An
-/// identical pair keeps them.
-fn apply_pair_override(
+/// Apply a validated `pair` override to a resolved request (r4.s1.w2; hoisted
+/// here at the close review, R3).
+///
+/// This is the ONE copy: the certification step and the MCP `run_backtest` /
+/// `run_walk_forward` tools all call it — `mcp → application` is the allowed
+/// ring direction, and the alternative was a second copy that could drift.
+///
+/// A **differing** pair clears the inherited snapshot pins: the pins name the
+/// other pair's exact `data_version`s and the new pair must resolve its own
+/// `HEAD` snapshots. An identical pair keeps them, so naming the inherited pair
+/// changes nothing.
+pub(crate) fn apply_pair_override(
     pair: &mut Pair,
     snapshots: &mut Option<SnapshotPins>,
     override_pair: Option<&Pair>,
