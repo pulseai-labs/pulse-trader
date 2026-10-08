@@ -933,3 +933,68 @@ async fn a_window_ending_at_the_holdout_start_runs() {
     let (_, to) = recorded_window(&world, out["run_id"].as_str().unwrap()).await;
     assert_eq!(to, HOLDOUT_MS);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persisted_run_reads_withhold_holdout_results() {
+    let world = world().await;
+    let client = world.client().await;
+    let mut args = arguments(&window_into_holdout());
+    args.insert("version_id".to_owned(), json!(world.child.as_str()));
+    let unsafe_run = call(&client, "run_backtest", Value::Object(args)).await;
+    let mut args = arguments(&window_clearing_holdout());
+    args.insert("version_id".to_owned(), json!(world.child.as_str()));
+    let safe_run = call(&client, "run_backtest", Value::Object(args)).await;
+    let wf = call(
+        &client,
+        "run_walk_forward",
+        json!({
+            "version_id": world.child.as_str(), "k": 2,
+            "from": "2025-01-10T00:00:00Z", "to": "2025-01-20T00:00:00Z"
+        }),
+    )
+    .await;
+    let full_run = call(
+        &client,
+        "run_backtest",
+        json!({"version_id": world.child.as_str()}),
+    )
+    .await;
+    let before = call(&client, "get_run", json!({"run_id": safe_run["run_id"]})).await;
+    world.open_freeze(HOLDOUT_MS).await;
+    for name in ["get_run", "export_trades"] {
+        let err = call_err(&client, name, json!({"run_id": unsafe_run["run_id"]})).await;
+        assert_eq!(err["field"], "run_id");
+        assert!(err["message"].as_str().unwrap().contains("BTCUSDT"));
+        assert!(err["message"].as_str().unwrap().contains("2025-01-16"));
+    }
+    let err = call_err(
+        &client,
+        "get_walk_forward_run",
+        json!({"walk_forward_run_id": wf["walk_forward_run_id"]}),
+    )
+    .await;
+    assert_eq!(err["field"], "run_id");
+    let list = call(
+        &client,
+        "list_runs",
+        json!({"version_id": world.child.as_str()}),
+    )
+    .await;
+    call_err(&client, "get_run", json!({"run_id": full_run["run_id"]})).await;
+    assert_eq!(list["withheld_for_holdout"], 3);
+    assert_eq!(list["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        call(&client, "get_run", json!({"run_id": safe_run["run_id"]})).await,
+        before
+    );
+    freeze_repo(&world.db, CLOSED_MS).close().await.unwrap();
+    call(&client, "get_run", json!({"run_id": unsafe_run["run_id"]})).await;
+    let list = call(
+        &client,
+        "list_runs",
+        json!({"version_id": world.child.as_str()}),
+    )
+    .await;
+    assert!(list.get("withheld_for_holdout").is_none());
+    client.cancel().await.unwrap();
+}

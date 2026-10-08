@@ -639,6 +639,46 @@ async fn open_holdout(state: &super::McpState) -> Result<Option<HoldoutFreeze>, 
         .map_err(tool_error)
 }
 
+/// Resolve an unwindowed run against its pinned snapshot, never today's HEAD.
+async fn guard_run_read(
+    state: &super::McpState,
+    holdout: Option<HoldoutFreeze>,
+    run: &PersistedRun,
+) -> Result<(), CallToolResult> {
+    if holdout.is_none() {
+        return Ok(());
+    }
+    let Some(inputs) = &run.inputs else {
+        return Err(field_error(
+            "run_id",
+            "the holdout freeze refuses a run whose input provenance is unavailable",
+        ));
+    };
+    let window = if let Some(window) = &inputs.window {
+        window.clone()
+    } else {
+        let store = state.candles.clone();
+        let inputs = inputs.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            store.load_version(
+                &inputs.pair,
+                inputs.primary.timeframe,
+                &inputs.primary.data_version,
+            )
+        })
+        .await
+        .map_err(tool_error)?
+        .map_err(tool_error)?;
+        let candles = &loaded.series.candles;
+        let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
+            return Ok(());
+        };
+        CandleWindow::new(first.open_time, last.close_time).map_err(tool_error)?
+    };
+    crate::application::holdout::guard_persisted_window(holdout, &inputs.pair, &window)
+        .map_err(|refusal| field_error("run_id", refusal))
+}
+
 /// The OPEN freeze's whole record, read once per `certify_version` call
 /// (r4.s1.w5, C4/Q2) — the step's precondition, its budget H, its holdout
 /// start and its id all come from it. `None` means no freeze is open, which
@@ -768,6 +808,10 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<ListRunsArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         // Resolve first: `list_runs_for_version` returns `[]` for an unknown
         // version, which a typo would silently read as "no runs yet" (G5).
         let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
@@ -781,9 +825,22 @@ impl PulseMcp {
             Err(e) => return Ok(tool_error(e)),
         };
         let mut entries = Vec::with_capacity(summaries.len());
+        let mut withheld_for_holdout = 0;
         for summary in &summaries {
             match repo.get_run_classified(&summary.id).await {
-                Ok(Some(run)) => entries.push(run_list_entry(&run)),
+                Ok(Some(run)) => match guard_run_read(&self.state, holdout, &run).await {
+                    Ok(()) => entries.push(run_list_entry(&run)),
+                    Err(result)
+                        if result
+                            .structured_content
+                            .as_ref()
+                            .and_then(|v| v.get("field"))
+                            .is_some() =>
+                    {
+                        withheld_for_holdout += 1;
+                    }
+                    Err(result) => return Ok(result),
+                },
                 Ok(None) => {
                     // r3.s1.w4 (#198): one unreadable row is skipped with a
                     // warning on the same channel the repository's list walk
@@ -810,7 +867,13 @@ impl PulseMcp {
                 }
             }
         }
-        Ok(structured_list("runs", entries))
+        if holdout.is_some() {
+            Ok(CallToolResult::structured(
+                json!({"runs": entries, "withheld_for_holdout": withheld_for_holdout}),
+            ))
+        } else {
+            Ok(structured_list("runs", entries))
+        }
     }
 
     /// Fetch one persisted run: summary, regime breakdown, skipped entries,
@@ -822,11 +885,18 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<GetRunArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let repo = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
         let run = match resolve_run(&repo, args.run_id).await {
             Ok(run) => run,
             Err(result) => return Ok(result),
         };
+        if let Err(result) = guard_run_read(&self.state, holdout, &run).await {
+            return Ok(result);
+        }
         let trades = match repo.get_trades(&run.id).await {
             Ok(t) => t,
             Err(e) => return Ok(tool_error(e)),
@@ -845,6 +915,10 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<ExportTradesArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         // One seam for the whole input: the id must be a safe single path
         // component AND name a real run — `get_trades` returns an empty vec
         // for an unknown id, which would otherwise write a header-only export
@@ -854,6 +928,9 @@ impl PulseMcp {
             Ok(run) => run,
             Err(result) => return Ok(result),
         };
+        if let Err(result) = guard_run_read(&self.state, holdout, &run).await {
+            return Ok(result);
+        }
         let trades = match repo.get_trades(&run.id).await {
             Ok(t) => t,
             Err(e) => return Ok(tool_error(e)),
@@ -1494,6 +1571,10 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<GetWalkForwardRunArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
         let run = match runs
             .get_walk_forward_run(&WalkForwardRunId::new(args.walk_forward_run_id))
@@ -1512,6 +1593,20 @@ impl PulseMcp {
             Ok(fold_runs) => fold_runs,
             Err(e) => return Ok(walk_forward_error_result(&e)),
         };
+        if let Some(inputs) = fold_runs.first().and_then(|fold| fold.inputs.as_ref()) {
+            if let Err(refusal) = crate::application::holdout::guard_persisted_window(
+                holdout,
+                &inputs.pair,
+                &run.span,
+            ) {
+                return Ok(field_error("run_id", refusal));
+            }
+        } else if holdout.is_some() {
+            return Ok(field_error(
+                "run_id",
+                "the holdout freeze refuses a run whose input provenance is unavailable",
+            ));
+        }
         let summaries: Vec<_> = fold_runs.iter().map(run_summary_of).collect();
         let detail = match walk_forward_run_detail(&run, &summaries) {
             Ok(detail) => detail,

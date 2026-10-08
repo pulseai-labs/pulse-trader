@@ -197,6 +197,32 @@ pub fn guard_span(
     }
 }
 
+/// Guard access to an already computed run's counted window.
+///
+/// Uses the same explicit-span decision as execution; a persisted result cannot
+/// be clamped. The refusal names the run identifier at the read boundary.
+///
+/// # Errors
+/// Returns [`HoldoutRefusal`] when the recorded window reaches the holdout.
+pub fn guard_persisted_window(
+    freeze: Option<HoldoutFreeze>,
+    pair: &Pair,
+    window: &CandleWindow,
+) -> Result<(), HoldoutRefusal> {
+    guard_span(
+        freeze,
+        pair,
+        Some(window.from_ms),
+        Some(window.to_ms),
+        window.to_ms,
+    )
+    .map(|_| ())
+    .map_err(|mut refusal| {
+        refusal.field = "run_id";
+        refusal
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
