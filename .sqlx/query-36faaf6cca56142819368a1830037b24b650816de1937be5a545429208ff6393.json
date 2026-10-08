@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT h AS \"h!: i64\", closed_at_ms FROM certification_freeze WHERE id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "h!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "closed_at_ms",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "36faaf6cca56142819368a1830037b24b650816de1937be5a545429208ff6393"
+}

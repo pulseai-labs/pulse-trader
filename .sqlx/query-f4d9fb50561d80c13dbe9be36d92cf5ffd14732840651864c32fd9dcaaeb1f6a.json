@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id, holdout_start_ms, h, alpha, holdout_test, opened_at_ms, closed_at_ms FROM certification_freeze WHERE closed_at_ms IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "holdout_start_ms",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "h",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "alpha",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "holdout_test",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "opened_at_ms",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "closed_at_ms",
+        "ordinal": 6,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "f4d9fb50561d80c13dbe9be36d92cf5ffd14732840651864c32fd9dcaaeb1f6a"
+}

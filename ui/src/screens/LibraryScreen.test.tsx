@@ -28,12 +28,18 @@ vi.mock("../bindings", () => ({
     // r3.s4.w5: App polls the running paper-session count for the titlebar
     // pill; an empty list keeps the strip at "0 paper · 0 live".
     paperSessions: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
+    // r4.s1.w5: the pane's certification-record read; an empty list by default
+    // (the "None yet." state every other pane test then renders).
+    certificationRecords: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: { versionId: "", records: [] } }),
   },
 }));
 
 import { commands } from "../bindings";
 import type {
   BusError,
+  CertificationRecordDto,
   LibraryOverview,
   LibraryVersion,
   VersionStats,
@@ -42,6 +48,40 @@ import { App, RouteContent } from "../App";
 import { resolveRoute } from "../routes";
 
 const overviewMock = vi.mocked(commands.libraryOverview);
+const certificationRecordsMock = vi.mocked(commands.certificationRecords);
+
+/** One certification record, in the generated DTO's shape (r4.s1.w5). */
+function certificationRecord(certified: boolean): CertificationRecordDto {
+  return {
+    id: "cert-1",
+    versionId: "v-alpha-2",
+    freezeId: "freeze-1",
+    hypothesisIndex: 3,
+    rule: "wf-v2",
+    pair: "BTCUSDT",
+    searchWalkForwardRunId: "wf-run-7f3a9c21",
+    searchPass: true,
+    holdoutStart: "2025-07-01T00:00:00.000Z",
+    holdoutEnd: "2026-01-01T00:00:00.000Z",
+    holdoutN: 214,
+    holdoutMeanR: "0.412",
+    holdoutZ: 2.638,
+    holdoutLowerBound: 0.181,
+    holdoutPasses: certified,
+    certified,
+    searchDataVersions: [
+      { timeframe: "15m", dataVersion: "m15-sha256:aaaa" },
+      { timeframe: "4h", dataVersion: "h4-sha256:bbbb" },
+    ],
+    holdoutDataVersions: [
+      { timeframe: "15m", dataVersion: "m15-sha256:aaaa" },
+      { timeframe: "4h", dataVersion: "h4-sha256:bbbb" },
+    ],
+    engineFingerprint: "fp",
+    createdAt: "2026-01-02T00:00:00.000Z",
+    calledBy: "claude-code",
+  };
+}
 
 function stats(expectancy: string, winRate: string, trades: number): VersionStats {
   return { expectancy, winRate, trades };
@@ -528,6 +568,55 @@ describe("LibraryScreen (d22 — certification badge, r2.s3.w4)", () => {
     expect(await inPane.findByText("Certification")).toBeTruthy();
     expect(inPane.getByText("uncertified")).toBeTruthy();
     expect(inPane.queryByText("wf-run-7f3a9c21")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r4.s1.w5 — the certification record's FULL read in the details pane
+// ---------------------------------------------------------------------------
+
+describe("LibraryScreen (r4.s1.w5 — the certification records)", () => {
+  it("renders one row per record, with the holdout numbers the agent never sees", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    certificationRecordsMock.mockResolvedValue({
+      status: "ok",
+      data: { versionId: "v-alpha-2", records: [certificationRecord(true)] },
+    });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v2"));
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const inPane = within(pane);
+    expect(await inPane.findByText("Certification records")).toBeTruthy();
+    expect(await inPane.findByText("#3")).toBeTruthy();
+    expect(inPane.getByText("BTCUSDT")).toBeTruthy();
+    expect(inPane.getByText("214t")).toBeTruthy();
+    expect(inPane.getByText("0.412")).toBeTruthy();
+    expect(inPane.getByText("0.181")).toBeTruthy();
+    expect(
+      certificationRecordsMock,
+    ).toHaveBeenCalledWith({ versionId: "v-alpha-2" });
+  });
+
+  it("says 'None yet.' when the version has no records", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    certificationRecordsMock.mockResolvedValue({
+      status: "ok",
+      data: { versionId: "v-alpha-2", records: [] },
+    });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v2"));
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const inPane = within(pane);
+    expect(await inPane.findByText("Certification records")).toBeTruthy();
+    expect(await inPane.findByText("None yet.")).toBeTruthy();
   });
 });
 

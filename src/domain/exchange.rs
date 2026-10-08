@@ -20,7 +20,8 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum ExchangeError {
     /// The adapter has no filters pinned for the requested symbol. v1's
-    /// `BinanceAdapter` only knows `BTCUSDT`; any other pair lands here.
+    /// `BinanceAdapter` knows BTCUSDT, ETHUSDT, SOLUSDT and XRPUSDT; any other
+    /// pair lands here.
     #[error("unknown symbol: {0}")]
     UnknownSymbol(String),
 }

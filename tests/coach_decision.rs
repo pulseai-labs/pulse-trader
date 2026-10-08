@@ -416,6 +416,7 @@ async fn world_with_dsl_windowed(dsl_json: &str, window: Option<CandleWindow>) -
             snapshots: None,
             window,
         },
+        None,
     )
     .await
     .expect("the parent backtest runs over the fixture");
@@ -524,6 +525,7 @@ async fn decide_with_exchange(
             session_id: world.session_id.clone(),
             action,
         },
+        None,
     )
     .await
 }
@@ -1286,6 +1288,7 @@ async fn a_read_back_failure_after_the_commit_is_still_an_accepted_outcome() {
             session_id: world.session_id.clone(),
             action: CoachAction::Accept,
         },
+        None,
     )
     .await
     .expect("a read-back failure is not an accept failure");
@@ -1423,6 +1426,7 @@ async fn an_absent_session_and_a_failed_turn_are_typed_refusals() {
             session_id: CoachingSessionId::new("sess-nope"),
             action: CoachAction::Accept,
         },
+        None,
     )
     .await;
     assert!(
@@ -1469,6 +1473,7 @@ async fn an_absent_session_and_a_failed_turn_are_typed_refusals() {
             session_id: CoachingSessionId::new("sess-failed"),
             action: CoachAction::Reject,
         },
+        None,
     )
     .await;
     assert!(

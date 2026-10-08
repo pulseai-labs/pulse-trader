@@ -54,7 +54,7 @@ use crate::domain::{
     AcceptFailureStage, BacktestRunId, BacktestRunRepository, CandidateDsl, CandleSeries,
     CandleSeriesRepository, CoachAcceptFailure, CoachAcceptanceRepository, CoachingRepository,
     CoachingSession, CoachingSessionId, DataError, Disposition, DispositionKind, EngineFingerprint,
-    ExchangeAdapter, Mutation, MutationError, PersistedRun, PreparedBacktest,
+    ExchangeAdapter, HoldoutFreeze, Mutation, MutationError, PersistedRun, PreparedBacktest,
     PreparedCoachAcceptance, Proposal, SeriesEnd, SessionOutcome, StrategyRepository,
     SymbolFilters, ValidatedDsl, WalkForwardRunRepository, apply, compile,
 };
@@ -254,6 +254,7 @@ pub enum CoachDecisionError {
 /// version has vanished, when a modify's mutation does not apply, or when the store
 /// fails. A failed ACCEPT is not an error — see
 /// [`CoachDecisionOutcome::AcceptFailed`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_coach_decision<S, C, E, R, A, Q>(
     strategies: &S,
     candles: &C,
@@ -262,6 +263,7 @@ pub async fn run_coach_decision<S, C, E, R, A, Q>(
     acceptance: &A,
     sessions: &Q,
     request: CoachDecisionRequest,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<CoachDecisionOutcome, CoachDecisionError>
 where
     S: StrategyRepository,
@@ -292,7 +294,7 @@ where
         CoachAction::Reject => reject(sessions, &session_id, &proposal).await,
         CoachAction::Accept => {
             accept(
-                strategies, candles, exchange, runs, acceptance, &session, &proposal,
+                strategies, candles, exchange, runs, acceptance, &session, &proposal, holdout,
             )
             .await
         }
@@ -374,6 +376,13 @@ where
 // ---------------------------------------------------------------------------
 
 /// The seven-step accept (spec §Accept), each step's failure recorded as its stage.
+///
+/// `holdout` is the open freeze (r4.s1.w4, Q4): before loading snapshots or
+/// computing the child, the parent's recorded window or pinned whole-snapshot
+/// span is guarded through the shared persisted-run guard. A
+/// window reaching the holdout records a `walk_forward` refusal. The later
+/// certification gate also guards the parent's certifying run's span.
+#[allow(clippy::too_many_arguments)]
 async fn accept<S, C, E, R, A>(
     strategies: &S,
     candles: &C,
@@ -382,6 +391,7 @@ async fn accept<S, C, E, R, A>(
     acceptance: &A,
     session: &CoachingSession,
     proposal: &Proposal,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<CoachDecisionOutcome, CoachDecisionError>
 where
     S: StrategyRepository,
@@ -424,6 +434,29 @@ where
         Err(failure) => return record_staged(acceptance, &session.id, failure).await,
     };
 
+    if let Err(error) =
+        crate::application::holdout::guard_persisted_run(candles.clone(), holdout, &parent_run)
+            .await
+    {
+        let stage = match error {
+            crate::application::holdout::PersistedRunGuardError::Snapshot(_)
+            | crate::application::holdout::PersistedRunGuardError::Worker(_) => {
+                AcceptFailureStage::LoadSnapshots
+            }
+            _ => AcceptFailureStage::WalkForward,
+        };
+        return record_staged(
+            acceptance,
+            &session.id,
+            StagedFailure {
+                stage,
+                message: error.to_string(),
+                subject: None,
+            },
+        )
+        .await;
+    }
+
     // 4-5. LOAD SNAPSHOTS, COMPILE AND COMPUTE — off the async runtime, exactly as
     //      `run_version_backtest` does it: the same Parquet decode and the same
     //      synchronous engine, and holding a Tokio worker for either stalls every
@@ -461,6 +494,7 @@ where
         &parent_run,
         &prepared,
         candidate.validated(),
+        holdout,
     )
     .await
     {
@@ -523,6 +557,7 @@ where
 /// `k` and the counted span from the certifying run's row, the pair/timeframes/
 /// cost config/snapshot pins from the parent run's recorded inputs (the same
 /// values `prepare_offthread` just replayed, read back off `prepared`).
+#[allow(clippy::too_many_arguments)]
 async fn certify_gate<C, E, R>(
     candles: &C,
     exchange: &E,
@@ -531,20 +566,28 @@ async fn certify_gate<C, E, R>(
     parent_run: &PersistedRun,
     prepared: &PreparedBacktest,
     candidate: &ValidatedDsl,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<Option<WalkForwardRunDraft>, StagedFailure>
 where
     C: CandleSeriesRepository + Clone + Send + 'static,
     E: ExchangeAdapter + Clone + Send + 'static,
     R: WalkForwardRunRepository,
 {
-    if !parent.certified {
+    // The gate's precondition is the parent's own certification — the child of
+    // a version whose latest walk-forward run PASSED must out-certify it — read
+    // from the RUN, not from `StrategyVersion::certified` (r4.s1.w5): that flag
+    // also means "carries a certification record", and G4 gates a `wf-v2`
+    // lineage under wf-v2 whether or not such a record exists yet. A parent
+    // with no run at all, or whose run failed, is ungated — exactly as before
+    // the record existed. (A pointer that names a run which no longer exists is
+    // the corrupt case this gate refuses by name, below.)
+    if parent.latest_walk_forward_run_id.is_none() {
         return Ok(None);
     }
-
-    // `certified` is DERIVED from the pointer's `pass`, so the run exists
-    // whenever the read is honest — a corrupt or absent row is exactly the
-    // case this gate exists to refuse, so the load is spelled out, not unwrapped.
     let certifying = certifying_run(runs, parent).await?;
+    if !certifying.verdict.pass {
+        return Ok(None);
+    }
 
     // The CANDIDATE is what walks forward — its own compile, mapped to the stage
     // the taxonomy reserves for it (D6).
@@ -576,6 +619,15 @@ where
             from_ms: Some(certifying.span.from_ms),
             to_ms: Some(certifying.span.to_ms),
             scheme: certifying.scheme,
+            // G4: the gate re-runs the candidate under the RULE of the parent's
+            // own certifying run (r4.s1.w3) — a wf-v2 lineage is judged by
+            // wf-v2, a wf-v1 lineage exactly as before.
+            rule: certifying.rule,
+            // r4.s1.w4 (Q4): the gate's span is the parent's certifying run's
+            // recorded span — an explicit bound, so the guard refuses the
+            // accept (at the `walk_forward` stage, by name) when it reaches
+            // into the frozen holdout rather than evaluating holdout data.
+            holdout,
         },
     )
     .await

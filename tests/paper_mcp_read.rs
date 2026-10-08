@@ -43,6 +43,10 @@ const BANNED_WORDS: [&str; 3] = ["promote", "stop", "shadow"];
 /// with R, an open position, a shadow verdict — enough for every read tool to
 /// answer something non-trivial.
 async fn seed_session(db: &Db, store_dir: &Path) -> PaperSessionId {
+    seed_session_with_trade_count(db, store_dir, 2).await
+}
+
+async fn seed_session_with_trade_count(db: &Db, store_dir: &Path, count: usize) -> PaperSessionId {
     let strategies = SqliteStrategyRepo::new(db.pool().clone());
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
     let paper = SqlitePaperSessionRepo::new(
@@ -108,7 +112,13 @@ async fn seed_session(db: &Db, store_dir: &Path) -> PaperSessionId {
         }],
     }];
     let mut seq = 1_i64;
-    for r in [Decimal::ONE, Decimal::new(5, 1)] {
+    for r in (0..count).map(|i| {
+        if i % 2 == 0 {
+            Decimal::ONE
+        } else {
+            Decimal::new(5, 1)
+        }
+    }) {
         seq += 1;
         events.push(PaperEvent::Fill {
             seq,
@@ -445,4 +455,72 @@ async fn an_agent_token_reaches_the_four_tools_over_mcp() {
         let structured = &call["result"]["structuredContent"];
         assert_eq!(structured, &want, "{name}: {structured}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paper_mcp_withholds_certifying_fold_results_during_freeze() {
+    let tmp = TempDir::new().unwrap();
+    let (db_path, db) = migrated_db(&tmp).await;
+    let store_dir = tmp.path().join("store");
+    copy_tree(&manifest(FIXTURE_STORE), &store_dir);
+    let id = seed_session_with_trade_count(&db, &store_dir, 20).await;
+    let client = spawn_client(&db_path, &store_dir).await;
+    let before = call(
+        &client,
+        "get_paper_comparison",
+        json!({"session_id": id.as_str()}),
+    )
+    .await;
+    assert!(
+        before.get("fold_min").is_some(),
+        "the comparison contains backtest fold statistics"
+    );
+    pulse::SqliteCertificationFreezeRepo::with_deps(
+        db.pool().clone(),
+        pulse::FakeClock::at(1_760_000_000_000),
+    )
+    .open(&pulse::OpenFreezeRequest {
+        holdout_start_ms: 1_736_985_600_000,
+        h: 12,
+        alpha: "0.05".to_owned(),
+        holdout_test: "C1".to_owned(),
+    })
+    .await
+    .unwrap();
+    for tool in ["get_paper_comparison", "get_paper_session"] {
+        let error = support::mcp::call_err(&client, tool, json!({"session_id": id.as_str()})).await;
+        assert_eq!(error["field"], "run_id");
+        assert!(error["message"].as_str().unwrap().contains("BTCUSDT"));
+        assert!(error["message"].as_str().unwrap().contains("2025-01-16"));
+    }
+    let list = call(&client, "list_paper_sessions", json!({})).await;
+    assert_eq!(list["withheld_for_holdout"], 1);
+    assert!(list["sessions"].as_array().unwrap().is_empty());
+    // The operator read is unchanged, and own-engine paper trades are exempt.
+    let operator = expected_summary(&db, &store_dir, &id).await;
+    assert_eq!(operator["comparison"], before);
+    let trades = call(
+        &client,
+        "get_paper_trades",
+        json!({"session_id": id.as_str()}),
+    )
+    .await;
+    assert_eq!(trades["closed_trades"].as_array().unwrap().len(), 20);
+    pulse::SqliteCertificationFreezeRepo::with_deps(
+        db.pool().clone(),
+        pulse::FakeClock::at(1_760_000_000_001),
+    )
+    .close()
+    .await
+    .unwrap();
+    assert_eq!(
+        call(
+            &client,
+            "get_paper_comparison",
+            json!({"session_id": id.as_str()})
+        )
+        .await,
+        before
+    );
+    client.cancel().await.unwrap();
 }

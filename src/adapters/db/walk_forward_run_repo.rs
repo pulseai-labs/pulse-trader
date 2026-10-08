@@ -153,20 +153,19 @@ fn decode_scheme_and_rule(
             )));
         }
     };
-    let rule = match rule_text {
-        "wf-v1" => VerdictRule::WfV1,
-        other => {
-            return Err(DataError::Db(format!(
-                "walk_forward_run `{id_str}` has unknown rule `{other}`"
-            )));
-        }
-    };
+    let rule = VerdictRule::from_name(rule_text).ok_or_else(|| {
+        DataError::Db(format!(
+            "walk_forward_run `{id_str}` has unknown rule `{rule_text}`"
+        ))
+    })?;
     Ok((scheme, rule))
 }
 
 /// The `walk_forward_run` row's `RunVerdict` decode — `pooled.holds` is derived
 /// (`n >= N_MIN && lower_bound > 0`), not a column, so it is recomputed and
-/// round-trips exactly.
+/// round-trips exactly. The pooled bound is the same for both rules (r4.s1.w3:
+/// `wf-v2` differs only in which FOLDS hold, and that tally is a column), so
+/// the recomputation is rule-independent.
 fn decode_run_verdict(
     folds_holding: i64,
     folds_required: i64,
@@ -337,10 +336,12 @@ struct RunRow {
 ///   the taker fee, the slippage, the funding configuration and the starting
 ///   equity agree across folds, so only the window (and its lead-in) differs;
 /// - every fold's verdict IS the verdict of the trades that fold run carries —
-///   its `realized_r` series through `FoldVerdict::from_rs`, the same rule the
-///   app path applies and the read re-derives;
-/// - the run verdict IS `RunVerdict::assess` over those derived fold verdicts
-///   and their pooled `realized_r` series: the fold tallies, the scheme's
+///   its `realized_r` series through the DRAFT'S OWN rule
+///   ([`VerdictRule::assess_fold`]: `wf-v1`'s bound rule or `wf-v2`'s mean rule,
+///   r4.s1.w3), the same rule the app path applies and the read re-derives;
+/// - the run verdict IS the draft's own rule's `assess_run` over those derived
+///   fold verdicts and their pooled `realized_r` series: the fold tallies, the
+///   scheme's
 ///   `⌈2K/3⌉` and the pooled verdict over every fold's trades concatenated in
 ///   fold order (L5).
 ///
@@ -378,18 +379,20 @@ fn validate_scheme(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
 }
 
 /// The fold's verdict DERIVED from the trades its run actually carries (R1), by
-/// the same rule the app path and the read use: every trade's `realized_r`
-/// through [`FoldVerdict::from_rs`]. Cross-checking the caller's `n` and
-/// `lower_bound` against a `holds` flag left the numbers themselves unattested,
-/// so a fold run with ZERO trades could claim `n = 20`, a positive bound and
-/// `holds = true` and be persisted into a certification. Returns the fold's
-/// series with the verdict — the series is what the pooled verdict is assessed
-/// over (L5).
+/// the DRAFT'S OWN rule — the same rule the app path applied and the read
+/// re-derives: every trade's `realized_r` through [`VerdictRule::assess_fold`]
+/// (`wf-v1`'s bound rule or `wf-v2`'s mean rule; r4.s1.w3). Cross-checking the
+/// caller's `n` and `lower_bound` against a `holds` flag left the numbers
+/// themselves unattested, so a fold run with ZERO trades could claim `n = 20`, a
+/// positive bound and `holds = true` and be persisted into a certification.
+/// Returns the fold's series with the verdict — the series is what the pooled
+/// verdict is assessed over (L5).
 fn derive_fold(
+    rule: VerdictRule,
     fold: &crate::domain::backtest::WalkForwardFoldDraft,
 ) -> Result<(Vec<rust_decimal::Decimal>, FoldVerdict), DataError> {
     let rs: Vec<rust_decimal::Decimal> = fold.result.trades.iter().map(|t| t.realized_r).collect();
-    let derived = FoldVerdict::from_rs(&rs);
+    let derived = rule.assess_fold(&rs);
     if derived != fold.verdict {
         return Err(DataError::Db(format!(
             "walk-forward draft refused: fold {} records n={} mean_r={} lower_bound={} holds={} \
@@ -504,7 +507,7 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
             )));
         }
 
-        let (rs, derived) = derive_fold(fold)?;
+        let (rs, derived) = derive_fold(draft.rule, fold)?;
         pooled_rs.extend_from_slice(&rs);
         derived_folds.push(derived);
         cursor = fold.window.to_ms;
@@ -517,11 +520,12 @@ fn validate_draft(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
     }
     // The run verdict is the same kind of derivation, one level up: the fold
     // tallies and the pooled verdict over every fold's trades concatenated in
-    // fold order. `assess` recomputes `folds_holding`, the scheme's
+    // fold order, under the DRAFT'S OWN rule (`assess_run` recomputes
+    // `folds_holding` from the folds that rule assessed, the scheme's
     // `folds_required` for this fold count, `pooled` from the pooled series, and
-    // `pass` from both — so a draft that agrees with its trades at the fold level
-    // cannot disagree with them here.
-    let derived_run = RunVerdict::assess(&derived_folds, &pooled_rs);
+    // `pass` from both) — so a draft that agrees with its trades at the fold
+    // level cannot disagree with them here.
+    let derived_run = draft.rule.assess_run(&derived_folds, &pooled_rs);
     if draft.verdict != derived_run {
         return Err(incoherent(format!(
             "verdict records folds_holding={} folds_required={} pooled(n={}, mean_r={}, \

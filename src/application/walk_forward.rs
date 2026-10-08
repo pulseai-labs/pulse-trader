@@ -27,15 +27,14 @@ use crate::application::backtest::{
     prepare_over_loaded_series,
 };
 use crate::domain::backtest::{
-    CandleWindow, FoldScheme, FoldVerdict, K_DEFAULT, RunSummary, RunVerdict, VerdictRule,
-    WalkForwardError, WalkForwardFoldDraft, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
-    fold_windows,
+    CandleWindow, FoldScheme, K_DEFAULT, RunSummary, RunVerdict, VerdictRule, WalkForwardError,
+    WalkForwardFoldDraft, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId, fold_windows,
 };
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestRunRepository, CandleSeries, CandleSeriesRepository, CompiledStrategy, DataError,
-    ExchangeAdapter, Pair, PreparedBacktest, StrategyRepository, Timeframe, ValidatedDsl,
-    WalkForwardRunRepository, compile, validate,
+    ExchangeAdapter, HoldoutFreeze, Pair, PreparedBacktest, StrategyRepository, Timeframe,
+    ValidatedDsl, WalkForwardRunRepository, compile, validate,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +73,10 @@ pub struct WalkForwardRequest {
     /// in transport decoding. Widened to `i64` for that call below: the domain
     /// keeps the wider comparison so the refusal can name what was sent.
     pub k: Option<i32>,
+    /// The verdict rule (`wf-v1` | `wf-v2`); `None` defaults to
+    /// [`VerdictRule::WfV1`], so every caller that does not name a rule behaves
+    /// exactly as it did before wf-v2 existed (r4.s1.w3).
+    pub rule: Option<VerdictRule>,
 }
 
 /// The use case's answer — built from the saved rows, never the in-memory
@@ -228,6 +231,13 @@ pub(crate) struct WalkForwardBlockingOutput {
 /// explicit `from` earlier than that refuses, field-pathed, and `from >= to`
 /// refuses an empty-by-construction span. Returns the proven `from < to`
 /// window plus whether `from` was defaulted.
+///
+/// `holdout` is the open freeze (r4.s1.w4, Q4/G1): the guard runs here, where
+/// the requested bounds and the snapshot's own end are both known — an explicit
+/// bound into the holdout is refused by name, and a defaulted `to` is clamped
+/// to the holdout start (only when the snapshot's end actually reaches past
+/// it, so a snapshot already inside the search span is left alone).
+#[allow(clippy::too_many_arguments)]
 fn resolve_counted_span(
     compiled: &CompiledStrategy,
     primary: &CandleSeries,
@@ -235,12 +245,27 @@ fn resolve_counted_span(
     d1: Option<&CandleSeries>,
     from_ms: Option<i64>,
     to_ms: Option<i64>,
+    holdout: Option<HoldoutFreeze>,
+    pair: &Pair,
 ) -> Result<(CandleWindow, bool), WalkForwardAppError> {
     let first_warm = first_fully_warm_bar_ms(compiled, primary, htf, d1)
         .ok_or(WalkForwardAppError::NeverWarm)?;
     // The snapshot's real end: the last candle's close, or the first warm bar on
     // a snapshot too short to have one.
     let snapshot_end = primary.candles.last().map_or(first_warm, |c| c.close_time);
+    // r4.s1.w4: the holdout guard, BEFORE the snapshot-end and warm-bar
+    // refusals — a window reaching into the frozen holdout is the campaign's
+    // refusal, and it must not be masked by an unrelated bound error.
+    let clamped_to =
+        match crate::application::holdout::guard_span(holdout, pair, from_ms, to_ms, snapshot_end)
+            .map_err(|refusal| {
+            WalkForwardAppError::Shared(BacktestAppError::HoldoutRefused(refusal))
+        })? {
+            crate::application::holdout::SpanDecision::Pass => None,
+            crate::application::holdout::SpanDecision::ClampToHoldoutStart { holdout_start_ms } => {
+                Some(holdout_start_ms)
+            }
+        };
     // An explicit `to` may not reach PAST that end (R8): every fold would still
     // hold a candle, so the empty-fold check below cannot catch it, and the last
     // fold would run only through the snapshot's real end while the persisted
@@ -256,7 +281,7 @@ fn resolve_counted_span(
             latest_allowed_ms: snapshot_end,
         });
     }
-    let resolved_to = to_ms.unwrap_or(snapshot_end);
+    let resolved_to = to_ms.unwrap_or_else(|| clamped_to.unwrap_or(snapshot_end));
     let (resolved_from, from_defaulted) = match from_ms {
         Some(explicit) => {
             if explicit < first_warm {
@@ -291,8 +316,10 @@ fn resolve_counted_span(
 /// The K fold executions inside the blocking task: each fold gets a FRESH copy
 /// of the whole snapshot (the lead-in cut `prepare_over_loaded_series` makes is
 /// destructive), runs the shared prepare path, and contributes its trades to
-/// the pooled `wf-v1` bound. Asserts all folds share one engine fingerprint.
-/// Returns the shared fingerprint, the fold drafts, and the assessed verdict.
+/// the pooled bound. Each fold's verdict is assessed under `rule`, and the run
+/// verdict is that rule's `assess_run` over those folds. Asserts all folds
+/// share one engine fingerprint. Returns the shared fingerprint, the fold
+/// drafts, and the assessed verdict.
 #[allow(clippy::too_many_arguments)]
 fn execute_folds<E>(
     validated: &ValidatedDsl,
@@ -304,6 +331,7 @@ fn execute_folds<E>(
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
     d1: Option<&CandleSeries>,
+    rule: VerdictRule,
 ) -> Result<(String, Vec<WalkForwardFoldDraft>, RunVerdict), WalkForwardAppError>
 where
     E: ExchangeAdapter,
@@ -346,7 +374,7 @@ where
             .map(|t| t.realized_r)
             .collect();
         pooled_rs.extend_from_slice(&fold_rs);
-        fold_verdicts.push(FoldVerdict::from_rs(&fold_rs));
+        fold_verdicts.push(rule.assess_fold(&fold_rs));
         fold_drafts.push(WalkForwardFoldDraft {
             index: fold_index,
             window: w.clone(),
@@ -360,15 +388,16 @@ where
     Ok((
         fingerprint.unwrap_or_default(),
         fold_drafts,
-        RunVerdict::assess(&fold_verdicts, &pooled_rs),
+        rule.assess_run(&fold_verdicts, &pooled_rs),
     ))
 }
 
 /// The one blocking task's whole body (a13, #201): load the pinned snapshots
 /// once, resolve the counted span (refusing its boundary failures), cut the
 /// folds and refuse an empty one BEFORE any fold runs, then run each fold
-/// through the shared [`prepare_over_loaded_series`] and fold the `wf-v1`
-/// verdict. No I/O beyond the snapshot loads; nothing persists here.
+/// through the shared [`prepare_over_loaded_series`] and fold it into the run
+/// verdict under `rule`. No I/O beyond the snapshot loads; nothing persists
+/// here.
 #[allow(clippy::too_many_arguments)]
 fn run_walk_forward_blocking<C, E>(
     candles: &C,
@@ -383,6 +412,8 @@ fn run_walk_forward_blocking<C, E>(
     from_ms: Option<i64>,
     to_ms: Option<i64>,
     scheme: FoldScheme,
+    rule: VerdictRule,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<WalkForwardBlockingOutput, WalkForwardAppError>
 where
     C: CandleSeriesRepository,
@@ -433,7 +464,10 @@ where
     };
 
     // The counted span: `to` defaults to the snapshot's last candle's
-    // close_time (L3); `from` defaults to the first fully-warm bar.
+    // close_time (L3); `from` defaults to the first fully-warm bar. With a
+    // freeze open, the holdout guard runs inside the resolution (r4.s1.w4):
+    // an explicit bound into the holdout refuses, a defaulted `to` clamps to
+    // the holdout start.
     let (span, from_defaulted) = resolve_counted_span(
         compiled,
         &primary,
@@ -441,6 +475,8 @@ where
         d1.as_ref(),
         from_ms,
         to_ms,
+        holdout,
+        pair,
     )?;
     let folds = fold_windows(&span, scheme.k());
     // Refuse an empty fold BEFORE any fold runs (a6): the counted slice is
@@ -469,11 +505,12 @@ where
         &primary,
         htf.as_ref(),
         d1.as_ref(),
+        rule,
     )?;
     Ok(WalkForwardBlockingOutput {
         draft: WalkForwardRunDraft {
             scheme,
-            rule: VerdictRule::WfV1,
+            rule,
             span,
             from_defaulted,
             engine_fingerprint: fingerprint,
@@ -511,6 +548,13 @@ pub(crate) struct WalkForwardUnpersistedParams {
     pub to_ms: Option<i64>,
     /// The fold scheme the span is cut under.
     pub scheme: FoldScheme,
+    /// The verdict rule the folds and the run are judged under (r4.s1.w3).
+    pub rule: VerdictRule,
+    /// The open freeze's holdout start (r4.s1.w4, Q4): `Some` wires the holdout
+    /// guard into the span resolution (an explicit bound into the holdout is
+    /// refused, a defaulted `to` clamps to the holdout start), `None` leaves
+    /// the span exactly as before.
+    pub holdout: Option<HoldoutFreeze>,
 }
 
 /// The walk-forward computation with NO persistence — the one `spawn_blocking`
@@ -550,6 +594,8 @@ where
             params.from_ms,
             params.to_ms,
             params.scheme,
+            params.rule,
+            params.holdout,
         )
     })
     .await
@@ -560,6 +606,12 @@ where
 
 /// Run one persisted strategy version's walk-forward and answer from the saved
 /// rows.
+///
+/// `holdout` is the open freeze's holdout start (r4.s1.w4, Q4): `Some` wires the
+/// holdout guard into the span resolution (an explicit bound into the holdout is
+/// refused, a defaulted `to` is clamped to the holdout start), `None` — no
+/// freeze open, or an exempt caller (the certify-fixture seed) — leaves every
+/// behaviour byte-identical.
 ///
 /// # Errors
 ///
@@ -572,6 +624,7 @@ pub async fn run_walk_forward<S, C, E, R>(
     exchange: &E,
     runs: &R,
     request: &WalkForwardRequest,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<WalkForwardOutcome, WalkForwardAppError>
 where
     S: StrategyRepository,
@@ -597,6 +650,9 @@ where
     // former private copy of the two checks is gone.
     check_request_shape(&compiled, request.primary_timeframe, request.htf_timeframe)?;
     let scheme = FoldScheme::rolling_oos(request.k.map_or(i64::from(K_DEFAULT), i64::from))?;
+    // The rule the whole run is judged under: an unnamed rule is wf-v1, exactly
+    // what every caller got before wf-v2 existed (r4.s1.w3).
+    let rule = request.rule.unwrap_or(VerdictRule::WfV1);
 
     // ONE blocking task for the snapshot loads, the warm-bar probe, the span
     // resolution, and all K fold runs (a13, #201) — the shared unpersisted
@@ -615,6 +671,8 @@ where
             from_ms: request.from_ms,
             to_ms: request.to_ms,
             scheme,
+            rule,
+            holdout,
         },
     )
     .await?;

@@ -287,6 +287,7 @@ async fn world_with_session_run(choice: SessionRun) -> World {
         &BinanceAdapter::new(),
         &runs,
         &backtest_request(&version.id),
+        None,
     )
     .await
     .expect("the parent backtest runs over the fixture");
@@ -428,6 +429,7 @@ async fn decide(world: &World, action: CoachAction) -> CoachDecisionOutcome {
             session_id: world.session_id.clone(),
             action,
         },
+        None,
     )
     .await
     .expect("the decision resolves")
@@ -596,6 +598,7 @@ async fn standalone_and_fold_runs_persist_the_filters_the_engine_ran_under() {
         from_ms: None,
         to_ms: None,
         k: Some(2),
+        rule: None,
     };
     run_walk_forward(
         &world.strategies(),
@@ -603,6 +606,7 @@ async fn standalone_and_fold_runs_persist_the_filters_the_engine_ran_under() {
         &BinanceAdapter::new(),
         &world.runs(),
         &wf,
+        None,
     )
     .await
     .expect("the walk-forward runs over the fixture");
@@ -647,6 +651,7 @@ async fn the_fixture_run_s_content_hash_is_frozen_at_the_pre_change_value() {
         &BinanceAdapter::new(),
         &world.runs(),
         &backtest_request(&world.version_id),
+        None,
     )
     .await
     .expect("the second cold run executes");
@@ -725,6 +730,7 @@ async fn two_runs_of_one_version_carry_distinguishable_filters() {
         &FixedFiltersExchange(coarse.clone()),
         &world.runs(),
         &backtest_request(&world.version_id),
+        None,
     )
     .await
     .expect("the second run executes under the pinned seam");
@@ -793,6 +799,7 @@ async fn a_corrupt_latest_row_never_blocks_a_new_run() {
         &BinanceAdapter::new(),
         &world.runs(),
         &backtest_request(&world.version_id),
+        None,
     )
     .await
     .expect("the new run executes despite the unreadable priors");
@@ -813,6 +820,7 @@ async fn a_corrupt_latest_row_never_blocks_a_new_run() {
         &BinanceAdapter::new(),
         &world.runs(),
         &backtest_request(&world.version_id),
+        None,
     )
     .await
     .expect("the second new run executes");
@@ -1003,6 +1011,7 @@ async fn list_runs_skips_an_unreadable_row_and_returns_the_readable_ones() {
         &BinanceAdapter::new(),
         &world.runs(),
         &backtest_request(&world.version_id),
+        None,
     )
     .await
     .expect("the second run executes");
@@ -1012,6 +1021,7 @@ async fn list_runs_skips_an_unreadable_row_and_returns_the_readable_ones() {
         &BinanceAdapter::new(),
         &world.runs(),
         &backtest_request(&world.version_id),
+        None,
     )
     .await
     .expect("the third run executes");
@@ -1120,6 +1130,7 @@ async fn list_runs_reports_a_store_failure_instead_of_a_short_catalog() {
         &BinanceAdapter::new(),
         &world.runs(),
         &backtest_request(&world.version_id),
+        None,
     )
     .await
     .expect("the run executes");

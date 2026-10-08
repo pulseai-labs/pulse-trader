@@ -11,6 +11,11 @@
 // `lib.rs` can curate the public surface via the `domain::backtest::` path.
 pub(crate) mod backtest;
 mod candle;
+// r4.s1.w5 (G7, C1, C4, C5): the certification record's value types — the
+// immutable `certification` row, the draft the step writes, and the step's
+// typed refusals. Pure + zero-I/O; the SQLite store is
+// `adapters::db::certification_repo`.
+pub(crate) mod certification;
 mod clock;
 // r1.s2.w2 (ADR-0021): the coaching session domain — never-silence outcomes, the
 // typed failure taxonomy, and the disposition state machine. Pure + zero-I/O; the
@@ -28,6 +33,10 @@ mod error;
 // `PULSE_TARGET_TRIPLE`) plus the FR-7 `compare()` warning mechanism (built but
 // unwired this slice — VS-1.2.4 surfaces it).
 mod fingerprint;
+// r4.s1.w4 (F1, C4): the certification-freeze value types — the freeze record,
+// its store's typed refusals, and the holdout guard's view of an open freeze.
+// Pure + zero-I/O; the SQLite store is `adapters::db::certification_freeze_repo`.
+mod freeze;
 // r1.s4.w4: the `IdSource` port — "a fresh opaque row id" as an injected
 // dependency, so the coach accept's transaction-minted child/run ids are
 // deterministic under test the way `Clock` made `created_at` deterministic.
@@ -105,12 +114,25 @@ pub use backtest::{
 // Re-exported so `lib.rs` can curate the crate surface — an un-re-exported
 // public domain type is a `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{
-    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
-    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
-    WalkForwardRunDraft, WalkForwardRunId, Z, fold_windows, folds_required,
+    FoldScheme, FoldVerdict, HOLDOUT_ALPHA, HoldoutVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN,
+    RunVerdict, VerdictRule, WalkForwardError, WalkForwardFold, WalkForwardFoldDraft,
+    WalkForwardMembership, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId, Z, fold_windows,
+    folds_required, holdout_test,
 };
 pub use candle::Candle;
 pub use clock::Clock;
+// r4.s1.w4 (F1, C4): the certification-freeze surface. Re-exported so `lib.rs`
+// can curate the crate surface — an un-re-exported public domain type is a
+// `dead_code` BUILD error under `deny(warnings)`.
+pub use freeze::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeRequest};
+// r4.s1.w5 (G7, C1, C4, C5): the certification record's surface — the row, its
+// draft and the refusal vocabulary. Re-exported so `lib.rs` can curate the
+// crate surface — an un-re-exported public domain type is a `dead_code` BUILD
+// error under `deny(warnings)`. (The step's error enum lives in
+// `application::certification`, close R2: it carries application-ring errors.)
+pub use certification::{
+    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
+};
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
 // concrete indicator adapter implements and the backtester reads through.
 pub use dsl::{
@@ -185,9 +207,10 @@ pub use paper::{ComparisonVerdict, OosComparison, comparison};
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
-    BacktestRunRepository, CandleSeriesRepository, ClosedBarSource, CoachAcceptanceRepository,
-    CoachingRepository, ExchangeAdapter, FixtureSnapshotStore, LlmCallRepository, LlmProvider,
-    MarketDataSource, PaperSessionRepository, StrategyRepository, WalkForwardRunRepository,
+    BacktestRunRepository, CandleSeriesRepository, CertificationRepository, ClosedBarSource,
+    CoachAcceptanceRepository, CoachingRepository, ExchangeAdapter, FixtureSnapshotStore,
+    LlmCallRepository, LlmProvider, MarketDataSource, PaperSessionRepository, StrategyRepository,
+    WalkForwardRunRepository,
 };
 // r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
 // live in `port` like every other port and are re-exported `pub(crate)` rather than

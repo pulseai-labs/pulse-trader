@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO certification_freeze (id, holdout_start_ms, h, alpha, holdout_test, opened_at_ms, closed_at_ms) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "3cae7312c586d75e3df1bf8df6c00fc81db7182b19573af2454375bb779694f8"
+}

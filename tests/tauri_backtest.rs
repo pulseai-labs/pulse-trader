@@ -359,6 +359,7 @@ async fn an_htf_child_inheriting_an_m15_only_run_runs_on_the_default_h4() {
         &pulse::BinanceAdapter::new(),
         &state.backtest_run_repo(),
         &parent_request,
+        None,
     )
     .await
     .expect("the M15-only parent run succeeds");
@@ -770,6 +771,7 @@ async fn run_with_failure(env: &Env, version_id: &VersionId, fail: FailAt) -> Ba
         &pulse::BinanceAdapter::new(),
         &runs,
         &r1_request(version_id),
+        None,
     )
     .await
     .expect_err("the injected failure must surface")
@@ -878,6 +880,7 @@ async fn a_pre_save_failure_has_no_run_id() {
             &pulse::BinanceAdapter::new(),
             &runs,
             &req,
+            None,
         )
         .await
         .expect_err("an unknown version id is an error")
@@ -1055,6 +1058,7 @@ async fn a_windowed_runs_read_back_is_sliced_to_the_persisted_window() {
         &pulse::BinanceAdapter::new(),
         &runs,
         &request,
+        None,
     )
     .await
     .expect("the windowed run succeeds");
@@ -1141,6 +1145,7 @@ async fn a_window_ending_mid_hold_does_not_fabricate_an_end_of_data_trade() {
         &pulse::BinanceAdapter::new(),
         &runs,
         &r1_request(&version_id),
+        None,
     )
     .await
     .expect("the unwindowed run succeeds");
@@ -1181,6 +1186,7 @@ async fn a_window_ending_mid_hold_does_not_fabricate_an_end_of_data_trade() {
         &pulse::BinanceAdapter::new(),
         &runs,
         &request,
+        None,
     )
     .await
     .expect("the windowed run succeeds");
@@ -1353,6 +1359,7 @@ async fn candle_and_engine_work_runs_off_the_calling_worker_thread() {
         &pulse::BinanceAdapter::new(),
         &runs,
         &r1_request(&version_id),
+        None,
     )
     .await
     .expect("run succeeds");

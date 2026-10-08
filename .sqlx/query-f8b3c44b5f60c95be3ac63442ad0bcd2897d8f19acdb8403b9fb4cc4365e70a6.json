@@ -1,0 +1,140 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 certification.id           AS \"id!: String\",\n                 version_id                 AS \"version_id!: String\",\n                 freeze_id                  AS \"freeze_id!: String\",\n                 hypothesis_index           AS \"hypothesis_index!: i64\",\n                 rule                       AS \"rule!: String\",\n                 pair                       AS \"pair!: String\",\n                 search_walk_forward_run_id AS \"search_walk_forward_run_id!: String\",\n                 search_pass                AS \"search_pass!: i64\",\n                 certification.holdout_start_ms AS \"holdout_start_ms!: i64\",\n                 holdout_end_ms             AS \"holdout_end_ms!: i64\",\n                 holdout_n                  AS \"holdout_n!: i64\",\n                 holdout_mean_r             AS \"holdout_mean_r!: String\",\n                 holdout_z                  AS \"holdout_z!: f64\",\n                 holdout_lower_bound        AS \"holdout_lower_bound!: f64\",\n                 holdout_passes             AS \"holdout_passes!: i64\",\n                 certified                  AS \"certified!: i64\",\n                 search_inputs              AS \"search_inputs!: String\",\n                 holdout_inputs             AS \"holdout_inputs!: String\",\n                 engine_fingerprint         AS \"engine_fingerprint!: String\",\n                 created_at                 AS \"created_at!: String\",\n                 called_by                  AS \"called_by!: String\"\n               FROM certification\n               JOIN certification_freeze ON certification_freeze.id = certification.freeze_id\n               WHERE version_id = ?1\n               ORDER BY certification_freeze.opened_at_ms DESC, hypothesis_index DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "version_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "freeze_id!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "hypothesis_index!: i64",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "rule!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "pair!: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "search_walk_forward_run_id!: String",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "search_pass!: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "holdout_start_ms!: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "holdout_end_ms!: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "holdout_n!: i64",
+        "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "holdout_mean_r!: String",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "holdout_z!: f64",
+        "ordinal": 12,
+        "type_info": "Float"
+      },
+      {
+        "name": "holdout_lower_bound!: f64",
+        "ordinal": 13,
+        "type_info": "Float"
+      },
+      {
+        "name": "holdout_passes!: i64",
+        "ordinal": 14,
+        "type_info": "Integer"
+      },
+      {
+        "name": "certified!: i64",
+        "ordinal": 15,
+        "type_info": "Integer"
+      },
+      {
+        "name": "search_inputs!: String",
+        "ordinal": 16,
+        "type_info": "Text"
+      },
+      {
+        "name": "holdout_inputs!: String",
+        "ordinal": 17,
+        "type_info": "Text"
+      },
+      {
+        "name": "engine_fingerprint!: String",
+        "ordinal": 18,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: String",
+        "ordinal": 19,
+        "type_info": "Text"
+      },
+      {
+        "name": "called_by!: String",
+        "ordinal": 20,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f8b3c44b5f60c95be3ac63442ad0bcd2897d8f19acdb8403b9fb4cc4365e70a6"
+}

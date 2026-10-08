@@ -6,7 +6,106 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The certification step: one hypothesis, one holdout, one immutable record, and `certify_version`
+  (r4.s1.w5).** While a freeze is open, certifying a version walks it forward under `wf-v2` on the
+  search span — the guard clamps the span's end to the holdout start — runs ONE backtest over the
+  holdout (never persisted: no run read may surface holdout trades) and applies the C1 holdout test
+  at the freeze's H, then writes one immutable `certification` record (migration `0020`) whatever the
+  outcome: the search verdict, the pair, the per-timeframe data versions, the holdout's window, trade
+  count, mean and bound, the engine fingerprint and the calling client's label. The record is
+  immutable by trigger, and the write transaction refuses a call that would take the freeze past its
+  H hypotheses (the unique `(freeze_id, hypothesis_index)` index and a new budget trigger hold the
+  same law in the schema), so two overlapping calls cannot overrun the budget; a refused or errored
+  call writes nothing. The step refuses typed and by name — no open freeze, a
+  lineage root created before the freeze (C4), and the (H+1)th hypothesis — and MCP gains
+  `certify_version` (agent scope): one call is one hypothesis, and the answer carries the
+  certification's id, its pass/fail, the search-span verdict, `holdout_passed` and the hypotheses
+  used and left — **no holdout number** (grill Q5). The app reads the full record through a new
+  `app`-scope `certification_records` route, one row per record in the version detail view. A
+  version's `certified` flag and paper promotion now read the record: a `wf-v2` search-span pass
+  certifies and promotes nothing by itself — the `wf-v1` path, the override path and paper sessions
+  are unchanged.
+
+- **The holdout the tools enforce: the certification freeze, its guard, #327's echo, and the
+  archive-hole fill (r4.s1.w4).** `pulse certify freeze --holdout-start <YYYY-MM-DD> --h <N>
+  --alpha <decimal> --test <name>` opens ONE immutable freeze record (migration `0019`:
+  `certification_freeze`, immutable by trigger, at most one open, a new holdout strictly after
+  the last close — a spent holdout is never reused), `pulse certify close-freeze` closes it once,
+  and `pulse certify status` prints the open freeze or `no open freeze`. While a freeze is open,
+  ONE application-layer guard covers every entry point (MCP `run_backtest`/`run_walk_forward`,
+  the app's backtest and walk-forward, the coach's certification gate, and `pulse backtest`): a
+  window reaching into the holdout is refused by name — the pair and the holdout start — and a
+  defaulted end is clamped to the holdout start (the app and CLI's whole-snapshot runs stop
+  there, and the run records the clamped window). MCP `export_candles`/`export_indicators` return
+  only candles before the holdout start and say how many rows were withheld (the parquet byte
+  copy is refused while a freeze is open: it cannot be cut). Every MCP run result now echoes its
+  effective window under `effective_window` (`from` inclusive, `to` exclusive, per-bound
+  `defaulted`/`clamped`) — #327's settled echo — and both run-tool descriptions state the
+  exclusive bound. `pulse fetch-data` fills interior archive holes (the SOLUSDT/XRPUSDT
+  2022-02/2022-04 gaps) from the REST klines endpoint through the bounded incremental path —
+  funding included, one new snapshot, the prior file kept — and the summary reports
+  `filled_candle_count` beside the `gap_count` that remains. The certification step, the
+  certify-fixture seed and paper sessions are exempt by name (grill Q4). Refs
+  [#327](https://github.com/pulseai-labs/pulse-trader/issues/327).
+
+- **Four pairs, a start date for `fetch-data`, and pair-validated runs (r4.s1.w2).** ETHUSDT,
+  SOLUSDT and XRPUSDT now fetch, backtest and walk forward exactly as BTCUSDT does: the broker
+  adapter pins each pair's dated USD-M filters (`LOT_SIZE.stepSize`/`minQty`, `MIN_NOTIONAL`, the
+  top leverage tier) and its 8h funding interval beside BTCUSDT's unchanged values; the MCP
+  `run_backtest` and `run_walk_forward` tools take an optional `pair` argument (omitted = today's
+  inheritance; an unknown pair is refused naming `pair`; a known pair with no `HEAD` snapshot is
+  refused naming the pair and the timeframe); and `pulse fetch-data` takes
+  `--from <YYYY-MM-DD>` (UTC, floored to the first of its month, mutually exclusive with
+  `--years`). A `--from` earlier than the snapshot's first candle backfills the missing earlier
+  months through the same bulk + checksum path, tops up to now and commits ONE new snapshot — a
+  new `data_version` with `HEAD` moved and the prior file kept — reported as the `backfill`
+  action. `save_run` validates `inputs.pair` before writing (#148), so a path-hostile symbol can
+  no longer mint an unreadable run row, and the CLI's unknown-pair refusal is covered by a test
+  (#52). The engine fingerprint changes with the broker table, as expected. Refs
+  [#148](https://github.com/pulseai-labs/pulse-trader/issues/148),
+  [#52](https://github.com/pulseai-labs/pulse-trader/issues/52).
+
+- **`wf-v2`, the C1 holdout test, and the frozen hypothesis budget (r4.s1.w3).** The walk-forward
+  gains a second named verdict rule beside the byte-identical `wf-v1`: **`wf-v2`** holds a fold on
+  a positive mean expectancy (`n >= 20`) instead of a positive lower bound, and keeps `wf-v1`'s
+  `⌈2K/3⌉` holding-fold requirement and pooled one-sided 95% bound. The rule is request-selectable
+  — the MCP `run_walk_forward` tool takes an optional `rule` argument (`wf-v1` by default; an
+  unknown value is refused naming `rule`), the store decoder accepts `wf-v2`, the save gate
+  re-derives every fold and the run verdict under the draft's own rule, and the coach's
+  certification gate re-runs a candidate under the parent's own rule. A new domain function
+  `holdout_test` implements the **C1 holdout test** — the one-sided lower confidence bound of a
+  holdout's expectancy at a family-wise 5% split over the hypothesis budget, `z = z(1 − 0.05/H)` —
+  with its power measured over seeds 1..=1000. `tests/wf_v2_calibration.rs` calibrates the rule (a
+  planted +0.25R edge passes on at least 19 of 20 seeds, a zero-edge series on at most 4, with the
+  exact counts pinned) and `tests/wf_v2_measurement.rs` re-derives ADR-0028's frozen α, power,
+  real-path-null and runtime numbers on demand. **ADR-0028** freezes the rule, the C1 test, the
+  holdout start (2025-07-01, all four pairs) and **H = 12**.
+
 ### Changed
+
+- **Engine-sensitive dependency bumps: `polars` 0.54.4, `zip` 8.6.0, `rust_decimal` 1.42.1.** The
+  three pins move together under the determinism gate: the determinism lanes, the golden fixture
+  and every `data_version` stay identical, and the engine fingerprint moves (it hashes
+  `Cargo.lock`, which is expected). `polars` 0.54.4 requires `chrono ^0.4.42` where 0.53 pinned
+  `<=0.4.41`, so `chrono` 0.4.41 → 0.4.45 rides along; `ta`, `sqlx` and every other direct pin are
+  unchanged. Refs [#59](https://github.com/pulseai-labs/pulse-trader/issues/59),
+  [#60](https://github.com/pulseai-labs/pulse-trader/issues/60),
+  [#61](https://github.com/pulseai-labs/pulse-trader/issues/61).
+
+- **The lockfile guard is a script CI runs.** `scripts/check-lockfile-guard.sh` checks
+  `build_support/lockfile-guard.txt` against `Cargo.lock` and fails — naming the crate — when a
+  listed crate's version differs, the crate appears twice, or it is missing. A bump of a guarded
+  crate (`polars` + `polars-*`, `rust_decimal`, `ta`, `zip`, `sqlx` + `sqlx-*`) now takes a visible
+  edit of the guard file.
+
+- **A snapshot re-write after a writer-version change is idempotent again**
+  ([#5](https://github.com/pulseai-labs/pulse-trader/issues/5)). `CandleStore::write_snapshot`
+  reconciles a re-write against the file at the same content-addressed path by comparing the
+  decoded candles and provenance instead of a byte image that carried the writer's `created_by`
+  string, so a snapshot written by a different Polars version no longer wrongly returns
+  `SnapshotExists`; a same-path file holding different candles is still refused.
 
 - **Safe dependency bumps (r4 chore).** GitHub Actions: `actions/checkout` 7.0.1, `cargo-deny-action` 2.1.1, `install-action` 2.86.8, `upload-artifact` 7.0.1, `download-artifact` 8.0.1. Cargo: `uuid` 1.24.0, `anyhow` 1.0.104, `quinn-proto` 0.11.17 (security). UI dev tooling: `vitest` ^5.0.0 (`vite` stays on ^6.4; the vite 8 move is deferred to r4.s5), plus lockfile-only `undici` 8.11.2 and `source-map-js` 1.2.2. Cargo also takes `xxhash-rust` 0.8.16. Together these clear 13 of the 14 open Dependabot alerts; `glib` (GTK/tauri stack) stays open. No product version bump; `rust_decimal`, `ta`, `polars` and `zip` are unchanged.
 

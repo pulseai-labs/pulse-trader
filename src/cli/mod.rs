@@ -11,6 +11,9 @@
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
 pub(crate) mod backtest;
+// r4.s1.w4 (F1/C4): `pulse certify freeze` / `close-freeze` / `status` — the
+// operator's local freeze administration on the server host, like `pulse token`.
+pub(crate) mod certify;
 // r3.s3.w4 (D12, ADR-0026): `pulse backup` / `pulse restore` — the online
 // backup + the verified restore (restore reuses import's engine).
 pub(crate) mod backup;
@@ -54,9 +57,12 @@ use crate::domain::{CandleSeriesRepository, Pair, Timeframe};
 
 use backtest::{BacktestArgs, run_backtest_cli};
 use backup::{BackupArgs, RestoreArgs, run_backup, run_restore};
+use certify::{CertifyArgs, run_certify};
 use coach::{CoachArgs, run_coach};
 use compose::{ComposeArgs, run_compose};
-use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
+use fetch_data::{
+    TfOutcome, TfSummary, ensure_one_tf, from_window_start_ms, years_window_start_ms,
+};
 use import::{ImportArgs, run_import};
 use indicators::{IndicatorsArgs, run_indicators};
 use llm::{LlmArgs, run_llm_check};
@@ -110,6 +116,11 @@ pub enum Command {
     /// local administration on the server host. `issue` prints the token once
     /// on stdout; everything else goes to stderr.
     Token(TokenArgs),
+    /// Open / close / inspect the certification freeze (r4.s1.w4, F1/C4) —
+    /// the operator's local freeze administration on the server host. The
+    /// freeze record is what the holdout guard reads: while one is open, every
+    /// run and export stops at its holdout start.
+    Certify(CertifyArgs),
     /// Run the always-on server (r3.s3.w1, ADR-0026): bind the tailnet
     /// address (the D6 policy — or loopback under `--dev-loopback`), then
     /// serve `/api/v1` until SIGTERM/SIGINT. One stderr line per request and
@@ -137,7 +148,7 @@ pub enum Command {
     Restore(RestoreArgs),
 }
 
-/// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
+/// `pulse fetch-data <PAIR> --tf <M15,H4> (--years <N> | --from <YYYY-MM-DD>) [--json]`.
 #[derive(Debug, clap::Args)]
 pub struct FetchArgs {
     /// The trading pair symbol (e.g. `BTCUSDT`).
@@ -146,8 +157,15 @@ pub struct FetchArgs {
     #[arg(long, value_delimiter = ',')]
     pub tf: Vec<String>,
     /// Years of history to fetch (floored to the start of the month N years back, UTC).
-    #[arg(long)]
-    pub years: u32,
+    /// Mutually exclusive with `--from`; exactly one of the two is required.
+    #[arg(long, conflicts_with = "from", required_unless_present = "from")]
+    pub years: Option<u32>,
+    /// Start date `YYYY-MM-DD` (UTC), floored to the first day of its month —
+    /// the bulk archive's granularity. A start earlier than `HEAD`'s first
+    /// candle backfills the missing earlier months into one new snapshot.
+    /// Mutually exclusive with `--years`; exactly one of the two is required.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub from: Option<String>,
     /// Emit the per-tf summary as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,
@@ -247,6 +265,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // r3.s3.w1: the token administration arm. The migrated-db open is the
         // same migrate-then-open every other DB-using arm uses.
         Command::Token(args) => run_token(&args).await,
+        // r4.s1.w4 (F1/C4): the freeze administration arm — the same
+        // migrate-then-open every other DB-using arm uses.
+        Command::Certify(args) => run_certify(&args).await,
         // r3.s4.w2 (E4): the certify-fixture seed arm — the migrated-db open
         // is the same migrate-then-open every other DB-using arm uses.
         Command::Fixture(args) => match args.command {
@@ -307,7 +328,7 @@ pub async fn run_fetch_data<S, C, R>(
     args: &FetchArgs,
 ) -> anyhow::Result<()>
 where
-    S: crate::domain::MarketDataSource,
+    S: crate::domain::MarketDataSource + Sync,
     C: crate::domain::Clock,
     R: CandleSeriesRepository,
 {
@@ -316,14 +337,27 @@ where
     // `../`, `/abs`, or `a/b` would escape/relocate the store root).
     let pair = Pair::parse(args.pair.clone())
         .map_err(|e| anyhow::anyhow!("invalid pair argument: {e}"))?;
-    validate_years(args.years)?;
+    // Exactly one of `--years` / `--from` (clap enforces it for the binary;
+    // this is the library-caller guard), resolved ONCE into the shared start
+    // epoch-ms the per-tf orchestration takes (r4.s1.w2).
+    let start_ms = match (args.from.as_deref(), args.years) {
+        (Some(raw), None) => from_window_start_ms(raw).map_err(|e| anyhow::anyhow!("{e}"))?,
+        (None, Some(years)) => {
+            validate_years(years)?;
+            years_window_start_ms(clock.now_ms(), years)
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--years and --from are mutually exclusive; pass exactly one")
+        }
+        (None, None) => anyhow::bail!("exactly one of --years or --from is required"),
+    };
     let timeframes = parse_timeframes(&args.tf)?;
 
     let mut summaries: Vec<TfSummary> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for tf in timeframes {
-        match ensure_one_tf(source, repo, clock, &pair, tf, args.years).await {
+        match ensure_one_tf(source, repo, clock, &pair, tf, start_ms).await {
             TfOutcome::Ok(summary) => summaries.push(summary),
             TfOutcome::Failed { timeframe, error } => failures.push((timeframe, error)),
         }
@@ -437,8 +471,15 @@ fn render(summaries: &[TfSummary], failures: &[(String, String)], json: bool) {
         let bold = ansi_emphasis();
         let reset = if bold.is_empty() { "" } else { "\x1b[0m" };
         for summary in summaries {
+            // The filled count is appended only when the run filled something,
+            // so every pre-w4 line stays byte-identical (r4.s1.w4).
+            let filled = if summary.filled_candle_count > 0 {
+                format!(", {} filled", summary.filled_candle_count)
+            } else {
+                String::new()
+            };
             println!(
-                "{bold}{} {}{reset}: {} ({} candles, {} gaps) -> {}",
+                "{bold}{} {}{reset}: {} ({} candles, {} gaps{filled}) -> {}",
                 summary.pair,
                 summary.timeframe,
                 summary.action,
@@ -524,8 +565,50 @@ mod tests {
         };
         assert_eq!(args.pair, "BTCUSDT");
         assert_eq!(args.tf, vec!["M15".to_string(), "H4".to_string()]);
-        assert_eq!(args.years, 1);
+        assert_eq!(args.years, Some(1));
+        assert_eq!(args.from, None);
         assert!(!args.json);
+    }
+
+    /// r4.s1.w2: `--from` alone parses; `--years` + `--from` refuses, and
+    /// neither refuses — exactly one of the two is required.
+    #[test]
+    fn parses_fetch_data_with_from_and_requires_exactly_one_window() {
+        let cli = Cli::try_parse_from([
+            "pulse",
+            "fetch-data",
+            "BTCUSDT",
+            "--tf",
+            "M15",
+            "--from",
+            "2021-01-01",
+        ])
+        .expect("parse --from");
+        let super::Command::FetchData(args) = cli.command else {
+            panic!("expected fetch-data command");
+        };
+        assert_eq!(args.from.as_deref(), Some("2021-01-01"));
+        assert_eq!(args.years, None, "--from replaces --years");
+
+        assert!(
+            Cli::try_parse_from([
+                "pulse",
+                "fetch-data",
+                "BTCUSDT",
+                "--tf",
+                "M15",
+                "--years",
+                "1",
+                "--from",
+                "2021-01-01",
+            ])
+            .is_err(),
+            "--years and --from are mutually exclusive"
+        );
+        assert!(
+            Cli::try_parse_from(["pulse", "fetch-data", "BTCUSDT", "--tf", "M15"]).is_err(),
+            "exactly one of --years / --from is required"
+        );
     }
 
     #[test]

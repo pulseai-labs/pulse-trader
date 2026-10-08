@@ -24,406 +24,20 @@
 //!      walk-forward may have advanced it since the accept.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod coach_gate_support;
 mod coach_support;
 mod support;
 
+use coach_gate_support::*;
+use support::mcp::{seeded_trade, seeded_walk_forward_draft};
+
 use pulse::{
-    AcceptFailureStage, BacktestConfig, BacktestInputs, BacktestRequest, BacktestResult,
-    BinanceAdapter, CandleStore, CandleWindow, CoachAcceptanceRepository, CoachAction,
-    CoachDecisionOutcome, CoachDecisionRequest, CoachRequestFingerprint, CoachSessionClaim,
-    CoachingRepository, CoachingSessionId, CreatedBy, Disposition, EngineFingerprint, EquityCurve,
-    FakeClock, FoldScheme, FoldVerdict, Hypothesis, InitialCoachOutcome, LlmCallId, MIGRATOR,
-    Mutation, NewVersion, Pair, ParamValue, PreparedBacktest, PreparedCoachAcceptance, Proposal,
-    RegimeBreakdown, RunVerdict, SeqIdSource, SessionOutcome, SkippedEntryCounts,
-    SqliteBacktestRunRepo, SqliteCoachAcceptanceRepo, SqliteCoachingRepo, SqliteStrategyRepo,
-    StrategyRepository, SummaryStats, Timeframe, VerdictRule, VersionId, WalkForwardFoldDraft,
-    WalkForwardRunDraft, WalkForwardRunRepository, fold_windows, run_coach_decision,
-    run_version_backtest,
+    AcceptFailureStage, BacktestResult, CoachAcceptanceRepository, CoachAction,
+    CoachDecisionOutcome, Disposition, EngineFingerprint, EquityCurve, FakeClock, PreparedBacktest,
+    PreparedCoachAcceptance, RegimeBreakdown, SkippedEntryCounts, SqliteBacktestRunRepo,
+    SummaryStats, VerdictRule, WalkForwardRunRepository,
 };
 use rust_decimal::Decimal;
-use sqlx::SqlitePool;
-use support::mcp::{
-    FIXTURE_STORE, copy_tree, manifest, seeded_fold_trades, seeded_trade, seeded_walk_forward_draft,
-};
-use tempfile::TempDir;
-
-/// A pinned instant, so `created_at` is deterministic everywhere.
-const NOW_MS: i64 = 1_756_425_600_000; // 2026-08-29T00:00:00Z
-
-/// The certifying run's timestamp — the pointer orders on `seq` alone, so
-/// this is a later SAVE, not merely a later instant.
-const CERTIFY_MS: i64 = 1_756_512_000_000; // 2026-08-30T00:00:00Z
-
-/// The one-and-only request fingerprint the fixture session claims under.
-const FINGERPRINT: &str = "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899";
-
-/// The sweepable leaf every fixture mutation addresses.
-const RSI_PERIOD: &str = "entry.lhs.indicator.rsi.period";
-
-/// The same minimal, valid DSL `coach_decision.rs` uses — it produces real
-/// trades over the fixture, so the parent run is a genuine one.
-const MINIMAL_DSL: &str = r#"{
-  "schema_version": "1.0.0",
-  "name": "RSI Oversold (gate)",
-  "direction": "long",
-  "entry": {
-    "type": "Compare",
-    "lhs": { "type": "Indicator", "spec": { "indicator": "Rsi", "period": 14 } },
-    "op": "Lt",
-    "rhs": { "type": "Constant", "value": "30" }
-  },
-  "filters": [],
-  "exits": [
-    { "type": "StopLoss", "distance_pct": "0.05" },
-    { "type": "TakeProfit", "target_r": "2" }
-  ],
-  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
-}"#;
-
-// ---------------------------------------------------------------------------
-// The fixture world (the coach_decision.rs shape)
-// ---------------------------------------------------------------------------
-
-struct World {
-    _tmp: TempDir,
-    db: pulse::Db,
-    store: CandleStore,
-    version_id: VersionId,
-    parent_inputs: BacktestInputs,
-    session_id: CoachingSessionId,
-}
-
-impl World {
-    fn pool(&self) -> &SqlitePool {
-        self.db.pool()
-    }
-
-    fn strategies(&self) -> SqliteStrategyRepo<pulse::SystemClock> {
-        SqliteStrategyRepo::new(self.pool().clone())
-    }
-
-    fn runs(&self) -> SqliteBacktestRunRepo<pulse::SystemClock> {
-        SqliteBacktestRunRepo::new(self.pool().clone())
-    }
-
-    fn sessions(&self) -> SqliteCoachingRepo<FakeClock> {
-        SqliteCoachingRepo::with_deps(self.pool().clone(), FakeClock::at(NOW_MS))
-    }
-
-    fn acceptance(&self) -> SqliteCoachAcceptanceRepo<FakeClock, SeqIdSource> {
-        SqliteCoachAcceptanceRepo::with_deps(
-            self.pool().clone(),
-            FakeClock::at(NOW_MS),
-            SeqIdSource::with_prefix("minted"),
-        )
-    }
-
-    async fn proposal(&self) -> Proposal {
-        match self
-            .sessions()
-            .get_session(&self.session_id)
-            .await
-            .expect("read the session")
-            .expect("the session exists")
-            .outcome
-        {
-            SessionOutcome::Proposed { proposal } => proposal,
-            other => panic!("expected a proposal turn, got {other:?}"),
-        }
-    }
-
-    async fn table_count(&self, table: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(self.pool())
-            .await
-            .unwrap()
-    }
-
-    /// The version's persisted certification pair `(certified, pointer)`.
-    async fn certification(&self, version: &VersionId) -> (bool, Option<String>) {
-        let row: (Option<String>, Option<i64>) = sqlx::query_as(
-            "SELECT v.latest_walk_forward_run_id, w.pass \
-             FROM strategy_version v \
-             LEFT JOIN walk_forward_run w ON w.id = v.latest_walk_forward_run_id \
-             WHERE v.id = ?1",
-        )
-        .bind(version.as_str())
-        .fetch_one(self.pool())
-        .await
-        .expect("the version row reads");
-        (row.1.unwrap_or(0) != 0, row.0)
-    }
-}
-
-async fn world() -> World {
-    let tmp = TempDir::new().unwrap();
-    let db = pulse::Db::with_path(&tmp.path().join("pulse.db"))
-        .await
-        .unwrap();
-    MIGRATOR.run(db.pool()).await.expect("run the shipped set");
-
-    let strategies = SqliteStrategyRepo::new(db.pool().clone());
-    let strategy = strategies
-        .create_strategy("RSI Oversold", None, &[])
-        .await
-        .expect("create strategy");
-    let version = strategies
-        .create_version(NewVersion {
-            strategy_id: strategy.id.clone(),
-            parent_version_id: None,
-            dsl_json: MINIMAL_DSL.to_owned(),
-            created_by: CreatedBy::Human,
-            creating_llm_call_ids: vec![],
-        })
-        .await
-        .expect("create version");
-
-    // The fixture store is COPIED so these tests own a writable snapshot set.
-    let store_dir = tmp.path().join("candles");
-    copy_tree(&manifest(FIXTURE_STORE), &store_dir);
-    let store = CandleStore::with_base_dir(store_dir);
-    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
-
-    // A REAL parent run: its persisted inputs name real data versions, which is
-    // what lets the gate's snapshot pins resolve.
-    let outcome = run_version_backtest(
-        &strategies,
-        &store,
-        &BinanceAdapter::new(),
-        &runs,
-        &BacktestRequest {
-            version_id: version.id.clone(),
-            pair: Pair::new("BTCUSDT"),
-            primary_timeframe: Timeframe::M15,
-            htf_timeframe: Some(Timeframe::H4),
-            config: BacktestConfig::default(),
-            snapshots: None,
-            window: None,
-        },
-    )
-    .await
-    .expect("the parent backtest runs over the fixture");
-
-    seed_llm_call(db.pool()).await;
-    let session_id = seed_proposed_session(
-        db.pool(),
-        &outcome.run.id,
-        &version.id,
-        proposed_mutation(21),
-    )
-    .await;
-
-    World {
-        _tmp: tmp,
-        db,
-        store,
-        version_id: version.id,
-        parent_inputs: outcome.inputs.clone(),
-        session_id,
-    }
-}
-
-async fn seed_llm_call(pool: &SqlitePool) {
-    sqlx::query(
-        "INSERT INTO llm_call \
-         (id, backend, model, prompt_messages, completion, input_tokens, output_tokens, cost, \
-          cost_currency, created_at, created_by, schema_version) \
-         VALUES ('call-1', 'ollama', 'glm-5.3-flash', '[]', NULL, 1, 1, '0', 'CNY', \
-                 '2026-08-29T00:00:00.000Z', 'coach_llm', 1)",
-    )
-    .execute(pool)
-    .await
-    .expect("seed llm_call");
-}
-
-async fn seed_proposed_session(
-    pool: &SqlitePool,
-    run_id: &pulse::BacktestRunId,
-    version_id: &VersionId,
-    mutation: Mutation,
-) -> CoachingSessionId {
-    let repo = SqliteCoachingRepo::with_deps(pool.clone(), FakeClock::at(NOW_MS));
-    let id = CoachingSessionId::new("sess-1");
-    repo.claim_session(CoachSessionClaim {
-        session_id: id.clone(),
-        backtest_run_id: run_id.clone(),
-        strategy_version_id: version_id.clone(),
-        request_fingerprint: CoachRequestFingerprint::new(FINGERPRINT).unwrap(),
-        created_at: "2026-08-29T00:00:00.000Z".to_owned(),
-    })
-    .await
-    .expect("claim the session");
-    repo.finish_session(
-        &id,
-        InitialCoachOutcome {
-            llm_call_id: Some(LlmCallId::new("call-1")),
-            outcome: SessionOutcome::Proposed {
-                proposal: Proposal {
-                    mutation,
-                    hypothesis: Hypothesis::new("a slower RSI trades less often").unwrap(),
-                    disposition: Disposition::Proposed,
-                    accept_failure: None,
-                },
-            },
-        },
-    )
-    .await
-    .expect("settle the claim");
-    id
-}
-
-fn proposed_mutation(period: u32) -> Mutation {
-    Mutation::SetParam {
-        path: RSI_PERIOD.to_owned(),
-        new_value: ParamValue::Period { value: period },
-    }
-}
-
-async fn decide(world: &World, action: CoachAction) -> CoachDecisionOutcome {
-    run_coach_decision(
-        &world.strategies(),
-        &world.store,
-        &BinanceAdapter::new(),
-        &world.runs(),
-        &world.acceptance(),
-        &world.sessions(),
-        CoachDecisionRequest {
-            session_id: world.session_id.clone(),
-            action,
-        },
-    )
-    .await
-    .expect("the decision resolves")
-}
-
-// ---------------------------------------------------------------------------
-// The synthetic certifying run (AC-1(v)'s lever)
-// ---------------------------------------------------------------------------
-
-/// A walk-forward draft whose recorded verdict PASSES — two folds, both
-/// holding, over the parent run's own inputs.
-fn passing_draft(inputs: &BacktestInputs, span: CandleWindow) -> WalkForwardRunDraft {
-    draft_with_fold_verdict(inputs, span, true)
-}
-
-/// A synthetic draft whose verdicts are DERIVED from the trades its folds carry
-/// (R1): each fold takes twenty trades alternating around a positive (or
-/// negative) mean, and the fold and run verdicts come from `FoldVerdict::from_rs`
-/// / `RunVerdict::assess` over them — the identical derivation the write gate and
-/// the read apply, so this fixture cannot claim a verdict its trades do not
-/// support. `folds_hold` picks the two coherent extremes the tests need: every
-/// fold holding (the run passes) or none holding (the run fails, so a save
-/// de-certifies).
-fn draft_with_fold_verdict(
-    inputs: &BacktestInputs,
-    span: CandleWindow,
-    folds_hold: bool,
-) -> WalkForwardRunDraft {
-    let k = 2_u8;
-    let (lo, hi) = if folds_hold {
-        (Decimal::new(5, 1), Decimal::new(15, 1))
-    } else {
-        (Decimal::new(-5, 1), Decimal::new(-15, 1))
-    };
-    let folds: Vec<WalkForwardFoldDraft> = fold_windows(&span, k)
-        .iter()
-        .enumerate()
-        .map(|(i, window)| {
-            let trades = seeded_fold_trades(20, lo, hi, i);
-            let rs: Vec<Decimal> = trades.iter().map(|t| t.realized_r).collect();
-            let verdict = FoldVerdict::from_rs(&rs);
-            let net_pnl: Decimal = trades.iter().map(|t| t.realized_pnl).sum();
-            let fees_total: Decimal = trades.iter().map(|t| t.fees_total).sum();
-            let funding_total: Decimal = trades.iter().map(|t| t.funding_total).sum();
-            let slippage_total: Decimal = trades.iter().map(|t| t.slippage_total).sum();
-            let summary = SummaryStats::from_trades(
-                &trades,
-                net_pnl,
-                fees_total,
-                funding_total,
-                &EquityCurve::default(),
-            );
-            let mut fold_inputs = inputs.clone();
-            fold_inputs.window = Some(window.clone());
-            fold_inputs.lead_in_from_ms = Some(window.from_ms);
-            WalkForwardFoldDraft {
-                index: u8::try_from(i).unwrap(),
-                window: window.clone(),
-                verdict,
-                inputs: fold_inputs,
-                result: BacktestResult {
-                    trades,
-                    net_pnl,
-                    fees_total,
-                    funding_total,
-                    slippage_total,
-                    regime_breakdown: RegimeBreakdown::new(),
-                    skipped_entries: SkippedEntryCounts::new(),
-                    open_position: None,
-                    engine_fingerprint: EngineFingerprint::current(),
-                    summary: summary.clone(),
-                    equity_curve: EquityCurve::default(),
-                },
-                summary,
-                starting_equity: Decimal::new(10_000, 0),
-            }
-        })
-        .collect();
-    let pooled_rs: Vec<Decimal> = folds
-        .iter()
-        .flat_map(|f| f.result.trades.iter().map(|t| t.realized_r))
-        .collect();
-    let fold_verdicts: Vec<FoldVerdict> = folds.iter().map(|f| f.verdict.clone()).collect();
-    WalkForwardRunDraft {
-        scheme: FoldScheme::rolling_oos(i64::from(k)).unwrap(),
-        rule: VerdictRule::WfV1,
-        span,
-        from_defaulted: false,
-        engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
-        verdict: RunVerdict::assess(&fold_verdicts, &pooled_rs),
-        folds,
-    }
-}
-
-/// The walkable span the fixture's M15 snapshot covers, from the candle at
-/// `from_idx` to the last candle's close — the same bounds `run_walk_forward`
-/// resolves by default. `from_idx` must sit at or past the warm bar of every
-/// DSL the test walks (the candidate's own warm point is what the gate's
-/// span has to clear).
-fn fixture_span_from(from_idx: usize) -> CandleWindow {
-    let store = CandleStore::with_base_dir(manifest(FIXTURE_STORE));
-    let head = store
-        .read_head(&Pair::new("BTCUSDT"), Timeframe::M15)
-        .expect("read HEAD")
-        .expect("fixture HEAD present");
-    let series = store
-        .read_snapshot(&Pair::new("BTCUSDT"), Timeframe::M15, &head)
-        .expect("read fixture snapshot");
-    CandleWindow::new(
-        series.candles[from_idx].open_time,
-        series.candles.last().unwrap().close_time,
-    )
-    .expect("the span is ordered")
-}
-
-/// The certifying span this suite uses: candle 30 onward, past the warm bar of
-/// both the RSI(14) parent and the RSI(21) candidate the accept applies — so
-/// the gate's own walk-forward RUNS and its verdict is what decides.
-fn fixture_span() -> CandleWindow {
-    fixture_span_from(30)
-}
-
-/// Certify the parent: one synthetic passing walk-forward, saved through the
-/// real repository so the pointer lands exactly as the product moves it.
-async fn certify_parent(world: &World) -> pulse::WalkForwardRunId {
-    let repo = SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(CERTIFY_MS));
-    repo.save_walk_forward_run(
-        &world.version_id,
-        &passing_draft(&world.parent_inputs, fixture_span()),
-    )
-    .await
-    .expect("the certifying run persists")
-}
 
 /// The payload a passed gate hands `commit_acceptance` — the proposal's own
 /// mutation as the optimistic lock, the applied RSI(21) child DSL, a prepared
@@ -946,5 +560,47 @@ async fn a_settled_accept_replays_after_the_parents_pointer_moves() {
         world.table_count("strategy_version").await,
         2,
         "nothing new was minted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// r4.s1.w3 — G4: the gate re-runs under the PARENT'S rule
+// ---------------------------------------------------------------------------
+
+/// The parent's certifying run is a wf-v2 one, so the gate re-runs the
+/// candidate under wf-v2 (G4) and the recorded failure names that rule — the
+/// gate never falls back to wf-v1 for a wf-v2 lineage. (The one-month fixture
+/// cannot pass either rule, so the RULE the gate used is what this pins: the
+/// message is built from the certifying run's own rule name, which is the value
+/// the re-run received.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wf_v2_parent_re_runs_the_gate_under_its_own_rule() {
+    let world = world().await;
+
+    // The same coherent draft `certify_parent` saves, judged under wf-v2.
+    let mut draft = passing_draft(&world.parent_inputs, fixture_span());
+    draft.rule = VerdictRule::WfV2;
+    SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(CERTIFY_MS))
+        .save_walk_forward_run(&world.version_id, &draft)
+        .await
+        .expect("the wf-v2 certifying run persists");
+
+    let outcome = decide(&world, CoachAction::Accept).await;
+    let CoachDecisionOutcome::AcceptFailed(proposal) = outcome else {
+        panic!("the one-month fixture cannot pass wf-v2 — expected AcceptFailed, got {outcome:?}");
+    };
+    let failure = proposal.accept_failure.expect("the failure is recorded");
+    assert_eq!(failure.stage, AcceptFailureStage::WalkForward);
+    assert!(
+        failure.message.contains("under wf-v2"),
+        "the gate re-runs under the parent's own rule: {}",
+        failure.message
+    );
+
+    // Nothing persisted: no child was minted.
+    assert_eq!(
+        world.table_count("strategy_version").await,
+        1,
+        "no child was minted"
     );
 }

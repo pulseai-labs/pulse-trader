@@ -9,6 +9,10 @@
 //! asserting a relationship that never existed. This adapter takes a `run_id` and
 //! nothing else, and derives the rest, so the fragments have nowhere to come from.
 //!
+//! **Every projection is holdout-guarded before any trade or prompt read.**
+//! Both coach entry points use this source; a persisted result reaching the open
+//! freeze is refused by the shared application guard before any provider call.
+//!
 //! **It adds no SQL.** The three reads are the EXISTING repository methods, with
 //! their fail-closed integrity re-check (`backtest_run.result_content_hash`), their
 //! `schema_version` read-rejects and their `Migrator`-driven DSL read path intact.
@@ -32,7 +36,9 @@ use sqlx::SqlitePool;
 use crate::domain::{BacktestRunId, BacktestRunRepository, DataError, StrategyRepository};
 use crate::domain::{CoachTurnProjection, CoachTurnSource, ProjectedRun};
 
-use super::{SqliteBacktestRunRepo, SqliteStrategyRepo};
+use super::{SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteStrategyRepo};
+use crate::adapters::store::CandleStore;
+use crate::application::holdout::guard_persisted_run;
 
 /// The `SQLite` coach-turn projection over `pulse.db`.
 ///
@@ -42,13 +48,24 @@ use super::{SqliteBacktestRunRepo, SqliteStrategyRepo};
 /// clock the composition root injects there.
 pub struct SqliteCoachTurnSource {
     pool: SqlitePool,
+    candles: Option<CandleStore>,
 }
 
 impl SqliteCoachTurnSource {
     /// Build the projection over a pool (cloned from `Db::pool()`).
     #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            candles: None,
+        }
+    }
+    /// Use the entry point's candle store for pinned, unwindowed run spans.
+    /// The CLI default is resolved lazily, only when a freeze is open.
+    #[must_use]
+    pub fn with_candles(mut self, candles: CandleStore) -> Self {
+        self.candles = Some(candles);
+        self
     }
 }
 
@@ -63,6 +80,22 @@ impl CoachTurnSource for SqliteCoachTurnSource {
         let Some(run) = runs.get_run(run_id).await? else {
             return Ok(None);
         };
+        // The sealed projection is the common boundary for desktop and CLI
+        // turns. Read the open freeze once and refuse before loading trades,
+        // rendering context, claiming a turn, or calling a provider.
+        let holdout = SqliteCertificationFreezeRepo::new(self.pool.clone())
+            .open_freeze()
+            .await?
+            .map(|freeze| freeze.holdout());
+        if holdout.is_some() {
+            let candles = match &self.candles {
+                Some(candles) => candles.clone(),
+                None => CandleStore::with_default_base_dir()?,
+            };
+            guard_persisted_run(candles, holdout, &run)
+                .await
+                .map_err(|error| DataError::Db(error.to_string()))?;
+        }
         // The COMPLETE ordered trade set of THIS run — the repo orders by `seq`, and
         // there is no argument here through which a caller could ask for fewer.
         let trades = runs.get_trades(run_id).await?;

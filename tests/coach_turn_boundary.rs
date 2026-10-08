@@ -252,6 +252,14 @@ async fn seeded() -> (TempDir, Db, StrategyVersion, BacktestRunId) {
 
 /// A real run through the real repo, so `get_run`'s integrity re-check passes.
 async fn save_a_run(db: &Db, version: &StrategyVersion) -> BacktestRunId {
+    save_a_run_with_inputs(db, version, &seed_inputs()).await
+}
+
+async fn save_a_run_with_inputs(
+    db: &Db,
+    version: &StrategyVersion,
+    inputs: &BacktestInputs,
+) -> BacktestRunId {
     let run_repo =
         SqliteBacktestRunRepo::with_deps(db.pool().clone(), FakeClock::at(1_700_000_000_000));
     let result = BacktestResult {
@@ -270,7 +278,7 @@ async fn save_a_run(db: &Db, version: &StrategyVersion) -> BacktestRunId {
     run_repo
         .save_run(
             &version.id,
-            &seed_inputs(),
+            inputs,
             &result,
             &SummaryStats::default(),
             Decimal::new(10_000, 0),
@@ -1541,4 +1549,47 @@ async fn the_registry_entry_is_cleared_after_a_provider_error() {
         !registry.in_flight(&session_id),
         "the registry entry must be cleared on the error path too"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_coach_refuses_windowed_holdout_before_any_provider_call() {
+    let (_tmp, db, version, _run) = seeded().await;
+    let mut inputs = seed_inputs();
+    inputs.window = Some(pulse::CandleWindow::new(1_736_985_599_000, 1_736_985_601_000).unwrap());
+    let run_id = save_a_run_with_inputs(&db, &version, &inputs).await;
+    pulse::SqliteCertificationFreezeRepo::with_deps(
+        db.pool().clone(),
+        FakeClock::at(1_760_000_000_000),
+    )
+    .open(&pulse::OpenFreezeRequest {
+        holdout_start_ms: 1_736_985_600_000,
+        h: 12,
+        alpha: "0.05".to_owned(),
+        holdout_test: "C1".to_owned(),
+    })
+    .await
+    .unwrap();
+    let (provider, calls) = ScriptedProvider::new(vec![propose("entry.lhs.indicator.rsi.period")]);
+    let result = drive(&db, &run_id, Drive::new(provider)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let error = refusal(result, "holdout window");
+    assert!(error.to_string().contains("BTCUSDT") && error.to_string().contains("2025-01-16"));
+    assert_eq!(ledger_count(&db).await, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coaching_sessions")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    pulse::SqliteCertificationFreezeRepo::with_deps(
+        db.pool().clone(),
+        FakeClock::at(1_760_000_000_001),
+    )
+    .close()
+    .await
+    .unwrap();
+    let (provider, calls) = ScriptedProvider::new(vec![propose("entry.lhs.indicator.rsi.period")]);
+    drive(&db, &run_id, Drive::new(provider)).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

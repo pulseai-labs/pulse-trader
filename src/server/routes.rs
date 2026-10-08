@@ -28,6 +28,7 @@ use serde_json::Value;
 use super::ServerState;
 use super::auth::Scope;
 use super::ops;
+use crate::tauri::certification::certification_records_core;
 use crate::tauri::walk_forward::{get_backtest_run_core, get_walk_forward_run_core};
 
 // ---------------------------------------------------------------------------
@@ -92,6 +93,10 @@ pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum:
         })
         .mount_post_json(state, "/api/v1/get-backtest-run", |state, request| {
             Box::pin(plain_get_backtest_run(state, request))
+        })
+        // r4.s1.w5 (spec A4/C5): the app's full certification-record read.
+        .mount_post_json(state, "/api/v1/certification-records", |state, request| {
+            Box::pin(plain_certification_records(state, request))
         })
         .mount_post_json(
             state,
@@ -301,6 +306,20 @@ async fn plain_get_walk_forward_run(
     request: crate::tauri::GetWalkForwardRunRequest,
 ) -> Response {
     match get_walk_forward_run_core(&state.desktop, request).await {
+        Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
+        Err(err) => ops::bus_422(&err),
+    }
+}
+
+/// `POST /api/v1/certification-records` — a version's certification records in
+/// full, holdout numbers included (r4.s1.w5, spec A4/C5), straight through the
+/// core. Mounted `Scope::App`: an `agent` token is a 403 `scope_refused` with
+/// an audit row, exactly like every other route on this table.
+async fn plain_certification_records(
+    state: Arc<ServerState>,
+    request: crate::tauri::CertificationRecordsRequest,
+) -> Response {
+    match certification_records_core(&state.desktop, request).await {
         Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
         Err(err) => ops::bus_422(&err),
     }

@@ -26,7 +26,7 @@ use std::future::Future;
 use crate::domain::MarketDataSource;
 use crate::domain::{Candle, CandleSeries, Clock, DataError, DataVersion, Pair, Timeframe};
 
-use super::incremental::{RestPageSource, fetch_incremental_with};
+use super::incremental::{RestPageSource, fetch_incremental_bounded_with, fetch_incremental_with};
 use super::{BulkMonthSource, MonthSource, PageSource, ingest_window_with_lag};
 
 /// A [`MarketDataSource`] backed by Binance USD-M Futures: bulk monthly archives
@@ -145,6 +145,31 @@ where
         async move {
             fetch_incremental_with(&self.pages, &self.clock, &pair, tf, since_ms, since_ms + 1)
                 .await
+        }
+    }
+
+    /// The genuinely bounded top-up (r4.s1.w4): the page walk carries `endTime`,
+    /// so an interior-gap fill downloads the gap — not the years of candles
+    /// after it. Funding is stamped exactly as the unbounded path stamps it.
+    fn fetch_incremental_until(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send {
+        let pair = pair.clone();
+        async move {
+            fetch_incremental_bounded_with(
+                &self.pages,
+                &self.clock,
+                &pair,
+                tf,
+                since_ms,
+                Some(until_ms),
+                since_ms + 1,
+            )
+            .await
         }
     }
 }

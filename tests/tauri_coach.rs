@@ -1534,3 +1534,41 @@ fn both_coach_sites_build_the_shared_transport_and_config() {
         }
     }
 }
+
+#[tokio::test]
+async fn coach_turn_refuses_unwindowed_holdout_before_any_provider_call() {
+    let world = world().await;
+    let state = world.state().await;
+    let db = world.db().await;
+    pulse::SqliteCertificationFreezeRepo::with_deps(
+        db.pool().clone(),
+        pulse::FakeClock::at(1_760_000_000_000),
+    )
+    .open(&pulse::OpenFreezeRequest {
+        holdout_start_ms: 1_736_985_600_000,
+        h: 12,
+        alpha: "0.05".to_owned(),
+        holdout_test: "C1".to_owned(),
+    })
+    .await
+    .unwrap();
+    let (provider, calls) = ScriptedProvider::new(vec![propose_call(
+        RSI_PERIOD,
+        &json!({ "type": "Period", "value": 21 }),
+        "slower RSI",
+    )]);
+    let result = coach_turn_core(
+        &state,
+        deps(provider),
+        turn_request("sess-holdout", &world.parent_run_id),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let error = result.expect_err("the selected whole snapshot reaches the holdout");
+    assert!(error.to_string().contains("BTCUSDT") && error.to_string().contains("2025-01-16"));
+    assert_eq!(world.count("SELECT COUNT(*) FROM llm_call").await, 0);
+    assert_eq!(
+        world.count("SELECT COUNT(*) FROM coaching_sessions").await,
+        0
+    );
+}

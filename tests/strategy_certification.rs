@@ -18,13 +18,13 @@
 mod support;
 
 use pulse::{
-    CandleWindow, CreatedBy, Db, FakeClock, FoldScheme, MIGRATOR, NewVersion,
-    SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyRepository, StrategyVersion, VersionId,
-    WalkForwardRunId, WalkForwardRunRepository,
+    CandleWindow, CreatedBy, Db, FakeClock, FoldScheme, FoldVerdict, MIGRATOR, NewVersion,
+    RunVerdict, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyRepository, StrategyVersion,
+    Trade, VerdictRule, VersionId, WalkForwardRunId, WalkForwardRunRepository,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use support::mcp::{seeded_walk_forward_draft, seeded_walk_forward_draft_k};
+use support::mcp::{seeded_trade_at_r, seeded_walk_forward_draft, seeded_walk_forward_draft_k};
 use tempfile::TempDir;
 
 const MINIMAL_DSL: &str = r#"{
@@ -576,5 +576,153 @@ async fn a_draft_whose_folds_are_different_experiments_is_refused() {
     assert!(
         version.latest_walk_forward_run_id.is_none() && !version.certified,
         "a refused draft cannot advance certification"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// r4.s1.w3 — the save gate under the DRAFT'S OWN rule (wf-v2)
+// ---------------------------------------------------------------------------
+
+/// The mixed fold the two rules disagree about: ten +1.0R and ten −0.55R
+/// trades give a positive mean (0.225R) and a lower bound under water
+/// (t ≈ 1.30) — wf-v2 holds it, wf-v1 does not.
+fn rule_discriminating_trades() -> Vec<Trade> {
+    (0..20)
+        .map(|i| {
+            let r = if i < 10 {
+                Decimal::new(1, 0)
+            } else {
+                Decimal::new(-55, 2)
+            };
+            seeded_trade_at_r(i64::from(i), r)
+        })
+        .collect()
+}
+
+/// The write gate re-derives every fold and the run under the draft's OWN rule
+/// (r4.s1.w3): the SAME trades are coherent under wf-v1 and incoherent under
+/// wf-v2, and a wf-v2 draft re-derived under wf-v2 persists. A hardcoded wf-v1
+/// derivation would refuse the coherent wf-v2 draft and accept the incoherent
+/// one — this pins both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wf_v2_draft_is_rederived_under_its_own_rule() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    // The draft as wf-v1 derives it: fold 0's bound is under water, so it does
+    // not hold; fold 1 (the seeded all-negative series) holds under neither.
+    let mut draft = seeded_walk_forward_draft(false);
+    draft.folds[0].result.trades = rule_discriminating_trades();
+    let rs0: Vec<Decimal> = draft.folds[0]
+        .result
+        .trades
+        .iter()
+        .map(|t| t.realized_r)
+        .collect();
+    draft.folds[0].verdict = FoldVerdict::from_rs(&rs0);
+    let pooled: Vec<Decimal> = draft
+        .folds
+        .iter()
+        .flat_map(|f| f.result.trades.iter().map(|t| t.realized_r))
+        .collect();
+    let folds_v1: Vec<FoldVerdict> = draft.folds.iter().map(|f| f.verdict.clone()).collect();
+    draft.verdict = RunVerdict::assess(&folds_v1, &pooled);
+    assert!(draft.folds[0].verdict.mean_r > Decimal::ZERO);
+    assert!(
+        !draft.folds[0].verdict.holds,
+        "wf-v1's bound is under water on this fold"
+    );
+
+    // (a) Under wf-v1 the draft is coherent — the trades really do derive what
+    // it records — so it persists.
+    let v1_id = runs
+        .save_walk_forward_run(&world.version_id, &draft)
+        .await
+        .expect("the wf-v1 draft is coherent and persists");
+    let v1_run = runs
+        .get_walk_forward_run(&v1_id)
+        .await
+        .expect("read back")
+        .expect("the wf-v1 run exists");
+    assert_eq!(v1_run.rule, VerdictRule::WfV1);
+
+    // (b) The SAME trades and recorded verdicts under wf-v2: wf-v2 derives
+    // `holds = true` for fold 0, the record says false — refused, naming it.
+    let mut as_v2 = draft.clone();
+    as_v2.rule = VerdictRule::WfV2;
+    let err = runs
+        .save_walk_forward_run(&world.version_id, &as_v2)
+        .await
+        .expect_err("a wf-v2 draft whose folds disagree with wf-v2 must refuse");
+    assert!(
+        err.to_string().contains("walk-forward draft refused")
+            && err.to_string().contains("fold 0 records")
+            && err.to_string().contains("holds=false"),
+        "the refusal names the fold and the derived flag: {err}"
+    );
+
+    // (c) Re-derived under its own rule the wf-v2 draft is coherent: fold 0
+    // holds, fold 1 does not, one of two required — a failing run, persisted.
+    let mut coherent_v2 = as_v2;
+    for fold in &mut coherent_v2.folds {
+        let rs: Vec<Decimal> = fold.result.trades.iter().map(|t| t.realized_r).collect();
+        fold.verdict = VerdictRule::WfV2.assess_fold(&rs);
+    }
+    let folds_v2: Vec<FoldVerdict> = coherent_v2
+        .folds
+        .iter()
+        .map(|f| f.verdict.clone())
+        .collect();
+    coherent_v2.verdict = VerdictRule::WfV2.assess_run(&folds_v2, &pooled);
+    assert_eq!(coherent_v2.verdict.folds_holding, 1);
+    assert!(!coherent_v2.verdict.pass);
+    let v2_id = runs
+        .save_walk_forward_run(&world.version_id, &coherent_v2)
+        .await
+        .expect("the coherent wf-v2 draft persists");
+    let v2_run = runs
+        .get_walk_forward_run(&v2_id)
+        .await
+        .expect("read back")
+        .expect("the wf-v2 run exists");
+    assert_eq!(v2_run.rule, VerdictRule::WfV2);
+    assert_eq!(v2_run.verdict, coherent_v2.verdict);
+    assert!(v2_run.folds[0].verdict.holds);
+    assert_eq!(
+        v2_run.folds[0].verdict.mean_r,
+        coherent_v2.folds[0].verdict.mean_r
+    );
+}
+
+/// The decoder accepts `wf-v2` (r4.s1.w3): a coherent wf-v2 draft persists,
+/// reads back with the rule, the name and the verdict intact — and the read is
+/// the domain type, not a string passthrough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wf_v2_draft_round_trips_through_the_decoder() {
+    let world = world().await;
+    let runs =
+        SqliteBacktestRunRepo::with_deps(world.pool().clone(), FakeClock::at(1_756_512_000_000));
+
+    // The seeded passing series holds under BOTH rules (positive mean, positive
+    // bound), so switching the rule keeps the draft coherent.
+    let mut draft = seeded_walk_forward_draft(true);
+    draft.rule = VerdictRule::WfV2;
+    let id = runs
+        .save_walk_forward_run(&world.version_id, &draft)
+        .await
+        .expect("the coherent wf-v2 draft persists");
+    let run = runs
+        .get_walk_forward_run(&id)
+        .await
+        .expect("read back")
+        .expect("the run exists");
+    assert_eq!(run.rule, VerdictRule::WfV2);
+    assert_eq!(run.rule.name(), "wf-v2");
+    assert_eq!(run.verdict, draft.verdict);
+    assert_eq!(run.scheme, draft.scheme);
+    assert!(
+        run.verdict.pass,
+        "the seeded passing series passes wf-v2 too"
     );
 }

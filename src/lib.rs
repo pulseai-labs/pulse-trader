@@ -388,6 +388,13 @@ pub use adapters::db::SqliteStrategyRepo;
 // (revoking a token must end an open stream), so it is surfaced like the
 // other SQLite adapters.
 pub use adapters::db::SqliteClientTokenRepo;
+// r4.s1.w4 (F1/C4): the certification-freeze store and its value types. The
+// store is the ONLY writer of `certification_freeze` (the two operator commands
+// and the guard's read), and the tests drive it directly over a temp DB.
+// REQUIRED under `deny(warnings)` + `pub(crate) mod adapters`/`domain` — a new
+// public type unused outside its module is a `dead_code` build error.
+pub use adapters::db::SqliteCertificationFreezeRepo;
+pub use domain::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeRequest};
 // VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter. `SqliteBacktestRunRepo`
 // implements the FR-6 persisted-run surface over `query!`/`query_as!` (the
 // committed `.sqlx/` cache). REQUIRED under `deny(warnings)` + `pub(crate) mod
@@ -559,10 +566,10 @@ pub use application::walk_forward::{
     WalkForwardAppError, WalkForwardOutcome, WalkForwardRequest, run_walk_forward,
 };
 pub use domain::{
-    FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
-    WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,
-    WalkForwardRunDraft, WalkForwardRunId, WalkForwardRunRepository, Z, fold_windows,
-    folds_required,
+    FoldScheme, FoldVerdict, HOLDOUT_ALPHA, HoldoutVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN,
+    RunVerdict, VerdictRule, WalkForwardError, WalkForwardFold, WalkForwardFoldDraft,
+    WalkForwardMembership, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
+    WalkForwardRunRepository, Z, fold_windows, folds_required, holdout_test,
 };
 
 // r3.s4.w2 (ADR-0027): the certify-fixture surface — the deterministic
@@ -820,3 +827,26 @@ pub use crate::tauri::{
 pub fn run() -> anyhow::Result<()> {
     cli::run()
 }
+
+// r4.s1.w5 (spec A4/C5): the app's full certification-record read — the wire
+// shapes and the transport-free core behind `POST /api/v1/certification-records`
+// and the `certification_records` bus command (ADR-0020: additive only).
+pub use crate::tauri::{
+    CertificationRecordDto, CertificationRecordsDto, CertificationRecordsRequest,
+    CertificationSelectionDto, certification_records_core,
+};
+
+// r4.s1.w5 (spec A2/A3, G7/C1/C4/C5): the certification step and its record.
+// The step is the ONE caller allowed to evaluate the holdout (grill Q4); its
+// store is the certification table's only writer. Surfaced for the MCP tool,
+// the app's read and the integration suites. REQUIRED under `deny(warnings)` +
+// `pub(crate) mod adapters`/`domain` — a new public type unused outside its
+// module is a `dead_code` build error, not a warning.
+pub use adapters::db::SqliteCertificationRepo;
+pub use application::certification::{
+    CertifyError, CertifyOutcome, CertifyRequest, certify_version,
+};
+pub use domain::{
+    CertificationDraft, CertificationInputs, CertificationRecord, CertificationRepository,
+    CertifyRefusal,
+};

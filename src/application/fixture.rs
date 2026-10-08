@@ -373,9 +373,16 @@ where
         from_ms: None,
         to_ms: None,
         k: None,
+        rule: None,
     };
     let outcome = crate::application::walk_forward::run_walk_forward(
         strategies, snapshots, exchange, runs, &request,
+        // EXEMPT (grill Q4, G8): the certify-fixture seed runs on its own
+        // synthetic snapshots — never HEAD, never the campaign's data — so it
+        // is exempt from the holdout guard and passes `None` deliberately. The
+        // other two exemptions are the certification step (w5) and paper
+        // sessions; the guard module's doc names all three.
+        None,
     )
     .await
     .map_err(FixtureSeedError::WalkForward)?;
