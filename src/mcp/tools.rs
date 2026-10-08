@@ -52,7 +52,9 @@ use crate::application::mcp_read::{
 use crate::application::mcp_write::{
     SubmitError, SubmitRequest, SubmitTarget, submit_agent_version,
 };
-use crate::application::paper_read::{list_summaries, session_summary, session_trades};
+use crate::application::paper_read::{
+    SessionSummary, list_summaries, session_summary, session_trades,
+};
 use crate::application::walk_forward::{WalkForwardAppError, WalkForwardRequest, run_walk_forward};
 use crate::application::walk_forward_read::{
     load_fold_runs, rfc3339_secs, run_summary_of, walk_forward_run_detail,
@@ -654,6 +656,38 @@ async fn guard_run_read(
             }
             other => tool_error(other),
         })
+}
+
+/// Paper's live trades are exempt; its historical certifying fold results are not.
+async fn guard_paper_run_read(
+    state: &super::McpState,
+    holdout: Option<HoldoutFreeze>,
+    summary: &SessionSummary,
+) -> Result<(), CallToolResult> {
+    use crate::domain::paper::session::Graduation;
+    if holdout.is_none() {
+        return Ok(());
+    }
+    let Graduation::Certified {
+        walk_forward_run_id,
+        ..
+    } = &summary.graduation
+    else {
+        return Ok(());
+    };
+    let runs = SqliteBacktestRunRepo::new(state.db.pool().clone());
+    let run = runs
+        .get_walk_forward_run(walk_forward_run_id)
+        .await
+        .map_err(tool_error)?
+        .ok_or_else(|| {
+            field_error(
+                "run_id",
+                "the holdout freeze refuses a paper comparison whose certifying run is unavailable",
+            )
+        })?;
+    crate::application::holdout::guard_persisted_window(holdout, &summary.pair, &run.span)
+        .map_err(|refusal| field_error("run_id", refusal))
 }
 
 /// The OPEN freeze's whole record, read once per `certify_version` call
@@ -1604,11 +1638,39 @@ impl PulseMcp {
         &self,
         Parameters(_args): Parameters<ListPaperSessionsArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let paper = self.paper_repo();
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
-        match list_summaries(&paper, &runs).await {
-            Ok(summaries) => Ok(structured_list("sessions", summaries)),
-            Err(e) => Ok(tool_error(e)),
+        let summaries = match list_summaries(&paper, &runs).await {
+            Ok(summaries) => summaries,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        let mut entries = Vec::with_capacity(summaries.len());
+        let mut withheld_for_holdout = 0;
+        for summary in summaries {
+            match guard_paper_run_read(&self.state, holdout, &summary).await {
+                Ok(()) => entries.push(summary),
+                Err(result)
+                    if result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|value| value.get("field"))
+                        .is_some() =>
+                {
+                    withheld_for_holdout += 1;
+                }
+                Err(result) => return Ok(result),
+            }
+        }
+        if holdout.is_some() {
+            Ok(CallToolResult::structured(json!({
+                "sessions": entries, "withheld_for_holdout": withheld_for_holdout,
+            })))
+        } else {
+            Ok(structured_list("sessions", entries))
         }
     }
 
@@ -1621,12 +1683,21 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<PaperSessionArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let paper = self.paper_repo();
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
         match session_summary(&paper, &runs, &PaperSessionId::new(args.session_id)).await {
-            Ok(Some(summary)) => Ok(CallToolResult::structured(
-                serde_json::to_value(summary).unwrap_or_else(|_| json!({})),
-            )),
+            Ok(Some(summary)) => {
+                if let Err(result) = guard_paper_run_read(&self.state, holdout, &summary).await {
+                    return Ok(result);
+                }
+                Ok(CallToolResult::structured(
+                    serde_json::to_value(summary).unwrap_or_else(|_| json!({})),
+                ))
+            }
             Ok(None) => Ok(field_error("session_id", "no such paper session")),
             Err(e) => Ok(tool_error(e)),
         }
@@ -1659,12 +1730,21 @@ impl PulseMcp {
         &self,
         Parameters(args): Parameters<PaperSessionArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let paper = self.paper_repo();
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
         match session_summary(&paper, &runs, &PaperSessionId::new(args.session_id)).await {
-            Ok(Some(summary)) => Ok(CallToolResult::structured(
-                serde_json::to_value(summary.comparison).unwrap_or_else(|_| json!({})),
-            )),
+            Ok(Some(summary)) => {
+                if let Err(result) = guard_paper_run_read(&self.state, holdout, &summary).await {
+                    return Ok(result);
+                }
+                Ok(CallToolResult::structured(
+                    serde_json::to_value(summary.comparison).unwrap_or_else(|_| json!({})),
+                ))
+            }
             Ok(None) => Ok(field_error("session_id", "no such paper session")),
             Err(e) => Ok(tool_error(e)),
         }
