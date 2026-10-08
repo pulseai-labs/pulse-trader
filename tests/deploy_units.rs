@@ -13,6 +13,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use pulse::RetryPolicy;
 
@@ -26,6 +29,10 @@ const WATCH_TIMER: &str = include_str!("../deploy/pulse-watch.timer");
 /// bind, its database and its data dir are its own — and the role flag is what
 /// makes the server refuse the other role's data.
 const QA_UNIT: &str = include_str!("../deploy/pulse-qa.service");
+
+/// r4.s2.w5 (C3): the off-box backup pull and the Mini's forced command.
+const PULL_SERVICE: &str = include_str!("../deploy/pulse-backup-pull.service");
+const PULL_TIMER: &str = include_str!("../deploy/pulse-backup-pull.timer");
 
 /// The `key=value` lines of one `[Section]` of `unit`, comments and blanks skipped.
 fn section_of(unit: &str, name: &str) -> HashMap<String, String> {
@@ -295,4 +302,165 @@ fn watch_timer_probes_every_sixty_seconds() {
         "timers.target",
         "a timer is enabled for timers.target"
     );
+}
+
+// ---------------------------------------------------------------------------
+// r4.s2.w5 (C3) — `deploy/pulse-backup-pull.{service,timer}`: the pull runs on
+// draco-desk an hour after the Mini's own backup, and the Mini's forced command
+// (`deploy/pulse-backup-serve.sh`) serves exactly one shape — a read.
+// Installing the units, the script and the key is the cutover's (SPINE.md step
+// 6, a credential stop); these tests pin the text and the script's behaviour.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pull_service_is_one_pull_cycle_with_the_ssh_target() {
+    let service = section_of(PULL_SERVICE, "Service");
+    assert_eq!(service["Type"], "oneshot", "one run is one pull");
+    let exec = &service["ExecStart"];
+    let words: Vec<&str> = exec.split_whitespace().collect();
+    assert_eq!(words.len(), 2, "the script and its one argument: {exec}");
+    assert!(
+        words[0].starts_with("%h/") && words[0].ends_with("deploy/pulse-backup-pull.sh"),
+        "the installed script runs the pull: {exec}"
+    );
+    assert_eq!(
+        words[1], "macmini:/Users/draco/pulse-backups",
+        "the ssh target, an ABSOLUTE remote path — a forced command expands no `~`: {exec}"
+    );
+    assert!(
+        !service
+            .keys()
+            .any(|k| k == "Environment" || k == "EnvironmentFile"),
+        "the unit sets no credential; the key, the destination and the verify binary are \
+         the script's defaults"
+    );
+}
+
+#[test]
+fn pull_timer_pulls_after_the_mini_backup() {
+    let timer = section_of(PULL_TIMER, "Timer");
+    assert_eq!(
+        timer["OnCalendar"], "*-*-* 04:30:00",
+        "an hour after the Mini's own 03:30 backup"
+    );
+    assert_eq!(
+        timer["Persistent"], "true",
+        "a powered-off draco-desk runs the missed pull at boot"
+    );
+    assert_eq!(
+        section_of(PULL_TIMER, "Install")["WantedBy"],
+        "timers.target",
+        "a timer is enabled for timers.target"
+    );
+}
+
+/// The forced-command script, run the way sshd would: `bash
+/// deploy/pulse-backup-serve.sh` with `SSH_ORIGINAL_COMMAND` set.
+fn serve_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/pulse-backup-serve.sh")
+}
+
+/// A temp `rsync` that records its argv and exits 0. The forced command must
+/// EXEC rsync with the client's own words, and this is how a test sees what it
+/// exec'd — a refusal never reaches it.
+struct FakeRsync {
+    dir: tempfile::TempDir,
+    log: PathBuf,
+}
+
+impl FakeRsync {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("rsync-argv.log");
+        let rsync = dir.path().join("rsync");
+        std::fs::write(
+            &rsync,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$RSYNC_ARGV_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&rsync).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&rsync, permissions).unwrap();
+        Self { dir, log }
+    }
+
+    fn run(&self, root: &Path, command: &str) -> Output {
+        Command::new("bash")
+            .arg(serve_script())
+            .env("SSH_ORIGINAL_COMMAND", command)
+            .env("PULSE_BACKUP_ROOT", root)
+            .env("RSYNC_ARGV_LOG", &self.log)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.dir.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .expect("run the forced command")
+    }
+
+    /// What rsync was exec'd with; empty when a refusal stopped it first.
+    fn argv(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+#[test]
+fn forced_command_serves_a_protocol_29_sender_invocation() {
+    let fake = FakeRsync::new();
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().display().to_string();
+
+    // The protocol-29 (openrsync / "rsync version 2.6.9 compatible") shape the
+    // Mini's client sends — the acceptance case the plan gate asked for — and
+    // the modern rsync 3.x bundle beside it. Both are SERVED, never refused.
+    for command in [
+        format!("rsync --server --sender -logDtpr . {root_path}/"),
+        format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}"),
+    ] {
+        let output = fake.run(root.path(), &command);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "a sender invocation must be served: {command}: {stderr}"
+        );
+        assert!(!stderr.contains("refused"), "nothing was refused: {stderr}");
+        let argv = fake.argv();
+        assert!(
+            argv.contains("--server") && argv.contains("--sender"),
+            "rsync got the client's own words: {argv}"
+        );
+        assert!(argv.contains(&root_path), "the root travels: {argv}");
+    }
+}
+
+#[test]
+fn forced_command_refuses_everything_but_a_read() {
+    let fake = FakeRsync::new();
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().display().to_string();
+
+    // A write (an rsync invocation without `--sender`), a delete, a `..` path,
+    // a path outside the root, a shell, and a shell metacharacter.
+    for command in [
+        format!("rsync --server -logDtpre.iLsfxC . {root_path}"),
+        format!("rsync --server --sender --delete . {root_path}"),
+        format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}/../etc"),
+        "rsync --server --sender -logDtpre.iLsfxC . /etc".to_owned(),
+        format!("rm -rf {root_path}"),
+        format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}; rm -rf /"),
+        "sh -c id".to_owned(),
+    ] {
+        let output = fake.run(root.path(), &command);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!output.status.success(), "must be refused: {command}");
+        assert!(stderr.contains("refused"), "by name: {command}: {stderr}");
+        assert!(
+            fake.argv().is_empty(),
+            "a refused command is never executed: {command}"
+        );
+    }
 }

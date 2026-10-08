@@ -141,10 +141,59 @@ draco-desk) after 3 failed probes, or at once on the start-limit marker. It tell
 "Mini unreachable — it may need a FileVault unlock" from "service down", and
 carries no token, no credential URL and no session data. The nightly backup is
 pulled OFF the Mini by draco-desk (the Mini has no outbound credential and
-`draco-desk:22` is closed from the Mini) over a dedicated read-only `rrsync`
-key, with a restore drill against the pulled copy. "Off-box" is the same home
-LAN — a known limit recorded at planning (C6); an off-site copy is a later
-candidate.
+`draco-desk:22` is closed from the Mini) over a dedicated read-only key, with a
+restore drill against the pulled copy. "Off-box" is the same home LAN — a known
+limit recorded at planning (C6); an off-site copy is a later candidate.
+
+**The off-box backup (w5).** The Mini's nightly backup is a launchd calendar
+job: `deploy/com.pulsetrader.backup.plist` runs the installed binary's `backup`
+(defaults: the platform data dir, `~/pulse-backups`, keep 14) at 03:30 local,
+with `RunAtLoad` and `KeepAlive` absent — launchd runs a missed occurrence when
+the machine wakes, which is the draco-desk timers' `Persistent=true` behaviour —
+no `EnvironmentVariables` (a backup reads no credential), and
+`backup.log`/`backup.err` under `~/Library/Logs/PulseTrader/`, rotated by the
+same 7-day job as the server's logs. `just deploy-mac` installs it beside the
+serve agent and loads it; it is never kickstarted, because a deploy must not
+take an extra backup.
+
+draco-desk pulls it at 04:30 (`deploy/pulse-backup-pull.timer`,
+`Persistent=true`) through `deploy/pulse-backup-pull.sh`: `rsync -a
+--ignore-existing` with the dedicated key `~/.ssh/pulse_backup_ed25519`, never
+`--delete`. The artifacts are immutable, so a backup deleted or corrupted on the
+Mini cannot erase the off-box copy, and a tampered off-box file stays visible to
+the verify instead of being papered over by the next pull. The newest pulled
+backup is then checked in place, read-only, by `pulse backup-verify <file>` — the
+restore's checks that need no second database: the backup's own `.heads.json`
+manifest, every snapshot it names, every snapshot a run references, and every
+version and run reading back — and a mismatch exits non-zero BEFORE any pruning.
+Retention keeps the newest 30 databases, each with its manifest; `candles/` is
+one shared additive store and is never pruned. An empty off-box directory after
+a pull is a named failure. `pulse backup --keep 0` is refused at parse time
+(#240): it used to prune the backup it had just made and then fail.
+
+**The forced command.** The Mini's rsync is macOS's own (openrsync, "rsync
+version 2.6.9 compatible") and carries no `rrsync` — checked read-only at
+planning — so the pull key's `authorized_keys` line forces
+`deploy/pulse-backup-serve.sh` (installed by `deploy-mac` to
+`~/.local/share/pulse-serve/deploy/`). It reads `$SSH_ORIGINAL_COMMAND` and
+serves exactly one shape — an rsync SENDER invocation rooted at
+`~/pulse-backups` — refusing by name everything else: a write, a delete, a `..`
+path, a shell, a path outside the root, any shell metacharacter. The key can
+therefore never write, delete or read outside the backup directory. The line the
+operator adds at cutover (step 6, a credential stop), with the public half of the
+key generated there:
+
+```text
+from="100.90.203.21",restrict,command="/Users/draco/.local/share/pulse-serve/deploy/pulse-backup-serve.sh" ssh-ed25519 <the pull key> draco-desk off-box backup pull
+```
+
+`just restore-drill <file>` is the drill: it restores a pulled backup into a
+fresh scratch directory under `~/.cache/pulse-scratch/`, starts `pulse serve
+--dev-loopback` on it, waits for `/healthz`, shows the tokenless 401 handshake
+refusal (the auth stack answering — the drill holds no token, and never prints
+one), prints the restored library's version and run counts, then stops the server
+and removes the scratch directory. `tests/backup_offbox_restore.rs` drives the
+whole line (demo line d72), the forced-command refusals included.
 
 **draco-desk is QA (w3).** It runs its own database and its own data dir, and QA
 and prod refuse each other's data. `pulse serve --role <prod|qa>` pins a data

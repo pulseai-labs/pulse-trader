@@ -264,6 +264,69 @@ restore file:
     fi
     echo "restore: ok — pulse-serve restarted on the restored database"
 
+# Restore a PULLED backup into a fresh scratch directory and prove it serves
+# (r4.s2.w5, criterion 5 / demo line d76): restore, start `pulse serve
+# --dev-loopback` on the restored copy, wait for `/healthz`, show the tokenless
+# handshake refusal (the auth stack answering — the drill holds no token by
+# design and never prints one), print the restored library's version and run
+# counts, then stop the server and remove the scratch directory.
+#
+# NEVER the live data dir: everything happens under
+# ~/.cache/pulse-scratch/restore-drill.* (host rule 1: never /tmp) and the trap
+# removes it even on failure. The binary is the installed QA build (`PULSE_BIN`
+# overrides it); the backup directory beside `{{ file }}` holds the `candles/`
+# the restore needs (`PULSE_DRILL_BACKUP_DIR` overrides that); the server binds
+# 127.0.0.1 only (`PULSE_DRILL_PORT` overrides the port).
+restore-drill file:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f "{{ file }}" ]; then
+        echo "restore-drill: no such backup file: {{ file }}" >&2
+        exit 1
+    fi
+    BIN="${PULSE_BIN:-$HOME/.local/share/pulse-qa/bin/pulse}"
+    BACKUP_DIR="${PULSE_DRILL_BACKUP_DIR:-$(dirname "{{ file }}")}"
+    PORT="${PULSE_DRILL_PORT:-8423}"
+    SCRATCH_ROOT="${PULSE_DRILL_SCRATCH_ROOT:-$HOME/.cache/pulse-scratch}"
+    mkdir -p "$SCRATCH_ROOT"
+    SCRATCH="$(mktemp -d "$SCRATCH_ROOT/restore-drill.XXXXXX")"
+    SERVER_PID=""
+    cleanup() {
+        if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+        fi
+        rm -rf "$SCRATCH"
+    }
+    trap cleanup EXIT
+
+    echo "restore-drill: restoring {{ file }} into $SCRATCH (never the live data dir)"
+    RESTORE_OUT="$("$BIN" restore "{{ file }}" --backup-dir "$BACKUP_DIR" \
+        --db "$SCRATCH/pulse.db" --data-dir "$SCRATCH/data")"
+    printf '%s\n' "$RESTORE_OUT"
+
+    "$BIN" serve --dev-loopback --bind "127.0.0.1:$PORT" \
+        --db "$SCRATCH/pulse.db" --data-dir "$SCRATCH/data" &
+    SERVER_PID=$!
+
+    bash scripts/wait-healthy.sh "http://127.0.0.1:$PORT" 30
+
+    # The handshake answers: tokenless it REFUSES with 401 and the API-version
+    # header, which is the proof the auth stack is up. The drill never holds or
+    # prints a token.
+    HANDSHAKE="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$PORT/api/v1/handshake" || true)"
+    if [ "$HANDSHAKE" != "401" ]; then
+        echo "restore-drill: the handshake answered $HANDSHAKE, want 401 (the tokenless refusal)" >&2
+        exit 1
+    fi
+
+    echo "restore-drill: the restored copy serves (/healthz ok; the handshake's 401 proves the auth stack answers)"
+    "$BIN" --version
+    "$BIN" strategy list --db "$SCRATCH/pulse.db"
+    printf '%s\n' "$RESTORE_OUT" | grep -E '^  (versions verified|runs verified|paper digests|snapshots verified):' || true
+    echo "restore-drill: ok — the restored copy verified hash for hash and served"
+
 # --- the Mac Mini prod service (r4.s2.w1, G5/G6/G7/G9/G10, ADR-0029) ---------
 
 # Build a TAGGED commit ON the Mac Mini and install it as prod's always-on
@@ -284,7 +347,8 @@ restore file:
 # printed or copied; only its mode and owner are.
 #
 # It clears the start limit (the marker and the start log, as `prod-reset`
-# does), (re)loads the two agents, kickstarts the server, and only then reports
+# does), (re)loads the three agents (serve, logrotate, backup — the backup one
+# is loaded but not kickstarted), kickstarts the server, and only then reports
 # success — through the SAME health gate as `deploy` (#346): the tailnet
 # address has to answer, not just exist. If that gate fails, the agent is left
 # loaded for inspection and the recipe exits non-zero.
@@ -305,17 +369,17 @@ deploy-mac tag:
     #    login PATH). #314: no Node on the Mini, and the server never reads the
     #    bundle — the placeholder dist is the deliberate setting.
     ssh macmini 'export PATH="$HOME/.cargo/bin:$PATH"; cd "$HOME/.cache/pulse-deploy/src" && PULSE_ALLOW_PLACEHOLDER_DIST=1 cargo build --release --bin pulse'
-    # 3. Install the binary, the config dir, the log-rotation script and the
-    #    two plists. A rollback to an old tag installs that tag's artifacts,
-    #    so everything comes from $SRC on the Mini.
+    # 3. Install the binary, the config dir, the two scripts and the three
+    #    plists (serve, logrotate, backup). A rollback to an old tag installs
+    #    that tag's artifacts, so everything comes from $SRC on the Mini.
     ssh macmini 'set -e
         mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.local/share/pulse-serve/deploy" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/PulseTrader"
         install -m 0755 "$HOME/.cache/pulse-deploy/src/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
         rm -rf "$HOME/.local/share/pulse-serve/config"
         mkdir -p "$HOME/.local/share/pulse-serve/config"
         cp -R "$HOME/.cache/pulse-deploy/src/config/." "$HOME/.local/share/pulse-serve/config/"
-        install -m 0755 "$HOME/.cache/pulse-deploy/src/deploy/pulse-logrotate.sh" "$HOME/.local/share/pulse-serve/deploy/pulse-logrotate.sh"
-        install -m 0644 "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.serve.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.logrotate.plist" "$HOME/Library/LaunchAgents/"'
+        install -m 0755 "$HOME/.cache/pulse-deploy/src/deploy/pulse-logrotate.sh" "$HOME/.cache/pulse-deploy/src/deploy/pulse-backup-serve.sh" "$HOME/.local/share/pulse-serve/deploy/"
+        install -m 0644 "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.serve.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.logrotate.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.backup.plist" "$HOME/Library/LaunchAgents/"'
     # 4. Permissions (G10). Names and modes only — the file is never printed.
     ssh macmini 'set -e
         DATA="$HOME/Library/Application Support/PulseTrader"
@@ -340,14 +404,18 @@ deploy-mac tag:
                 exit 1
             fi
         fi'
-    # 5. Clear the start limit, (re)load both agents, kickstart the server.
+    # 5. Clear the start limit, (re)load all three agents, kickstart the server.
+    #    The backup agent is loaded but NOT kickstarted: its calendar runs it at
+    #    03:30 local, and a deploy must not take an extra backup.
     ssh macmini 'set -e
         DATA="$HOME/Library/Application Support/PulseTrader"
         rm -f "$DATA/serve-start-limit" "$DATA/serve-starts"
         launchctl bootout "gui/$(id -u)/com.pulsetrader.serve" 2>/dev/null || true
         launchctl bootout "gui/$(id -u)/com.pulsetrader.logrotate" 2>/dev/null || true
+        launchctl bootout "gui/$(id -u)/com.pulsetrader.backup" 2>/dev/null || true
         launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.pulsetrader.serve.plist"
         launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.pulsetrader.logrotate.plist"
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.pulsetrader.backup.plist"
         launchctl kickstart -k "gui/$(id -u)/com.pulsetrader.serve"'
     # 6. The real health gate (#346), from here: the Mini's tailnet address has
     #    to answer, not just exist. 150 s covers the 120-second bind retry.

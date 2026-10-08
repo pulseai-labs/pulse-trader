@@ -34,6 +34,9 @@ use pulse::{StartGuard, StartLimit, record_start};
 
 const SERVE_PLIST: &str = include_str!("../deploy/com.pulsetrader.serve.plist");
 const LOGROTATE_PLIST: &str = include_str!("../deploy/com.pulsetrader.logrotate.plist");
+/// r4.s2.w5 (C3/G9): the Mini's nightly backup — a launchd calendar job, the
+/// same pattern as the serve agent.
+const BACKUP_PLIST: &str = include_str!("../deploy/com.pulsetrader.backup.plist");
 
 /// The plist the agent runs: 3 starts in 900 s — #342's parity.
 const LIMIT: StartLimit = StartLimit {
@@ -543,5 +546,50 @@ fn a_refused_start_exits_zero_through_the_real_binary() {
         std::fs::read_to_string(dir.path().join("serve-starts")).unwrap(),
         log_after_fourth,
         "a marker-present start appends nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// r4.s2.w5 (C3/G9) — the Mini's nightly backup job
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backup_plist_is_a_daily_calendar_job_over_the_installed_binary() {
+    let plist = parse_plist(BACKUP_PLIST);
+    assert_eq!(
+        plist.get("Label").str_value(),
+        "com.pulsetrader.backup",
+        "the agent's label"
+    );
+    assert_eq!(
+        plist.get("ProgramArguments").strings(),
+        vec!["/Users/draco/.local/share/pulse-serve/bin/pulse", "backup"],
+        "the installed binary's `backup` with its defaults: the platform data dir, ~/pulse-backups and keep 14"
+    );
+    let calendar = plist.get("StartCalendarInterval");
+    assert_eq!(calendar.get("Hour").integer(), 3, "03:30 local");
+    assert_eq!(calendar.get("Minute").integer(), 30, "03:30 local");
+}
+
+#[test]
+fn backup_plist_carries_no_credential_and_writes_the_logs() {
+    let plist = parse_plist(BACKUP_PLIST);
+    let dict = plist.dict();
+    assert!(
+        !dict.contains_key("EnvironmentVariables"),
+        "`pulse backup` reads no credential, and no plist carries one (G7)"
+    );
+    assert!(
+        !dict.contains_key("RunAtLoad") && !dict.contains_key("KeepAlive"),
+        "a calendar job neither runs at load nor is kept alive; launchd runs a missed \
+         occurrence when the machine wakes"
+    );
+    let out = plist.get("StandardOutPath").str_value();
+    let err = plist.get("StandardErrorPath").str_value();
+    assert_eq!(out, "/Users/draco/Library/Logs/PulseTrader/backup.log");
+    assert_eq!(err, "/Users/draco/Library/Logs/PulseTrader/backup.err");
+    assert!(
+        out.starts_with('/') && err.starts_with('/'),
+        "launchd expands no `~`: every path in a plist is absolute"
     );
 }
