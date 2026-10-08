@@ -31,7 +31,9 @@
 //! `None` means no freeze is open (or the caller is an exemption), and the
 //! guard is then inert.
 
-use crate::domain::{CandleWindow, HoldoutFreeze, Pair};
+use crate::domain::{
+    CandleSeriesRepository, CandleWindow, DataError, HoldoutFreeze, Pair, PersistedRun,
+};
 
 /// A run or export refused because its window reaches into the frozen holdout.
 ///
@@ -43,7 +45,7 @@ use crate::domain::{CandleWindow, HoldoutFreeze, Pair};
 pub struct HoldoutRefusal {
     /// The pair the refused run or export would have evaluated.
     pub pair: Pair,
-    /// The offending request member: `"from"` or `"to"`.
+    /// The offending request member: `"from"`, `"to"`, or a persisted `"run_id"`.
     pub field: &'static str,
     /// The open freeze's holdout start, epoch ms.
     pub holdout_start_ms: i64,
@@ -221,6 +223,64 @@ pub fn guard_persisted_window(
         refusal.field = "run_id";
         refusal
     })
+}
+
+/// A persisted result cannot be released when its recorded range is unknown.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PersistedRunGuardError {
+    #[error(transparent)]
+    Refused(#[from] HoldoutRefusal),
+    #[error("the holdout freeze refuses a run whose input provenance is unavailable")]
+    MissingInputs,
+    #[error(transparent)]
+    Snapshot(#[from] DataError),
+    #[error("holdout snapshot worker failed: {0}")]
+    Worker(String),
+}
+
+/// Resolve a persisted result's counted window and apply the ONE holdout
+/// decision. An unwindowed run names its exact primary snapshot, never HEAD.
+/// No snapshot is loaded when no freeze is open or a window is recorded.
+/// Snapshot decoding goes off the async runtime, before any caller computes
+/// a child or constructs a model prompt.
+pub(crate) async fn guard_persisted_run<C>(
+    candles: C,
+    freeze: Option<HoldoutFreeze>,
+    run: &PersistedRun,
+) -> Result<(), PersistedRunGuardError>
+where
+    C: CandleSeriesRepository + Send + 'static,
+{
+    if freeze.is_none() {
+        return Ok(());
+    }
+    let inputs = run
+        .inputs
+        .as_ref()
+        .ok_or(PersistedRunGuardError::MissingInputs)?;
+    let window = if let Some(window) = &inputs.window {
+        window.clone()
+    } else {
+        let inputs = inputs.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            candles.load_version(
+                &inputs.pair,
+                inputs.primary.timeframe,
+                &inputs.primary.data_version,
+            )
+        })
+        .await
+        .map_err(|e| PersistedRunGuardError::Worker(e.to_string()))??;
+        let (Some(first), Some(last)) =
+            (loaded.series.candles.first(), loaded.series.candles.last())
+        else {
+            return Ok(());
+        };
+        CandleWindow::new(first.open_time, last.close_time)
+            .map_err(|e| PersistedRunGuardError::Snapshot(DataError::Db(e.to_string())))?
+    };
+    guard_persisted_window(freeze, &inputs.pair, &window)?;
+    Ok(())
 }
 
 #[cfg(test)]

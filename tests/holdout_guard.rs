@@ -1038,3 +1038,50 @@ async fn coach_refuses_parent_window_before_snapshot_load() {
     assert_eq!(gate_world.table_count("backtest_run").await, before);
     assert_eq!(gate_world.table_count("strategy_version").await, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coach_refuses_unwindowed_parent_before_child_computation() {
+    #[derive(Clone)]
+    struct CountingExchange(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl pulse::ExchangeAdapter for CountingExchange {
+        fn symbol_filters(
+            &self,
+            pair: &Pair,
+        ) -> Result<pulse::SymbolFilters, pulse::ExchangeError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            pulse::ExchangeAdapter::symbol_filters(&pulse::BinanceAdapter::new(), pair)
+        }
+    }
+    let gate_world = coach_gate_support::world().await;
+    assert!(gate_world.parent_inputs.window.is_none());
+    let before = gate_world.table_count("backtest_run").await;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outcome = pulse::run_coach_decision(
+        &gate_world.strategies(),
+        &gate_world.store,
+        &CountingExchange(calls.clone()),
+        &gate_world.runs(),
+        &gate_world.acceptance(),
+        &gate_world.sessions(),
+        pulse::CoachDecisionRequest {
+            session_id: gate_world.session_id.clone(),
+            action: CoachAction::Accept,
+        },
+        Some(HoldoutFreeze {
+            holdout_start_ms: HOLDOUT_MS,
+        }),
+    )
+    .await
+    .unwrap();
+    match outcome {
+        CoachDecisionOutcome::AcceptFailed(proposal) => {
+            let failure = proposal.accept_failure.unwrap();
+            assert_eq!(failure.stage, AcceptFailureStage::WalkForward);
+            assert!(failure.message.contains("BTCUSDT") && failure.message.contains("2025-01-16"));
+        }
+        other => panic!("expected holdout refusal, got {other:?}"),
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(gate_world.table_count("backtest_run").await, before);
+    assert_eq!(gate_world.table_count("strategy_version").await, 1);
+}

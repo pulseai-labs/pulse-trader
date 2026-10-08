@@ -378,7 +378,8 @@ where
 /// The seven-step accept (spec §Accept), each step's failure recorded as its stage.
 ///
 /// `holdout` is the open freeze (r4.s1.w4, Q4): before loading snapshots or
-/// computing the child, the parent's recorded inputs window is guarded. A
+/// computing the child, the parent's recorded window or pinned whole-snapshot
+/// span is guarded through the shared persisted-run guard. A
 /// window reaching the holdout records a `walk_forward` refusal. The later
 /// certification gate also guards the parent's certifying run's span.
 #[allow(clippy::too_many_arguments)]
@@ -433,20 +434,23 @@ where
         Err(failure) => return record_staged(acceptance, &session.id, failure).await,
     };
 
-    if let Some(window) = &inputs.window
-        && let Err(refusal) = crate::application::holdout::guard_backtest_window(
-            holdout,
-            &inputs.pair,
-            Some(window),
-            None,
-        )
+    if let Err(error) =
+        crate::application::holdout::guard_persisted_run(candles.clone(), holdout, &parent_run)
+            .await
     {
+        let stage = match error {
+            crate::application::holdout::PersistedRunGuardError::Snapshot(_)
+            | crate::application::holdout::PersistedRunGuardError::Worker(_) => {
+                AcceptFailureStage::LoadSnapshots
+            }
+            _ => AcceptFailureStage::WalkForward,
+        };
         return record_staged(
             acceptance,
             &session.id,
             StagedFailure {
-                stage: AcceptFailureStage::WalkForward,
-                message: refusal.to_string(),
+                stage,
+                message: error.to_string(),
                 subject: None,
             },
         )

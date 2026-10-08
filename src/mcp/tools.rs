@@ -645,38 +645,15 @@ async fn guard_run_read(
     holdout: Option<HoldoutFreeze>,
     run: &PersistedRun,
 ) -> Result<(), CallToolResult> {
-    if holdout.is_none() {
-        return Ok(());
-    }
-    let Some(inputs) = &run.inputs else {
-        return Err(field_error(
-            "run_id",
-            "the holdout freeze refuses a run whose input provenance is unavailable",
-        ));
-    };
-    let window = if let Some(window) = &inputs.window {
-        window.clone()
-    } else {
-        let store = state.candles.clone();
-        let inputs = inputs.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            store.load_version(
-                &inputs.pair,
-                inputs.primary.timeframe,
-                &inputs.primary.data_version,
-            )
-        })
+    use crate::application::holdout::{PersistedRunGuardError, guard_persisted_run};
+    guard_persisted_run(state.candles.clone(), holdout, run)
         .await
-        .map_err(tool_error)?
-        .map_err(tool_error)?;
-        let candles = &loaded.series.candles;
-        let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
-            return Ok(());
-        };
-        CandleWindow::new(first.open_time, last.close_time).map_err(tool_error)?
-    };
-    crate::application::holdout::guard_persisted_window(holdout, &inputs.pair, &window)
-        .map_err(|refusal| field_error("run_id", refusal))
+        .map_err(|error| match error {
+            PersistedRunGuardError::Refused(_) | PersistedRunGuardError::MissingInputs => {
+                field_error("run_id", error)
+            }
+            other => tool_error(other),
+        })
 }
 
 /// The OPEN freeze's whole record, read once per `certify_version` call
