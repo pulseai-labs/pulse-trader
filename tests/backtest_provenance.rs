@@ -538,10 +538,11 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     assert!(applied.contains(&17), "0017 rides along: {applied:?}");
     assert!(applied.contains(&18), "0018 rides along: {applied:?}");
     assert!(applied.contains(&19), "0019 rides along: {applied:?}");
+    assert!(applied.contains(&20), "0020 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(19),
-        "0006 is recorded at its own version, below the maximum 0019 sets"
+        Some(20),
+        "0006 is recorded at its own version, below the maximum 0020 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;

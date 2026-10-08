@@ -26,6 +26,9 @@
 
 // r1.s3.w3: the Backtest Lab wire contract (DTOs + the pure projection).
 pub(crate) mod backtest;
+// r4.s1.w5 (spec A4/C5): the certification-record read — the app's full view of
+// a version's records, one plain route and one bus command (ADR-0020: additive).
+pub(crate) mod certification;
 // r1.s4.w3: the coach rail's wire contract (DTOs + the named recoveries) and the
 // two command cores. A separate module so `commands.rs` stays the registration
 // surface while the projection logic lives beside its own unit tests.
@@ -79,6 +82,11 @@ pub use walk_forward::{
     WalkForwardRunDto, WalkForwardRunRequest, WalkForwardVerdictDto, get_backtest_run_core,
     get_walk_forward_run_core, run_walk_forward_version_core,
 };
+// r4.s1.w5 (spec A4/C5): the certification-record read's wire shapes and core.
+pub use certification::{
+    CertificationRecordDto, CertificationRecordsDto, CertificationRecordsRequest,
+    CertificationSelectionDto, certification_records_core,
+};
 
 /// Build the `tauri-specta` builder that owns the command registry.
 ///
@@ -119,6 +127,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::paper_stop,
         commands::paper_stop_all,
         commands::paper_session_events,
+        // r4.s1.w5: the app's full certification-record read.
+        commands::certification_records,
     ])
 }
 

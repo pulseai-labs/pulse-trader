@@ -57,6 +57,10 @@ struct World {
     runs: SqliteBacktestRunRepo<pulse::SystemClock>,
     paper: SqlitePaperSessionRepo<FakeClock>,
     store: CandleStore,
+    /// The certification-record store (r4.s1.w5) — empty in this suite: none of
+    /// its versions is certified through a record, which is the point (the
+    /// `wf-v1` and override paths must not need one).
+    certifications: pulse::SqliteCertificationRepo<pulse::SystemClock>,
 }
 
 /// The test clock: a fixed instant, so an override's `at` is assertable.
@@ -72,11 +76,12 @@ async fn world() -> World {
         SqlitePaperSessionRepo::with_clock(db.pool().clone(), FakeClock::at(NOW_MS), store.clone());
     World {
         _tmp: tmp,
-        db,
+        db: db.clone(),
         strategies,
         runs,
         paper,
         store,
+        certifications: pulse::SqliteCertificationRepo::new(db.pool().clone()),
     }
 }
 
@@ -429,6 +434,7 @@ async fn try_promote(
         &world.runs,
         &world.paper,
         &clock,
+        &world.certifications,
         version_id,
         override_request.as_ref(),
         NonEmptyLabel::try_new(label).unwrap(),
@@ -1000,6 +1006,7 @@ async fn ix_unreadable_fold_inputs_refuse_certification() {
         &unreadable,
         &world.paper,
         &FakeClock::at(NOW_MS),
+        &world.certifications,
         &version_id,
         None,
         NonEmptyLabel::try_new("operator-token").unwrap(),
@@ -1038,6 +1045,7 @@ async fn x_disagreeing_fold_inputs_refuse_at_the_gate() {
     let error = decide_promotion(
         &version,
         Some(&run),
+        None,
         &[None, None],
         &EngineFingerprint::current(),
         None,
@@ -1056,6 +1064,7 @@ async fn x_disagreeing_fold_inputs_refuse_at_the_gate() {
     let error = decide_promotion(
         &version,
         Some(&run),
+        None,
         &borrowed,
         &EngineFingerprint::current(),
         None,
@@ -1073,6 +1082,7 @@ async fn x_disagreeing_fold_inputs_refuse_at_the_gate() {
     let draft = decide_promotion(
         &version,
         Some(&run),
+        None,
         &borrowed,
         &EngineFingerprint::current(),
         None,

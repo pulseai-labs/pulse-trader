@@ -279,11 +279,11 @@ async fn migration_0005_applies_to_a_database_already_at_0007() {
     // `0013`, `0014`, `0016`, `0017`, `0018` and `0019`, which the fixture
     // withheld; asserting `Some(7)` here would now be asserting that they did
     // not run, which is a different (and false) claim.
-    assert_all_rode_along(&applied, &[8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19]);
+    assert_all_rode_along(&applied, &[8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20]);
     assert_eq!(
         applied.iter().copied().max(),
-        Some(19),
-        "0005 is recorded at its own version, below the new maximum 0019 sets"
+        Some(20),
+        "0005 is recorded at its own version, below the new maximum 0020 sets"
     );
 
     assert!(

@@ -82,6 +82,7 @@ async fn seed_session(host: &PaperHost, name: &str) -> PaperSession {
         &host.runs(),
         &host.paper(),
         &host.clock,
+        &host.certifications(),
         &version.id,
         Some(&OverrideRequest {
             reason: NonEmptyReason::try_new("scope-suite seed").expect("non-empty reason"),

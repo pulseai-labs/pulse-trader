@@ -11,7 +11,7 @@
 //! `llm_call.key_source` provenance column, r1.s1.w2) and `0008` (the coach
 //! lifecycle rebuild of the two coaching tables, r1.s4.w4), `0009` (the
 //! external-agent provenance + run-window contract, r2.s1.w1) and `0010` (the
-//! window-edge open-position mark, r2.s1 G1); the embedded max is therefore 19
+//! window-edge open-position mark, r2.s1 G1); the embedded max is therefore 20
 //! (r2.s2.w2 `0011`, r2.s3.w2 `0012`, r2.s3.w3 `0013`, r2.s3.w4 `0014`, and
 //! r3.s3.w1 `0016` — the client-token tables; `0015` is reserved for r3.s1;
 //! r3.s2.w4 `0017` — `backtest_run.d1_data_version`, the recorded daily snapshot;
@@ -109,8 +109,8 @@ async fn migrate_up_then_undo_is_reversible() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        19,
-        "migrated to embedded max (19)"
+        20,
+        "migrated to embedded max (20)"
     );
     assert!(
         object_present(db.pool(), "table", "strategy").await,
@@ -138,7 +138,7 @@ async fn migrate_up_then_undo_is_reversible() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 19, "after re-run, max == 19");
+    assert_eq!(applied_max(db.pool()).await, 20, "after re-run, max == 20");
     assert!(
         index_present(db.pool()).await,
         "after re-run, 0002 index back"
@@ -170,7 +170,7 @@ async fn backup_written_before_migrate() {
     match outcome {
         pulse::MigrationOutcome::Migrated { from, to, backup } => {
             assert_eq!(from, 1, "from == the pre-migration version");
-            assert_eq!(to, 19, "to == the embedded max");
+            assert_eq!(to, 20, "to == the embedded max");
             assert!(backup.exists(), "backup file exists: {}", backup.display());
             let name = backup.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
@@ -185,7 +185,7 @@ async fn backup_written_before_migrate() {
 
     // The migration completed to the embedded max.
     let db = Db::with_path(&path).await.expect("reopen migrated db");
-    assert_eq!(applied_max(db.pool()).await, 19, "schema now at 0019");
+    assert_eq!(applied_max(db.pool()).await, 20, "schema now at 0020");
     assert!(
         index_present(db.pool()).await,
         "0002 index present post-migrate"
@@ -216,8 +216,8 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        19,
-        "migrated to embedded max (19)"
+        20,
+        "migrated to embedded max (20)"
     );
     assert!(
         schema_0003_present(db.pool()).await,
@@ -254,7 +254,7 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 19, "after re-run, max == 19");
+    assert_eq!(applied_max(db.pool()).await, 20, "after re-run, max == 20");
     assert!(
         schema_0003_present(db.pool()).await,
         "after re-run, 0003 backtest_run + trade tables and both indexes back"
@@ -286,8 +286,8 @@ async fn migration_0004_llm_call_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        19,
-        "migrated to embedded max (19)"
+        20,
+        "migrated to embedded max (20)"
     );
     assert!(
         schema_0004_present(db.pool()).await,
@@ -320,7 +320,7 @@ async fn migration_0004_llm_call_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 19, "after re-run, max == 19");
+    assert_eq!(applied_max(db.pool()).await, 20, "after re-run, max == 20");
     assert!(
         schema_0004_present(db.pool()).await,
         "after re-run, 0004 llm_call table + triggers + index back"
@@ -418,7 +418,7 @@ async fn migration_0011_trade_stop_price_roundtrip() {
         .expect("migrate to embedded max");
 
     // (a) At the embedded max the column exists.
-    assert_eq!(applied_max(db.pool()).await, 19, "embedded max is 19");
+    assert_eq!(applied_max(db.pool()).await, 20, "embedded max is 20");
     assert!(
         stop_price_column_present(db.pool()).await,
         "trade.stop_price exists after up"
@@ -436,12 +436,12 @@ async fn migration_0011_trade_stop_price_roundtrip() {
         "after undo to 10, trade.stop_price is gone"
     );
 
-    // (c) Re-running brings 0011-0019 back (reversible round): 10 → 19.
+    // (c) Re-running brings 0011-0020 back (reversible round): 10 → 20.
     MIGRATOR
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 19, "after re-run, max == 19");
+    assert_eq!(applied_max(db.pool()).await, 20, "after re-run, max == 20");
     assert!(
         stop_price_column_present(db.pool()).await,
         "after re-run, trade.stop_price is back"
@@ -549,7 +549,7 @@ async fn migration_0019_certification_freeze_roundtrip() {
         .expect("migrate to embedded max");
 
     // (a) At the embedded max the table is present.
-    assert_eq!(applied_max(db.pool()).await, 19, "embedded max is 19");
+    assert_eq!(applied_max(db.pool()).await, 20, "embedded max is 20");
     assert!(
         object_present(db.pool(), "table", "certification_freeze").await,
         "certification_freeze exists after up"
@@ -565,12 +565,12 @@ async fn migration_0019_certification_freeze_roundtrip() {
         "after undo to 18, certification_freeze is gone"
     );
 
-    // (c) Re-running brings 0019 back (reversible round): 18 → 19.
+    // (c) Re-running brings 0019 AND 0020 back (reversible round): 18 → 20.
     MIGRATOR
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 19, "after re-run, max == 19");
+    assert_eq!(applied_max(db.pool()).await, 20, "after re-run, max == 20");
     assert!(
         object_present(db.pool(), "table", "certification_freeze").await,
         "after re-run, certification_freeze is back"
@@ -608,11 +608,12 @@ async fn migration_0019_down_refuses_a_freeze_row() {
         err.to_string().contains("0019") && err.to_string().contains("refus"),
         "the refusal names the migration and the state: {err}"
     );
-    // The abort was transactional: the schema stays at 0019 with the row.
+    // Each migration's down is its own transaction: 0020's (empty) down
+    // committed, 0019's refused — so the schema stands at 0019 with the row.
     assert_eq!(
         applied_max(db.pool()).await,
         19,
-        "the refused down left the schema at 0019"
+        "0020's empty down applied; the refused 0019 down left the schema at 0019"
     );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM certification_freeze")
         .fetch_one(db.pool())
@@ -628,3 +629,125 @@ async fn migration_0019_down_refuses_a_freeze_row() {
 // (`run_migrations_with_backup_using`) is private: the public entry point always uses
 // the embedded `MIGRATOR`. Widening that seam to `pub` just to reach it from an
 // integration test would grow the API surface for a test's convenience.
+
+/// r4.s1.w5 / AC-5: `0020` adds the immutable `certification` table (one row
+/// per hypothesis: the search verdict, the holdout's window, count, mean and
+/// bound, and the two data-version selections). An empty table downgrades
+/// losslessly to the exact 0019 shape, and the re-run brings it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0020_certification_roundtrip() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+
+    // (a) At the embedded max the table and its two laws are present.
+    assert_eq!(applied_max(db.pool()).await, 20, "embedded max is 20");
+    assert!(
+        object_present(db.pool(), "table", "certification").await,
+        "certification exists after up"
+    );
+    assert!(
+        object_present(db.pool(), "index", "certification_freeze_index").await,
+        "the (freeze_id, hypothesis_index) unique index exists after up"
+    );
+
+    // (b) Empty: the down restores 0019 exactly — the table is gone, max 19.
+    undo_to(db.pool(), 19)
+        .await
+        .expect("empty 0020 downgrades losslessly");
+    assert_eq!(applied_max(db.pool()).await, 19, "after undo, max == 19");
+    assert!(
+        !object_present(db.pool(), "table", "certification").await,
+        "after undo to 19, certification is gone"
+    );
+
+    // (c) Re-running brings 0020 back (reversible round): 19 → 20.
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("re-run to embedded max");
+    assert_eq!(applied_max(db.pool()).await, 20, "after re-run, max == 20");
+    assert!(
+        object_present(db.pool(), "table", "certification").await,
+        "after re-run, certification is back"
+    );
+}
+
+/// r4.s1.w5 / AC-5: the `0020` down REFUSES over a certification row — 0019
+/// has no table for it, and dropping it would erase the record of what a spent
+/// hypothesis scored (ADR-0018; the scratch-table + refuse-trigger pattern
+/// 0010/0013/0019 set).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0020_down_refuses_a_certification_row() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+    seed_certification(db.pool()).await;
+
+    let err = undo_to(db.pool(), 19)
+        .await
+        .expect_err("a certification row must refuse the 0020 down");
+    assert!(
+        err.to_string().contains("0020") && err.to_string().contains("refus"),
+        "the refusal names the migration and the state: {err}"
+    );
+    // The abort was transactional: the schema stays at 0020 with the row.
+    assert_eq!(
+        applied_max(db.pool()).await,
+        20,
+        "the refused down left the schema at the embedded max"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM certification")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "the refused down left the certification record in place"
+    );
+
+    // And the row is still immutable, whatever the down refused to do.
+    let edit = sqlx::query("UPDATE certification SET certified = 0 WHERE id = 'cert-1'")
+        .execute(db.pool())
+        .await
+        .expect_err("an edit is refused");
+    assert!(edit.to_string().contains("immutable"), "{edit}");
+}
+
+/// Seed the FK chain a `certification` row needs — a strategy, its version, one
+/// `walk_forward_run` of it, an open freeze — then the record itself. Raw sqlx,
+/// the same shape the repo suites' seeds use; the JSON columns carry the real
+/// selection shape (the `15m`/`4h` serde spelling).
+async fn seed_certification(pool: &SqlitePool) {
+    seed_run_with_trade(pool, None, "hash").await;
+    sqlx::query(
+        "INSERT INTO walk_forward_run          (id, seq, strategy_version_id, created_at, scheme, rule, k, span_from_ms,           span_to_ms, from_defaulted, engine_fingerprint, folds_holding, folds_required,           pooled_n, pooled_mean_r, pooled_lower_bound, pass)          VALUES ('wf-1', 1, 'ver-1', '2026-06-30T00:00:00.000Z', 'rolling-oos/v1', 'wf-v2',                  6, 0, 1000, 0, 'fp', 6, 4, 100, '0.4', 0.2, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO certification_freeze          (id, holdout_start_ms, h, alpha, holdout_test, opened_at_ms, closed_at_ms)          VALUES ('freeze-1', 1751328000000, 12, '0.0463', 'C1: z = z(1 - 0.05/H)',                  1759900000000, NULL)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let selections = "{\"primary\":{\"timeframe\":\"15m\",\"data_version\":\"v-primary\"},\"htf\":null,\"d1\":null}";
+    sqlx::query(
+        "INSERT INTO certification          (id, version_id, freeze_id, hypothesis_index, rule, pair, search_walk_forward_run_id,           search_pass, holdout_start_ms, holdout_end_ms, holdout_n, holdout_mean_r, holdout_z,           holdout_lower_bound, holdout_passes, certified, search_inputs, holdout_inputs,           engine_fingerprint, created_at, called_by)          VALUES ('cert-1', 'ver-1', 'freeze-1', 1, 'wf-v2', 'BTCUSDT', 'wf-1', 1,                  1751328000000, 1754006400000, 200, '0.4', 2.64, 0.2, 1, 1, ?1, ?1,                  'fp', '2026-06-30T00:00:00.000Z', 'test-agent')",
+    )
+    .bind(selections)
+    .execute(pool)
+    .await
+    .unwrap();
+}

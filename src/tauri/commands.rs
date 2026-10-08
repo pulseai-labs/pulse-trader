@@ -58,6 +58,7 @@ use super::backtest::{
     BacktestRunDto, BacktestRunRequest, CompareChildRunDto, CompareChildRunRequest,
     backtest_run_dto,
 };
+use super::certification::{CertificationRecordsDto, CertificationRecordsRequest};
 use super::coach::{
     CoachDecisionDto, CoachDecisionRequestDto, CoachSessionDto, CoachTurnRequestDto, summary_dto,
 };
@@ -77,8 +78,8 @@ use super::walk_forward::{
 };
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
-    Db, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteLlmCallRepo,
-    SqliteStrategyRepo, default_db_path, open_migrated,
+    Db, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
+    SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path, open_migrated,
 };
 // r3.s3.w5: the thin-client state every proxied command speaks through.
 use crate::agent::ComposerEvent;
@@ -144,6 +145,8 @@ pub const BUS_COMMANDS: &[&str] = &[
     "paper_stop",
     "paper_stop_all",
     "paper_session_events",
+    // r4.s1.w5: the app's full certification-record read (spec A4/C5).
+    "certification_records",
 ];
 
 // ---------------------------------------------------------------------------
@@ -404,6 +407,14 @@ impl DesktopState {
     #[must_use]
     pub fn freeze_repo(&self) -> SqliteCertificationFreezeRepo<SystemClock> {
         SqliteCertificationFreezeRepo::new(self.db.pool().clone())
+    }
+
+    /// The certification-record store over the shared pool (r4.s1.w5, spec A4)
+    /// — the app's full view of a version's certification records. Same
+    /// cheap-wrapper pattern as [`DesktopState::strategy_repo`].
+    #[must_use]
+    pub fn certification_repo(&self) -> SqliteCertificationRepo<SystemClock> {
+        SqliteCertificationRepo::new(self.db.pool().clone())
     }
 
     /// The open freeze's holdout start (r4.s1.w4, Q4), read once per app call —
@@ -1748,6 +1759,27 @@ pub async fn get_backtest_run(
     request: GetBacktestRunRequest,
 ) -> Result<BacktestRunDto, BusError> {
     state.post("/api/v1/get-backtest-run", &request).await
+}
+
+/// `certification_records` — one version's certification records in full: the
+/// app's own view of what an agent-scope `certify_version` call recorded,
+/// holdout numbers included (r4.s1.w5, spec A4/C5). The same read the
+/// `agent` surface deliberately does NOT have.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`certification_records_core`].
+/// The record's immutability is the store's, not this read's. A version with
+/// no records answers an empty list.
+///
+/// [`certification_records_core`]: crate::tauri::certification::certification_records_core
+#[tauri::command]
+#[specta::specta]
+pub async fn certification_records(
+    state: tauri::State<'_, ClientState>,
+    request: CertificationRecordsRequest,
+) -> Result<CertificationRecordsDto, BusError> {
+    state.post("/api/v1/certification-records", &request).await
 }
 
 // ---------------------------------------------------------------------------

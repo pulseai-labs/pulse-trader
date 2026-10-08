@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO certification (id, version_id, freeze_id, hypothesis_index, rule, pair, search_walk_forward_run_id, search_pass, holdout_start_ms, holdout_end_ms, holdout_n, holdout_mean_r, holdout_z, holdout_lower_bound, holdout_passes, certified, search_inputs, holdout_inputs, engine_fingerprint, created_at, called_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 21
+    },
+    "nullable": []
+  },
+  "hash": "7c38b775231efd93489e79369fe1a555d6cbf8ca89782e8e3a3428c3c8fc5143"
+}

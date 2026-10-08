@@ -550,14 +550,21 @@ where
     E: ExchangeAdapter + Clone + Send + 'static,
     R: WalkForwardRunRepository,
 {
-    if !parent.certified {
+    // The gate's precondition is the parent's own certification — the child of
+    // a version whose latest walk-forward run PASSED must out-certify it — read
+    // from the RUN, not from `StrategyVersion::certified` (r4.s1.w5): that flag
+    // also means "carries a certification record", and G4 gates a `wf-v2`
+    // lineage under wf-v2 whether or not such a record exists yet. A parent
+    // with no run at all, or whose run failed, is ungated — exactly as before
+    // the record existed. (A pointer that names a run which no longer exists is
+    // the corrupt case this gate refuses by name, below.)
+    if parent.latest_walk_forward_run_id.is_none() {
         return Ok(None);
     }
-
-    // `certified` is DERIVED from the pointer's `pass`, so the run exists
-    // whenever the read is honest — a corrupt or absent row is exactly the
-    // case this gate exists to refuse, so the load is spelled out, not unwrapped.
     let certifying = certifying_run(runs, parent).await?;
+    if !certifying.verdict.pass {
+        return Ok(None);
+    }
 
     // The CANDIDATE is what walks forward — its own compile, mapped to the stage
     // the taxonomy reserves for it (D6).

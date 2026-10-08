@@ -26,8 +26,8 @@ use pulse::{
     BinanceAdapter, Candle, CandleStore, Clock, ClosedBarSource, CreatedBy, DataError, Db, LiveEnv,
     NewVersion, NonEmptyLabel, NonEmptyReason, OverrideRequest, Pair, PaperControl, PaperRuntime,
     PaperSession, PaperSessionId, PaperSessionRepository, SettlePolicy, SqliteBacktestRunRepo,
-    SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SystemClock,
-    Timeframe, VersionId, promote,
+    SqliteCertificationRepo, SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyDsl,
+    StrategyRepository, SystemClock, Timeframe, VersionId, promote,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -253,6 +253,12 @@ impl PaperWorld {
         }
     }
 
+    /// A fresh certification-record store over the world's pool (r4.s1.w5) —
+    /// the promotion gate's read.
+    pub fn certifications(&self) -> SqliteCertificationRepo<SystemClock> {
+        SqliteCertificationRepo::new(self.db.pool().clone())
+    }
+
     /// A fresh paper-session repository over the world's pool/store/clock.
     pub fn paper(&self) -> SqlitePaperSessionRepo<SteppedClock> {
         SqlitePaperSessionRepo::with_clock(
@@ -341,6 +347,7 @@ pub async fn promote_session(
         &world.runs(),
         &world.paper(),
         &world.clock.clone(),
+        &world.certifications(),
         version_id,
         Some(&request),
         NonEmptyLabel::try_new("operator-token").unwrap(),
@@ -501,6 +508,12 @@ impl PaperHost {
             self.clock.clone(),
             self.store.clone(),
         )
+    }
+
+    /// A fresh certification-record store over the host's pool (r4.s1.w5) —
+    /// the app-side promotion's record read.
+    pub fn certifications(&self) -> SqliteCertificationRepo<SystemClock> {
+        SqliteCertificationRepo::new(self.db.pool().clone())
     }
 
     /// A fresh strategy repository over the host's pool.

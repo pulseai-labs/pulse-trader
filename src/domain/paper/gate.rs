@@ -34,12 +34,13 @@
 use rust_decimal::Decimal;
 
 use crate::domain::backtest::{BacktestInputs, WalkForwardRun};
+use crate::domain::certification::CertificationRecord;
 use crate::domain::paper::session::{
     CertifiedDataVersion, Graduation, MIN_TRADES, NonEmptyLabel, NonEmptyReason, SLIPPAGE_BPS,
     STARTING_EQUITY_USDT, TAKER_FEE_BPS,
 };
 use crate::domain::strategy::StrategyVersion;
-use crate::domain::{EngineFingerprint, Pair, Timeframe};
+use crate::domain::{EngineFingerprint, Pair, Timeframe, VerdictRule};
 
 /// An override promotion request: the human's non-empty reason, the instant
 /// it was taken (RFC3339, from the injected clock — the caller stamps it, the
@@ -192,9 +193,18 @@ fn certified_versions(fold_inputs: &[Option<&BacktestInputs>]) -> Vec<CertifiedD
 
 /// The promotion gate (spec §4). See the module docs for the two paths.
 ///
+/// **`certification` is the version's certified record, when it has one**
+/// (r4.s1.w5, spec A5). A `wf-v2` run's pass is a SEARCH-span verdict, and the
+/// campaign's candidates are tuned towards it — so it certifies nothing by
+/// itself: a `wf-v2` run promotes as `Certified` only when `certification`
+/// names that very run and says `certified`. The `wf-v1` path is unchanged
+/// (today's rule, kept for the fixture and older lineages), and so is the
+/// override path.
+///
 /// # Errors
 ///
-/// [`PromotionRefused::Uncertified`] when there is no passing run and no
+/// [`PromotionRefused::Uncertified`] when there is no run that certifies (a
+/// failing run, or a `wf-v2` run with no certified record behind it) and no
 /// override, [`PromotionRefused::CertifiedUnderOtherEngine`] when the
 /// certifying run predates this build (with or without an override), and
 /// [`PromotionRefused::CertificationUnreadable`] when a fold run's inputs are
@@ -202,12 +212,24 @@ fn certified_versions(fold_inputs: &[Option<&BacktestInputs>]) -> Vec<CertifiedD
 pub fn decide_promotion(
     _version: &StrategyVersion,
     certifying_run: Option<&WalkForwardRun>,
+    certification: Option<&CertificationRecord>,
     fold_inputs: &[Option<&BacktestInputs>],
     current_fingerprint: &EngineFingerprint,
     promotion_override: Option<PromotionOverride>,
     promoted_by: NonEmptyLabel,
 ) -> Result<PromotionDraft, PromotionRefused> {
-    if let Some(run) = certifying_run.filter(|run| run.verdict.pass) {
+    // A run certifies when it passed AND the version carries the certification
+    // that names it: `wf-v1` runs are their own certification (the pre-wf-v2
+    // rule), while a `wf-v2` search-span pass needs the record.
+    let certifying = certifying_run
+        .filter(|run| run.verdict.pass)
+        .filter(|run| match run.rule {
+            VerdictRule::WfV1 => true,
+            VerdictRule::WfV2 => certification.is_some_and(|record| {
+                record.certified && record.search_walk_forward_run_id == run.id
+            }),
+        });
+    if let Some(run) = certifying {
         let certified_under = EngineFingerprint::from_stored(run.engine_fingerprint.clone());
         if certified_under != *current_fingerprint {
             return Err(PromotionRefused::CertifiedUnderOtherEngine {

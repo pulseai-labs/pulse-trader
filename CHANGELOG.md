@@ -8,6 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The certification step: one hypothesis, one holdout, one immutable record, and `certify_version`
+  (r4.s1.w5).** While a freeze is open, certifying a version walks it forward under `wf-v2` on the
+  search span — the guard clamps the span's end to the holdout start — runs ONE backtest over the
+  holdout (never persisted: no run read may surface holdout trades) and applies the C1 holdout test
+  at the freeze's H, then writes one immutable `certification` record (migration `0020`) whatever the
+  outcome: the search verdict, the pair, the per-timeframe data versions, the holdout's window, trade
+  count, mean and bound, the engine fingerprint and the calling client's label. The record is
+  immutable by trigger, `(freeze_id, hypothesis_index)` is unique so the budget cannot race, and a
+  refused or errored call writes nothing. The step refuses typed and by name — no open freeze, a
+  lineage root created before the freeze (C4), and the (H+1)th hypothesis — and MCP gains
+  `certify_version` (agent scope): one call is one hypothesis, and the answer carries the
+  certification's id, its pass/fail, the search-span verdict, `holdout_passed` and the hypotheses
+  used and left — **no holdout number** (grill Q5). The app reads the full record through a new
+  `app`-scope `certification_records` route, one row per record in the version detail view. A
+  version's `certified` flag and paper promotion now read the record: a `wf-v2` search-span pass
+  certifies and promotes nothing by itself — the `wf-v1` path, the override path and paper sessions
+  are unchanged.
+
 - **The holdout the tools enforce: the certification freeze, its guard, #327's echo, and the
   archive-hole fill (r4.s1.w4).** `pulse certify freeze --holdout-start <YYYY-MM-DD> --h <N>
   --alpha <decimal> --test <name>` opens ONE immutable freeze record (migration `0019`:

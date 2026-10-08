@@ -35,12 +35,14 @@ use serde_json::json;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
-    RunReadFailure, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteStrategyRepo,
+    RunReadFailure, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
+    SqliteStrategyRepo,
 };
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
     BacktestAppError, SnapshotPins, resolve_default_request, run_version_backtest,
 };
+use crate::application::certification::{CertifyRequest, certify_version};
 use crate::application::mcp_read::{
     parse_indicator_specs, run_detail, run_list_entry, strategy_entry, version_detail,
     version_entry,
@@ -53,12 +55,14 @@ use crate::application::walk_forward::{WalkForwardAppError, WalkForwardRequest, 
 use crate::application::walk_forward_read::{
     load_fold_runs, rfc3339_secs, run_summary_of, walk_forward_run_detail,
 };
+use crate::domain::certification::{CertifyError, CertifyRefusal};
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
-    CompiledValue, DataError, DataVersion, EvalContext, ExchangeAdapter as _, HoldoutFreeze,
-    MfeMaeAggregates, Pair, PaperSessionId, PersistedRun, Series, StrategyRepository, Timeframe,
-    ValidationCode, VerdictRule, WalkForwardRunId, WalkForwardRunRepository,
+    CompiledValue, DataError, DataVersion, EvalContext, ExchangeAdapter as _, FreezeRecord,
+    HoldoutFreeze, MfeMaeAggregates, Pair, PaperSessionId, PersistedRun, Series,
+    StrategyRepository, Timeframe, ValidationCode, VerdictRule, WalkForwardRunId,
+    WalkForwardRunRepository,
 };
 
 use super::PulseMcp;
@@ -232,6 +236,19 @@ pub(crate) struct RunWalkForwardArgs {
     /// wf-v2 existed.
     #[serde(default)]
     rule: Option<String>,
+}
+
+/// `certify_version` args (r4.s1.w5, spec A3).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CertifyVersionArgs {
+    /// The strategy-version id to certify.
+    version_id: String,
+    /// Optional `Binance` pair symbol (e.g. `SOLUSDT`) overriding the inherited
+    /// pair — validated through the run's own exchange adapter exactly as
+    /// `run_backtest`'s, before the step runs anything.
+    #[serde(default)]
+    pair: Option<String>,
 }
 
 /// `get_walk_forward_run` args (r2.s3.w5).
@@ -638,6 +655,40 @@ async fn open_holdout(state: &super::McpState) -> Result<Option<HoldoutFreeze>, 
         .await
         .map(|record| record.map(|r| r.holdout()))
         .map_err(tool_error)
+}
+
+/// The OPEN freeze's whole record, read once per `certify_version` call
+/// (r4.s1.w5, C4/Q2) — the step's precondition, its budget H, its holdout
+/// start and its id all come from it. `None` means no freeze is open, which
+/// the step refuses by name. A read failure is a tool error, never a silent
+/// `None`: an unreadable freeze table must not look like "no freeze".
+async fn open_freeze_record(
+    state: &super::McpState,
+) -> Result<Option<FreezeRecord>, CallToolResult> {
+    SqliteCertificationFreezeRepo::new(state.db.pool().clone())
+        .open_freeze()
+        .await
+        .map_err(tool_error)
+}
+
+/// A certification failure as the calling agent reads it (r4.s1.w5). The three
+/// typed refusals are field-pathed and name their reason — the missing freeze,
+/// the pre-freeze lineage root (naming it), or the spent budget (naming H);
+/// the composed use cases keep their own established mappings.
+fn certify_error_result(err: &CertifyError) -> CallToolResult {
+    match err {
+        CertifyError::Refused(CertifyRefusal::NoOpenFreeze) => field_error("freeze", err),
+        CertifyError::Refused(CertifyRefusal::PreFreezeLineage { .. }) => {
+            field_error("version_id", err)
+        }
+        CertifyError::Refused(CertifyRefusal::HypothesisBudgetSpent { .. }) => {
+            field_error("hypotheses", err)
+        }
+        CertifyError::VersionNotFound(_) => field_error("version_id", err),
+        CertifyError::WalkForward(error) => walk_forward_error_result(error),
+        CertifyError::Backtest(error) => backtest_error_result(error),
+        CertifyError::Store(_) | CertifyError::Internal(_) => tool_error(err),
+    }
 }
 
 /// An epoch-ms instant as RFC 3339 UTC **milliseconds** — the effective-window
@@ -1370,6 +1421,84 @@ impl PulseMcp {
             "to_clamped": to_clamped,
         });
         Ok(CallToolResult::structured(payload))
+    }
+
+    /// Certify one strategy version against the frozen holdout (r4.s1.w5,
+    /// spec A3; grill Q2/Q4/Q5).
+    ///
+    /// While a freeze is open, this walks the version forward under `wf-v2`
+    /// over the search span — the guard clamps the span's end to the holdout
+    /// start — runs ONE backtest over the holdout, and applies the C1 holdout
+    /// test at the freeze's hypothesis budget H. The record it writes is
+    /// immutable and every call counts, certified or not; the (H+1)th call is
+    /// refused by name. The answer carries the certification's id, its
+    /// pass/fail, the search-span verdict, whether the holdout passed, and the
+    /// hypotheses used and left — **never a holdout number** (grill Q5: no
+    /// holdout n, mean, bound, z, end or trade list); the app's own read shows
+    /// the full record.
+    #[tool(
+        description = "Certify one strategy version against the frozen holdout: ONE call is ONE hypothesis. Requires an open freeze (`pulse certify freeze`) and a version whose lineage root was created after it. Walks the version forward under wf-v2 over the search span, runs one backtest over the holdout, and applies the C1 holdout test at the freeze's budget H; the call is recorded whether or not it certifies, and the 13th call under H = 12 is refused. Answers certification_id, certified, the search-span verdict (pass, folds holding/required, pooled bound), holdout_passed, hypotheses_used and hypotheses_left — the holdout's own numbers (n, mean, bound, z, end, trades) are never returned here. Optional pair (e.g. SOLUSDT) overrides the inherited pair."
+    )]
+    #[allow(clippy::too_many_lines)]
+    async fn certify_version(
+        &self,
+        Parameters(args): Parameters<CertifyVersionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // r4.s1.w2's `pair` seam, unchanged: the symbol's shape, then the run's
+        // own exchange adapter's pin table — BEFORE the step, so a malformed or
+        // unpinned symbol is a `pair` field error and never burns a hypothesis.
+        let override_pair = match pair_override(self.state.exchange, args.pair.as_deref()) {
+            Ok(pair) => pair,
+            Err(result) => return Ok(result),
+        };
+        // r4.s1.w5 (C4/Q2): the OPEN freeze — the step's precondition, its
+        // budget and its holdout start. `None` (no freeze) is the step's own
+        // named refusal, not a tool error.
+        let freeze = match open_freeze_record(&self.state).await {
+            Ok(freeze) => freeze,
+            Err(result) => return Ok(result),
+        };
+        // The calling label comes from the SESSION identity — the authenticated
+        // token's label over HTTP, the flag/handshake name over stdio — never
+        // from a tool argument (grill Q5: the call is attributable).
+        let called_by = self.identity_lock().name.clone();
+        let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
+        let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        let certifications = SqliteCertificationRepo::new(self.state.db.pool().clone());
+        let outcome = match certify_version(
+            &strategies,
+            &self.state.candles,
+            &self.state.exchange,
+            &runs,
+            &certifications,
+            freeze.as_ref(),
+            &CertifyRequest {
+                version_id: VersionId::new(args.version_id),
+                pair: override_pair,
+                called_by,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(certify_error_result(&error)),
+        };
+        // Q5's "only this": the six facts an agent may see. The search verdict's
+        // tallies and pooled bound are the agent's own run feedback; the
+        // holdout's numbers are absent, not null.
+        Ok(CallToolResult::structured(json!({
+            "certification_id": outcome.record.id,
+            "certified": outcome.record.certified,
+            "search": {
+                "pass": outcome.search_verdict.pass,
+                "folds_holding": outcome.search_verdict.folds_holding,
+                "folds_required": outcome.search_verdict.folds_required,
+                "pooled_lower_bound": outcome.search_verdict.pooled.lower_bound,
+            },
+            "holdout_passed": outcome.record.holdout_passes,
+            "hypotheses_used": outcome.hypotheses_used,
+            "hypotheses_left": outcome.hypotheses_left,
+        })))
     }
 
     /// Fetch one persisted walk-forward run — the SAME `WalkForwardRunDetail`

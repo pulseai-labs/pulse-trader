@@ -253,12 +253,14 @@ async fn promote_out_of_band(ts: &TestServer, version_id: &VersionId) -> PaperSe
         ts.db.pool().clone(),
         CandleStore::with_base_dir(ts.data_dir.clone()),
     );
+    let certifications = pulse::SqliteCertificationRepo::new(ts.db.pool().clone());
     let session = promote(
         &strategies,
         &runs,
         &runs,
         &paper,
         &pulse::SystemClock,
+        &certifications,
         version_id,
         None,
         NonEmptyLabel::try_new("w5-out-of-band").unwrap(),

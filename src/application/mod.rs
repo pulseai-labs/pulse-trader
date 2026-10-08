@@ -100,3 +100,10 @@ pub(crate) mod walk_forward;
 // `WalkForwardRunDetail` wire shape both MCP walk-forward tools return, so no
 // delivery ring re-derives its own read.
 pub(crate) mod walk_forward_read;
+
+// r4.s1.w5 (spec A2, G7/C1/C4/C5): the certification step — the ONE caller
+// allowed to evaluate the holdout (grill Q4). It composes `run_walk_forward`
+// (the search span, under wf-v2) and the shared `prepare_over_loaded_series`
+// (the unpersisted holdout backtest), applies the C1 test at the open freeze's
+// H, and writes one immutable `certification` record whatever the outcome.
+pub(crate) mod certification;

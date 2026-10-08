@@ -292,6 +292,21 @@ export const commands = {
 	 *  [`PaperStreamEvent::TokenRefused`] on the channel.
 	 */
 	paperSessionEvents: (id: string, afterSeq: number | null, channel: Channel<PaperStreamEvent>) => typedError<null, BusError>(__TAURI_INVOKE("paper_session_events", { id, afterSeq, channel })),
+	/**
+	 *  `certification_records` — one version's certification records in full: the
+	 *  app's own view of what an agent-scope `certify_version` call recorded,
+	 *  holdout numbers included (r4.s1.w5, spec A4/C5). The same read the
+	 *  `agent` surface deliberately does NOT have.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`certification_records_core`].
+	 *  The record's immutability is the store's, not this read's. A version with
+	 *  no records answers an empty list.
+	 * 
+	 *  [`certification_records_core`]: crate::tauri::certification::certification_records_core
+	 */
+	certificationRecords: (request: CertificationRecordsRequest) => typedError<CertificationRecordsDto, BusError>(__TAURI_INVOKE("certification_records", { request })),
 };
 
 /* Types */
@@ -692,6 +707,77 @@ text: string } |
 { kind: "finished"; 
 /**  A closing summary line. */
 message: string };
+
+/**
+ *  One certification record in full — everything the immutable row carries,
+ *  the holdout's numbers included (the `agent` surface sees none of them).
+ */
+export type CertificationRecordDto = {
+	/**  The record's id. */
+	id: string,
+	/**  The certified version. */
+	versionId: string,
+	/**  The freeze the call ran under. */
+	freezeId: string,
+	/**  The hypothesis's position under that freeze (`1..=H`). */
+	hypothesisIndex: number,
+	/**  The search rule's persisted name. */
+	rule: string,
+	/**  The pair both halves evaluated. */
+	pair: string,
+	/**  The persisted search-span walk-forward run. */
+	searchWalkForwardRunId: string,
+	/**  Whether the search-span `wf-v2` verdict passed. */
+	searchPass: boolean,
+	/**  The holdout window's inclusive start, RFC 3339 ms. */
+	holdoutStart: string,
+	/**  The holdout window's exclusive end, RFC 3339 ms (C5). */
+	holdoutEnd: string,
+	/**  The holdout's trade count (C5). */
+	holdoutN: number,
+	/**  The holdout's mean expectancy in R, exact decimal string. */
+	holdoutMeanR: string,
+	/**  The C1 test's quantile at this freeze's H. */
+	holdoutZ: number | null,
+	/**  The one-sided lower bound on the holdout expectancy. */
+	holdoutLowerBound: number | null,
+	/**  Whether the C1 holdout test passed. */
+	holdoutPasses: boolean,
+	/**  `search_pass AND holdout_passes`. */
+	certified: boolean,
+	/**  The search span's data versions, per timeframe. */
+	searchDataVersions: CertificationSelectionDto[],
+	/**  The holdout's data versions, per timeframe. */
+	holdoutDataVersions: CertificationSelectionDto[],
+	/**  The search run's engine fingerprint. */
+	engineFingerprint: string,
+	/**  When the record was written, RFC 3339 ms. */
+	createdAt: string,
+	/**  The calling client's label. */
+	calledBy: string,
+};
+
+/**  What `certification_records` answers: one version's records, newest first. */
+export type CertificationRecordsDto = {
+	/**  The version the records belong to. */
+	versionId: string,
+	/**  The records, newest (highest `hypothesis_index`) first. */
+	records: CertificationRecordDto[],
+};
+
+/**  What `certification_records` is asked for: one strategy version. */
+export type CertificationRecordsRequest = {
+	/**  The version whose certification records to read. */
+	versionId: string,
+};
+
+/**  One side's recorded `(timeframe, data_version)` selections. */
+export type CertificationSelectionDto = {
+	/**  The candle interval, e.g. `M15`. */
+	timeframe: string,
+	/**  The exact immutable snapshot identity (`ADR-0009`'s content hash). */
+	dataVersion: string,
+};
 
 /**
  *  What the trader did with the coach's proposal.

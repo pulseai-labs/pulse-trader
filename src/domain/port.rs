@@ -35,6 +35,7 @@ use crate::domain::backtest::{
     SnapshotSelection, Trade, WalkForwardRun, WalkForwardRunDraft, WalkForwardRunId,
 };
 use crate::domain::candle::Candle;
+use crate::domain::certification::{CertificationDraft, CertificationRecord};
 use crate::domain::coaching::{
     AcceptedCoachOutcome, CoachAcceptFailure, CoachSessionClaim, CoachSessionClaimResult,
     CoachTurnProjection, CoachingSession, CoachingSessionId, Disposition, InitialCoachOutcome,
@@ -693,6 +694,69 @@ pub trait WalkForwardRunRepository {
         &self,
         id: &WalkForwardRunId,
     ) -> impl Future<Output = Result<Option<WalkForwardRun>, DataError>> + Send;
+}
+
+/// `PulseTrader`'s certification-record persistence port (r4.s1.w5, G7/C1/C5) —
+/// the immutable `certification` rows that record one hypothesis each. The
+/// established repository style: `impl Future<Output = ...> + Send`, consumed
+/// generically, never `dyn`; the SQLite adapter
+/// (`adapters::db::certification_repo`) implements it over `pulse.db` behind
+/// `0020`'s immutability triggers.
+///
+/// **Rows are create + read only** — a certification is written once, whatever
+/// its outcome, and is never updated or deleted: it is the audit trail's atom.
+/// The adapter derives the `hypothesis_index` inside the write transaction
+/// (`MAX(index)+1` under that freeze), which is what makes the hypothesis
+/// budget race-free beside `0020`'s unique index.
+pub trait CertificationRepository {
+    /// A version's certification records, **newest first** (`hypothesis_index`
+    /// descending), fail-closed like every sibling read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row or a store failure.
+    fn list_for_version(
+        &self,
+        version_id: &VersionId,
+    ) -> impl Future<Output = Result<Vec<CertificationRecord>, DataError>> + Send;
+
+    /// A version's newest **certified** record (`certified = 1`), or `None`
+    /// when it has none — the promotion gate's read (a wf-v2 search pass alone
+    /// never certifies, so the gate needs the record, not the run).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row or a store failure.
+    fn latest_certified(
+        &self,
+        version_id: &VersionId,
+    ) -> impl Future<Output = Result<Option<CertificationRecord>, DataError>> + Send;
+
+    /// How many hypotheses the freeze has already spent — the step's budget
+    /// read before it runs anything (`>= h` refuses by name, Q2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a store failure.
+    fn count_for_freeze(
+        &self,
+        freeze_id: &str,
+    ) -> impl Future<Output = Result<u32, DataError>> + Send;
+
+    /// Persist one record in ONE `BEGIN IMMEDIATE` transaction: the adapter
+    /// mints the id and `created_at` (injected [`Clock`]), derives
+    /// `hypothesis_index = MAX(index)+1` under the draft's freeze, and derives
+    /// the `certified` cell from the draft's halves (the schema's CHECK holds
+    /// the same law against a raw INSERT).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the version or freeze does not exist or
+    /// the store fails.
+    fn insert(
+        &self,
+        draft: &CertificationDraft,
+    ) -> impl Future<Output = Result<CertificationRecord, DataError>> + Send;
 }
 
 /// `PulseTrader`'s paper-session persistence port (r3.s4.w2, ADR-0027) — the
