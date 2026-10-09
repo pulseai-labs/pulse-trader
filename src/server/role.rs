@@ -206,39 +206,102 @@ fn create_exclusive(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused
     write_marker(data_dir, role, true)
 }
 
-/// The one marker write: one line, mode 0600, the data dir created first.
-/// `exclusive` picks `create_new` (the absent-marker race) over
-/// create-or-replace (the callers that already validated the marker —
-/// `qa-seed`'s re-run).
+/// The one marker write: one line, mode 0600, the data dir created first (0700,
+/// PR-354 fix D1b), and the marker PUBLISHED from a temp file (PR-354 fix D1a).
+///
+/// The role is written to a unique temp file beside the marker and only then
+/// published under the marker's name — with a hard link on the exclusive path
+/// (`link(2)` fails `AlreadyExists` atomically, which [`check`] turns into
+/// "re-read and validate the winner") and a rename on the create-or-replace
+/// path (`qa-seed`'s re-run). A marker is therefore never visible empty or
+/// partial: the old create-then-write let a racing reader see `""` and refuse
+/// `MarkerUnreadable`, and a failed write left an empty marker that refused
+/// every later start.
 fn write_marker(data_dir: &Path, role: ServerRole, exclusive: bool) -> Result<(), RoleRefused> {
     let path = data_dir.join(ROLE_MARKER_NAME);
-    fs::create_dir_all(data_dir).map_err(|source| RoleRefused::MarkerWrite {
-        path: path.clone(),
-        source,
-    })?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    if exclusive {
-        options.create_new(true);
-    } else {
-        options.create(true).truncate(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&path)
-        .map_err(|source| RoleRefused::MarkerWrite {
+    crate::adapters::db::create_private_dir(data_dir).map_err(|source| {
+        RoleRefused::MarkerWrite {
             path: path.clone(),
             source,
-        })?;
+        }
+    })?;
+    let (temp, mut file) = create_temp_marker(data_dir, &path)?;
+    let result = write_and_publish(&mut file, &temp, &path, role, exclusive);
+    drop(file);
+    // The temp name goes whatever happened: on success the published marker
+    // holds the inode, on failure nothing at all is left behind.
+    let _ = fs::remove_file(&temp);
+    result
+}
+
+/// The unique temp file a marker write lands in first, beside the marker it
+/// publishes: this process's pid plus a process-local counter, so neither two
+/// writes in one process nor two processes can collide. A stale temp from a
+/// crashed run with a recycled pid is stepped over (the next counter is free).
+fn create_temp_marker(data_dir: &Path, marker: &Path) -> Result<(PathBuf, fs::File), RoleRefused> {
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..8 {
+        let temp = temp_marker_path(data_dir);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = Some(error);
+            }
+            Err(source) => {
+                return Err(RoleRefused::MarkerWrite {
+                    path: marker.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(RoleRefused::MarkerWrite {
+        path: marker.to_path_buf(),
+        source: last.unwrap_or_else(|| std::io::Error::other("no marker temp name was free")),
+    })
+}
+
+/// The temp marker's name under `data_dir`.
+fn temp_marker_path(data_dir: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    data_dir.join(format!(".{ROLE_MARKER_NAME}.{}.{n}", std::process::id()))
+}
+
+/// Write the role into the temp file, flush it, then publish it under the
+/// marker's name — `hard_link` (exclusive) or `rename` (create-or-replace).
+fn write_and_publish(
+    file: &mut fs::File,
+    temp: &Path,
+    path: &Path,
+    role: ServerRole,
+    exclusive: bool,
+) -> Result<(), RoleRefused> {
     writeln!(file, "{}", role.as_str()).map_err(|source| RoleRefused::MarkerWrite {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source,
     })?;
-    Ok(())
+    file.flush().map_err(|source| RoleRefused::MarkerWrite {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let published = if exclusive {
+        fs::hard_link(temp, path)
+    } else {
+        fs::rename(temp, path)
+    };
+    published.map_err(|source| RoleRefused::MarkerWrite {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// The containment rule: the database must sit inside the data dir, because the
@@ -365,7 +428,9 @@ fn resolve(path: &Path) -> Result<PathBuf, RoleRefused> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{ROLE_MARKER_NAME, RoleRefused, ServerRole, check, create_exclusive, lost_race};
+    use super::{
+        ROLE_MARKER_NAME, RoleRefused, ServerRole, check, create_exclusive, lost_race, write,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -461,5 +526,72 @@ mod tests {
             }
             other => panic!("the failure is the create's MarkerWrite: {other}"),
         }
+    }
+
+    /// PR-354 fix D1b: a data dir this code creates is 0700, never the process
+    /// umask's 0755 — the marker's dir holds the database and the tokens (G10).
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_data_dir_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("fresh").join("nested");
+
+        check(&data_dir, &data_dir.join("pulse.db"), ServerRole::Prod)
+            .expect("the first start marks a fresh dir");
+
+        for path in [dir.path().join("fresh"), data_dir.clone()] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is private", path.display());
+        }
+        let marker_mode = fs::metadata(data_dir.join(ROLE_MARKER_NAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(marker_mode, 0o600, "and the marker is too");
+    }
+
+    /// PR-354 fix D1a: the marker is published from a temp file, so a write that
+    /// cannot land leaves NO marker at all — the old create-then-write left an
+    /// empty one, which refused every later start as `MarkerUnreadable` — and no
+    /// temp file behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_marker_write_leaves_no_marker_and_no_temp() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        // A read-only dir: the temp file cannot be created at all.
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        for (what, attempt) in [
+            ("write", write(&data_dir, ServerRole::Qa)),
+            (
+                "exclusive create",
+                create_exclusive(&data_dir, ServerRole::Qa),
+            ),
+        ] {
+            let error = attempt.expect_err("a read-only dir refuses the marker write");
+            assert!(
+                matches!(error, RoleRefused::MarkerWrite { .. }),
+                "{what}: {error}"
+            );
+            assert!(
+                !data_dir.join(ROLE_MARKER_NAME).exists(),
+                "{what}: no marker exists"
+            );
+            let leftovers: Vec<_> = fs::read_dir(&data_dir)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect();
+            assert!(leftovers.is_empty(), "{what}: no temp left: {leftovers:?}");
+        }
+
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

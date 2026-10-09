@@ -181,12 +181,15 @@ pub(crate) fn canonical_identity(path: &Path) -> PathBuf {
     out
 }
 
-/// Create the lock file's parent directory when it is not there yet.
+/// Create the lock file's parent directory when it is not there yet — 0700,
+/// never the process umask's 0755 (PR-354 fix D1b: this call is the FIRST thing
+/// to make the database's directory on a fresh install, so it is the one that
+/// decides the isolation).
 fn create_parent(lock_path: &Path) -> Result<(), InstanceLockError> {
     if let Some(parent) = lock_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent).map_err(|error| InstanceLockError::Io {
+        super::create_private_dir(parent).map_err(|error| InstanceLockError::Io {
             lock: lock_path.to_path_buf(),
             reason: format!("create {}: {error}", parent.display()),
         })?;
@@ -317,4 +320,5 @@ mod tests {
         let again = InstanceLock::acquire(&db).expect("drop released the lock");
         drop(again);
     }
+
 }
