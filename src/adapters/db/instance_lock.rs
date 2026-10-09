@@ -3,7 +3,9 @@
 //! `pulse serve` holds this lock for its process lifetime; `pulse import` and
 //! `pulse restore` take it on their TARGET before any write. It is a
 //! **non-blocking** exclusive `flock(2)` on `<db path>.serve.lock`, beside the
-//! database — the same idiom [`migrate`](super::migrate)'s migration lock uses,
+//! RESOLVED database (PR-354 fix C3b: the resolved identity, so every spelling
+//! of one database takes one lock) — the same idiom
+//! [`migrate`](super::migrate)'s migration lock uses,
 //! except that a held lock is a REFUSAL with a named reason here, never a wait:
 //! the operator stops the server (or the in-flight data op) and retries.
 //!

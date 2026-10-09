@@ -19,8 +19,11 @@
 //! data-dir paths and, when `--role` is passed, applies the data dir's role
 //! marker BEFORE the database is opened (step 0, r4.s2.w3 — a refused start
 //! touches nothing: no database file created or migrated, no lock, no start-log
-//! entry, no marker change). It then migrate-then-opens the DB (step 1) and
-//! hands the [`ServeConfig`] here, where the rest run in order, one stderr line
+//! entry, no marker change), takes the database's instance lock on the resolved
+//! path (step 0c, r4.s2 PR-354 fix C3a — the lock came after the
+//! migrate-then-open before that, so an import could swap the file in between),
+//! then migrate-then-opens the DB (step 1) and hands the [`ServeConfig`] here
+//! (the guard with it), where the rest run in order, one stderr line
 //! per step through the state's sink: the start guard (step 2b, r4.s2.w1 — a
 //! refused start exits 0 here, before the credential, the bind and anything
 //! else), *credential resolution (step 3 — the w3 seam, marked below)*,

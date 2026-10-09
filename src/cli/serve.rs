@@ -2,8 +2,11 @@
 //! ADR-0026). Thin by design: the ordered startup steps, the bind policy and
 //! the retry loop live in `server::bind` where the tests drive them; this
 //! module parses the flags, applies the data-dir role marker (`--role`,
-//! r4.s2.w3) BEFORE the database is opened, opens the migrated DB, resolves the
-//! data dir and hands the [`ServeConfig`] over.
+//! r4.s2.w3) BEFORE the database is opened, takes the database's instance lock
+//! on the resolved path (PR-354 fix C3a — before the migrate-then-open, so an
+//! import/restore cannot swap the file in between), opens the migrated DB,
+//! resolves the data dir and hands the [`ServeConfig`] (the lock's guard with
+//! it) over.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
