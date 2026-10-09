@@ -947,13 +947,11 @@ fn marker_ssh(key: &Path, ssh_host: &str) -> MarkerReport {
                 let bytes = reader
                     .and_then(|handle| handle.join().ok())
                     .unwrap_or_default();
-                return match status.success() {
-                    true => {
-                        let stdout = String::from_utf8_lossy(&bytes);
-                        marker_line(&stdout).unwrap_or(MarkerReport::Failed)
-                    }
-                    false => MarkerReport::Failed,
-                };
+                if !status.success() {
+                    return MarkerReport::Failed;
+                }
+                let stdout = String::from_utf8_lossy(&bytes);
+                return marker_line(&stdout).unwrap_or(MarkerReport::Failed);
             }
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(SSH_MARKER_POLL);
