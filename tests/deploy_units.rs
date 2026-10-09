@@ -410,21 +410,25 @@ impl FakeRsync {
 }
 
 #[test]
-fn forced_command_serves_a_protocol_29_sender_invocation() {
+fn forced_command_serves_the_two_real_clients() {
     let fake = FakeRsync::new();
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().display().to_string();
 
-    // The protocol-29 (openrsync / "rsync version 2.6.9 compatible") shape the
-    // Mini's client sends — the acceptance case the plan gate asked for — and
-    // the modern rsync 3.x bundle beside it. Both are SERVED, never refused.
-    // The third is what macOS's openrsync ACTUALLY sends for the pull's own
-    // invocation (PR-354 fix C4): the short flags one word each, plus the
-    // pull's `--ignore-existing` as a long option.
+    // The EXACT server commands the two real clients send for this pull
+    // (PR-354 fix D3), and nothing else is served:
+    //   rsync 3.x — draco-desk's client, the deployed one, captured on the host
+    //   with rsync 3.4.1 (its long options are only `--server`/`--sender`; the
+    //   rest rides the short cluster);
+    //   macOS openrsync — the CI runner's client, derived from Apple's
+    //   openrsync `fargs.c` (`-a` emits g/l/o/p/D/r/t one word each,
+    //   `--ignore-existing` is the pull's own flag, `--dirs` is -a's implied
+    //   dirs) and confirmed by the CI refusal that named `--dirs`.
     for command in [
-        format!("rsync --server --sender -logDtpr . {root_path}/"),
-        format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}"),
-        format!("rsync --server --sender -g -l -o -p -r -t -D --ignore-existing . {root_path}/"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/"),
+        format!(
+            "rsync --server --sender -g -l -o -p -D -r -t --ignore-existing --dirs . {root_path}/"
+        ),
     ] {
         let output = fake.run(root.path(), &command);
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -449,24 +453,29 @@ fn forced_command_refuses_everything_but_a_read() {
     let root_path = root.path().display().to_string();
 
     // A write (an rsync invocation without `--sender`), a delete, a `..` path,
-    // a path outside the root, a shell, and a shell metacharacter.
+    // a path outside the root, a shell, and a shell metacharacter — plus the
+    // options an exact allowlist exists to stop (PR-354 fix D3): the delete
+    // family's abbreviations and long spellings (`--remove-source`, `--del`),
+    // and the link-following short options (`-rL`, `-L`, `-k`) and their long
+    // spelling (`--copy-links`), which would let a symlink under $ROOT expose
+    // files outside it.
     for command in [
-        format!("rsync --server -logDtpre.iLsfxC . {root_path}"),
+        format!("rsync --server -logDtpre.iLsfxCIvu . {root_path}"),
         format!("rsync --server --sender --delete . {root_path}"),
-        format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}/../etc"),
-        "rsync --server --sender -logDtpre.iLsfxC . /etc".to_owned(),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/../etc"),
+        "rsync --server --sender -logDtpre.iLsfxCIvu . /etc".to_owned(),
         format!("rm -rf {root_path}"),
-        format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}; rm -rf /"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}; rm -rf /"),
         "sh -c id".to_owned(),
-        // The delete family's unique abbreviations and long spellings
-        // (PR-354 fix C4): rsync and openrsync both accept `--remove-source`
-        // for `--remove-source-files` and `--del` for `--delete*`, so an exact
-        // allowlist is the only defense — a spelling denylist let these reach
-        // the exec and delete files under $ROOT.
         format!("rsync --server --sender --remove-source . {root_path}"),
         format!("rsync --server --sender --remove-source-files . {root_path}"),
         format!("rsync --server --sender --del . {root_path}"),
         format!("rsync --server --sender --delete-after . {root_path}"),
+        format!("rsync --server --sender -rL . {root_path}"),
+        format!("rsync --server --sender -L . {root_path}"),
+        format!("rsync --server --sender -k . {root_path}"),
+        format!("rsync --server --sender --copy-links . {root_path}"),
+        format!("rsync --server --sender -rL --dirs . {root_path}"),
     ] {
         let output = fake.run(root.path(), &command);
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

@@ -65,23 +65,34 @@ for WORD in "${WORDS[@]}"; do
     # form a human would type.
     "~/"*) WORD="$HOME/${WORD#\~/}" ;;
   esac
+  # The EXACT words the two real clients send for THIS pull (PR-354 fix D3).
+  # These are allowlists, not denylists: rsync and openrsync both accept unique
+  # abbreviations, so a spelling denylist let `--remove-source`/`--del` through,
+  # and a permissive `-*` let `-L` (copy-links) read through a symlink to files
+  # outside $ROOT. Anything else is refused by name.
+  #
+  #   rsync 3.x — draco-desk's client, the deployed one (captured on the host:
+  #   `rsync --server --sender -logDtpre.iLsfxCIvu . <root>/` with rsync 3.4.1);
+  #
+  #   macOS openrsync — the CI runner's client (Apple's openrsync fargs.c: `-a`
+  #   sets g/l/o/p/D/r/t, `--ignore-existing` is the pull's own flag, and
+  #   `--dirs` is -a's implied dirs — the CI refusal named exactly `--dirs`):
+  #   `rsync --server --sender -g -l -o -p -D -r -t --ignore-existing --dirs . <root>/`.
   case "$WORD" in
     --*)
-      # An EXACT allowlist of the long options the real clients send for this
-      # pull (PR-354 fix C4). rsync 3.x sends `--server --sender` and carries
-      # everything else in the short cluster; macOS's openrsync — the CI
-      # runner's `rsync`, and the shape the Mini serves — also sends the pull's
-      # own `--ignore-existing` as a long option. A DENYLIST of spellings was a
-      # forced-command bypass: rsync/openrsync accept unique abbreviations, so
-      # `--remove-source`, `--del` and `--delete-after` (deletes under $ROOT)
-      # were never named. Anything outside the allowlist is refused by name.
       case "$WORD" in
-        --server | --sender | --ignore-existing) ;;
+        --server | --sender | --ignore-existing | --dirs) ;;
         *) refuse "'$WORD' (only the pull's own long options are allowed)" ;;
       esac
       ;;
     -e)
       refuse "'-e' (an rsh command has no place in a forced command)"
+      ;;
+    -*)
+      case "$WORD" in
+        -logDtpre.iLsfxCIvu | -g | -l | -o | -p | -D | -r | -t) ;;
+        *) refuse "'$WORD' (only the pull's own short options are allowed)" ;;
+      esac
       ;;
   esac
   ARGS+=("$WORD")
