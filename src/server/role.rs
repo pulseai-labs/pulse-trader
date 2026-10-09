@@ -180,13 +180,49 @@ pub fn read(data_dir: &Path) -> Result<Option<ServerRole>, RoleRefused> {
 /// nothing else on the host reads the role, but the file sets the server's
 /// safety boundary, so it is as private as the data it describes).
 ///
+/// Creates the data dir when it is not there yet (PR-354 fix C2a): the first
+/// `--role` start on a fresh data dir must not fail with ENOENT before the
+/// database's own open would have made the directory — launchd would relaunch
+/// a server that never starts.
+///
 /// # Errors
 ///
 /// [`RoleRefused::MarkerWrite`] when the file cannot be created or written.
 pub fn write(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
+    write_marker(data_dir, role, false)
+}
+
+/// Create the marker EXCLUSIVELY for an absent-marker start (PR-354 fix C2b):
+/// two overlapping starts both read no marker, and with a plain create both
+/// would write — the loser would overwrite the winner's role. `create_new`
+/// (`O_EXCL`) makes the second create fail with `AlreadyExists`, which
+/// [`check`] turns into "re-read and validate the winning role".
+///
+/// # Errors
+///
+/// [`RoleRefused::MarkerWrite`] — with an `AlreadyExists` source when the
+/// marker appeared between the read and this call.
+fn create_exclusive(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
+    write_marker(data_dir, role, true)
+}
+
+/// The one marker write: one line, mode 0600, the data dir created first.
+/// `exclusive` picks `create_new` (the absent-marker race) over
+/// create-or-replace (the callers that already validated the marker —
+/// `qa-seed`'s re-run).
+fn write_marker(data_dir: &Path, role: ServerRole, exclusive: bool) -> Result<(), RoleRefused> {
     let path = data_dir.join(ROLE_MARKER_NAME);
+    fs::create_dir_all(data_dir).map_err(|source| RoleRefused::MarkerWrite {
+        path: path.clone(),
+        source,
+    })?;
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true);
+    if exclusive {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -225,23 +261,61 @@ pub(crate) fn ensure_db_inside_data_dir(data_dir: &Path, db: &Path) -> Result<()
 }
 
 /// Apply the marker for a `--role {role}` start: refuse a database outside the
-/// data dir, refuse a dir marked with the other role, write the marker when it
+/// data dir, refuse a dir marked with the other role, create the marker when it
 /// is absent, and continue on the same role.
+///
+/// The absent-marker path creates EXCLUSIVELY (PR-354 fix C2b): when two starts
+/// overlap, the loser's create fails `AlreadyExists` and it re-reads the
+/// winner's marker, validating it exactly as an existing marker is validated —
+/// never overwriting it.
 ///
 /// # Errors
 ///
 /// [`RoleRefused`] — and NOTHING is written on any refusal.
 pub fn check(data_dir: &Path, db: &Path, role: ServerRole) -> Result<(), RoleRefused> {
     ensure_db_inside_data_dir(data_dir, db)?;
-    match read(data_dir)? {
-        None => write(data_dir, role),
-        Some(marked) if marked == role => Ok(()),
-        Some(marked) => Err(RoleRefused::Mismatch {
-            marked,
-            asked: role,
-            data_dir: data_dir.to_path_buf(),
-        }),
+    if let Some(marked) = read(data_dir)? {
+        return same_role(marked, role, data_dir);
     }
+    match create_exclusive(data_dir, role) {
+        Ok(()) => Ok(()),
+        Err(RoleRefused::MarkerWrite { path, source })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            lost_race(data_dir, role, path, source)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The loser of the absent-marker race (PR-354 fix C2b): another start created
+/// the marker between this one's read and its exclusive create. Re-read the
+/// winner's marker and validate it exactly as an existing marker is validated —
+/// the same role continues, the other refuses by name. A marker that vanished
+/// between the two reads is refused by name, never overwritten.
+fn lost_race(
+    data_dir: &Path,
+    role: ServerRole,
+    path: PathBuf,
+    source: std::io::Error,
+) -> Result<(), RoleRefused> {
+    match read(data_dir)? {
+        Some(marked) => same_role(marked, role, data_dir),
+        None => Err(RoleRefused::MarkerWrite { path, source }),
+    }
+}
+
+/// The existing-marker rule, in one place: the same role continues, the other
+/// refuses, naming both roles and the dir.
+fn same_role(marked: ServerRole, role: ServerRole, data_dir: &Path) -> Result<(), RoleRefused> {
+    if marked == role {
+        return Ok(());
+    }
+    Err(RoleRefused::Mismatch {
+        marked,
+        asked: role,
+        data_dir: data_dir.to_path_buf(),
+    })
 }
 
 /// The absolute, symlink-resolved form of `path`, resolved through its deepest
@@ -284,6 +358,108 @@ fn resolve(path: &Path) -> Result<PathBuf, RoleRefused> {
                 }
             }
             Err(error) => return Err(unresolved(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{ROLE_MARKER_NAME, RoleRefused, ServerRole, check, create_exclusive, lost_race};
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// PR-354 fix C2a: the marker write creates the data dir when it is not
+    /// there yet, so the first `--role` start on a fresh dir cannot fail with
+    /// ENOENT before the database's own open would have made the directory.
+    #[test]
+    fn the_marker_write_creates_a_data_dir_that_does_not_exist_yet() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("fresh").join("nested");
+        let db = data_dir.join("pulse.db");
+
+        check(&data_dir, &db, ServerRole::Prod).expect("the first start marks a fresh dir");
+
+        assert_eq!(
+            fs::read_to_string(data_dir.join(ROLE_MARKER_NAME)).unwrap(),
+            "prod\n"
+        );
+    }
+
+    /// PR-354 fix C2b: the absent-marker path creates EXCLUSIVELY. The loser of
+    /// a start race — its read saw no marker, the winner's create landed first
+    /// — must re-read and validate the winner's role exactly as an existing
+    /// marker is validated, never overwrite it. (Two overlapping starts cannot
+    /// be interleaved deterministically in-process, so this drives the loser's
+    /// own branch: the create fails `AlreadyExists` and the re-read decides.)
+    #[test]
+    fn a_lost_marker_race_re_reads_the_winner_instead_of_overwriting_it() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join(ROLE_MARKER_NAME);
+
+        // The winner marked the dir `prod`; the loser asked for `qa`.
+        fs::write(&marker, "prod\n").unwrap();
+        let (path, source) = exclusive_create_lost(dir.path(), ServerRole::Qa);
+        let refusal = lost_race(dir.path(), ServerRole::Qa, path, source)
+            .expect_err("the other role refuses, exactly like an existing marker");
+        assert!(
+            matches!(
+                &refusal,
+                RoleRefused::Mismatch {
+                    marked: ServerRole::Prod,
+                    asked: ServerRole::Qa,
+                    ..
+                }
+            ),
+            "the refusal names both roles: {refusal}"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "prod\n",
+            "the winner's marker is never overwritten"
+        );
+
+        // The winner marked it `prod` and the loser asked for `prod`: continue.
+        let (path, source) = exclusive_create_lost(dir.path(), ServerRole::Prod);
+        lost_race(dir.path(), ServerRole::Prod, path, source).expect("the same role continues");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "prod\n");
+
+        // A marker that VANISHED between the two reads — a dangling symlink is
+        // the one shape a read sees as absent while the exclusive create still
+        // refuses it — is refused by name, never overwritten.
+        #[cfg(unix)]
+        {
+            fs::remove_file(&marker).unwrap();
+            std::os::unix::fs::symlink(dir.path().join("gone"), &marker).unwrap();
+            let (path, source) = exclusive_create_lost(dir.path(), ServerRole::Qa);
+            let refusal = lost_race(dir.path(), ServerRole::Qa, path, source)
+                .expect_err("a vanished marker is refused, never overwritten");
+            assert!(
+                matches!(&refusal, RoleRefused::MarkerWrite { source, .. }
+                    if source.kind() == std::io::ErrorKind::AlreadyExists),
+                "the refusal is the create's AlreadyExists: {refusal}"
+            );
+        }
+    }
+
+    /// The exclusive create's failure, as the loser of the race sees it: the
+    /// marker path and the `AlreadyExists` source.
+    fn exclusive_create_lost(
+        data_dir: &std::path::Path,
+        role: ServerRole,
+    ) -> (std::path::PathBuf, std::io::Error) {
+        let error = create_exclusive(data_dir, role)
+            .expect_err("the exclusive create loses to the marker already there");
+        match error {
+            RoleRefused::MarkerWrite { path, source } => {
+                assert_eq!(
+                    source.kind(),
+                    std::io::ErrorKind::AlreadyExists,
+                    "the loser's create fails AlreadyExists, not another IO error"
+                );
+                (path, source)
+            }
+            other => panic!("the failure is the create's MarkerWrite: {other}"),
         }
     }
 }

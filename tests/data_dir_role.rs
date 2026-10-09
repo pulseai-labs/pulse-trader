@@ -446,6 +446,42 @@ fn an_unmarked_dir_is_marked_on_first_start_and_accepted_on_the_next() {
     assert_eq!(marker_of(&data).trim(), "qa");
 }
 
+/// PR-354 fix C2a: the FIRST start may be the one that creates the data dir.
+/// `role::write` never created it, so `pulse serve --role prod` on a fresh
+/// data dir failed with ENOENT before `open_db` could — and launchd relaunched
+/// it forever (deploy-mac's "the server creates it on first start" case).
+#[test]
+fn a_first_start_creates_the_data_dir_it_marks() {
+    let (root, home) = scratch();
+    let data = root.path().join("fresh-data");
+    assert!(!data.exists(), "the dir is this start's to make");
+    let db = data.join("pulse.db");
+
+    let server = start_server(
+        &home,
+        &[
+            "serve",
+            "--role",
+            "prod",
+            "--dev-loopback",
+            "--bind",
+            "127.0.0.1:0",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+
+    assert!(server.base.starts_with("http://127.0.0.1:"));
+    assert_eq!(
+        marker_of(&data).trim(),
+        "prod",
+        "the fresh dir is created and marked"
+    );
+    assert!(db.exists(), "and the database is there beside the marker");
+}
+
 // ---------------------------------------------------------------------------
 // The handshake's additive `role` field (C5).
 // ---------------------------------------------------------------------------
