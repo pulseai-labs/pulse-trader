@@ -31,6 +31,11 @@
 		<key>Minute</key>
 		<integer>30</integer>
 	</dict>
+	<!-- Umask 63 (decimal) = 077: the nightly job's out-dir, database, manifest
+	     and candle files are private whatever the login's umask is (the writer
+	     also sets 0700/0600 itself; PR-354 fix D5). -->
+	<key>Umask</key>
+	<integer>63</integer>
 	<key>StandardOutPath</key>
 	<string>/Users/draco/Library/Logs/PulseTrader/backup.log</string>
 	<key>StandardErrorPath</key>

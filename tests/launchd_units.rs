@@ -569,6 +569,14 @@ fn backup_plist_is_a_daily_calendar_job_over_the_installed_binary() {
     let calendar = plist.get("StartCalendarInterval");
     assert_eq!(calendar.get("Hour").integer(), 3, "03:30 local");
     assert_eq!(calendar.get("Minute").integer(), 30, "03:30 local");
+    // PR-354 fix D5: umask 077 (63 decimal), so the nightly job's ~/pulse-backups
+    // and the database, manifest and candle files under it are private whatever
+    // the login's umask is (the writer sets 0700/0600 itself too).
+    assert_eq!(
+        plist.get("Umask").integer(),
+        63,
+        "the backup job runs under umask 077"
+    );
 }
 
 #[test]

@@ -775,7 +775,9 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
     // below it is an entry this backup makes, and each publish into it has to
     // sync its parent (fix round 1, F6).
     let created_root = publish::existing_ancestor(out_dir);
-    fs::create_dir_all(out_dir)
+    // 0700, never the process umask's 0755 (PR-354 fix D5): the out-dir holds
+    // the database, its manifest and the candle store.
+    crate::adapters::db::create_private_dir(out_dir)
         .map_err(|e| anyhow!("create backup dir {}: {e}", out_dir.display()))?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let final_path = unique_backup_path(out_dir, &stamp);
@@ -797,6 +799,17 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
         let cleanup = remove_reported(&partial);
         return Err(fold_cleanup(
             anyhow!("the backup copy of {} failed: {e}", db_path.display()),
+            cleanup,
+        ));
+    }
+    // 0600, regardless of the umask SQLite created it with (PR-354 fix D5).
+    if let Err(error) = publish::set_private_file(&partial) {
+        let cleanup = remove_reported(&partial);
+        return Err(fold_cleanup(
+            anyhow!(
+                "make the backup copy {} private: {error}",
+                partial.display()
+            ),
             cleanup,
         ));
     }

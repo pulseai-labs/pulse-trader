@@ -1180,6 +1180,12 @@ fn write_file_atomic(path: &Path, bytes: &[u8], created: Option<&Path>) -> anyho
     let temporary = temporary_sibling(path)?;
     let _ = fs::remove_file(&temporary);
     fs::write(&temporary, bytes).map_err(|e| anyhow!("write {}: {e}", temporary.display()))?;
+    // 0600, never the umask's 0644 (PR-354 fix D5): this writes a backup's HEAD
+    // manifest and the shared store's pointers.
+    if let Err(error) = publish::set_private_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(anyhow!("make {} private: {error}", temporary.display()));
+    }
     let flushed = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1687,6 +1693,15 @@ pub(crate) fn copy_snapshot_into(source: &Path, dest: &Path) -> anyhow::Result<(
             temporary.display()
         )
     })?;
+    // 0600, never the source's mode (`fs::copy` carries it) or the umask
+    // (PR-354 fix D5): a snapshot the backup/import wrote is data.
+    if let Err(error) = publish::set_private_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(anyhow!(
+            "make the snapshot copy {} private: {error}",
+            temporary.display()
+        ));
+    }
     // The bytes must be ON DISK before the name that promises them exists: the
     // rename publishes them, and a crash must not leave a durable name over
     // bytes that never landed. (Opened read+write so the flush is legal on every

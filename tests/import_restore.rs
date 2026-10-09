@@ -2052,3 +2052,69 @@ fn restore_help_states_the_server_stopped_precondition() {
         "the --help text states the server-stopped precondition: {help}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// a backup under the default umask is private (PR-354 fix D5)
+// ---------------------------------------------------------------------------
+
+/// PR-354 fix D5: the nightly backup used to land 0755/0644 (the login's umask).
+/// The writer now creates its out-dir 0700 and its database, manifest and candle
+/// files 0600 itself, and the plist's `Umask 63` covers everything else — so a
+/// `pulse backup` run under umask 022 leaves nothing group- or world-readable.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_under_umask_022_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let s = seed_mac_source(false).await;
+    let out_dir = s.dir.path().join("backups");
+    // SAFETY: nextest runs one test per process, so the process umask is this
+    // test's alone, and the spawned `pulse backup` inherits it.
+    let previous = unsafe { libc::umask(0o022) };
+
+    let out = run_pulse(
+        &s.home,
+        &[
+            "backup",
+            "--db",
+            s.from_db.to_str().unwrap(),
+            "--data-dir",
+            s.from_data.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "backup: {}", combined(&out));
+
+    let mode = |path: &Path| {
+        fs::metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(&out_dir), 0o700, "the out-dir is private");
+    let backup = backup_db_files(&out_dir)
+        .into_iter()
+        .next()
+        .expect("the backup database");
+    assert_eq!(mode(&backup), 0o600, "the database is private");
+    assert_eq!(
+        mode(&manifest_path_for(&backup)),
+        0o600,
+        "its manifest is private"
+    );
+    let candle = out_dir
+        .join("candles")
+        .join("BTCUSDT")
+        .join("15m")
+        .join(format!("{}.parquet", s.stems.0));
+    assert!(
+        candle.is_file(),
+        "the snapshot landed: {}",
+        candle.display()
+    );
+    assert_eq!(mode(&candle), 0o600, "the snapshot copy is private");
+
+    unsafe { libc::umask(previous) };
+}
