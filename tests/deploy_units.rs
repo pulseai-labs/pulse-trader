@@ -424,9 +424,7 @@ fn forced_command_serves_a_protocol_29_sender_invocation() {
     for command in [
         format!("rsync --server --sender -logDtpr . {root_path}/"),
         format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}"),
-        format!(
-            "rsync --server --sender -g -l -o -p -r -t -D --ignore-existing . {root_path}/"
-        ),
+        format!("rsync --server --sender -g -l -o -p -r -t -D --ignore-existing . {root_path}/"),
     ] {
         let output = fake.run(root.path(), &command);
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
