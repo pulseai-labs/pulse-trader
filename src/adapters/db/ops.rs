@@ -934,10 +934,9 @@ mod tests {
     /// PR-354 fix C5: the digest follows the SOURCE's shape. A copy whose schema
     /// drifted — a column this build's migrations ADD, or a REORDERED column
     /// list — must still agree on content, while a real content difference is
-    /// still refused; and a source that predates the paper tables entirely
-    /// counts as EMPTY, with the migrated copy required to hold zero rows.
+    /// still refused.
     #[tokio::test]
-    async fn the_paper_digest_follows_the_sources_schema_and_content() {
+    async fn the_paper_digest_tolerates_a_drifted_copy_schema() {
         let tmp = TempDir::new().unwrap();
         let source = open_migrated(&tmp.path().join("source.db")).await.unwrap();
         let target = open_migrated(&tmp.path().join("target.db")).await.unwrap();
@@ -976,10 +975,6 @@ mod tests {
             Some("session_id=sess-1 seq=1"),
             "the changed row is still named"
         );
-        sqlx::query("UPDATE paper_event SET payload = 'payload-1' WHERE seq = 1")
-            .execute(target.pool())
-            .await
-            .unwrap();
 
         // A REORDERED column list on the copy: rebuild the table with the same
         // columns in another order and the same rows. The old table is renamed
@@ -1033,16 +1028,30 @@ mod tests {
         assert_eq!(digest.source_digest, digest.target_digest);
         assert_eq!(digest.rows, 1);
 
-        // The source predating migration 0018 (no paper tables at all): its
-        // side is empty, and the copy that holds a row is a real difference.
-        // paper_bar first: its trigger references paper_event.
+        source.pool().close().await;
+        target.pool().close().await;
+        reordered.pool().close().await;
+    }
+
+    /// PR-354 fix C5: a source that predates the paper tables entirely counts as
+    /// EMPTY, and the migrated copy must then hold zero rows — any row is a real
+    /// difference, named by its first key.
+    #[tokio::test]
+    async fn a_paper_table_the_source_lacks_must_be_empty_in_the_copy() {
+        let tmp = TempDir::new().unwrap();
+        let source = open_migrated(&tmp.path().join("source.db")).await.unwrap();
+        let copy = open_migrated(&tmp.path().join("copy.db")).await.unwrap();
+        seed_paper(copy.pool(), 1).await;
+        // The source predating migration 0018: no paper tables at all.
+        // paper_bar first: its trigger's body names paper_event.
         for table in ["paper_bar", "paper_event", "paper_session"] {
             sqlx::query(&format!("DROP TABLE {table}"))
                 .execute(source.pool())
                 .await
                 .unwrap();
         }
-        let digest = paper_table_digest(source.pool(), reordered.pool(), "paper_event")
+
+        let digest = paper_table_digest(source.pool(), copy.pool(), "paper_event")
             .await
             .unwrap();
         assert_eq!(
@@ -1053,12 +1062,17 @@ mod tests {
         assert_ne!(digest.source_digest, digest.target_digest);
 
         // The same copy with the table emptied agrees: absent from the source
-        // means "zero rows in the migrated copy".
-        sqlx::query("DELETE FROM paper_event")
-            .execute(reordered.pool())
+        // means "zero rows in the migrated copy". (The append-only trigger goes
+        // first — this test is about the digest, not the trigger.)
+        sqlx::query("DROP TRIGGER paper_event_no_delete")
+            .execute(copy.pool())
             .await
             .unwrap();
-        let digest = paper_table_digest(source.pool(), reordered.pool(), "paper_event")
+        sqlx::query("DELETE FROM paper_event")
+            .execute(copy.pool())
+            .await
+            .unwrap();
+        let digest = paper_table_digest(source.pool(), copy.pool(), "paper_event")
             .await
             .unwrap();
         assert_eq!(digest.first_difference, None, "an empty copy agrees");
@@ -1066,7 +1080,6 @@ mod tests {
         assert_eq!(digest.source_digest, digest.target_digest);
 
         source.pool().close().await;
-        target.pool().close().await;
-        reordered.pool().close().await;
+        copy.pool().close().await;
     }
 }
