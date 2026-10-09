@@ -369,18 +369,11 @@ deploy-mac tag:
     #    login PATH). #314: no Node on the Mini, and the server never reads the
     #    bundle — the placeholder dist is the deliberate setting.
     ssh macmini 'export PATH="$HOME/.cargo/bin:$PATH"; cd "$HOME/.cache/pulse-deploy/src" && PULSE_ALLOW_PLACEHOLDER_DIST=1 cargo build --release --bin pulse'
-    # 3. Install the binary, the config dir, the two scripts and the three
-    #    plists (serve, logrotate, backup). A rollback to an old tag installs
-    #    that tag's artifacts, so everything comes from $SRC on the Mini.
-    ssh macmini 'set -e
-        mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.local/share/pulse-serve/deploy" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/PulseTrader"
-        install -m 0755 "$HOME/.cache/pulse-deploy/src/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
-        rm -rf "$HOME/.local/share/pulse-serve/config"
-        mkdir -p "$HOME/.local/share/pulse-serve/config"
-        cp -R "$HOME/.cache/pulse-deploy/src/config/." "$HOME/.local/share/pulse-serve/config/"
-        install -m 0755 "$HOME/.cache/pulse-deploy/src/deploy/pulse-logrotate.sh" "$HOME/.cache/pulse-deploy/src/deploy/pulse-backup-serve.sh" "$HOME/.local/share/pulse-serve/deploy/"
-        install -m 0644 "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.serve.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.logrotate.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.backup.plist" "$HOME/Library/LaunchAgents/"'
-    # 4. Permissions (G10). Names and modes only — the file is never printed.
+    # 3. Permissions (G10) FIRST — before ANYTHING is installed (PR-354 fix B3).
+    #    The binary, config, scripts and plists used to be installed first, so a
+    #    refusal here left a brand-new binary that launchd's next KeepAlive
+    #    restart ran over a data dir the gate had just refused: a refusal must
+    #    install nothing. Names and modes only — the file is never printed.
     ssh macmini 'set -e
         DATA="$HOME/Library/Application Support/PulseTrader"
         if [ -d "$DATA" ]; then
@@ -404,6 +397,19 @@ deploy-mac tag:
                 exit 1
             fi
         fi'
+    # 4. Install the binary, the config dir, the two scripts and the three
+    #    plists (serve, logrotate, backup). A rollback to an old tag installs
+    #    that tag's artifacts, so everything comes from $SRC on the Mini. The
+    #    permission gate above has already passed, so nothing is replaced when
+    #    it refuses.
+    ssh macmini 'set -e
+        mkdir -p "$HOME/.local/share/pulse-serve/bin" "$HOME/.local/share/pulse-serve/deploy" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/PulseTrader"
+        install -m 0755 "$HOME/.cache/pulse-deploy/src/target/release/pulse" "$HOME/.local/share/pulse-serve/bin/pulse"
+        rm -rf "$HOME/.local/share/pulse-serve/config"
+        mkdir -p "$HOME/.local/share/pulse-serve/config"
+        cp -R "$HOME/.cache/pulse-deploy/src/config/." "$HOME/.local/share/pulse-serve/config/"
+        install -m 0755 "$HOME/.cache/pulse-deploy/src/deploy/pulse-logrotate.sh" "$HOME/.cache/pulse-deploy/src/deploy/pulse-backup-serve.sh" "$HOME/.local/share/pulse-serve/deploy/"
+        install -m 0644 "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.serve.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.logrotate.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.backup.plist" "$HOME/Library/LaunchAgents/"'
     # 5. Clear the start limit, (re)load all three agents, kickstart the server.
     #    The backup agent is loaded but NOT kickstarted: its calendar runs it at
     #    03:30 local, and a deploy must not take an extra backup.

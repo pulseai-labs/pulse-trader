@@ -553,3 +553,39 @@ fn forced_command_refuses_everything_but_a_read() {
         );
     }
 }
+
+/// PR-354 fix B3: `deploy-mac`'s G10 permission gate runs BEFORE anything is
+/// installed. The install used to come first, so a refusal left a brand-new
+/// binary (and plists) that launchd's next `KeepAlive` restart ran over a data
+/// dir the gate had just refused — a refusal must install nothing.
+#[test]
+fn deploy_mac_checks_permissions_before_it_installs() {
+    let justfile = include_str!("../justfile");
+    let recipe = justfile
+        .split_once("deploy-mac tag:")
+        .expect("the deploy-mac recipe")
+        .1;
+    let recipe = recipe
+        .split_once("\nprod-reset:")
+        .expect("the recipe's end")
+        .0;
+
+    let data_dir_check = recipe
+        .find("stat -f %Lp \"$DATA\"")
+        .expect("the data dir's mode check is in the recipe");
+    let env_check = recipe
+        .find("stat -f %Lp \"$DATA/.env\"")
+        .expect("the .env check is in the recipe");
+    let first_install = recipe
+        .find("install -m 0755 \"$HOME/.cache/pulse-deploy/src/target/release/pulse\"")
+        .expect("the binary install is in the recipe");
+    assert!(
+        data_dir_check < first_install && env_check < first_install,
+        "both G10 checks precede the first install (data dir at {data_dir_check}, \
+         .env at {env_check}, install at {first_install})"
+    );
+    assert!(
+        recipe[data_dir_check..first_install].contains("exit 1"),
+        "a failed check exits non-zero before anything installs"
+    );
+}
