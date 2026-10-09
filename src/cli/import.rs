@@ -4830,7 +4830,6 @@ mod tests {
         assert!(!flow.target_db.exists(), "and nothing was installed");
     }
 
-
     /// The digest comparison driven exactly as the engine drives it: copy the
     /// source, change one column AFTER the copy, verify — the mismatch names the
     /// table and the first differing key.

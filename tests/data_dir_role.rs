@@ -220,7 +220,6 @@ fn token_issue(home: &Path, db: &Path, scope: &str, label: &str) -> String {
         .to_owned()
 }
 
-
 // ---------------------------------------------------------------------------
 // The refusal order (spec §1): a cross-role start touches NOTHING.
 // ---------------------------------------------------------------------------

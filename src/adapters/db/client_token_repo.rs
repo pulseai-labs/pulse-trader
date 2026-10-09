@@ -96,7 +96,6 @@ pub enum TokenStoreError {
     Db(#[from] DataError),
 }
 
-
 /// The `SQLite` store for `client_token` rows and the `token_audit` ledger.
 ///
 /// Constructed from a [`SqlitePool`] (cloned from `Db::pool()`), with an
@@ -239,7 +238,6 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
             revoked_at: Some(now),
         })
     }
-
 
     /// Insert one `client_token` row plus its `issued` audit row INSIDE the
     /// caller's transaction, returning the new row id. One home for the two INSERT
@@ -419,4 +417,3 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
         Ok(())
     }
 }
-
