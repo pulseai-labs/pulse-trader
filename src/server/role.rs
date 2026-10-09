@@ -226,7 +226,7 @@ fn write_marker(data_dir: &Path, role: ServerRole, exclusive: bool) -> Result<()
         }
     })?;
     let (temp, mut file) = create_temp_marker(data_dir, &path)?;
-    let result = write_and_publish(&mut file, &temp, &path, role, exclusive);
+    let result = write_and_publish(&mut file, &temp, &path, data_dir, role, exclusive);
     drop(file);
     // The temp name goes whatever happened: on success the published marker
     // holds the inode, on failure nothing at all is left behind.
@@ -276,12 +276,20 @@ fn temp_marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(format!(".{ROLE_MARKER_NAME}.{}.{n}", std::process::id()))
 }
 
-/// Write the role into the temp file, flush it, then publish it under the
-/// marker's name — `hard_link` (exclusive) or `rename` (create-or-replace).
+/// Write the role into the temp file, sync it, then publish it under the
+/// marker's name — `hard_link` (exclusive) or `rename` (create-or-replace) —
+/// and fsync the data dir so the published name is durable too (PR-354 fix S2:
+/// the marker was flushed but never synced, so a power loss could leave a start
+/// believing a dir is marked when it is not).
+///
+/// The chain is the import's publish discipline, reused rather than copied:
+/// `sync_file` fsyncs the temp file's bytes before the name that promises them
+/// exists, and `sync_dir` fsyncs the directory entry the link/rename created.
 fn write_and_publish(
     file: &mut fs::File,
     temp: &Path,
     path: &Path,
+    data_dir: &Path,
     role: ServerRole,
     exclusive: bool,
 ) -> Result<(), RoleRefused> {
@@ -293,6 +301,11 @@ fn write_and_publish(
         path: path.to_path_buf(),
         source,
     })?;
+    // The bytes must be ON DISK before the name that promises them exists.
+    crate::cli::publish::sync_file(temp, path).map_err(|error| RoleRefused::MarkerWrite {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(error.to_string()),
+    })?;
     let published = if exclusive {
         fs::hard_link(temp, path)
     } else {
@@ -301,6 +314,11 @@ fn write_and_publish(
     published.map_err(|source| RoleRefused::MarkerWrite {
         path: path.to_path_buf(),
         source,
+    })?;
+    // And the directory entry that publishes it must be durable too.
+    crate::cli::publish::sync_dir(data_dir).map_err(|error| RoleRefused::MarkerWrite {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(error.to_string()),
     })
 }
 
@@ -593,5 +611,60 @@ mod tests {
         }
 
         fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// PR-354 fix S2: the marker's bytes and the directory entry that publishes
+    /// it are fsynced — the import's publish chain, reused. A file-sync failure
+    /// (before the publish) refuses and leaves NO marker; a dir-sync failure
+    /// (after it) refuses too, and neither leaves a temp behind.
+    #[test]
+    fn a_failed_marker_sync_is_a_refusal_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+
+        // The file sync fails before the publish: no marker exists.
+        crate::cli::publish::probe::fail_next_file_sync();
+        let error = write(&data_dir, ServerRole::Prod).expect_err("a failed file sync refuses");
+        assert!(
+            matches!(error, RoleRefused::MarkerWrite { .. }),
+            "a MarkerWrite refusal: {error}"
+        );
+        assert!(
+            !data_dir.join(ROLE_MARKER_NAME).exists(),
+            "no marker was published"
+        );
+        assert!(
+            no_temp(&data_dir),
+            "and the temp is gone: {:?}",
+            fs::read_dir(&data_dir).unwrap().flatten().count()
+        );
+
+        // The dir sync fails AFTER the publish: the marker is there, the run
+        // still refuses (it cannot claim the name is durable), and the temp is
+        // removed all the same.
+        crate::cli::publish::probe::fail_next_sync_of(&data_dir);
+        let error = write(&data_dir, ServerRole::Prod).expect_err("a failed dir sync refuses");
+        assert!(
+            matches!(error, RoleRefused::MarkerWrite { .. }),
+            "a MarkerWrite refusal: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(data_dir.join(ROLE_MARKER_NAME)).unwrap(),
+            "prod\n",
+            "the marker itself is published"
+        );
+        assert!(no_temp(&data_dir), "and no temp is left");
+
+        // With no injection armed the whole chain succeeds and leaves one file.
+        write(&data_dir, ServerRole::Prod).expect("the publish works");
+        assert!(no_temp(&data_dir), "no temp after a successful publish");
+    }
+
+    /// Whether the data dir holds no marker temp (every entry is the marker).
+    fn no_temp(data_dir: &std::path::Path) -> bool {
+        fs::read_dir(data_dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| entry.file_name() == std::ffi::OsStr::new(ROLE_MARKER_NAME))
     }
 }
