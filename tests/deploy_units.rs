@@ -666,3 +666,69 @@ fn deploy_mac_checks_permissions_before_it_installs() {
         "a failed check exits non-zero before anything installs"
     );
 }
+
+/// PR-354 fix Q1 (Codex 4232021330): `deploy-mac <tag>` used to check only
+/// that the tag exists, and step 4 installed the tag's binary FIRST. A tag from
+/// before this PR carries no `deploy/pulse-logrotate.sh`, no
+/// `deploy/pulse-backup-serve.sh` and none of the three plists, so the install
+/// failed AFTER the binary had been replaced — the Mini then ran the OLD binary
+/// under the CURRENT serve plist (--role, --start-limit) and launchd relaunched
+/// it without limit. The preflight now runs after the build and before both the
+/// G10 gate and the first install, naming every artifact step 4 installs.
+#[test]
+fn deploy_mac_checks_every_artifact_before_it_installs() {
+    let justfile = include_str!("../justfile");
+    let recipe = justfile
+        .split_once("deploy-mac tag:")
+        .expect("the deploy-mac recipe")
+        .1;
+    let recipe = recipe
+        .split_once("\nprod-reset:")
+        .expect("the recipe's end")
+        .0;
+
+    let build = recipe
+        .find("cargo build --release --bin pulse")
+        .expect("step 2's build is in the recipe");
+    let preflight = recipe
+        .find("the tag lacks")
+        .expect("the preflight names what the tag lacks");
+    let gate = recipe
+        .find("stat -f %Lp \"$DATA\"")
+        .expect("the G10 data dir check is in the recipe");
+    let first_install = recipe
+        .find("install -m 0755 \"$HOME/.cache/pulse-deploy/src/target/release/pulse\"")
+        .expect("the binary install is in the recipe");
+
+    assert!(
+        build < preflight,
+        "the preflight comes after the build (build at {build}, preflight at {preflight})"
+    );
+    assert!(
+        preflight < gate && preflight < first_install,
+        "and before the G10 gate (at {gate}) and the first install (at {first_install})"
+    );
+
+    // The preflight block itself — from its first refusal text to the gate —
+    // names every one of the seven artifacts, in step 4's own order and
+    // spelling.
+    let block = &recipe[preflight..gate];
+    for artifact in [
+        "target/release/pulse",
+        "config/",
+        "deploy/pulse-logrotate.sh",
+        "deploy/pulse-backup-serve.sh",
+        "deploy/com.pulsetrader.serve.plist",
+        "deploy/com.pulsetrader.logrotate.plist",
+        "deploy/com.pulsetrader.backup.plist",
+    ] {
+        assert!(
+            block.contains(artifact),
+            "the preflight names {artifact}: {block}"
+        );
+    }
+    assert!(
+        block.contains("exit 1"),
+        "a missing artifact exits non-zero before anything installs: {block}"
+    );
+}

@@ -369,11 +369,37 @@ deploy-mac tag:
     #    login PATH). #314: no Node on the Mini, and the server never reads the
     #    bundle — the placeholder dist is the deliberate setting.
     ssh macmini 'export PATH="$HOME/.cargo/bin:$PATH"; cd "$HOME/.cache/pulse-deploy/src" && PULSE_ALLOW_PLACEHOLDER_DIST=1 cargo build --release --bin pulse'
-    # 3. Permissions (G10) FIRST — before ANYTHING is installed (PR-354 fix B3).
-    #    The binary, config, scripts and plists used to be installed first, so a
-    #    refusal here left a brand-new binary that launchd's next KeepAlive
-    #    restart ran over a data dir the gate had just refused: a refusal must
-    #    install nothing. Names and modes only — the file is never printed.
+    # 3. The tag's ARTIFACT preflight (PR-354 fix Q1): after the build and
+    #    BEFORE the G10 gate and every install, because a tag from before this
+    #    PR carries no `deploy/pulse-logrotate.sh`, no
+    #    `deploy/pulse-backup-serve.sh` and none of the three plists. The
+    #    install below would otherwise replace the BINARY first and fail after
+    #    it, leaving the Mini running the OLD binary under the CURRENT serve
+    #    plist (`--role`, `--start-limit`) with launchd relaunching it without
+    #    limit. Every artifact step 5 installs is checked here, in that step's
+    #    own order and spelling, and a tag without them installs NOTHING.
+    ssh macmini 'set -e
+        SRC="$HOME/.cache/pulse-deploy/src"
+        if [ ! -f "$SRC/target/release/pulse" ]; then
+            echo "deploy-mac: the tag lacks target/release/pulse - refusing, nothing installed" >&2
+            exit 1
+        fi
+        if [ ! -d "$SRC/config" ]; then
+            echo "deploy-mac: the tag lacks config/ - refusing, nothing installed" >&2
+            exit 1
+        fi
+        for artifact in deploy/pulse-logrotate.sh deploy/pulse-backup-serve.sh deploy/com.pulsetrader.serve.plist deploy/com.pulsetrader.logrotate.plist deploy/com.pulsetrader.backup.plist; do
+            if [ ! -f "$SRC/$artifact" ]; then
+                echo "deploy-mac: the tag lacks $artifact - refusing, nothing installed" >&2
+                exit 1
+            fi
+        done'
+    # 4. Permissions (G10), after the preflight and still before ANYTHING is
+    #    installed (PR-354 fix B3). The binary, config, scripts and plists used
+    #    to be installed first, so a refusal here left a brand-new binary that
+    #    launchd's next KeepAlive restart ran over a data dir the gate had just
+    #    refused: a refusal must install nothing. Names and modes only — the
+    #    file is never printed.
     ssh macmini 'set -e
         DATA="$HOME/Library/Application Support/PulseTrader"
         if [ -d "$DATA" ]; then
@@ -397,9 +423,10 @@ deploy-mac tag:
                 exit 1
             fi
         fi'
-    # 4. Install the binary, the config dir, the two scripts and the three
+    # 5. Install the binary, the config dir, the two scripts and the three
     #    plists (serve, logrotate, backup). A rollback to an old tag installs
-    #    that tag's artifacts, so everything comes from $SRC on the Mini. The
+    #    that tag's artifacts, so everything comes from $SRC on the Mini — the
+    #    step 3 preflight has already confirmed every one of them is there. The
     #    permission gate above has already passed, so nothing is replaced when
     #    it refuses.
     ssh macmini 'set -e
@@ -410,7 +437,7 @@ deploy-mac tag:
         cp -R "$HOME/.cache/pulse-deploy/src/config/." "$HOME/.local/share/pulse-serve/config/"
         install -m 0755 "$HOME/.cache/pulse-deploy/src/deploy/pulse-logrotate.sh" "$HOME/.cache/pulse-deploy/src/deploy/pulse-backup-serve.sh" "$HOME/.local/share/pulse-serve/deploy/"
         install -m 0644 "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.serve.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.logrotate.plist" "$HOME/.cache/pulse-deploy/src/deploy/com.pulsetrader.backup.plist" "$HOME/Library/LaunchAgents/"'
-    # 5. Clear the start limit, (re)load all three agents, kickstart the server.
+    # 6. Clear the start limit, (re)load all three agents, kickstart the server.
     #    The backup agent is loaded but NOT kickstarted: its calendar runs it at
     #    03:30 local, and a deploy must not take an extra backup.
     ssh macmini 'set -e
@@ -423,7 +450,7 @@ deploy-mac tag:
         launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.pulsetrader.logrotate.plist"
         launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.pulsetrader.backup.plist"
         launchctl kickstart -k "gui/$(id -u)/com.pulsetrader.serve"'
-    # 6. The real health gate (#346), from here: the Mini's tailnet address has
+    # 7. The real health gate (#346), from here: the Mini's tailnet address has
     #    to answer, not just exist. 150 s covers the 120-second bind retry.
     bash scripts/wait-healthy.sh "http://100.103.30.74:8420" 150
     ssh macmini '"$HOME/.local/share/pulse-serve/bin/pulse" --version'
