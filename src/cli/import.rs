@@ -2,8 +2,8 @@
 //! candle snapshots onto this host (r3.s3.w4, ADR-0026).
 //!
 //! The order (spec §Interface contract): refuse a source that resolves to the
-//! target (#264, symlinks resolved) and take the target's instance lock (#250)
-//! BEFORE anything else; refuse a non-empty target (with `--replace`, back it
+//! target (#264, symlinks resolved) BEFORE anything else; refuse a non-empty
+//! target (with `--replace`, back it
 //! up first through the same backup `pulse backup` makes); copy the source
 //! consistently with `VACUUM INTO` from a read-only open into a temporary file
 //! BESIDE the target (never `/tmp`); migrate the copy forward
@@ -19,15 +19,13 @@
 //! `pulse restore` (`cli/backup.rs`) reuses [`run_verified_copy`] with the
 //! backup as the source: same verification, same atomic install, no chmod.
 //!
-//! **Its precondition: the server must be stopped — checked, not just
-//! documented (#250).** The install deletes the target's `-wal`/`-shm` and
-//! renames over `pulse.db`, so a running `pulse serve` would keep serving the
-//! unlinked old inode, the deleted WAL content is gone, and every write it
-//! commits after the swap is silently lost. Import therefore takes the target's
-//! instance lock ([`crate::adapters::db::instance_lock`]) before any write — a
-//! running server holds it, so the run refuses by name — and holds it until the
-//! install completes. D7's cutover order is unchanged: quit the old Mac app,
-//! stop the unit, then import.
+//! **Its precondition: the server must be stopped.** The install deletes the
+//! target's `-wal`/`-shm` and renames over `pulse.db`, so a running
+//! `pulse serve` would keep serving the unlinked old inode, the deleted WAL
+//! content is gone, and every write it commits after the swap is silently lost.
+//! The instance-lock enforcement this PR carried (r4.s2.w2's #250) was split out
+//! to issue #355; D7's cutover order stands: quit the old
+//! Mac app, stop the unit, then import.
 
 use std::collections::HashMap;
 use std::fs;
@@ -44,7 +42,7 @@ use super::publish;
 #[cfg(test)]
 use super::publish::probe;
 use crate::adapters::db::default_db_path;
-use crate::adapters::db::instance_lock::{InstanceLock, canonical_identity};
+use crate::adapters::db::instance_lock::canonical_identity;
 use crate::adapters::db::ops;
 pub(crate) use crate::adapters::db::{
     DB_STATE_SUFFIXES, TargetIdentity, inode_of, quarantine_name, refuse_orphaned_quarantines,
@@ -68,12 +66,12 @@ const MAX_NAMED_MISMATCHES: usize = 20;
 /// `pulse import --from-db <mac.db> --from-data-dir <dir holding its
 /// candles/> [--db <target>] [--data-dir <target>] [--replace]`.
 ///
-/// **Precondition: the server must be stopped — and this command enforces it
-/// (#250).** The target's instance lock is taken before any write and held
-/// until the install completes, so a running `pulse serve` refuses this run by
-/// name instead of losing every write it commits after the swap. A source that
-/// resolves to the target is refused too (#264), before anything is touched.
-/// D7's cutover order stands: quit the old Mac app, stop the unit, then import.
+/// **Precondition: the server must be stopped.** A running `pulse serve` would
+/// keep serving the unlinked old inode after the install's rename, so stop it
+/// first (the instance-lock enforcement this PR carried was split out to issue
+/// #355). A source that resolves to the target is refused (#264), before
+/// anything is touched. D7's cutover order stands: quit the old Mac app, stop
+/// the unit, then import.
 #[derive(Debug, Args)]
 pub struct ImportArgs {
     /// The Mac `pulse.db` copy to import. Read-only throughout; set a-w on
@@ -408,10 +406,9 @@ fn same_file_identity(left: (u64, u64), right: (u64, u64)) -> bool {
 /// The shared verified-copy engine (import over the Mac source; restore over
 /// a backup — the same verification, the same atomic install).
 ///
-/// It refuses a source that resolves to the target (#264) and a target whose
-/// instance lock is held (#250) before any write, holds that lock until the
-/// install completes, and compares the three paper tables by content digest as
-/// part of the verification (r4.s2.w2).
+/// It refuses a source that resolves to the target (#264) before any write and
+/// compares the three paper tables by content digest as part of the
+/// verification (r4.s2.w2).
 ///
 /// # Errors
 ///
@@ -428,22 +425,13 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     refuse_source_is_target(label, &job)?;
 
     // ---- The deepest ancestor that exists BEFORE the target's directory is
-    // created — computed HERE, before the instance lock below, whose
-    // `create_dir_all` makes the target's parent. The lock used to run first,
-    // so on a first import into a new directory the created root WAS the
-    // directory the lock had just made, and the parent that received its entry
-    // was never synced (PR-354 fix C3c; a regression from main). Every level
-    // below it is an entry this run makes, so the install's directory sync has
-    // to cover them (fix round 1, F6). A bare relative target resolves to the
-    // current directory, which already exists (fix round 5, P4).
+    // created — computed HERE, before the `create_dir_all` below makes the
+    // target's parent, so the parent that receives that entry is covered by the
+    // install's directory sync (PR-354 fix C3c). Every level below it is an
+    // entry this run makes, so the install's directory sync has to cover them
+    // (fix round 1, F6). A bare relative target resolves to the current
+    // directory, which already exists (fix round 5, P4).
     let created_root = publish::existing_ancestor(&target_dir(job.db_target));
-
-    // ---- #250 (r4.s2.w2): the target's instance lock, held until the install
-    // completes. A running `pulse serve` holds it, so this run refuses by name
-    // instead of writing under a live server — and a concurrent data op cannot
-    // interleave with this one.
-    let _instance_lock = InstanceLock::acquire(job.db_target)
-        .map_err(|error| anyhow!("{label}: refusing: {error}"))?;
 
     // ---- Round 6, Fix A: a RESTORE takes its pointers from the chosen
     // backup's own manifest, never from the shared store's pointer directory
@@ -2537,7 +2525,6 @@ mod tests {
         run_verified_copy, same_file_identity, scan_heads, scan_snapshots, set_source_mutation,
         sidecar_path, write_head_manifest,
     };
-    use crate::adapters::db::instance_lock::InstanceLock;
     use crate::adapters::db::{Db, open_migrated, open_migrated_copy};
     use crate::adapters::store::CandleStore;
     use std::fs;
@@ -4688,7 +4675,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // r4.s2.w2 — the move made safe (#250, #264, the paper digests)
+    // r4.s2.w2 — the move made safe (#264, the paper digests)
     // -----------------------------------------------------------------------
 
     /// Fold any write-ahead log into the file before a byte comparison:
@@ -4843,26 +4830,6 @@ mod tests {
         assert!(!flow.target_db.exists(), "and nothing was installed");
     }
 
-    /// #250: a held instance lock on the target refuses the run by name, and
-    /// dropping the holder lets the same run through.
-    #[tokio::test]
-    async fn a_held_target_lock_refuses_the_run() {
-        let flow = flow().await;
-        let holder = InstanceLock::acquire(&flow.target_db).expect("hold the target's lock");
-        let error = run_verified_copy(import_job(&flow))
-            .await
-            .expect_err("a held lock refuses the run");
-        assert!(
-            error.to_string().contains("a running pulse serve holds it"),
-            "{error}"
-        );
-
-        drop(holder);
-        run_verified_copy(import_job(&flow))
-            .await
-            .expect("the lock is free and the import runs");
-        assert!(flow.target_db.exists(), "the import installed the target");
-    }
 
     /// The digest comparison driven exactly as the engine drives it: copy the
     /// source, change one column AFTER the copy, verify — the mismatch names the
@@ -4957,11 +4924,12 @@ mod tests {
         assert!(leftovers.is_empty(), "the temporary is gone: {leftovers:?}");
     }
 
-    /// PR-354 fix C3c: `created_root` is computed BEFORE the instance lock's
-    /// `create_dir_all`. The fixture's target directory (`<temp>/server`) does
+    /// PR-354 fix C3c: `created_root` is computed BEFORE any directory is
+    /// created. The fixture's target directory (`<temp>/server`) does
     /// not exist yet, so the pre-existing ancestor is the tempdir itself: the
     /// install's directory syncs must reach it (its entry is the one that
-    /// received the new directory). With the lock first, the created root WAS
+    /// received the new directory). Computed after the `create_dir_all`, the
+    /// created root WAS
     /// `server/` and the tempdir's sync never ran — the entry was left
     /// unflushed, a regression from main.
     #[tokio::test]

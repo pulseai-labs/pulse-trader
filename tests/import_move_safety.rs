@@ -1,12 +1,11 @@
 //! r4.s2.w2 AC-1 (ledger d69) — the move made safe (`tests/import_move_safety.rs`).
 //!
 //! Four behaviours, driven through the spawned `pulse` binary (the
-//! `import_restore.rs` / `server_auth.rs` patterns), plus the serve-side half of
-//! the same lock:
+//! `import_restore.rs` / `server_auth.rs` patterns), plus the server's own lock:
 //!
-//! (i) a held instance lock on the target refuses import AND restore, and the
-//!     same import succeeds once the holder exits; a second `pulse serve` on a
-//!     held database refuses too (#250);
+//! (i) a second `pulse serve` on a database a live server holds refuses, and a
+//!     new server starts once the holder exits (#250 — the import/restore half
+//!     of that lock was split out to issue #355);
 //! (ii) a source that resolves to the target is refused — the path itself, a
 //!     symlink to it, and equal data dirs (#264) — with the source untouched;
 //! (iii) a source `paper_event` column changed AFTER the copy is refused by the
@@ -116,29 +115,6 @@ fn run_pulse(home: &Path, args: &[&str]) -> Output {
         .env_remove("XDG_CACHE_HOME")
         .output()
         .expect("spawn the pulse binary")
-}
-
-/// The `pulse-*.db` backup files in an out-dir (never `candles/`, never a
-/// `.partial`), sorted by name.
-fn backup_db_files(out_dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = fs::read_dir(out_dir)
-        .map(|dir| {
-            dir.flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.is_file()
-                        && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                            n.starts_with("pulse-")
-                                && Path::new(n)
-                                    .extension()
-                                    .is_some_and(|e| e.eq_ignore_ascii_case("db"))
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    files.sort();
-    files
 }
 
 /// The seeded source "Mac" host: a migrated db with one strategy/version and
@@ -379,61 +355,22 @@ fn import_temporaries(target: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// The `paper_session` row count of a database file.
-async fn paper_session_count(path: &Path) -> i64 {
-    let db = Db::with_path(path)
-        .await
-        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paper_session")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    db.pool().close().await;
-    count
-}
-
 // ---------------------------------------------------------------------------
-// (i) the instance lock: import and restore refuse while a server holds it
+// (i) the server's instance lock: a second server on one database refuses
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_lock_refuses_import_and_restore_and_lifts_when_the_server_exits() {
+async fn a_second_server_on_a_held_database_is_refused() {
     let dir = TempDir::new().unwrap();
     let home = dir.path().join("home");
     let config = dir.path().join("config");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&config).unwrap();
-    let src = seed_source(&dir.path().join("mac"), 2, 2, 0).await;
     let target_db = dir.path().join("server").join("pulse.db");
     let target_data = dir.path().join("server-data");
     // `pulse serve` opens the db's migration lock beside it, so the database's
     // directory must exist first (a real deployment's does).
     fs::create_dir_all(target_db.parent().unwrap()).unwrap();
-
-    // A real backup (of the SOURCE — unrelated to the target) so the restore arm
-    // is refused on a genuine restore invocation.
-    let out_dir = dir.path().join("backups");
-    let backup = run_pulse(
-        &home,
-        &[
-            "backup",
-            "--db",
-            src.db.to_str().unwrap(),
-            "--data-dir",
-            src.data.to_str().unwrap(),
-            "--out-dir",
-            out_dir.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        backup.status.success(),
-        "seed backup: {}",
-        combined(&backup)
-    );
-    let backup_db = backup_db_files(&out_dir)
-        .into_iter()
-        .next()
-        .expect("the backup db exists");
 
     // The live server holds the target's instance lock before it binds.
     let mut serve = Serve::spawn(&home, &config, &target_db, &target_data);
@@ -458,87 +395,13 @@ async fn a_held_lock_refuses_import_and_restore_and_lifts_when_the_server_exits(
         "the refusal names the lock: {second_lines}"
     );
 
-    // The import is refused, naming the target and the reason.
-    let import = run_pulse(
-        &home,
-        &[
-            "import",
-            "--from-db",
-            src.db.to_str().unwrap(),
-            "--from-data-dir",
-            src.data.to_str().unwrap(),
-            "--db",
-            target_db.to_str().unwrap(),
-            "--data-dir",
-            target_data.to_str().unwrap(),
-        ],
-    );
-    let text = combined(&import);
-    assert!(!import.status.success(), "import refused: {text}");
-    assert!(
-        text.contains(target_db.to_str().unwrap()),
-        "the refusal names the target: {text}"
-    );
-    assert!(
-        text.contains("a running pulse serve holds it"),
-        "the refusal names the holder: {text}"
-    );
-    assert!(
-        import_temporaries(&target_db).is_empty(),
-        "no temporary was left beside the target"
-    );
-    assert_eq!(
-        paper_session_count(&target_db).await,
-        0,
-        "the refused import installed nothing"
-    );
-
-    // The restore is refused the same way.
-    let restore = run_pulse(
-        &home,
-        &[
-            "restore",
-            backup_db.to_str().unwrap(),
-            "--backup-dir",
-            out_dir.to_str().unwrap(),
-            "--db",
-            target_db.to_str().unwrap(),
-            "--data-dir",
-            target_data.to_str().unwrap(),
-        ],
-    );
-    let text = combined(&restore);
-    assert!(!restore.status.success(), "restore refused: {text}");
-    assert!(
-        text.contains("a running pulse serve holds it"),
-        "the restore refusal names the holder: {text}"
-    );
-
-    // The holder exits: the SAME import now succeeds — the lock was the reason.
+    // The holder exits: the lock is free and a new server starts and listens.
     serve.kill();
-    let import = run_pulse(
-        &home,
-        &[
-            "import",
-            "--from-db",
-            src.db.to_str().unwrap(),
-            "--from-data-dir",
-            src.data.to_str().unwrap(),
-            "--db",
-            target_db.to_str().unwrap(),
-            "--data-dir",
-            target_data.to_str().unwrap(),
-        ],
-    );
+    let mut third = Serve::spawn(&home, &config, &target_db, &target_data);
     assert!(
-        import.status.success(),
-        "the import succeeds once the lock is free: {}",
-        combined(&import)
-    );
-    assert_eq!(
-        paper_session_count(&target_db).await,
-        1,
-        "the session moved"
+        third.wait_for_line("listening on", 60),
+        "the lock lifts when the holder exits; lines:\n{}",
+        third.output()
     );
 }
 
@@ -601,66 +464,6 @@ fn a_held_lock_refuses_serve_before_the_database_is_created() {
         "and the database was never created: {}",
         db.display()
     );
-}
-
-/// PR-354 fix C3b: the lock is keyed on the database's RESOLVED identity, so a
-/// server holding `real/pulse.db` and an import whose `--db` is a SYMLINK to it
-/// (or reaches it through a symlinked directory) take the SAME lock. Keyed on
-/// the path as typed they took two, and the import renamed over the live
-/// database's file while the server kept the unlinked inode.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_symlinked_target_takes_the_live_databases_lock() {
-    let dir = TempDir::new().unwrap();
-    let home = dir.path().join("home");
-    let config = dir.path().join("config");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&config).unwrap();
-    let src = seed_source(&dir.path().join("mac"), 2, 2, 0).await;
-    let server_dir = dir.path().join("server");
-    fs::create_dir_all(&server_dir).unwrap();
-    let target_db = server_dir.join("pulse.db");
-    let target_data = dir.path().join("server-data");
-
-    // The live server holds the target's instance lock before it binds.
-    let mut serve = Serve::spawn(&home, &config, &target_db, &target_data);
-    assert!(
-        serve.wait_for_line("listening on", 60),
-        "pulse serve starts and holds the lock; lines:\n{}",
-        serve.output()
-    );
-
-    let file_link = dir.path().join("link.db");
-    std::os::unix::fs::symlink(&target_db, &file_link).unwrap();
-    let dir_link = dir.path().join("alias");
-    std::os::unix::fs::symlink(&server_dir, &dir_link).unwrap();
-
-    for spelling in [file_link.clone(), dir_link.join("pulse.db")] {
-        let import = run_pulse(
-            &home,
-            &[
-                "import",
-                "--from-db",
-                src.db.to_str().unwrap(),
-                "--from-data-dir",
-                src.data.to_str().unwrap(),
-                "--db",
-                spelling.to_str().unwrap(),
-                "--data-dir",
-                dir.path().join("other-data").to_str().unwrap(),
-            ],
-        );
-        let text = combined(&import);
-        assert!(
-            !import.status.success(),
-            "an import through {} is refused: {text}",
-            spelling.display()
-        );
-        assert!(
-            text.contains("a running pulse serve holds it"),
-            "the refusal is the LIVE database's lock, not the non-empty target's: {text}"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
