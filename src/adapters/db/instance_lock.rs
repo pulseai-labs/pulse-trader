@@ -29,6 +29,16 @@ pub(crate) enum InstanceLockError {
         /// The lock file that holds it.
         lock: PathBuf,
     },
+    /// A path could not be resolved to an identity (PR-354 fix Z1): its
+    /// unresolved tail holds a `.`/`..` component, or the walk could not reach
+    /// an existing ancestor. Refused by name, never normalized — appending such
+    /// a tail verbatim resolves to a DIFFERENT file than the path names.
+    Unresolved {
+        /// The path as given.
+        target: PathBuf,
+        /// Why it was refused.
+        reason: String,
+    },
     /// The lock file could not be reached (parent directory, create, open).
     Io {
         /// The lock file the call failed on.
@@ -63,6 +73,9 @@ impl core::fmt::Display for InstanceLockError {
                 "cannot take the instance lock {}: {reason}",
                 lock.display()
             ),
+            Self::Unresolved { target, reason } => {
+                write!(f, "cannot resolve {}: {reason}", target.display())
+            }
             Self::HardLinked { target, links } => write!(
                 f,
                 "the database {} has {links} hard links — a hard-linked alias would take a \
@@ -98,15 +111,18 @@ impl InstanceLock {
     /// canonicalized and any not-yet-existing tail is appended unchanged, so a
     /// target the caller is about to create still resolves consistently with
     /// one that exists.
-    #[must_use]
-    pub(crate) fn lock_path(db_path: &Path) -> PathBuf {
-        let resolved = canonical_identity(db_path);
+    /// # Errors
+    ///
+    /// [`InstanceLockError::Unresolved`] when the database path's unresolved
+    /// tail holds a `.`/`..` component (PR-354 fix Z1).
+    pub(crate) fn lock_path(db_path: &Path) -> Result<PathBuf, InstanceLockError> {
+        let resolved = canonical_identity(db_path)?;
         let mut name = resolved.file_name().map_or_else(
             || std::ffi::OsString::from("pulse.db"),
             std::ffi::OsStr::to_os_string,
         );
         name.push(LOCK_SUFFIX);
-        resolved.with_file_name(name)
+        Ok(resolved.with_file_name(name))
     }
 
     /// Take the exclusive, NON-BLOCKING instance lock on `db_path`.
@@ -142,7 +158,7 @@ impl InstanceLock {
             });
         }
 
-        let lock_path = Self::lock_path(db_path);
+        let lock_path = Self::lock_path(db_path)?;
         create_parent(&lock_path)?;
         let file = open_lock_file(&lock_path)?;
         // SAFETY: `file` is a live open fd for the duration of the call, and the
@@ -176,7 +192,7 @@ impl InstanceLock {
     /// [`InstanceLockError::Io`] when the lock file cannot be created or opened.
     #[cfg(not(unix))]
     pub(crate) fn acquire(db_path: &Path) -> Result<Self, InstanceLockError> {
-        let lock_path = Self::lock_path(db_path);
+        let lock_path = Self::lock_path(db_path)?;
         create_parent(&lock_path)?;
         Ok(Self {
             _file: open_lock_file(&lock_path)?,
@@ -184,37 +200,113 @@ impl InstanceLock {
     }
 }
 
+/// The path's raw components, `.` and `..` PRESERVED: `Path::components`
+/// normalizes a `.` in the middle of a path away, which is exactly the component
+/// the refusal below has to see. On unix the bytes are used directly, so a
+/// non-UTF-8 path is handled too; elsewhere the components `Path` yields are
+/// used (a middle `.` is invisible there, while `..` is still refused).
+fn raw_components(path: &Path) -> Vec<std::ffi::OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let mut out: Vec<std::ffi::OsString> = Vec::new();
+        if path.is_absolute() {
+            out.push(std::ffi::OsString::from("/"));
+        }
+        out.extend(
+            path.as_os_str()
+                .as_bytes()
+                .split(|byte| *byte == b'/')
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| std::ffi::OsString::from_vec(segment.to_vec())),
+        );
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        path.components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect()
+    }
+}
+
+/// Whether one raw component is `.` or `..`.
+fn is_dot_component(segment: &std::ffi::OsString) -> bool {
+    segment == "." || segment == ".."
+}
+
 /// `path` with every symlinked ancestor resolved and any not-yet-existing tail
 /// preserved: the deepest ancestor that EXISTS is canonicalized and the
-/// remaining components are appended unchanged. A path with nothing to resolve
-/// against (a bare relative name that does not exist) resolves the cwd.
+/// remaining components are appended unchanged. The tail must be made of plain
+/// names — a `.` or `..` below the deepest existing ancestor is REFUSED (PR-354
+/// fix Z1), never normalized: appending it verbatim resolves to a DIFFERENT file
+/// than the path names (which is how `/srv/new/../pulse.db` bypassed import's
+/// #264 same-target refusal against `/srv/pulse.db`), and a path ENDING in `..`
+/// used to fall back to the current directory, a silent pass.
 ///
 /// One copy of the rule, shared by the instance lock's [`InstanceLock::lock_path`]
-/// and the import's same-target refusal (PR-354 fix C3b; it lived in
-/// `cli::import` only, and the lock keyed on the path as typed).
-pub(crate) fn canonical_identity(path: &Path) -> PathBuf {
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut current = path.to_path_buf();
-    let resolved = loop {
-        if let Ok(root) = fs::canonicalize(&current) {
-            break root;
-        }
-        match current.file_name().map(std::ffi::OsStr::to_os_string) {
-            Some(name) => {
-                tail.push(name);
-                current = match current.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-                    _ => PathBuf::from("."),
-                };
-            }
-            None => break fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(".")),
-        }
+/// and the import's same-target refusal (PR-354 fix C3b).
+///
+/// # Errors
+///
+/// [`InstanceLockError::Unresolved`] when the unresolved tail holds a `.`/`..`
+/// component, or when the walk cannot reach an existing ancestor.
+pub(crate) fn canonical_identity(path: &Path) -> Result<PathBuf, InstanceLockError> {
+    let refuse = |reason: String| InstanceLockError::Unresolved {
+        target: path.to_path_buf(),
+        reason,
     };
-    let mut out = resolved;
-    for name in tail.iter().rev() {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| refuse(format!("the current directory cannot be resolved: {error}")))?
+            .join(path)
+    };
+    let mut resolved: Option<PathBuf> = None;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    for segment in raw_components(&absolute) {
+        // The candidate is the deepest existing prefix, the tail pushed so far
+        // and this segment, joined TEXTUALLY: `PathBuf::join` drops a `.`
+        // component before any syscall, which would hide exactly the case this
+        // refusal exists for (PR-354 fix Z1).
+        let mut joined = match &resolved {
+            Some(root) => root.clone().into_os_string(),
+            None => std::ffi::OsString::new(),
+        };
+        for name in &tail {
+            joined.push(std::path::MAIN_SEPARATOR.to_string());
+            joined.push(name);
+        }
+        if !joined.is_empty() {
+            joined.push(std::path::MAIN_SEPARATOR.to_string());
+        }
+        joined.push(&segment);
+        let prefix = PathBuf::from(joined);
+        match fs::canonicalize(&prefix) {
+            // Still inside the existing prefix: `.`/`..` here resolve against
+            // real directories, so they are not the refusal's business.
+            Ok(root) => resolved = Some(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if is_dot_component(&segment) {
+                    return Err(refuse(format!(
+                        "the unresolved tail holds a {} component; refusing rather than \
+                         normalizing the path",
+                        segment.to_string_lossy()
+                    )));
+                }
+                tail.push(segment);
+            }
+            Err(error) => return Err(refuse(error.to_string())),
+        }
+    }
+    let Some(mut out) = resolved else {
+        return Err(refuse("the path has no resolvable root".to_owned()));
+    };
+    for name in tail {
         out.push(name);
     }
-    out
+    Ok(out)
 }
 
 /// Create the lock file's parent directory when it is not there yet — 0700,
@@ -249,8 +341,8 @@ fn open_lock_file(lock_path: &Path) -> Result<fs::File, InstanceLockError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{InstanceLock, InstanceLockError};
-    use std::path::Path;
+    use super::{InstanceLock, InstanceLockError, canonical_identity};
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     /// The lock file is the database's own path plus `.serve.lock`, wherever
@@ -259,12 +351,12 @@ mod tests {
     #[test]
     fn the_lock_file_sits_beside_the_database() {
         assert_eq!(
-            InstanceLock::lock_path(Path::new("/srv/pulse.db")),
+            InstanceLock::lock_path(Path::new("/srv/pulse.db")).expect("a plain path"),
             Path::new("/srv/pulse.db.serve.lock")
         );
         let cwd = std::fs::canonicalize(".").expect("the cwd resolves");
         assert_eq!(
-            InstanceLock::lock_path(Path::new("pulse.db")),
+            InstanceLock::lock_path(Path::new("pulse.db")).expect("a relative path"),
             cwd.join("pulse.db.serve.lock")
         );
     }
@@ -287,20 +379,21 @@ mod tests {
         let dir_link = tmp.path().join("alias");
         std::os::unix::fs::symlink(&real, &dir_link).expect("the directory symlink");
 
-        let lock = InstanceLock::lock_path(&db);
+        let lock = InstanceLock::lock_path(&db).expect("the database");
         assert_eq!(
-            InstanceLock::lock_path(&file_link),
+            InstanceLock::lock_path(&file_link).expect("the file symlink"),
             lock,
             "a symlink to the database takes its lock"
         );
         assert_eq!(
-            InstanceLock::lock_path(&dir_link.join("pulse.db")),
+            InstanceLock::lock_path(&dir_link.join("pulse.db")).expect("the directory symlink"),
             lock,
             "a symlinked directory component takes it too"
         );
         // And a target that does not exist yet resolves through its deepest
         // EXISTING ancestor, so the first acquire and the second agree.
-        let fresh = InstanceLock::lock_path(&real.join("fresh").join("pulse.db"));
+        let fresh =
+            InstanceLock::lock_path(&real.join("fresh").join("pulse.db")).expect("a fresh target");
         assert_eq!(
             fresh,
             std::fs::canonicalize(&real)
@@ -318,9 +411,13 @@ mod tests {
         let db = tmp.path().join("fresh").join("pulse.db");
         let lock = InstanceLock::acquire(&db).expect("acquire on a fresh target");
         assert!(
-            InstanceLock::lock_path(&db).exists(),
+            InstanceLock::lock_path(&db)
+                .expect("the lock path")
+                .exists(),
             "the lock file exists: {}",
-            InstanceLock::lock_path(&db).display()
+            InstanceLock::lock_path(&db)
+                .expect("the lock path")
+                .display()
         );
         drop(lock);
     }
@@ -339,9 +436,15 @@ mod tests {
         match &refused {
             InstanceLockError::Held { target, lock } => {
                 assert_eq!(target, &db, "the refusal names the database");
-                assert_eq!(lock, &InstanceLock::lock_path(&db), "and the lock file");
+                assert_eq!(
+                    lock,
+                    &InstanceLock::lock_path(&db).expect("the lock path"),
+                    "and the lock file"
+                );
             }
-            other @ (InstanceLockError::Io { .. } | InstanceLockError::HardLinked { .. }) => {
+            other @ (InstanceLockError::Io { .. }
+            | InstanceLockError::HardLinked { .. }
+            | InstanceLockError::Unresolved { .. }) => {
                 panic!("expected Held, got {other:?}");
             }
         }
@@ -384,5 +487,54 @@ mod tests {
                 other => panic!("the refusal is HardLinked, not {other:?}"),
             }
         }
+    }
+
+    /// PR-354 fix Z1: the identity walk REFUSES a `.` or `..` in the unresolved
+    /// tail — it used to append it verbatim (so `/srv/new/../pulse.db` did not
+    /// equal `/srv/pulse.db`, bypassing import's #264 refusal) and a path
+    /// ENDING in `..` fell back to the current directory, a silent pass.
+    #[test]
+    fn a_dot_component_in_the_unresolved_tail_is_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("srv");
+        std::fs::create_dir_all(&dir).expect("the fixture directory");
+        let db = dir.join("pulse.db");
+        std::fs::write(&db, b"the database").expect("the database");
+
+        for (what, path) in [
+            (
+                "a `..` in the tail",
+                dir.join("new").join("..").join("pulse.db"),
+            ),
+            ("a trailing `..`", dir.join("new").join("..")),
+            (
+                "a `.` in the tail",
+                PathBuf::from(format!("{}/new/./pulse.db", dir.display())),
+            ),
+        ] {
+            let error = canonical_identity(&path).expect_err("the dot tail is refused");
+            let message = error.to_string();
+            assert!(
+                message.contains(&path.display().to_string()) && message.contains("cannot resolve"),
+                "{what}: the refusal names the path: {message}"
+            );
+            assert!(
+                message.contains("..") || message.contains('.'),
+                "{what}: and the component: {message}"
+            );
+        }
+
+        // A plain path still resolves, and so does a fresh tail of plain names.
+        assert_eq!(
+            canonical_identity(&db).expect("a plain path"),
+            std::fs::canonicalize(&db).expect("the canonical path")
+        );
+        assert_eq!(
+            canonical_identity(&dir.join("fresh").join("pulse.db")).expect("a fresh tail"),
+            std::fs::canonicalize(&dir)
+                .expect("the directory")
+                .join("fresh")
+                .join("pulse.db")
+        );
     }
 }

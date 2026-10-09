@@ -727,3 +727,54 @@ async fn a_clean_import_prints_the_three_paper_digests() {
     target.pool().close().await;
     source.pool().close().await;
 }
+
+/// PR-354 fix Z1: a target whose UNRESOLVED tail holds `..` used to compare
+/// unequal to the source it names — `canonical_identity` fell back to the cwd
+/// for a path ending in `..` — so the #264 same-target refusal was bypassed and
+/// the install renamed over the source. It is refused by name now, and nothing
+/// is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dot_dot_target_that_names_the_source_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let src = seed_source(&dir.path().join("mac"), 2, 2, 0).await;
+    let before = sha256_file(&src.db);
+    let source_name = src.db.file_name().unwrap();
+    // `<dir>/new/../<source name>`: `new` does not exist, and the path names the
+    // SOURCE file.
+    let target = dir.path().join("new").join("..").join(source_name);
+
+    let out = run_pulse(
+        &home,
+        &[
+            "import",
+            "--from-db",
+            src.db.to_str().unwrap(),
+            "--from-data-dir",
+            src.data.to_str().unwrap(),
+            "--db",
+            target.to_str().unwrap(),
+            "--data-dir",
+            dir.path().join("other-data").to_str().unwrap(),
+        ],
+    );
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "the dot-dot target is refused: {text}"
+    );
+    assert!(
+        text.contains("..") && text.contains("refus"),
+        "the refusal names the component: {text}"
+    );
+    assert_eq!(
+        sha256_file(&src.db),
+        before,
+        "the source is byte-for-byte untouched"
+    );
+    assert!(
+        !dir.path().join("new").exists(),
+        "no `new` directory was left behind"
+    );
+}

@@ -117,6 +117,19 @@ pub enum RoleRefused {
         /// The data dir, as given.
         data_dir: PathBuf,
     },
+    /// A `.` or `..` sits in the UNRESOLVED tail of a path (PR-354 fix Z1): the
+    /// tail is appended verbatim, so it is refused rather than normalized.
+    #[error(
+        "the path {} holds a {component:?} component below its deepest existing ancestor; \
+         refusing rather than normalizing it",
+        path.display()
+    )]
+    DotComponent {
+        /// The path as given.
+        path: PathBuf,
+        /// The offending component (`..` or `.`).
+        component: String,
+    },
     /// A path could not be resolved for the containment check.
     #[error("cannot resolve {}: {source}", path.display())]
     PathUnresolved {
@@ -375,48 +388,111 @@ fn same_role(marked: ServerRole, role: ServerRole, data_dir: &Path) -> Result<()
     })
 }
 
+/// The path's raw components, `.` and `..` PRESERVED: `Path::components`
+/// normalizes a `.` in the middle of a path away, which is exactly the component
+/// the refusal below has to see. On unix the bytes are used directly, so a
+/// non-UTF-8 path is handled too; elsewhere the components `Path` yields are
+/// used (a middle `.` is invisible there, while `..` is still refused).
+fn raw_components(path: &Path) -> Vec<OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let mut out: Vec<OsString> = Vec::new();
+        if path.is_absolute() {
+            out.push(OsString::from("/"));
+        }
+        out.extend(
+            path.as_os_str()
+                .as_bytes()
+                .split(|byte| *byte == b'/')
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| OsString::from_vec(segment.to_vec())),
+        );
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        path.components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect()
+    }
+}
+
+/// Whether one raw component is `.` or `..`.
+fn is_dot_component(segment: &OsString) -> bool {
+    segment == "." || segment == ".."
+}
+
 /// The absolute, symlink-resolved form of `path`, resolved through its deepest
 /// EXISTING ancestor so a path whose final components do not exist yet (the
 /// database a `--role` start is about to create) resolves consistently with one
-/// that does (the data dir). The unresolved tail is appended verbatim.
+/// that does (the data dir). The unresolved tail is appended verbatim — and it
+/// must be made of plain names: a `.` or `..` below the deepest existing
+/// ancestor is REFUSED (PR-354 fix Z1), never normalized, because the verbatim
+/// append would otherwise climb out of the data dir
+/// (`<dir>/new/../../outside`) after the lexical containment check passed.
 ///
 /// # Errors
 ///
-/// [`RoleRefused::PathUnresolved`] on any IO error while walking up — the
-/// caller turns that into a named refusal, never a silent pass.
+/// [`RoleRefused::DotComponent`] for a `.`/`..` in the unresolved tail, and
+/// [`RoleRefused::PathUnresolved`] on any IO error while walking — the caller
+/// turns both into a named refusal, never a silent pass.
 fn resolve(path: &Path) -> Result<PathBuf, RoleRefused> {
     let unresolved = |source| RoleRefused::PathUnresolved {
         path: path.to_path_buf(),
         source,
+    };
+    let dot = |segment: &OsString| RoleRefused::DotComponent {
+        path: path.to_path_buf(),
+        component: segment.to_string_lossy().into_owned(),
     };
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().map_err(unresolved)?.join(path)
     };
-    let mut cursor = absolute.as_path();
+    let mut resolved: Option<PathBuf> = None;
     let mut tail: Vec<OsString> = Vec::new();
-    loop {
-        match fs::canonicalize(cursor) {
-            Ok(mut resolved) => {
-                for name in tail.iter().rev() {
-                    resolved.push(name);
-                }
-                return Ok(resolved);
-            }
+    for segment in raw_components(&absolute) {
+        // The candidate is the deepest existing prefix, the tail pushed so far
+        // and this segment, joined TEXTUALLY: `PathBuf::join` drops a `.`
+        // component before any syscall, which would hide exactly the case this
+        // refusal exists for (PR-354 fix Z1).
+        let mut joined = match &resolved {
+            Some(root) => root.clone().into_os_string(),
+            None => std::ffi::OsString::new(),
+        };
+        for name in &tail {
+            joined.push(std::path::MAIN_SEPARATOR.to_string());
+            joined.push(name);
+        }
+        if !joined.is_empty() {
+            joined.push(std::path::MAIN_SEPARATOR.to_string());
+        }
+        joined.push(&segment);
+        let prefix = PathBuf::from(joined);
+        match fs::canonicalize(&prefix) {
+            // Still inside the existing prefix: `.`/`..` here resolve against
+            // real directories, so they are not the refusal's business.
+            Ok(root) => resolved = Some(root),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = cursor.file_name() else {
-                    return Err(unresolved(error));
-                };
-                tail.push(name.to_os_string());
-                match cursor.parent() {
-                    Some(parent) => cursor = parent,
-                    None => return Err(unresolved(error)),
+                if is_dot_component(&segment) {
+                    return Err(dot(&segment));
                 }
+                tail.push(segment);
             }
             Err(error) => return Err(unresolved(error)),
         }
     }
+    let Some(mut out) = resolved else {
+        return Err(unresolved(std::io::Error::other(
+            "the path has no resolvable root",
+        )));
+    };
+    for name in tail {
+        out.push(name);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -642,5 +718,52 @@ mod tests {
             .unwrap()
             .flatten()
             .all(|entry| entry.file_name() == std::ffi::OsStr::new(ROLE_MARKER_NAME))
+    }
+
+    /// PR-354 fix Z1: a `..` or `.` component in the UNRESOLVED tail is refused
+    /// by name, before anything is created. The tail is appended verbatim, so
+    /// `<qa>/new/../../outside/pulse.db` passed the lexical containment check
+    /// (`starts_with`) and then climbed out of the data dir once `new` existed;
+    /// a `.` was silently appended twice.
+    #[test]
+    fn a_dot_component_in_the_unresolved_tail_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let qa = dir.path().join("qa");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&qa).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let db = qa
+            .join("new")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("pulse.db");
+        assert!(!qa.join("new").exists(), "the fixture's `new` is absent");
+        let error = check(&qa, &db, ServerRole::Prod).expect_err("the dot-dot tail is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("..") && message.contains(&db.display().to_string()),
+            "the refusal names the component and the path: {message}"
+        );
+        assert!(!qa.join("new").exists(), "nothing was created");
+        assert!(!qa.join(ROLE_MARKER_NAME).exists(), "no marker");
+        assert!(
+            !outside.join("pulse.db").exists(),
+            "and no database outside the data dir"
+        );
+
+        // A `.` in the tail is refused too (`Path::join` would drop it, so the
+        // path is built from its text).
+        let dot = std::path::PathBuf::from(format!("{}/new/./pulse.db", qa.display()));
+        let error = check(&qa, &dot, ServerRole::Prod).expect_err("the dot tail is refused");
+        assert!(
+            error.to_string().contains('.'),
+            "the refusal names the component: {error}"
+        );
+        assert!(
+            !qa.join("new").exists(),
+            "nothing was created for the dot tail either"
+        );
     }
 }

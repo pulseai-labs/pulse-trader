@@ -340,7 +340,9 @@ fn take_source_mutation() -> Option<SourceMutation> {
 ///
 /// Returns an [`anyhow::Error`] naming the source, the target and the mistake.
 fn refuse_source_is_target(label: &str, job: &VerifiedCopy<'_>) -> anyhow::Result<()> {
-    if resolves_to_same(job.from_db, job.db_target) {
+    if resolves_to_same(job.from_db, job.db_target)
+        .map_err(|error| anyhow!("{label}: refusing: {error}"))?
+    {
         anyhow::bail!(
             "{label}: refusing: the source database {} IS the target database {} — nothing was \
              touched (#264)",
@@ -348,7 +350,9 @@ fn refuse_source_is_target(label: &str, job: &VerifiedCopy<'_>) -> anyhow::Resul
             job.db_target.display()
         );
     }
-    if resolves_to_same(job.from_data_dir, job.data_target) {
+    if resolves_to_same(job.from_data_dir, job.data_target)
+        .map_err(|error| anyhow!("{label}: refusing: {error}"))?
+    {
         anyhow::bail!(
             "{label}: refusing: the source data dir {} IS the target data dir {} — nothing was \
              touched (#264)",
@@ -370,12 +374,18 @@ fn refuse_source_is_target(label: &str, job: &VerifiedCopy<'_>) -> anyhow::Resul
 /// (the target may not exist yet), the CANONICAL paths are compared instead:
 /// the deepest existing ancestor is canonicalized and the component below it
 /// appended.
-#[must_use]
-fn resolves_to_same(existing: &Path, other: &Path) -> bool {
-    match (device_and_inode(existing), device_and_inode(other)) {
-        (Some(left), Some(right)) => same_file_identity(left, right),
-        _ => canonical_identity(existing) == canonical_identity(other),
+/// # Errors
+///
+/// A named refusal when either path's unresolved tail holds a `.`/`..`
+/// component (PR-354 fix Z1): such a path is never normalized into an identity
+/// that silently differs from what it names.
+fn resolves_to_same(existing: &Path, other: &Path) -> anyhow::Result<bool> {
+    if let (Some(left), Some(right)) = (device_and_inode(existing), device_and_inode(other)) {
+        return Ok(same_file_identity(left, right));
     }
+    let left = canonical_identity(existing).map_err(|error| anyhow!("{error}"))?;
+    let right = canonical_identity(other).map_err(|error| anyhow!("{error}"))?;
+    Ok(left == right)
 }
 
 /// `path`'s filesystem identity — the device AND the inode (PR-354 fix C8).
@@ -4983,18 +4993,21 @@ mod tests {
         let other = dir.path().join("other.db");
         fs::write(&other, b"another database").expect("write the other");
         assert!(
-            !resolves_to_same(&file, &other),
+            !resolves_to_same(&file, &other).unwrap(),
             "distinct files are not one"
         );
         #[cfg(unix)]
         {
             let link = dir.path().join("link.db");
             std::os::unix::fs::symlink(&file, &link).expect("the symlink");
-            assert!(resolves_to_same(&file, &link), "a symlink is the same file");
+            assert!(
+                resolves_to_same(&file, &link).unwrap(),
+                "a symlink is the same file"
+            );
         }
         // ...and a target that does not exist yet falls back to canonical
         // paths: a fresh file beside it is not the source.
         let fresh = dir.path().join("fresh").join("pulse.db");
-        assert!(!resolves_to_same(&file, &fresh));
+        assert!(!resolves_to_same(&file, &fresh).unwrap());
     }
 }
