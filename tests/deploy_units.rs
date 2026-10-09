@@ -446,6 +446,59 @@ fn forced_command_serves_the_two_real_clients() {
     }
 }
 
+/// PR-354 fix P2 (Codex 4231276352): the operand loop skipped EVERY `.`, so
+/// `rsync --server --sender <flags> . . <root>/` passed — and the second `.`
+/// is ANOTHER transfer root, which rsync (and openrsync) resolve against the
+/// forced command's cwd, the Mini user's home. Exactly ONE `.` is accepted, in
+/// the separator position (the first non-option word, before the sources); a
+/// second one, or one after a source, is refused BY NAME and never executed.
+#[test]
+fn forced_command_refuses_a_second_dot_operand() {
+    let fake = FakeRsync::new();
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().display().to_string();
+
+    for command in [
+        // The reported shape: the protocol's separator, then a SECOND `.`.
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . . {root_path}/"),
+        // A `.` after the source, and one with the source before the
+        // separator (both are extra transfer roots, not the separator).
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu {root_path}/ ."),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/ ."),
+    ] {
+        let output = fake.run(root.path(), &command);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "must be refused: {command}: {stderr}"
+        );
+        assert!(
+            stderr.contains("refused") && stderr.contains("'.'"),
+            "by name: {command}: {stderr}"
+        );
+        assert!(
+            fake.argv().is_empty(),
+            "a refused command is never executed: {command}"
+        );
+    }
+
+    // The ONE separator both real clients send still passes.
+    for command in [
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/"),
+        format!(
+            "rsync --server --sender -g -l -o -p -D -r -t --ignore-existing --dirs . {root_path}/"
+        ),
+    ] {
+        let output = fake.run(root.path(), &command);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "must be served: {command}: {stderr}"
+        );
+        assert!(!stderr.contains("refused"), "nothing was refused: {stderr}");
+    }
+}
+
 /// PR-354 fix B2: rsync follows a command-line symlink that ends in `/`, so an
 /// operand like `$ROOT/link/` read outside the backup root even though the
 /// prefix test strips the trailing slash. Anything below the root with a

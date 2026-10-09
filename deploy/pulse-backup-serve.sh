@@ -125,8 +125,13 @@ symlink_in_path() {
 }
 
 # Every operand must be the transfer root or under it: `.` is the protocol's
-# own separator, and everything else has to resolve inside $ROOT. The first
-# word is the command itself, never an operand.
+# own separator, accepted EXACTLY ONCE, as the first non-option word — rsync
+# and openrsync put the transfer root there, before the sources (PR-354 fix P2:
+# the loop used to skip EVERY `.`, so `rsync --server --sender <flags> . .
+# "$ROOT/"` passed, and that second `.` is ANOTHER transfer root, resolved
+# against this script's cwd — the Mini user's home). A second `.`, or one in
+# any other position, is refused by name. Everything else has to resolve inside
+# $ROOT. The first word is the command itself, never an operand.
 #
 # Below the root, two shapes are refused by name (PR-354 fix B2): a trailing
 # slash on anything but the root itself — rsync follows a command-line symlink
@@ -134,10 +139,17 @@ symlink_in_path() {
 # though the prefix test strips the slash — and any operand that is, or passes
 # through, a symlink beneath the root.
 FOUND_ROOT=0
+SEPARATOR=0
 for WORD in "${ARGS[@]:1}"; do
   case "$WORD" in
     -*) continue ;;
-    .) continue ;;
+    .)
+      if [ "$SEPARATOR" = 1 ] || [ "$FOUND_ROOT" = 1 ]; then
+        refuse "a second '.' operand (only one transfer root is served)"
+      fi
+      SEPARATOR=1
+      continue
+      ;;
   esac
   OPERAND="$WORD"
   case "$OPERAND" in
