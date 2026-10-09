@@ -276,6 +276,12 @@ pub struct ServeConfig {
     /// marker before the database was opened; this is the value the handshake
     /// reports (and what the app's QA badge reads).
     pub role: Option<super::role::ServerRole>,
+    /// The database's instance lock (#250, r4.s2.w2), ALREADY TAKEN by the
+    /// composition root on the resolved db path before `open_db` (PR-354 fix
+    /// C3a — taken here it came after the migrate-then-open, so an import could
+    /// swap the file in between and the server kept the unlinked inode). The
+    /// server holds this guard for its whole lifetime.
+    pub(crate) instance_lock: InstanceLock,
 }
 
 /// The default polling grace: five seconds past each bar's close.
@@ -343,13 +349,12 @@ fn start_guard(data_dir: &std::path::Path, limit: StartLimit, sink: &Arc<dyn Req
 /// serve-loop failure.
 pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     // ---- Step 0 (#250, r4.s2.w2): the database's instance lock, held for this
-    // process's lifetime. A second server — or an in-flight import/restore that
-    // holds the target until its install completes — refuses this one by name,
-    // before anything touches the database.
-    let _instance_lock =
-        InstanceLock::acquire(config.db.path()).map_err(|error| ServeError::InstanceLockHeld {
-            reason: error.to_string(),
-        })?;
+    // process's lifetime. The composition root took it on the resolved db path
+    // BEFORE `open_db` (PR-354 fix C3a: taken here it came after the
+    // migrate-then-open, so an import/restore could swap the file in between
+    // and the server kept the unlinked inode); this arm holds the guard it
+    // passed.
+    let _instance_lock = config.instance_lock;
 
     // r3.s4.w4: the control channel is created BEFORE the state, so the
     // routes' handle and the runtime's receiver come from one pair.

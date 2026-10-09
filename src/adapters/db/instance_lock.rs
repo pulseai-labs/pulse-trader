@@ -67,16 +67,26 @@ pub(crate) struct InstanceLock {
 
 impl InstanceLock {
     /// The lock file beside `db_path`: `<db name>.serve.lock` in the database's
-    /// own directory. A bare relative `pulse.db` keeps its lock beside it in
-    /// the current directory.
+    /// own directory — the directory being the RESOLVED identity's, so every
+    /// spelling of one database takes one lock (PR-354 fix C3b): a symlink to
+    /// the database, or a symlinked directory component, resolves to the same
+    /// file as the real path, and `pulse serve pulse.db` and
+    /// `pulse import --db link.db` can no longer take two different locks while
+    /// the import renames over the live database.
+    ///
+    /// The rule is [`canonical_identity`]: the deepest existing ancestor is
+    /// canonicalized and any not-yet-existing tail is appended unchanged, so a
+    /// target the caller is about to create still resolves consistently with
+    /// one that exists.
     #[must_use]
     pub(crate) fn lock_path(db_path: &Path) -> PathBuf {
-        let mut name = db_path.file_name().map_or_else(
+        let resolved = canonical_identity(db_path);
+        let mut name = resolved.file_name().map_or_else(
             || std::ffi::OsString::from("pulse.db"),
             std::ffi::OsStr::to_os_string,
         );
         name.push(LOCK_SUFFIX);
-        db_path.with_file_name(name)
+        resolved.with_file_name(name)
     }
 
     /// Take the exclusive, NON-BLOCKING instance lock on `db_path`.
@@ -136,6 +146,39 @@ impl InstanceLock {
     }
 }
 
+/// `path` with every symlinked ancestor resolved and any not-yet-existing tail
+/// preserved: the deepest ancestor that EXISTS is canonicalized and the
+/// remaining components are appended unchanged. A path with nothing to resolve
+/// against (a bare relative name that does not exist) resolves the cwd.
+///
+/// One copy of the rule, shared by the instance lock's [`InstanceLock::lock_path`]
+/// and the import's same-target refusal (PR-354 fix C3b; it lived in
+/// `cli::import` only, and the lock keyed on the path as typed).
+pub(crate) fn canonical_identity(path: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    let resolved = loop {
+        if let Ok(root) = fs::canonicalize(&current) {
+            break root;
+        }
+        match current.file_name().map(std::ffi::OsStr::to_os_string) {
+            Some(name) => {
+                tail.push(name);
+                current = match current.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                    _ => PathBuf::from("."),
+                };
+            }
+            None => break fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    };
+    let mut out = resolved;
+    for name in tail.iter().rev() {
+        out.push(name);
+    }
+    out
+}
+
 /// Create the lock file's parent directory when it is not there yet.
 fn create_parent(lock_path: &Path) -> Result<(), InstanceLockError> {
     if let Some(parent) = lock_path.parent()
@@ -170,16 +213,59 @@ mod tests {
     use tempfile::TempDir;
 
     /// The lock file is the database's own path plus `.serve.lock`, wherever
-    /// the database lives (a bare relative name included).
+    /// the database lives. A bare relative name resolves against the cwd — the
+    /// same lock its absolute spelling takes (PR-354 fix C3b).
     #[test]
     fn the_lock_file_sits_beside_the_database() {
         assert_eq!(
             InstanceLock::lock_path(Path::new("/srv/pulse.db")),
             Path::new("/srv/pulse.db.serve.lock")
         );
+        let cwd = std::fs::canonicalize(".").expect("the cwd resolves");
         assert_eq!(
             InstanceLock::lock_path(Path::new("pulse.db")),
-            Path::new("pulse.db.serve.lock")
+            cwd.join("pulse.db.serve.lock")
+        );
+    }
+
+    /// PR-354 fix C3b: the lock is keyed on the RESOLVED identity, so every
+    /// spelling of one database takes one lock — a symlink to the database and
+    /// a symlinked directory component included. Keyed on the path as typed,
+    /// `serve pulse.db` and `import --db link.db` took two different locks and
+    /// the import renamed over the live database.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_spelling_takes_the_same_lock() {
+        let tmp = TempDir::new().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("the real directory");
+        let db = real.join("pulse.db");
+        std::fs::write(&db, b"the database").expect("the database");
+        let file_link = tmp.path().join("link.db");
+        std::os::unix::fs::symlink(&db, &file_link).expect("the file symlink");
+        let dir_link = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &dir_link).expect("the directory symlink");
+
+        let lock = InstanceLock::lock_path(&db);
+        assert_eq!(
+            InstanceLock::lock_path(&file_link),
+            lock,
+            "a symlink to the database takes its lock"
+        );
+        assert_eq!(
+            InstanceLock::lock_path(&dir_link.join("pulse.db")),
+            lock,
+            "a symlinked directory component takes it too"
+        );
+        // And a target that does not exist yet resolves through its deepest
+        // EXISTING ancestor, so the first acquire and the second agree.
+        let fresh = InstanceLock::lock_path(&real.join("fresh").join("pulse.db"));
+        assert_eq!(
+            fresh,
+            std::fs::canonicalize(&real)
+                .expect("the real directory resolves")
+                .join("fresh")
+                .join("pulse.db.serve.lock")
         );
     }
 

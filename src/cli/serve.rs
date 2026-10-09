@@ -12,9 +12,10 @@ use std::str::FromStr;
 use clap::Args;
 
 use crate::adapters::db::default_db_path;
+use crate::adapters::db::instance_lock::InstanceLock;
 use crate::adapters::store::default_base_dir;
 use crate::application::paper_control::DEFAULT_PAPER_REPLY_TIMEOUT_MS;
-use crate::server::bind::{DEFAULT_POLL_GRACE_MS, ServeConfig};
+use crate::server::bind::{DEFAULT_POLL_GRACE_MS, ServeConfig, ServeError};
 use crate::server::role::{self, ServerRole};
 use crate::server::start_limit::StartLimit;
 
@@ -84,10 +85,23 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
         None => None,
     };
     let data_dir = resolved_data_dir(args)?;
+    let db_path = resolved_db_path(args)?;
     if let Some(role) = role {
-        role::check(&data_dir, &resolved_db_path(args)?, role)
+        role::check(&data_dir, &db_path, role)
             .map_err(|error| anyhow::anyhow!("pulse serve: refusing to serve: {error}"))?;
     }
+    // ---- Step 0c (PR-354 fix C3a): the database's instance lock, held for this
+    // process's lifetime. It is taken HERE — on the resolved db path, BEFORE
+    // `open_db` — because an import/restore can otherwise swap the database file
+    // in between the migrate-then-open and the later acquire: the server would
+    // keep serving the unlinked inode while the import installs a new file under
+    // the same name. A second server, or an in-flight data op, refuses this one
+    // by name before anything touches the database.
+    let instance_lock = InstanceLock::acquire(&db_path).map_err(|error| {
+        anyhow::Error::new(ServeError::InstanceLockHeld {
+            reason: error.to_string(),
+        })
+    })?;
     // ---- Step 1: the migrated DB (the one migrate-then-open every arm uses).
     let db = super::open_db(args.db.as_deref()).await?;
     crate::server::bind::serve(ServeConfig {
@@ -99,6 +113,7 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
         paper_reply_timeout_ms: DEFAULT_PAPER_REPLY_TIMEOUT_MS,
         start_limit,
         role,
+        instance_lock,
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))

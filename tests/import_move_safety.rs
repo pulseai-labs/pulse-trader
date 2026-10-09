@@ -542,6 +542,127 @@ async fn a_held_lock_refuses_import_and_restore_and_lifts_when_the_server_exits(
     );
 }
 
+/// PR-354 fix C3a: the instance lock is taken BEFORE the database is opened.
+/// With the old order (`open_db` first, the lock inside `bind::serve`), a start
+/// that was about to be refused had already created and MIGRATED the database —
+/// the very file an import/restore may be swapping. A held lock must refuse
+/// with the database still absent.
+#[cfg(unix)]
+#[test]
+fn a_held_lock_refuses_serve_before_the_database_is_created() {
+    use std::os::unix::io::AsRawFd as _;
+
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    let db = data.join("pulse.db");
+
+    // Hold the lock exactly as a running server would: the lock file beside the
+    // database's RESOLVED directory (the fixture dir exists, so the resolved
+    // form is its canonical spelling).
+    let lock_path = fs::canonicalize(&data).unwrap().join("pulse.db.serve.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("the lock file");
+    // SAFETY: `lock_file` is a live open fd for the duration of the call, and
+    // it stays open (holding the lock) until the end of the test.
+    let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test holds the instance lock");
+
+    let out = run_pulse(
+        &home,
+        &[
+            "serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--dev-loopback",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a held lock refuses the start: {text}"
+    );
+    assert!(
+        text.contains("serve.lock"),
+        "the refusal names the lock: {text}"
+    );
+    assert!(
+        !db.exists(),
+        "and the database was never created: {}",
+        db.display()
+    );
+}
+
+/// PR-354 fix C3b: the lock is keyed on the database's RESOLVED identity, so a
+/// server holding `real/pulse.db` and an import whose `--db` is a SYMLINK to it
+/// (or reaches it through a symlinked directory) take the SAME lock. Keyed on
+/// the path as typed they took two, and the import renamed over the live
+/// database's file while the server kept the unlinked inode.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_symlinked_target_takes_the_live_databases_lock() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let config = dir.path().join("config");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&config).unwrap();
+    let src = seed_source(&dir.path().join("mac"), 2, 2, 0).await;
+    let server_dir = dir.path().join("server");
+    fs::create_dir_all(&server_dir).unwrap();
+    let target_db = server_dir.join("pulse.db");
+    let target_data = dir.path().join("server-data");
+
+    // The live server holds the target's instance lock before it binds.
+    let mut serve = Serve::spawn(&home, &config, &target_db, &target_data);
+    assert!(
+        serve.wait_for_line("listening on", 60),
+        "pulse serve starts and holds the lock; lines:\n{}",
+        serve.output()
+    );
+
+    let file_link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&target_db, &file_link).unwrap();
+    let dir_link = dir.path().join("alias");
+    std::os::unix::fs::symlink(&server_dir, &dir_link).unwrap();
+
+    for spelling in [file_link.clone(), dir_link.join("pulse.db")] {
+        let import = run_pulse(
+            &home,
+            &[
+                "import",
+                "--from-db",
+                src.db.to_str().unwrap(),
+                "--from-data-dir",
+                src.data.to_str().unwrap(),
+                "--db",
+                spelling.to_str().unwrap(),
+                "--data-dir",
+                dir.path().join("other-data").to_str().unwrap(),
+            ],
+        );
+        let text = combined(&import);
+        assert!(
+            !import.status.success(),
+            "an import through {} is refused: {text}",
+            spelling.display()
+        );
+        assert!(
+            text.contains("a running pulse serve holds it"),
+            "the refusal is the LIVE database's lock, not the non-empty target's: {text}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (ii) source == target (#264)
 // ---------------------------------------------------------------------------

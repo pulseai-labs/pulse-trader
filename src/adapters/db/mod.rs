@@ -155,7 +155,7 @@ pub(crate) use migrate::{
 #[cfg(test)]
 pub(crate) use migrate::{InterruptedInstall, QuarantineOwner, orphaned_quarantines};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -189,12 +189,6 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: SqlitePool,
-    /// The database file this pool was opened at — the instance lock's target
-    /// (r4.s2.w2: `pulse serve` locks the file it opened, and the data-ops
-    /// verbs lock the file they are about to replace). Kept so the lock path
-    /// is derived from the ONE resolution that opened the pool, never a second
-    /// invented one.
-    path: PathBuf,
 }
 
 impl Db {
@@ -261,10 +255,7 @@ impl Db {
             .connect_with(opts)
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
-        Ok(Self {
-            pool,
-            path: path.to_path_buf(),
-        })
+        Ok(Self { pool })
     }
 
     /// Open the pool at the platform-default `pulse.db` path
@@ -283,13 +274,6 @@ impl Db {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
-    }
-
-    /// The database file this pool was opened at (r4.s2.w2: the file the
-    /// instance lock is taken on).
-    #[must_use]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 }
 

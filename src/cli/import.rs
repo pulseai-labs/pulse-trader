@@ -44,7 +44,7 @@ use super::publish;
 #[cfg(test)]
 use super::publish::probe;
 use crate::adapters::db::default_db_path;
-use crate::adapters::db::instance_lock::InstanceLock;
+use crate::adapters::db::instance_lock::{InstanceLock, canonical_identity};
 use crate::adapters::db::ops;
 pub(crate) use crate::adapters::db::{
     DB_STATE_SUFFIXES, TargetIdentity, inode_of, quarantine_name, refuse_orphaned_quarantines,
@@ -378,35 +378,6 @@ fn resolves_to_same(existing: &Path, other: &Path) -> bool {
     canonical_identity(existing) == canonical_identity(other)
 }
 
-/// `path` with every symlinked ancestor resolved and any not-yet-existing tail
-/// preserved: the deepest ancestor that EXISTS is canonicalized and the
-/// remaining components are appended unchanged. A path with nothing to resolve
-/// against (a bare relative name that does not exist) resolves the cwd.
-fn canonical_identity(path: &Path) -> PathBuf {
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut current = path.to_path_buf();
-    let resolved = loop {
-        if let Ok(root) = fs::canonicalize(&current) {
-            break root;
-        }
-        match current.file_name().map(std::ffi::OsStr::to_os_string) {
-            Some(name) => {
-                tail.push(name);
-                current = match current.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-                    _ => PathBuf::from("."),
-                };
-            }
-            None => break fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(".")),
-        }
-    };
-    let mut out = resolved;
-    for name in tail.iter().rev() {
-        out.push(name);
-    }
-    out
-}
-
 /// The shared verified-copy engine (import over the Mac source; restore over
 /// a backup — the same verification, the same atomic install).
 ///
@@ -428,6 +399,17 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     // ANYTHING else — before the lock file, before any read of the target — so
     // the source is never touched, not even by this run's first byte.
     refuse_source_is_target(label, &job)?;
+
+    // ---- The deepest ancestor that exists BEFORE the target's directory is
+    // created — computed HERE, before the instance lock below, whose
+    // `create_dir_all` makes the target's parent. The lock used to run first,
+    // so on a first import into a new directory the created root WAS the
+    // directory the lock had just made, and the parent that received its entry
+    // was never synced (PR-354 fix C3c; a regression from main). Every level
+    // below it is an entry this run makes, so the install's directory sync has
+    // to cover them (fix round 1, F6). A bare relative target resolves to the
+    // current directory, which already exists (fix round 5, P4).
+    let created_root = publish::existing_ancestor(&target_dir(job.db_target));
 
     // ---- #250 (r4.s2.w2): the target's instance lock, held until the install
     // completes. A running `pulse serve` holds it, so this run refuses by name
@@ -480,13 +462,8 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     }
 
     // ---- Step 2: a consistent copy of the source, beside the target (the
-    // same filesystem, under the target's directory, never /tmp).
-    //
-    // The deepest ancestor that exists BEFORE the target's directory is created:
-    // every level below it is an entry this run makes, so the install's directory
-    // sync has to cover them (fix round 1, F6). A bare relative target resolves
-    // to the current directory, which already exists (fix round 5, P4).
-    let created_root = publish::existing_ancestor(&target_dir(job.db_target));
+    // same filesystem, under the target's directory, never /tmp). The created
+    // root this run's syncs must cover was computed before the lock.
     if let Some(parent) = job.db_target.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -4936,4 +4913,35 @@ mod tests {
                 .collect();
         assert!(leftovers.is_empty(), "the temporary is gone: {leftovers:?}");
     }
+
+    /// PR-354 fix C3c: `created_root` is computed BEFORE the instance lock's
+    /// `create_dir_all`. The fixture's target directory (`<temp>/server`) does
+    /// not exist yet, so the pre-existing ancestor is the tempdir itself: the
+    /// install's directory syncs must reach it (its entry is the one that
+    /// received the new directory). With the lock first, the created root WAS
+    /// `server/` and the tempdir's sync never ran — the entry was left
+    /// unflushed, a regression from main.
+    #[tokio::test]
+    async fn a_first_import_syncs_the_parent_that_received_the_new_directory() {
+        let flow = flow().await;
+        assert!(
+            !flow.target_db.parent().expect("a parent").exists(),
+            "the target's directory is this run's to create"
+        );
+        let _ = publish::probe::take();
+        // Keyed on the directory the walk must REACH: the injection fires only
+        // if `levels_to_sync` climbed past the target's own directory.
+        publish::probe::fail_next_sync_of(flow.dir.path());
+
+        let error = run_verified_copy(import_job(&flow))
+            .await
+            .expect_err("the first import must sync the pre-existing ancestor");
+        let message = error.to_string();
+        assert!(
+            message.contains("injected failure")
+                && message.contains(&flow.dir.path().display().to_string()),
+            "the failure is the pre-existing ancestor's own sync: {message}"
+        );
+    }
+
 }
