@@ -446,6 +446,72 @@ fn forced_command_serves_the_two_real_clients() {
     }
 }
 
+/// PR-354 fix B2: rsync follows a command-line symlink that ends in `/`, so an
+/// operand like `$ROOT/link/` read outside the backup root even though the
+/// prefix test strips the trailing slash. Anything below the root with a
+/// trailing slash, and anything that is or passes through a symlink beneath the
+/// root, is refused by name; the root itself and real files under it are served.
+#[cfg(unix)]
+#[test]
+fn forced_command_refuses_trailing_slashes_and_symlinks_under_the_root() {
+    let fake = FakeRsync::new();
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root_path = root.path().display().to_string();
+
+    // A real file and a real directory under the root, and two symlinks to a
+    // directory OUTSIDE it: one the operand itself, one an intermediate
+    // component.
+    std::fs::write(root.path().join("pulse-1.db"), b"a backup").unwrap();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("mid")).unwrap();
+
+    for command in [
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/link/"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/link"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/dir/"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/mid/sub"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/mid/sub/"),
+    ] {
+        let output = fake.run(root.path(), &command);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "must be refused: {command}: {stderr}"
+        );
+        assert!(stderr.contains("refused"), "by name: {command}: {stderr}");
+        assert!(
+            fake.argv().is_empty(),
+            "a refused command is never executed: {command}"
+        );
+    }
+
+    // The root itself (with or without its trailing slash) and a real file
+    // under it are served — the two real clients' shapes stay valid.
+    for command in [
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}"),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu . {root_path}/pulse-1.db"),
+    ] {
+        let output = fake.run(root.path(), &command);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "must be served: {command}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("refused"),
+            "nothing was refused: {command}: {stderr}"
+        );
+        assert!(
+            fake.argv().contains(&root_path),
+            "rsync got the client's own words: {command}: {}",
+            fake.argv()
+        );
+    }
+}
+
 #[test]
 fn forced_command_refuses_everything_but_a_read() {
     let fake = FakeRsync::new();
