@@ -17,9 +17,12 @@
 //!
 //! **Stdout discipline** (mirror `pulse token issue`): the two tokens are the
 //! ONLY stdout lines, written CHECKED, in label order (`qa-app`, then
-//! `qa-agent`). A failure after the transaction — writing the marker, printing
-//! the tokens — best-effort revokes the two fresh tokens and exits non-zero: a
-//! credential that cannot be revealed is revoked, not left behind.
+//! `qa-agent`). The marker write and the print run INSIDE the seed's one
+//! transaction (PR-354 fix C7): a failure there rolls the replace back — nothing
+//! was issued, so no credential exists that no operator has seen, and the
+//! re-run the message promises succeeds. A committed-then-revoked pair could
+//! not be re-issued: labels are never reused (the `UNIQUE` holds after a
+//! revoke), so the failure would leave `qa-app`/`qa-agent` taken forever.
 //!
 //! `--db` and `--data-dir` are REQUIRED. The defaults are prod's paths, and a
 //! seed that silently defaulted onto prod's data would be exactly the accident
@@ -30,6 +33,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::adapters::db::NewToken;
+use crate::adapters::db::ReplacePublishedError;
 use crate::adapters::db::SqliteClientTokenRepo;
 use crate::adapters::db::instance_lock::InstanceLock;
 use crate::server::auth::{Scope, hash_token, mint_token};
@@ -66,8 +70,8 @@ struct FreshToken {
 ///
 /// Returns an [`anyhow::Error`] — printed to stderr by `main` with a non-zero
 /// exit — on any refusal (prod-marked dir, held database), a database failure,
-/// or a failure to write the marker or print the tokens (in which case the two
-/// fresh tokens are best-effort revoked first).
+/// or a failure to write the marker or print the tokens (the transaction rolls
+/// back, so nothing was issued and the re-run succeeds).
 pub(crate) async fn run_qa_seed(args: &QaSeedArgs) -> anyhow::Result<()> {
     // ---- The containment rule first (`serve --role`'s own, one copy of it):
     // the marker describes the data dir's data, so a `--db` outside `--data-dir`
@@ -122,44 +126,46 @@ pub(crate) async fn run_qa_seed(args: &QaSeedArgs) -> anyhow::Result<()> {
         })
         .collect();
     let repo = SqliteClientTokenRepo::new(db.pool().clone());
-    let revoked = repo
-        .replace_all_with(&rows, "cli:qa-seed")
+    // ---- ONE transaction: every copied token revoked, the two fresh ones
+    // issued — and the marker write and the token print run INSIDE it (PR-354
+    // fix C7). A failure there rolls the whole replace back, so NOTHING was
+    // issued: no credential exists that no operator has seen, and the fresh
+    // labels stay free — the re-run the failure message promises succeeds
+    // instead of dying on `LabelExists` (labels are never reused, so the
+    // committed-then-revoked pair this used to leave behind blocked every
+    // re-run).
+    let revoked = match repo
+        .replace_all_with_published(&rows, "cli:qa-seed", || publish(&args.data_dir, &fresh))
         .await
-        .map_err(|error| anyhow::anyhow!("qa-seed: {error}"))?;
+    {
+        Ok(revoked) => revoked,
+        Err(ReplacePublishedError::Store(error)) => {
+            return Err(anyhow::anyhow!("qa-seed: {error}"));
+        }
+        Err(ReplacePublishedError::Publish(error)) => return Err(error),
+    };
     eprintln!(
         "pulse qa-seed: revoked {} copied token(s); issued qa-app and qa-agent",
         revoked.len()
     );
-
-    // ---- The marker and the print. Any failure AFTER the transaction revokes
-    // the two fresh tokens (best effort): they exist in the database but no
-    // operator has seen them, and an unrevealable credential is revoked, not
-    // left behind (the `pulse token issue` rule).
-    let published = publish(&args.data_dir, &fresh);
-    if let Err(error) = published {
-        for fresh in &fresh {
-            if let Err(refusal) = repo.revoke(fresh.label).await {
-                eprintln!(
-                    "pulse qa-seed: WARNING — could not revoke {}: {refusal}",
-                    fresh.label
-                );
-            }
-        }
-        return Err(error);
-    }
     Ok(())
 }
 
 /// Write the `qa` marker, then print the two tokens as the ONLY stdout lines.
+/// Both run INSIDE the seed's transaction (PR-354 fix C7): a failure here
+/// returns before the commit, so the whole replace rolls back and NOTHING was
+/// issued — the re-run the message promises succeeds. The marker is a
+/// filesystem write and is not rolled back; a dir marked `qa` with the seed
+/// still to run is exactly the state the re-run wants.
 fn publish(data_dir: &std::path::Path, fresh: &[FreshToken]) -> anyhow::Result<()> {
     role::write(data_dir, ServerRole::Qa).map_err(|error| {
         anyhow::anyhow!(
-            "qa-seed: the tokens are issued but the marker could not be written: {error}"
+            "qa-seed: the marker could not be written: {error}; nothing was issued — re-run the command"
         )
     })?;
     write_token_lines(&fresh[0].token, &fresh[1].token).map_err(|error| {
         anyhow::anyhow!(
-            "qa-seed: the tokens are issued but could not be printed ({error}); they have been revoked — re-run the command"
+            "qa-seed: the tokens could not be printed ({error}); nothing was issued — re-run the command"
         )
     })
 }

@@ -149,9 +149,12 @@ fn start_server(home: &Path, args: &[&str]) -> Running {
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
-            if sender.send(line).is_err() {
-                break;
-            }
+            // Keep READING when nobody listens any more: this pipe is the
+            // server's stderr, and CLOSING it (the old `break` on a failed
+            // send) makes the server's next log write fail, which kills the
+            // connection the request rides — the `qa_seed_can_be_re_run` test
+            // makes more than one request against one server.
+            let _ = sender.send(line);
         }
     });
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -788,5 +791,118 @@ fn qa_seed_refuses_a_database_outside_the_data_dir() {
     assert!(
         !elsewhere.join("pulse.db.serve.lock").exists(),
         "the refusal lands before the instance lock"
+    );
+}
+
+/// PR-354 fix C7: the recovery the publish-failure message promises is TRUE.
+/// The marker write and the token print run INSIDE the seed's transaction, so a
+/// failed print rolls the replace back — nothing was issued, and a re-run issues
+/// the two QA tokens instead of dying on `LabelExists`. Before the fix the
+/// fresh pair was committed and then revoked, and revoked labels are never
+/// reused, so every re-run was blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qa_seed_can_be_re_run_after_a_publish_failure() {
+    let (root, home) = scratch();
+    let data = root.path().join("qa-data");
+    fs::create_dir_all(&data).unwrap();
+    let db = data.join("pulse.db");
+    let copied = token_issue(&home, &db, "app", "copied-app");
+
+    // The publish failure: the read end of the child's stdout is CLOSED before
+    // it can print, so the token print fails with a broken pipe — the operator's
+    // broken pipe / full disk, injected without any seam in the binary.
+    let mut child = pulse_cmd()
+        .env("HOME", &home)
+        .args([
+            "qa-seed",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn qa-seed with a closed stdout");
+    drop(child.stdout.take().expect("stdout is piped"));
+    let failed = child.wait_with_output().expect("wait for qa-seed");
+    let failure_text = String::from_utf8_lossy(&failed.stderr).into_owned();
+    assert!(
+        !failed.status.success(),
+        "the print failure fails the run: {failure_text}"
+    );
+    assert!(
+        failure_text.contains("re-run the command"),
+        "the failure tells the operator to re-run: {failure_text}"
+    );
+
+    // The re-run: it must SUCCEED — the failed run issued nothing, so the two
+    // labels are free (and the copied token is still the active one).
+    let again = run(
+        &home,
+        &[
+            "qa-seed",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        again.status.success(),
+        "the re-run the message promised succeeds: {}",
+        text(&again)
+    );
+    let stdout = String::from_utf8(again.stdout).expect("utf-8 stdout");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 2, "exactly two stdout lines: {stdout:?}");
+
+    // And both tokens WORK: a QA server accepts each, reporting the scope its
+    // line order promises (qa-app then qa-agent).
+    let server = start_server(
+        &home,
+        &[
+            "serve",
+            "--role",
+            "qa",
+            "--dev-loopback",
+            "--bind",
+            "127.0.0.1:0",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+    for (token, scope) in lines.iter().zip(["app", "agent"]) {
+        assert!(token.starts_with("pt_"), "a minted token: {token:?}");
+        let body = handshake(&server.base, token);
+        assert!(
+            body.contains("HTTP/1.1 200"),
+            "the re-run's {scope} token works: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"scope\":\"{scope}\"")),
+            "and it carries the {scope} scope: {body}"
+        );
+        assert!(body.contains("\"role\":\"qa\""), "on the qa role: {body}");
+    }
+    // The copied prod token was revoked by the re-run: the server refuses it.
+    let refused = handshake(&server.base, &copied);
+    assert!(
+        refused.contains("HTTP/1.1 401"),
+        "the copied token is revoked by the seed: {refused}"
+    );
+    drop(server);
+
+    // And the database says the same.
+    let list = token_list(&home, &db);
+    assert!(
+        list.lines()
+            .any(|line| line.starts_with("copied-app ") && line.contains("revoked:")),
+        "the copied token is revoked: {list}"
     );
 }
