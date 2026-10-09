@@ -66,10 +66,19 @@ for WORD in "${WORDS[@]}"; do
     "~/"*) WORD="$HOME/${WORD#\~/}" ;;
   esac
   case "$WORD" in
-    --delete* | --remove-source-files* | --files-from* | --log-file* | \
-      --write-batch* | --only-write-batch* | --temp-dir* | --partial-dir* | \
-      --backup-dir* | --daemon* | --config* | --rsh* | --rsync-path*)
-      refuse "'$WORD'"
+    --*)
+      # An EXACT allowlist of the long options the real clients send for this
+      # pull (PR-354 fix C4). rsync 3.x sends `--server --sender` and carries
+      # everything else in the short cluster; macOS's openrsync — the CI
+      # runner's `rsync`, and the shape the Mini serves — also sends the pull's
+      # own `--ignore-existing` as a long option. A DENYLIST of spellings was a
+      # forced-command bypass: rsync/openrsync accept unique abbreviations, so
+      # `--remove-source`, `--del` and `--delete-after` (deletes under $ROOT)
+      # were never named. Anything outside the allowlist is refused by name.
+      case "$WORD" in
+        --server | --sender | --ignore-existing) ;;
+        *) refuse "'$WORD' (only the pull's own long options are allowed)" ;;
+      esac
       ;;
     -e)
       refuse "'-e' (an rsh command has no place in a forced command)"

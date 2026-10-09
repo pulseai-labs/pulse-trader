@@ -418,9 +418,15 @@ fn forced_command_serves_a_protocol_29_sender_invocation() {
     // The protocol-29 (openrsync / "rsync version 2.6.9 compatible") shape the
     // Mini's client sends — the acceptance case the plan gate asked for — and
     // the modern rsync 3.x bundle beside it. Both are SERVED, never refused.
+    // The third is what macOS's openrsync ACTUALLY sends for the pull's own
+    // invocation (PR-354 fix C4): the short flags one word each, plus the
+    // pull's `--ignore-existing` as a long option.
     for command in [
         format!("rsync --server --sender -logDtpr . {root_path}/"),
         format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}"),
+        format!(
+            "rsync --server --sender -g -l -o -p -r -t -D --ignore-existing . {root_path}/"
+        ),
     ] {
         let output = fake.run(root.path(), &command);
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -454,6 +460,15 @@ fn forced_command_refuses_everything_but_a_read() {
         format!("rm -rf {root_path}"),
         format!("rsync --server --sender -logDtpre.iLsfxC . {root_path}; rm -rf /"),
         "sh -c id".to_owned(),
+        // The delete family's unique abbreviations and long spellings
+        // (PR-354 fix C4): rsync and openrsync both accept `--remove-source`
+        // for `--remove-source-files` and `--del` for `--delete*`, so an exact
+        // allowlist is the only defense — a spelling denylist let these reach
+        // the exec and delete files under $ROOT.
+        format!("rsync --server --sender --remove-source . {root_path}"),
+        format!("rsync --server --sender --remove-source-files . {root_path}"),
+        format!("rsync --server --sender --del . {root_path}"),
+        format!("rsync --server --sender --delete-after . {root_path}"),
     ] {
         let output = fake.run(root.path(), &command);
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
