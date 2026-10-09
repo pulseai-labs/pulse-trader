@@ -74,7 +74,10 @@ case "$SRC" in
 esac
 
 echo "pulse-backup-pull: pulling $SRC into $DEST"
-rsync -a --ignore-existing "${TRANSPORT[@]}" "$SRC/" "$DEST/"
+# The bash-3.2-safe spelling (PR-354 fix C1): `"${TRANSPORT[@]}"` on an EMPTY
+# array aborts under `set -u` on bash < 4.4 — macOS's /bin/bash is 3.2 — so the
+# local-source path (the tests) must not expand it bare.
+rsync -a --ignore-existing ${TRANSPORT[@]+"${TRANSPORT[@]}"} "$SRC/" "$DEST/"
 
 # The pulled databases, oldest first by name (the `pulse-<stamp>` names sort
 # chronologically).
