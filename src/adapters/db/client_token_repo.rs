@@ -56,8 +56,8 @@ pub struct ClientToken {
 }
 
 /// A freshly minted token's row material for
-/// [`SqliteClientTokenRepo::replace_all_with_published`]: everything EXCEPT the
-/// token itself — the store keeps only its SHA-256 hex.
+/// [`SqliteClientTokenRepo::issue`]: everything EXCEPT the token itself — the
+/// store keeps only its SHA-256 hex.
 pub struct NewToken<'a> {
     /// The unique label (never reused, even after a revoke).
     pub label: &'a str,
@@ -78,17 +78,6 @@ struct FoundTokenRow {
     schema_version: String,
 }
 
-/// The labels `pulse qa-seed` issues — and the ONLY labels the ordinary issue
-/// path reserves (PR-354 fix D7).
-///
-/// A prod copy that happens to carry one of them (a database seeded by an
-/// earlier run, or a hand-issued token) makes `pulse qa-seed` fail with
-/// `LabelExists` forever, because labels are never reused. Reserving them on
-/// `issue` means no r4.s2 prod can ever hold them; the seed's own path
-/// ([`SqliteClientTokenRepo::replace_all_with_published`]) issues exactly these
-/// two and is not subject to the reservation.
-pub const RESERVED_LABELS: [&str; 2] = ["qa-app", "qa-agent"];
-
 /// The named refusals of the token store (D5), plus the wrapped `DataError`.
 #[derive(Debug, thiserror::Error)]
 pub enum TokenStoreError {
@@ -96,11 +85,6 @@ pub enum TokenStoreError {
     /// never reused.
     #[error("a token named {0:?} already exists; labels are never reused")]
     LabelExists(String),
-    /// The label is one of [`RESERVED_LABELS`]: only `pulse qa-seed` issues it.
-    #[error(
-        "the label {0:?} is reserved for `pulse qa-seed`; issue this token under another label"
-    )]
-    LabelReserved(String),
     /// No token carries this label.
     #[error("no token named {0:?}")]
     LabelUnknown(String),
@@ -112,33 +96,6 @@ pub enum TokenStoreError {
     Db(#[from] DataError),
 }
 
-/// Why [`SqliteClientTokenRepo::replace_all_with_published`] failed (PR-354
-/// fix C7): the replace itself, or the publish step that runs inside its
-/// transaction. Either way NOTHING was written — a `Store` failure is the
-/// refusal or database error that rolled the transaction back, and a `Publish`
-/// failure is `publish`'s own error with the rollback already done.
-#[derive(Debug)]
-pub enum ReplacePublishedError<E> {
-    /// The replace was refused (a fresh label is taken) or a write BEFORE the
-    /// publish step failed. Nothing was printed and nothing was written.
-    Store(TokenStoreError),
-    /// The publish step (the token print) failed; the transaction was rolled
-    /// back. Nothing was written, and nothing valid was printed.
-    Publish(E),
-    /// The COMMIT failed AFTER a successful publish: the tokens WERE printed
-    /// and are NOT valid, and nothing was written. The caller's message must
-    /// say both (PR-354 fix D2).
-    Commit(TokenStoreError),
-}
-
-impl<E: core::fmt::Display> core::fmt::Display for ReplacePublishedError<E> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Store(error) | Self::Commit(error) => write!(f, "{error}"),
-            Self::Publish(error) => write!(f, "{error}"),
-        }
-    }
-}
 
 /// The `SQLite` store for `client_token` rows and the `token_audit` ledger.
 ///
@@ -196,12 +153,6 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
         token_sha256: &str,
         created_by: &str,
     ) -> Result<ClientToken, TokenStoreError> {
-        // The reserved labels are refused by name BEFORE anything is written
-        // (PR-354 fix D7): only `pulse qa-seed` issues them, so a prod copy can
-        // never hold one and the seed can always issue its pair.
-        if RESERVED_LABELS.contains(&label) {
-            return Err(TokenStoreError::LabelReserved(label.to_owned()));
-        }
         let now = self.now_rfc3339()?;
         let mut tx = self
             .pool
@@ -289,114 +240,6 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
         })
     }
 
-    /// Revoke EVERY active token and issue `fresh`, running `publish` BEFORE
-    /// the commit — all in ONE write-first transaction (r4.s2.w3, C5's QA seed).
-    ///
-    /// A database copied from prod carries prod's tokens; QA seeding must
-    /// revoke every one of them — each revoke audited exactly like any other —
-    /// and leave exactly the fresh QA tokens. One transaction, so a failure
-    /// leaves the token set exactly as it was: never a half-revoked copy.
-    /// Returns the revoked rows, label-ordered.
-    ///
-    /// `publish` is the seed's marker write and token print, and running it
-    /// INSIDE the transaction is what makes the recovery message true (PR-354
-    /// fix C7): labels are never reused (the `UNIQUE` holds after a revoke, and
-    /// rows are never deleted), so a publish failure that had already committed
-    /// the fresh rows would leave `qa-app`/`qa-agent` taken — the operator's
-    /// re-run would die on `LabelExists`. Here a failed publish rolls the
-    /// transaction back and NOTHING was written, so the re-run succeeds.
-    ///
-    /// # Errors
-    ///
-    /// [`ReplacePublishedError::Store`] when a fresh label is taken (labels are
-    /// never reused, even revoked ones) or the database fails — nothing was
-    /// written either way; [`ReplacePublishedError::Publish`] when `publish`
-    /// failed, with the transaction rolled back.
-    pub async fn replace_all_with_published<F, E>(
-        &self,
-        fresh: &[NewToken<'_>],
-        created_by: &str,
-        publish: F,
-    ) -> Result<Vec<ClientToken>, ReplacePublishedError<E>>
-    where
-        F: FnOnce() -> Result<(), E>,
-    {
-        use ReplacePublishedError::{Commit, Publish, Store};
-
-        let now = self
-            .now_rfc3339()
-            .map_err(|e| Store(TokenStoreError::Db(e)))?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
-            Store(TokenStoreError::Db(DataError::Db(format!(
-                "begin replace tx: {e}"
-            ))))
-        })?;
-
-        let active = sqlx::query_as!(
-            FoundTokenRow,
-            "SELECT id, label, scope, created_at, revoked_at, schema_version \
-             FROM client_token WHERE revoked_at IS NULL ORDER BY label"
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| {
-            Store(TokenStoreError::Db(DataError::Db(format!(
-                "select active tokens: {e}"
-            ))))
-        })?;
-
-        let mut revoked = Vec::with_capacity(active.len());
-        for found in active {
-            Self::revoke_found_row(&mut tx, &found, &now)
-                .await
-                .map_err(Store)?;
-            revoked.push(ClientToken {
-                id: found.id,
-                label: found.label,
-                scope: found.scope,
-                created_at: found.created_at,
-                revoked_at: Some(now.clone()),
-            });
-        }
-
-        for token in fresh {
-            let taken =
-                sqlx::query_scalar!("SELECT id FROM client_token WHERE label = ?", token.label)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        Store(TokenStoreError::Db(DataError::Db(format!(
-                            "label pre-check: {e}"
-                        ))))
-                    })?;
-            if taken.is_some() {
-                return Err(Store(TokenStoreError::LabelExists(token.label.to_owned())));
-            }
-            Self::insert_issued_row(&mut tx, NewToken { ..*token }, created_by, &now)
-                .await
-                .map_err(Store)?;
-        }
-
-        // The publish step (the marker write and the token print) runs BEFORE
-        // the commit: dropping `tx` on failure rolls every revoke and insert
-        // back, so the fresh labels stay free for the operator's re-run.
-        if let Err(error) = publish() {
-            return Err(Publish(error));
-        }
-        #[cfg(test)]
-        if probe::take_injected_commit_failure() {
-            return Err(Commit(TokenStoreError::Db(DataError::Db(
-                "injected commit failure (cfg(test) seam)".to_owned(),
-            ))));
-        }
-
-        tx.commit().await.map_err(|e| {
-            Commit(TokenStoreError::Db(DataError::Db(format!(
-                "commit replace: {e}"
-            ))))
-        })?;
-        Ok(revoked)
-    }
 
     /// Insert one `client_token` row plus its `issued` audit row INSIDE the
     /// caller's transaction, returning the new row id. One home for the two INSERT
@@ -577,26 +420,3 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
     }
 }
 
-/// The `cfg(test)` seam the D2 tests drive: a one-shot COMMIT failure, so the
-/// "the printed tokens are NOT valid" path is reachable without a real
-/// mid-transaction fault (the print runs before the commit and cannot be
-/// interleaved from outside).
-#[cfg(test)]
-pub(crate) mod probe {
-    use std::cell::Cell;
-
-    thread_local! {
-        /// A one-shot: the next replace's commit fails.
-        static FAIL_NEXT_COMMIT: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Arm the next commit failure.
-    pub(crate) fn fail_next_commit() {
-        FAIL_NEXT_COMMIT.with(|armed| armed.set(true));
-    }
-
-    /// Consume the armed failure.
-    pub(crate) fn take_injected_commit_failure() -> bool {
-        FAIL_NEXT_COMMIT.with(|armed| armed.replace(false))
-    }
-}

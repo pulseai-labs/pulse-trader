@@ -209,12 +209,8 @@ unit, on port 8421 so it can run BESIDE draco-desk's current prod until the
 cutover retires that unit. `just deploy <tag>` targets QA only — it installs and
 restarts `pulse-qa.service`, creates `~/.local/share/pulse-qa` mode 0700, and
 refuses without `Linger=yes` before it builds (#248) — and touches neither
-`pulse-serve.service` nor the backup units (G2). `pulse qa-seed --db <path>
---data-dir <path>` (C5) revokes EVERY token the copied prod database carries
-(each revoke audited exactly like any other) and issues the two fresh QA tokens
-(`qa-app`, `qa-agent`) in one transaction, then writes the `qa` marker and prints
-the tokens once on stdout; it refuses a prod-marked dir and a database a live
-server holds. The handshake gains an ADDITIVE optional `role` field (`prod` /
+`pulse-serve.service` nor the backup units (G2). QA seeding (`pulse qa-seed`)
+moved to issue #355. The handshake gains an ADDITIVE optional `role` field (`prod` /
 `qa`), and the app's status strip shows a QA badge when the connected server
 reports `qa`, so a stale URL can no longer pass for prod unnoticed. Builds, walks
 and patches run there against QA only; prod's data is touched by nothing but the

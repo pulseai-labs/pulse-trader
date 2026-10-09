@@ -24,8 +24,8 @@
 //! describes the dir the data lives in; a database outside it would make the
 //! marker meaningless, so the containment check refuses by name first, and it
 //! is pure (no writes) — a start refused for its paths leaves no marker behind.
-//! [`ensure_db_inside_data_dir`] is the one copy of that rule; `pulse qa-seed`
-//! reuses it (r4.s2 close-review F3).
+//! [`ensure_db_inside_data_dir`] is the one copy of that rule, and
+//! `pulse serve --role` is its only caller.
 //!
 //! A marker this build cannot read (empty, torn, hand-edited) is a REFUSAL,
 //! never an overwrite: the one thing a safety marker must not do is let a
@@ -181,22 +181,21 @@ pub fn read(data_dir: &Path) -> Result<Option<ServerRole>, RoleRefused> {
 /// would write — the loser would overwrite the winner's role. The publish is a
 /// hard link of the synced temp file, so the second create fails with
 /// `AlreadyExists` atomically, which [`check`] turns into "re-read and validate
-/// the winning role" and `qa-seed` (PR-354 fix B1) turns into "the dir was
-/// marked while the seed ran: never overwrite it".
+/// the winning role".
 ///
 /// # Errors
 ///
 /// [`RoleRefused::MarkerWrite`] — with an `AlreadyExists` source when the
 /// marker appeared between the read and this call.
-pub(crate) fn create_exclusive(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
+fn create_exclusive(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
     write_marker(data_dir, role)
 }
 
 /// The one marker write: one line, mode 0600, the data dir created first (0700,
 /// PR-354 fix D1b), and the marker PUBLISHED from a temp file (PR-354 fix D1a)
 /// by a hard link — the exclusive create (`link(2)` fails `AlreadyExists`
-/// atomically, which [`check`] and `qa-seed` turn into "re-read and validate the
-/// winner"; there is no create-or-replace path left, PR-354 fix B1). A marker is
+/// atomically, which [`check`] turns into "re-read and validate the winner";
+/// there is no create-or-replace path left, PR-354 fix B1). A marker is
 /// therefore never visible empty or partial: the old create-then-write let a
 /// racing reader see `""` and refuse `MarkerUnreadable`, and a failed write left
 /// an empty marker that refused every later start.

@@ -41,11 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   run beside draco-desk's current prod until the cutover. `just deploy <tag>` now installs and
   restarts QA only (prod's unit and the backup units are untouched, G2), creates
   `~/.local/share/pulse-qa` mode 0700, and refuses without `Linger=yes` before it builds (#248);
-  `just deploy-check` rehearses the QA unit. `pulse qa-seed --db <path> --data-dir <path>` revokes
-  every token a copied prod database carries (each revoke audited exactly like any other) and issues
-  the two fresh QA tokens (`qa-app`, `qa-agent`) in one transaction, then writes the `qa` marker and
-  prints the two tokens once on stdout — refusing a `prod`-marked data dir and a database a live
-  server holds. The handshake gains an ADDITIVE optional `role` field, and the app's status strip
+  `just deploy-check` rehearses the QA unit. QA seeding (`pulse qa-seed`) moved to issue #355.
+  The handshake gains an ADDITIVE optional `role` field, and the app's status strip
   shows a QA badge when the connected server reports `qa`, so a stale URL cannot pass for prod
   unnoticed. `tests/data_dir_role.rs` drives the real binary through the refusals, the marker, the
   seed and the handshake (demo line d70). Refs
