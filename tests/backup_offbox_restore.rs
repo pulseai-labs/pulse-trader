@@ -596,13 +596,30 @@ async fn retention_keeps_the_newest_and_never_prunes_candles() {
     let a = root.join("A");
     let b = root.join("B");
 
+    // The backups in CREATION order — three runs inside one second make
+    // `pulse-<stamp>.db`, `-1`, `-2`, and a name sort does not equal that order
+    // (PR-354 fix D4). Each run's new file is the one that was not there before.
+    let mut created: Vec<String> = Vec::new();
     for run in 0..3 {
+        let before: Vec<String> = backup_db_files(&a)
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            .collect();
         let output = backup(&seeded, &a);
         assert!(
             output.status.success(),
             "backup {run}: {}",
             combined(&output)
         );
+        let after: Vec<String> = backup_db_files(&a)
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            .collect();
+        let made = after
+            .into_iter()
+            .find(|name| !before.contains(name))
+            .unwrap_or_else(|| panic!("backup {run} made one new file: {before:?}"));
+        created.push(made);
     }
     let source_backups = backup_db_files(&a);
     assert_eq!(source_backups.len(), 3, "three nightly backups");
@@ -620,19 +637,25 @@ async fn retention_keeps_the_newest_and_never_prunes_candles() {
 
     let kept = backup_db_files(&b);
     assert_eq!(kept.len(), 2, "the newest two are kept: {kept:?}");
-    let kept_names: Vec<&str> = kept
+    let mut kept_names: Vec<String> = kept
         .iter()
-        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
         .collect();
-    let newest_names: Vec<&str> = source_backups[source_backups.len() - 2..]
-        .iter()
-        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
-        .collect();
-    assert_eq!(kept_names, newest_names, "and they are the newest by name");
-    let pruned = &source_backups[0];
-    assert!(!b.join(pruned.file_name().unwrap()).exists(), "pruned");
+    kept_names.sort();
+    let mut newest: Vec<String> = created[created.len() - 2..].to_vec();
+    newest.sort();
+    assert_eq!(
+        kept_names, newest,
+        "and they are the newest two by CREATION order"
+    );
+    let pruned = created[0].clone();
+    assert!(!b.join(&pruned).exists(), "the oldest is pruned: {pruned}");
     assert!(
-        !manifest_of(&b.join(pruned.file_name().unwrap())).exists(),
+        !manifest_of(&b.join(&pruned)).exists(),
         "a pruned backup takes its manifest with it"
     );
     assert!(
@@ -773,4 +796,82 @@ async fn backup_verify_refuses_a_backup_without_its_manifest() {
         "a manifest-less backup is refused: {text}"
     );
     assert!(text.contains("manifest"), "by name: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// 8. Same-second backups sort by their numeric suffix (PR-354 fix D4)
+// ---------------------------------------------------------------------------
+
+/// PR-354 fix D4: same-second backups are `pulse-<stamp>.db`,
+/// `pulse-<stamp>-1.db`, `pulse-<stamp>-2.db`, … — the order the writer creates
+/// them in. A plain name sort put every suffixed file before the unsuffixed
+/// first and `-10` before `-2`, so NEWEST (the file the pull verifies) and the
+/// prune picked the wrong files. The sort is now (stamp, numeric suffix, no
+/// suffix = 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_second_backups_are_ordered_by_their_numeric_suffix() {
+    let seeded = seed_source().await;
+    let root = seeded.dir.path();
+    let a = root.join("A");
+    let b = root.join("B");
+
+    // One real backup (a valid database plus its manifest), then the family the
+    // writer makes inside one second: unsuffixed, then -1, -2, -10.
+    let made = backup(&seeded, &a);
+    assert!(made.status.success(), "{}", combined(&made));
+    let template = backup_db_files(&a).into_iter().next().expect("one backup");
+    let bytes = fs::read(&template).unwrap();
+    let manifest = fs::read(manifest_of(&template)).unwrap();
+    fs::remove_file(&template).unwrap();
+    fs::remove_file(manifest_of(&template)).unwrap();
+
+    let stamp = "20261009T133000Z";
+    let mut names = vec![format!("pulse-{stamp}.db")];
+    for suffix in [1, 2, 10] {
+        names.push(format!("pulse-{stamp}-{suffix}.db"));
+    }
+    // An older stamp, so the stamp key is exercised too.
+    names.push("pulse-20250101T000000Z.db".to_owned());
+    for name in &names {
+        fs::write(a.join(name), &bytes).unwrap();
+        fs::write(manifest_of(&a.join(name)), &manifest).unwrap();
+    }
+
+    let pulled = run_pull(
+        &seeded.home,
+        &[
+            ("PULSE_BIN", env!("CARGO_BIN_EXE_pulse")),
+            ("PULSE_OFFBOX_KEEP", "2"),
+        ],
+        a.to_str().unwrap(),
+        &b,
+    );
+    assert!(pulled.status.success(), "{}", combined(&pulled));
+
+    let mut kept: Vec<String> = backup_db_files(&b)
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .collect();
+    kept.sort();
+    let mut expected = vec![
+        format!("pulse-{stamp}-2.db"),
+        format!("pulse-{stamp}-10.db"),
+    ];
+    expected.sort();
+    assert_eq!(
+        kept, expected,
+        "the two newest are -2 and -10, not the unsuffixed and -1"
+    );
+    assert!(
+        !b.join(format!("pulse-{stamp}-1.db")).exists(),
+        "the older same-second backups were pruned"
+    );
+    assert!(
+        !b.join(format!("pulse-{stamp}.db")).exists(),
+        "and the unsuffixed one (suffix 0) is the oldest of its second"
+    );
+    assert!(
+        !b.join("pulse-20250101T000000Z.db").exists(),
+        "and the older stamp is gone"
+    );
 }

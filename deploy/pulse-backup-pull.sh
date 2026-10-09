@@ -79,16 +79,33 @@ echo "pulse-backup-pull: pulling $SRC into $DEST"
 # local-source path (the tests) must not expand it bare.
 rsync -a --ignore-existing ${TRANSPORT[@]+"${TRANSPORT[@]}"} "$SRC/" "$DEST/"
 
-# The pulled databases, oldest first by name (the `pulse-<stamp>` names sort
-# chronologically).
+# The pulled databases, oldest first: by STAMP, then by the numeric suffix a
+# same-second backup carries (`pulse-<stamp>.db`, `pulse-<stamp>-1.db`, …), with
+# no suffix counting as 0 (PR-354 fix D4). A plain name sort put the suffixed
+# files before the unsuffixed first and `-10` before `-2`, so NEWEST and the
+# prune picked the wrong files. The stamp itself carries no `-`
+# (`%Y%m%dT%H%M%SZ`), so a trailing `-<digits>` is unambiguously a suffix; the
+# keyed sort is portable (GNU and BSD `sort` both take `-k`/`-n`; `sort -V` is
+# not).
 BACKUPS=()
 while IFS= read -r backup; do
   BACKUPS+=("$backup")
 done < <(
   for file in "$DEST"/pulse-*.db; do
     [ -f "$file" ] || continue
-    printf '%s\n' "$file"
-  done | LC_ALL=C sort
+    name="${file##*/}"
+    rest="${name%.db}"
+    rest="${rest#pulse-}"
+    suffix=0
+    last="${rest##*-}"
+    if [ "$last" != "$rest" ]; then
+      case "$last" in
+        '' | *[!0-9]*) ;;
+        *) suffix="$last"; rest="${rest%-*}" ;;
+      esac
+    fi
+    printf '%s\t%s\t%s\n' "$rest" "$suffix" "$file"
+  done | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2n | cut -f3
 )
 COUNT=${#BACKUPS[@]}
 
