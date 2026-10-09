@@ -363,19 +363,46 @@ fn refuse_source_is_target(label: &str, job: &VerifiedCopy<'_>) -> anyhow::Resul
 
 /// Whether `other` names the same filesystem object as `existing`.
 ///
-/// A SYMLINK resolves to its target: when both paths exist their inodes are
-/// compared — which catches a symlink, a hard link, and a differently-cased
-/// spelling on a case-insensitive filesystem — and the CANONICAL paths are
-/// compared otherwise (the target may not exist yet, so its deepest existing
-/// ancestor is canonicalized and the component below it appended).
+/// A SYMLINK resolves to its target: when both paths exist their filesystem
+/// identities are compared — DEVICE and inode (PR-354 fix C8: an inode number
+/// alone is unique only within one filesystem, so a source and a target on
+/// different filesystems with colliding numbers were refused as the same file)
+/// — which catches a symlink, a hard link, and a differently-cased spelling on
+/// a case-insensitive filesystem. When either path has no identity to read
+/// (the target may not exist yet), the CANONICAL paths are compared instead:
+/// the deepest existing ancestor is canonicalized and the component below it
+/// appended.
 #[must_use]
 fn resolves_to_same(existing: &Path, other: &Path) -> bool {
-    if let (TargetIdentity::Inode(left), TargetIdentity::Inode(right)) =
-        (inode_of(existing), inode_of(other))
-    {
-        return left == right;
+    match (device_and_inode(existing), device_and_inode(other)) {
+        (Some(left), Some(right)) => same_file_identity(left, right),
+        _ => canonical_identity(existing) == canonical_identity(other),
     }
-    canonical_identity(existing) == canonical_identity(other)
+}
+
+/// `path`'s filesystem identity — the device AND the inode (PR-354 fix C8).
+/// `None` when there is no file at the path (or the platform has no
+/// `MetadataExt`), which sends the caller to the canonical-path fallback.
+#[cfg(unix)]
+fn device_and_inode(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// No device/inode to read on platforms without `MetadataExt` — the same gate
+/// [`inode_of`](crate::adapters::db::inode_of) carries. The caller falls back
+/// to canonical paths.
+#[cfg(not(unix))]
+fn device_and_inode(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Whether two filesystem identities name the same object: the device and the
+/// inode must BOTH match. A pure helper, so the cross-filesystem rule is
+/// testable without two filesystems mounted (PR-354 fix C8).
+#[must_use]
+fn same_file_identity(left: (u64, u64), right: (u64, u64)) -> bool {
+    left == right
 }
 
 /// The shared verified-copy engine (import over the Mac source; restore over
@@ -2491,8 +2518,9 @@ mod tests {
     use super::{
         COPY_SIDECAR_SUFFIXES, HeadSource, InstallFailure, InstallRefusal, StepFailure,
         VerifiedCopy, copy_snapshot_into, copy_snapshots, install_tmp_db, publish,
-        remove_added_snapshots_keeping, remove_tmp_db, run_steps, run_verified_copy, scan_heads,
-        scan_snapshots, set_source_mutation, sidecar_path, write_head_manifest,
+        remove_added_snapshots_keeping, remove_tmp_db, resolves_to_same, run_steps,
+        run_verified_copy, same_file_identity, scan_heads, scan_snapshots, set_source_mutation,
+        sidecar_path, write_head_manifest,
     };
     use crate::adapters::db::instance_lock::InstanceLock;
     use crate::adapters::db::{Db, open_migrated, open_migrated_copy};
@@ -4944,4 +4972,47 @@ mod tests {
         );
     }
 
+    /// PR-354 fix C8: the same-target refusal compares the DEVICE and the
+    /// inode. An inode number alone is unique only within one filesystem, so a
+    /// source and a target on different filesystems whose numbers collide were
+    /// refused as the same file. Two filesystems cannot be built portably in a
+    /// test (nothing to mount), so the rule is driven over identity pairs —
+    /// plus the real paths for the cases one filesystem CAN produce.
+    #[test]
+    fn a_colliding_inode_number_on_another_filesystem_is_not_the_same_file() {
+        assert!(
+            same_file_identity((1, 42), (1, 42)),
+            "the same device and inode is the same file"
+        );
+        assert!(
+            !same_file_identity((1, 42), (2, 42)),
+            "the same inode number on another device is a different file"
+        );
+        assert!(
+            !same_file_identity((1, 42), (1, 43)),
+            "another inode on the same device is a different file"
+        );
+
+        // The real paths: two spellings of one file ARE the same file (the
+        // symlink resolves to its target's identity)...
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("pulse.db");
+        fs::write(&file, b"the database").expect("write the database");
+        let other = dir.path().join("other.db");
+        fs::write(&other, b"another database").expect("write the other");
+        assert!(
+            !resolves_to_same(&file, &other),
+            "distinct files are not one"
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.db");
+            std::os::unix::fs::symlink(&file, &link).expect("the symlink");
+            assert!(resolves_to_same(&file, &link), "a symlink is the same file");
+        }
+        // ...and a target that does not exist yet falls back to canonical
+        // paths: a fresh file beside it is not the source.
+        let fresh = dir.path().join("fresh").join("pulse.db");
+        assert!(!resolves_to_same(&file, &fresh));
+    }
 }
