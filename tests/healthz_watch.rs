@@ -1030,9 +1030,15 @@ async fn the_real_probe_never_goes_through_an_ambient_proxy() {
     // listener at all.
     let dead = "http://127.0.0.1:1";
     // SAFETY: nextest runs one test per process, so these are this test's alone.
+    // NO_PROXY/no_proxy are cleared too: with NO_PROXY=127.0.0.1 inherited, the
+    // probe would reach the listener even WITHOUT `no_proxy` on the client, and
+    // this test would pass without the fix it exists to prove (PR-354 fix D8).
     unsafe {
         for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
             std::env::set_var(name, dead);
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            std::env::remove_var(name);
         }
     }
 
