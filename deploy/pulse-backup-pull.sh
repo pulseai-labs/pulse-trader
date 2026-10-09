@@ -87,24 +87,36 @@ rsync -a --ignore-existing ${TRANSPORT[@]+"${TRANSPORT[@]}"} "$SRC/" "$DEST/"
 # (`%Y%m%dT%H%M%SZ`), so a trailing `-<digits>` is unambiguously a suffix; the
 # keyed sort is portable (GNU and BSD `sort` both take `-k`/`-n`; `sort -V` is
 # not).
+
+# The sort key of one pulled database, printed as `<stamp><TAB><suffix><TAB><path>`.
+# It is a FUNCTION at top level, called from the loop below (PR-354 fix S1):
+# bash 3.2 misparses a `case` written inside the process substitution's loop —
+# macOS CI failed the whole pull script with "syntax error near unexpected token
+# `;;'" — so the `case` lives here, outside every `$( )`/`<( )`, and the loop
+# only calls it. The `key_` prefix keeps the function off the caller's names.
+backup_sort_key() {
+  key_file="$1"
+  key_name="${key_file##*/}"
+  key_rest="${key_name%.db}"
+  key_rest="${key_rest#pulse-}"
+  key_suffix=0
+  key_last="${key_rest##*-}"
+  if [ "$key_last" != "$key_rest" ]; then
+    case "$key_last" in
+      '' | *[!0-9]*) ;;
+      *) key_suffix="$key_last"; key_rest="${key_rest%-*}" ;;
+    esac
+  fi
+  printf '%s\t%s\t%s\n' "$key_rest" "$key_suffix" "$key_file"
+}
+
 BACKUPS=()
 while IFS= read -r backup; do
   BACKUPS+=("$backup")
 done < <(
   for file in "$DEST"/pulse-*.db; do
     [ -f "$file" ] || continue
-    name="${file##*/}"
-    rest="${name%.db}"
-    rest="${rest#pulse-}"
-    suffix=0
-    last="${rest##*-}"
-    if [ "$last" != "$rest" ]; then
-      case "$last" in
-        '' | *[!0-9]*) ;;
-        *) suffix="$last"; rest="${rest%-*}" ;;
-      esac
-    fi
-    printf '%s\t%s\t%s\n' "$rest" "$suffix" "$file"
+    backup_sort_key "$file"
   done | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2n | cut -f3
 )
 COUNT=${#BACKUPS[@]}
