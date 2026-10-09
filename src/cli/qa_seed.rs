@@ -41,6 +41,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::adapters::db::NewToken;
+use crate::adapters::db::RESERVED_LABELS;
 use crate::adapters::db::ReplacePublishedError;
 use crate::adapters::db::SqliteClientTokenRepo;
 use crate::adapters::db::instance_lock::InstanceLock;
@@ -59,8 +60,13 @@ pub struct QaSeedArgs {
     data_dir: PathBuf,
 }
 
-/// The two fresh tokens the seed issues, in the order their lines print.
-const QA_TOKENS: [(&str, Scope); 2] = [("qa-app", Scope::App), ("qa-agent", Scope::Agent)];
+/// The two fresh tokens the seed issues, in the order their lines print — the
+/// reserved labels themselves ([`RESERVED_LABELS`], PR-354 fix D7), so the
+/// reservation and the seed can never drift apart.
+const QA_TOKENS: [(&str, Scope); 2] = [
+    (RESERVED_LABELS[0], Scope::App),
+    (RESERVED_LABELS[1], Scope::Agent),
+];
 
 /// One fresh QA token: its label, its scope, the plaintext (printed once, then
 /// dropped) and the SHA-256 hex the store keeps.

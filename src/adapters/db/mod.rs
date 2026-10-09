@@ -100,7 +100,9 @@ pub use paper_session_repo::SqlitePaperSessionRepo;
 pub mod client_token_repo;
 // `TokenStoreError` is deliberately NOT re-exported: nothing outside this
 // module tree names it (callers map it into their own error vocabulary).
-pub use client_token_repo::{ClientToken, NewToken, ReplacePublishedError, SqliteClientTokenRepo};
+pub use client_token_repo::{
+    ClientToken, NewToken, RESERVED_LABELS, ReplacePublishedError, SqliteClientTokenRepo,
+};
 
 // r4.s1.w4 (F1/C4): the certification-freeze store — `certification_freeze`
 // rows, opened once and closed once. `query!` macros for this table are

@@ -78,6 +78,17 @@ struct FoundTokenRow {
     schema_version: String,
 }
 
+/// The labels `pulse qa-seed` issues — and the ONLY labels the ordinary issue
+/// path reserves (PR-354 fix D7).
+///
+/// A prod copy that happens to carry one of them (a database seeded by an
+/// earlier run, or a hand-issued token) makes `pulse qa-seed` fail with
+/// `LabelExists` forever, because labels are never reused. Reserving them on
+/// `issue` means no r4.s2 prod can ever hold them; the seed's own path
+/// ([`SqliteClientTokenRepo::replace_all_with_published`]) issues exactly these
+/// two and is not subject to the reservation.
+pub const RESERVED_LABELS: [&str; 2] = ["qa-app", "qa-agent"];
+
 /// The named refusals of the token store (D5), plus the wrapped `DataError`.
 #[derive(Debug, thiserror::Error)]
 pub enum TokenStoreError {
@@ -85,6 +96,11 @@ pub enum TokenStoreError {
     /// never reused.
     #[error("a token named {0:?} already exists; labels are never reused")]
     LabelExists(String),
+    /// The label is one of [`RESERVED_LABELS`]: only `pulse qa-seed` issues it.
+    #[error(
+        "the label {0:?} is reserved for `pulse qa-seed`; issue this token under another label"
+    )]
+    LabelReserved(String),
     /// No token carries this label.
     #[error("no token named {0:?}")]
     LabelUnknown(String),
@@ -180,6 +196,12 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
         token_sha256: &str,
         created_by: &str,
     ) -> Result<ClientToken, TokenStoreError> {
+        // The reserved labels are refused by name BEFORE anything is written
+        // (PR-354 fix D7): only `pulse qa-seed` issues them, so a prod copy can
+        // never hold one and the seed can always issue its pair.
+        if RESERVED_LABELS.contains(&label) {
+            return Err(TokenStoreError::LabelReserved(label.to_owned()));
+        }
         let now = self.now_rfc3339()?;
         let mut tx = self
             .pool
