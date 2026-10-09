@@ -50,6 +50,24 @@ const HOST_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The marker check's ssh `ConnectTimeout`, in seconds.
 const SSH_CONNECT_TIMEOUT_SECS: u64 = 5;
 
+/// The marker check's ssh keepalive pair (PR-354 fix C6): a keepalive every
+/// [`SSH_KEEPALIVE_INTERVAL_SECS`], and ssh gives up after
+/// [`SSH_KEEPALIVE_COUNT`] unanswered — the session that CONNECTS and then goes
+/// quiet ends itself in about ten seconds.
+const SSH_KEEPALIVE_INTERVAL_SECS: u64 = 5;
+const SSH_KEEPALIVE_COUNT: u64 = 2;
+
+/// The HARD bound on one marker check's ssh (PR-354 fix C6). `ConnectTimeout`
+/// bounds only the connect and the keepalive pair only a session that has gone
+/// quiet, so an ssh that connects and then hangs (a stalled banner, a half-open
+/// session) would stall every watcher cycle until systemd killed the oneshot —
+/// no probe result, no push. At this bound the child is killed and the check
+/// reads FAILED, never "start limit".
+const SSH_MARKER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the bounded wait looks at the marker ssh's child.
+const SSH_MARKER_POLL: Duration = Duration::from_millis(50);
+
 /// The ntfy push's request timeout.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -722,11 +740,18 @@ pub struct HttpProbe {
 
 impl HttpProbe {
     /// The probe with its own client (the short timeout rides the client).
+    ///
+    /// `no_proxy` is a SECURITY requirement, not a preference
+    /// (`src/client/mod.rs` declares it for every surface that reaches the
+    /// server, r3.s3.w5 review round 6): an ambient `HTTP_PROXY`/`ALL_PROXY`
+    /// must never carry this request — and the probe's URL — through a third
+    /// party (PR-354 fix C6b).
     #[must_use]
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(PROBE_TIMEOUT)
+                .no_proxy()
                 .build()
                 .unwrap_or_default(),
         }
@@ -871,28 +896,79 @@ impl MarkerSeam for SshMarker {
             if !key.is_file() {
                 return MarkerReport::KeyMissing;
             }
-            let run = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("ssh")
-                    .arg("-i")
-                    .arg(&key)
-                    .arg("-o")
-                    .arg("BatchMode=yes")
-                    .arg("-o")
-                    .arg("IdentitiesOnly=yes")
-                    .arg("-o")
-                    .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
-                    .arg(&ssh_host)
-                    .output()
-            })
-            .await;
+            let run = tokio::task::spawn_blocking(move || marker_ssh(&key, &ssh_host)).await;
             match run {
-                Ok(Ok(output)) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    marker_line(&stdout).unwrap_or(MarkerReport::Failed)
-                }
-                _ => MarkerReport::Failed,
+                Ok(report) => report,
+                Err(_) => MarkerReport::Failed,
             }
         })
+    }
+}
+
+/// One `ssh` marker check, BOUNDED (PR-354 fix C6): the connect timeout bounds
+/// only the connect and the keepalive pair only a session that has gone quiet,
+/// so the child is also killed at [`SSH_MARKER_TIMEOUT`]. A check that cannot
+/// finish reads FAILED — never "start limit" — and the watcher's cycle never
+/// stalls on it.
+fn marker_ssh(key: &Path, ssh_host: &str) -> MarkerReport {
+    let spawned = std::process::Command::new("ssh")
+        .arg("-i")
+        .arg(key)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
+        .arg("-o")
+        .arg(format!("ServerAliveInterval={SSH_KEEPALIVE_INTERVAL_SECS}"))
+        .arg("-o")
+        .arg(format!("ServerAliveCountMax={SSH_KEEPALIVE_COUNT}"))
+        .arg(ssh_host)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return MarkerReport::Failed;
+    };
+    // Drain stdout on its own thread, so a chatty child can never block on a
+    // full pipe while this waits on it.
+    let reader = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            bytes
+        })
+    });
+    let deadline = std::time::Instant::now() + SSH_MARKER_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let bytes = reader
+                    .and_then(|handle| handle.join().ok())
+                    .unwrap_or_default();
+                return match status.success() {
+                    true => {
+                        let stdout = String::from_utf8_lossy(&bytes);
+                        marker_line(&stdout).unwrap_or(MarkerReport::Failed)
+                    }
+                    false => MarkerReport::Failed,
+                };
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(SSH_MARKER_POLL);
+            }
+            Ok(None) | Err(_) => {
+                // The bound (or a wait error): kill it and reap, so no ssh is
+                // left running and the check reads FAILED. The reader is NOT
+                // joined: a descendant that inherited the stdout pipe could hold
+                // it open past the bound — the very stall this bound exists to
+                // prevent — and the check must return now.
+                let _ = child.kill();
+                let _ = child.wait();
+                return MarkerReport::Failed;
+            }
+        }
     }
 }
 

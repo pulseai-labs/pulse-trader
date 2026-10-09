@@ -21,6 +21,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use pulse::{
     ALERT_AFTER_FAILURES, ClockSeam, Db, HostSeam, HttpProbe, LogSeam, MarkerReport, MarkerSeam,
@@ -763,20 +764,32 @@ const MARKER_LINE: &str =
     "utc=2026-10-09T00:00:00Z\nunix=1760000000\nstarts=3\nwindow_seconds=900\nlimit=3\n";
 
 /// A temp `ssh` that records each run's argv and prints the marker fixture's
-/// bytes. It sits FIRST on this process's `PATH`.
+/// bytes. It sits FIRST on this process's `PATH`. With `hangs()` armed it
+/// records its PID and sleeps instead of answering — the shape a session that
+/// connects and then stalls has (PR-354 fix C6).
 struct FakeSsh {
     dir: TempDir,
     log: PathBuf,
     fixture: PathBuf,
+    hang: PathBuf,
+    pid: PathBuf,
+    finished: PathBuf,
 }
 
 impl FakeSsh {
+    /// How long the hanging fake sleeps: longer than any bound the test waits
+    /// on, so a check that returns in time can only have killed it.
+    const HANG_SECS: u64 = 45;
+
     fn new() -> Self {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = TempDir::new().expect("a temp dir for the fake ssh");
         let log = dir.path().join("ssh-runs.log");
         let fixture = dir.path().join("stdout");
+        let hang = dir.path().join("hang");
+        let pid = dir.path().join("ssh-pid");
+        let finished = dir.path().join("finished");
         let script = dir.path().join("ssh");
         std::fs::write(
             &script,
@@ -785,8 +798,17 @@ impl FakeSsh {
                  set -euo pipefail\n\
                  printf 'run\\n' >> '{log}'\n\
                  printf '%s\\n' \"$@\" >> '{log}'\n\
+                 printf '%s\\n' \"$$\" > '{pid}'\n\
+                 if [ -e '{hang}' ]; then\n\
+                   sleep {hang_secs}\n\
+                   printf 'finished\\n' >> '{finished}'\n\
+                 fi\n\
                  cat '{fixture}'\n",
                 log = log.display(),
+                pid = pid.display(),
+                hang = hang.display(),
+                hang_secs = Self::HANG_SECS,
+                finished = finished.display(),
                 fixture = fixture.display(),
             ),
         )
@@ -794,12 +816,37 @@ impl FakeSsh {
         let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("make the fake ssh executable");
-        Self { dir, log, fixture }
+        Self {
+            dir,
+            log,
+            fixture,
+            hang,
+            pid,
+            finished,
+        }
     }
 
     /// What the next check's ssh prints on stdout.
     fn prints(&self, stdout: &str) {
         std::fs::write(&self.fixture, stdout).expect("write the marker fixture");
+    }
+
+    /// Make every run hang: the fake sleeps after recording its PID.
+    fn hangs(&self) {
+        std::fs::write(&self.hang, "hang").expect("arm the hang");
+    }
+
+    /// The PID the LAST run recorded.
+    fn last_pid(&self) -> String {
+        std::fs::read_to_string(&self.pid)
+            .expect("the fake ssh recorded its pid")
+            .trim()
+            .to_owned()
+    }
+
+    /// Whether any run reached the end of the script (the hang's last line).
+    fn finished(&self) -> bool {
+        self.finished.exists()
     }
 
     /// How many runs the log holds. One run writes one `run` line, so a call that
@@ -908,4 +955,95 @@ async fn the_marker_check_pins_the_key_and_reads_only_the_forced_commands_two_an
             "the key and the host travel: {what}: {argv:?}"
         );
     }
+}
+
+/// PR-354 fix C6: a marker ssh that CONNECTS and then hangs must not stall the
+/// watcher's cycle — `ConnectTimeout` bounds only the connect — so the check is
+/// bounded hard: it reads FAILED (never "start limit") and the child is killed,
+/// not left running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hanging_marker_ssh_is_killed_and_reads_failed() {
+    let ssh = FakeSsh::new();
+    let key_dir = TempDir::new().expect("a temp dir for the key");
+    let key = key_dir.path().join("pulse_watch_ed25519");
+    std::fs::write(&key, "a stub key").expect("write the key");
+
+    // SAFETY: nextest runs one test per process, so this process's PATH is this
+    // test's alone; no other thread can be inside an env window.
+    let previous = std::env::var("PATH").unwrap_or_default();
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{previous}", ssh.dir.path().display()));
+    }
+
+    let marker = SshMarker::new(key.clone());
+    ssh.hangs();
+    let started = Instant::now();
+    let report = marker.marker("pulse-marker-fake.invalid".to_owned()).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        report,
+        MarkerReport::Failed,
+        "a hung check is FAILED, never Present"
+    );
+    assert_eq!(ssh.runs(), 1, "the fake ssh ran, never a real one");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the hard bound ended the check, not the fake's own {}-second sleep: {elapsed:?}",
+        FakeSsh::HANG_SECS
+    );
+    assert!(
+        !ssh.finished(),
+        "the hung ssh never reached the end of its script"
+    );
+    // The child was KILLED, not left running: its recorded pid is gone.
+    let pid = ssh.last_pid();
+    let alive = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid}"))
+        .status()
+        .expect("run kill -0");
+    assert!(!alive.success(), "the ssh child ({pid}) is gone");
+    // And the argv carries the keepalive pair beside the connect timeout: the
+    // session that goes quiet after connecting ends itself, the hard bound is
+    // only the backstop.
+    let argv = ssh.argv();
+    assert!(
+        arg_pair(&argv, "-o", "ServerAliveInterval=5"),
+        "the check probes the session's liveness: {argv:?}"
+    );
+    assert!(
+        arg_pair(&argv, "-o", "ServerAliveCountMax=2"),
+        "and gives up after two unanswered keepalives: {argv:?}"
+    );
+}
+
+/// PR-354 fix C6b: the probe's client carries `no_proxy` — a SECURITY
+/// requirement (`src/client/mod.rs` declares it for every surface that reaches
+/// the server) — so an ambient proxy can never carry the probe, and the server
+/// URL with it, through a third party.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_real_probe_never_goes_through_an_ambient_proxy() {
+    let healthz = FakeHttp::spawn(200, r#"{"status":"ok","api_version":1}"#);
+
+    // A dead proxy on port 1: a client that honored it could not reach the
+    // listener at all.
+    let dead = "http://127.0.0.1:1";
+    // SAFETY: nextest runs one test per process, so these are this test's alone.
+    unsafe {
+        for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            std::env::set_var(name, dead);
+        }
+    }
+
+    let probe = HttpProbe::new();
+    assert_eq!(
+        probe.probe(healthz.base.clone()).await,
+        ProbeReport::Ok,
+        "the probe reached the server with a proxy in the environment"
+    );
+    assert!(
+        !healthz.requests().is_empty(),
+        "the request reached the listener, not the proxy"
+    );
 }
