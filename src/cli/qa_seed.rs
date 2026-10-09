@@ -170,18 +170,56 @@ pub(crate) async fn run_qa_seed(args: &QaSeedArgs) -> anyhow::Result<()> {
         revoked.len()
     );
 
-    // ---- The `qa` marker LAST, after the commit (PR-354 fix D2): the tokens
-    // are committed and printed by now, so a marker failure leaves two VALID
-    // tokens and an unmarked dir — never a `qa` marker over a database whose
-    // prod tokens are still active. `pulse serve --role qa` writes the marker
-    // itself on its first start (the absent-marker path), so no re-run is
-    // needed.
-    role::write(&args.data_dir, ServerRole::Qa).map_err(|error| {
-        anyhow::anyhow!(
+    // ---- The `qa` marker LAST, after the commit (PR-354 fix D2), and
+    // EXCLUSIVELY (PR-354 fix B1): see `publish_marker`.
+    publish_marker(&args.data_dir)
+}
+
+/// Publish the `qa` marker exclusively, after the commit (PR-354 fixes D2 and
+/// B1).
+///
+/// The seed read the marker at the start, when the dir may have been unmarked —
+/// and a concurrent `serve --role prod` can mark it while the seed runs. The
+/// publish is therefore role.rs's exclusive hard-link create (with its fsyncs),
+/// never a create-or-replace: the seed must not overwrite `prod` with `qa`. An
+/// `AlreadyExists` re-reads the winner:
+///
+/// - `qa` — the dir is marked as intended; continue;
+/// - `prod` — REFUSE by name. The tokens this run just committed ARE valid in
+///   this database, but the dir is prod's; overwriting the marker is exactly the
+///   cross-role accident the marker exists to prevent;
+/// - unreadable (or vanished) — refuse by name.
+///
+/// A create that fails for any other reason keeps the D2 message: the tokens are
+/// valid, and `pulse serve --role qa` writes the marker on its first start (the
+/// absent-marker path), so no re-run is needed.
+fn publish_marker(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    match role::create_exclusive(data_dir, ServerRole::Qa) {
+        Ok(()) => Ok(()),
+        Err(role::RoleRefused::MarkerWrite { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            match role::read(data_dir) {
+                Ok(Some(ServerRole::Qa)) => Ok(()),
+                Ok(Some(ServerRole::Prod)) => Err(anyhow::anyhow!(
+                    "qa-seed: refusing: this data dir is marked prod ({}); the tokens issued \
+                     above ARE valid in this database, but the dir is prod's — QA seeds its own \
+                     data dir, and the prod marker was never overwritten",
+                    data_dir.display()
+                )),
+                Ok(None) => Err(anyhow::anyhow!(
+                    "qa-seed: the tokens above ARE valid, but the marker vanished between the \
+                     create and the re-read ({}); re-run the command",
+                    data_dir.display()
+                )),
+                Err(error) => Err(anyhow::anyhow!("qa-seed: refusing: {error}")),
+            }
+        }
+        Err(error) => Err(anyhow::anyhow!(
             "qa-seed: the tokens above ARE valid, but the marker could not be written: {error}; \
              `pulse serve --role qa` creates it on its first start — no re-run is needed"
-        )
-    })
+        )),
+    }
 }
 
 /// Print the two tokens as the ONLY stdout lines, INSIDE the seed's transaction
@@ -213,7 +251,7 @@ fn write_token_lines(app: &str, agent: &str) -> std::io::Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{QaSeedArgs, run_qa_seed};
+    use super::{QaSeedArgs, publish_marker, run_qa_seed};
     use crate::adapters::db::client_token_repo::probe;
     use crate::adapters::db::{NewToken, SqliteClientTokenRepo, open_migrated};
     use crate::server::role::ROLE_MARKER_NAME;
@@ -305,5 +343,45 @@ mod tests {
                 .unwrap();
         assert_eq!(active, 2);
         handle.pool().close().await;
+    }
+
+    /// PR-354 fix B1: the seed publishes its marker EXCLUSIVELY. A `prod` marker
+    /// that appeared while the seed ran is refused by name — never overwritten —
+    /// and an existing `qa` marker continues. Deterministic: the marker is placed
+    /// before the publish step, which the test calls directly, so nothing races.
+    #[test]
+    fn the_marker_publish_never_overwrites_prod() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("qa-data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let marker = data_dir.join(ROLE_MARKER_NAME);
+
+        // A fresh dir is marked `qa`.
+        publish_marker(&data_dir).expect("a fresh dir is marked qa");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "qa\n");
+
+        // An existing `qa` marker continues (the winner is this same role).
+        publish_marker(&data_dir).expect("an existing qa marker continues");
+
+        // A `prod` marker that appeared mid-run is refused by name, and the file
+        // is still prod afterwards.
+        fs::write(&marker, "prod\n").unwrap();
+        let error = publish_marker(&data_dir).expect_err("prod is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("prod") && message.contains("ARE valid"),
+            "the refusal names prod and says the tokens are valid: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "prod\n",
+            "the prod marker is never overwritten"
+        );
+
+        // A marker this build cannot read is refused by name too.
+        fs::write(&marker, "garbage\n").unwrap();
+        let error = publish_marker(&data_dir).expect_err("an unreadable marker is refused");
+        assert!(error.to_string().contains("garbage"), "{error}");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "garbage\n");
     }
 }

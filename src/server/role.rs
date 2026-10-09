@@ -176,48 +176,31 @@ pub fn read(data_dir: &Path) -> Result<Option<ServerRole>, RoleRefused> {
     }
 }
 
-/// Write the marker: one line, mode 0600 (the `serve-start-limit` discipline —
-/// nothing else on the host reads the role, but the file sets the server's
-/// safety boundary, so it is as private as the data it describes).
-///
-/// Creates the data dir when it is not there yet (PR-354 fix C2a): the first
-/// `--role` start on a fresh data dir must not fail with ENOENT before the
-/// database's own open would have made the directory — launchd would relaunch
-/// a server that never starts.
-///
-/// # Errors
-///
-/// [`RoleRefused::MarkerWrite`] when the file cannot be created or written.
-pub fn write(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
-    write_marker(data_dir, role, false)
-}
-
 /// Create the marker EXCLUSIVELY for an absent-marker start (PR-354 fix C2b):
 /// two overlapping starts both read no marker, and with a plain create both
-/// would write — the loser would overwrite the winner's role. `create_new`
-/// (`O_EXCL`) makes the second create fail with `AlreadyExists`, which
-/// [`check`] turns into "re-read and validate the winning role".
+/// would write — the loser would overwrite the winner's role. The publish is a
+/// hard link of the synced temp file, so the second create fails with
+/// `AlreadyExists` atomically, which [`check`] turns into "re-read and validate
+/// the winning role" and `qa-seed` (PR-354 fix B1) turns into "the dir was
+/// marked while the seed ran: never overwrite it".
 ///
 /// # Errors
 ///
 /// [`RoleRefused::MarkerWrite`] — with an `AlreadyExists` source when the
 /// marker appeared between the read and this call.
-fn create_exclusive(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
-    write_marker(data_dir, role, true)
+pub(crate) fn create_exclusive(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
+    write_marker(data_dir, role)
 }
 
 /// The one marker write: one line, mode 0600, the data dir created first (0700,
-/// PR-354 fix D1b), and the marker PUBLISHED from a temp file (PR-354 fix D1a).
-///
-/// The role is written to a unique temp file beside the marker and only then
-/// published under the marker's name — with a hard link on the exclusive path
-/// (`link(2)` fails `AlreadyExists` atomically, which [`check`] turns into
-/// "re-read and validate the winner") and a rename on the create-or-replace
-/// path (`qa-seed`'s re-run). A marker is therefore never visible empty or
-/// partial: the old create-then-write let a racing reader see `""` and refuse
-/// `MarkerUnreadable`, and a failed write left an empty marker that refused
-/// every later start.
-fn write_marker(data_dir: &Path, role: ServerRole, exclusive: bool) -> Result<(), RoleRefused> {
+/// PR-354 fix D1b), and the marker PUBLISHED from a temp file (PR-354 fix D1a)
+/// by a hard link — the exclusive create (`link(2)` fails `AlreadyExists`
+/// atomically, which [`check`] and `qa-seed` turn into "re-read and validate the
+/// winner"; there is no create-or-replace path left, PR-354 fix B1). A marker is
+/// therefore never visible empty or partial: the old create-then-write let a
+/// racing reader see `""` and refuse `MarkerUnreadable`, and a failed write left
+/// an empty marker that refused every later start.
+fn write_marker(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
     let path = data_dir.join(ROLE_MARKER_NAME);
     crate::adapters::db::create_private_dir(data_dir).map_err(|source| {
         RoleRefused::MarkerWrite {
@@ -226,7 +209,7 @@ fn write_marker(data_dir: &Path, role: ServerRole, exclusive: bool) -> Result<()
         }
     })?;
     let (temp, mut file) = create_temp_marker(data_dir, &path)?;
-    let result = write_and_publish(&mut file, &temp, &path, data_dir, role, exclusive);
+    let result = write_and_publish(&mut file, &temp, &path, data_dir, role);
     drop(file);
     // The temp name goes whatever happened: on success the published marker
     // holds the inode, on failure nothing at all is left behind.
@@ -277,8 +260,8 @@ fn temp_marker_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Write the role into the temp file, sync it, then publish it under the
-/// marker's name — `hard_link` (exclusive) or `rename` (create-or-replace) —
-/// and fsync the data dir so the published name is durable too (PR-354 fix S2:
+/// marker's name with a `hard_link` — and fsync the data dir so the published
+/// name is durable too (PR-354 fix S2:
 /// the marker was flushed but never synced, so a power loss could leave a start
 /// believing a dir is marked when it is not).
 ///
@@ -291,7 +274,6 @@ fn write_and_publish(
     path: &Path,
     data_dir: &Path,
     role: ServerRole,
-    exclusive: bool,
 ) -> Result<(), RoleRefused> {
     writeln!(file, "{}", role.as_str()).map_err(|source| RoleRefused::MarkerWrite {
         path: path.to_path_buf(),
@@ -306,12 +288,7 @@ fn write_and_publish(
         path: path.to_path_buf(),
         source: std::io::Error::other(error.to_string()),
     })?;
-    let published = if exclusive {
-        fs::hard_link(temp, path)
-    } else {
-        fs::rename(temp, path)
-    };
-    published.map_err(|source| RoleRefused::MarkerWrite {
+    fs::hard_link(temp, path).map_err(|source| RoleRefused::MarkerWrite {
         path: path.to_path_buf(),
         source,
     })?;
@@ -446,9 +423,7 @@ fn resolve(path: &Path) -> Result<PathBuf, RoleRefused> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{
-        ROLE_MARKER_NAME, RoleRefused, ServerRole, check, create_exclusive, lost_race, write,
-    };
+    use super::{ROLE_MARKER_NAME, RoleRefused, ServerRole, check, create_exclusive, lost_race};
     use std::fs;
     use tempfile::TempDir;
 
@@ -586,29 +561,22 @@ mod tests {
         // A read-only dir: the temp file cannot be created at all.
         fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
-        for (what, attempt) in [
-            ("write", write(&data_dir, ServerRole::Qa)),
-            (
-                "exclusive create",
-                create_exclusive(&data_dir, ServerRole::Qa),
-            ),
-        ] {
-            let error = attempt.expect_err("a read-only dir refuses the marker write");
-            assert!(
-                matches!(error, RoleRefused::MarkerWrite { .. }),
-                "{what}: {error}"
-            );
-            assert!(
-                !data_dir.join(ROLE_MARKER_NAME).exists(),
-                "{what}: no marker exists"
-            );
-            let leftovers: Vec<_> = fs::read_dir(&data_dir)
-                .unwrap()
-                .flatten()
-                .map(|entry| entry.file_name())
-                .collect();
-            assert!(leftovers.is_empty(), "{what}: no temp left: {leftovers:?}");
-        }
+        let error = create_exclusive(&data_dir, ServerRole::Qa)
+            .expect_err("a read-only dir refuses the marker write");
+        assert!(
+            matches!(error, RoleRefused::MarkerWrite { .. }),
+            "a MarkerWrite refusal: {error}"
+        );
+        assert!(
+            !data_dir.join(ROLE_MARKER_NAME).exists(),
+            "no marker exists"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&data_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "no temp left: {leftovers:?}");
 
         fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -624,7 +592,8 @@ mod tests {
 
         // The file sync fails before the publish: no marker exists.
         crate::cli::publish::probe::fail_next_file_sync();
-        let error = write(&data_dir, ServerRole::Prod).expect_err("a failed file sync refuses");
+        let error =
+            create_exclusive(&data_dir, ServerRole::Prod).expect_err("a failed file sync refuses");
         assert!(
             matches!(error, RoleRefused::MarkerWrite { .. }),
             "a MarkerWrite refusal: {error}"
@@ -643,7 +612,8 @@ mod tests {
         // still refuses (it cannot claim the name is durable), and the temp is
         // removed all the same.
         crate::cli::publish::probe::fail_next_sync_of(&data_dir);
-        let error = write(&data_dir, ServerRole::Prod).expect_err("a failed dir sync refuses");
+        let error =
+            create_exclusive(&data_dir, ServerRole::Prod).expect_err("a failed dir sync refuses");
         assert!(
             matches!(error, RoleRefused::MarkerWrite { .. }),
             "a MarkerWrite refusal: {error}"
@@ -655,9 +625,16 @@ mod tests {
         );
         assert!(no_temp(&data_dir), "and no temp is left");
 
-        // With no injection armed the whole chain succeeds and leaves one file.
-        write(&data_dir, ServerRole::Prod).expect("the publish works");
-        assert!(no_temp(&data_dir), "no temp after a successful publish");
+        // With no injection armed the whole chain succeeds and leaves one file
+        // (a FRESH dir: the marker above is already there, and the publish is
+        // exclusive).
+        let fresh = dir.path().join("fresh");
+        create_exclusive(&fresh, ServerRole::Prod).expect("the publish works");
+        assert_eq!(
+            fs::read_to_string(fresh.join(ROLE_MARKER_NAME)).unwrap(),
+            "prod\n"
+        );
+        assert!(no_temp(&fresh), "no temp after a successful publish");
     }
 
     /// Whether the data dir holds no marker temp (every entry is the marker).
