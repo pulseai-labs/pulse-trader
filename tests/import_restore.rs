@@ -513,6 +513,65 @@ async fn clean_import_verifies_counts_hashes_reads_and_readonly_source() {
 }
 
 // ---------------------------------------------------------------------------
+// (i-b) a source older than the paper tables (PR-354 fix C5)
+// ---------------------------------------------------------------------------
+
+/// PR-354 fix C5: a source older than migration `0018` has no paper table at
+/// all. Its side counts as EMPTY — the migrated copy's paper tables must hold
+/// zero rows — and the import must succeed, printing `rows=0` for the three
+/// tables, instead of failing the digest on a table the source never had (and
+/// instead of digesting the copy's own, newer schema).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_older_than_the_paper_tables_imports_cleanly() {
+    let s = seed_mac_source(false).await;
+    // The pre-0018 shape: every table migration 0018 creates is gone and its
+    // migration row with them, so the copy's own migrate creates them fresh.
+    // paper_bar goes first — its trigger's body names paper_event.
+    let db = Db::with_path(&s.from_db).await.unwrap();
+    for table in [
+        "paper_bar",
+        "paper_event",
+        "paper_session",
+        "fixture_snapshot",
+    ] {
+        sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 18")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.pool().close().await;
+
+    let target_db = s.dir.path().join("older-source").join("pulse.db");
+    let target_data = s.dir.path().join("older-source-data");
+    let out = import_once(&s, &target_db, &target_data);
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "a source without the paper tables imports cleanly: {text}"
+    );
+    for table in ["paper_session", "paper_event", "paper_bar"] {
+        assert!(
+            text.contains(&format!("{table} rows=0")),
+            "the summary names {table} as empty: {text}"
+        );
+    }
+    // The copy has the tables (its own migrations made them) and holds none.
+    let tgt = Db::with_path(&target_db).await.unwrap();
+    for table in ["paper_session", "paper_event", "paper_bar"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(tgt.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table} is empty in the copy");
+    }
+    drop(tgt);
+}
+
+// ---------------------------------------------------------------------------
 // (ii) flipped snapshot byte
 // ---------------------------------------------------------------------------
 
