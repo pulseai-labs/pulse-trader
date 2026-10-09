@@ -390,6 +390,77 @@ fn a_role_start_is_refused_when_the_db_is_outside_the_data_dir() {
 }
 
 // ---------------------------------------------------------------------------
+// PR-354 fix N1: an absent marker is published only under the instance lock.
+// ---------------------------------------------------------------------------
+
+/// PR-354 fix N1 (Codex P1): the role marker used to be published in serve's
+/// step 0b, BEFORE the instance lock at step 0c. A `pulse serve --role qa`
+/// started while another server — a roleless one, say — already held the
+/// database's lock therefore wrote `server-role=qa` into the LIVE database's
+/// data dir, then lost the lock and exited: the running server's dir stayed
+/// durably relabelled. With the lock held, the start must refuse by name with
+/// the instance-lock refusal and the marker must STILL be absent.
+#[cfg(unix)]
+#[test]
+fn a_held_instance_lock_refuses_before_an_absent_marker_is_published() {
+    use std::os::unix::io::AsRawFd as _;
+
+    let (root, home) = scratch();
+    let data = root.path().join("qa-data");
+    fs::create_dir_all(&data).unwrap();
+    let db = data.join("pulse.db");
+
+    // Hold the lock exactly as a running server would: the lock file beside the
+    // database's RESOLVED directory (the fixture dir exists, so the resolved
+    // form is its canonical spelling) — the `import_move_safety.rs` idiom.
+    let lock_path = fs::canonicalize(&data).unwrap().join("pulse.db.serve.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("the lock file");
+    // SAFETY: `lock_file` is a live open fd for the duration of the call, and
+    // it stays open (holding the lock) until the end of the test.
+    let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test holds the instance lock");
+
+    let out = run_refused(
+        &home,
+        &[
+            "serve",
+            "--role",
+            "qa",
+            "--dev-loopback",
+            "--bind",
+            "127.0.0.1:0",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+    let text = text(&out);
+    assert!(
+        !out.status.success(),
+        "a held instance lock refuses the start: {text}"
+    );
+    assert!(
+        text.contains("serve.lock"),
+        "the refusal is the instance-lock one, by name: {text}"
+    );
+    assert!(
+        !data.join("server-role").exists(),
+        "the live database's dir is NOT relabelled: no marker was published"
+    );
+    assert!(
+        !db.exists(),
+        "and the database was never created: {}",
+        db.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The marker's happy path: an unmarked dir is marked, then accepted.
 // ---------------------------------------------------------------------------
 

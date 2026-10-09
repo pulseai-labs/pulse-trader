@@ -20,6 +20,13 @@
 //! — a QA server started by mistake with prod's `--db` must never open prod's
 //! database before it refuses.
 //!
+//! The split is the other half of it (PR-354 fix N1): the existing marker is
+//! checked BEFORE the instance lock — [`check_before_lock`] — while an ABSENT
+//! marker is published by [`publish_absent_marker`] only once the lock is held
+//! (and still before the database is opened). A start that loses the lock to a
+//! server already on that database therefore writes no marker, never relabels
+//! the live database's dir on its way out.
+//!
 //! **With `--role`, the database must sit inside the data dir.** The marker
 //! describes the dir the data lives in; a database outside it would make the
 //! marker meaningless, so the containment check refuses by name first, and it
@@ -193,8 +200,8 @@ pub fn read(data_dir: &Path) -> Result<Option<ServerRole>, RoleRefused> {
 /// two overlapping starts both read no marker, and with a plain create both
 /// would write — the loser would overwrite the winner's role. The publish is a
 /// hard link of the synced temp file, so the second create fails with
-/// `AlreadyExists` atomically, which [`check`] turns into "re-read and validate
-/// the winning role".
+/// `AlreadyExists` atomically, which [`publish_absent_marker`] turns into
+/// "re-read and validate the winning role".
 ///
 /// # Errors
 ///
@@ -207,8 +214,9 @@ fn create_exclusive(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused
 /// The one marker write: one line, mode 0600, the data dir created first (0700,
 /// PR-354 fix D1b), and the marker PUBLISHED from a temp file (PR-354 fix D1a)
 /// by a hard link — the exclusive create (`link(2)` fails `AlreadyExists`
-/// atomically, which [`check`] turns into "re-read and validate the winner";
-/// there is no create-or-replace path left, PR-354 fix B1). A marker is
+/// atomically, which [`publish_absent_marker`] turns into "re-read and validate
+/// the winner"; there is no create-or-replace path left, PR-354 fix B1). A
+/// marker is
 /// therefore never visible empty or partial: the old create-then-write let a
 /// racing reader see `""` and refuse `MarkerUnreadable`, and a failed write left
 /// an empty marker that refused every later start.
@@ -330,9 +338,32 @@ pub(crate) fn ensure_db_inside_data_dir(data_dir: &Path, db: &Path) -> Result<()
     Ok(())
 }
 
-/// Apply the marker for a `--role {role}` start: refuse a database outside the
-/// data dir, refuse a dir marked with the other role, create the marker when it
-/// is absent, and continue on the same role.
+/// The PRE-LOCK half of a `--role {role}` start (PR-354 fix N1): refuse a
+/// database outside the data dir, and refuse a dir marked with the OTHER role.
+/// It reads the EXISTING marker only — an absent marker is NOT written here,
+/// because that write must wait for the instance lock.
+///
+/// This is the half that runs before the instance lock, so a refusal here takes
+/// no lock and writes nothing (w3's ruled order: a refused start touches
+/// nothing at all).
+///
+/// # Errors
+///
+/// [`RoleRefused`] — and NOTHING is written on any refusal.
+pub fn check_before_lock(data_dir: &Path, db: &Path, role: ServerRole) -> Result<(), RoleRefused> {
+    ensure_db_inside_data_dir(data_dir, db)?;
+    match read(data_dir)? {
+        Some(marked) => same_role(marked, role, data_dir),
+        None => Ok(()),
+    }
+}
+
+/// The POST-LOCK half (PR-354 fix N1): publish the marker for an ABSENT-marker
+/// start, only now that the caller holds the database's instance lock. The old
+/// single check published it BEFORE the lock, so a start that then lost the
+/// lock — another server already serving that database — had already durably
+/// relabelled the live database's data dir and exited. A lock refusal
+/// therefore writes no marker; nothing is written before the lock is in hand.
 ///
 /// The absent-marker path creates EXCLUSIVELY (PR-354 fix C2b): when two starts
 /// overlap, the loser's create fails `AlreadyExists` and it re-reads the
@@ -342,8 +373,7 @@ pub(crate) fn ensure_db_inside_data_dir(data_dir: &Path, db: &Path) -> Result<()
 /// # Errors
 ///
 /// [`RoleRefused`] — and NOTHING is written on any refusal.
-pub fn check(data_dir: &Path, db: &Path, role: ServerRole) -> Result<(), RoleRefused> {
-    ensure_db_inside_data_dir(data_dir, db)?;
+pub fn publish_absent_marker(data_dir: &Path, role: ServerRole) -> Result<(), RoleRefused> {
     if let Some(marked) = read(data_dir)? {
         return same_role(marked, role, data_dir);
     }
@@ -498,20 +528,28 @@ fn resolve(path: &Path) -> Result<PathBuf, RoleRefused> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{ROLE_MARKER_NAME, RoleRefused, ServerRole, check, create_exclusive, lost_race};
+    use super::{
+        ROLE_MARKER_NAME, RoleRefused, ServerRole, check_before_lock, create_exclusive, lost_race,
+        publish_absent_marker,
+    };
     use std::fs;
     use tempfile::TempDir;
 
     /// PR-354 fix C2a: the marker write creates the data dir when it is not
     /// there yet, so the first `--role` start on a fresh dir cannot fail with
     /// ENOENT before the database's own open would have made the directory.
+    /// (PR-354 fix N1: the write is the POST-lock half, so the test calls the
+    /// two halves in serve's order.)
     #[test]
     fn the_marker_write_creates_a_data_dir_that_does_not_exist_yet() {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("fresh").join("nested");
         let db = data_dir.join("pulse.db");
 
-        check(&data_dir, &db, ServerRole::Prod).expect("the first start marks a fresh dir");
+        check_before_lock(&data_dir, &db, ServerRole::Prod)
+            .expect("an unmarked dir passes the pre-lock check");
+        publish_absent_marker(&data_dir, ServerRole::Prod)
+            .expect("the first start marks a fresh dir");
 
         assert_eq!(
             fs::read_to_string(data_dir.join(ROLE_MARKER_NAME)).unwrap(),
@@ -606,7 +644,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("fresh").join("nested");
 
-        check(&data_dir, &data_dir.join("pulse.db"), ServerRole::Prod)
+        check_before_lock(&data_dir, &data_dir.join("pulse.db"), ServerRole::Prod)
+            .expect("an unmarked dir passes the pre-lock check");
+        publish_absent_marker(&data_dir, ServerRole::Prod)
             .expect("the first start marks a fresh dir");
 
         for path in [dir.path().join("fresh"), data_dir.clone()] {
@@ -740,7 +780,8 @@ mod tests {
             .join("outside")
             .join("pulse.db");
         assert!(!qa.join("new").exists(), "the fixture's `new` is absent");
-        let error = check(&qa, &db, ServerRole::Prod).expect_err("the dot-dot tail is refused");
+        let error =
+            check_before_lock(&qa, &db, ServerRole::Prod).expect_err("the dot-dot tail is refused");
         let message = error.to_string();
         assert!(
             message.contains("..") && message.contains(&db.display().to_string()),
@@ -756,7 +797,8 @@ mod tests {
         // A `.` in the tail is refused too (`Path::join` would drop it, so the
         // path is built from its text).
         let dot = std::path::PathBuf::from(format!("{}/new/./pulse.db", qa.display()));
-        let error = check(&qa, &dot, ServerRole::Prod).expect_err("the dot tail is refused");
+        let error =
+            check_before_lock(&qa, &dot, ServerRole::Prod).expect_err("the dot tail is refused");
         assert!(
             error.to_string().contains('.'),
             "the refusal names the component: {error}"

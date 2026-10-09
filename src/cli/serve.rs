@@ -1,12 +1,13 @@
 //! `pulse serve` — the composition root of the always-on server (r3.s3.w1,
 //! ADR-0026). Thin by design: the ordered startup steps, the bind policy and
 //! the retry loop live in `server::bind` where the tests drive them; this
-//! module parses the flags, applies the data-dir role marker (`--role`,
-//! r4.s2.w3) BEFORE the database is opened, takes the database's instance lock
-//! on the resolved path (PR-354 fix C3a — before the migrate-then-open, so an
-//! import/restore cannot swap the file in between), opens the migrated DB,
-//! resolves the data dir and hands the [`ServeConfig`] (the lock's guard with
-//! it) over.
+//! module parses the flags, checks the data-dir role marker (`--role`,
+//! r4.s2.w3) BEFORE the database is opened — an existing marker before the
+//! instance lock, an absent one published only with the lock held (PR-354 fix
+//! N1) — takes the database's instance lock on the resolved path (PR-354 fix
+//! C3a — before the migrate-then-open, so an import/restore cannot swap the
+//! file in between), opens the migrated DB, resolves the data dir and hands the
+//! [`ServeConfig`] (the lock's guard with it) over.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -50,10 +51,12 @@ pub struct ServeArgs {
     start_limit: Option<String>,
     /// The role this data dir is for, `prod` or `qa` (r4.s2.w3, C5). With
     /// `--role`, the database must sit inside `--data-dir`, and
-    /// `<data dir>/server-role` is applied BEFORE the database is opened: an
-    /// unmarked dir is marked with this role, the same role continues, and the
-    /// other role is refused by name (never starting on the other role's
-    /// data). Without `--role` nothing is checked or written.
+    /// `<data dir>/server-role` is checked BEFORE the database is opened — an
+    /// existing marker before the instance lock, an absent one published only
+    /// with the lock held (PR-354 fix N1): the same role continues, the other
+    /// is refused by name (never starting on the other role's data), and an
+    /// unmarked dir is marked with this role. Without `--role` nothing is
+    /// checked or written.
     #[arg(long, value_name = "prod|qa")]
     role: Option<String>,
 }
@@ -75,12 +78,12 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
         ),
         None => None,
     };
-    // ---- Step 0b (r4.s2.w3, C5): the role marker, applied BEFORE the database
-    // is opened. A refused start must touch NOTHING at all — no database file
-    // created or migrated, no instance lock, no start-log entry, no marker
-    // change — so a QA server started with prod's `--db` by mistake never opens
-    // prod's database. The two paths read here are the same ones `open_db` and
-    // the server below resolve.
+    // ---- Step 0b (r4.s2.w3, C5; PR-354 fix N1): the EXISTING role marker,
+    // read BEFORE the instance lock. A refused start must touch NOTHING at all
+    // — no database file created or migrated, no instance lock, no start-log
+    // entry, no marker change — so a QA server started with prod's `--db` by
+    // mistake never opens prod's database. The two paths read here are the same
+    // ones `open_db` and the server below resolve.
     let role = match &args.role {
         Some(raw) => {
             Some(ServerRole::parse(raw).map_err(|error| anyhow::anyhow!("--role: {error}"))?)
@@ -90,7 +93,7 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
     let data_dir = resolved_data_dir(args)?;
     let db_path = resolved_db_path(args)?;
     if let Some(role) = role {
-        role::check(&data_dir, &db_path, role)
+        role::check_before_lock(&data_dir, &db_path, role)
             .map_err(|error| anyhow::anyhow!("pulse serve: refusing to serve: {error}"))?;
     }
     // ---- Step 0c (PR-354 fix C3a): the database's instance lock, held for this
@@ -105,6 +108,17 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
             reason: error.to_string(),
         })
     })?;
+    // ---- Step 0d (PR-354 fix N1): an ABSENT role marker is published only
+    // HERE, with the instance lock in hand and still before `open_db`. The old
+    // order published it in step 0b, so a `--role qa` start that then lost the
+    // lock above — another server already on that database — had already
+    // written `server-role=qa` and durably relabelled a live database's dir
+    // before it exited. A lock refusal now writes no marker; the refusal path
+    // above still writes nothing either.
+    if let Some(role) = role {
+        role::publish_absent_marker(&data_dir, role)
+            .map_err(|error| anyhow::anyhow!("pulse serve: refusing to serve: {error}"))?;
+    }
     // ---- Step 1: the migrated DB (the one migrate-then-open every arm uses).
     let db = super::open_db(args.db.as_deref()).await?;
     crate::server::bind::serve(ServeConfig {

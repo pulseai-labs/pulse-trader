@@ -16,10 +16,12 @@
 //! full 120s budget instantly.
 //!
 //! **Startup order.** The composition root (`cli/serve.rs`) resolves the db and
-//! data-dir paths and, when `--role` is passed, applies the data dir's role
-//! marker BEFORE the database is opened (step 0, r4.s2.w3 — a refused start
-//! touches nothing: no database file created or migrated, no lock, no start-log
-//! entry, no marker change), takes the database's instance lock on the resolved
+//! data-dir paths and, when `--role` is passed, checks the data dir's role
+//! marker BEFORE the database is opened (step 0b; an ABSENT marker is published
+//! at step 0d, only once the lock below is held — r4.s2.w3, PR-354 fix N1, so a
+//! start that loses the lock never relabels the dir; a refused start touches
+//! nothing: no database file created or migrated, no lock, no start-log entry,
+//! no marker change), takes the database's instance lock on the resolved
 //! path (step 0c, r4.s2 PR-354 fix C3a — the lock came after the
 //! migrate-then-open before that, so an import could swap the file in between),
 //! then migrate-then-opens the DB (step 1) and hands the [`ServeConfig`] here
