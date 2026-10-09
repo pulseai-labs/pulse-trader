@@ -19,3 +19,11 @@ Description=Off-box backup pull from the Mac Mini (pulse backup)
 [Service]
 Type=oneshot
 ExecStart=%h/.local/share/pulse-qa/deploy/pulse-backup-pull.sh macmini:/Users/draco/pulse-backups
+# A normal pull is minutes: rsync copies the Mini's backup directory over the
+# home LAN, then `pulse backup-verify` reads the newest copy. Without a bound
+# of its own the unit inherits systemd's 90 s oneshot default, which a live
+# pull can exceed; 30min is sized well above the normal nightly cycle, and it
+# still kills a STALLED connection — so the unit never stays half-run, and the
+# next timer elapse (`Persistent=true` covers one that fired meanwhile) starts
+# its own cycle.
+TimeoutStartSec=30min

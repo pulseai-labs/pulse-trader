@@ -337,6 +337,24 @@ fn pull_service_is_one_pull_cycle_with_the_ssh_target() {
     );
 }
 
+/// PR-354 fix P3 (Codex 4231276359): the pull unit carries its OWN start
+/// bound. A oneshot without `TimeoutStartSec=` inherits systemd's
+/// `DefaultTimeoutStartSec` — 90 s — which a live pull can exceed (rsync of
+/// the Mini's backup directory over the home LAN, then `pulse backup-verify`
+/// on the newest copy), and a STALLED connection would otherwise hold the
+/// cycle until that default. 30min is sized well above a normal nightly pull,
+/// and it is still a hard stop so the next timer elapse can start its own
+/// cycle; the unit's own comment says both.
+#[test]
+fn pull_service_bounds_one_pull_cycle() {
+    let service = section_of(PULL_SERVICE, "Service");
+    assert_eq!(
+        service["TimeoutStartSec"], "30min",
+        "a bound well above a normal nightly pull, and still a hard stop for a stalled \
+         connection (systemd's 90 s oneshot default is the bug)"
+    );
+}
+
 #[test]
 fn pull_timer_pulls_after_the_mini_backup() {
     let timer = section_of(PULL_TIMER, "Timer");
