@@ -475,10 +475,16 @@ fn forced_command_refuses_a_second_dot_operand() {
     let fake = FakeRsync::new();
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().display().to_string();
+    // A real directory under the root: the P2b case puts its `.` after it.
+    std::fs::create_dir(root.path().join("x")).unwrap();
 
     for command in [
         // The reported shape: the protocol's separator, then a SECOND `.`.
         format!("rsync --server --sender -logDtpre.iLsfxCIvu . . {root_path}/"),
+        // A `.` AFTER an operand is not the separator either — below-root
+        // (PR-354 fix P2b) or the root itself.
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu {root_path}/x ."),
+        format!("rsync --server --sender -logDtpre.iLsfxCIvu {root_path} ."),
         // A `.` after the source, and one with the source before the
         // separator (both are extra transfer roots, not the separator).
         format!("rsync --server --sender -logDtpre.iLsfxCIvu {root_path}/ ."),
