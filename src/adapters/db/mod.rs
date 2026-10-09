@@ -115,8 +115,9 @@ pub mod certification_repo;
 pub use certification_repo::SqliteCertificationRepo;
 
 // r4.s2.w2 (#250): the per-database instance lock — `pulse serve` holds it for
-// its process lifetime and the data-ops verbs take it on their target. Not
-// re-exported (the cli verbs and `server::bind` are its only callers).
+// its process lifetime; the data-ops verbs take none in this PR (the
+// import/restore enforcement was split out to issue #355). Not re-exported (the
+// cli verbs and `server::bind` are its only callers).
 pub(crate) mod instance_lock;
 
 // r3.s3.w4 (D7/D12, ADR-0026): the small copy/verify helper set the data-ops

@@ -120,9 +120,9 @@ pub enum ServeError {
         reason: String,
     },
     /// The database's instance lock is held (#250, r4.s2.w2): another
-    /// `pulse serve` runs against this database, or an import/restore has it
-    /// held until its install completes. The refusal names the database and the
-    /// lock file.
+    /// `pulse serve` runs against this database — the only holder in this PR
+    /// (the instance lock for import/restore was split out to issue #355). The
+    /// refusal names the database and the lock file.
     #[error("pulse serve: refusing to start: {reason}")]
     InstanceLockHeld {
         /// The lock refusal's words, naming the database and the lock file.

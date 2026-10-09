@@ -101,8 +101,9 @@ pub(crate) async fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
     // `open_db` — because an import/restore can otherwise swap the database file
     // in between the migrate-then-open and the later acquire: the server would
     // keep serving the unlinked inode while the import installs a new file under
-    // the same name. A second server, or an in-flight data op, refuses this one
-    // by name before anything touches the database.
+    // the same name. A second server refuses this one by name before anything
+    // touches the database (the instance lock is `pulse serve`'s alone in this
+    // PR; the import/restore enforcement was split out to issue #355).
     let instance_lock = InstanceLock::acquire(&db_path).map_err(|error| {
         anyhow::Error::new(ServeError::InstanceLockHeld {
             reason: error.to_string(),
