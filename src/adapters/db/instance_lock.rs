@@ -36,6 +36,17 @@ pub(crate) enum InstanceLockError {
         /// The underlying failure, in the operator's words.
         reason: String,
     },
+    /// The database file has MORE THAN ONE HARD LINK (PR-354 fix D6).
+    /// Canonicalisation unifies symlinks but not hard links, so a hard-linked
+    /// alias of a live database would take a different lock file and the two
+    /// spellings would not exclude each other. One inode, one lock — refused
+    /// before the lock is taken.
+    HardLinked {
+        /// The database path as given.
+        target: PathBuf,
+        /// How many links the file carries.
+        links: u64,
+    },
 }
 
 impl core::fmt::Display for InstanceLockError {
@@ -51,6 +62,13 @@ impl core::fmt::Display for InstanceLockError {
                 f,
                 "cannot take the instance lock {}: {reason}",
                 lock.display()
+            ),
+            Self::HardLinked { target, links } => write!(
+                f,
+                "the database {} has {links} hard links — a hard-linked alias would take a \
+                 different lock file, so this one cannot be locked safely; point --db at the \
+                 one file",
+                target.display()
             ),
         }
     }
@@ -98,13 +116,31 @@ impl InstanceLock {
     /// directory may be this call's to make (the same first-run case
     /// [`Db`](super::Db) covers for the database itself).
     ///
+    /// A database file with MORE THAN ONE HARD LINK is refused before anything
+    /// else (PR-354 fix D6): canonicalisation unifies symlinks but not hard
+    /// links, so an alias of a live database would take a different lock file
+    /// and the two spellings would not exclude each other.
+    ///
     /// # Errors
     ///
-    /// [`InstanceLockError::Held`] when another process holds the lock;
+    /// [`InstanceLockError::HardLinked`] when the database has more than one
+    /// link; [`InstanceLockError::Held`] when another process holds the lock;
     /// [`InstanceLockError::Io`] when the lock file cannot be created or locked.
     #[cfg(unix)]
     pub(crate) fn acquire(db_path: &Path) -> Result<Self, InstanceLockError> {
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::AsRawFd;
+
+        // `metadata` follows symlinks, so the link count is the RESOLVED
+        // file's: every spelling of the aliased database is refused.
+        if let Ok(meta) = fs::metadata(db_path)
+            && meta.nlink() > 1
+        {
+            return Err(InstanceLockError::HardLinked {
+                target: db_path.to_path_buf(),
+                links: meta.nlink(),
+            });
+        }
 
         let lock_path = Self::lock_path(db_path);
         create_parent(&lock_path)?;
@@ -305,7 +341,7 @@ mod tests {
                 assert_eq!(target, &db, "the refusal names the database");
                 assert_eq!(lock, &InstanceLock::lock_path(&db), "and the lock file");
             }
-            other @ InstanceLockError::Io { .. } => {
+            other @ (InstanceLockError::Io { .. } | InstanceLockError::HardLinked { .. }) => {
                 panic!("expected Held, got {other:?}");
             }
         }
@@ -321,4 +357,32 @@ mod tests {
         drop(again);
     }
 
+    /// PR-354 fix D6: a hard-linked alias of a database takes a DIFFERENT lock
+    /// file (canonicalisation unifies symlinks, not hard links), so the two
+    /// spellings would not exclude each other. A database with more than one
+    /// link is refused before the lock — both spellings, by name and count —
+    /// while a normal database still locks.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_database_is_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = tmp.path().join("pulse.db");
+        std::fs::write(&db, b"the database").expect("write the database");
+
+        let lock = InstanceLock::acquire(&db).expect("a single-link database locks");
+        drop(lock);
+
+        let alias = tmp.path().join("alias.db");
+        std::fs::hard_link(&db, &alias).expect("the hard link");
+        for path in [&db, &alias] {
+            let error = InstanceLock::acquire(path).expect_err("a hard-linked database is refused");
+            match error {
+                InstanceLockError::HardLinked { target, links } => {
+                    assert_eq!(&target, path, "the refusal names the path as given");
+                    assert_eq!(links, 2, "and the link count");
+                }
+                other => panic!("the refusal is HardLinked, not {other:?}"),
+            }
+        }
+    }
 }
