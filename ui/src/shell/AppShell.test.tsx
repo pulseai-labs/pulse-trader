@@ -25,6 +25,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 import { Sidebar, WindowChrome } from "./AppShell";
+import type { ServerStatus } from "../bindings";
 
 function setHash(hash: string) {
   window.location.hash = hash;
@@ -70,6 +71,30 @@ describe("WindowChrome traffic lights", () => {
   it("renders no Layout button -- no layout feature exists (r1 dead-control convention)", () => {
     render(<WindowChrome />);
     expect(screen.queryByRole("button", { name: /layout/i })).toBeNull();
+  });
+});
+
+describe("WindowChrome server status strip", () => {
+  function status(role: string | null): ServerStatus {
+    return {
+      state: "up",
+      binary_version: "0.1.3",
+      engine_fingerprint: null,
+      reason: null,
+      role,
+    };
+  }
+
+  it("shows the QA badge when the connected server reports role qa", () => {
+    render(<WindowChrome serverStatus={status("qa")} />);
+    expect(screen.getByText("QA")).toBeTruthy();
+  });
+
+  it("shows nothing new for prod or an absent role", () => {
+    const { rerender } = render(<WindowChrome serverStatus={status("prod")} />);
+    expect(screen.queryByText("QA")).toBeNull();
+    rerender(<WindowChrome serverStatus={status(null)} />);
+    expect(screen.queryByText("QA")).toBeNull();
   });
 });
 

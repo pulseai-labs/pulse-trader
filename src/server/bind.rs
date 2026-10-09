@@ -15,9 +15,20 @@
 //! at once. The retry clock and sleeper are injectable, so the tests run the
 //! full 120s budget instantly.
 //!
-//! **Startup order** (one stderr line per step, through the state's sink):
-//! migrate-then-open the DB (step 1, the composition root), resolve the data
-//! dir (step 2), *credential resolution (step 3 — the w3 seam, marked below)*,
+//! **Startup order.** The composition root (`cli/serve.rs`) resolves the db and
+//! data-dir paths and, when `--role` is passed, checks the data dir's role
+//! marker BEFORE the database is opened (step 0b; an ABSENT marker is published
+//! at step 0d, only once the lock below is held — r4.s2.w3, PR-354 fix N1, so a
+//! start that loses the lock never relabels the dir; a refused start touches
+//! nothing: no database file created or migrated, no lock, no start-log entry,
+//! no marker change), takes the database's instance lock on the resolved
+//! path (step 0c, r4.s2 PR-354 fix C3a — the lock came after the
+//! migrate-then-open before that, so an import could swap the file in between),
+//! then migrate-then-opens the DB (step 1) and hands the [`ServeConfig`] here
+//! (the guard with it), where the rest run in order, one stderr line
+//! per step through the state's sink: the start guard (step 2b, r4.s2.w1 — a
+//! refused start exits 0 here, before the credential, the bind and anything
+//! else), *credential resolution (step 3 — the w3 seam, marked below)*,
 //! `check_bind` (step 4), retrying bind (step 5), the one `listening on` line
 //! (step 6), serve until SIGTERM/SIGINT (step 7), then the shutdown line.
 //!
@@ -38,7 +49,9 @@ use tokio::net::TcpListener;
 use crate::adapters::binance::RestClosedBars;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{SqlitePaperSessionRepo, SqliteStrategyRepo};
+use crate::adapters::db::{
+    SqlitePaperSessionRepo, SqliteStrategyRepo, instance_lock::InstanceLock,
+};
 use crate::adapters::secrets::{self, CredentialProfile, StartupCredential};
 use crate::adapters::store::CandleStore;
 use crate::application::paper_runtime::{
@@ -49,6 +62,7 @@ use crate::domain::{
 };
 
 use super::log::RequestLog;
+use super::start_limit::{self, StartGuard, StartLimit};
 use super::{ServerState, router};
 
 /// The Tailscale CGNAT range `100.64.0.0/10` — the first accepted octet pair
@@ -103,6 +117,15 @@ pub enum ServeError {
         /// Which file, and why — the owner/mode/open/read failure
         /// ([`CredentialFileRefusal`]'s one-line rendering), worded for the
         /// operator.
+        reason: String,
+    },
+    /// The database's instance lock is held (#250, r4.s2.w2): another
+    /// `pulse serve` runs against this database — the only holder in this PR
+    /// (the instance lock for import/restore was split out to issue #355). The
+    /// refusal names the database and the lock file.
+    #[error("pulse serve: refusing to start: {reason}")]
+    InstanceLockHeld {
+        /// The lock refusal's words, naming the database and the lock file.
         reason: String,
     },
 }
@@ -248,6 +271,22 @@ pub struct ServeConfig {
     /// How long a paper control request waits for its reply (r3.s4.w4, spec
     /// §1). Thirty seconds by default.
     pub paper_reply_timeout_ms: u64,
+    /// The launchd start bound (r4.s2.w1, G5) — `Some` when `--start-limit` was
+    /// passed. systemd enforces its own limit (the unit passes no such flag);
+    /// launchd has none, so there the server counts, and a refused start exits 0
+    /// before the credential and the bind.
+    pub start_limit: Option<StartLimit>,
+    /// The role this server runs as (r4.s2.w3, C5) — `Some` only when `--role`
+    /// was passed. The composition root has already applied the data dir's
+    /// marker before the database was opened; this is the value the handshake
+    /// reports (and what the app's QA badge reads).
+    pub role: Option<super::role::ServerRole>,
+    /// The database's instance lock (#250, r4.s2.w2), ALREADY TAKEN by the
+    /// composition root on the resolved db path before `open_db` (PR-354 fix
+    /// C3a — taken here it came after the migrate-then-open, so an import could
+    /// swap the file in between and the server kept the unlinked inode). The
+    /// server holds this guard for its whole lifetime.
+    pub(crate) instance_lock: InstanceLock,
 }
 
 /// The default polling grace: five seconds past each bar's close.
@@ -268,6 +307,44 @@ fn credential_source_label(source: CredentialSource) -> &'static str {
     }
 }
 
+/// Apply the launchd start bound (r4.s2.w1, G5): record this start, and, when
+/// it is refused, write the named line through the same sink every startup line
+/// uses. Returns whether the server may proceed to serve.
+///
+/// An IO failure fails OPEN — one named line, then serve — because refusing to
+/// serve would not stop the relaunch loop either (a non-zero exit relaunches
+/// under `KeepAlive { SuccessfulExit = false }`) and would take a healthy
+/// server down for a counter file. See [`start_limit`]'s module docs.
+fn start_guard(data_dir: &std::path::Path, limit: StartLimit, sink: &Arc<dyn RequestLog>) -> bool {
+    match start_limit::record_start(data_dir, limit, start_limit::now_unix_secs()) {
+        Ok(StartGuard::Proceed) => true,
+        Ok(StartGuard::Limited {
+            count,
+            marker_written,
+        }) => {
+            let marker = if marker_written {
+                format!(
+                    "; marker at {}",
+                    data_dir.join(start_limit::START_MARKER_NAME).display()
+                )
+            } else {
+                "; the marker could not be written".to_owned()
+            };
+            sink.write(format!(
+                "pulse serve: start limit reached - {count} starts in {}s (limit {}){marker}; exiting 0 so launchd stops relaunching",
+                limit.window_secs, limit.starts
+            ));
+            false
+        }
+        Err(error) => {
+            sink.write(format!(
+                "pulse serve: start-limit: cannot record this start ({error}); continuing without the bound"
+            ));
+            true
+        }
+    }
+}
+
 /// Run the server until SIGTERM/SIGINT. See the module docs for the ordered
 /// startup steps and the w3 seam.
 ///
@@ -276,13 +353,38 @@ fn credential_source_label(source: CredentialSource) -> &'static str {
 /// [`ServeError`] on any refused bind, exhausted retry budget, bind failure or
 /// serve-loop failure.
 pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
+    // ---- Step 0 (#250, r4.s2.w2): the database's instance lock, held for this
+    // process's lifetime. The composition root took it on the resolved db path
+    // BEFORE `open_db` (PR-354 fix C3a: taken here it came after the
+    // migrate-then-open, so an import/restore could swap the file in between
+    // and the server kept the unlinked inode); this arm holds the guard it
+    // passed.
+    let _instance_lock = config.instance_lock;
+
     // r3.s4.w4: the control channel is created BEFORE the state, so the
     // routes' handle and the runtime's receiver come from one pair.
     let (paper_control, paper_commands) =
         crate::application::paper_control::PaperControl::channel(config.paper_reply_timeout_ms);
-    let state =
-        Arc::new(ServerState::new(config.db, config.data_dir).with_paper_control(paper_control));
+    // The state takes the data dir by value; the start guard below reads it too
+    // (one PathBuf clone at startup, before anything serves).
+    let state = Arc::new(
+        ServerState::new(config.db, config.data_dir.clone())
+            .with_paper_control(paper_control)
+            .with_role(config.role),
+    );
     let sink = state.log().clone();
+
+    // ---- Step 2b: the start guard (r4.s2.w1, G5) ---------------------------
+    // launchd has no start limit of its own, so the bound rides here — before
+    // the credential and the bind, so a refused start touches nothing else, and
+    // through the sink, so the named line lands where every startup line does.
+    // `Ok(())` is exit 0: with `KeepAlive { SuccessfulExit = false }` that is
+    // exactly what stops launchd relaunching.
+    if let Some(limit) = config.start_limit
+        && !start_guard(&config.data_dir, limit, &sink)
+    {
+        return Ok(());
+    }
 
     // ---- Step 3: CREDENTIAL RESOLUTION — THE w3 SEAM (r3.s3.w3) ------------
     // The server credential profile (R3): this process resolves the LLM

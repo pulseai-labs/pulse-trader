@@ -440,11 +440,12 @@ pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_back
 // r3.s3.w4 (D7/D12): the copy/verify helpers the import/backup/restore verbs
 // compose (the raw-SQL tier beside the repositories). Re-exported ALL for the
 // same deny(warnings)/dead_code reason as the block above; `cli::import` and
-// `cli::backup` are the composition roots.
+// `cli::backup` are the composition roots. r4.s2.w2 appends the paper tables'
+// content digests to the same set.
 pub use adapters::db::ops::{
-    SnapshotRef, all_run_ids, all_version_ids, open_read_only, referenced_snapshots,
-    stored_run_hashes, stored_version_hashes, table_count, table_names, target_row_counts,
-    vacuum_into_copy,
+    PAPER_TABLES, PaperTableDigest, SnapshotRef, all_run_ids, all_version_ids, open_read_only,
+    paper_table_digest, paper_table_keys, referenced_snapshots, stored_run_hashes,
+    stored_version_hashes, table_count, table_names, target_row_counts, vacuum_into_copy,
 };
 
 // r3.s3.w1 (ADR-0026): the server surface. `router` + `mount_scoped` build the
@@ -461,7 +462,11 @@ pub use server::bind::{
     BindRefused, RetryPolicy, RetrySleep, ServeConfig, ServeError, TokioSleep, WakeTrigger,
     bind_with_retry, check_bind, run_paper_runtime,
 };
+// r4.s2.w1 (G5): the launchd start bound the `pulse serve` startup applies, and
+// the integration test's direct handle on it (an injected clock plus a
+// temporary data dir, no server, no launchd).
 pub use server::log::{CaptureLog, RequestLog};
+pub use server::start_limit::{StartGuard, StartLimit, record_start};
 pub use server::{API_VERSION, ServerState, mount_scoped, router};
 // r3.s3.w2: the operation registry's public seam. `SweepConfig` is the
 // injectable retention the spec requires ("tests use milliseconds");
@@ -471,6 +476,20 @@ pub use server::{API_VERSION, ServerState, mount_scoped, router};
 // body). Re-exported because `tests/server_stream.rs` drives both through the
 // lib boundary.
 pub use server::ops::{ComposeRunCtx, ComposeRunner, SweepConfig};
+
+// r4.s2.w4 (Q2/C3/C4): the off-box watcher's one-cycle surface. `run_once` is
+// the pure-over-seams cycle, `WatchSeams` carries one dependency per thing the
+// process cannot do in a test, and `HttpProbe`/`NtfyNotifier` are the real
+// probe and push the live check drives. `tests/healthz_watch.rs` drives every
+// branch through this surface (a scripted probe/host/marker/clock/log, plus a
+// local fake ntfy listener for the real notifier). REQUIRED under
+// `deny(warnings)` — the items are `pub` in a private module and unused
+// in-crate otherwise.
+pub use cli::watch::{
+    ALERT_AFTER_FAILURES, ClockSeam, HostSeam, HttpProbe, LogSeam, MarkerReport, MarkerSeam,
+    NotifySeam, NtfyNotifier, ProbeReport, ProbeSeam, STILL_DOWN_REMINDER_SECS, SshMarker,
+    WatchConfig, WatchErrorKind, WatchFuture, WatchSeams, run_once,
+};
 
 // VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,
 // BACKLOG-4). The trade-record entities (`Trade`/`Fill`/`ExitReason`/

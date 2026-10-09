@@ -7,6 +7,12 @@
 //! Every response (refusals and 404s included) carries
 //! `X-Pulse-Api-Version: 1`, stamped by the outermost middleware.
 //!
+//! **`/healthz`** (r4.s2.w4, Q1; ADR-0029) is the ONE route outside the auth
+//! middleware — the deploy gate (`scripts/wait-healthy.sh`) and the off-box
+//! watcher read it without a token. It is mounted on the base router, so it
+//! keeps the router-level request-log and API-version layers and nothing else:
+//! no auth pass, no token, no `token_audit` row, no table touched.
+//!
 //! **Module layout:** `auth` carries the scope vocabulary, token minting and
 //! the auth middleware; `log` carries the request-log layer and the injectable
 //! sink; `routes` mounts the command surface through `mount_scoped`; `ops`
@@ -19,7 +25,11 @@ pub mod bind;
 pub mod log;
 pub mod ops;
 pub mod paper;
+// r4.s2.w3 (C5/ADR-0029): the data-dir role marker — `pulse serve --role`.
+pub mod role;
 pub mod routes;
+// r4.s2.w1 (G5): the launchd start bound — `pulse serve --start-limit`.
+pub mod start_limit;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +37,6 @@ use std::sync::Arc;
 use axum::Extension;
 use axum::Json;
 use axum::extract::Request;
-use axum::response::IntoResponse;
 use axum::routing::{MethodRouter, get};
 use serde::Serialize;
 
@@ -69,6 +78,12 @@ pub struct ServerState {
     /// runtime is installed (tests, or a failed startup), and the control
     /// routes answer 503 `runtime_unavailable`.
     pub(crate) paper_control: Option<crate::application::paper_control::PaperControl>,
+    /// The role this server was started with (r4.s2.w3, C5): `Some` only when
+    /// `pulse serve --role` was passed, in which case the data dir's marker has
+    /// been checked (and written when it was absent). The handshake reports it
+    /// additively; `None` is every server older than the flag, and no `role`
+    /// key appears in its handshake.
+    pub(crate) role: Option<role::ServerRole>,
 }
 
 impl ServerState {
@@ -94,7 +109,18 @@ impl ServerState {
             ops: ops::OpRegistry::new(ops::SweepConfig::default()),
             compose_runner: ops::default_compose_runner(),
             paper_control: None,
+            role: None,
         }
+    }
+
+    /// The r4.s2.w3 seam: the role the data dir is marked with, read from
+    /// `--role` / `<data dir>/server-role` at startup. The handshake reports it
+    /// (ADDITIVE, omitted when the server runs without `--role`), which is what
+    /// the app's QA badge reads.
+    #[must_use]
+    pub fn with_role(mut self, role: Option<role::ServerRole>) -> Self {
+        self.role = role;
+        self
     }
 
     /// The w4 seam: install the paper runtime's control handle, so the paper
@@ -163,20 +189,83 @@ struct HandshakeBody {
     /// persist cannot exercise a single route.
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<&'static str>,
+    /// The role this server runs as: `prod` or `qa`, read from the data dir's
+    /// marker at startup.
+    ///
+    /// ADDITIVE (r4.s2.w3, C5): a server started without `--role` omits the
+    /// field entirely (the `skip_serializing_if` above — the `scope` pattern),
+    /// and an older server omits it too, so a client that does not know the
+    /// field behaves exactly as it did before it existed. It is here because
+    /// QA's database is a copy of prod's: without the role in the handshake, a
+    /// stale URL would let QA's server pass for prod with nobody noticing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'static str>,
 }
 
 /// `GET /api/v1/handshake` — accepted for either scope (the auth middleware is
 /// mounted with [`RequiredScope::Any`]), so any live token can ask what is
 /// running before sending real work. The answer carries the caller's own scope
-/// in `scope`, which is what lets a client refuse to save a token that cannot do
-/// its work.
-async fn handshake(scope: Option<Extension<auth::AuthenticatedScope>>) -> impl IntoResponse {
-    Json(HandshakeBody {
+/// in `scope` — which is what lets a client refuse to save a token that cannot
+/// do its work — and the server's `role` when it was started with one.
+fn handshake_body(scope: Option<&'static str>, role: Option<role::ServerRole>) -> HandshakeBody {
+    HandshakeBody {
         api_version: API_VERSION,
         binary_version: env!("CARGO_PKG_VERSION").to_owned(),
         engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
         target_triple: EngineFingerprint::target().to_owned(),
-        scope: scope.map(|Extension(scope)| scope.0.as_str()),
+        scope,
+        role: role.map(role::ServerRole::as_str),
+    }
+}
+
+/// The handshake route: `get(handler)` where the handler reads the state's role
+/// from a captured copy — the router `router()` hands out stays `Router<()>`
+/// (the house pattern: state rides captured closures and extensions, never a
+/// `State` extractor), so the role is copied out before the middleware takes
+/// its own handle.
+fn handshake_route(state: &Arc<ServerState>, middleware_state: Arc<ServerState>) -> MethodRouter {
+    let handshake_role = state.role;
+    get(
+        move |scope: Option<Extension<auth::AuthenticatedScope>>| async move {
+            Json(handshake_body(
+                scope.map(|Extension(scope)| scope.0.as_str()),
+                handshake_role,
+            ))
+        },
+    )
+    .layer(axum::middleware::from_fn(
+        move |req: Request, next: axum::middleware::Next| {
+            let state = middleware_state.clone();
+            async move { auth::require_scope(req, next, state, RequiredScope::Any).await }
+        },
+    ))
+}
+
+/// The `/healthz` body (Q1): exactly two keys. `degraded` means the paper
+/// runtime is not running — the response is 200 either way, because the route
+/// answers "is the server there and what is its state", and the deploy gate
+/// waits for `ok` specifically.
+#[derive(Serialize)]
+struct HealthzBody {
+    /// `ok` or `degraded`.
+    status: &'static str,
+    /// The API version this server speaks.
+    api_version: u32,
+}
+
+/// `GET /healthz` (Q1, r4.s2.w4; ADR-0029) — the ONE route outside the auth
+/// middleware. Its body is only `{"status":"ok"|"degraded","api_version":N}`:
+/// no token, no version string, no path, no session data. It writes no
+/// `token_audit` row and touches no table, and it is reachable only on the
+/// server's existing bind.
+fn healthz_body(state: &Arc<ServerState>) -> Json<HealthzBody> {
+    let status = match &state.paper_control {
+        Some(control) if control.is_available() => "ok",
+        _ => "degraded",
+    };
+    Json(HealthzBody {
+        status,
+        api_version: API_VERSION,
     })
 }
 
@@ -195,14 +284,19 @@ pub fn router(state: Arc<ServerState>) -> axum::Router {
     // Each middleware owns its `Arc` (cloned per request inside the closure) —
     // a `move` closure must capture an owned handle, never a borrow.
     let handshake_state = state.clone();
-    let handshake = get(handshake).layer(axum::middleware::from_fn(
-        move |req: Request, next: axum::middleware::Next| {
-            let state = handshake_state.clone();
-            async move { auth::require_scope(req, next, state, RequiredScope::Any).await }
-        },
-    ));
+    let handshake = handshake_route(&state, handshake_state);
+    // r4.s2.w4 (Q1): `/healthz` — the ONE route with no auth middleware. It is
+    // mounted on the base router BEFORE the router-level `.layer` pair below, so
+    // the request-log and API-version layers wrap it (and nothing else does).
+    let healthz_state = state.clone();
+    let healthz = get(move || {
+        let state = healthz_state.clone();
+        async move { healthz_body(&state) }
+    });
     let base = routes::mount_all(
-        axum::Router::new().route("/api/v1/handshake", handshake),
+        axum::Router::new()
+            .route("/healthz", healthz)
+            .route("/api/v1/handshake", handshake),
         &state,
     );
     // r3.s3.w5 (AC-2): MCP over HTTP — the same `PulseMcp` the stdio transport

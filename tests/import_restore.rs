@@ -513,6 +513,65 @@ async fn clean_import_verifies_counts_hashes_reads_and_readonly_source() {
 }
 
 // ---------------------------------------------------------------------------
+// (i-b) a source older than the paper tables (PR-354 fix C5)
+// ---------------------------------------------------------------------------
+
+/// PR-354 fix C5: a source older than migration `0018` has no paper table at
+/// all. Its side counts as EMPTY — the migrated copy's paper tables must hold
+/// zero rows — and the import must succeed, printing `rows=0` for the three
+/// tables, instead of failing the digest on a table the source never had (and
+/// instead of digesting the copy's own, newer schema).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_older_than_the_paper_tables_imports_cleanly() {
+    let s = seed_mac_source(false).await;
+    // The pre-0018 shape: every table migration 0018 creates is gone and its
+    // migration row with them, so the copy's own migrate creates them fresh.
+    // paper_bar goes first — its trigger's body names paper_event.
+    let db = Db::with_path(&s.from_db).await.unwrap();
+    for table in [
+        "paper_bar",
+        "paper_event",
+        "paper_session",
+        "fixture_snapshot",
+    ] {
+        sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 18")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.pool().close().await;
+
+    let target_db = s.dir.path().join("older-source").join("pulse.db");
+    let target_data = s.dir.path().join("older-source-data");
+    let out = import_once(&s, &target_db, &target_data);
+    let text = combined(&out);
+    assert!(
+        out.status.success(),
+        "a source without the paper tables imports cleanly: {text}"
+    );
+    for table in ["paper_session", "paper_event", "paper_bar"] {
+        assert!(
+            text.contains(&format!("{table} rows=0")),
+            "the summary names {table} as empty: {text}"
+        );
+    }
+    // The copy has the tables (its own migrations made them) and holds none.
+    let tgt = Db::with_path(&target_db).await.unwrap();
+    for table in ["paper_session", "paper_event", "paper_bar"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(tgt.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table} is empty in the copy");
+    }
+    drop(tgt);
+}
+
+// ---------------------------------------------------------------------------
 // (ii) flipped snapshot byte
 // ---------------------------------------------------------------------------
 
@@ -1992,4 +2051,70 @@ fn restore_help_states_the_server_stopped_precondition() {
         help.contains("must be stopped"),
         "the --help text states the server-stopped precondition: {help}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// a backup under the default umask is private (PR-354 fix D5)
+// ---------------------------------------------------------------------------
+
+/// PR-354 fix D5: the nightly backup used to land 0755/0644 (the login's umask).
+/// The writer now creates its out-dir 0700 and its database, manifest and candle
+/// files 0600 itself, and the plist's `Umask 63` covers everything else — so a
+/// `pulse backup` run under umask 022 leaves nothing group- or world-readable.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_under_umask_022_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let s = seed_mac_source(false).await;
+    let out_dir = s.dir.path().join("backups");
+    // SAFETY: nextest runs one test per process, so the process umask is this
+    // test's alone, and the spawned `pulse backup` inherits it.
+    let previous = unsafe { libc::umask(0o022) };
+
+    let out = run_pulse(
+        &s.home,
+        &[
+            "backup",
+            "--db",
+            s.from_db.to_str().unwrap(),
+            "--data-dir",
+            s.from_data.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "backup: {}", combined(&out));
+
+    let mode = |path: &Path| {
+        fs::metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(&out_dir), 0o700, "the out-dir is private");
+    let backup = backup_db_files(&out_dir)
+        .into_iter()
+        .next()
+        .expect("the backup database");
+    assert_eq!(mode(&backup), 0o600, "the database is private");
+    assert_eq!(
+        mode(&manifest_path_for(&backup)),
+        0o600,
+        "its manifest is private"
+    );
+    let candle = out_dir
+        .join("candles")
+        .join("BTCUSDT")
+        .join("15m")
+        .join(format!("{}.parquet", s.stems.0));
+    assert!(
+        candle.is_file(),
+        "the snapshot landed: {}",
+        candle.display()
+    );
+    assert_eq!(mode(&candle), 0o600, "the snapshot copy is private");
+
+    unsafe { libc::umask(previous) };
 }

@@ -114,6 +114,12 @@ pub use certification_freeze_repo::SqliteCertificationFreezeRepo;
 pub mod certification_repo;
 pub use certification_repo::SqliteCertificationRepo;
 
+// r4.s2.w2 (#250): the per-database instance lock — `pulse serve` holds it for
+// its process lifetime; the data-ops verbs take none in this PR (the
+// import/restore enforcement was split out to issue #355). Not re-exported (the
+// cli verbs and `server::bind` are its only callers).
+pub(crate) mod instance_lock;
+
 // r3.s3.w4 (D7/D12, ADR-0026): the small copy/verify helper set the data-ops
 // verbs compose — the read-only source open, the VACUUM INTO copy, count/hash/
 // id reads and the referenced-snapshot projection. Raw `query`/`query_scalar`
@@ -175,6 +181,29 @@ const BUSY_TIMEOUT_SECS: u64 = 5;
 /// touch here.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Create `path` as a PRIVATE directory tree (0700 on unix) when it does not
+/// exist yet. An existing directory is left exactly as it is — never chmodded.
+///
+/// The data dir, the database's parent and the backup out-dir hold the database
+/// and the tokens, so a directory this code creates must not inherit the
+/// process umask (0755 under the default 022, which defeats the 0700 isolation
+/// G10 asks for — PR-354 fix D1b). `DirBuilder::recursive(true)` applies the
+/// mode to every level it creates.
+///
+/// # Errors
+///
+/// The underlying IO error when a level cannot be created.
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 /// A thin newtype over a `sqlx::SqlitePool` for the `PulseTrader` `SQLite` tier.
 ///
 /// Every pooled connection inherits WAL + `foreign_keys = ON` + a 5s busy-timeout
@@ -232,7 +261,7 @@ impl Db {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            create_private_dir(parent).map_err(|e| {
                 DataError::Io(format!(
                     "could not create the database directory {}: {e}",
                     parent.display()

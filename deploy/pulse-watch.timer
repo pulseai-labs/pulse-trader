@@ -1,0 +1,12 @@
+# The prod watcher's schedule (r4.s2.w4, Q2): one probe a minute, the first 60
+# seconds after boot. `pulse watch` de-duplicates its own pushes, so a missed
+# or repeated activation is harmless. Enabling it is the cutover's (step 6).
+[Unit]
+Description=Probe prod every 60 seconds (pulse watch)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+
+[Install]
+WantedBy=timers.target

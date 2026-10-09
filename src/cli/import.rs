@@ -1,15 +1,17 @@
 //! `pulse import` — D7's verified one-way move of a Mac `pulse.db` + its
 //! candle snapshots onto this host (r3.s3.w4, ADR-0026).
 //!
-//! The order (spec §Interface contract): refuse a non-empty target (with
-//! `--replace`, back it up first through the same backup `pulse backup`
-//! makes); copy the source consistently with `VACUUM INTO` from a read-only
-//! open into a temporary file BESIDE the target (never `/tmp`); migrate the
-//! copy forward (`open_migrated`); copy the snapshots (an existing same-named
-//! file must be byte-identical); verify everything — row counts, stored
-//! hashes, repository reads, snapshot reads, referenced snapshots — without
-//! stopping at the first failure within a check; then atomically rename the
-//! temporary database into place, `chmod a-w` the source path, and print the
+//! The order (spec §Interface contract): refuse a source that resolves to the
+//! target (#264, symlinks resolved) BEFORE anything else; refuse a non-empty
+//! target (with `--replace`, back it
+//! up first through the same backup `pulse backup` makes); copy the source
+//! consistently with `VACUUM INTO` from a read-only open into a temporary file
+//! BESIDE the target (never `/tmp`); migrate the copy forward
+//! (`open_migrated`); copy the snapshots (an existing same-named file must be
+//! byte-identical); verify everything — row counts, stored hashes, the three
+//! paper digests, repository reads, snapshot reads, referenced snapshots —
+//! without stopping at the first failure within a check; then atomically rename
+//! the temporary database into place, `chmod a-w` the source path, and print the
 //! summary. On any failure every temporary is deleted, every snapshot this
 //! run added is removed, the target is untouched, and every mismatch is named
 //! (up to 20, then "…and N more").
@@ -18,12 +20,12 @@
 //! backup as the source: same verification, same atomic install, no chmod.
 //!
 //! **Its precondition: the server must be stopped.** The install deletes the
-//! target's `-wal`/`-shm` and renames over `pulse.db`, so a running `pulse
-//! serve` would keep serving the unlinked old inode, the deleted WAL content is
-//! gone, and every write it commits after the swap is silently lost. Import
-//! does not check the process — the same posture restore documents: the CLI's
-//! `--help` states the precondition, and the operator's cutover order is D7's —
-//! quit the old Mac app, then import.
+//! target's `-wal`/`-shm` and renames over `pulse.db`, so a running
+//! `pulse serve` would keep serving the unlinked old inode, the deleted WAL
+//! content is gone, and every write it commits after the swap is silently lost.
+//! The instance-lock enforcement this PR carried (r4.s2.w2's #250) was split out
+//! to issue #355; D7's cutover order stands: quit the old
+//! Mac app, stop the unit, then import.
 
 use std::collections::HashMap;
 use std::fs;
@@ -40,6 +42,7 @@ use super::publish;
 #[cfg(test)]
 use super::publish::probe;
 use crate::adapters::db::default_db_path;
+use crate::adapters::db::instance_lock::canonical_identity;
 use crate::adapters::db::ops;
 pub(crate) use crate::adapters::db::{
     DB_STATE_SUFFIXES, TargetIdentity, inode_of, quarantine_name, refuse_orphaned_quarantines,
@@ -63,11 +66,12 @@ const MAX_NAMED_MISMATCHES: usize = 20;
 /// `pulse import --from-db <mac.db> --from-data-dir <dir holding its
 /// candles/> [--db <target>] [--data-dir <target>] [--replace]`.
 ///
-/// **Precondition: the server must be stopped.** Import does not check the
-/// process; the install renames over `pulse.db` and deletes its stale
-/// `-wal`/`-shm`, so a running `pulse serve` would keep serving the unlinked
-/// old file and lose every write it commits afterwards. D7's cutover order:
-/// quit the old Mac app, then import on the server host with the unit stopped.
+/// **Precondition: the server must be stopped.** A running `pulse serve` would
+/// keep serving the unlinked old inode after the install's rename, so stop it
+/// first (the instance-lock enforcement this PR carried was split out to issue
+/// #355). A source that resolves to the target is refused (#264), before
+/// anything is touched. D7's cutover order stands: quit the old Mac app, stop
+/// the unit, then import.
 #[derive(Debug, Args)]
 pub struct ImportArgs {
     /// The Mac `pulse.db` copy to import. Read-only throughout; set a-w on
@@ -167,7 +171,12 @@ pub(crate) struct Mismatch {
 }
 
 impl Mismatch {
-    fn new(table: &str, id: impl Into<String>, field: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        table: &str,
+        id: impl Into<String>,
+        field: &str,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             table: table.to_owned(),
             id: id.into(),
@@ -183,6 +192,9 @@ struct Summary {
     versions_verified: usize,
     runs_verified: usize,
     snapshots_verified: usize,
+    /// The three paper tables' content digests (r4.s2.w2), in
+    /// [`ops::PAPER_TABLES`] order — the summary prints them.
+    paper_digests: Vec<ops::PaperTableDigest>,
 }
 
 /// The files this run added to the target data dir — removed on any failure
@@ -287,15 +299,149 @@ fn override_backup_out_dir(dir: &Path) {
     BACKUP_OUT_DIR_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(dir.to_path_buf()));
 }
 
+/// A source mutation the engine awaits right after its copy step: the
+/// concurrent writer the paper digest check exists to catch.
+#[cfg(test)]
+pub(crate) type SourceMutation =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send>;
+
+// Where a test hands the next verified copy the source mutation to await
+// (r4.s2.w2), in the same spirit as `publish::probe`: a writer that lands
+// between the copy's read snapshot and the verification reads cannot be
+// scheduled from outside the engine, and the digest refusal is worth proving
+// deterministically.
+#[cfg(test)]
+thread_local! {
+    static SOURCE_MUTATION: std::cell::RefCell<Option<SourceMutation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arrange the mutation the next verified copy on this thread awaits after its
+/// copy step.
+#[cfg(test)]
+fn set_source_mutation(mutation: SourceMutation) {
+    SOURCE_MUTATION.with(|cell| *cell.borrow_mut() = Some(mutation));
+}
+
+/// Take the pending mutation, if one is arranged.
+#[cfg(test)]
+fn take_source_mutation() -> Option<SourceMutation> {
+    SOURCE_MUTATION.with(|cell| cell.borrow_mut().take())
+}
+
+// ---------------------------------------------------------------------------
+// #264: a source that resolves to the target
+// ---------------------------------------------------------------------------
+
+/// Refuse (#264, r4.s2.w2) a source database — or data dir — that resolves to
+/// the target: the import would write over the very thing it is moving.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] naming the source, the target and the mistake.
+fn refuse_source_is_target(label: &str, job: &VerifiedCopy<'_>) -> anyhow::Result<()> {
+    if resolves_to_same(job.from_db, job.db_target)
+        .map_err(|error| anyhow!("{label}: refusing: {error}"))?
+    {
+        anyhow::bail!(
+            "{label}: refusing: the source database {} IS the target database {} — nothing was \
+             touched (#264)",
+            job.from_db.display(),
+            job.db_target.display()
+        );
+    }
+    if resolves_to_same(job.from_data_dir, job.data_target)
+        .map_err(|error| anyhow!("{label}: refusing: {error}"))?
+    {
+        anyhow::bail!(
+            "{label}: refusing: the source data dir {} IS the target data dir {} — nothing was \
+             touched (#264)",
+            job.from_data_dir.display(),
+            job.data_target.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether `other` names the same filesystem object as `existing`.
+///
+/// A SYMLINK resolves to its target: when both paths exist their filesystem
+/// identities are compared — DEVICE and inode (PR-354 fix C8: an inode number
+/// alone is unique only within one filesystem, so a source and a target on
+/// different filesystems with colliding numbers were refused as the same file)
+/// — which catches a symlink, a hard link, and a differently-cased spelling on
+/// a case-insensitive filesystem. When either path has no identity to read
+/// (the target may not exist yet), the CANONICAL paths are compared instead:
+/// the deepest existing ancestor is canonicalized and the component below it
+/// appended.
+/// # Errors
+///
+/// A named refusal when either path's unresolved tail holds a `.`/`..`
+/// component (PR-354 fix Z1): such a path is never normalized into an identity
+/// that silently differs from what it names.
+fn resolves_to_same(existing: &Path, other: &Path) -> anyhow::Result<bool> {
+    if let (Some(left), Some(right)) = (device_and_inode(existing), device_and_inode(other)) {
+        return Ok(same_file_identity(left, right));
+    }
+    let left = canonical_identity(existing).map_err(|error| anyhow!("{error}"))?;
+    let right = canonical_identity(other).map_err(|error| anyhow!("{error}"))?;
+    Ok(left == right)
+}
+
+/// `path`'s filesystem identity — the device AND the inode (PR-354 fix C8).
+/// `None` when there is no file at the path (or the platform has no
+/// `MetadataExt`), which sends the caller to the canonical-path fallback.
+#[cfg(unix)]
+fn device_and_inode(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// No device/inode to read on platforms without `MetadataExt` — the same gate
+/// [`inode_of`](crate::adapters::db::inode_of) carries. The caller falls back
+/// to canonical paths.
+#[cfg(not(unix))]
+fn device_and_inode(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Whether two filesystem identities name the same object: the device and the
+/// inode must BOTH match. A pure helper, so the cross-filesystem rule is
+/// testable without two filesystems mounted (PR-354 fix C8).
+#[must_use]
+fn same_file_identity(left: (u64, u64), right: (u64, u64)) -> bool {
+    left == right
+}
+
 /// The shared verified-copy engine (import over the Mac source; restore over
 /// a backup — the same verification, the same atomic install).
+///
+/// It refuses a source that resolves to the target (#264) before any write and
+/// compares the three paper tables by content digest as part of the
+/// verification (r4.s2.w2).
 ///
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] on any refusal, mismatch or failure; the
 /// target is left exactly as it was and every temporary is deleted.
+#[allow(clippy::too_many_lines)] // one linear sequence: the refusals, the copy, the steps, the install
 pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<()> {
     let label = job.source_label;
+
+    // ---- #264 (r4.s2.w2): a source that resolves to the target is the
+    // mistake that writes over the very thing being moved. Refused before
+    // ANYTHING else — before the lock file, before any read of the target — so
+    // the source is never touched, not even by this run's first byte.
+    refuse_source_is_target(label, &job)?;
+
+    // ---- The deepest ancestor that exists BEFORE the target's directory is
+    // created — computed HERE, before the `create_dir_all` below makes the
+    // target's parent, so the parent that receives that entry is covered by the
+    // install's directory sync (PR-354 fix C3c). Every level below it is an
+    // entry this run makes, so the install's directory sync has to cover them
+    // (fix round 1, F6). A bare relative target resolves to the current
+    // directory, which already exists (fix round 5, P4).
+    let created_root = publish::existing_ancestor(&target_dir(job.db_target));
 
     // ---- Round 6, Fix A: a RESTORE takes its pointers from the chosen
     // backup's own manifest, never from the shared store's pointer directory
@@ -341,13 +487,8 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
     }
 
     // ---- Step 2: a consistent copy of the source, beside the target (the
-    // same filesystem, under the target's directory, never /tmp).
-    //
-    // The deepest ancestor that exists BEFORE the target's directory is created:
-    // every level below it is an entry this run makes, so the install's directory
-    // sync has to cover them (fix round 1, F6). A bare relative target resolves
-    // to the current directory, which already exists (fix round 5, P4).
-    let created_root = publish::existing_ancestor(&target_dir(job.db_target));
+    // same filesystem, under the target's directory, never /tmp). The created
+    // root this run's syncs must cover was computed before the lock.
     if let Some(parent) = job.db_target.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -372,6 +513,22 @@ pub(crate) async fn run_verified_copy(job: VerifiedCopy<'_>) -> anyhow::Result<(
         let cleanup = remove_tmp_db(&tmp_db);
         return Err(fold_cleanup(
             anyhow!("flush the copied database: {error}"),
+            cleanup,
+        ));
+    }
+
+    // The `cfg(test)` seam this module's own tests drive (the `publish::probe`
+    // spirit): a writer that lands AFTER the copy — whose read snapshot is
+    // closed here — and before the verification reads. That writer is the paper
+    // digest check's real trigger, and no black-box test can schedule it, so
+    // the test hands the engine the mutation to await.
+    #[cfg(test)]
+    if let Some(mutate) = take_source_mutation()
+        && let Err(error) = mutate().await
+    {
+        let cleanup = remove_tmp_db(&tmp_db);
+        return Err(fold_cleanup(
+            anyhow!("the injected source mutation failed: {error}"),
             cleanup,
         ));
     }
@@ -506,6 +663,9 @@ async fn run_steps(
     step_stored_hashes(&source, copy_pool, &mut mismatches)
         .await
         .map_err(|e| fatal(e, &writes))?;
+    let paper_digests = step_paper_digests(&source, copy_pool, &mut mismatches)
+        .await
+        .map_err(|e| fatal(e, &writes))?;
     let (versions_verified, runs_verified) = step_repository_reads(copy_pool, &mut mismatches)
         .await
         .map_err(|e| fatal(e, &writes))?;
@@ -540,6 +700,7 @@ async fn run_steps(
             versions_verified,
             runs_verified,
             snapshots_verified,
+            paper_digests,
         },
         writes,
     ))
@@ -652,10 +813,44 @@ fn push_hash_mismatches(
     }
 }
 
+/// Step 5b′ (r4.s2.w2): the three paper tables compared by CONTENT DIGEST, not
+/// only by row count — every row's columns, in primary-key order, hashed on
+/// both sides. A difference refuses the import, naming the table and the first
+/// differing key; on success the digests ride the summary and are printed.
+///
+/// The check is the "the paper state moved exactly" half of the move made safe
+/// (spec §Approach 3): a changed column, a missing row or a reordered schema is
+/// invisible to a count and visible here.
+async fn step_paper_digests(
+    source: &sqlx::SqlitePool,
+    copy_pool: &sqlx::SqlitePool,
+    mismatches: &mut Vec<Mismatch>,
+) -> Result<Vec<ops::PaperTableDigest>, anyhow::Error> {
+    let mut digests = Vec::with_capacity(ops::PAPER_TABLES.len());
+    for (table, _) in ops::PAPER_TABLES {
+        let digest = ops::paper_table_digest(source, copy_pool, table)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        if let Some(key) = &digest.first_difference {
+            mismatches.push(Mismatch::new(
+                table,
+                key.clone(),
+                "digest",
+                format!(
+                    "the paper digest differs from the source ({} row(s); source {} vs copy {})",
+                    digest.rows, digest.source_digest, digest.target_digest
+                ),
+            ));
+        }
+        digests.push(digest);
+    }
+    Ok(digests)
+}
+
 /// Step 5c: every version and every run reads back through its repository on
 /// the COPY — the tamper defenses (`version_hash` re-derived on read; #39's
 /// `result_content_hash` re-derived from the trades).
-async fn step_repository_reads(
+pub(crate) async fn step_repository_reads(
     copy_pool: &sqlx::SqlitePool,
     mismatches: &mut Vec<Mismatch>,
 ) -> Result<(usize, usize), anyhow::Error> {
@@ -708,7 +903,7 @@ async fn step_repository_reads(
 
 /// Step 5d: every copied snapshot reads back through `CandleStore` in the
 /// TARGET (embedded provenance plus the re-derived `data_version`).
-fn step_snapshot_reads(
+pub(crate) fn step_snapshot_reads(
     target_store: &CandleStore,
     source_snapshots: &[SourceSnapshot],
     mismatches: &mut Vec<Mismatch>,
@@ -731,7 +926,7 @@ fn step_snapshot_reads(
 
 /// Step 5e: every `data_version` a run references (primary and HTF) exists as
 /// a verified snapshot in the target.
-async fn step_referenced_snapshots(
+pub(crate) async fn step_referenced_snapshots(
     target_store: &CandleStore,
     copy_pool: &sqlx::SqlitePool,
     mismatches: &mut Vec<Mismatch>,
@@ -983,6 +1178,12 @@ fn write_file_atomic(path: &Path, bytes: &[u8], created: Option<&Path>) -> anyho
     let temporary = temporary_sibling(path)?;
     let _ = fs::remove_file(&temporary);
     fs::write(&temporary, bytes).map_err(|e| anyhow!("write {}: {e}", temporary.display()))?;
+    // 0600, never the umask's 0644 (PR-354 fix D5): this writes a backup's HEAD
+    // manifest and the shared store's pointers.
+    if let Err(error) = publish::set_private_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(anyhow!("make {} private: {error}", temporary.display()));
+    }
     let flushed = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1490,6 +1691,15 @@ pub(crate) fn copy_snapshot_into(source: &Path, dest: &Path) -> anyhow::Result<(
             temporary.display()
         )
     })?;
+    // 0600, never the source's mode (`fs::copy` carries it) or the umask
+    // (PR-354 fix D5): a snapshot the backup/import wrote is data.
+    if let Err(error) = publish::set_private_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(anyhow!(
+            "make the snapshot copy {} private: {error}",
+            temporary.display()
+        ));
+    }
     // The bytes must be ON DISK before the name that promises them exists: the
     // rename publishes them, and a crash must not leave a durable name over
     // bytes that never landed. (Opened read+write so the flush is legal on every
@@ -2264,7 +2474,7 @@ fn set_read_only(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Print every mismatch, up to [`MAX_NAMED_MISMATCHES`], then "…and N more".
-fn print_refusal(label: &str, mismatches: &[Mismatch]) {
+pub(crate) fn print_refusal(label: &str, mismatches: &[Mismatch]) {
     eprintln!(
         "{label}: REFUSED — {} verification mismatch(es):",
         mismatches.len()
@@ -2294,6 +2504,18 @@ fn print_summary(label: &str, job: &VerifiedCopy<'_>, summary: &Summary) {
     println!("  tables: {tables}");
     println!("  versions verified: {}", summary.versions_verified);
     println!("  runs verified: {}", summary.runs_verified);
+    let paper = summary
+        .paper_digests
+        .iter()
+        .map(|digest| {
+            format!(
+                "{} rows={} sha256={}",
+                digest.table, digest.rows, digest.source_digest
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  paper digests: {paper}");
     println!("  snapshots verified: {}", summary.snapshots_verified);
     println!("  target db: {}", job.db_target.display());
     println!("  target data dir: {}", job.data_target.display());
@@ -2307,16 +2529,41 @@ fn print_summary(label: &str, job: &VerifiedCopy<'_>, summary: &Summary) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        COPY_SIDECAR_SUFFIXES, HeadSource, InstallFailure, InstallRefusal, VerifiedCopy,
-        copy_snapshot_into, copy_snapshots, install_tmp_db, publish,
-        remove_added_snapshots_keeping, remove_tmp_db, run_verified_copy, scan_heads,
-        scan_snapshots, sidecar_path, write_head_manifest,
+        COPY_SIDECAR_SUFFIXES, HeadSource, InstallFailure, InstallRefusal, StepFailure,
+        VerifiedCopy, copy_snapshot_into, copy_snapshots, install_tmp_db, publish,
+        remove_added_snapshots_keeping, remove_tmp_db, resolves_to_same, run_steps,
+        run_verified_copy, same_file_identity, scan_heads, scan_snapshots, set_source_mutation,
+        sidecar_path, write_head_manifest,
     };
-    use crate::adapters::db::{open_migrated, open_migrated_copy};
+    use crate::adapters::db::{Db, open_migrated, open_migrated_copy};
     use crate::adapters::store::CandleStore;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// The same minimal, valid, compilable DSL the import/restore integration
+    /// suite seeds with — a REAL repository-written `version_hash` comes out of
+    /// it, which the import's repository-read check re-derives.
+    const MINIMAL_DSL: &str = r#"{
+  "schema_version": "1.0.0",
+  "name": "RSI Oversold (move safety)",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Indicator", "spec": { "indicator": "Rsi", "period": 14 } },
+    "op": "Lt",
+    "rhs": { "type": "Constant", "value": "30" }
+  },
+  "filters": [],
+  "exits": [
+    { "type": "StopLoss", "distance_pct": "0.05" },
+    { "type": "TakeProfit", "target_r": "2.0" }
+  ],
+  "risk": {
+    "risk_per_trade_pct": "0.01",
+    "max_leverage": "3"
+  }
+}"#;
 
     /// Every `*.partial` file beside one destination.
     fn partial_files(dest: &Path) -> Vec<PathBuf> {
@@ -2393,6 +2640,7 @@ mod tests {
             .expect("create the source directory");
         let db = open_migrated(&source_db).await.expect("migrate the source");
         db.pool().close().await;
+        settle_wal(&source_db).await;
         let target_db = dir.path().join("server").join("pulse.db");
         let target_data = dir.path().join("server-data");
         Flow {
@@ -4434,5 +4682,332 @@ mod tests {
             "the sync happens AFTER the rename, never before it: {syncs:?}"
         );
         assert!(manifest.exists(), "the manifest is published");
+    }
+
+    // -----------------------------------------------------------------------
+    // r4.s2.w2 — the move made safe (#264, the paper digests)
+    // -----------------------------------------------------------------------
+
+    /// Fold any write-ahead log into the file before a byte comparison:
+    /// SQLite's checkpoint-on-close is asynchronous relative to the pool's
+    /// `close()`, and the "source untouched" checks must not race it.
+    async fn settle_wal(db_path: &Path) {
+        let db = Db::with_path(db_path)
+            .await
+            .expect("open to settle the WAL");
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(db.pool())
+            .await
+            .expect("checkpoint the WAL");
+        db.pool().close().await;
+    }
+
+    /// Seed the flow's source with one strategy + version (through the REAL
+    /// repository — the import's repository-read check re-derives the version
+    /// hash), one paper session, `events` event rows and `bars` bar rows.
+    async fn seed_paper_rows(flow: &Flow, events: i64, bars: i64) {
+        use crate::adapters::db::SqliteStrategyRepo;
+        use crate::domain::StrategyRepository as _;
+        use crate::domain::strategy::{CreatedBy, NewVersion, StrategyId};
+
+        let db = Db::with_path(&flow.source_db)
+            .await
+            .expect("open the source");
+        let pool = db.pool().clone();
+        let repo = SqliteStrategyRepo::new(pool.clone());
+        let strategy = repo
+            .create_strategy("move safety", None, &[])
+            .await
+            .expect("seed the strategy");
+        let version = repo
+            .create_version(NewVersion {
+                strategy_id: StrategyId::new(strategy.id.as_str().to_owned()),
+                parent_version_id: None,
+                dsl_json: MINIMAL_DSL.to_owned(),
+                created_by: CreatedBy::Human,
+                creating_llm_call_ids: vec![],
+            })
+            .await
+            .expect("seed the version");
+        sqlx::query(
+            "INSERT INTO paper_session \
+             (id, seq, strategy_version_id, created_at, pair, primary_timeframe, htf_timeframe, \
+              uses_d1, starting_equity, taker_fee_bps, slippage_bps, engine_fingerprint, \
+              graduation, walk_forward_run_id, override_reason, override_at, \
+              certified_data_versions, fixture, min_trades, promoted_by) \
+             VALUES ('sess-1', 1, ?1, '2026-01-01T00:00:00.000Z', 'BTCUSDT', '15m', NULL, 0, \
+                     '10000', '4', '1', 'fp', 'override', NULL, 'move safety', \
+                     '2026-01-01T00:00:00.000Z', '[]', 0, 1, 'operator-token')",
+        )
+        .bind(version.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed the paper session");
+        for seq in 1..=events {
+            sqlx::query(
+                "INSERT INTO paper_event (session_id, seq, at, kind, payload) \
+                 VALUES ('sess-1', ?1, '2026-01-01T00:00:00.000Z', 'bar_processed', ?2)",
+            )
+            .bind(seq)
+            .bind(format!("payload-{seq}"))
+            .execute(&pool)
+            .await
+            .expect("seed a paper event");
+        }
+        for seq in 1..=bars {
+            sqlx::query(
+                "INSERT INTO paper_bar \
+                 (session_id, timeframe, seq, open_time, close_time, open, high, low, close, \
+                  volume, funding_rate, lead_in) \
+                 VALUES ('sess-1', '15m', ?1, ?2, ?3, '60000', '60100', '59900', '60050', '100', \
+                         NULL, 0)",
+            )
+            .bind(seq)
+            .bind(1_735_689_600_000_i64 + seq * 900_000)
+            .bind(1_735_689_600_000_i64 + seq * 900_000 + 899_999)
+            .execute(&pool)
+            .await
+            .expect("seed a paper bar");
+        }
+        db.pool().close().await;
+        settle_wal(&flow.source_db).await;
+    }
+
+    /// The append-only triggers the tamper needs out of the way (the source is
+    /// this test's own file).
+    async fn drop_paper_event_triggers(db_path: &Path) {
+        let holder = Db::with_path(db_path).await.expect("open the writer");
+        for trigger in ["paper_event_no_update", "paper_event_no_delete"] {
+            sqlx::query(&format!("DROP TRIGGER {trigger}"))
+                .execute(holder.pool())
+                .await
+                .expect("drop the append-only trigger");
+        }
+        holder.pool().close().await;
+    }
+
+    /// Change exactly one column of one source `paper_event` row.
+    async fn change_one_paper_event(db_path: &Path) {
+        let holder = Db::with_path(db_path).await.expect("open the writer");
+        sqlx::query(
+            "UPDATE paper_event SET payload = 'changed after the copy' \
+             WHERE session_id = 'sess-1' AND seq = 2",
+        )
+        .execute(holder.pool())
+        .await
+        .expect("change one column");
+        holder.pool().close().await;
+    }
+
+    /// #264: a source that IS the target is refused before the run touches
+    /// anything — the same path, a symlink to it, and equal data dirs.
+    #[tokio::test]
+    async fn a_source_that_is_the_target_is_refused_before_anything_is_written() {
+        let flow = flow().await;
+        let before = fs::read(&flow.source_db).expect("read the source");
+
+        let mut job = import_job(&flow);
+        job.db_target = &flow.source_db;
+        let error = run_verified_copy(job)
+            .await
+            .expect_err("a source that IS the target is refused");
+        assert!(error.to_string().contains("IS the target"), "{error}");
+
+        let link = flow.dir.path().join("link.db");
+        std::os::unix::fs::symlink(&flow.source_db, &link).expect("symlink the source");
+        let mut job = import_job(&flow);
+        job.db_target = &link;
+        let error = run_verified_copy(job)
+            .await
+            .expect_err("a symlink to the source is refused too");
+        assert!(error.to_string().contains("IS the target"), "{error}");
+
+        let mut job = import_job(&flow);
+        job.data_target = &flow.source_data;
+        let error = run_verified_copy(job)
+            .await
+            .expect_err("equal data dirs are refused");
+        assert!(
+            error.to_string().contains("IS the target data dir"),
+            "{error}"
+        );
+
+        assert_eq!(
+            fs::read(&flow.source_db).expect("re-read the source"),
+            before,
+            "the source is never touched"
+        );
+        assert!(!flow.target_db.exists(), "and nothing was installed");
+    }
+
+    /// The digest comparison driven exactly as the engine drives it: copy the
+    /// source, change one column AFTER the copy, verify — the mismatch names the
+    /// table and the first differing key.
+    #[tokio::test]
+    async fn a_source_changed_after_the_copy_names_the_table_and_key() {
+        let flow = flow().await;
+        seed_paper_rows(&flow, 2, 0).await;
+        drop_paper_event_triggers(&flow.source_db).await;
+
+        let tmp_db = super::temp_db_path(&flow.target_db, "import");
+        fs::create_dir_all(tmp_db.parent().expect("the target's directory"))
+            .expect("create the target's directory");
+        let source = crate::adapters::db::ops::open_read_only(&flow.source_db)
+            .await
+            .expect("open the source");
+        crate::adapters::db::ops::vacuum_into_copy(&source, &tmp_db)
+            .await
+            .expect("copy the source");
+        source.close().await;
+
+        // "injected after the copy": one changed column in one source row.
+        change_one_paper_event(&flow.source_db).await;
+
+        let opened = open_migrated_copy(&tmp_db).await.expect("the copy opens");
+        let failure = run_steps(&import_job(&flow), &opened, None).await;
+        opened.pool().close().await;
+
+        let Err(StepFailure::Mismatches { mismatches, .. }) = failure else {
+            panic!("the changed source is a verification mismatch");
+        };
+        let named = mismatches
+            .iter()
+            .find(|mismatch| mismatch.table == "paper_event")
+            .expect("the paper_event digest is named");
+        assert_eq!(
+            named.id, "session_id=sess-1 seq=2",
+            "the first differing key"
+        );
+        assert_eq!(named.field, "digest");
+        let _ = fs::remove_file(&tmp_db);
+    }
+
+    /// The whole run refuses when the source changes between its copy and the
+    /// verification reads — the deterministic arm of the digest refusal (the
+    /// integration suite's timed arm only corroborates the same refusal).
+    #[tokio::test]
+    async fn a_source_changed_after_the_copy_refuses_the_run() {
+        let flow = flow().await;
+        seed_paper_rows(&flow, 2, 0).await;
+        drop_paper_event_triggers(&flow.source_db).await;
+        let source_db = flow.source_db.clone();
+        set_source_mutation(Box::new(move || {
+            Box::pin(async move {
+                let writer = Db::with_path(&source_db).await.map_err(|e| e.to_string())?;
+                sqlx::query(
+                    "UPDATE paper_event SET payload = 'changed after the copy' \
+                     WHERE session_id = 'sess-1' AND seq = 2",
+                )
+                .execute(writer.pool())
+                .await
+                .map_err(|e| e.to_string())?;
+                writer.pool().close().await;
+                Ok(())
+            })
+        }));
+
+        let error = run_verified_copy(import_job(&flow))
+            .await
+            .expect_err("the digest refuses the changed source");
+        assert!(error.to_string().contains("refused"), "{error}");
+        assert!(
+            !flow.target_db.exists(),
+            "nothing was installed: {}",
+            flow.target_db.display()
+        );
+        let leftovers: Vec<PathBuf> =
+            fs::read_dir(flow.target_db.parent().expect("the target's directory"))
+                .expect("read the target's directory")
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            // The migration lock beside the copy is inert and is
+                            // never removed by design; the COPY itself must be gone.
+                            name.contains("import-tmp") && !name.ends_with(".migrate.lock")
+                        })
+                })
+                .collect();
+        assert!(leftovers.is_empty(), "the temporary is gone: {leftovers:?}");
+    }
+
+    /// PR-354 fix C3c: `created_root` is computed BEFORE any directory is
+    /// created. The fixture's target directory (`<temp>/server`) does
+    /// not exist yet, so the pre-existing ancestor is the tempdir itself: the
+    /// install's directory syncs must reach it (its entry is the one that
+    /// received the new directory). Computed after the `create_dir_all`, the
+    /// created root WAS
+    /// `server/` and the tempdir's sync never ran — the entry was left
+    /// unflushed, a regression from main.
+    #[tokio::test]
+    async fn a_first_import_syncs_the_parent_that_received_the_new_directory() {
+        let flow = flow().await;
+        assert!(
+            !flow.target_db.parent().expect("a parent").exists(),
+            "the target's directory is this run's to create"
+        );
+        let _ = publish::probe::take();
+        // Keyed on the directory the walk must REACH: the injection fires only
+        // if `levels_to_sync` climbed past the target's own directory.
+        publish::probe::fail_next_sync_of(flow.dir.path());
+
+        let error = run_verified_copy(import_job(&flow))
+            .await
+            .expect_err("the first import must sync the pre-existing ancestor");
+        let message = error.to_string();
+        assert!(
+            message.contains("injected failure")
+                && message.contains(&flow.dir.path().display().to_string()),
+            "the failure is the pre-existing ancestor's own sync: {message}"
+        );
+    }
+
+    /// PR-354 fix C8: the same-target refusal compares the DEVICE and the
+    /// inode. An inode number alone is unique only within one filesystem, so a
+    /// source and a target on different filesystems whose numbers collide were
+    /// refused as the same file. Two filesystems cannot be built portably in a
+    /// test (nothing to mount), so the rule is driven over identity pairs —
+    /// plus the real paths for the cases one filesystem CAN produce.
+    #[test]
+    fn a_colliding_inode_number_on_another_filesystem_is_not_the_same_file() {
+        assert!(
+            same_file_identity((1, 42), (1, 42)),
+            "the same device and inode is the same file"
+        );
+        assert!(
+            !same_file_identity((1, 42), (2, 42)),
+            "the same inode number on another device is a different file"
+        );
+        assert!(
+            !same_file_identity((1, 42), (1, 43)),
+            "another inode on the same device is a different file"
+        );
+
+        // The real paths: two spellings of one file ARE the same file (the
+        // symlink resolves to its target's identity)...
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("pulse.db");
+        fs::write(&file, b"the database").expect("write the database");
+        let other = dir.path().join("other.db");
+        fs::write(&other, b"another database").expect("write the other");
+        assert!(
+            !resolves_to_same(&file, &other).unwrap(),
+            "distinct files are not one"
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.db");
+            std::os::unix::fs::symlink(&file, &link).expect("the symlink");
+            assert!(
+                resolves_to_same(&file, &link).unwrap(),
+                "a symlink is the same file"
+            );
+        }
+        // ...and a target that does not exist yet falls back to canonical
+        // paths: a fresh file beside it is not the source.
+        let fresh = dir.path().join("fresh").join("pulse.db");
+        assert!(!resolves_to_same(&file, &fresh).unwrap());
     }
 }

@@ -115,6 +115,29 @@ pub(crate) fn sync_dir(dir: &Path) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("fsync directory {}: {error}", dir.display()))
 }
 
+/// Make one file private: mode 0600 on unix, a no-op elsewhere (PR-354 fix D5).
+///
+/// The backup and import surfaces must not inherit the process umask or the
+/// SOURCE file's mode: SQLite creates its files with the umask (0644 under the
+/// default 022) and `fs::copy` carries the source's permissions, so the mode is
+/// set explicitly at each write.
+///
+/// # Errors
+///
+/// The underlying IO error when the mode cannot be set.
+pub(crate) fn set_private_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// fsync a just-written FILE — its bytes — before the rename that gives it its
 /// final name.
 ///

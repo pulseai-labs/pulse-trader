@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  r4.s2.w1 (G9) — the daily log rotation for the Mini's prod server: a launchd
+  calendar job in draco's gui/ domain running the installed
+  deploy/pulse-logrotate.sh.
+
+  The script copy-truncates ~/Library/Logs/PulseTrader/serve.log and serve.err
+  into dated files and deletes dated files older than 7 days; it touches
+  nothing outside ~/Library/Logs/PulseTrader/ (launchd keeps the live files
+  open, so they must be truncated in place, never moved).
+
+  Installed by `just deploy-mac <tag>` beside com.pulsetrader.serve.plist and
+  loaded with `launchctl bootstrap gui/$(id -u)`. It carries no environment and
+  no credential.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.pulsetrader.logrotate</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/draco/.local/share/pulse-serve/deploy/pulse-logrotate.sh</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>

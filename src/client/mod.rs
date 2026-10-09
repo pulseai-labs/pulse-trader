@@ -169,7 +169,7 @@ impl TokenScope {
 /// Field names match the server's serialization exactly (no rename): the
 /// server's `HandshakeBody` has no `rename_all`, so neither does this.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct HandshakeDto {
+pub(crate) struct HandshakeDto {
     api_version: u32,
     binary_version: String,
     engine_fingerprint: String,
@@ -181,6 +181,14 @@ struct HandshakeDto {
     /// existed — connected, no refusal (see `handshake_body`).
     #[serde(default)]
     scope: Option<String>,
+    /// The role the server runs as (`prod` or `qa`), when it was started with
+    /// one (r4.s2.w3, C5).
+    ///
+    /// ADDITIVE wire field, same rule as `scope`: an older server — or one
+    /// started without `--role` — omits it, and an absent role means no badge
+    /// and no other change (see [`ServerStatus::role`]).
+    #[serde(default)]
+    role: Option<String>,
 }
 
 /// What `server_connect` learned — the spec's named outcomes: `connected`,
@@ -380,21 +388,21 @@ impl ServerClient {
         required: TokenScope,
     ) -> Result<(Self, ConnectOutcome), ClientError> {
         let client = Self::with_scope(base_url, token, required, RetryBackoff::default());
-        let (binary_version, engine_fingerprint) = client.handshake().await?;
+        let body = client.handshake().await?;
         Ok((
             client,
             ConnectOutcome::Connected {
-                binary_version,
-                engine_fingerprint,
+                binary_version: body.binary_version,
+                engine_fingerprint: body.engine_fingerprint,
             },
         ))
     }
 
     /// The handshake, as [`ClientState::status`] re-runs it for a fresh
-    /// up/down/refused answer (the 15 s poll; d28).
-    pub(crate) async fn handshake(&self) -> Result<(String, String), ClientError> {
-        let body = self.handshake_body().await?;
-        Ok((body.binary_version, body.engine_fingerprint))
+    /// up/down/refused answer (the 15 s poll; d28). The whole body comes back
+    /// since r4.s2.w3: the status strip also renders the server's `role`.
+    pub(crate) async fn handshake(&self) -> Result<HandshakeDto, ClientError> {
+        self.handshake_body().await
     }
 
     async fn handshake_body(&self) -> Result<HandshakeDto, ClientError> {
@@ -1210,11 +1218,12 @@ impl ClientState {
             Link::Up(client) => client.clone(),
         };
         match snapshot.handshake().await {
-            Ok((binary_version, engine_fingerprint)) => ServerStatus {
+            Ok(body) => ServerStatus {
                 state: ServerStatusState::Up,
-                binary_version: Some(binary_version),
-                engine_fingerprint: Some(engine_fingerprint),
+                binary_version: Some(body.binary_version),
+                engine_fingerprint: Some(body.engine_fingerprint),
                 reason: None,
+                role: body.role,
             },
             // The token stopped working server-side: refused with the reason.
             Err(err @ ClientError::TokenRefused { .. }) => {
@@ -1229,6 +1238,7 @@ impl ClientState {
                 binary_version: None,
                 engine_fingerprint: None,
                 reason: None,
+                role: None,
             },
         }
     }
@@ -1438,7 +1448,9 @@ impl Default for ClientState {
 }
 
 /// What the status strip renders (spec: `state: up | down | not_connected |
-/// refused`, with the server's version and fingerprint when known).
+/// refused`, with the server's version and fingerprint when known — and, since
+/// r4.s2.w3, the role the server reported, which the strip renders as the QA
+/// badge).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub struct ServerStatus {
     /// The connection state.
@@ -1450,6 +1462,12 @@ pub struct ServerStatus {
     /// Why the last exchange refused, when it did — the Connect screen's
     /// "reason for the last refusal" comes from here.
     pub reason: Option<String>,
+    /// The role the server reported (`prod` or `qa`), when it answered with
+    /// one. ADDITIVE (r4.s2.w3, C5): `None` — an older server, or one started
+    /// without `--role` — renders nothing new. `Some("qa")` is the QA badge:
+    /// QA's database is a copy of prod's, so a stale URL landing on QA must be
+    /// visible at a glance.
+    pub role: Option<String>,
 }
 
 /// The connection state the strip switches on. Wire tokens are the spec's own:
@@ -1476,6 +1494,7 @@ impl ServerStatus {
             binary_version: None,
             engine_fingerprint: None,
             reason: None,
+            role: None,
         }
     }
 
@@ -1485,6 +1504,7 @@ impl ServerStatus {
             binary_version: None,
             engine_fingerprint: None,
             reason: Some(reason),
+            role: None,
         }
     }
 }

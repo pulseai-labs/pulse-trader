@@ -99,19 +99,23 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
 
   # VS-1.2.3 work-3.04 (NFR-2, BACKLOG-12): the determinism gate. Runs the
-  # 100x-sequential + 100x-Rayon-parallel determinism test on Linux BOTH ARCHES —
+  # 100x-sequential + 100x-Rayon-parallel determinism test on BOTH Linux ARCHES —
   # ubuntu-latest (x86_64) + ubuntu-24.04-arm (arm64) — because the property under
   # test is about CPU ARCH, not OS (D4); x86_64 is retained as the FP-hygiene
   # forcing function (the arch most likely to expose stray FMA/x87 contraction).
-  # apple-darwin determinism is deferred to a release/nightly workflow (#62), NOT
-  # every PR — do not add darwin arches here. Runs `--release` (gate-2 grill): the
+  # r4.s2.w2 (#62) ADDS the third lane: arm64-darwin on macos-latest, the arch the
+  # prod server moves to — a new target triple replays every paper session, so
+  # the hash that machine would produce must equal the Linux one BEFORE the move.
+  # Runs `--release` (gate-2 grill): the
   # cross-arch CI compare is the AUTHORITATIVE gate, so it must prove the SHIPPED
   # codegen profile (the `.app` ships `--release`); the local
   # `cargo test --test determinism` AC stays debug (fast, in-process 100x-identity).
   # The emitter WRITES the single canonical content hash to a FILE
   # (target/determinism-hash.txt) — uploaded as the per-arch artifact; no stdout
-  # scraping. The dependent `determinism-crossarch` job downloads both and cmp's
-  # them: byte-equality across arches = the live AC#1 cross-arch proof (#29).
+  # scraping. The dependent `determinism-crossarch` job downloads all three and
+  # cmp's them: byte-equality across arches = the live AC#1 cross-arch proof
+  # (#29) and, since r4.s2.w2, the darwin half of G4 — a darwin hash that differs
+  # HALTS for an operator ruling, and nothing is re-baselined.
   determinism:
     name: determinism (${{ matrix.arch }})
     strategy:
@@ -122,6 +126,10 @@ jobs:
             runner: ubuntu-latest
           - arch: arm64
             runner: ubuntu-24.04-arm
+          # r4.s2.w2 (#62): the Mac Mini's arch, the third lane the G4 ruling
+          # waits on before the move.
+          - arch: arm64-darwin
+            runner: macos-latest
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -147,8 +155,10 @@ jobs:
       # these dev packages `gobject-sys` fails pkg-config ("Package 'gobject-2.0'
       # … not found") before any test runs. This job compiles the whole crate
       # (the test links the lib, whose `mod tauri` pulls the dependency in), so
-      # it needs Tauri v2's documented Linux prerequisites.
+      # it needs Tauri v2's documented Linux prerequisites. r4.s2.w2 added the
+      # arm64-darwin lane: macOS ships those frameworks, so the step is Linux-only.
       - name: Install Tauri Linux system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
@@ -174,9 +184,11 @@ jobs:
           path: target/determinism-hash.txt
           if-no-files-found: error
 
-  # VS-1.2.3 work-3.04: the live AC#1 cross-arch proof. Downloads BOTH arches'
-  # determinism-hash.txt and cmp's them byte-for-byte — EQUAL ⇒ the two arches
-  # produced the SAME content hash (closes #29's cross-arch half). RED here on the
+  # VS-1.2.3 work-3.04: the live AC#1 cross-arch proof. Downloads ALL THREE
+  # arches' determinism-hash.txt and cmp's them byte-for-byte — EQUAL ⇒ the arches
+  # produced the SAME content hash (closes #29's cross-arch half; since r4.s2.w2
+  # the darwin lane's hash joins it, and a darwin hash that differs is G4: halt
+  # for an operator ruling, never a re-baseline). RED here on the
   # f64 regime component is the signal to apply the D3 fallback (regime-free
   # money_math_hash()) and file a narrowed #29.
   determinism-crossarch:
@@ -198,11 +210,19 @@ jobs:
           name: determinism-hash-arm64
           path: arm64
 
+      - name: Download arm64-darwin hash
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: determinism-hash-arm64-darwin
+          path: arm64-darwin
+
       - name: Compare cross-arch content hashes (byte-equal = AC#1 proof)
         run: |
-          echo "x86_64: $(cat x86_64/determinism-hash.txt)"
-          echo "arm64:  $(cat arm64/determinism-hash.txt)"
+          echo "x86_64:       $(cat x86_64/determinism-hash.txt)"
+          echo "arm64:        $(cat arm64/determinism-hash.txt)"
+          echo "arm64-darwin: $(cat arm64-darwin/determinism-hash.txt)"
           cmp x86_64/determinism-hash.txt arm64/determinism-hash.txt
+          cmp x86_64/determinism-hash.txt arm64-darwin/determinism-hash.txt
 
   # Review-finding fix (Codex P2 justfile:18 + CodeRabbit justfile:78 +
   # CodeRabbit scripts/check-adr-0022.sh:12): the `check` job above never ran

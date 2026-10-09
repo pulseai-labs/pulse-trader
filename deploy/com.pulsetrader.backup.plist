@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  r4.s2.w5 (C3, G9) — the Mac Mini's nightly `pulse backup` as a launchd
+  calendar job (ADR-0029's backup section), installed by `just deploy-mac`
+  beside the serve agent and loaded into draco's gui/ domain.
+
+  StartCalendarInterval 03:30 local; launchd runs a missed occurrence when the
+  machine wakes, which is the systemd `Persistent=true` behaviour draco-desk's
+  timers have. The job runs the installed binary's `backup` with its defaults:
+  the platform data dir, ~/pulse-backups, and keep 14.
+
+  `pulse backup` reads no credential, so there is NO EnvironmentVariables
+  entry (G7). Logs land under ~/Library/Logs/PulseTrader/ and are rotated by
+  com.pulsetrader.logrotate beside them (G9). launchd expands no `~`, so every
+  path here is absolute; the Mini's user is draco.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.pulsetrader.backup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/draco/.local/share/pulse-serve/bin/pulse</string>
+		<string>backup</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<!-- Umask 63 (decimal) = 077: the nightly job's out-dir, database, manifest
+	     and candle files are private whatever the login's umask is (the writer
+	     also sets 0700/0600 itself; PR-354 fix D5). -->
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/draco/Library/Logs/PulseTrader/backup.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/draco/Library/Logs/PulseTrader/backup.err</string>
+</dict>
+</plist>

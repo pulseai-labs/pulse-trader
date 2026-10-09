@@ -17,9 +17,12 @@
 //! import contract) on the backup into a temporary file beside the target,
 //! refuses a non-empty target without `--replace` (backing the target up
 //! first when it replaces), then performs the same atomic rename and prints a
-//! summary. Its precondition — the server must be stopped — is stated in
-//! `--help`; the `just restore` recipe stops the unit, restores, then starts
-//! it again.
+//! summary — the three paper digests included (r4.s2.w2). Its precondition —
+//! the server must be stopped — is the operator's: the instance lock this PR
+//! keeps (r4.s2.w2's #250) is held by `pulse serve` only (`<db>.serve.lock`),
+//! `pulse restore` takes none, and the enforcement for import/restore was split
+//! out to issue #355. The `just restore` recipe stops the unit, restores, then
+//! starts it again.
 //!
 //! [`backup_target`] is the one full-backup body — database + the source data
 //! dir's snapshots — that `pulse backup` and BOTH `--replace` safety backups
@@ -34,11 +37,12 @@ use chrono::Utc;
 use clap::Args;
 
 use super::import::{
-    HeadChange, HeadSource, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal,
+    HeadChange, HeadSource, Mismatch, SourceHead, SourceSnapshot, VerifiedCopy, bytes_equal,
     copy_snapshot_into, default_backup_out_dir, fold_cleanup, manifest_path, named_by_pointer,
-    path_present, refuse_orphaned_quarantines, resolve_target_data_dir, resolve_target_db,
-    restore_heads, run_verified_copy, scan_heads, scan_snapshots, stranded_pointers,
-    write_head_manifest,
+    path_present, print_refusal, read_head_manifest, refuse_orphaned_quarantines,
+    resolve_target_data_dir, resolve_target_db, restore_heads, run_verified_copy, scan_heads,
+    scan_snapshots, step_referenced_snapshots, step_repository_reads, step_snapshot_reads,
+    stranded_pointers, write_head_manifest,
 };
 use super::publish;
 use crate::adapters::db::ops;
@@ -60,17 +64,24 @@ pub struct BackupArgs {
     pub out_dir: Option<PathBuf>,
     /// How many `pulse-*.db` files to keep (the oldest are pruned, each with
     /// its own `.heads.json` pointer manifest; `candles/` is one shared store
-    /// and is never pruned).
-    #[arg(long, default_value_t = 14)]
+    /// and is never pruned). `0` is refused by name (#240): it would prune the
+    /// backup this very run just made and then fail.
+    #[arg(
+        long,
+        default_value_t = 14,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub keep: u32,
 }
 
 /// `pulse restore <backup.db> --backup-dir <dir holding its candles/>
 /// [--db <target>] [--data-dir <target>] --replace`.
 ///
-/// **Precondition: the server must be stopped.** Restore does not check the
-/// process; the `just restore` recipe stops `pulse-serve`, restores, then
-/// starts it again.
+/// **Precondition: the server must be stopped — the operator's, not enforced
+/// here.** The instance lock this PR keeps (#250) is held by `pulse serve`
+/// only; `pulse restore` takes none, and the enforcement for import/restore is
+/// tracked in issue #355. The `just restore` recipe still stops `pulse-serve`,
+/// restores, then starts it again.
 #[derive(Debug, Args)]
 pub struct RestoreArgs {
     /// The backup database file (a `pulse-<stamp>.db` from an out-dir).
@@ -88,6 +99,17 @@ pub struct RestoreArgs {
     /// first.
     #[arg(long, default_value_t = false)]
     pub replace: bool,
+}
+
+/// `pulse backup-verify <file>` (r4.s2.w5, C3): verify ONE backup artifact in
+/// place — the read-only half of a restore's checks, so a pull can check what
+/// it fetched beside a live server.
+#[derive(Debug, Args)]
+pub struct BackupVerifyArgs {
+    /// The backup database to verify (a `pulse-<stamp>.db`). Its OWN pointer
+    /// manifest (`<file>.heads.json`) and the `candles/` store beside it are
+    /// the rest of the artifact.
+    pub file: PathBuf,
 }
 
 /// Run the backup (the composition root's thin wrapper).
@@ -755,7 +777,9 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
     // below it is an entry this backup makes, and each publish into it has to
     // sync its parent (fix round 1, F6).
     let created_root = publish::existing_ancestor(out_dir);
-    fs::create_dir_all(out_dir)
+    // 0700, never the process umask's 0755 (PR-354 fix D5): the out-dir holds
+    // the database, its manifest and the candle store.
+    crate::adapters::db::create_private_dir(out_dir)
         .map_err(|e| anyhow!("create backup dir {}: {e}", out_dir.display()))?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let final_path = unique_backup_path(out_dir, &stamp);
@@ -777,6 +801,17 @@ async fn stage_database(db_path: &Path, out_dir: &Path) -> anyhow::Result<Staged
         let cleanup = remove_reported(&partial);
         return Err(fold_cleanup(
             anyhow!("the backup copy of {} failed: {e}", db_path.display()),
+            cleanup,
+        ));
+    }
+    // 0600, regardless of the umask SQLite created it with (PR-354 fix D5).
+    if let Err(error) = publish::set_private_file(&partial) {
+        let cleanup = remove_reported(&partial);
+        return Err(fold_cleanup(
+            anyhow!(
+                "make the backup copy {} private: {error}",
+                partial.display()
+            ),
             cleanup,
         ));
     }
@@ -903,6 +938,97 @@ pub(crate) async fn run_restore(args: &RestoreArgs) -> anyhow::Result<()> {
         chmod_source: false,
     })
     .await
+}
+
+/// Verify one backup artifact in place (r4.s2.w5): every restore check that
+/// needs no second database and no target — the backup's own manifest, every
+/// snapshot the store holds, every snapshot the manifest names, every snapshot
+/// a run references, and every version and run reading back. Nothing is
+/// written, so a pull can verify the copy it just fetched beside a live
+/// server.
+///
+/// The COMPARATIVE checks a restore also makes — table counts, stored hashes
+/// and paper digests, source versus copy — need a second database to compare
+/// against and are deliberately not faked here.
+///
+/// # Errors
+///
+/// A missing or unreadable `.heads.json` manifest (refused by name, exactly as
+/// a restore refuses it), an unreadable backup database, or any mismatch —
+/// every one reported, not just the first.
+pub(crate) async fn run_backup_verify(args: &BackupVerifyArgs) -> anyhow::Result<()> {
+    let file = &args.file;
+    if !file.is_file() {
+        anyhow::bail!("backup-verify: no such backup: {}", file.display());
+    }
+    let backup_dir = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+
+    // The backup's OWN manifest (round 6, Fix A): the shared store's pointer
+    // directory is one set every backup overwrites, so it is never the source
+    // of a single backup's pointers. A backup without one is refused here,
+    // before anything is read.
+    let heads = read_head_manifest(&manifest_path(file))?;
+
+    let store = CandleStore::with_base_dir(backup_dir.to_path_buf());
+    let mut mismatches: Vec<Mismatch> = Vec::new();
+
+    // Every snapshot the store holds must verify...
+    let (snapshots, scan_issues) = scan_snapshots(backup_dir);
+    mismatches.extend(scan_issues);
+    let snapshots_verified = step_snapshot_reads(&store, &snapshots, &mut mismatches);
+
+    // ...and every pointer the manifest names must have made it: a restore
+    // publishes these pointers, and one naming a snapshot the store does not
+    // hold would leave the restored store with a dangling current snapshot.
+    let mut pointers_verified = 0usize;
+    for head in &heads {
+        match store.read_snapshot(&head.pair, head.timeframe, &head.version) {
+            Ok(_) => pointers_verified += 1,
+            Err(error) => mismatches.push(Mismatch::new(
+                "pointer",
+                store
+                    .snapshot_path(&head.pair, head.timeframe, &head.version)
+                    .display()
+                    .to_string(),
+                "snapshot",
+                format!("the manifest names it and the store does not verify it: {error}"),
+            )),
+        }
+    }
+
+    // The database itself, READ-ONLY: every version and run reads back through
+    // its repository, and every snapshot a run references is present.
+    let source = ops::open_read_only(file)
+        .await
+        .map_err(|error| anyhow!("backup-verify: open {}: {error}", file.display()))?;
+    let (versions_verified, runs_verified) =
+        step_repository_reads(&source, &mut mismatches).await?;
+    step_referenced_snapshots(&store, &source, &mut mismatches).await?;
+    source.close().await;
+
+    if !mismatches.is_empty() {
+        print_refusal("backup-verify", &mismatches);
+        anyhow::bail!(
+            "backup-verify: {} verification mismatch(es) in {}; see above",
+            mismatches.len(),
+            file.display()
+        );
+    }
+
+    println!("backup-verify: verification summary");
+    println!("  versions verified: {versions_verified}");
+    println!("  runs verified: {runs_verified}");
+    println!("  snapshots verified: {snapshots_verified}");
+    println!("  manifest pointers verified: {pointers_verified}");
+    println!("  backup: {}", file.display());
+    println!(
+        "note: this verifies the artifact in place, read-only — it does not restore it and does \
+         not migrate it forward"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

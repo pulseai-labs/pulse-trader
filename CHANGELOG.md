@@ -8,6 +8,89 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Off-box backup: the Mini's nightly `pulse backup` as a launchd calendar job, a read-only pull to
+  draco-desk over a dedicated forced-command key, and a restore drill from the pulled copy (r4.s2.w5).**
+  `deploy/com.pulsetrader.backup.plist` runs the installed binary's `backup` (defaults: the platform
+  data dir, `~/pulse-backups`, keep 14) at 03:30 local, with its logs under `~/Library/Logs/PulseTrader/`
+  and no credential in the plist; `just deploy-mac` installs and loads it beside the serve agent.
+  `deploy/pulse-backup-pull.{sh,service,timer}` pulls at 04:30 (`Persistent=true`) with the dedicated
+  key `~/.ssh/pulse_backup_ed25519`: `rsync -a --ignore-existing` and never `--delete`, so a backup
+  deleted or corrupted on the Mini cannot erase the off-box copy. The newest pulled backup is then
+  verified in place by the new read-only `pulse backup-verify <file>` — the backup's own `.heads.json`
+  manifest, every snapshot it names, and every version and run reading back — exiting non-zero on a
+  mismatch before any pruning; retention keeps the newest 30 databases with their manifests and never
+  prunes `candles/`. The Mini's rsync is openrsync with no `rrsync` (checked read-only), so the key's
+  `authorized_keys` line forces `deploy/pulse-backup-serve.sh`, which serves only an rsync sender
+  invocation rooted at `~/pulse-backups` and refuses a write, a delete, a `..` path, a shell and any
+  path outside the root by name. `just restore-drill <file>` restores a pulled backup into a fresh
+  scratch directory, serves it on loopback, checks `/healthz` and the tokenless handshake, then removes
+  the scratch; the daily log rotation now covers the backup job's logs too. `pulse backup --keep 0` is
+  refused at parse time (#240 — it used to prune the backup it had just made and then fail).
+  `tests/backup_offbox_restore.rs` drives the whole line, the forced-command refusals included (demo
+  line d72). Refs [#240](https://github.com/pulseai-labs/pulse-trader/issues/240).
+
+- **draco-desk becomes QA: the data-dir role marker, the QA unit on 8421, `just deploy` retargeted,
+  QA seeding with token revocation, the handshake's `role` field and the app's QA badge (r4.s2.w3).**
+  `pulse serve --role <prod|qa>` pins a data dir in `<data dir>/server-role` (one line, mode 0600):
+  an unmarked dir is marked, the same role continues, and the other role is refused by name — before
+  the database is opened, so a refused start creates no database file, no instance lock, no
+  start-log entry and no marker change; with `--role`, the database must sit inside the data dir.
+  The Mini's plist gains `--role prod`; the new `deploy/pulse-qa.service` runs `pulse serve --role qa
+  --bind 100.90.203.21:8421 --db %h/.local/share/pulse-qa/pulse.db --data-dir
+  %h/.local/share/pulse-qa` with the same 3-starts-in-900-s bound as prod's unit, on 8421 so QA can
+  run beside draco-desk's current prod until the cutover. `just deploy <tag>` now installs and
+  restarts QA only (prod's unit and the backup units are untouched, G2), creates
+  `~/.local/share/pulse-qa` mode 0700, and refuses without `Linger=yes` before it builds (#248);
+  `just deploy-check` rehearses the QA unit. QA seeding (`pulse qa-seed`) moved to issue #355.
+  The handshake gains an ADDITIVE optional `role` field, and the app's status strip
+  shows a QA badge when the connected server reports `qa`, so a stale URL cannot pass for prod
+  unnoticed. `tests/data_dir_role.rs` drives the real binary through the refusals, the marker, the
+  seed and the handshake (demo line d70). Refs
+  [#248](https://github.com/pulseai-labs/pulse-trader/issues/248).
+
+- **Prod's service on the Mac Mini: a launchd LaunchAgent with bounded restarts, `just deploy-mac`,
+  a real deploy health gate, and ADR-0029 (r4.s2.w1).** The always-on server gains a launchd home:
+  `deploy/com.pulsetrader.serve.plist` runs `pulse serve --bind 100.103.30.74:8420` from the
+  installed binary in `draco`'s `gui/` domain with `RunAtLoad`, `KeepAlive { SuccessfulExit =
+  false }` and the ONE environment entry `PULSE_CONFIG_DIR` — no credential in the plist (G7) — and
+  launchd's stdout/stderr under `~/Library/Logs/PulseTrader/`, rotated daily into dated files by
+  `deploy/com.pulsetrader.logrotate.plist` + `deploy/pulse-logrotate.sh` (7 days kept, G9). launchd
+  has no start limit, so the bound moves into the server: `pulse serve --start-limit <N>/<SECONDS>`
+  counts starts in a sliding window in `<data dir>/serve-starts` and, when a start would exceed it,
+  writes `<data dir>/serve-start-limit` and exits 0 before binding — `KeepAlive {
+  SuccessfulExit = false }` then stops relaunching (#342's parity; `just prod-reset` clears the
+  marker and the start log and kickstarts the agent). `just deploy-mac <tag>` ships the tagged
+  source over ssh (`git archive`, no GitHub credential on the Mini) and builds there with
+  `PULSE_ALLOW_PLACEHOLDER_DIST=1` (#314: the server never serves the embedded frontend), checks
+  G10 (data dir 0700, `.env` 0600 and owned by `draco` — contents never printed), (re)bootstraps
+  both agents, and only reports success once the tailnet address answers. That gate is the new
+  `scripts/wait-healthy.sh` (#346): it polls `/healthz` for a 200 with `"status":"ok"` and, until
+  w4 lands the route, accepts a 401 from `/api/v1/handshake` carrying `X-Pulse-Api-Version` —
+  `just deploy` on draco-desk uses it in place of `systemctl is-active`, which read `active`
+  through the whole 120-second bind retry. ADR-0029 amends ADR-0026's operations: prod on the Mini,
+  draco-desk becomes QA. `tests/launchd_units.rs` parses both plists and drives the counter with an
+  injected clock and the real binary's exit 0 (demo line d68). Refs
+  [#346](https://github.com/pulseai-labs/pulse-trader/issues/346),
+  [#314](https://github.com/pulseai-labs/pulse-trader/issues/314),
+  [#342](https://github.com/pulseai-labs/pulse-trader/issues/342).
+
+- **The move made safe: the instance lock, a source that is the target refused, and the paper tables
+  verified by digest (r4.s2.w2).** `pulse serve` takes a non-blocking instance lock on its database
+  (`<db>.serve.lock`) and holds it for its process lifetime, so a second server on a held database
+  refuses by name (#250); `pulse import` and `pulse restore` take no instance lock in this release —
+  the operator stops the server before either, and the lock for import/restore is tracked in
+  [#355](https://github.com/pulseai-labs/pulse-trader/issues/355). An import refuses a source
+  database or data dir that resolves to the target — the path itself, a symlink to it, a hard link
+  (#264) — before anything is touched. `paper_session`, `paper_event` and `paper_bar` are compared
+  by SHA-256 content digest (every row's columns, primary-key order, length-prefixed) between the
+  source and the copy: a changed column, a missing row or a schema difference refuses the import
+  naming the table and the first differing key, the verification summary prints the three digests,
+  and `pulse restore` runs the same check through the shared engine. CI's determinism matrix gains an
+  `arm64-darwin` (`macos-latest`) lane whose hash is compared with both Linux arches (#62), and a
+  new pinned `paper_replay_golden` suite replays a committed fixture of recorded bars and events —
+  the certify fixture's synthetic BTCUSDT series — so a darwin engine difference fails the
+  `macos-latest` job.
+
 - **The certification step: one hypothesis, one holdout, one immutable record, and `certify_version`
   (r4.s1.w5).** While a freeze is open, certifying a version walks it forward under `wf-v2` on the
   search span — the guard clamps the span's end to the holdout start — runs ONE backtest over the
@@ -82,6 +165,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   exact counts pinned) and `tests/wf_v2_measurement.rs` re-derives ADR-0028's frozen α, power,
   real-path-null and runtime numbers on demand. **ADR-0028** freezes the rule, the C1 test, the
   holdout start (2025-07-01, all four pairs) and **H = 12**.
+
+- **The prod watcher and its push alert: an unauthenticated `/healthz` and `pulse watch` (r4.s2.w4).**
+  `GET /healthz` is the ONE route outside the auth middleware (ADR-0029's Q1): 200 with exactly
+  `{"status":"ok"|"degraded","api_version":1}` — `degraded` means the paper runtime is not running —
+  keeping the request-log and API-version layers, writing no `token_audit` row and touching no table,
+  so the deploy gate (`scripts/wait-healthy.sh`) and an off-box watcher read it with no token.
+  `pulse watch` (`--url`, `--ssh-host`, `--topic-file`, `--state-file`, `--ntfy-url`) is one probe
+  cycle, meant for `deploy/pulse-watch.timer` on draco-desk (every 60 s): it probes
+  `<url>/healthz`, and on failure tells "service down" (the host answers on port 22) from "Mini
+  unreachable — it may need a FileVault unlock", and checks the start-limit marker over the dedicated
+  forced-command key — alerting **at once** when the marker is present ("start limit reached on prod
+  — run just prod-reset"). It alerts after 3 failed probes, de-duplicates to one alert per incident,
+  sends one "recovered", reminds every 6 hours while the outage lasts, and pushes one "watcher error"
+  per distinct error (missing or non-0600 topic file, unwritable 0600 state file, missing key,
+  malformed `--url`) and exits non-zero. Nothing it sends or logs carries a token, a credential URL,
+  the topic or session data. `deploy/pulse-watch.{service,timer}` are parsed by `tests/deploy_units.rs`,
+  and the whole behaviour is pinned by `tests/healthz_watch.rs` (demo line d71), which drives the real
+  probe and the real notifier against a local fake listener — never the real ntfy.sh — and closes the
+  known limit "a failed unit raises no push alert".
 
 ### Changed
 
