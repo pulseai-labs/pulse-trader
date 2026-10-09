@@ -103,16 +103,22 @@ pub enum TokenStoreError {
 /// failure is `publish`'s own error with the rollback already done.
 #[derive(Debug)]
 pub enum ReplacePublishedError<E> {
-    /// The replace was refused (a fresh label is taken) or the database failed.
+    /// The replace was refused (a fresh label is taken) or a write BEFORE the
+    /// publish step failed. Nothing was printed and nothing was written.
     Store(TokenStoreError),
-    /// The publish step failed; the transaction was rolled back.
+    /// The publish step (the token print) failed; the transaction was rolled
+    /// back. Nothing was written, and nothing valid was printed.
     Publish(E),
+    /// The COMMIT failed AFTER a successful publish: the tokens WERE printed
+    /// and are NOT valid, and nothing was written. The caller's message must
+    /// say both (PR-354 fix D2).
+    Commit(TokenStoreError),
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for ReplacePublishedError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Store(error) => write!(f, "{error}"),
+            Self::Store(error) | Self::Commit(error) => write!(f, "{error}"),
             Self::Publish(error) => write!(f, "{error}"),
         }
     }
@@ -293,7 +299,7 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
     where
         F: FnOnce() -> Result<(), E>,
     {
-        use ReplacePublishedError::{Publish, Store};
+        use ReplacePublishedError::{Commit, Publish, Store};
 
         let now = self
             .now_rfc3339()
@@ -355,9 +361,15 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
         if let Err(error) = publish() {
             return Err(Publish(error));
         }
+        #[cfg(test)]
+        if probe::take_injected_commit_failure() {
+            return Err(Commit(TokenStoreError::Db(DataError::Db(
+                "injected commit failure (cfg(test) seam)".to_owned(),
+            ))));
+        }
 
         tx.commit().await.map_err(|e| {
-            Store(TokenStoreError::Db(DataError::Db(format!(
+            Commit(TokenStoreError::Db(DataError::Db(format!(
                 "commit replace: {e}"
             ))))
         })?;
@@ -540,5 +552,29 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
         .await
         .map_err(|e| DataError::Db(format!("insert audit: {e}")))?;
         Ok(())
+    }
+}
+
+/// The `cfg(test)` seam the D2 tests drive: a one-shot COMMIT failure, so the
+/// "the printed tokens are NOT valid" path is reachable without a real
+/// mid-transaction fault (the print runs before the commit and cannot be
+/// interleaved from outside).
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// A one-shot: the next replace's commit fails.
+        static FAIL_NEXT_COMMIT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm the next commit failure.
+    pub(crate) fn fail_next_commit() {
+        FAIL_NEXT_COMMIT.with(|armed| armed.set(true));
+    }
+
+    /// Consume the armed failure.
+    pub(crate) fn take_injected_commit_failure() -> bool {
+        FAIL_NEXT_COMMIT.with(|armed| armed.replace(false))
     }
 }

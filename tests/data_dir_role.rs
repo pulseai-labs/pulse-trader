@@ -836,6 +836,11 @@ async fn qa_seed_can_be_re_run_after_a_publish_failure() {
         "the failure tells the operator to re-run: {failure_text}"
     );
 
+    assert!(
+        !data.join("server-role").exists(),
+        "a failed print leaves no marker: the marker is written only after the commit"
+    );
+
     // The re-run: it must SUCCEED — the failed run issued nothing, so the two
     // labels are free (and the copied token is still the active one).
     let again = run(
@@ -905,4 +910,93 @@ async fn qa_seed_can_be_re_run_after_a_publish_failure() {
             .any(|line| line.starts_with("copied-app ") && line.contains("revoked:")),
         "the copied token is revoked: {list}"
     );
+}
+
+/// PR-354 fix D2: a marker failure AFTER the commit leaves two VALID tokens and
+/// says so — the tokens are committed and printed, `pulse serve --role qa`
+/// writes the marker on its first start, and no re-run is needed. The old order
+/// wrote the marker inside the transaction, so a failed commit could leave a
+/// `qa` marker over a database whose prod tokens were still active.
+///
+/// The injection: the DATA DIR is read-only (the marker's temp file cannot be
+/// created) while the database lives in a writable subdirectory — so the marker
+/// read sees no marker, the lock, the database and the commit all work, and
+/// only the marker write fails.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qa_seed_reports_valid_tokens_when_the_marker_fails_after_the_commit() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (root, home) = scratch();
+    let data = root.path().join("qa-data");
+    let db_dir = data.join("db");
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = db_dir.join("pulse.db");
+    let copied = token_issue(&home, &db, "app", "copied-app");
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let out = run(
+        &home,
+        &[
+            "qa-seed",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+    let text = text(&out);
+    assert!(
+        !out.status.success(),
+        "the marker failure fails the run: {text}"
+    );
+    assert!(
+        text.contains("ARE valid") && text.contains("no re-run is needed"),
+        "the message says the tokens are valid and no re-run is needed: {text}"
+    );
+    assert!(
+        !data.join("server-role").exists(),
+        "and no marker was written"
+    );
+
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 2, "the two tokens were printed: {stdout:?}");
+
+    // Both printed tokens WORK — a server WITHOUT --role (no marker check)
+    // accepts each with its scope — and the copied prod token is refused.
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+    let server = start_server(
+        &home,
+        &[
+            "serve",
+            "--dev-loopback",
+            "--bind",
+            "127.0.0.1:0",
+            "--db",
+            db.to_str().unwrap(),
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+    );
+    for (token, scope) in lines.iter().zip(["app", "agent"]) {
+        let body = handshake(&server.base, token);
+        assert!(
+            body.contains("HTTP/1.1 200"),
+            "the committed {scope} token works: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"scope\":\"{scope}\"")),
+            "and it carries the {scope} scope: {body}"
+        );
+    }
+    let refused = handshake(&server.base, &copied);
+    assert!(
+        refused.contains("HTTP/1.1 401"),
+        "the copied token is revoked by the seed: {refused}"
+    );
+    drop(server);
 }

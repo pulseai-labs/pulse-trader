@@ -17,12 +17,20 @@
 //!
 //! **Stdout discipline** (mirror `pulse token issue`): the two tokens are the
 //! ONLY stdout lines, written CHECKED, in label order (`qa-app`, then
-//! `qa-agent`). The marker write and the print run INSIDE the seed's one
-//! transaction (PR-354 fix C7): a failure there rolls the replace back — nothing
-//! was issued, so no credential exists that no operator has seen, and the
-//! re-run the message promises succeeds. A committed-then-revoked pair could
-//! not be re-issued: labels are never reused (the `UNIQUE` holds after a
-//! revoke), so the failure would leave `qa-app`/`qa-agent` taken forever.
+//! `qa-agent`). The print runs INSIDE the seed's one transaction (PR-354 fix
+//! C7): a print failure rolls the replace back — nothing was issued, so no
+//! credential exists that no operator has seen, and the re-run the message
+//! promises succeeds. A committed-then-revoked pair could not be re-issued:
+//! labels are never reused (the `UNIQUE` holds after a revoke), so the failure
+//! would leave `qa-app`/`qa-agent` taken forever.
+//!
+//! **The marker goes LAST** (PR-354 fix D2): print, COMMIT, then write
+//! `<data dir>/server-role`. A marker failure after the commit leaves two VALID
+//! tokens and says so (`pulse serve --role qa` writes the marker on its first
+//! start — no re-run needed); a commit failure after the print says the printed
+//! tokens are NOT valid and that a re-run works. The old order wrote the marker
+//! first, so a failed commit left a `qa` marker over a database whose prod
+//! tokens were still active.
 //!
 //! `--db` and `--data-dir` are REQUIRED. The defaults are prod's paths, and a
 //! seed that silently defaulted onto prod's data would be exactly the accident
@@ -70,8 +78,9 @@ struct FreshToken {
 ///
 /// Returns an [`anyhow::Error`] — printed to stderr by `main` with a non-zero
 /// exit — on any refusal (prod-marked dir, held database), a database failure,
-/// or a failure to write the marker or print the tokens (the transaction rolls
-/// back, so nothing was issued and the re-run succeeds).
+/// a failure to print the tokens (the transaction rolls back: nothing was
+/// issued and the re-run succeeds), or a failure to write the marker AFTER the
+/// commit (the tokens are valid then, and the message says so).
 pub(crate) async fn run_qa_seed(args: &QaSeedArgs) -> anyhow::Result<()> {
     // ---- The containment rule first (`serve --role`'s own, one copy of it):
     // the marker describes the data dir's data, so a `--db` outside `--data-dir`
@@ -135,7 +144,7 @@ pub(crate) async fn run_qa_seed(args: &QaSeedArgs) -> anyhow::Result<()> {
     // committed-then-revoked pair this used to leave behind blocked every
     // re-run).
     let revoked = match repo
-        .replace_all_with_published(&rows, "cli:qa-seed", || publish(&args.data_dir, &fresh))
+        .replace_all_with_published(&rows, "cli:qa-seed", || print_tokens(&fresh))
         .await
     {
         Ok(revoked) => revoked,
@@ -143,26 +152,37 @@ pub(crate) async fn run_qa_seed(args: &QaSeedArgs) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("qa-seed: {error}"));
         }
         Err(ReplacePublishedError::Publish(error)) => return Err(error),
+        Err(ReplacePublishedError::Commit(error)) => {
+            return Err(anyhow::anyhow!(
+                "qa-seed: the tokens printed above are NOT valid: the transaction could not be \
+                 committed ({error}); nothing was issued — re-run the command"
+            ));
+        }
     };
     eprintln!(
         "pulse qa-seed: revoked {} copied token(s); issued qa-app and qa-agent",
         revoked.len()
     );
-    Ok(())
+
+    // ---- The `qa` marker LAST, after the commit (PR-354 fix D2): the tokens
+    // are committed and printed by now, so a marker failure leaves two VALID
+    // tokens and an unmarked dir — never a `qa` marker over a database whose
+    // prod tokens are still active. `pulse serve --role qa` writes the marker
+    // itself on its first start (the absent-marker path), so no re-run is
+    // needed.
+    role::write(&args.data_dir, ServerRole::Qa).map_err(|error| {
+        anyhow::anyhow!(
+            "qa-seed: the tokens above ARE valid, but the marker could not be written: {error}; \
+             `pulse serve --role qa` creates it on its first start — no re-run is needed"
+        )
+    })
 }
 
-/// Write the `qa` marker, then print the two tokens as the ONLY stdout lines.
-/// Both run INSIDE the seed's transaction (PR-354 fix C7): a failure here
-/// returns before the commit, so the whole replace rolls back and NOTHING was
-/// issued — the re-run the message promises succeeds. The marker is a
-/// filesystem write and is not rolled back; a dir marked `qa` with the seed
-/// still to run is exactly the state the re-run wants.
-fn publish(data_dir: &std::path::Path, fresh: &[FreshToken]) -> anyhow::Result<()> {
-    role::write(data_dir, ServerRole::Qa).map_err(|error| {
-        anyhow::anyhow!(
-            "qa-seed: the marker could not be written: {error}; nothing was issued — re-run the command"
-        )
-    })?;
+/// Print the two tokens as the ONLY stdout lines, INSIDE the seed's transaction
+/// (PR-354 fix C7): a print failure returns before the commit, so the whole
+/// replace rolls back and nothing was issued. The `qa` marker is written after
+/// the commit (PR-354 fix D2), never before it.
+fn print_tokens(fresh: &[FreshToken]) -> anyhow::Result<()> {
     write_token_lines(&fresh[0].token, &fresh[1].token).map_err(|error| {
         anyhow::anyhow!(
             "qa-seed: the tokens could not be printed ({error}); nothing was issued — re-run the command"
@@ -182,4 +202,102 @@ fn write_token_lines(app: &str, agent: &str) -> std::io::Result<()> {
     writeln!(lines, "{app}")?;
     writeln!(lines, "{agent}")?;
     lines.flush()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{QaSeedArgs, run_qa_seed};
+    use crate::adapters::db::client_token_repo::probe;
+    use crate::adapters::db::{NewToken, SqliteClientTokenRepo, open_migrated};
+    use crate::server::role::ROLE_MARKER_NAME;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// PR-354 fix D2: a COMMIT failure lands AFTER the print, so the run must
+    /// say the printed tokens are NOT valid, leave NO `qa` marker (the marker is
+    /// written only after a successful commit) and leave the database exactly as
+    /// it was — and the re-run must then succeed.
+    #[tokio::test]
+    async fn a_commit_failure_leaves_no_marker_and_the_re_run_works() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("qa-data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("pulse.db");
+        let handle = open_migrated(&db).await.unwrap();
+        // A copied prod token, so the replace has something to revoke.
+        let repo = SqliteClientTokenRepo::new(handle.pool().clone());
+        repo.issue("copied-app", "app", &"a".repeat(64), "cli:token-issue")
+            .await
+            .unwrap();
+        handle.pool().close().await;
+
+        let args = QaSeedArgs {
+            db: db.clone(),
+            data_dir: data_dir.clone(),
+        };
+        probe::fail_next_commit();
+        let error = run_qa_seed(&args)
+            .await
+            .expect_err("the injected commit failure fails the run");
+        let message = error.to_string();
+        assert!(
+            message.contains("NOT valid") && message.contains("re-run"),
+            "the message says the printed tokens are not valid: {message}"
+        );
+        assert!(
+            !data_dir.join(ROLE_MARKER_NAME).exists(),
+            "no marker after a commit failure"
+        );
+
+        // Nothing was written: the copied token is still active, and the fresh
+        // labels are free — the re-run succeeds and marks the dir.
+        run_qa_seed(&args).await.expect("the re-run succeeds");
+        assert_eq!(
+            fs::read_to_string(data_dir.join(ROLE_MARKER_NAME)).unwrap(),
+            "qa\n"
+        );
+        let handle = open_migrated(&db).await.unwrap();
+        let active: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM client_token WHERE revoked_at IS NULL")
+                .fetch_one(handle.pool())
+                .await
+                .unwrap();
+        assert_eq!(active, 2, "exactly the two fresh tokens are active");
+        handle.pool().close().await;
+    }
+
+    /// The reserved labels (PR-354 fix D7) are exactly the seed's two: the
+    /// ordinary issue path refuses them, and the seed itself still issues both.
+    #[tokio::test]
+    async fn the_seed_issues_the_labels_the_ordinary_path_reserves() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("qa-data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("pulse.db");
+        let handle = open_migrated(&db).await.unwrap();
+        let repo = SqliteClientTokenRepo::new(handle.pool().clone());
+        let fresh = [
+            NewToken {
+                label: "qa-app",
+                scope: "app",
+                token_sha256: &"b".repeat(64),
+            },
+            NewToken {
+                label: "qa-agent",
+                scope: "agent",
+                token_sha256: &"c".repeat(64),
+            },
+        ];
+        repo.replace_all_with_published(&fresh, "cli:qa-seed", || Ok::<(), String>(()))
+            .await
+            .expect("the seed issues the reserved labels");
+        let active: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM client_token WHERE revoked_at IS NULL")
+                .fetch_one(handle.pool())
+                .await
+                .unwrap();
+        assert_eq!(active, 2);
+        handle.pool().close().await;
+    }
 }
