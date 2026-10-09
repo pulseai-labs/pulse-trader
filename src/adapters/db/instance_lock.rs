@@ -1,13 +1,14 @@
 //! The per-database instance lock (#250, r4.s2.w2).
 //!
-//! `pulse serve` holds this lock for its process lifetime; `pulse import` and
-//! `pulse restore` take it on their TARGET before any write. It is a
+//! `pulse serve` holds this lock for its process lifetime. `pulse import` and
+//! `pulse restore` take none in this PR — the enforcement for them was split
+//! out to issue #355, so the operator stops the server before either. It is a
 //! **non-blocking** exclusive `flock(2)` on `<db path>.serve.lock`, beside the
 //! RESOLVED database (PR-354 fix C3b: the resolved identity, so every spelling
 //! of one database takes one lock) — the same idiom
 //! [`migrate`](super::migrate)'s migration lock uses,
 //! except that a held lock is a REFUSAL with a named reason here, never a wait:
-//! the operator stops the server (or the in-flight data op) and retries.
+//! the operator stops the server that holds it and retries.
 //!
 //! Dropping the guard releases the lock: `flock` is per open-file-description,
 //! so closing the file — a panicking path included — frees a waiter.
@@ -21,8 +22,8 @@ const LOCK_SUFFIX: &str = ".serve.lock";
 /// Why an instance lock could not be taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InstanceLockError {
-    /// Another process holds the lock: a running `pulse serve`, or an in-flight
-    /// import/restore that holds it until its install completes.
+    /// Another process holds the lock: a running `pulse serve` — the only
+    /// holder in this PR (the import/restore lock is issue #355).
     Held {
         /// The database whose instance lock is held.
         target: PathBuf,
@@ -103,9 +104,9 @@ impl InstanceLock {
     /// own directory — the directory being the RESOLVED identity's, so every
     /// spelling of one database takes one lock (PR-354 fix C3b): a symlink to
     /// the database, or a symlinked directory component, resolves to the same
-    /// file as the real path, and `pulse serve pulse.db` and
-    /// `pulse import --db link.db` can no longer take two different locks while
-    /// the import renames over the live database.
+    /// file as the real path, so two `pulse serve` spellings of one database —
+    /// `--db pulse.db` and `--db link.db`, say — can no longer take two
+    /// different locks.
     ///
     /// The rule is [`canonical_identity`]: the deepest existing ancestor is
     /// canonicalized and any not-yet-existing tail is appended unchanged, so a

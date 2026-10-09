@@ -241,7 +241,7 @@ impl<C: Clock> SqliteClientTokenRepo<C> {
 
     /// Insert one `client_token` row plus its `issued` audit row INSIDE the
     /// caller's transaction, returning the new row id. One home for the two INSERT
-    /// shapes every issuing path writes (`issue` and `replace_all_with`).
+    /// shapes the issuing path writes (`issue`).
     async fn insert_issued_row(
         conn: &mut SqliteConnection,
         token: NewToken<'_>,
