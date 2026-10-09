@@ -40,6 +40,19 @@ pub(crate) enum InstanceLockError {
         /// Why it was refused.
         reason: String,
     },
+    /// The path resolves through a DANGLING SYMLINK — a component that exists
+    /// as a symlink, but whose referent `canonicalize` cannot follow (PR-354
+    /// fix P1). The walk used to append the link's name: the lock would land
+    /// beside the LINK while SQLite follows it to the referent, so a server on
+    /// the referent took a DIFFERENT lock and the import's same-target refusal
+    /// compared the wrong identity. Refused by name, never followed, never
+    /// appended.
+    DanglingSymlink {
+        /// The path as given.
+        target: PathBuf,
+        /// The dangling link the walk reached.
+        link: PathBuf,
+    },
     /// The lock file could not be reached (parent directory, create, open).
     Io {
         /// The lock file the call failed on.
@@ -77,6 +90,13 @@ impl core::fmt::Display for InstanceLockError {
             Self::Unresolved { target, reason } => {
                 write!(f, "cannot resolve {}: {reason}", target.display())
             }
+            Self::DanglingSymlink { target, link } => write!(
+                f,
+                "cannot resolve {}: {} is a dangling symlink — refusing rather than following \
+                 or appending it (point --db at the referent once it exists)",
+                target.display(),
+                link.display()
+            ),
             Self::HardLinked { target, links } => write!(
                 f,
                 "the database {} has {links} hard links — a hard-linked alias would take a \
@@ -115,7 +135,9 @@ impl InstanceLock {
     /// # Errors
     ///
     /// [`InstanceLockError::Unresolved`] when the database path's unresolved
-    /// tail holds a `.`/`..` component (PR-354 fix Z1).
+    /// tail holds a `.`/`..` component (PR-354 fix Z1), and
+    /// [`InstanceLockError::DanglingSymlink`] when a component exists as a
+    /// symlink the walk cannot follow (PR-354 fix P1).
     pub(crate) fn lock_path(db_path: &Path) -> Result<PathBuf, InstanceLockError> {
         let resolved = canonical_identity(db_path)?;
         let mut name = resolved.file_name().map_or_else(
@@ -236,6 +258,15 @@ fn is_dot_component(segment: &std::ffi::OsString) -> bool {
     segment == "." || segment == ".."
 }
 
+/// Whether `path` EXISTS as a symlink whose referent the walk cannot follow —
+/// exactly the `NotFound` case [`canonical_identity`] meets on a component
+/// (PR-354 fix P1). `symlink_metadata` does not follow the link, so this
+/// answers without touching the referent, and a component that simply does not
+/// exist is not a dangling symlink.
+fn is_dangling_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
 /// `path` with every symlinked ancestor resolved and any not-yet-existing tail
 /// preserved: the deepest ancestor that EXISTS is canonicalized and the
 /// remaining components are appended unchanged. The tail must be made of plain
@@ -251,7 +282,9 @@ fn is_dot_component(segment: &std::ffi::OsString) -> bool {
 /// # Errors
 ///
 /// [`InstanceLockError::Unresolved`] when the unresolved tail holds a `.`/`..`
-/// component, or when the walk cannot reach an existing ancestor.
+/// component, or when the walk cannot reach an existing ancestor, and
+/// [`InstanceLockError::DanglingSymlink`] when a component EXISTS as a symlink
+/// the walk cannot follow (PR-354 fix P1).
 pub(crate) fn canonical_identity(path: &Path) -> Result<PathBuf, InstanceLockError> {
     let refuse = |reason: String| InstanceLockError::Unresolved {
         target: path.to_path_buf(),
@@ -295,6 +328,17 @@ pub(crate) fn canonical_identity(path: &Path) -> Result<PathBuf, InstanceLockErr
                          normalizing the path",
                         segment.to_string_lossy()
                     )));
+                }
+                // A component `canonicalize` cannot follow, but that EXISTS as a
+                // symlink, is DANGLING (PR-354 fix P1): the walk used to append
+                // the link's name, so the lock landed beside the LINK while
+                // SQLite follows it to the referent — two locks for one
+                // database. Refused by name instead.
+                if is_dangling_symlink(&prefix) {
+                    return Err(InstanceLockError::DanglingSymlink {
+                        target: path.to_path_buf(),
+                        link: prefix,
+                    });
                 }
                 tail.push(segment);
             }
@@ -445,6 +489,7 @@ mod tests {
             }
             other @ (InstanceLockError::Io { .. }
             | InstanceLockError::HardLinked { .. }
+            | InstanceLockError::DanglingSymlink { .. }
             | InstanceLockError::Unresolved { .. }) => {
                 panic!("expected Held, got {other:?}");
             }
@@ -488,6 +533,51 @@ mod tests {
                 other => panic!("the refusal is HardLinked, not {other:?}"),
             }
         }
+    }
+
+    /// PR-354 fix P1 (Codex 4231276344): a DANGLING final symlink as the
+    /// database is REFUSED by name. `fs::canonicalize` returns `NotFound` for it,
+    /// so the walk appended the link's name — the lock landed beside the
+    /// SYMLINK while SQLite follows it to the referent, and a server on the
+    /// referent took a DIFFERENT lock. Nothing is created by the refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_database_is_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).expect("the data dir");
+        let referent = data.join("gone").join("real.db");
+        let link = data.join("pulse.db");
+        std::os::unix::fs::symlink(&referent, &link).expect("the dangling symlink");
+
+        let error = canonical_identity(&link)
+            .expect_err("a dangling symlink must be refused, never appended");
+        let message = error.to_string();
+        assert!(
+            message.contains("dangling symlink") && message.contains(&link.display().to_string()),
+            "the refusal names the path and says it is a dangling symlink: {message}"
+        );
+
+        // The acquire takes the same refusal, and it creates nothing at all:
+        // no lock file, no referent, no referent directory.
+        let refused = InstanceLock::acquire(&link).expect_err("the lock refuses it too");
+        assert!(
+            refused.to_string().contains("dangling symlink"),
+            "the acquire refusal keeps the name: {refused}"
+        );
+        assert!(
+            !data.join("pulse.db.serve.lock").exists(),
+            "no lock file was created"
+        );
+        assert!(
+            !referent.exists(),
+            "and no referent: {}",
+            referent.display()
+        );
+        assert!(
+            !data.join("gone").exists(),
+            "and no referent directory was created"
+        );
     }
 
     /// PR-354 fix Z1: the identity walk REFUSES a `.` or `..` in the unresolved

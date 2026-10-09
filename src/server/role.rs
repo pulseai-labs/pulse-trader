@@ -137,6 +137,23 @@ pub enum RoleRefused {
         /// The offending component (`..` or `.`).
         component: String,
     },
+    /// A component of the path EXISTS as a symlink the walk cannot follow — the
+    /// link is DANGLING (PR-354 fix P1). The walk used to append the link's
+    /// name, so the containment check passed LEXICALLY (the link sits inside
+    /// the data dir) while SQLite would follow it to a referent elsewhere: the
+    /// role marker would be applied to the wrong data. Refused by name, never
+    /// followed and never appended.
+    #[error(
+        "the path {} is a dangling symlink ({}): refusing rather than following or appending it",
+        path.display(),
+        link.display()
+    )]
+    DanglingSymlink {
+        /// The path as given.
+        path: PathBuf,
+        /// The dangling link the walk reached.
+        link: PathBuf,
+    },
     /// A path could not be resolved for the containment check.
     #[error("cannot resolve {}: {source}", path.display())]
     PathUnresolved {
@@ -453,6 +470,15 @@ fn is_dot_component(segment: &OsString) -> bool {
     segment == "." || segment == ".."
 }
 
+/// Whether `path` EXISTS as a symlink whose referent the walk cannot follow —
+/// exactly the `NotFound` case [`resolve`] meets on a component (PR-354 fix P1).
+/// `symlink_metadata` does not follow the link, so this answers without
+/// touching the referent, and a component that simply does not exist is not a
+/// dangling symlink.
+fn is_dangling_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
 /// The absolute, symlink-resolved form of `path`, resolved through its deepest
 /// EXISTING ancestor so a path whose final components do not exist yet (the
 /// database a `--role` start is about to create) resolves consistently with one
@@ -464,9 +490,11 @@ fn is_dot_component(segment: &OsString) -> bool {
 ///
 /// # Errors
 ///
-/// [`RoleRefused::DotComponent`] for a `.`/`..` in the unresolved tail, and
-/// [`RoleRefused::PathUnresolved`] on any IO error while walking — the caller
-/// turns both into a named refusal, never a silent pass.
+/// [`RoleRefused::DotComponent`] for a `.`/`..` in the unresolved tail,
+/// [`RoleRefused::DanglingSymlink`] for a component that exists as a symlink
+/// the walk cannot follow (PR-354 fix P1), and [`RoleRefused::PathUnresolved`]
+/// on any IO error while walking — the caller turns both into a named refusal,
+/// never a silent pass.
 fn resolve(path: &Path) -> Result<PathBuf, RoleRefused> {
     let unresolved = |source| RoleRefused::PathUnresolved {
         path: path.to_path_buf(),
@@ -508,6 +536,17 @@ fn resolve(path: &Path) -> Result<PathBuf, RoleRefused> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if is_dot_component(&segment) {
                     return Err(dot(&segment));
+                }
+                // A component `canonicalize` cannot follow, but that EXISTS as a
+                // symlink, is DANGLING (PR-354 fix P1): the walk used to append
+                // the link's name, so the containment check passed LEXICALLY
+                // while SQLite would follow the link to a referent elsewhere.
+                // Refused by name instead.
+                if is_dangling_symlink(&prefix) {
+                    return Err(RoleRefused::DanglingSymlink {
+                        path: path.to_path_buf(),
+                        link: prefix,
+                    });
                 }
                 tail.push(segment);
             }
@@ -632,6 +671,43 @@ mod tests {
             }
             other => panic!("the failure is the create's MarkerWrite: {other}"),
         }
+    }
+
+    /// PR-354 fix P1 (Codex 4231276344): a DANGLING final symlink as the
+    /// database is REFUSED by name. `resolve` used to append the link's name,
+    /// so the LEXICAL containment check PASSED (the link sits inside the data
+    /// dir) while SQLite would follow the link to a referent elsewhere — the
+    /// marker would be applied to the wrong data. Nothing is created.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_database_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let data = dir.path().join("qa-data");
+        fs::create_dir_all(&data).unwrap();
+        let referent = dir.path().join("outside").join("real.db");
+        let link = data.join("pulse.db");
+        std::os::unix::fs::symlink(&referent, &link).unwrap();
+
+        let error = check_before_lock(&data, &link, ServerRole::Qa)
+            .expect_err("a dangling symlink database must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("dangling symlink") && message.contains(&link.display().to_string()),
+            "the refusal names the path and says it is a dangling symlink: {message}"
+        );
+        assert!(
+            !data.join(ROLE_MARKER_NAME).exists(),
+            "no marker was written"
+        );
+        assert!(
+            !data.join("pulse.db.serve.lock").exists(),
+            "no instance lock file either"
+        );
+        assert!(!referent.exists(), "no referent was created");
+        assert!(
+            !dir.path().join("outside").exists(),
+            "and no referent directory"
+        );
     }
 
     /// PR-354 fix D1b: a data dir this code creates is 0700, never the process
