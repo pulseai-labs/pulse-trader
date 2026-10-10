@@ -63,6 +63,16 @@ Both take `{ "left": <operand>, "op": <comparator>, "right": <operand> }`.
 **Every operand — left AND right — MUST include a `source`.** Pick one shape:
 
 - `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx"|"atr", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number>, "output": "line"|"signal"|"histogram" }` (the optional `output` picks which MACD series the operand reads; omit it for the line) — or for the rolling extremes: `{ "source": "indicator", "indicator": "highest"|"lowest", "period": <number> }` (the highest value / lowest value of the last `period` **prior** bars, excluding the current one; add `"price_field": "high"` for `highest` and `"price_field": "low"` for `lowest` unless the trader names another field)
+
+- **The schema-1.3.0 structure and pattern indicators** (the swing structure a
+  breakout is built from; each is still an `indicator` operand, so any of them
+  may carry `"timeframe": "h4"`, and they all work on any series):
+  - **pivots** — `{ "source": "indicator", "indicator": "pivot_high"|"pivot_low", "left": <number>, "right": <number> }`: the most recent confirmed swing high / swing low — a bar whose high strictly exceeds the `left` bars before it and is at least equal to the `right` bars after it (lows mirror it). A pivot is **confirmed only once its `right` bars have closed**, and its value then **never repaints**: a pivot whose right bars are still forming does not exist for any value.
+  - **levels** — `{ "source": "indicator", "indicator": "resistance"|"support", "left": <number>, "right": <number>, "tolerance_pct": "<decimal fraction>", "min_touches": <number>, "lookback": <number> }`: the nearest level above the close (`resistance`) — below it (`support`) — built from confirmed pivots within the last `lookback` bars: `min_touches` pivots that all sit within `tolerance_pct` of each other form a level, whose value is the mean of its touching pivots. `tolerance_pct` is a decimal **fraction**, the `distance_pct` convention: `"0.01"` = 1%, never `1` or `"1%"`. **The zone-break trap:** `resistance` is by definition the nearest level strictly **above** the close of its own bar, so `close > resistance` and a same-bar `crosses_above` on it **can never hold**. Break it against the **previous** bar's level: `{ "left": { "source": "price", "price_field": "close", "timeframe": "h4" }, "op": "crosses_above", "right": { "source": "lag", "bars": 1, "of": <the resistance operand> } }` — the `lag` reads the operand's value one bar back **on the operand's own series**, so on a `"timeframe": "h4"` operand it is the previous H4 bar (the mirror for a short is `crosses_below` of the close over `lag(support{…}, 1)`).
+  - **anatomy** — `{ "source": "indicator", "indicator": "body"|"upper_wick"|"lower_wick"|"range" }`: the current bar's `|close − open|`, `high − max(open, close)`, `min(open, close) − low` and `high − low`.
+  - **necklines** — `{ "source": "indicator", "indicator": "double_top_neckline"|"double_bottom_neckline", "left": <number>, "right": <number>, "tolerance_pct": "<decimal fraction>" }`: the barrier a double top / double bottom breaks — the lowest low strictly between the last two confirmed pivot highs when those are within `tolerance_pct` of each other (the mirror: the highest high between the last two within-tolerance pivot lows).
+  - **trendlines** — `{ "source": "indicator", "indicator": "trendline_lows"|"trendline_highs", "left": <number>, "right": <number> }`: the line through the last two confirmed pivot lows / pivot highs, extended to the current bar — defined only when the pair rises (lows) / falls (highs).
+
 - `{ "source": "price", "price_field": "open"|"high"|"low"|"close"|"volume" }`
 - `{ "source": "constant", "value": "<decimal string>" }`  ← a bare threshold like 30 is a **constant**: `{ "source": "constant", "value": "30" }`
 - `{ "source": "arith", "op": "add"|"sub"|"mul"|"div", "lhs": <operand>, "rhs": <operand> }` — a pointwise arithmetic combination of two operands, e.g. `atr(14) / close`: `{ "source": "arith", "op": "div", "lhs": { "source": "indicator", "indicator": "atr", "period": 14 }, "rhs": { "source": "price", "price_field": "close" } }`
@@ -130,6 +140,28 @@ EMA. The slope condition takes no `right` operand; `"bars": 1` may be omitted
 `stop_loss_pct` is not added alongside it. The daily confirmation gates on the
 **daily** close versus the **daily** EMA(50) — `"timeframe": "d1"` on BOTH
 operands.
+
+### Worked example — "4h resistance breakout with a strong body and a trendline break"
+
+Call the tools one at a time, in this order:
+
+1. `create_strategy` → `{ "name": "S/R Breakout 4H", "direction": "long" }`
+2. `add_entry_signal` → `{ "left": { "source": "price", "price_field": "close", "timeframe": "h4" }, "op": "crosses_above", "right": { "source": "lag", "bars": 1, "of": { "source": "indicator", "indicator": "resistance", "left": 2, "right": 1, "tolerance_pct": "0.01", "min_touches": 2, "lookback": 150, "timeframe": "h4" } } }`
+3. `add_filter` → `{ "left": { "source": "indicator", "indicator": "body", "timeframe": "h4" }, "op": "gt", "right": { "source": "arith", "op": "mul", "lhs": { "source": "indicator", "indicator": "range", "timeframe": "h4" }, "rhs": { "source": "constant", "value": "0.5" } } }`
+4. `add_filter` → `{ "left": { "source": "price", "price_field": "close", "timeframe": "h4" }, "op": "gt", "right": { "source": "indicator", "indicator": "trendline_highs", "left": 2, "right": 1, "timeframe": "h4" } }`
+5. `set_exit_rules` → `{ "stop_loss_pct": "0.015", "take_profit_r": "1" }`
+6. `set_risk_params` → `{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }`
+7. `finalize_strategy` → `{}`
+
+The entry is the **zone-break form**: the H4 close crosses above the level the
+`resistance` indicator carried on the **previous** H4 bar (`lag(…, 1)`), never
+the same bar's level — a `resistance` value sits above its own bar's close by
+definition, so comparing against it directly can never hold. Step 3 keeps
+only bars whose body is more than half their range, and step 4 requires the
+close to have broken the falling trendline through the last two swing highs;
+both are ANDed with the entry. Each structure/pattern operand carries
+`"timeframe": "h4"` because the strategy trades the H4 zone, and every value is
+read on the last **closed** H4 bar.
 
 ## Prompt-level invariants (absolute rules)
 

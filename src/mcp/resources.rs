@@ -56,6 +56,13 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "rolling_extremes",
         "`Highest{period, source}` and `Lowest{period, source}` cover the N closed bars BEFORE the current bar, excluding it (the prior-N convention, rendered `highest(high, 20 prior)`); `source` is any price field and defaults to `high` for `Highest` and `low` for `Lowest`; they warm up over N+1 bars and work on any series (`h4:highest(high, 20)` is the prior 20 closed H4 bars)",
     ),
+    // r4.s6.w1/w3 (schema 1.3.0), published by r4.s6.w4: the structure and
+    // pattern vocabulary — including the zone-break form the never-true
+    // same-bar comparison would violate.
+    (
+        "structure_indicators",
+        "the schema-1.3.0 structure and pattern variants work on any series (an `h4:` operand reads the last closed H4 bar): `PivotHigh{left,right}`/`PivotLow{left,right}` are the most recent confirmed swing high/low, confirmed only once the `right` bars after them have closed, so a value never repaints; `Resistance{left,right,tolerance_pct,min_touches,lookback}`/`Support{…}` are the nearest level strictly above/below the current close that at least `min_touches` (>= 2) confirmed pivots within `tolerance_pct` of each other touched, the level being the mean of its touches, a pivot counting while it stays inside `lookback` bars (`lookback` > `left + right`); `tolerance_pct` is a decimal fraction in (0, 0.10] (`0.003` = 0.3%); `Body`/`UpperWick`/`LowerWick`/`Range` are the current bar's `abs(close−open)`, `high−max(open,close)`, `min(open,close)−low` and `high−low`; `DoubleTopNeckline{left,right,tolerance_pct}`/`DoubleBottomNeckline{…}` are the lowest low/highest high strictly between the last two confirmed pivot highs/lows within tolerance; `TrendlineLows{left,right}`/`TrendlineHighs{left,right}` are the line through the last two rising/falling confirmed pivots extended to the current bar, its quotient rounded to 8 decimal places half-even; because a `Resistance`/`Support` level sits strictly above/below the close of its own bar by definition, a break compares the close with the PREVIOUS bar's level — `CrossesAbove(close, lag(Resistance{…}, 1))`, the lag counting H4 bars on an `h4:` operand (the mirror is `CrossesBelow` over `lag(Support{…}, 1)`) — never the same bar's level",
+    ),
     // r3.s2.w3 (Q2): value expressions — the semantics the grammar cannot
     // express, keyed by the construct each entry covers.
     (

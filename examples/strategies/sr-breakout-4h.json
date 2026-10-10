@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.3.0",
+  "name": "S/R Breakout 4H",
+  "direction": "long",
+  "entry": {
+    "type": "CrossesAbove",
+    "lhs": { "type": "Price", "series": "htf", "field": "Close" },
+    "rhs": {
+      "type": "Lag",
+      "value": {
+        "type": "Indicator",
+        "series": "htf",
+        "spec": {
+          "indicator": "Resistance",
+          "left": 2,
+          "right": 1,
+          "tolerance_pct": "0.01",
+          "min_touches": 2,
+          "lookback": 150
+        }
+      },
+      "bars": 1
+    }
+  },
+  "filters": [
+    {
+      "type": "Compare",
+      "lhs": { "type": "Indicator", "series": "htf", "spec": { "indicator": "Body" } },
+      "op": "Gt",
+      "rhs": {
+        "type": "Arith",
+        "op": "mul",
+        "lhs": { "type": "Indicator", "series": "htf", "spec": { "indicator": "Range" } },
+        "rhs": { "type": "Constant", "value": "0.5" }
+      }
+    },
+    {
+      "type": "Compare",
+      "lhs": { "type": "Price", "series": "htf", "field": "Close" },
+      "op": "Gt",
+      "rhs": {
+        "type": "Indicator",
+        "series": "htf",
+        "spec": { "indicator": "TrendlineHighs", "left": 2, "right": 1 }
+      }
+    }
+  ],
+  "exits": [
+    { "type": "StopLoss", "distance_pct": "0.015" },
+    { "type": "TakeProfit", "target_r": "1" }
+  ],
+  "risk": {
+    "risk_per_trade_pct": "0.01",
+    "max_leverage": "3"
+  }
+}
