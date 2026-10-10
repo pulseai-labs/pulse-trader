@@ -94,9 +94,9 @@ impl IndicatorSlot {
 /// Whether `spec` is one of the six level/pattern variants whose values are
 /// legitimately `None` on some bars after the indicator is ready — a broken
 /// zone, a within-tolerance neckline not yet paired, a wrong-way trendline.
-/// Their slots are warmed by `is_ready()` alone (see
-/// [`IndicatorEngine::is_warm`]); every other slot keeps the
-/// all-history-`Some` rule.
+/// Their slots are warmed by their LATCHED `is_ready()` plus the ring depth,
+/// without the all-history-`Some` rule (see [`IndicatorEngine::is_warm`]);
+/// every other slot keeps the all-`Some` rule.
 fn is_level_or_pattern(spec: &IndicatorSpec) -> bool {
     matches!(
         spec,
@@ -217,24 +217,30 @@ impl IndicatorEngine {
     /// strategy with no lag has `max_lag = 0`, so its warm point is exactly
     /// the pre-expression one.
     ///
-    /// **The level/pattern carve-out (r4.s6 PR-362 fix round 1, Codex
-    /// 4238952612 / close review R1).** The six level/pattern variants
-    /// (`Resistance`, `Support`, `DoubleTopNeckline`, `DoubleBottomNeckline`,
-    /// `TrendlineLows`, `TrendlineHighs`) yield `None` on a bar where no level
-    /// exists after they are ready — their `is_ready()` reports "a value is
-    /// possible at all", never "the next call returns `Some`" — and a clean
-    /// break of the only zone is exactly such a bar. The taught break
-    /// `CrossesAbove(close, lag(Resistance, 1))` reads the PREVIOUS bars'
-    /// values, so the breakout bar's own `None` must not hold the whole entry
-    /// gate cold. Such a slot therefore counts as warm once its `is_ready()`
-    /// is true; a `None` from it is read by the no-value rule (a comparison
-    /// over it is false), never as "not warm". Every other slot keeps the
+    /// **The level/pattern carve-out (r4.s6 PR-362 fix rounds 1-2, Codex
+    /// 4238952612/4239217700/4239217701 + close review R1).** The six
+    /// level/pattern variants (`Resistance`, `Support`, `DoubleTopNeckline`,
+    /// `DoubleBottomNeckline`, `TrendlineLows`, `TrendlineHighs`) yield `None`
+    /// on a bar where no level exists after they are ready — their `is_ready()`
+    /// reports "a value is possible at all", never "the next call returns
+    /// `Some`" — and a clean break of the only zone is exactly such a bar. The
+    /// taught break `CrossesAbove(close, lag(Resistance, 1))` reads the PREVIOUS
+    /// bars' values, so the breakout bar's own `None` must not hold the whole
+    /// entry gate cold. Such a slot therefore counts as warm once its
+    /// `is_ready()` is true AND its ring holds `max_lag + 2` values (rule B:
+    /// the ring-depth requirement stays — a lagged leaf never reads past the
+    /// history that exists, so a `Not` over an unavailable lag cannot fire
+    /// hundreds of bars early); a `None` from it is read by the no-value rule
+    /// (a comparison over it is false), never as "not warm". Its readiness is
+    /// LATCHED by the adapters (rule A): once true it never reverts, so a pivot
+    /// aging out of `lookback` cannot make the slot cold and freeze every
+    /// unrelated entry branch behind it. Every other slot keeps the
     /// all-history-`Some` rule unchanged.
     #[must_use]
     pub fn is_warm(&self) -> bool {
         self.indicators.iter().all(|slot| {
             if is_level_or_pattern(&slot.spec) {
-                slot.indicator.is_ready()
+                slot.history.len() == slot.max_lag as usize + 2 && slot.indicator.is_ready()
             } else {
                 slot.history.len() == slot.max_lag as usize + 2
                     && slot.history.iter().all(Option::is_some)

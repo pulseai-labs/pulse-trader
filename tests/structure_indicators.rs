@@ -1127,3 +1127,154 @@ fn a_clean_break_of_the_only_support_enters_on_the_break_bar() {
         "the level holds, then vanishes on the break bar"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (j) The warm gate's latch and ring depth (fix round 2, rules A + B)
+// ---------------------------------------------------------------------------
+
+/// Rule A (r4.s6 PR-362 fix round 2, Codex 4239217701 / CodeRabbit 4239215025):
+/// a level slot's readiness is LATCHED — once the window has held `min_touches`
+/// pivots it stays ready, so a pivot aging out of `lookback` cannot make the
+/// engine cold and freeze every unrelated entry branch. This strategy's entry
+/// is `Or(rsi(14) < 30, close > lag(resistance, 1))`: the level window empties
+/// at bar 7 (lookback 6) and the RSI branch can only fire around bar 15, so on
+/// db4f073 the gate is cold exactly when the RSI branch wants to fire — zero
+/// trades. With the latch the RSI branch fires once, long after the level
+/// window emptied.
+#[test]
+fn an_or_branch_still_fires_after_the_level_window_empties() {
+    let rows: [(i64, i64, i64, i64); 20] = [
+        (100, 100, 99, 100),
+        (100, 106, 100, 101), // pivot high 106
+        (101, 102, 100, 101), // confirms it
+        (101, 103, 100, 102),
+        (102, 107, 101, 103), // second pivot high 107 → the level, 106.5
+        (103, 103, 101, 102), // confirms it
+        (102, 102, 100, 101),
+        (101, 101, 99, 100), // the 106 pivot ages out of the 6-bar window
+        (100, 101, 99, 100),
+        (100, 100, 98, 99),
+        (99, 99, 97, 98), // the 107 pivot ages out too: the window is empty
+        (98, 98, 95, 96),
+        (96, 96, 93, 94),
+        (94, 94, 90, 91),
+        (91, 91, 87, 88),
+        (88, 88, 84, 85), // rsi(14) is now < 30 — the other branch wants in
+        (85, 86, 83, 84),
+        (84, 85, 83, 84),
+        (84, 85, 83, 84),
+        (84, 85, 83, 84),
+    ];
+    let candles = candles_from(&rows);
+    let spec = IndicatorSpec::Resistance {
+        left: fixed_u32(1),
+        right: fixed_u32(1),
+        tolerance_pct: fixed_dec(TOLERANCE),
+        min_touches: fixed_u32(2),
+        lookback: fixed_u32(6),
+    };
+    let entry = Condition::Or {
+        conditions: vec![
+            Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec: IndicatorSpec::Rsi {
+                        period: fixed_u32(14),
+                    },
+                },
+                op: Comparator::Lt,
+                rhs: ValueSource::Constant { value: dec(30) },
+            },
+            Condition::Compare {
+                lhs: ValueSource::Price {
+                    series: Series::Primary,
+                    field: PriceField::Close,
+                },
+                op: Comparator::Gt,
+                rhs: ValueSource::Lag {
+                    value: Box::new(ValueSource::Indicator {
+                        series: Series::Primary,
+                        spec: spec.clone(),
+                    }),
+                    bars: 1,
+                },
+            },
+        ],
+    };
+    let result = run_primary(&compiled(&long_dsl(entry)), &m15_series(candles.clone()));
+
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "the RSI branch fires once the latch keeps the gate open"
+    );
+    let trade = &result.trades[0];
+    let signal_bar = candles
+        .iter()
+        .position(|candle| candle.close_time == trade.entry_signal_time)
+        .expect("the signal time resolves to a fixture bar");
+    assert!(
+        signal_bar >= 10,
+        "the entry fires after the level window emptied (bar {signal_bar}); on \
+         db4f073 the gate went cold at bar 7 and no trade ever fired"
+    );
+}
+
+/// Rule B (r4.s6 PR-362 fix round 2, Codex 4239217700): the level/pattern slots
+/// keep the `history.len() == max_lag + 2` ring-depth requirement — F3 relaxed
+/// only the all-`Some` rule. `Not(Compare(lag(resistance, 20), …))` turns the
+/// unavailable lag into a real entry, so with the ring requirement dropped the
+/// gate opens at bar 5 and the `Not` fires there, 16 bars before the requested
+/// history exists. With the ring kept, the first warm bar is bar 21.
+#[test]
+fn a_deep_lag_keeps_the_gate_closed_until_the_ring_holds_it() {
+    let mut rows: Vec<(i64, i64, i64, i64)> = vec![
+        (100, 100, 99, 100),
+        (100, 106, 100, 101), // pivot high 106
+        (101, 102, 100, 101), // confirms it
+        (101, 103, 100, 102),
+        (102, 107, 101, 103), // second pivot high 107 → the level, 106.5
+        (103, 103, 101, 102), // confirms it; the level holds from here
+    ];
+    rows.extend(std::iter::repeat_n((102, 103, 101, 102), 20));
+    let candles = candles_from(&rows);
+
+    let spec = IndicatorSpec::Resistance {
+        left: fixed_u32(1),
+        right: fixed_u32(1),
+        tolerance_pct: fixed_dec(TOLERANCE),
+        min_touches: fixed_u32(2),
+        lookback: fixed_u32(60),
+    };
+    let entry = Condition::Not {
+        condition: Box::new(Condition::Compare {
+            lhs: ValueSource::Lag {
+                value: Box::new(ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec: spec.clone(),
+                }),
+                bars: 20,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant { value: dec(0) },
+        }),
+    };
+    let result = run_primary(&compiled(&long_dsl(entry)), &m15_series(candles.clone()));
+
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "the Not fires once, and only once the ring holds the lag"
+    );
+    let trade = &result.trades[0];
+    let signal_bar = candles
+        .iter()
+        .position(|candle| candle.close_time == trade.entry_signal_time)
+        .expect("the signal time resolves to a fixture bar");
+    assert!(
+        signal_bar >= 21,
+        "the gate opens only when the slot's ring holds max_lag + 2 = 22 values \
+         (bar 21); on db4f073 it opened at bar 5 and the Not fired there \
+         (bar {signal_bar})"
+    );
+}

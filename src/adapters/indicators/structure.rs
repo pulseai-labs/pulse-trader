@@ -253,6 +253,12 @@ pub struct LevelIndicator {
     /// Bars fed so far (mirrors the tracker's counter so the window rule can be
     /// evaluated against the current bar).
     seen: u64,
+    /// The readiness latch (r4.s6 PR-362 fix round 2, rule A): `true` once the
+    /// window has held `min_touches` pivots at any bar, and never back to
+    /// `false`. Readiness must be monotonic because the engine's warm gate
+    /// reads it: a pivot aging out of `lookback` must not make a warmed level
+    /// slot cold again and freeze every unrelated entry branch behind it.
+    ready: bool,
 }
 
 impl LevelIndicator {
@@ -288,6 +294,7 @@ impl LevelIndicator {
             lookback,
             above,
             seen: 0,
+            ready: false,
         })
     }
 
@@ -366,6 +373,10 @@ impl Indicator for LevelIndicator {
             }
             self.pivots.pop_front();
         }
+        // Latch readiness (rule A): once the window has held `min_touches`
+        // pivots, it stays ready — the eviction above must not un-warm a slot
+        // the engine's gate already opened.
+        self.ready = self.ready || self.pivots.len() >= self.min_touches as usize;
         self.level(candle.close)
     }
 
@@ -374,12 +385,13 @@ impl Indicator for LevelIndicator {
         // every other adapter; a level cannot promise that, because whether the
         // NEXT bar's close sits below (resistance) or above (support) a
         // qualifying run is the next bar's own fact. This reports the part the
-        // indicator can know: enough pivots are in the window for a level to be
-        // possible at all. The engine's warm gate reads this as genuine
-        // readiness for a level/pattern slot (r4.s6 PR-362 fix round 1): past
-        // it, a `None` value means "no level at this bar" and a comparison over
-        // it is false — it can never be an entry by itself.
-        self.pivots.len() >= self.min_touches as usize
+        // indicator can know: enough pivots have been in the window for a level
+        // to be possible at all. The engine's warm gate reads it as readiness
+        // for a level/pattern slot (r4.s6 PR-362 fix rounds 1-2): past it, a
+        // `None` value means "no level at this bar" and a comparison over it is
+        // false — it can never be an entry by itself. LATCHED: once true it
+        // never reverts (a pivot aging out of `lookback` cannot freeze the gate).
+        self.ready
     }
 }
 

@@ -198,6 +198,8 @@ impl Indicator for NecklineIndicator {
         // limit. The engine's warm gate reads this as genuine readiness for a
         // level/pattern slot (r4.s6 PR-362 fix round 1): past it, a `None` value
         // is a no-value reading, false in a comparison, never an entry itself.
+        // Monotonic by construction (`earlier` is only ever assigned from
+        // `latest`, so it never returns to `None`) — no latch needed (rule A).
         self.earlier.is_some()
     }
 }
@@ -283,7 +285,9 @@ impl Indicator for TrendlineIndicator {
     fn is_ready(&self) -> bool {
         // The neckline's reading of the same limit: a pair has confirmed, so a
         // value is possible at all — and the engine's warm gate reads it as
-        // readiness for this slot (r4.s6 PR-362 fix round 1).
+        // readiness for this slot (r4.s6 PR-362 fix round 1). Monotonic by
+        // construction (`earlier` is only ever assigned from `latest`) — no
+        // latch needed (rule A).
         self.earlier.is_some()
     }
 }
