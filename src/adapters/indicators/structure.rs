@@ -312,51 +312,94 @@ impl LevelIndicator {
     /// cluster the old disjoint sweep split — `[100, 109]` then a lone `118`
     /// at 10% tolerance — still forms `[109, 118]`.
     fn level(&self, close: Decimal) -> Option<Decimal> {
+        let mut best: Option<Decimal> = None;
+        self.for_each_candidate(|mean| {
+            let qualifies = if self.above {
+                mean > close
+            } else {
+                mean < close
+            };
+            if qualifies {
+                best = Some(match best {
+                    None => mean,
+                    Some(current) if self.above => current.min(mean),
+                    Some(current) => current.max(mean),
+                });
+            }
+        });
+        best
+    }
+
+    /// Visit every candidate level — the mean of each maximal within-tolerance
+    /// run of the sorted in-window pivot prices — in ascending-anchor order.
+    /// [`LevelIndicator::level`] keeps the best of them; the scan's proptest
+    /// compares the whole set against a naive reference scan.
+    fn for_each_candidate(&self, mut visit: impl FnMut(Decimal)) {
         if self.pivots.len() < self.min_touches as usize {
-            return None;
+            return;
         }
         let mut prices: Vec<Decimal> = self.pivots.iter().map(|pivot| pivot.price).collect();
         prices.sort();
 
-        let mut best: Option<Decimal> = None;
+        // The window `[start, end)` is the maximal run for the current start.
+        // `end` moves forward only — the tolerance threshold `p_i × (1 + tol)`
+        // grows with the anchor — so every price enters and leaves the window
+        // once and the whole scan is linear in the pivot count (r4.s6 PR-362
+        // fix round 2, rule C). The window's sum is carried across starts:
+        // subtract the anchor that leaves, add the prices that enter.
+        let mut end = 1_usize;
+        let mut total = prices[0];
+        let mut sum_ok = true;
         for start in 0..prices.len() {
-            // The run's anchor is its LOWEST price; the run extends while a
-            // later price sits within `tolerance_pct` of that anchor. Every
-            // start is considered, so the scan is O(run length) per pivot.
-            let anchor = prices[start];
-            let mut total = anchor;
-            let mut count = 1u32;
-            let mut overflow = false;
-            let mut cursor = start + 1;
-            while cursor < prices.len()
-                && within_tolerance(anchor, prices[cursor], self.tolerance_pct)
-            {
-                match total.checked_add(prices[cursor]) {
-                    Some(sum) => total = sum,
-                    None => overflow = true,
+            if end < start + 1 {
+                // The previous run ended at its anchor: open a fresh window.
+                end = start + 1;
+                total = prices[start];
+                sum_ok = true;
+            } else if !sum_ok {
+                // A run left `Decimal`'s range: rebuild this window's sum from
+                // scratch (the checked-op contract) and carry on.
+                let mut acc = Decimal::ZERO;
+                let mut ok = true;
+                for price in &prices[start..end] {
+                    match acc.checked_add(*price) {
+                        Some(sum) => acc = sum,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
-                count = count.saturating_add(1);
-                cursor += 1;
+                total = acc;
+                sum_ok = ok;
+            } else if start > 0 {
+                // The anchor that leaves the window; subtracting from a
+                // representable sum is exact.
+                total = total
+                    .checked_sub(prices[start - 1])
+                    .unwrap_or(Decimal::ZERO);
             }
-            if overflow || count < self.min_touches {
+            while end < prices.len()
+                && within_tolerance(prices[start], prices[end], self.tolerance_pct)
+            {
+                let Some(sum) = total.checked_add(prices[end]) else {
+                    // The run's sum left `Decimal`'s range: this start has no
+                    // candidate — never a phantom mean (R2-6). The next start's
+                    // scan resumes here and rebuilds the sum from scratch.
+                    sum_ok = false;
+                    break;
+                };
+                total = sum;
+                end += 1;
+            }
+            let count = u32::try_from(end - start).unwrap_or(u32::MAX);
+            if !sum_ok || count < self.min_touches {
                 continue;
             }
             if let Some(mean) = group_mean(total, count) {
-                let qualifies = if self.above {
-                    mean > close
-                } else {
-                    mean < close
-                };
-                if qualifies {
-                    best = Some(match best {
-                        None => mean,
-                        Some(current) if self.above => current.min(mean),
-                        Some(current) => current.max(mean),
-                    });
-                }
+                visit(mean);
             }
         }
-        best
     }
 }
 
@@ -442,5 +485,106 @@ impl Indicator for Anatomy {
         // candle can carry, the next call returns Some (the checked steps
         // above are the overflow contract, not an expected `None`).
         true
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{Extreme, LevelIndicator, Pivot, PivotTracker, group_mean, within_tolerance};
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, RngSeed};
+    use rust_decimal::Decimal;
+    use std::collections::VecDeque;
+
+    /// The F4 rule written out naively — every start scanned from scratch, in
+    /// the order the rule states — the oracle the two-pointer scan must
+    /// reproduce exactly: same candidates, same order, same duplicates.
+    fn naive_candidates(
+        prices: &[Decimal],
+        tolerance_pct: Decimal,
+        min_touches: u32,
+    ) -> Vec<Decimal> {
+        let mut sorted = prices.to_vec();
+        sorted.sort();
+        let mut candidates = Vec::new();
+        for start in 0..sorted.len() {
+            let anchor = sorted[start];
+            let mut total = anchor;
+            let mut count = 1_u32;
+            let mut overflow = false;
+            for &price in &sorted[start + 1..] {
+                if !within_tolerance(anchor, price, tolerance_pct) {
+                    break;
+                }
+                match total.checked_add(price) {
+                    Some(sum) => total = sum,
+                    None => overflow = true,
+                }
+                count = count.saturating_add(1);
+            }
+            if overflow || count < min_touches {
+                continue;
+            }
+            if let Some(mean) = group_mean(total, count) {
+                candidates.push(mean);
+            }
+        }
+        candidates
+    }
+
+    /// A `LevelIndicator` whose window holds exactly `prices`. The scan reads
+    /// only `pivots`, `tolerance_pct` and `min_touches`, so the pivot tracker is
+    /// bypassed and the run scan is exercised directly.
+    fn indicator_with_prices(
+        prices: &[Decimal],
+        tolerance_pct: Decimal,
+        min_touches: u32,
+    ) -> LevelIndicator {
+        LevelIndicator {
+            tracker: PivotTracker::new(1, 1, Extreme::High),
+            pivots: prices
+                .iter()
+                .enumerate()
+                .map(|(bar, price)| Pivot {
+                    bar: bar as u64,
+                    price: *price,
+                })
+                .collect::<VecDeque<_>>(),
+            tolerance_pct,
+            min_touches,
+            lookback: 60,
+            above: true,
+            seen: 0,
+            ready: true,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            rng_seed: RngSeed::Fixed(0x725F_5EED),
+            ..ProptestConfig::default()
+        })]
+
+        /// Rule C's proof (r4.s6 PR-362 fix round 2): over random sorted price
+        /// sets (1..=24 prices in 1..=2000), tolerances in (0, 0.10] and
+        /// `min_touches` 1..=5, the two-pointer scan yields exactly the naive
+        /// reference scan's candidate list. Deterministic: fixed seed, 512 cases.
+        #[test]
+        fn the_two_pointer_scan_matches_the_naive_reference(
+            mut prices in prop::collection::vec(1_i64..=2_000, 1..=24),
+            tolerance_milli in 1_u32..=100,
+            min_touches in 1_u32..=5,
+        ) {
+            prices.sort_unstable();
+            let prices: Vec<Decimal> = prices.into_iter().map(Decimal::from).collect();
+            let tolerance_pct = Decimal::new(i64::from(tolerance_milli), 3);
+            let indicator = indicator_with_prices(&prices, tolerance_pct, min_touches);
+            let mut got = Vec::new();
+            indicator.for_each_candidate(|mean| got.push(mean));
+            let want = naive_candidates(&prices, tolerance_pct, min_touches);
+            prop_assert_eq!(got, want);
+        }
     }
 }
