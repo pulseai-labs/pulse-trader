@@ -8,6 +8,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DSL schema 1.3.0: swing pivots, support/resistance and candle anatomy as price-level indicator
+  variants (r4.s6.w1).** Eight new `IndicatorSpec` variants — `PivotHigh`/`PivotLow` (`left`,
+  `right`), `Resistance`/`Support` (`left`, `right`, `tolerance_pct`, `min_touches`, `lookback`) and
+  the parameterless `Body`/`UpperWick`/`LowerWick`/`Range` — so a breakout reads
+  `CrossesAbove(close, lag(htf Resistance{…}, 1))` through the existing comparisons and the `htf` operand;
+  the seam stays indicators, not conditions (ADR-0024 addendum,
+  `docs/adr/0024-addendum-structure-indicators-1-3-0.md`). A swing pivot is confirmed only once its
+  `right` bars have closed, and each structure indicator passes a truncation no-repaint test; the
+  level variants keep confirmed pivots within `lookback`, group them by the decimal-fraction
+  `tolerance_pct` (`0.003` = 0.3%, the `distance_pct` convention), keep groups with at least
+  `min_touches` pivots, and return the mean of the nearest qualifying group above (below) the
+  current close. `tolerance_pct` is a `SweepableValue<Decimal>`; the other parameters are
+  `SweepableValue<u32>` with `left`/`right` ≥ 1, `min_touches` ≥ 2 and `lookback` > `left + right`.
+  The `1.2.0 → 1.3.0` migration is identity (only the version string is rewritten), every
+  pre-1.3.0 document keeps its meaning and its frozen `result_content_hash`, and the new vocabulary
+  reaches the engine, validation, rendering, the one-mutation framework, the builder tools and the
+  indicator read path. On the same pivots, r4.s6.w3 adds the four **pattern** variants —
+  `DoubleTopNeckline`/`DoubleBottomNeckline` (`left`, `right`, `tolerance_pct`: the lowest low /
+  highest high strictly between the last two within-tolerance pivot highs/lows, held until a newer
+  pivot confirms) and `TrendlineLows`/`TrendlineHighs` (`left`, `right`: the line through the last
+  two rising pivot lows / falling pivot highs, extended to the current bar, its quotient rounded to
+  8 decimal places half-even) — through the same engine, validation, rendering, mutation,
+  builder-tool and read-path arms, with a truncation no-repaint test and byte-identical two-run
+  streaming per variant.
+
+- **The agent learns the 1.3.0 structure vocabulary, and the first S/R breakout example ships with a
+  golden backtest (r4.s6.w4).** The composer prompt's public default (`src/agent/prompts/composer.md`)
+  names all twelve structure and pattern variants — `pivot_high`/`pivot_low`, `resistance`/`support`,
+  `body`/`upper_wick`/`lower_wick`/`range`, `double_top_neckline`/`double_bottom_neckline`,
+  `trendline_lows`/`trendline_highs` — with their operand fields, the `tolerance_pct` fraction
+  convention, the confirmed-`right`-bars-late / never-repaints property, and a worked 4h resistance
+  breakout whose entry compares the close with the **previous** bar's level
+  (`crosses_above(close, lag(resistance{…}, 1))`) — never the same bar's, which can never hold — and
+  the `pulse://dsl/schema` conventions gain the matching `structure_indicators` entry.
+  `examples/strategies/sr-breakout-4h.json` is the initial checked-in 4h S/R breakout (an H4 close
+  crossing the previous H4 bar's resistance, gated by an H4 `body > 0.5 × range` anatomy filter and an
+  H4 trendline-highs break, with a 1.5% stop and a 1R target), and `tests/sr_breakout_example.rs` pins
+  its golden trade count and net P&L on the fixture store, proves every entry sits on a bar where the
+  zone break held (from an independently streamed `Resistance` series), and that two runs are
+  byte-identical; `tests/compose_vocabulary_1_3.rs` drives the same strategy through the real builder
+  tools and checks the prompt names every token.
+
 - **Off-box backup: the Mini's nightly `pulse backup` as a launchd calendar job, a read-only pull to
   draco-desk over a dedicated forced-command key, and a restore drill from the pulled copy (r4.s2.w5).**
   `deploy/com.pulsetrader.backup.plist` runs the installed binary's `backup` (defaults: the platform
@@ -187,6 +229,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **DSL schema 1.3.0 is the served and written version (r4.s6.w1).** `DSL_SCHEMA_VERSION` and
+  `SchemaVersion::CURRENT` move to `1.3.0`; `1.0.0`, `1.1.0` and `1.2.0` documents still load
+  (identity-migrated), the composer prompt's frontmatter pin and the `pulse://dsl/schema`
+  conventions string move with them, and the engine fingerprint moves with the schema string
+  while every frozen pre-bump `result_content_hash` stays identical.
+
 - **Engine-sensitive dependency bumps: `polars` 0.54.4, `zip` 8.6.0, `rust_decimal` 1.42.1.** The
   three pins move together under the determinism gate: the determinism lanes, the golden fixture
   and every `data_version` stay identical, and the engine fingerprint moves (it hashes
@@ -266,6 +314,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Preserved unmerged as [PR #123](https://github.com/pulseai-labs/pulse-trader/pull/123).
 
 ### Fixed
+
+- **The `pulse://dsl/schema` resource read works from Claude Code (#353).** MCP clients on the
+  2026-07-28 protocol revision validate `resources/read` and `resources/list` against that
+  revision's result schema, where SEP-2549 makes `ttlMs` (integer ≥ 0) and `cacheScope`
+  (`public` | `private`) REQUIRED on a cacheable result; rmcp models both as optional and left them
+  unset, so Claude Code refused the read with `Invalid result for resources/read` naming exactly
+  those two fields while tool calls kept working. Both results now carry `ttlMs: 0` — the schema
+  text changes with the DSL version, so a cached copy must never be reused — and
+  `cacheScope: "private"`. `tests/mcp_dsl_schema_resource.rs` pins the wire shape (the allowed key
+  set plus the two required cache hints on both results), and a live Claude Code session reads the
+  resource from a served build. Refs
+  [#353](https://github.com/pulseai-labs/pulse-trader/issues/353).
 
 - **`pulse-serve.service` now gives up after repeated failed starts (0.1.3).** The
   unit set no start limit, so systemd's default (5 starts in 10 s) applied. `pulse

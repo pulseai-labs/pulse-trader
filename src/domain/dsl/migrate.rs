@@ -18,15 +18,17 @@
 //! (VS-1.1.4 / agent layer) composes `load → validate → compile`.
 //!
 //! **The production registry.** [`Migrator::v1`] registers the real steps —
-//! currently two: the `1.0.0 → 1.1.0` and `1.1.0 → 1.2.0` identity steps
-//! (schema 1.1.0 is additive — a new defaulted field and new enum variants;
-//! schema 1.2.0 is additive too — MACD's defaulted `output` field — so each
-//! step rewrites only the `schema_version` string; every pre-bump document
-//! deserializes identically at `CURRENT`). Chaining + error paths are
-//! additionally proven by synthetic test migrations (see the test module).
+//! currently three: the `1.0.0 → 1.1.0`, `1.1.0 → 1.2.0` and `1.2.0 → 1.3.0`
+//! identity steps (schema 1.1.0 is additive — a new defaulted field and new
+//! enum variants; schema 1.2.0 is additive too — MACD's defaulted `output`
+//! field; schema 1.3.0 is additive as well — the r4.s6 structure indicator
+//! variants — so each step rewrites only the `schema_version` string; every
+//! pre-bump document deserializes identically at `CURRENT`). Chaining + error
+//! paths are additionally proven by synthetic test migrations (see the test
+//! module).
 //!
 //! **No forward-compatibility** (architect-critic): every `schema_version >
-//! CURRENT` — including a same-major future minor like `1.3.0` vs `1.2.0` — is
+//! CURRENT` — including a same-major future minor like `1.4.0` vs `1.3.0` — is
 //! rejected as [`LoadError::FutureVersion`]. A newer minor may carry semantics
 //! this engine cannot honor, and silently ignoring unknown fields could
 //! mis-execute a real-money strategy.
@@ -168,7 +170,8 @@ impl SchemaVersion {
 ///
 /// A **value** (not a global) so tests can build a custom registry with
 /// synthetic migrations. [`Migrator::v1`] is the production registry — it
-/// carries the real `1.0.0 → 1.1.0` and `1.1.0 → 1.2.0` identity steps.
+/// carries the real `1.0.0 → 1.1.0`, `1.1.0 → 1.2.0` and
+/// `1.2.0 → 1.3.0` identity steps.
 #[derive(Clone, Default)]
 pub struct Migrator {
     migrations: Vec<Migration>,
@@ -208,9 +211,28 @@ fn identity_1_1_0_to_1_2_0(mut value: Value) -> Result<Value, MigrationError> {
     Ok(value)
 }
 
+/// The `1.2.0 → 1.3.0` step: **identity**. Schema 1.3.0 is purely additive
+/// (r4.s6 ADR-0024 addendum — twelve structure and pattern indicator variants:
+/// `PivotHigh`/`PivotLow`, `Resistance`/`Support` and the four anatomy variants
+/// from r4.s6.w1, plus the four pattern variants `DoubleTopNeckline`/
+/// `DoubleBottomNeckline` and `TrendlineLows`/`TrendlineHighs` from r4.s6.w3),
+/// so the document's meaning is unchanged; `apply` rewrites only the
+/// `schema_version` string and leaves every other byte alone. `dsl_original` is
+/// preserved verbatim by [`Loaded`] regardless — the migration never touches it.
+fn identity_1_2_0_to_1_3_0(mut value: Value) -> Result<Value, MigrationError> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| MigrationError("document is not a JSON object".to_owned()))?;
+    obj.insert(
+        "schema_version".to_owned(),
+        serde_json::Value::String("1.3.0".to_owned()),
+    );
+    Ok(value)
+}
+
 impl Migrator {
-    /// The production registry: the two real steps, `1.0.0 → 1.1.0` and
-    /// `1.1.0 → 1.2.0` (both identity).
+    /// The production registry: the three real steps, `1.0.0 → 1.1.0`,
+    /// `1.1.0 → 1.2.0` and `1.2.0 → 1.3.0` (all identity).
     ///
     /// Each `to` is pinned to the literal the step's `apply` stamps —
     /// NOT `SchemaVersion::CURRENT` (r2.s2 round-1 fix F8): a future `CURRENT`
@@ -247,6 +269,20 @@ impl Migrator {
                     },
                     kind: MigrationKind::Minor,
                     apply: identity_1_1_0_to_1_2_0,
+                },
+                Migration {
+                    from: SchemaVersion {
+                        major: 1,
+                        minor: 2,
+                        patch: 0,
+                    },
+                    to: SchemaVersion {
+                        major: 1,
+                        minor: 3,
+                        patch: 0,
+                    },
+                    kind: MigrationKind::Minor,
+                    apply: identity_1_2_0_to_1_3_0,
                 },
             ],
         }
@@ -522,7 +558,7 @@ mod tests {
     #[test]
     fn rejects_same_major_future_minor() {
         let mut value: Value = serde_json::from_str(&canonical_current_json()).unwrap();
-        value["schema_version"] = json!("1.3.0");
+        value["schema_version"] = json!("1.4.0");
         let json = value.to_string();
 
         let err = Migrator::v1()
@@ -530,7 +566,7 @@ mod tests {
             .expect_err("same-major future minor must reject");
         assert!(
             matches!(err, LoadError::FutureVersion { .. }),
-            "expected FutureVersion for 1.3.0 vs 1.2.0, got {err:?}"
+            "expected FutureVersion for 1.4.0 vs 1.3.0, got {err:?}"
         );
     }
 
@@ -697,7 +733,11 @@ mod tests {
     #[test]
     fn v1_terminal_version_matches_the_literal_its_apply_stamps() {
         let migrator = Migrator::v1();
-        for (from, expected_to) in [(v(1, 0, 0), v(1, 1, 0)), (v(1, 1, 0), v(1, 2, 0))] {
+        for (from, expected_to) in [
+            (v(1, 0, 0), v(1, 1, 0)),
+            (v(1, 1, 0), v(1, 2, 0)),
+            (v(1, 2, 0), v(1, 3, 0)),
+        ] {
             let step = migrator
                 .migrations
                 .iter()

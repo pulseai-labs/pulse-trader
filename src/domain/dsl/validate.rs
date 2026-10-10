@@ -655,6 +655,62 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Atr { period } => format!("ATR({})", period_value(period)),
         IndicatorSpec::Highest { period, .. } => format!("Highest({})", period_value(period)),
         IndicatorSpec::Lowest { period, .. } => format!("Lowest({})", period_value(period)),
+        IndicatorSpec::PivotHigh { left, right } => {
+            format!("PivotHigh({}/{})", period_value(left), period_value(right))
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            format!("PivotLow({}/{})", period_value(left), period_value(right))
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            min_touches,
+            lookback,
+            ..
+        } => format!(
+            "Resistance({}/{}, {}+ touches, {} bars)",
+            period_value(left),
+            period_value(right),
+            period_value(min_touches),
+            period_value(lookback)
+        ),
+        IndicatorSpec::Support {
+            left,
+            right,
+            min_touches,
+            lookback,
+            ..
+        } => format!(
+            "Support({}/{}, {}+ touches, {} bars)",
+            period_value(left),
+            period_value(right),
+            period_value(min_touches),
+            period_value(lookback)
+        ),
+        IndicatorSpec::Body => "Body".to_owned(),
+        IndicatorSpec::UpperWick => "UpperWick".to_owned(),
+        IndicatorSpec::LowerWick => "LowerWick".to_owned(),
+        IndicatorSpec::Range => "Range".to_owned(),
+        IndicatorSpec::DoubleTopNeckline { left, right, .. } => format!(
+            "DoubleTopNeckline({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
+        IndicatorSpec::DoubleBottomNeckline { left, right, .. } => format!(
+            "DoubleBottomNeckline({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
+        IndicatorSpec::TrendlineLows { left, right } => format!(
+            "TrendlineLows({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
+        IndicatorSpec::TrendlineHighs { left, right } => format!(
+            "TrendlineHighs({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
     }
 }
 
@@ -872,7 +928,300 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
                 errors,
             );
         }
+        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
+        // indicators (r4.s6.w3): twelve variants, checked by their own helper.
+        // They are listed here BY NAME — never matched with a wildcard — so a
+        // new variant still breaks this match and has to be routed by hand.
+        IndicatorSpec::PivotHigh { .. }
+        | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::Resistance { .. }
+        | IndicatorSpec::Support { .. }
+        | IndicatorSpec::DoubleTopNeckline { .. }
+        | IndicatorSpec::DoubleBottomNeckline { .. }
+        | IndicatorSpec::TrendlineLows { .. }
+        | IndicatorSpec::TrendlineHighs { .. }
+        | IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => check_structure_indicator(spec, path, errors),
     }
+}
+
+/// The rules of the structure and pattern families (schema 1.3.0, r4.s6.w1 and
+/// r4.s6.w3).
+///
+/// A pivot needs at least one bar on each side; a level needs `min_touches` >= 2
+/// (a "level" touched once is not a level), a window longer than the pivot span
+/// it must hold, and a tolerance that is a positive decimal fraction no wider
+/// than 0.10 (10%); a neckline needs that pivot span and that tolerance; a
+/// trendline the span alone.
+///
+/// `check_indicator` routes exactly the twelve variants here, so the trailing
+/// arm is a contract guard, unreachable by construction (the house shape at
+/// `agent/tools.rs`'s `Op` dispatch): a new variant is a compile error in the
+/// dispatcher's own match first.
+fn check_structure_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError>) {
+    match spec {
+        IndicatorSpec::PivotHigh { left, right } => {
+            check_pivot_span(left, right, path, "pivot_high", "PivotHigh", errors);
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            check_pivot_span(left, right, path, "pivot_low", "PivotLow", errors);
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => {
+            check_level_parameters(
+                (left, right, tolerance_pct, min_touches, lookback),
+                path,
+                "resistance",
+                "Resistance",
+                errors,
+            );
+        }
+        IndicatorSpec::Support {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => {
+            check_level_parameters(
+                (left, right, tolerance_pct, min_touches, lookback),
+                path,
+                "support",
+                "Support",
+                errors,
+            );
+        }
+        IndicatorSpec::DoubleTopNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => check_neckline_parameters(
+            (left, right, tolerance_pct),
+            path,
+            "double_top_neckline",
+            "DoubleTopNeckline",
+            errors,
+        ),
+        IndicatorSpec::DoubleBottomNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => check_neckline_parameters(
+            (left, right, tolerance_pct),
+            path,
+            "double_bottom_neckline",
+            "DoubleBottomNeckline",
+            errors,
+        ),
+        IndicatorSpec::TrendlineLows { left, right } => {
+            check_pivot_span(left, right, path, "trendline_lows", "TrendlineLows", errors);
+        }
+        IndicatorSpec::TrendlineHighs { left, right } => {
+            check_pivot_span(
+                left,
+                right,
+                path,
+                "trendline_highs",
+                "TrendlineHighs",
+                errors,
+            );
+        }
+        // The candle-anatomy variants carry no numeric leaf at all — the
+        // `series`-tag precedent: nothing to range-check.
+        IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => {}
+        other => unreachable!(
+            "check_indicator routes only the structure/pattern variants here, never {other:?}"
+        ),
+    }
+}
+
+/// Rule 6 for a `SweepableValue<u32>` that must be at least `min` (a
+/// period-like leaf with a floor).
+fn check_u32_at_least(
+    v: &SweepableValue<u32>,
+    path: &str,
+    label: &str,
+    min: u32,
+    errors: &mut Vec<FieldError>,
+) {
+    match v {
+        SweepableValue::Sweep { .. } => push_sweep(path, errors),
+        SweepableValue::Fixed(n) => {
+            if *n < min {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::FieldRange,
+                    message: format!("{label} must be at least {min}"),
+                });
+            }
+        }
+    }
+}
+
+/// The pivot span rule shared by `PivotHigh`/`PivotLow`: `left`/`right` >= 1.
+fn check_pivot_span(
+    left: &SweepableValue<u32>,
+    right: &SweepableValue<u32>,
+    path: &str,
+    field: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    check_u32_at_least(
+        left,
+        &format!("{path}.{field}.left"),
+        &format!("{label} left"),
+        1,
+        errors,
+    );
+    check_u32_at_least(
+        right,
+        &format!("{path}.{field}.right"),
+        &format!("{label} right"),
+        1,
+        errors,
+    );
+}
+
+/// The five borrowed `SweepableValue` leaves of a `Resistance`/`Support` spec,
+/// in declaration order: `(left, right, tolerance_pct, min_touches, lookback)`.
+/// Named so the shared rule set can take them as one value without tripping the
+/// pedantic type-complexity budget.
+type LevelLeaves<'a> = (
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<Decimal>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+);
+
+/// The shared rule set for `Resistance`/`Support`: `left`/`right` >= 1,
+/// `min_touches` >= 2, `lookback` > `left + right` (only checkable when all
+/// three are `Fixed` — the MACD `fast < slow` precedent), and `tolerance_pct` a
+/// decimal fraction in `(0, 0.10]`.
+fn check_level_parameters(
+    leaves: LevelLeaves<'_>,
+    path: &str,
+    field: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    let (left, right, tolerance_pct, min_touches, lookback) = leaves;
+    check_u32_at_least(
+        left,
+        &format!("{path}.{field}.left"),
+        &format!("{label} left"),
+        1,
+        errors,
+    );
+    check_u32_at_least(
+        right,
+        &format!("{path}.{field}.right"),
+        &format!("{label} right"),
+        1,
+        errors,
+    );
+    check_u32_at_least(
+        min_touches,
+        &format!("{path}.{field}.min_touches"),
+        &format!("{label} min_touches"),
+        2,
+        errors,
+    );
+    check_tolerance(
+        tolerance_pct,
+        &format!("{path}.{field}.tolerance_pct"),
+        label,
+        errors,
+    );
+    // `lookback` must be `Fixed` like every other leaf (rule 1): a `Sweep`
+    // short-circuits to `SweepUnsupported` at its own path, and only then is
+    // the cross-field bound (`lookback` must hold the pivot span plus the
+    // pivot itself) considered — it is checkable only when `left`, `right`
+    // and `lookback` are all `Fixed`.
+    match lookback {
+        SweepableValue::Sweep { .. } => {
+            push_sweep(&format!("{path}.{field}.lookback"), errors);
+        }
+        SweepableValue::Fixed(k) => {
+            if let (SweepableValue::Fixed(l), SweepableValue::Fixed(r)) = (left, right) {
+                let span = u64::from(*l) + u64::from(*r);
+                if u64::from(*k) <= span {
+                    errors.push(FieldError {
+                        path: format!("{path}.{field}.lookback"),
+                        code: ValidationCode::FieldRange,
+                        message: format!(
+                            "{label} lookback ({k}) must be greater than left + right ({l} + {r} = {span})"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Rule 6 for a `tolerance_pct`-style decimal fraction: `0 < x ≤ 0.10`, on the
+/// `distance_pct` convention. Shared by the level variants (`Resistance` /
+/// `Support`) and the necklines, so the rule has one copy.
+fn check_tolerance(
+    tolerance_pct: &SweepableValue<Decimal>,
+    path: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    match tolerance_pct {
+        SweepableValue::Sweep { .. } => push_sweep(path, errors),
+        SweepableValue::Fixed(d) => {
+            if *d <= Decimal::ZERO || *d > Decimal::new(10, 2) {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::FieldRange,
+                    message: format!(
+                        "{label} tolerance_pct must be a decimal fraction in the range (0, 0.10] — 0.003 means 0.3%"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// The three borrowed `SweepableValue` leaves of a `DoubleTopNeckline` /
+/// `DoubleBottomNeckline` spec, in declaration order:
+/// `(left, right, tolerance_pct)`.
+type NecklineLeaves<'a> = (
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<Decimal>,
+);
+
+/// The shared rule set for `DoubleTopNeckline`/`DoubleBottomNeckline`:
+/// `left`/`right` ≥ 1 (the pivot span every pivot-based variant needs) and
+/// `tolerance_pct` a decimal fraction in `(0, 0.10]` (the level rule).
+fn check_neckline_parameters(
+    leaves: NecklineLeaves<'_>,
+    path: &str,
+    field: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    let (left, right, tolerance_pct) = leaves;
+    check_pivot_span(left, right, path, field, label, errors);
+    check_tolerance(
+        tolerance_pct,
+        &format!("{path}.{field}.tolerance_pct"),
+        label,
+        errors,
+    );
 }
 
 /// Rule 1 + rule 6 for a `SweepableValue<u32>` that must be `> 0`.
@@ -1568,6 +1917,318 @@ mod tests {
             "exactly one error for the field: {sweep_errs:?}"
         );
         assert_eq!(sweep_errs[0].code, ValidationCode::SweepUnsupported);
+    }
+
+    /// F1 (fix round 1, Codex 4238952605), the two arms that skipped the
+    /// check: a `Sweep` `lookback` on `Resistance`/`Support` used to pass
+    /// validation (the all-`Fixed` cross-field `if let` silently skipped it)
+    /// while every later engine construction failed with `UnexpectedSweep`.
+    /// Each now refuses at its own path, with no spurious `FieldRange`.
+    #[test]
+    fn a_sweep_level_lookback_is_refused_at_its_own_path() {
+        for (field, spec) in [
+            (
+                "resistance",
+                IndicatorSpec::Resistance {
+                    left: SweepableValue::Fixed(2),
+                    right: SweepableValue::Fixed(1),
+                    tolerance_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                    min_touches: SweepableValue::Fixed(2),
+                    lookback: SweepableValue::Sweep {
+                        start: 20,
+                        end: 40,
+                        step: 10,
+                    },
+                },
+            ),
+            (
+                "support",
+                IndicatorSpec::Support {
+                    left: SweepableValue::Fixed(2),
+                    right: SweepableValue::Fixed(1),
+                    tolerance_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                    min_touches: SweepableValue::Fixed(2),
+                    lookback: SweepableValue::Sweep {
+                        start: 20,
+                        end: 40,
+                        step: 10,
+                    },
+                },
+            ),
+        ] {
+            let path = format!("entry.lhs.indicator.{field}.lookback");
+            let mut s = valid_base();
+            s.entry = Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec,
+                },
+                op: Comparator::Lt,
+                rhs: ValueSource::Constant {
+                    value: Decimal::new(30, 0),
+                },
+            };
+            let errs = validate(&s).expect_err("a sweep lookback is refused");
+            assert_eq!(
+                errs.errors().len(),
+                1,
+                "{path}: exactly one error, got {:?}",
+                errs.errors()
+            );
+            assert_eq!(errs.errors()[0].path, path, "the error sits at the leaf");
+            assert_eq!(
+                errs.errors()[0].code,
+                ValidationCode::SweepUnsupported,
+                "{path}"
+            );
+        }
+    }
+
+    /// F1, the class guard: EVERY leaf of EVERY schema-1.3.0 structure and
+    /// pattern variant refuses a `Sweep` at its own path, with exactly one
+    /// `SweepUnsupported` error — no silent drop, no spurious `FieldRange`
+    /// for the same leaf. The leaves are enumerated BY NAME here, so a leaf
+    /// that stops being routed to `push_sweep` fails this test first.
+    #[test]
+    fn every_structure_leaf_refuses_a_sweep_at_its_own_path() {
+        fn sweep_u32() -> SweepableValue<u32> {
+            SweepableValue::Sweep {
+                start: 2,
+                end: 4,
+                step: 1,
+            }
+        }
+        fn sweep_dec() -> SweepableValue<Decimal> {
+            SweepableValue::Sweep {
+                start: Decimal::new(1, 2),
+                end: Decimal::new(5, 2),
+                step: Decimal::new(1, 2),
+            }
+        }
+        fn fixed_u32(v: u32) -> SweepableValue<u32> {
+            SweepableValue::Fixed(v)
+        }
+        fn fixed_dec(mantissa: i64, scale: u32) -> SweepableValue<Decimal> {
+            SweepableValue::Fixed(Decimal::new(mantissa, scale))
+        }
+
+        // One sweep per case; every other leaf is fixed and in range, so the
+        // sweep is the only error the strategy can draw.
+        let mut cases: Vec<(String, IndicatorSpec)> = vec![
+            (
+                "pivot_high.left".to_owned(),
+                IndicatorSpec::PivotHigh {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "pivot_high.right".to_owned(),
+                IndicatorSpec::PivotHigh {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+            (
+                "pivot_low.left".to_owned(),
+                IndicatorSpec::PivotLow {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "pivot_low.right".to_owned(),
+                IndicatorSpec::PivotLow {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+        ];
+
+        for (field, resistance) in [("resistance", true), ("support", false)] {
+            let level = |left: SweepableValue<u32>,
+                         right: SweepableValue<u32>,
+                         tolerance_pct: SweepableValue<Decimal>,
+                         min_touches: SweepableValue<u32>,
+                         lookback: SweepableValue<u32>| {
+                if resistance {
+                    IndicatorSpec::Resistance {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                } else {
+                    IndicatorSpec::Support {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                }
+            };
+            cases.push((
+                format!("{field}.left"),
+                level(
+                    sweep_u32(),
+                    fixed_u32(1),
+                    fixed_dec(1, 2),
+                    fixed_u32(2),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.right"),
+                level(
+                    fixed_u32(2),
+                    sweep_u32(),
+                    fixed_dec(1, 2),
+                    fixed_u32(2),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.tolerance_pct"),
+                level(
+                    fixed_u32(2),
+                    fixed_u32(1),
+                    sweep_dec(),
+                    fixed_u32(2),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.min_touches"),
+                level(
+                    fixed_u32(2),
+                    fixed_u32(1),
+                    fixed_dec(1, 2),
+                    sweep_u32(),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.lookback"),
+                level(
+                    fixed_u32(2),
+                    fixed_u32(1),
+                    fixed_dec(1, 2),
+                    fixed_u32(2),
+                    sweep_u32(),
+                ),
+            ));
+        }
+
+        for (suffix, spec) in [
+            (
+                "double_top_neckline.left",
+                IndicatorSpec::DoubleTopNeckline {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_top_neckline.right",
+                IndicatorSpec::DoubleTopNeckline {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_top_neckline.tolerance_pct",
+                IndicatorSpec::DoubleTopNeckline {
+                    left: fixed_u32(2),
+                    right: fixed_u32(1),
+                    tolerance_pct: sweep_dec(),
+                },
+            ),
+            (
+                "double_bottom_neckline.left",
+                IndicatorSpec::DoubleBottomNeckline {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_bottom_neckline.right",
+                IndicatorSpec::DoubleBottomNeckline {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_bottom_neckline.tolerance_pct",
+                IndicatorSpec::DoubleBottomNeckline {
+                    left: fixed_u32(2),
+                    right: fixed_u32(1),
+                    tolerance_pct: sweep_dec(),
+                },
+            ),
+            (
+                "trendline_lows.left",
+                IndicatorSpec::TrendlineLows {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "trendline_lows.right",
+                IndicatorSpec::TrendlineLows {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+            (
+                "trendline_highs.left",
+                IndicatorSpec::TrendlineHighs {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "trendline_highs.right",
+                IndicatorSpec::TrendlineHighs {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+        ] {
+            cases.push((suffix.to_owned(), spec));
+        }
+
+        for (suffix, spec) in cases {
+            let path = format!("entry.lhs.indicator.{suffix}");
+            let mut s = valid_base();
+            s.entry = Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec,
+                },
+                op: Comparator::Lt,
+                rhs: ValueSource::Constant {
+                    value: Decimal::new(30, 0),
+                },
+            };
+            let errs = validate(&s).expect_err("a sweep leaf is refused");
+            assert_eq!(
+                errs.errors().len(),
+                1,
+                "{path}: exactly one error, got {:?}",
+                errs.errors()
+            );
+            assert_eq!(
+                errs.errors()[0].path,
+                path,
+                "{path}: the error sits at the leaf"
+            );
+            assert_eq!(errs.errors()[0].code, ValidationCode::SweepUnsupported);
+        }
     }
 
     /// `FieldError`/`ValidationCode` serde round-trip (crosses the Tauri boundary

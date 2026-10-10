@@ -230,7 +230,7 @@ fn inline_1_0_0_document_migrates_and_deserializes_equal() {
 
 #[test]
 fn future_versions_still_reject() {
-    for future in ["1.3.0", "2.0.0"] {
+    for future in ["1.4.0", "2.0.0"] {
         let mut doc: Value = serde_json::from_str(INLINE_1_0_0).unwrap();
         doc["schema_version"] = json!(future);
         let err = Migrator::v1()

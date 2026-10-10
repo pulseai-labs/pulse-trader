@@ -19,12 +19,29 @@ use rust_decimal::Decimal;
 ///
 /// `is_ready()` is `true` iff the *next* call to `next` will return `Some`
 /// (i.e. warmup has completed).
+///
+/// **The level/pattern carve-out (r4.s6 PR-362 fix round 2).** The six
+/// level/pattern variants (`Resistance`, `Support`, `DoubleTopNeckline`,
+/// `DoubleBottomNeckline`, `TrendlineLows`, `TrendlineHighs`) cannot promise
+/// that: whether the next bar carries a level is the next bar's own fact, so
+/// their `is_ready()` reports "a value is possible at all" instead — a `None`
+/// after it is true is a no-value reading (a comparison over it is false), not
+/// a warmup state. Readiness for those six is LATCHED: once true it stays true
+/// for the life of the adapter. [`IndicatorEngine::is_warm`] reads it as the
+/// warm gate for those slots, together with the ring depth every slot must
+/// hold (`max_lag + 2` values), so the gate opens only once the deepest lag a
+/// leaf reads exists.
+///
+/// [`IndicatorEngine::is_warm`]: crate::IndicatorEngine::is_warm
 pub trait Indicator {
     /// Advance the indicator by one candle and return its value, or `None`
     /// while still in warmup.
     fn next(&mut self, candle: &Candle) -> Option<Decimal>;
 
-    /// `true` iff the next [`Indicator::next`] call will yield `Some`.
+    /// `true` when the indicator has the history it needs — exactly "the next
+    /// [`Indicator::next`] call yields `Some`" for every adapter except the
+    /// level/pattern carve-out above, whose post-readiness `None` bars are
+    /// no-value readings (see the type doc).
     fn is_ready(&self) -> bool;
 }
 

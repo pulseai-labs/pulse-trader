@@ -47,6 +47,13 @@ pub use domain::{
     MarketDataSource, Pair, Timeframe, ValidationError,
 };
 
+// r4.s6.w2 (#353): the DSL schema-version string the `pulse://dsl/schema`
+// resource serves. Re-exported so `tests/mcp_dsl_schema_resource.rs` compares
+// the served `schema_version` against the crate's own constant — the pinned
+// value moves with the DSL (schema 1.3.0 lands later this spine) instead of
+// being copied into the test.
+pub use domain::DSL_SCHEMA_VERSION;
+
 // r1.s3.w1 (#112): the candle-snapshot persistence port + the value it returns.
 // Re-exported beside `CandleStore` so the contract target
 // (`tests/candle_repository.rs`) can drive BOTH a zero-I/O double and the real

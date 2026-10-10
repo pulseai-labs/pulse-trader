@@ -56,6 +56,13 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "rolling_extremes",
         "`Highest{period, source}` and `Lowest{period, source}` cover the N closed bars BEFORE the current bar, excluding it (the prior-N convention, rendered `highest(high, 20 prior)`); `source` is any price field and defaults to `high` for `Highest` and `low` for `Lowest`; they warm up over N+1 bars and work on any series (`h4:highest(high, 20)` is the prior 20 closed H4 bars)",
     ),
+    // r4.s6.w1/w3 (schema 1.3.0), published by r4.s6.w4: the structure and
+    // pattern vocabulary — including the zone-break form the never-true
+    // same-bar comparison would violate.
+    (
+        "structure_indicators",
+        "the schema-1.3.0 structure and pattern variants work on any series (an `h4:` operand reads the last closed H4 bar): `PivotHigh{left,right}`/`PivotLow{left,right}` are the most recent confirmed swing high/low, confirmed only once the `right` bars after them have closed, so a value never repaints; `Resistance{left,right,tolerance_pct,min_touches,lookback}`/`Support{…}` are the nearest level strictly above/below the current close, built from the confirmed pivots within the last `lookback` bars: a candidate level is a run of sorted pivot prices whose highest is within `tolerance_pct` of their lowest (for each start pivot, the maximal run within tolerance of that start's own price; runs may overlap), and a run of at least `min_touches` (>= 2) pivots is a candidate whose value is the mean of its pivots — the value is the LOWEST candidate strictly above the close (`Support`: the HIGHEST strictly below it), a pivot counting while it stays inside `lookback` bars (`lookback` > `left + right`); `tolerance_pct` is a decimal fraction in (0, 0.10] (`0.003` = 0.3%); `Body`/`UpperWick`/`LowerWick`/`Range` are the current bar's `abs(close−open)`, `high−max(open,close)`, `min(open,close)−low` and `high−low`; `DoubleTopNeckline{left,right,tolerance_pct}`/`DoubleBottomNeckline{…}` are the lowest low/highest high strictly between the last two confirmed pivot highs/lows within tolerance; `TrendlineLows{left,right}`/`TrendlineHighs{left,right}` are the line through the last two rising/falling confirmed pivots extended to the current bar, its quotient rounded to 8 decimal places half-even; because a `Resistance`/`Support` level sits strictly above/below the close of its own bar by definition, a break compares the close with the PREVIOUS bar's level — `CrossesAbove(close, lag(Resistance{…}, 1))`, the lag counting H4 bars on an `h4:` operand (the mirror is `CrossesBelow` over `lag(Support{…}, 1)`) — never the same bar's level; after warm-up a comparison over a level/pattern operand with no level at that bar is false, so a `Not` over it is true",
+    ),
     // r3.s2.w3 (Q2): value expressions — the semantics the grammar cannot
     // express, keyed by the construct each entry covers.
     (
@@ -75,9 +82,11 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "`rising`/`falling` mean the value is strictly greater/less than its own value `bars` bars ago on the same series (`bars` in 1..=500, default 1); over a value containing a lag, or mixing both series, they are refused",
     ),
     // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
+    // r4.s6.w1: moved to 1.3.0 (the structure indicator variants); the served
+    // set grows by 1.2.0.
     (
         "schema_version",
-        "this engine writes and serves schema 1.2.0 and also loads 1.0.0 and 1.1.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.2.0",
+        "this engine writes and serves schema 1.3.0 and also loads 1.0.0, 1.1.0 and 1.2.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.3.0",
     ),
 ];
 
@@ -125,12 +134,12 @@ mod tests {
             assert!(properties.contains_key(field), "missing property {field}");
         }
         // F6: `schema_version` publishes the ACCEPTED values, not an
-        // unconstrained string — `Migrator::v1()` loads `1.0.0` and `1.1.0`
-        // (identity-migrated) and `CURRENT`, so the schema a validating agent
-        // reads must pin exactly that enum.
+        // unconstrained string — `Migrator::v1()` loads `1.0.0`, `1.1.0` and
+        // `1.2.0` (identity-migrated) and `CURRENT`, so the schema a validating
+        // agent reads must pin exactly that enum.
         assert_eq!(
             properties["schema_version"]["enum"],
-            serde_json::json!(["1.0.0", "1.1.0", DSL_SCHEMA_VERSION]),
+            serde_json::json!(["1.0.0", "1.1.0", "1.2.0", DSL_SCHEMA_VERSION]),
             "schema_version property must publish the accepted enum"
         );
         let conventions = doc["conventions"].as_object().expect("conventions object");

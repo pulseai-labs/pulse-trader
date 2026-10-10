@@ -2,7 +2,16 @@
 
 use std::collections::VecDeque;
 
-use super::{adx::Adx, atr::Atr, ema::Ema, macd::Macd, rolling::RollingExtremes, rsi::Rsi};
+use super::{
+    adx::Adx,
+    atr::Atr,
+    ema::Ema,
+    macd::Macd,
+    patterns::{NecklineIndicator, NecklineKind, TrendlineIndicator},
+    rolling::RollingExtremes,
+    rsi::Rsi,
+    structure::{Anatomy, AnatomyKind, Extreme, LevelIndicator, PivotIndicator},
+};
 use crate::{
     Candle, CompiledStrategy, CompiledValue, EvalContext, Indicator, IndicatorSpec, PriceField,
     Series, SweepableValue,
@@ -19,10 +28,15 @@ pub enum EngineError {
         field: String,
     },
     /// An adapter rejected a fixed period tuple.
+    ///
+    /// The spec is BOXED (r4.s6.w1): the structure variants took `IndicatorSpec`
+    /// past the size where carrying it inline in the error makes every
+    /// `Result`'s `Ok` path pay for the `Err` (`clippy::result_large_err`).
+    /// An invalid-period error is rare and constructed once per refusal.
     #[error("invalid period for {spec:?}: {detail}")]
     InvalidPeriod {
         /// The spec whose fixed parameters were rejected.
-        spec: IndicatorSpec,
+        spec: Box<IndicatorSpec>,
         /// Adapter/factory detail explaining the invalid parameter tuple.
         detail: String,
     },
@@ -75,6 +89,24 @@ impl IndicatorSlot {
         }
         self.history[len - 1 - n]
     }
+}
+
+/// Whether `spec` is one of the six level/pattern variants whose values are
+/// legitimately `None` on some bars after the indicator is ready — a broken
+/// zone, a within-tolerance neckline not yet paired, a wrong-way trendline.
+/// Their slots are warmed by their LATCHED `is_ready()` plus the ring depth,
+/// without the all-history-`Some` rule (see [`IndicatorEngine::is_warm`]);
+/// every other slot keeps the all-`Some` rule.
+fn is_level_or_pattern(spec: &IndicatorSpec) -> bool {
+    matches!(
+        spec,
+        IndicatorSpec::Resistance { .. }
+            | IndicatorSpec::Support { .. }
+            | IndicatorSpec::DoubleTopNeckline { .. }
+            | IndicatorSpec::DoubleBottomNeckline { .. }
+            | IndicatorSpec::TrendlineLows { .. }
+            | IndicatorSpec::TrendlineHighs { .. }
+    )
 }
 
 impl IndicatorEngine {
@@ -170,26 +202,50 @@ impl IndicatorEngine {
         self.indicators.len()
     }
 
-    /// Whether every owned indicator is fully warm: it has a **current** value,
-    /// a **previous** value, and its readiness window is satisfied — plus,
-    /// since r3.s2.w3 (b4), each slot's ring holds `max_lag + 2` values (so
-    /// `previous` of the deepest lag exists) and the candle ring holds
-    /// `price_lag + 2` candles when a lagged `Price` leaf exists.
+    /// Whether every owned indicator is fully warm: its ring holds `max_lag + 2`
+    /// values (since r3.s2.w3 (b4)), its readiness window is satisfied, and —
+    /// for every slot except the six level/pattern variants (the carve-out
+    /// below) — it has both a **current** and a **previous** value. The candle
+    /// ring holds `price_lag + 2` candles when a lagged `Price` leaf exists.
     ///
     /// A driver must not evaluate or fire strategy entry while
     /// [`IndicatorEngine::is_warm`] is false. Since #36 the guarantee includes
-    /// a previous value: on the bar right after an indicator's first value,
-    /// `previous` is still `None`, and a `CrossesAbove`/`CrossesBelow` leaf
-    /// evaluates `false` there — which a `Not`/`Or` composition would otherwise
+    /// a previous value for those slots: on the bar right after an indicator's
+    /// first value, `previous` is still `None`, and a `CrossesAbove`/`CrossesBelow`
+    /// leaf evaluates `false` there — which a `Not`/`Or` composition would otherwise
     /// turn into an entry on the first warm bar (#16, spine ruling a1). A
     /// strategy with no lag has `max_lag = 0`, so its warm point is exactly
     /// the pre-expression one.
+    ///
+    /// **The level/pattern carve-out (r4.s6 PR-362 fix rounds 1-2, Codex
+    /// 4238952612/4239217700/4239217701 + close review R1).** The six
+    /// level/pattern variants (`Resistance`, `Support`, `DoubleTopNeckline`,
+    /// `DoubleBottomNeckline`, `TrendlineLows`, `TrendlineHighs`) yield `None`
+    /// on a bar where no level exists after they are ready — their `is_ready()`
+    /// reports "a value is possible at all", never "the next call returns
+    /// `Some`" — and a clean break of the only zone is exactly such a bar. The
+    /// taught break `CrossesAbove(close, lag(Resistance, 1))` reads the PREVIOUS
+    /// bars' values, so the breakout bar's own `None` must not hold the whole
+    /// entry gate cold. Such a slot therefore counts as warm once its
+    /// `is_ready()` is true AND its ring holds `max_lag + 2` values (rule B:
+    /// the ring-depth requirement stays — a lagged leaf never reads past the
+    /// history that exists, so a `Not` over an unavailable lag cannot fire
+    /// hundreds of bars early); a `None` from it is read by the no-value rule
+    /// (a comparison over it is false), never as "not warm". Its readiness is
+    /// LATCHED by the adapters (rule A): once true it never reverts, so a pivot
+    /// aging out of `lookback` cannot make the slot cold and freeze every
+    /// unrelated entry branch behind it. Every other slot keeps the
+    /// all-history-`Some` rule unchanged.
     #[must_use]
     pub fn is_warm(&self) -> bool {
         self.indicators.iter().all(|slot| {
-            slot.history.len() == slot.max_lag as usize + 2
-                && slot.history.iter().all(Option::is_some)
-                && slot.indicator.is_ready()
+            if is_level_or_pattern(&slot.spec) {
+                slot.history.len() == slot.max_lag as usize + 2 && slot.indicator.is_ready()
+            } else {
+                slot.history.len() == slot.max_lag as usize + 2
+                    && slot.history.iter().all(Option::is_some)
+                    && slot.indicator.is_ready()
+            }
         }) && (self.price_lag == 0 || self.candles.len() == self.price_lag as usize + 2)
     }
 
@@ -324,7 +380,217 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
                 .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
                 .ok_or_else(|| invalid_period(spec, format!("Lowest period {period} is invalid")))
         }
+        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
+        // indicators (r4.s6.w3): twelve variants over the `structure` and
+        // `patterns` adapters, built by their own factory. They are listed here
+        // BY NAME — never matched with a wildcard — so a new variant still
+        // breaks this match and has to be routed by hand.
+        IndicatorSpec::PivotHigh { .. }
+        | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::Resistance { .. }
+        | IndicatorSpec::Support { .. }
+        | IndicatorSpec::DoubleTopNeckline { .. }
+        | IndicatorSpec::DoubleBottomNeckline { .. }
+        | IndicatorSpec::TrendlineLows { .. }
+        | IndicatorSpec::TrendlineHighs { .. }
+        | IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => build_structure_indicator(spec),
     }
+}
+
+/// Build the structure and pattern families' adapters (schema 1.3.0, r4.s6.w1
+/// and r4.s6.w3) — the two groups whose math lives in `structure`/`patterns`
+/// rather than behind `convert`.
+///
+/// `build_indicator` routes exactly the twelve variants here, so the trailing
+/// arm is a contract guard, unreachable by construction (the house shape at
+/// `agent/tools.rs`'s `Op` dispatch): a new variant is a compile error in the
+/// factory's own match first, and that match is where its builder is chosen.
+fn build_structure_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineError> {
+    match spec {
+        IndicatorSpec::PivotHigh { left, right } => {
+            build_pivot(spec, left, right, Extreme::High, "PivotHigh")
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            build_pivot(spec, left, right, Extreme::Low, "PivotLow")
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => build_level(
+            spec,
+            (left, right, tolerance_pct, min_touches, lookback),
+            true,
+            "Resistance",
+        ),
+        IndicatorSpec::Support {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => build_level(
+            spec,
+            (left, right, tolerance_pct, min_touches, lookback),
+            false,
+            "Support",
+        ),
+        IndicatorSpec::DoubleTopNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => build_neckline(
+            spec,
+            (left, right, tolerance_pct),
+            NecklineKind::DoubleTop,
+            "DoubleTopNeckline",
+        ),
+        IndicatorSpec::DoubleBottomNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => build_neckline(
+            spec,
+            (left, right, tolerance_pct),
+            NecklineKind::DoubleBottom,
+            "DoubleBottomNeckline",
+        ),
+        IndicatorSpec::TrendlineLows { left, right } => {
+            build_trendline(spec, left, right, true, "TrendlineLows")
+        }
+        IndicatorSpec::TrendlineHighs { left, right } => {
+            build_trendline(spec, left, right, false, "TrendlineHighs")
+        }
+        // The four anatomy variants take no parameters and are defined on every
+        // bar, including the first — nothing can refuse them.
+        IndicatorSpec::Body => Ok(Box::new(Anatomy::new(AnatomyKind::Body))),
+        IndicatorSpec::UpperWick => Ok(Box::new(Anatomy::new(AnatomyKind::UpperWick))),
+        IndicatorSpec::LowerWick => Ok(Box::new(Anatomy::new(AnatomyKind::LowerWick))),
+        IndicatorSpec::Range => Ok(Box::new(Anatomy::new(AnatomyKind::Range))),
+        other => unreachable!(
+            "build_indicator routes only the structure/pattern variants here, never {other:?}"
+        ),
+    }
+}
+
+/// Build a `PivotHigh`/`PivotLow` slot from its fixed span.
+fn build_pivot(
+    spec: &IndicatorSpec,
+    left: &SweepableValue<u32>,
+    right: &SweepableValue<u32>,
+    extreme: Extreme,
+    name: &str,
+) -> Result<Box<dyn Indicator>, EngineError> {
+    let left = fixed_u32(left, &format!("{}.left", name.to_ascii_lowercase()))?;
+    let right = fixed_u32(right, &format!("{}.right", name.to_ascii_lowercase()))?;
+    PivotIndicator::new(left, right, extreme)
+        .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+        .ok_or_else(|| {
+            invalid_period(
+                spec,
+                format!("{name} left={left}, right={right} is invalid"),
+            )
+        })
+}
+
+/// The five borrowed `SweepableValue` leaves of a `Resistance`/`Support` spec,
+/// in declaration order: `(left, right, tolerance_pct, min_touches, lookback)`.
+/// Named so the factory can take them as one value without tripping the
+/// pedantic type-complexity budget.
+type LevelLeaves<'a> = (
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<Decimal>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+);
+
+/// Build a `Resistance`/`Support` slot from its fixed parameter tuple.
+fn build_level(
+    spec: &IndicatorSpec,
+    leaves: LevelLeaves<'_>,
+    above: bool,
+    name: &str,
+) -> Result<Box<dyn Indicator>, EngineError> {
+    let (left, right, tolerance_pct, min_touches, lookback) = leaves;
+    let field = name.to_ascii_lowercase();
+    let left = fixed_u32(left, &format!("{field}.left"))?;
+    let right = fixed_u32(right, &format!("{field}.right"))?;
+    let tolerance_pct = fixed_decimal(tolerance_pct, &format!("{field}.tolerance_pct"))?;
+    let min_touches = fixed_u32(min_touches, &format!("{field}.min_touches"))?;
+    let lookback = fixed_u32(lookback, &format!("{field}.lookback"))?;
+    LevelIndicator::new(left, right, tolerance_pct, min_touches, lookback, above)
+        .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+        .ok_or_else(|| {
+            invalid_period(
+                spec,
+                format!(
+                    "{name} parameters left={left}, right={right}, tolerance_pct={tolerance_pct}, \
+                     min_touches={min_touches}, lookback={lookback} are invalid"
+                ),
+            )
+        })
+}
+
+/// The three borrowed `SweepableValue` leaves of a `DoubleTopNeckline` /
+/// `DoubleBottomNeckline` spec, in declaration order:
+/// `(left, right, tolerance_pct)`.
+type NecklineLeaves<'a> = (
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<Decimal>,
+);
+
+/// Build a `DoubleTopNeckline`/`DoubleBottomNeckline` slot from its fixed
+/// parameter tuple.
+fn build_neckline(
+    spec: &IndicatorSpec,
+    leaves: NecklineLeaves<'_>,
+    kind: NecklineKind,
+    name: &str,
+) -> Result<Box<dyn Indicator>, EngineError> {
+    let (left, right, tolerance_pct) = leaves;
+    let field = name.to_ascii_lowercase();
+    let left = fixed_u32(left, &format!("{field}.left"))?;
+    let right = fixed_u32(right, &format!("{field}.right"))?;
+    let tolerance_pct = fixed_decimal(tolerance_pct, &format!("{field}.tolerance_pct"))?;
+    NecklineIndicator::new(left, right, tolerance_pct, kind)
+        .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+        .ok_or_else(|| {
+            invalid_period(
+                spec,
+                format!(
+                    "{name} parameters left={left}, right={right}, tolerance_pct={tolerance_pct} \
+                     are invalid"
+                ),
+            )
+        })
+}
+
+/// Build a `TrendlineLows`/`TrendlineHighs` slot from its fixed span.
+fn build_trendline(
+    spec: &IndicatorSpec,
+    left: &SweepableValue<u32>,
+    right: &SweepableValue<u32>,
+    rising: bool,
+    name: &str,
+) -> Result<Box<dyn Indicator>, EngineError> {
+    let field = name.to_ascii_lowercase();
+    let left = fixed_u32(left, &format!("{field}.left"))?;
+    let right = fixed_u32(right, &format!("{field}.right"))?;
+    TrendlineIndicator::new(left, right, rising)
+        .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+        .ok_or_else(|| {
+            invalid_period(
+                spec,
+                format!("{name} left={left}, right={right} is invalid"),
+            )
+        })
 }
 
 fn fixed_u32(value: &SweepableValue<u32>, field: &str) -> Result<u32, EngineError> {
@@ -336,9 +602,18 @@ fn fixed_u32(value: &SweepableValue<u32>, field: &str) -> Result<u32, EngineErro
     }
 }
 
+fn fixed_decimal(value: &SweepableValue<Decimal>, field: &str) -> Result<Decimal, EngineError> {
+    match value {
+        SweepableValue::Fixed(value) => Ok(*value),
+        SweepableValue::Sweep { .. } => Err(EngineError::UnexpectedSweep {
+            field: field.to_owned(),
+        }),
+    }
+}
+
 fn invalid_period(spec: &IndicatorSpec, detail: String) -> EngineError {
     EngineError::InvalidPeriod {
-        spec: spec.clone(),
+        spec: Box::new(spec.clone()),
         detail,
     }
 }

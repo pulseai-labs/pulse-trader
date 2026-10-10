@@ -512,6 +512,23 @@ mod mapping {
         of: Option<Box<Operand>>,
         #[serde(default)]
         bars: Option<u32>,
+        // The structure and pattern indicators (schema 1.3.0, r4.s6.w1/w3): a
+        // pivot's left / right span, a level's touch count and window, and the
+        // tolerance as a decimal FRACTION (`0.003` = 0.3%, the `distance_pct`
+        // convention). `pivot_high`/`pivot_low`/`trendline_lows`/
+        // `trendline_highs` take `left`/`right`; `resistance`/`support` take all
+        // five; `double_top_neckline`/`double_bottom_neckline` take
+        // `left`/`right`/`tolerance_pct`.
+        #[serde(default)]
+        left: Option<u32>,
+        #[serde(default)]
+        right: Option<u32>,
+        #[serde(default)]
+        min_touches: Option<u32>,
+        #[serde(default)]
+        lookback: Option<u32>,
+        #[serde(default, with = "rust_decimal::serde::str_option")]
+        tolerance_pct: Option<Decimal>,
     }
 
     /// The comparator/cross the flat `op` string selects.
@@ -861,11 +878,80 @@ mod mapping {
                 period: fixed_period(operand, path)?,
                 source: price_field_or(operand.price_field.as_deref(), PriceField::Low, path)?,
             }),
+            // The structure indicators (r4.s6.w1): the pivot variants take
+            // `left`/`right`, the level variants the same span plus
+            // `tolerance_pct` (a decimal fraction — `0.003` = 0.3%),
+            // `min_touches` and `lookback`. The anatomy variants take no
+            // parameters: their arms read none of the operand's fields, so an
+            // operand key meant for another kind (say `period` beside
+            // `indicator: "body"`) is IGNORED here, not refused — the same
+            // read-what-you-need shape as the `price` arm. The only refused
+            // strays are the explicit `timeframe` ones (`constant`, `arith`,
+            // `lag`), where a dropped series would change the operand.
+            "pivot_high" => Ok(IndicatorSpec::PivotHigh {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+            }),
+            "pivot_low" => Ok(IndicatorSpec::PivotLow {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+            }),
+            "resistance" => Ok(IndicatorSpec::Resistance {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+                tolerance_pct: fixed_decimal(
+                    operand.tolerance_pct,
+                    &format!("{path}.tolerance_pct"),
+                )?,
+                min_touches: fixed_u32(operand.min_touches, &format!("{path}.min_touches"))?,
+                lookback: fixed_u32(operand.lookback, &format!("{path}.lookback"))?,
+            }),
+            "support" => Ok(IndicatorSpec::Support {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+                tolerance_pct: fixed_decimal(
+                    operand.tolerance_pct,
+                    &format!("{path}.tolerance_pct"),
+                )?,
+                min_touches: fixed_u32(operand.min_touches, &format!("{path}.min_touches"))?,
+                lookback: fixed_u32(operand.lookback, &format!("{path}.lookback"))?,
+            }),
+            "body" => Ok(IndicatorSpec::Body),
+            "upper_wick" => Ok(IndicatorSpec::UpperWick),
+            "lower_wick" => Ok(IndicatorSpec::LowerWick),
+            "range" => Ok(IndicatorSpec::Range),
+            // The pattern indicators (r4.s6.w3): the necklines take the pivot
+            // span plus `tolerance_pct` (a decimal fraction — `0.003` = 0.3%),
+            // the trendlines the span alone.
+            "double_top_neckline" => Ok(IndicatorSpec::DoubleTopNeckline {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+                tolerance_pct: fixed_decimal(
+                    operand.tolerance_pct,
+                    &format!("{path}.tolerance_pct"),
+                )?,
+            }),
+            "double_bottom_neckline" => Ok(IndicatorSpec::DoubleBottomNeckline {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+                tolerance_pct: fixed_decimal(
+                    operand.tolerance_pct,
+                    &format!("{path}.tolerance_pct"),
+                )?,
+            }),
+            "trendline_lows" => Ok(IndicatorSpec::TrendlineLows {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+            }),
+            "trendline_highs" => Ok(IndicatorSpec::TrendlineHighs {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+            }),
             other => Err(field_error(
                 format!("{path}.indicator"),
                 ValidationCode::FieldRange,
                 format!(
-                    "unknown indicator {other:?}; expected rsi|ema|adx|macd|atr|highest|lowest"
+                    "unknown indicator {other:?}; expected rsi|ema|adx|macd|atr|highest|lowest|pivot_high|pivot_low|resistance|support|double_top_neckline|double_bottom_neckline|trendline_lows|trendline_highs|body|upper_wick|lower_wick|range"
                 ),
             )),
         }
@@ -913,6 +999,21 @@ mod mapping {
                 path.to_owned(),
                 ValidationCode::FieldRange,
                 "this indicator requires a positive integer period",
+            )
+        })
+    }
+
+    /// Wrap a required decimal field into `SweepableValue::Fixed`, or a
+    /// correctable "field required" error (r4.s6.w1: `tolerance_pct`).
+    fn fixed_decimal(
+        value: Option<Decimal>,
+        path: &str,
+    ) -> Result<SweepableValue<Decimal>, FieldError> {
+        value.map(SweepableValue::Fixed).ok_or_else(|| {
+            field_error(
+                path.to_owned(),
+                ValidationCode::FieldRange,
+                "this indicator requires a decimal tolerance, e.g. \"0.003\" for 0.3%",
             )
         })
     }
@@ -982,7 +1083,13 @@ fn operand_schema_level(nested: &Value) -> Value {
             },
             "indicator": {
                 "type": "string",
-                "enum": ["rsi", "ema", "adx", "macd", "atr", "highest", "lowest"]
+                "enum": [
+                    "rsi", "ema", "adx", "macd", "atr", "highest", "lowest",
+                    "pivot_high", "pivot_low", "resistance", "support",
+                    "double_top_neckline", "double_bottom_neckline",
+                    "trendline_lows", "trendline_highs",
+                    "body", "upper_wick", "lower_wick", "range"
+                ]
             },
             "timeframe": {
                 "type": "string",
@@ -1019,6 +1126,30 @@ fn operand_schema_level(nested: &Value) -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "description": "lag only: how many closed bars back (1..=500), on the lagged operand's own series"
+            },
+            "left": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "pivot_high/pivot_low/resistance/support/double_top_neckline/double_bottom_neckline/trendline_lows/trendline_highs: bars the pivot must exceed to its left (strictly)"
+            },
+            "right": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "pivot_high/pivot_low/resistance/support/double_top_neckline/double_bottom_neckline/trendline_lows/trendline_highs: bars the pivot must be at least equal to on its right"
+            },
+            "tolerance_pct": {
+                "type": "string",
+                "description": "resistance/support/double_top_neckline/double_bottom_neckline: how close two pivots must be to count as one level (or a double top/bottom), as a decimal fraction on the distance_pct convention — \"0.003\" means 0.3% (range (0, 0.10])"
+            },
+            "min_touches": {
+                "type": "integer",
+                "minimum": 2,
+                "description": "resistance/support: how many touching pivots a level needs to qualify"
+            },
+            "lookback": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "resistance/support: how many bars back a confirmed pivot still counts; must exceed left + right"
             }
         },
         "required": ["source"]

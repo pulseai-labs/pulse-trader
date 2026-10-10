@@ -12,8 +12,10 @@ pub mod convert;
 pub mod ema;
 pub mod engine;
 pub mod macd;
+pub mod patterns;
 pub mod rolling;
 pub mod rsi;
+pub mod structure;
 pub mod wilder;
 
 #[cfg(test)]

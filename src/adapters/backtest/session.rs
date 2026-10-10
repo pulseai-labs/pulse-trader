@@ -603,8 +603,11 @@ impl EngineSession {
 
         // The entry gate: the running bar count stands in for `bar.index > 0`
         // (this is bar `self.bars` in the aligned feed's numbering), the
-        // engine's own three-conjunct warm gate, the HTF/D1 engine warm
-        // gates, and the paired-bar F3 clauses — the whole-run gate verbatim.
+        // engine's own per-slot warm gate (ring depth + readiness; the
+        // level/pattern slots keep the ring depth but skip the all-`Some`
+        // rule, their latched readiness standing in for it), the HTF/D1 engine
+        // warm gates, and the paired-bar F3 clauses — the whole-run gate
+        // verbatim.
         if counted
             && self.state.position.is_none()
             && self.state.pending_entry.is_none()
