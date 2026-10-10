@@ -576,6 +576,70 @@ fn overlapping_runs_form_the_resistance_above_the_close() {
     );
 }
 
+/// R3-1 (r4.s6 PR-362 fix round 3, delta review): with SEVERAL qualifying runs
+/// at once, a resistance is the LOWEST candidate strictly above the close and a
+/// support the HIGHEST strictly below it. Both halves use pivots 100/109/118 —
+/// runs `[100, 109]` (mean 104.5) and `[109, 118]` (mean 113.5), both on the
+/// same side of the close — so the fold that keeps the best is pinned by hand:
+/// flipping `level`'s `min`/`max` fold fails this test (the proptest pins the
+/// candidate ENUMERATION only).
+#[test]
+fn several_qualifying_runs_pick_the_lowest_above_and_the_highest_below() {
+    // Pivot highs 100 (bar 1), 109 (bar 4) and 118 (bar 7); bar 8 closes at
+    // 104, below both candidates — the resistance is the LOWER one.
+    let resistance_rows: [(i64, i64, i64, i64); 9] = [
+        (94, 95, 93, 94),
+        (94, 100, 94, 96), // pivot high 100
+        (96, 97, 95, 96),  // confirms it
+        (96, 102, 96, 101),
+        (101, 109, 101, 104), // pivot high 109
+        (104, 105, 102, 103), // confirms it
+        (103, 108, 103, 107),
+        (107, 118, 107, 116), // pivot high 118
+        (103, 105, 102, 104), // confirms it; the close is 104
+    ];
+    let resistance = IndicatorSpec::Resistance {
+        left: fixed_u32(1),
+        right: fixed_u32(1),
+        tolerance_pct: fixed_dec("0.1"),
+        min_touches: fixed_u32(2),
+        lookback: fixed_u32(20),
+    };
+    assert_eq!(
+        value_at(&resistance, &candles_from(&resistance_rows), 8),
+        Some(Decimal::from_str("104.5").expect("literal")),
+        "both runs qualify above the close 104 — the resistance is the LOWEST \
+         candidate (104.5), not the highest (113.5)"
+    );
+
+    // Mirror: pivot lows 118 (bar 1), 109 (bar 4) and 100 (bar 7); bar 8 closes
+    // at 114, above both candidates — the support is the HIGHER one.
+    let support_rows: [(i64, i64, i64, i64); 9] = [
+        (126, 127, 125, 126),
+        (126, 127, 118, 120), // pivot low 118
+        (120, 121, 119, 120), // confirms it
+        (120, 121, 118, 119),
+        (119, 120, 109, 112), // pivot low 109
+        (112, 113, 111, 112), // confirms it
+        (112, 113, 109, 110),
+        (110, 111, 100, 104), // pivot low 100
+        (104, 115, 102, 114), // confirms it; the close is 114
+    ];
+    let support = IndicatorSpec::Support {
+        left: fixed_u32(1),
+        right: fixed_u32(1),
+        tolerance_pct: fixed_dec("0.1"),
+        min_touches: fixed_u32(2),
+        lookback: fixed_u32(20),
+    };
+    assert_eq!(
+        value_at(&support, &candles_from(&support_rows), 8),
+        Some(Decimal::from_str("113.5").expect("literal")),
+        "both runs qualify below the close 114 — the support is the HIGHEST \
+         candidate (113.5), not the lowest (104.5)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (d) Anatomy
 // ---------------------------------------------------------------------------
