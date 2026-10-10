@@ -150,6 +150,80 @@ pub enum IndicatorSpec {
         #[serde(default = "default_lowest_source")]
         source: PriceField,
     },
+    /// The high of the most recent confirmed **swing high** (schema 1.3.0,
+    /// r4.s6.w1). Bar p is a pivot for a `left`/`right` pair when its high is
+    /// strictly greater than the `left` highs before it and greater-or-equal to
+    /// the `right` highs after it; equality is deliberate, so a run of equal
+    /// highs resolves to its FIRST bar. A pivot is confirmed only once bar
+    /// `p + right` has closed — a pivot whose right bars are still forming does
+    /// not exist for any value — and the value at bar t is the high of the most
+    /// recent confirmed pivot, `None` before the first one.
+    PivotHigh {
+        /// Bars the pivot must exceed to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at least equal to on its right.
+        right: SweepableValue<u32>,
+    },
+    /// The low of the most recent confirmed **swing low** (schema 1.3.0,
+    /// r4.s6.w1) — the mirror of [`IndicatorSpec::PivotHigh`] on lows: strictly
+    /// lower than the `left` lows before it, lower-or-equal to the `right` lows
+    /// after it, confirmed only once bar `p + right` closes.
+    PivotLow {
+        /// Bars the pivot must undercut to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at most equal to on its right.
+        right: SweepableValue<u32>,
+    },
+    /// The nearest **resistance** above the current close, built from confirmed
+    /// swing highs (schema 1.3.0, r4.s6.w1). Among the confirmed pivot highs
+    /// within the last `lookback` bars, the pivots that sit within
+    /// `tolerance_pct` of each other are grouped; every group with at least
+    /// `min_touches` pivots is a candidate, its level being the mean of its
+    /// touching pivots; the value is the LOWEST candidate level strictly above
+    /// the current close, `None` when no group qualifies. `tolerance_pct` is a
+    /// DECIMAL FRACTION on the `distance_pct` convention (`0.003` = 0.3%).
+    Resistance {
+        /// Bars a pivot must exceed to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars a pivot must be at least equal to on its right.
+        right: SweepableValue<u32>,
+        /// How close two pivots must be to count as one level, as a decimal
+        /// fraction (`0.003` = 0.3%) — the `distance_pct` convention.
+        tolerance_pct: SweepableValue<Decimal>,
+        /// How many touching pivots a level needs to qualify.
+        min_touches: SweepableValue<u32>,
+        /// How many bars back a confirmed pivot still counts.
+        lookback: SweepableValue<u32>,
+    },
+    /// The nearest **support** below the current close (schema 1.3.0,
+    /// r4.s6.w1) — the mirror of [`IndicatorSpec::Resistance`] on confirmed
+    /// swing lows: the HIGHEST qualifying level strictly below the current
+    /// close, `None` when no group qualifies.
+    Support {
+        /// Bars a pivot must undercut to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars a pivot must be at most equal to on its right.
+        right: SweepableValue<u32>,
+        /// How close two pivots must be to count as one level, as a decimal
+        /// fraction (`0.003` = 0.3%) — the `distance_pct` convention.
+        tolerance_pct: SweepableValue<Decimal>,
+        /// How many touching pivots a level needs to qualify.
+        min_touches: SweepableValue<u32>,
+        /// How many bars back a confirmed pivot still counts.
+        lookback: SweepableValue<u32>,
+    },
+    /// The body height of the current bar — `|close − open|` (schema 1.3.0,
+    /// r4.s6.w1). Always defined: the first bar already yields a value.
+    Body,
+    /// The upper wick of the current bar — `high − max(open, close)`
+    /// (schema 1.3.0, r4.s6.w1).
+    UpperWick,
+    /// The lower wick of the current bar — `min(open, close) − low`
+    /// (schema 1.3.0, r4.s6.w1).
+    LowerWick,
+    /// The full range of the current bar — `high − low` (schema 1.3.0,
+    /// r4.s6.w1).
+    Range,
 }
 
 /// `#[serde(default = …)]` target for [`IndicatorSpec::Highest`]'s `source`

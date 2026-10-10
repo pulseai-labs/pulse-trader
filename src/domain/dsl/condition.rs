@@ -300,6 +300,17 @@ mod prop_tests {
         ]
     }
 
+    /// r4.s6.w1: the decimal leaf the structure level variants carry
+    /// (`tolerance_pct`), in both its `Fixed` and `Sweep` shapes — the same
+    /// generator `strategy.rs` uses for its sweepable decimals.
+    fn arb_sweepable_decimal() -> impl Strategy<Value = SweepableValue<Decimal>> {
+        prop_oneof![
+            arb_decimal().prop_map(SweepableValue::Fixed),
+            (arb_decimal(), arb_decimal(), arb_decimal())
+                .prop_map(|(start, end, step)| SweepableValue::Sweep { start, end, step }),
+        ]
+    }
+
     /// Every `prop_oneof` arm below is `.boxed()` — see
     /// `strategy.rs`'s `arb_indicator_spec` for the #283 rationale: the
     /// union's value tree holds a `Box<dyn ValueTree>` instead of the arm's
@@ -345,6 +356,53 @@ mod prop_tests {
             (arb_sweepable_u32(), arb_price_field())
                 .prop_map(|(period, source)| IndicatorSpec::Lowest { period, source })
                 .boxed(),
+            // r4.s6.w1 (schema 1.3.0): the structure indicators — any span for
+            // the pivots, any leaf tuple for the levels, and the four
+            // parameterless anatomy variants.
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::PivotHigh { left, right })
+                .boxed(),
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::PivotLow { left, right })
+                .boxed(),
+            (
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+                arb_sweepable_decimal(),
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+            )
+                .prop_map(|(left, right, tolerance_pct, min_touches, lookback)| {
+                    IndicatorSpec::Resistance {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                },)
+                .boxed(),
+            (
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+                arb_sweepable_decimal(),
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+            )
+                .prop_map(|(left, right, tolerance_pct, min_touches, lookback)| {
+                    IndicatorSpec::Support {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                },)
+                .boxed(),
+            Just(IndicatorSpec::Body).boxed(),
+            Just(IndicatorSpec::UpperWick).boxed(),
+            Just(IndicatorSpec::LowerWick).boxed(),
+            Just(IndicatorSpec::Range).boxed(),
         ]
     }
 

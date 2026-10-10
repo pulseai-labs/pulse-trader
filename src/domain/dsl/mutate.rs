@@ -501,6 +501,67 @@ fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlF
                 IndicatorSpec::Lowest { period, .. } => {
                     f(&format!("{base}.lowest.period"), LeafMut::Period(period))?;
                 }
+                // r4.s6.w1: the structure indicators. `left`/`right`/
+                // `min_touches`/`lookback` are period-like u32 leaves;
+                // `tolerance_pct` is a decimal threshold on the
+                // `risk_per_trade_pct` precedent. The four anatomy variants
+                // carry no numeric leaf at all.
+                IndicatorSpec::PivotHigh { left, right } => {
+                    f(&format!("{base}.pivot_high.left"), LeafMut::Period(left))?;
+                    f(&format!("{base}.pivot_high.right"), LeafMut::Period(right))?;
+                }
+                IndicatorSpec::PivotLow { left, right } => {
+                    f(&format!("{base}.pivot_low.left"), LeafMut::Period(left))?;
+                    f(&format!("{base}.pivot_low.right"), LeafMut::Period(right))?;
+                }
+                IndicatorSpec::Resistance {
+                    left,
+                    right,
+                    tolerance_pct,
+                    min_touches,
+                    lookback,
+                } => {
+                    f(&format!("{base}.resistance.left"), LeafMut::Period(left))?;
+                    f(&format!("{base}.resistance.right"), LeafMut::Period(right))?;
+                    f(
+                        &format!("{base}.resistance.tolerance_pct"),
+                        LeafMut::Threshold(tolerance_pct),
+                    )?;
+                    f(
+                        &format!("{base}.resistance.min_touches"),
+                        LeafMut::Period(min_touches),
+                    )?;
+                    f(
+                        &format!("{base}.resistance.lookback"),
+                        LeafMut::Period(lookback),
+                    )?;
+                }
+                IndicatorSpec::Support {
+                    left,
+                    right,
+                    tolerance_pct,
+                    min_touches,
+                    lookback,
+                } => {
+                    f(&format!("{base}.support.left"), LeafMut::Period(left))?;
+                    f(&format!("{base}.support.right"), LeafMut::Period(right))?;
+                    f(
+                        &format!("{base}.support.tolerance_pct"),
+                        LeafMut::Threshold(tolerance_pct),
+                    )?;
+                    f(
+                        &format!("{base}.support.min_touches"),
+                        LeafMut::Period(min_touches),
+                    )?;
+                    f(
+                        &format!("{base}.support.lookback"),
+                        LeafMut::Period(lookback),
+                    )?;
+                }
+                IndicatorSpec::Body
+                | IndicatorSpec::UpperWick
+                | IndicatorSpec::LowerWick
+                | IndicatorSpec::Range => {}
             }
         }
         // The nesting-aware path grammar matches validate.rs's: `.arith.lhs`,

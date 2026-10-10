@@ -655,6 +655,42 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Atr { period } => format!("ATR({})", period_value(period)),
         IndicatorSpec::Highest { period, .. } => format!("Highest({})", period_value(period)),
         IndicatorSpec::Lowest { period, .. } => format!("Lowest({})", period_value(period)),
+        IndicatorSpec::PivotHigh { left, right } => {
+            format!("PivotHigh({}/{})", period_value(left), period_value(right))
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            format!("PivotLow({}/{})", period_value(left), period_value(right))
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            min_touches,
+            lookback,
+            ..
+        } => format!(
+            "Resistance({}/{}, {}+ touches, {} bars)",
+            period_value(left),
+            period_value(right),
+            period_value(min_touches),
+            period_value(lookback)
+        ),
+        IndicatorSpec::Support {
+            left,
+            right,
+            min_touches,
+            lookback,
+            ..
+        } => format!(
+            "Support({}/{}, {}+ touches, {} bars)",
+            period_value(left),
+            period_value(right),
+            period_value(min_touches),
+            period_value(lookback)
+        ),
+        IndicatorSpec::Body => "Body".to_owned(),
+        IndicatorSpec::UpperWick => "UpperWick".to_owned(),
+        IndicatorSpec::LowerWick => "LowerWick".to_owned(),
+        IndicatorSpec::Range => "Range".to_owned(),
     }
 }
 
@@ -871,6 +907,179 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
                 "Lowest period",
                 errors,
             );
+        }
+        // The structure indicators (schema 1.3.0, r4.s6.w1): a pivot needs at
+        // least one bar on each side; a level needs `min_touches` >= 2 (a
+        // "level" touched once is not a level), a window longer than the pivot
+        // span it must hold, and a tolerance that is a positive decimal
+        // fraction no wider than 0.10 (10%).
+        IndicatorSpec::PivotHigh { left, right } => {
+            check_pivot_span(left, right, path, "pivot_high", "PivotHigh", errors);
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            check_pivot_span(left, right, path, "pivot_low", "PivotLow", errors);
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => {
+            check_level_parameters(
+                (left, right, tolerance_pct, min_touches, lookback),
+                path,
+                "resistance",
+                "Resistance",
+                errors,
+            );
+        }
+        IndicatorSpec::Support {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => {
+            check_level_parameters(
+                (left, right, tolerance_pct, min_touches, lookback),
+                path,
+                "support",
+                "Support",
+                errors,
+            );
+        }
+        // The candle-anatomy variants carry no numeric leaf at all — the
+        // `series`-tag precedent: nothing to range-check.
+        IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => {}
+    }
+}
+
+/// Rule 6 for a `SweepableValue<u32>` that must be at least `min` (a
+/// period-like leaf with a floor).
+fn check_u32_at_least(
+    v: &SweepableValue<u32>,
+    path: &str,
+    label: &str,
+    min: u32,
+    errors: &mut Vec<FieldError>,
+) {
+    match v {
+        SweepableValue::Sweep { .. } => push_sweep(path, errors),
+        SweepableValue::Fixed(n) => {
+            if *n < min {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::FieldRange,
+                    message: format!("{label} must be at least {min}"),
+                });
+            }
+        }
+    }
+}
+
+/// The pivot span rule shared by `PivotHigh`/`PivotLow`: `left`/`right` >= 1.
+fn check_pivot_span(
+    left: &SweepableValue<u32>,
+    right: &SweepableValue<u32>,
+    path: &str,
+    field: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    check_u32_at_least(
+        left,
+        &format!("{path}.{field}.left"),
+        &format!("{label} left"),
+        1,
+        errors,
+    );
+    check_u32_at_least(
+        right,
+        &format!("{path}.{field}.right"),
+        &format!("{label} right"),
+        1,
+        errors,
+    );
+}
+
+/// The five borrowed `SweepableValue` leaves of a `Resistance`/`Support` spec,
+/// in declaration order: `(left, right, tolerance_pct, min_touches, lookback)`.
+/// Named so the shared rule set can take them as one value without tripping the
+/// pedantic type-complexity budget.
+type LevelLeaves<'a> = (
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<Decimal>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+);
+
+/// The shared rule set for `Resistance`/`Support`: `left`/`right` >= 1,
+/// `min_touches` >= 2, `lookback` > `left + right` (only checkable when all
+/// three are `Fixed` — the MACD `fast < slow` precedent), and `tolerance_pct` a
+/// decimal fraction in `(0, 0.10]`.
+fn check_level_parameters(
+    leaves: LevelLeaves<'_>,
+    path: &str,
+    field: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    let (left, right, tolerance_pct, min_touches, lookback) = leaves;
+    check_u32_at_least(
+        left,
+        &format!("{path}.{field}.left"),
+        &format!("{label} left"),
+        1,
+        errors,
+    );
+    check_u32_at_least(
+        right,
+        &format!("{path}.{field}.right"),
+        &format!("{label} right"),
+        1,
+        errors,
+    );
+    check_u32_at_least(
+        min_touches,
+        &format!("{path}.{field}.min_touches"),
+        &format!("{label} min_touches"),
+        2,
+        errors,
+    );
+    match tolerance_pct {
+        SweepableValue::Sweep { .. } => {
+            push_sweep(&format!("{path}.{field}.tolerance_pct"), errors);
+        }
+        SweepableValue::Fixed(d) => {
+            if *d <= Decimal::ZERO || *d > Decimal::new(10, 2) {
+                errors.push(FieldError {
+                    path: format!("{path}.{field}.tolerance_pct"),
+                    code: ValidationCode::FieldRange,
+                    message: format!(
+                        "{label} tolerance_pct must be a decimal fraction in the range (0, 0.10] — 0.003 means 0.3%"
+                    ),
+                });
+            }
+        }
+    }
+    // `lookback` must hold the pivot span plus the pivot itself.
+    if let (SweepableValue::Fixed(l), SweepableValue::Fixed(r), SweepableValue::Fixed(k)) =
+        (left, right, lookback)
+    {
+        let span = u64::from(*l) + u64::from(*r);
+        if u64::from(*k) <= span {
+            errors.push(FieldError {
+                path: format!("{path}.{field}.lookback"),
+                code: ValidationCode::FieldRange,
+                message: format!(
+                    "{label} lookback ({k}) must be greater than left + right ({l} + {r} = {span})"
+                ),
+            });
         }
     }
 }

@@ -96,6 +96,47 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
                 u32_leaf(period)
             )
         }
+        // The structure indicators (schema 1.3.0, r4.s6.w1) name the facts a
+        // trader needs to read the level: the pivot span, the touch count, the
+        // tolerance as a PERCENT (the DSL stores the fraction) and the window.
+        IndicatorSpec::PivotHigh { left, right } => {
+            format!("pivot high({}/{})", u32_leaf(left), u32_leaf(right))
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            format!("pivot low({}/{})", u32_leaf(left), u32_leaf(right))
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => format!(
+            "resistance(pivots {}/{}, {}+ touches within {}, {} bars)",
+            u32_leaf(left),
+            u32_leaf(right),
+            u32_leaf(min_touches),
+            pct_leaf(tolerance_pct),
+            u32_leaf(lookback)
+        ),
+        IndicatorSpec::Support {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => format!(
+            "support(pivots {}/{}, {}+ touches within {}, {} bars)",
+            u32_leaf(left),
+            u32_leaf(right),
+            u32_leaf(min_touches),
+            pct_leaf(tolerance_pct),
+            u32_leaf(lookback)
+        ),
+        IndicatorSpec::Body => "body".to_owned(),
+        IndicatorSpec::UpperWick => "upper wick".to_owned(),
+        IndicatorSpec::LowerWick => "lower wick".to_owned(),
+        IndicatorSpec::Range => "range".to_owned(),
     }
 }
 

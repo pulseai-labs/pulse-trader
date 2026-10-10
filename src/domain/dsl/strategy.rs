@@ -292,6 +292,53 @@ mod prop_tests {
             (arb_sweepable_u32(), arb_price_field())
                 .prop_map(|(period, source)| IndicatorSpec::Lowest { period, source })
                 .boxed(),
+            // r4.s6.w1 (schema 1.3.0): the structure indicators — any span for
+            // the pivots, any leaf tuple for the levels, and the four
+            // parameterless anatomy variants.
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::PivotHigh { left, right })
+                .boxed(),
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::PivotLow { left, right })
+                .boxed(),
+            (
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+                arb_sweepable_decimal(),
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+            )
+                .prop_map(|(left, right, tolerance_pct, min_touches, lookback)| {
+                    IndicatorSpec::Resistance {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                },)
+                .boxed(),
+            (
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+                arb_sweepable_decimal(),
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+            )
+                .prop_map(|(left, right, tolerance_pct, min_touches, lookback)| {
+                    IndicatorSpec::Support {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                },)
+                .boxed(),
+            Just(IndicatorSpec::Body).boxed(),
+            Just(IndicatorSpec::UpperWick).boxed(),
+            Just(IndicatorSpec::LowerWick).boxed(),
+            Just(IndicatorSpec::Range).boxed(),
         ]
     }
 

@@ -326,8 +326,13 @@ pub enum CompiledExit {
     },
     /// Close when a [`CompiledCondition`] becomes true.
     SignalExit {
-        /// The condition that, when true, closes the position.
-        condition: CompiledCondition,
+        /// The condition that, when true, closes the position. Boxed
+        /// (r4.s6.w1): the structure indicator variants took `CompiledCondition`
+        /// past the size where carrying it inline makes every `CompiledExit`
+        /// in the compiled plan pay for the largest variant
+        /// (`clippy::large_enum_variant`). The plan is built once; each exit is
+        /// evaluated through one indirection per bar.
+        condition: Box<CompiledCondition>,
     },
     /// An ATR-multiple stop (schema 1.1.0): `period` selects the primary-series
     /// ATR read at the signal bar, `multiple` scales it via [`atr_stop_price`]
@@ -825,7 +830,7 @@ fn compile_exit(rule: &ExitRule) -> Result<CompiledExit, CompileError> {
             Ok(CompiledExit::TimeStop { max_bars })
         }
         ExitRule::SignalExit { condition } => Ok(CompiledExit::SignalExit {
-            condition: compile_condition(condition),
+            condition: Box::new(compile_condition(condition)),
         }),
         ExitRule::AtrStop { period, multiple } => {
             let period = *fixed(period).ok_or_else(|| CompileError::UnexpectedSweep {
