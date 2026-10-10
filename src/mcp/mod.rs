@@ -27,7 +27,7 @@ pub(crate) mod tools;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rmcp::model::{
-    Implementation, InitializeRequestParams, InitializeResult, ListResourcesResult,
+    CacheScope, Implementation, InitializeRequestParams, InitializeResult, ListResourcesResult,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
     ResourceContents, ServerCapabilities,
 };
@@ -184,6 +184,11 @@ impl ServerHandler for PulseMcp {
     }
 
     /// The one resource this server advertises: `pulse://dsl/schema`.
+    ///
+    /// Carries the SEP-2549 cache hints (`ttlMs`, `cacheScope`) unconditionally:
+    /// a client on the 2026-07-28 revision validates a cacheable result against
+    /// a schema where both are REQUIRED, and one on an older revision tolerates
+    /// the extra keys (#353).
     async fn list_resources(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -194,13 +199,19 @@ impl ServerHandler for PulseMcp {
                 "The PulseTrader strategy DSL grammar as JSON Schema, plus the conventions an agent needs before composing a variant.",
             )
             .with_mime_type(resources::DSL_SCHEMA_MIME);
-        Ok(ListResourcesResult {
-            resources: vec![resource],
-            ..ListResourcesResult::default()
-        })
+        Ok(ListResourcesResult::with_all_items(vec![resource])
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
 
     /// Read `pulse://dsl/schema`; any other URI is a protocol-level error.
+    ///
+    /// The result carries the SEP-2549 cache hints (`ttlMs: 0`, `cacheScope:
+    /// private`) for every peer: the 2026-07-28 revision's result schema makes
+    /// both REQUIRED — Claude Code rejects the read without them (#353) — and
+    /// older revisions tolerate the extra keys. A zero TTL means never cached:
+    /// the schema text changes with the DSL version, so a stale copy would be a
+    /// wrong vocabulary.
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -217,9 +228,11 @@ impl ServerHandler for PulseMcp {
         if let ResourceContents::TextResourceContents { mime_type, .. } = &mut contents {
             *mime_type = Some(resources::DSL_SCHEMA_MIME.to_owned());
         }
-        Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
-            vec![contents],
-        )))
+        Ok(ReadResourceResponse::Complete(
+            ReadResourceResult::new(vec![contents])
+                .with_ttl_ms(0)
+                .with_cache_scope(CacheScope::Private),
+        ))
     }
 }
 
