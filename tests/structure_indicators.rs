@@ -1149,7 +1149,7 @@ fn a_clean_break_of_the_only_support_enters_on_the_break_bar() {
 // (j) The warm gate's latch and ring depth (fix round 2, rules A + B)
 // ---------------------------------------------------------------------------
 
-/// Rule A (r4.s6 PR-362 fix round 2, Codex 4239217701 / CodeRabbit 4239215025):
+/// Rule A (r4.s6 PR-362 fix round 2, Codex 4239217701 / `CodeRabbit` 4239215025):
 /// a level slot's readiness is LATCHED — once the window has held `min_touches`
 /// pivots it stays ready, so a pivot aging out of `lookback` cannot make the
 /// engine cold and freeze every unrelated entry branch. This strategy's entry
