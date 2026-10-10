@@ -33,6 +33,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   builder-tool and read-path arms, with a truncation no-repaint test and byte-identical two-run
   streaming per variant.
 
+- **The agent learns the 1.3.0 structure vocabulary, and the first S/R breakout example ships with a
+  golden backtest (r4.s6.w4).** The composer prompt's public default (`src/agent/prompts/composer.md`)
+  names all twelve structure and pattern variants — `pivot_high`/`pivot_low`, `resistance`/`support`,
+  `body`/`upper_wick`/`lower_wick`/`range`, `double_top_neckline`/`double_bottom_neckline`,
+  `trendline_lows`/`trendline_highs` — with their operand fields, the `tolerance_pct` fraction
+  convention, the confirmed-`right`-bars-late / never-repaints property, and a worked 4h resistance
+  breakout whose entry compares the close with the **previous** bar's level
+  (`crosses_above(close, lag(resistance{…}, 1))`) — never the same bar's, which can never hold — and
+  the `pulse://dsl/schema` conventions gain the matching `structure_indicators` entry.
+  `examples/strategies/sr-breakout-4h.json` is the initial checked-in 4h S/R breakout (an H4 close
+  crossing the previous H4 bar's resistance, gated by an H4 `body > 0.5 × range` anatomy filter and an
+  H4 trendline-highs break, with a 1.5% stop and a 1R target), and `tests/sr_breakout_example.rs` pins
+  its golden trade count and net P&L on the fixture store, proves every entry sits on a bar where the
+  zone break held (from an independently streamed `Resistance` series), and that two runs are
+  byte-identical; `tests/compose_vocabulary_1_3.rs` drives the same strategy through the real builder
+  tools and checks the prompt names every token.
+
 - **Off-box backup: the Mini's nightly `pulse backup` as a launchd calendar job, a read-only pull to
   draco-desk over a dedicated forced-command key, and a restore drill from the pulled copy (r4.s2.w5).**
   `deploy/com.pulsetrader.backup.plist` runs the installed binary's `backup` (defaults: the platform
