@@ -176,12 +176,14 @@ pub enum IndicatorSpec {
     },
     /// The nearest **resistance** above the current close, built from confirmed
     /// swing highs (schema 1.3.0, r4.s6.w1). Among the confirmed pivot highs
-    /// within the last `lookback` bars, the pivots that sit within
-    /// `tolerance_pct` of each other are grouped; every group with at least
-    /// `min_touches` pivots is a candidate, its level being the mean of its
-    /// touching pivots; the value is the LOWEST candidate level strictly above
-    /// the current close, `None` when no group qualifies. `tolerance_pct` is a
-    /// DECIMAL FRACTION on the `distance_pct` convention (`0.003` = 0.3%).
+    /// within the last `lookback` bars, a candidate level is a run of sorted
+    /// pivot prices whose highest is within `tolerance_pct` of their lowest
+    /// (for each start, the maximal run within the tolerance of its own lowest
+    /// price); every run of at least `min_touches` pivots is a candidate, its
+    /// level being the mean of its pivots. The value is the LOWEST candidate
+    /// level strictly above the current close, `None` when no run qualifies.
+    /// `tolerance_pct` is a DECIMAL FRACTION on the `distance_pct` convention
+    /// (`0.003` = 0.3%).
     Resistance {
         /// Bars a pivot must exceed to its left (strictly).
         left: SweepableValue<u32>,
@@ -197,8 +199,8 @@ pub enum IndicatorSpec {
     },
     /// The nearest **support** below the current close (schema 1.3.0,
     /// r4.s6.w1) — the mirror of [`IndicatorSpec::Resistance`] on confirmed
-    /// swing lows: the HIGHEST qualifying level strictly below the current
-    /// close, `None` when no group qualifies.
+    /// swing lows: the HIGHEST candidate level strictly below the current
+    /// close, `None` when no run qualifies.
     Support {
         /// Bars a pivot must undercut to its left (strictly).
         left: SweepableValue<u32>,

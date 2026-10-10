@@ -505,6 +505,60 @@ fn support_mirrors_the_resistance_below_the_close() {
     );
 }
 
+/// F4 (r4.s6 PR-362 fix round 1, Codex 4238952609): candidate levels are runs
+/// of sorted pivot prices whose highest is within `tolerance_pct` of their
+/// lowest, and the runs OVERLAP — a price can be the top of one candidate and
+/// the anchor of the next. At 10% tolerance, pivots 100/109/118 and a close of
+/// 110 give the candidates `[100, 109]` (104.5) and `[109, 118]` (113.5): the
+/// resistance is the lowest candidate above the close, 113.5. The old disjoint
+/// sweep consumed `[100, 109]` first, dropped 109 as an anchor, and answered
+/// `None`.
+#[test]
+fn overlapping_runs_form_the_resistance_above_the_close() {
+    // Pivot highs 100 (bar 1), 109 (bar 4) and 118 (bar 7) — each a strict
+    // local high with no other pivot in between — confirmed at the bar after.
+    let rows: [(i64, i64, i64, i64); 9] = [
+        (94, 95, 93, 94),
+        (94, 100, 94, 96), // pivot high 100
+        (96, 97, 95, 96),  // confirms it
+        (96, 102, 96, 101),
+        (101, 109, 101, 104), // pivot high 109
+        (104, 105, 102, 103), // confirms it
+        (103, 108, 103, 107),
+        (107, 118, 107, 116), // pivot high 118
+        (116, 112, 108, 110), // confirms it; the close is 110
+    ];
+
+    let spec = IndicatorSpec::Resistance {
+        left: fixed_u32(1),
+        right: fixed_u32(1),
+        tolerance_pct: fixed_dec("0.1"),
+        min_touches: fixed_u32(2),
+        lookback: fixed_u32(20),
+    };
+
+    // The Codex case: close 110 → the run [109, 118] is the lowest candidate
+    // above it.
+    let candles = candles_from(&rows);
+    assert_eq!(
+        value_at(&spec, &candles, 8),
+        Some(Decimal::from_str("113.5").expect("literal")),
+        "109 and 118 are within 10% of each other, so their run is a candidate \
+         at mean 113.5 — the lowest one above the close 110"
+    );
+
+    // With the close at 104 the same pivots give the OTHER candidate: the run
+    // [100, 109] at 104.5 is the lowest candidate above it, and the old
+    // disjoint sweep answers `None` for both closes.
+    let mut lower = rows;
+    lower[8].3 = 104;
+    assert_eq!(
+        value_at(&spec, &candles_from(&lower), 8),
+        Some(Decimal::from_str("104.5").expect("literal")),
+        "the run [100, 109] is the lowest candidate above the close 104"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (d) Anatomy
 // ---------------------------------------------------------------------------

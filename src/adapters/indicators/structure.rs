@@ -228,8 +228,11 @@ impl Indicator for PivotIndicator {
 ///
 /// The value at bar t is the lowest level **strictly above** the current close
 /// (the highest **strictly below** it for support), built from the confirmed
-/// pivots within the last `lookback` bars, grouped by `tolerance_pct`, keeping
-/// only groups with at least `min_touches` pivots. `None` when no group
+/// pivots within the last `lookback` bars. A candidate level is a **run of
+/// sorted pivot prices whose highest is within `tolerance_pct` of their
+/// lowest** — for each start `i`, the maximal run `p_i..=p_j` with
+/// `p_j − p_i ≤ p_i × tolerance_pct`, kept when it holds at least
+/// `min_touches` prices, with the run's mean as its value. `None` when no run
 /// qualifies.
 #[derive(Debug, Clone)]
 pub struct LevelIndicator {
@@ -289,6 +292,18 @@ impl LevelIndicator {
     }
 
     /// The current bar's level, from the in-window pivots and this close.
+    ///
+    /// Candidate levels are the runs of SORTED pivot prices whose highest is
+    /// within `tolerance_pct` of their lowest: for each start `i`, the run
+    /// `p_i..=p_j` with the largest `j` satisfying
+    /// `within_tolerance(p_i, p_j, tolerance_pct)` — `p_j − p_i ≤ p_i × tol`,
+    /// checked ops. A run of at least `min_touches` prices is a candidate with
+    /// value their mean (the `group_mean` rounding); the value is the LOWEST
+    /// candidate strictly above the close (the HIGHEST strictly below it for
+    /// support), `None` when no run qualifies. Runs OVERLAP by construction: a
+    /// price may be the top of one candidate and the anchor of the next, so a
+    /// cluster the old disjoint sweep split — `[100, 109]` then a lone `118`
+    /// at 10% tolerance — still forms `[109, 118]`.
     fn level(&self, close: Decimal) -> Option<Decimal> {
         if self.pivots.len() < self.min_touches as usize {
             return None;
@@ -297,15 +312,15 @@ impl LevelIndicator {
         prices.sort();
 
         let mut best: Option<Decimal> = None;
-        let mut index = 0;
-        while index < prices.len() {
-            // The group's anchor is its LOWEST price; every later price joins
-            // while it sits within `tolerance_pct` of that anchor.
-            let anchor = prices[index];
+        for start in 0..prices.len() {
+            // The run's anchor is its LOWEST price; the run extends while a
+            // later price sits within `tolerance_pct` of that anchor. Every
+            // start is considered, so the scan is O(run length) per pivot.
+            let anchor = prices[start];
             let mut total = anchor;
             let mut count = 1u32;
-            let mut cursor = index + 1;
             let mut overflow = false;
+            let mut cursor = start + 1;
             while cursor < prices.len()
                 && within_tolerance(anchor, prices[cursor], self.tolerance_pct)
             {
@@ -316,13 +331,10 @@ impl LevelIndicator {
                 count = count.saturating_add(1);
                 cursor += 1;
             }
-            if overflow {
-                index = cursor;
+            if overflow || count < self.min_touches {
                 continue;
             }
-            if count >= self.min_touches
-                && let Some(mean) = group_mean(total, count)
-            {
+            if let Some(mean) = group_mean(total, count) {
                 let qualifies = if self.above {
                     mean > close
                 } else {
@@ -336,7 +348,6 @@ impl LevelIndicator {
                     });
                 }
             }
-            index = cursor;
         }
         best
     }

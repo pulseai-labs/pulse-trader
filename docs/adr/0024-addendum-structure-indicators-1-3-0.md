@@ -48,8 +48,8 @@ anatomy variants take no parameters.
 |---|---|---|
 | `PivotHigh` | `left`, `right` | The high of the most recent bar p with `p + right ≤ t` whose high is strictly greater than the `left` bars before it and greater-or-equal to the `right` bars after it |
 | `PivotLow` | `left`, `right` | Mirror of `PivotHigh` on lows |
-| `Resistance` | `left`, `right`, `tolerance_pct`, `min_touches`, `lookback` | Among confirmed pivot highs within the last `lookback` bars, the lowest price level above the current close that at least `min_touches` pivot highs touched within `tolerance_pct` of each other; the level is the mean of its touching pivots |
-| `Support` | `left`, `right`, `tolerance_pct`, `min_touches`, `lookback` | Mirror on pivot lows: the highest level below the current close |
+| `Resistance` | `left`, `right`, `tolerance_pct`, `min_touches`, `lookback` | Among confirmed pivot highs within the last `lookback` bars, the lowest candidate level above the current close: a candidate is a run of sorted pivot prices whose highest is within `tolerance_pct` of their lowest (for each start, the maximal run within tolerance of that start's own price; runs may overlap), kept when it holds at least `min_touches` pivots, its level the mean of its pivots |
+| `Support` | `left`, `right`, `tolerance_pct`, `min_touches`, `lookback` | Mirror on pivot lows: the highest candidate level below the current close (the same runs of sorted pivot prices whose highest is within `tolerance_pct` of their lowest) |
 | `Body` | — | `abs(close − open)` of the current bar |
 | `UpperWick` | — | `high − max(open, close)` |
 | `LowerWick` | — | `min(open, close) − low` |
