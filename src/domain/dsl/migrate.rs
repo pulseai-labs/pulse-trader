@@ -212,9 +212,11 @@ fn identity_1_1_0_to_1_2_0(mut value: Value) -> Result<Value, MigrationError> {
 }
 
 /// The `1.2.0 → 1.3.0` step: **identity**. Schema 1.3.0 is purely additive
-/// (r4.s6 ADR-0024 addendum — eight price-level structure indicator variants:
-/// `PivotHigh`/`PivotLow`, `Resistance`/`Support` and the four anatomy
-/// variants), so the document's meaning is unchanged; `apply` rewrites only the
+/// (r4.s6 ADR-0024 addendum — twelve structure and pattern indicator variants:
+/// `PivotHigh`/`PivotLow`, `Resistance`/`Support` and the four anatomy variants
+/// from r4.s6.w1, plus the four pattern variants `DoubleTopNeckline`/
+/// `DoubleBottomNeckline` and `TrendlineLows`/`TrendlineHighs` from r4.s6.w3),
+/// so the document's meaning is unchanged; `apply` rewrites only the
 /// `schema_version` string and leaves every other byte alone. `dsl_original` is
 /// preserved verbatim by [`Loaded`] regardless — the migration never touches it.
 fn identity_1_2_0_to_1_3_0(mut value: Value) -> Result<Value, MigrationError> {

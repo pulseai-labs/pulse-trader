@@ -882,7 +882,12 @@ mod mapping {
             // `left`/`right`, the level variants the same span plus
             // `tolerance_pct` (a decimal fraction — `0.003` = 0.3%),
             // `min_touches` and `lookback`. The anatomy variants take no
-            // parameters and are refused here if any is supplied.
+            // parameters: their arms read none of the operand's fields, so an
+            // operand key meant for another kind (say `period` beside
+            // `indicator: "body"`) is IGNORED here, not refused — the same
+            // read-what-you-need shape as the `price` arm. The only refused
+            // strays are the explicit `timeframe` ones (`constant`, `arith`,
+            // `lag`), where a dropped series would change the operand.
             "pivot_high" => Ok(IndicatorSpec::PivotHigh {
                 left: fixed_u32(operand.left, &format!("{path}.left"))?,
                 right: fixed_u32(operand.right, &format!("{path}.right"))?,
