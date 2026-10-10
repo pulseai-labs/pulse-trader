@@ -469,100 +469,7 @@ fn visit_condition(cond: &mut Condition, path: &str, f: Visit<'_>) -> ControlFlo
 fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlFlow<()> {
     match v {
         ValueSource::Indicator { spec, .. } => {
-            let base = format!("{path}.indicator");
-            match spec {
-                IndicatorSpec::Rsi { period } => {
-                    f(&format!("{base}.rsi.period"), LeafMut::Period(period))?;
-                }
-                IndicatorSpec::Ema { period } => {
-                    f(&format!("{base}.ema.period"), LeafMut::Period(period))?;
-                }
-                IndicatorSpec::Adx { period } => {
-                    f(&format!("{base}.adx.period"), LeafMut::Period(period))?;
-                }
-                IndicatorSpec::Macd {
-                    fast, slow, signal, ..
-                } => {
-                    // `output` is not a numeric leaf — mutation targets periods
-                    // only (schema 1.2.0: the selector is structural, not sweepable).
-                    f(&format!("{base}.macd.fast"), LeafMut::Period(fast))?;
-                    f(&format!("{base}.macd.slow"), LeafMut::Period(slow))?;
-                    f(&format!("{base}.macd.signal"), LeafMut::Period(signal))?;
-                }
-                IndicatorSpec::Atr { period } => {
-                    f(&format!("{base}.atr.period"), LeafMut::Period(period))?;
-                }
-                // r3.s2.w2: the rolling extremes — the period is the sweepable
-                // leaf; `source` is a field tag, not a numeric parameter (the
-                // `series` precedent — see validate.rs's check arms).
-                IndicatorSpec::Highest { period, .. } => {
-                    f(&format!("{base}.highest.period"), LeafMut::Period(period))?;
-                }
-                IndicatorSpec::Lowest { period, .. } => {
-                    f(&format!("{base}.lowest.period"), LeafMut::Period(period))?;
-                }
-                // r4.s6.w1: the structure indicators. `left`/`right`/
-                // `min_touches`/`lookback` are period-like u32 leaves;
-                // `tolerance_pct` is a decimal threshold on the
-                // `risk_per_trade_pct` precedent. The four anatomy variants
-                // carry no numeric leaf at all.
-                IndicatorSpec::PivotHigh { left, right } => {
-                    f(&format!("{base}.pivot_high.left"), LeafMut::Period(left))?;
-                    f(&format!("{base}.pivot_high.right"), LeafMut::Period(right))?;
-                }
-                IndicatorSpec::PivotLow { left, right } => {
-                    f(&format!("{base}.pivot_low.left"), LeafMut::Period(left))?;
-                    f(&format!("{base}.pivot_low.right"), LeafMut::Period(right))?;
-                }
-                IndicatorSpec::Resistance {
-                    left,
-                    right,
-                    tolerance_pct,
-                    min_touches,
-                    lookback,
-                } => {
-                    f(&format!("{base}.resistance.left"), LeafMut::Period(left))?;
-                    f(&format!("{base}.resistance.right"), LeafMut::Period(right))?;
-                    f(
-                        &format!("{base}.resistance.tolerance_pct"),
-                        LeafMut::Threshold(tolerance_pct),
-                    )?;
-                    f(
-                        &format!("{base}.resistance.min_touches"),
-                        LeafMut::Period(min_touches),
-                    )?;
-                    f(
-                        &format!("{base}.resistance.lookback"),
-                        LeafMut::Period(lookback),
-                    )?;
-                }
-                IndicatorSpec::Support {
-                    left,
-                    right,
-                    tolerance_pct,
-                    min_touches,
-                    lookback,
-                } => {
-                    f(&format!("{base}.support.left"), LeafMut::Period(left))?;
-                    f(&format!("{base}.support.right"), LeafMut::Period(right))?;
-                    f(
-                        &format!("{base}.support.tolerance_pct"),
-                        LeafMut::Threshold(tolerance_pct),
-                    )?;
-                    f(
-                        &format!("{base}.support.min_touches"),
-                        LeafMut::Period(min_touches),
-                    )?;
-                    f(
-                        &format!("{base}.support.lookback"),
-                        LeafMut::Period(lookback),
-                    )?;
-                }
-                IndicatorSpec::Body
-                | IndicatorSpec::UpperWick
-                | IndicatorSpec::LowerWick
-                | IndicatorSpec::Range => {}
-            }
+            visit_indicator_spec(spec, &format!("{path}.indicator"), f)?;
         }
         // The nesting-aware path grammar matches validate.rs's: `.arith.lhs`,
         // `.arith.rhs`, `.lag.value`.
@@ -574,6 +481,209 @@ fn visit_value_source(v: &mut ValueSource, path: &str, f: Visit<'_>) -> ControlF
             visit_value_source(value, &format!("{path}.lag.value"), f)?;
         }
         ValueSource::Constant { .. } | ValueSource::Price { .. } => {}
+    }
+    ControlFlow::Continue(())
+}
+
+/// The numeric leaves of an [`IndicatorSpec`]: the smoothed and rolling families
+/// here, the structure and pattern families in [`visit_structure_spec`]. `base`
+/// is the spec's own path (already suffixed `.indicator`).
+fn visit_indicator_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> ControlFlow<()> {
+    match spec {
+        IndicatorSpec::Rsi { period } => {
+            f(&format!("{base}.rsi.period"), LeafMut::Period(period))?;
+        }
+        IndicatorSpec::Ema { period } => {
+            f(&format!("{base}.ema.period"), LeafMut::Period(period))?;
+        }
+        IndicatorSpec::Adx { period } => {
+            f(&format!("{base}.adx.period"), LeafMut::Period(period))?;
+        }
+        IndicatorSpec::Macd {
+            fast, slow, signal, ..
+        } => {
+            // `output` is not a numeric leaf — mutation targets periods
+            // only (schema 1.2.0: the selector is structural, not sweepable).
+            f(&format!("{base}.macd.fast"), LeafMut::Period(fast))?;
+            f(&format!("{base}.macd.slow"), LeafMut::Period(slow))?;
+            f(&format!("{base}.macd.signal"), LeafMut::Period(signal))?;
+        }
+        IndicatorSpec::Atr { period } => {
+            f(&format!("{base}.atr.period"), LeafMut::Period(period))?;
+        }
+        // r3.s2.w2: the rolling extremes — the period is the sweepable
+        // leaf; `source` is a field tag, not a numeric parameter (the
+        // `series` precedent — see validate.rs's check arms).
+        IndicatorSpec::Highest { period, .. } => {
+            f(&format!("{base}.highest.period"), LeafMut::Period(period))?;
+        }
+        IndicatorSpec::Lowest { period, .. } => {
+            f(&format!("{base}.lowest.period"), LeafMut::Period(period))?;
+        }
+        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
+        // indicators (r4.s6.w3): twelve variants, two helpers. Listed here BY
+        // NAME — never matched with a wildcard — so a new variant still breaks
+        // this match and has to be routed by hand.
+        IndicatorSpec::PivotHigh { .. }
+        | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::Resistance { .. }
+        | IndicatorSpec::Support { .. }
+        | IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => visit_structure_spec(spec, base, f)?,
+        IndicatorSpec::DoubleTopNeckline { .. }
+        | IndicatorSpec::DoubleBottomNeckline { .. }
+        | IndicatorSpec::TrendlineLows { .. }
+        | IndicatorSpec::TrendlineHighs { .. } => visit_pattern_spec(spec, base, f)?,
+    }
+    ControlFlow::Continue(())
+}
+
+/// The structure and pattern families' numeric leaves (r4.s6.w1 and r4.s6.w3).
+///
+/// `visit_indicator_spec` routes exactly the twelve variants here, so the
+/// trailing arm is a contract guard, unreachable by construction (the house
+/// shape at `agent/tools.rs`'s `Op` dispatch): a new variant is a compile error
+/// in the dispatcher's own match first.
+fn visit_structure_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> ControlFlow<()> {
+    match spec {
+        // r4.s6.w1: the structure indicators. `left`/`right`/
+        // `min_touches`/`lookback` are period-like u32 leaves;
+        // `tolerance_pct` is a decimal threshold on the
+        // `risk_per_trade_pct` precedent. The four anatomy variants
+        // carry no numeric leaf at all.
+        IndicatorSpec::PivotHigh { left, right } => {
+            f(&format!("{base}.pivot_high.left"), LeafMut::Period(left))?;
+            f(&format!("{base}.pivot_high.right"), LeafMut::Period(right))?;
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            f(&format!("{base}.pivot_low.left"), LeafMut::Period(left))?;
+            f(&format!("{base}.pivot_low.right"), LeafMut::Period(right))?;
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => {
+            f(&format!("{base}.resistance.left"), LeafMut::Period(left))?;
+            f(&format!("{base}.resistance.right"), LeafMut::Period(right))?;
+            f(
+                &format!("{base}.resistance.tolerance_pct"),
+                LeafMut::Threshold(tolerance_pct),
+            )?;
+            f(
+                &format!("{base}.resistance.min_touches"),
+                LeafMut::Period(min_touches),
+            )?;
+            f(
+                &format!("{base}.resistance.lookback"),
+                LeafMut::Period(lookback),
+            )?;
+        }
+        IndicatorSpec::Support {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => {
+            f(&format!("{base}.support.left"), LeafMut::Period(left))?;
+            f(&format!("{base}.support.right"), LeafMut::Period(right))?;
+            f(
+                &format!("{base}.support.tolerance_pct"),
+                LeafMut::Threshold(tolerance_pct),
+            )?;
+            f(
+                &format!("{base}.support.min_touches"),
+                LeafMut::Period(min_touches),
+            )?;
+            f(
+                &format!("{base}.support.lookback"),
+                LeafMut::Period(lookback),
+            )?;
+        }
+        IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => {}
+        other => unreachable!(
+            "visit_indicator_spec routes only the structure variants here, never {other:?}"
+        ),
+    }
+    ControlFlow::Continue(())
+}
+
+/// The pattern families' numeric leaves (schema 1.3.0, r4.s6.w3): the pivots'
+/// span on the `PivotHigh` precedent, plus the necklines' decimal
+/// `tolerance_pct` on the `Resistance` precedent.
+///
+/// `visit_indicator_spec` routes exactly the four pattern variants here, so the
+/// trailing arm is a contract guard, unreachable by construction (the house
+/// shape at `agent/tools.rs`'s `Op` dispatch).
+fn visit_pattern_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> ControlFlow<()> {
+    match spec {
+        IndicatorSpec::DoubleTopNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => {
+            f(
+                &format!("{base}.double_top_neckline.left"),
+                LeafMut::Period(left),
+            )?;
+            f(
+                &format!("{base}.double_top_neckline.right"),
+                LeafMut::Period(right),
+            )?;
+            f(
+                &format!("{base}.double_top_neckline.tolerance_pct"),
+                LeafMut::Threshold(tolerance_pct),
+            )?;
+        }
+        IndicatorSpec::DoubleBottomNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => {
+            f(
+                &format!("{base}.double_bottom_neckline.left"),
+                LeafMut::Period(left),
+            )?;
+            f(
+                &format!("{base}.double_bottom_neckline.right"),
+                LeafMut::Period(right),
+            )?;
+            f(
+                &format!("{base}.double_bottom_neckline.tolerance_pct"),
+                LeafMut::Threshold(tolerance_pct),
+            )?;
+        }
+        IndicatorSpec::TrendlineLows { left, right } => {
+            f(
+                &format!("{base}.trendline_lows.left"),
+                LeafMut::Period(left),
+            )?;
+            f(
+                &format!("{base}.trendline_lows.right"),
+                LeafMut::Period(right),
+            )?;
+        }
+        IndicatorSpec::TrendlineHighs { left, right } => {
+            f(
+                &format!("{base}.trendline_highs.left"),
+                LeafMut::Period(left),
+            )?;
+            f(
+                &format!("{base}.trendline_highs.right"),
+                LeafMut::Period(right),
+            )?;
+        }
+        other => unreachable!(
+            "visit_indicator_spec routes only the pattern variants here, never {other:?}"
+        ),
     }
     ControlFlow::Continue(())
 }

@@ -691,6 +691,26 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::UpperWick => "UpperWick".to_owned(),
         IndicatorSpec::LowerWick => "LowerWick".to_owned(),
         IndicatorSpec::Range => "Range".to_owned(),
+        IndicatorSpec::DoubleTopNeckline { left, right, .. } => format!(
+            "DoubleTopNeckline({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
+        IndicatorSpec::DoubleBottomNeckline { left, right, .. } => format!(
+            "DoubleBottomNeckline({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
+        IndicatorSpec::TrendlineLows { left, right } => format!(
+            "TrendlineLows({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
+        IndicatorSpec::TrendlineHighs { left, right } => format!(
+            "TrendlineHighs({}/{})",
+            period_value(left),
+            period_value(right)
+        ),
     }
 }
 
@@ -908,11 +928,40 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
                 errors,
             );
         }
-        // The structure indicators (schema 1.3.0, r4.s6.w1): a pivot needs at
-        // least one bar on each side; a level needs `min_touches` >= 2 (a
-        // "level" touched once is not a level), a window longer than the pivot
-        // span it must hold, and a tolerance that is a positive decimal
-        // fraction no wider than 0.10 (10%).
+        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
+        // indicators (r4.s6.w3): twelve variants, checked by their own helper.
+        // They are listed here BY NAME — never matched with a wildcard — so a
+        // new variant still breaks this match and has to be routed by hand.
+        IndicatorSpec::PivotHigh { .. }
+        | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::Resistance { .. }
+        | IndicatorSpec::Support { .. }
+        | IndicatorSpec::DoubleTopNeckline { .. }
+        | IndicatorSpec::DoubleBottomNeckline { .. }
+        | IndicatorSpec::TrendlineLows { .. }
+        | IndicatorSpec::TrendlineHighs { .. }
+        | IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => check_structure_indicator(spec, path, errors),
+    }
+}
+
+/// The rules of the structure and pattern families (schema 1.3.0, r4.s6.w1 and
+/// r4.s6.w3).
+///
+/// A pivot needs at least one bar on each side; a level needs `min_touches` >= 2
+/// (a "level" touched once is not a level), a window longer than the pivot span
+/// it must hold, and a tolerance that is a positive decimal fraction no wider
+/// than 0.10 (10%); a neckline needs that pivot span and that tolerance; a
+/// trendline the span alone.
+///
+/// `check_indicator` routes exactly the twelve variants here, so the trailing
+/// arm is a contract guard, unreachable by construction (the house shape at
+/// `agent/tools.rs`'s `Op` dispatch): a new variant is a compile error in the
+/// dispatcher's own match first.
+fn check_structure_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError>) {
+    match spec {
         IndicatorSpec::PivotHigh { left, right } => {
             check_pivot_span(left, right, path, "pivot_high", "PivotHigh", errors);
         }
@@ -949,12 +998,50 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
                 errors,
             );
         }
+        IndicatorSpec::DoubleTopNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => check_neckline_parameters(
+            (left, right, tolerance_pct),
+            path,
+            "double_top_neckline",
+            "DoubleTopNeckline",
+            errors,
+        ),
+        IndicatorSpec::DoubleBottomNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => check_neckline_parameters(
+            (left, right, tolerance_pct),
+            path,
+            "double_bottom_neckline",
+            "DoubleBottomNeckline",
+            errors,
+        ),
+        IndicatorSpec::TrendlineLows { left, right } => {
+            check_pivot_span(left, right, path, "trendline_lows", "TrendlineLows", errors);
+        }
+        IndicatorSpec::TrendlineHighs { left, right } => {
+            check_pivot_span(
+                left,
+                right,
+                path,
+                "trendline_highs",
+                "TrendlineHighs",
+                errors,
+            );
+        }
         // The candle-anatomy variants carry no numeric leaf at all — the
         // `series`-tag precedent: nothing to range-check.
         IndicatorSpec::Body
         | IndicatorSpec::UpperWick
         | IndicatorSpec::LowerWick
         | IndicatorSpec::Range => {}
+        other => unreachable!(
+            "check_indicator routes only the structure/pattern variants here, never {other:?}"
+        ),
     }
 }
 
@@ -1051,22 +1138,12 @@ fn check_level_parameters(
         2,
         errors,
     );
-    match tolerance_pct {
-        SweepableValue::Sweep { .. } => {
-            push_sweep(&format!("{path}.{field}.tolerance_pct"), errors);
-        }
-        SweepableValue::Fixed(d) => {
-            if *d <= Decimal::ZERO || *d > Decimal::new(10, 2) {
-                errors.push(FieldError {
-                    path: format!("{path}.{field}.tolerance_pct"),
-                    code: ValidationCode::FieldRange,
-                    message: format!(
-                        "{label} tolerance_pct must be a decimal fraction in the range (0, 0.10] — 0.003 means 0.3%"
-                    ),
-                });
-            }
-        }
-    }
+    check_tolerance(
+        tolerance_pct,
+        &format!("{path}.{field}.tolerance_pct"),
+        label,
+        errors,
+    );
     // `lookback` must hold the pivot span plus the pivot itself.
     if let (SweepableValue::Fixed(l), SweepableValue::Fixed(r), SweepableValue::Fixed(k)) =
         (left, right, lookback)
@@ -1082,6 +1159,60 @@ fn check_level_parameters(
             });
         }
     }
+}
+
+/// Rule 6 for a `tolerance_pct`-style decimal fraction: `0 < x ≤ 0.10`, on the
+/// `distance_pct` convention. Shared by the level variants (`Resistance` /
+/// `Support`) and the necklines, so the rule has one copy.
+fn check_tolerance(
+    tolerance_pct: &SweepableValue<Decimal>,
+    path: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    match tolerance_pct {
+        SweepableValue::Sweep { .. } => push_sweep(path, errors),
+        SweepableValue::Fixed(d) => {
+            if *d <= Decimal::ZERO || *d > Decimal::new(10, 2) {
+                errors.push(FieldError {
+                    path: path.to_owned(),
+                    code: ValidationCode::FieldRange,
+                    message: format!(
+                        "{label} tolerance_pct must be a decimal fraction in the range (0, 0.10] — 0.003 means 0.3%"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// The three borrowed `SweepableValue` leaves of a `DoubleTopNeckline` /
+/// `DoubleBottomNeckline` spec, in declaration order:
+/// `(left, right, tolerance_pct)`.
+type NecklineLeaves<'a> = (
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<Decimal>,
+);
+
+/// The shared rule set for `DoubleTopNeckline`/`DoubleBottomNeckline`:
+/// `left`/`right` ≥ 1 (the pivot span every pivot-based variant needs) and
+/// `tolerance_pct` a decimal fraction in `(0, 0.10]` (the level rule).
+fn check_neckline_parameters(
+    leaves: NecklineLeaves<'_>,
+    path: &str,
+    field: &str,
+    label: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    let (left, right, tolerance_pct) = leaves;
+    check_pivot_span(left, right, path, field, label, errors);
+    check_tolerance(
+        tolerance_pct,
+        &format!("{path}.{field}.tolerance_pct"),
+        label,
+        errors,
+    );
 }
 
 /// Rule 1 + rule 6 for a `SweepableValue<u32>` that must be `> 0`.

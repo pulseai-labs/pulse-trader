@@ -96,9 +96,35 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
                 u32_leaf(period)
             )
         }
-        // The structure indicators (schema 1.3.0, r4.s6.w1) name the facts a
-        // trader needs to read the level: the pivot span, the touch count, the
-        // tolerance as a PERCENT (the DSL stores the fraction) and the window.
+        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
+        // indicators (r4.s6.w3): twelve variants, one formatter. They are listed
+        // here BY NAME — never matched with a wildcard — so a new variant still
+        // breaks this match and has to be routed by hand.
+        IndicatorSpec::PivotHigh { .. }
+        | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::Resistance { .. }
+        | IndicatorSpec::Support { .. }
+        | IndicatorSpec::DoubleTopNeckline { .. }
+        | IndicatorSpec::DoubleBottomNeckline { .. }
+        | IndicatorSpec::TrendlineLows { .. }
+        | IndicatorSpec::TrendlineHighs { .. }
+        | IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => structure_indicator(spec),
+    }
+}
+
+/// The structure and pattern families in trader language (schema 1.3.0,
+/// r4.s6.w1 and r4.s6.w3): the pivot span, the touch count, the tolerance as a
+/// PERCENT (the DSL stores the fraction) and the window for the levels, the
+/// tops'/bottoms' tolerance for the necklines, and the direction for the lines.
+///
+/// `indicator` routes exactly the twelve variants here, so the trailing arm is a
+/// contract guard, unreachable by construction (the house shape at
+/// `agent/tools.rs`'s `Op` dispatch).
+fn structure_indicator(spec: &IndicatorSpec) -> String {
+    match spec {
         IndicatorSpec::PivotHigh { left, right } => {
             format!("pivot high({}/{})", u32_leaf(left), u32_leaf(right))
         }
@@ -137,6 +163,43 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
         IndicatorSpec::UpperWick => "upper wick".to_owned(),
         IndicatorSpec::LowerWick => "lower wick".to_owned(),
         IndicatorSpec::Range => "range".to_owned(),
+        // The pattern indicators (schema 1.3.0, r4.s6.w3) name the shape and the
+        // facts behind it: the pivot span, the tops'/bottoms' tolerance as a
+        // PERCENT (the DSL stores the fraction), and the direction the line
+        // runs.
+        IndicatorSpec::DoubleTopNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => format!(
+            "double top neckline(pivots {}/{}, tops within {})",
+            u32_leaf(left),
+            u32_leaf(right),
+            pct_leaf(tolerance_pct)
+        ),
+        IndicatorSpec::DoubleBottomNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => format!(
+            "double bottom neckline(pivots {}/{}, bottoms within {})",
+            u32_leaf(left),
+            u32_leaf(right),
+            pct_leaf(tolerance_pct)
+        ),
+        IndicatorSpec::TrendlineLows { left, right } => format!(
+            "rising trendline through pivot lows {}/{}",
+            u32_leaf(left),
+            u32_leaf(right)
+        ),
+        IndicatorSpec::TrendlineHighs { left, right } => format!(
+            "falling trendline through pivot highs {}/{}",
+            u32_leaf(left),
+            u32_leaf(right)
+        ),
+        other => unreachable!(
+            "indicator routes only the structure/pattern variants here, never {other:?}"
+        ),
     }
 }
 

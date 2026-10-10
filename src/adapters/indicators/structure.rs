@@ -159,7 +159,11 @@ impl PivotTracker {
 /// Prices inside a group are sorted ascending, so `price − anchor` is never
 /// negative. A checked operation that overflows reports "not within tolerance":
 /// no group, never a panic.
-fn within_tolerance(anchor: Decimal, price: Decimal, tolerance_pct: Decimal) -> bool {
+///
+/// Shared with the pattern indicators (`super::patterns`), whose necklines ask
+/// the same question of two pivot prices — the seam is this visibility word,
+/// never a copy of the rule.
+pub(crate) fn within_tolerance(anchor: Decimal, price: Decimal, tolerance_pct: Decimal) -> bool {
     let Some(spread) = price.checked_sub(anchor) else {
         return false;
     };

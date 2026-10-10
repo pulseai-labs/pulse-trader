@@ -7,6 +7,7 @@ use super::{
     atr::Atr,
     ema::Ema,
     macd::Macd,
+    patterns::{NecklineIndicator, NecklineKind, TrendlineIndicator},
     rolling::RollingExtremes,
     rsi::Rsi,
     structure::{Anatomy, AnatomyKind, Extreme, LevelIndicator, PivotIndicator},
@@ -337,6 +338,36 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
                 .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
                 .ok_or_else(|| invalid_period(spec, format!("Lowest period {period} is invalid")))
         }
+        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
+        // indicators (r4.s6.w3): twelve variants over the `structure` and
+        // `patterns` adapters, built by their own factory. They are listed here
+        // BY NAME — never matched with a wildcard — so a new variant still
+        // breaks this match and has to be routed by hand.
+        IndicatorSpec::PivotHigh { .. }
+        | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::Resistance { .. }
+        | IndicatorSpec::Support { .. }
+        | IndicatorSpec::DoubleTopNeckline { .. }
+        | IndicatorSpec::DoubleBottomNeckline { .. }
+        | IndicatorSpec::TrendlineLows { .. }
+        | IndicatorSpec::TrendlineHighs { .. }
+        | IndicatorSpec::Body
+        | IndicatorSpec::UpperWick
+        | IndicatorSpec::LowerWick
+        | IndicatorSpec::Range => build_structure_indicator(spec),
+    }
+}
+
+/// Build the structure and pattern families' adapters (schema 1.3.0, r4.s6.w1
+/// and r4.s6.w3) — the two groups whose math lives in `structure`/`patterns`
+/// rather than behind `convert`.
+///
+/// `build_indicator` routes exactly the twelve variants here, so the trailing
+/// arm is a contract guard, unreachable by construction (the house shape at
+/// `agent/tools.rs`'s `Op` dispatch): a new variant is a compile error in the
+/// factory's own match first, and that match is where its builder is chosen.
+fn build_structure_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineError> {
+    match spec {
         IndicatorSpec::PivotHigh { left, right } => {
             build_pivot(spec, left, right, Extreme::High, "PivotHigh")
         }
@@ -367,12 +398,41 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
             false,
             "Support",
         ),
+        IndicatorSpec::DoubleTopNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => build_neckline(
+            spec,
+            (left, right, tolerance_pct),
+            NecklineKind::DoubleTop,
+            "DoubleTopNeckline",
+        ),
+        IndicatorSpec::DoubleBottomNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => build_neckline(
+            spec,
+            (left, right, tolerance_pct),
+            NecklineKind::DoubleBottom,
+            "DoubleBottomNeckline",
+        ),
+        IndicatorSpec::TrendlineLows { left, right } => {
+            build_trendline(spec, left, right, true, "TrendlineLows")
+        }
+        IndicatorSpec::TrendlineHighs { left, right } => {
+            build_trendline(spec, left, right, false, "TrendlineHighs")
+        }
         // The four anatomy variants take no parameters and are defined on every
         // bar, including the first — nothing can refuse them.
         IndicatorSpec::Body => Ok(Box::new(Anatomy::new(AnatomyKind::Body))),
         IndicatorSpec::UpperWick => Ok(Box::new(Anatomy::new(AnatomyKind::UpperWick))),
         IndicatorSpec::LowerWick => Ok(Box::new(Anatomy::new(AnatomyKind::LowerWick))),
         IndicatorSpec::Range => Ok(Box::new(Anatomy::new(AnatomyKind::Range))),
+        other => unreachable!(
+            "build_indicator routes only the structure/pattern variants here, never {other:?}"
+        ),
     }
 }
 
@@ -431,6 +491,62 @@ fn build_level(
                     "{name} parameters left={left}, right={right}, tolerance_pct={tolerance_pct}, \
                      min_touches={min_touches}, lookback={lookback} are invalid"
                 ),
+            )
+        })
+}
+
+/// The three borrowed `SweepableValue` leaves of a `DoubleTopNeckline` /
+/// `DoubleBottomNeckline` spec, in declaration order:
+/// `(left, right, tolerance_pct)`.
+type NecklineLeaves<'a> = (
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<u32>,
+    &'a SweepableValue<Decimal>,
+);
+
+/// Build a `DoubleTopNeckline`/`DoubleBottomNeckline` slot from its fixed
+/// parameter tuple.
+fn build_neckline(
+    spec: &IndicatorSpec,
+    leaves: NecklineLeaves<'_>,
+    kind: NecklineKind,
+    name: &str,
+) -> Result<Box<dyn Indicator>, EngineError> {
+    let (left, right, tolerance_pct) = leaves;
+    let field = name.to_ascii_lowercase();
+    let left = fixed_u32(left, &format!("{field}.left"))?;
+    let right = fixed_u32(right, &format!("{field}.right"))?;
+    let tolerance_pct = fixed_decimal(tolerance_pct, &format!("{field}.tolerance_pct"))?;
+    NecklineIndicator::new(left, right, tolerance_pct, kind)
+        .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+        .ok_or_else(|| {
+            invalid_period(
+                spec,
+                format!(
+                    "{name} parameters left={left}, right={right}, tolerance_pct={tolerance_pct} \
+                     are invalid"
+                ),
+            )
+        })
+}
+
+/// Build a `TrendlineLows`/`TrendlineHighs` slot from its fixed span.
+fn build_trendline(
+    spec: &IndicatorSpec,
+    left: &SweepableValue<u32>,
+    right: &SweepableValue<u32>,
+    rising: bool,
+    name: &str,
+) -> Result<Box<dyn Indicator>, EngineError> {
+    let field = name.to_ascii_lowercase();
+    let left = fixed_u32(left, &format!("{field}.left"))?;
+    let right = fixed_u32(right, &format!("{field}.right"))?;
+    TrendlineIndicator::new(left, right, rising)
+        .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
+        .ok_or_else(|| {
+            invalid_period(
+                spec,
+                format!("{name} left={left}, right={right} is invalid"),
             )
         })
 }

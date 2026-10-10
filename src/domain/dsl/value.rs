@@ -224,6 +224,54 @@ pub enum IndicatorSpec {
     /// The full range of the current bar — `high − low` (schema 1.3.0,
     /// r4.s6.w1).
     Range,
+    /// The neckline of a **double top** (schema 1.3.0, r4.s6.w3). Let A and B
+    /// be the last two confirmed pivot highs, A earlier. When they are within
+    /// `tolerance_pct` of each other and `B.bar − A.bar ≥ 2`, the value is the
+    /// LOWEST LOW of the bars strictly between them; otherwise `None`. The
+    /// value stays the same until a newer pivot high is confirmed.
+    DoubleTopNeckline {
+        /// Bars the pivot must exceed to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at least equal to on its right.
+        right: SweepableValue<u32>,
+        /// How close the two tops must be, as a decimal fraction (`0.003` =
+        /// 0.3%) — the `distance_pct` convention.
+        tolerance_pct: SweepableValue<Decimal>,
+    },
+    /// The neckline of a **double bottom** (schema 1.3.0, r4.s6.w3) — the
+    /// mirror of [`IndicatorSpec::DoubleTopNeckline`] on confirmed pivot lows:
+    /// the HIGHEST HIGH of the bars strictly between the last two
+    /// within-tolerance pivot lows, `None` otherwise.
+    DoubleBottomNeckline {
+        /// Bars the pivot must undercut to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at most equal to on its right.
+        right: SweepableValue<u32>,
+        /// How close the two bottoms must be, as a decimal fraction (`0.003` =
+        /// 0.3%) — the `distance_pct` convention.
+        tolerance_pct: SweepableValue<Decimal>,
+    },
+    /// The **rising line through the last two confirmed pivot lows**, extended
+    /// to bar t (schema 1.3.0, r4.s6.w3). Let A and B be the last two confirmed
+    /// pivot lows, A earlier. When `B.price > A.price`, the value at bar t is
+    /// `B.price + (B.price − A.price) × (t − B.bar) / (B.bar − A.bar)`, the
+    /// quotient rounded to 8 decimal places half-even; a pair that does not
+    /// rise — or an operation that overflows — gives `None`.
+    TrendlineLows {
+        /// Bars the pivot must undercut to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at most equal to on its right.
+        right: SweepableValue<u32>,
+    },
+    /// The **falling line through the last two confirmed pivot highs** (schema
+    /// 1.3.0, r4.s6.w3) — the mirror of [`IndicatorSpec::TrendlineLows`] on
+    /// highs (`B.price < A.price`), same extension and rounding rule.
+    TrendlineHighs {
+        /// Bars the pivot must exceed to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at least equal to on its right.
+        right: SweepableValue<u32>,
+    },
 }
 
 /// `#[serde(default = …)]` target for [`IndicatorSpec::Highest`]'s `source`
