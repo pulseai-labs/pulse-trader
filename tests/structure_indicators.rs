@@ -550,15 +550,29 @@ fn overlapping_runs_form_the_resistance_above_the_close() {
          at mean 113.5 — the lowest one above the close 110"
     );
 
-    // With the close at 104 the same pivots give the OTHER candidate: the run
-    // [100, 109] at 104.5 is the lowest candidate above it, and the old
-    // disjoint sweep answers `None` for both closes.
-    let mut lower = rows;
-    lower[8].3 = 104;
+    // The second case must be one the old disjoint sweep FAILS: with the same
+    // pivots and the close at 104 the old sweep answers 104.5 (its [100, 109]
+    // group), so that close pins nothing about the overlap fix. Moving the
+    // middle pivot to 108 makes the old sweep's only group [100, 108] — mean
+    // 104, not strictly above the close — so it answers `None`, while the run
+    // [108, 118] is the lowest candidate above 104.
+    let rows: [(i64, i64, i64, i64); 9] = [
+        (94, 95, 93, 94),
+        (94, 100, 94, 96), // pivot high 100
+        (96, 97, 95, 96),  // confirms it
+        (96, 102, 96, 101),
+        (101, 108, 101, 104), // pivot high 108
+        (104, 105, 102, 103), // confirms it
+        (103, 107, 103, 106),
+        (107, 118, 107, 116), // pivot high 118
+        (116, 112, 108, 104), // confirms it; the close is 104
+    ];
     assert_eq!(
-        value_at(&spec, &candles_from(&lower), 8),
-        Some(Decimal::from_str("104.5").expect("literal")),
-        "the run [100, 109] is the lowest candidate above the close 104"
+        value_at(&spec, &candles_from(&rows), 8),
+        Some(Decimal::from_str("113").expect("literal")),
+        "the run [108, 118] is the lowest candidate above the close 104 — the \
+         old disjoint sweep answers None here (its [100, 108] group means 104, \
+         which is not strictly above the close)"
     );
 }
 
