@@ -267,6 +267,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The `pulse://dsl/schema` resource read works from Claude Code (#353).** MCP clients on the
+  2026-07-28 protocol revision validate `resources/read` and `resources/list` against that
+  revision's result schema, where SEP-2549 makes `ttlMs` (integer ≥ 0) and `cacheScope`
+  (`public` | `private`) REQUIRED on a cacheable result; rmcp models both as optional and left them
+  unset, so Claude Code refused the read with `Invalid result for resources/read` naming exactly
+  those two fields while tool calls kept working. Both results now carry `ttlMs: 0` — the schema
+  text changes with the DSL version, so a cached copy must never be reused — and
+  `cacheScope: "private"`. `tests/mcp_dsl_schema_resource.rs` pins the wire shape (the allowed key
+  set plus the two required cache hints on both results), and a live Claude Code session reads the
+  resource from a served build. Refs
+  [#353](https://github.com/pulseai-labs/pulse-trader/issues/353).
+
 - **`pulse-serve.service` now gives up after repeated failed starts (0.1.3).** The
   unit set no start limit, so systemd's default (5 starts in 10 s) applied. `pulse
   serve` retries its bind for 120 s before it exits non-zero, and the unit waits
