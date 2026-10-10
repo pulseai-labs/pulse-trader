@@ -1144,19 +1144,28 @@ fn check_level_parameters(
         label,
         errors,
     );
-    // `lookback` must hold the pivot span plus the pivot itself.
-    if let (SweepableValue::Fixed(l), SweepableValue::Fixed(r), SweepableValue::Fixed(k)) =
-        (left, right, lookback)
-    {
-        let span = u64::from(*l) + u64::from(*r);
-        if u64::from(*k) <= span {
-            errors.push(FieldError {
-                path: format!("{path}.{field}.lookback"),
-                code: ValidationCode::FieldRange,
-                message: format!(
-                    "{label} lookback ({k}) must be greater than left + right ({l} + {r} = {span})"
-                ),
-            });
+    // `lookback` must be `Fixed` like every other leaf (rule 1): a `Sweep`
+    // short-circuits to `SweepUnsupported` at its own path, and only then is
+    // the cross-field bound (`lookback` must hold the pivot span plus the
+    // pivot itself) considered — it is checkable only when `left`, `right`
+    // and `lookback` are all `Fixed`.
+    match lookback {
+        SweepableValue::Sweep { .. } => {
+            push_sweep(&format!("{path}.{field}.lookback"), errors);
+        }
+        SweepableValue::Fixed(k) => {
+            if let (SweepableValue::Fixed(l), SweepableValue::Fixed(r)) = (left, right) {
+                let span = u64::from(*l) + u64::from(*r);
+                if u64::from(*k) <= span {
+                    errors.push(FieldError {
+                        path: format!("{path}.{field}.lookback"),
+                        code: ValidationCode::FieldRange,
+                        message: format!(
+                            "{label} lookback ({k}) must be greater than left + right ({l} + {r} = {span})"
+                        ),
+                    });
+                }
+            }
         }
     }
 }
@@ -1908,6 +1917,318 @@ mod tests {
             "exactly one error for the field: {sweep_errs:?}"
         );
         assert_eq!(sweep_errs[0].code, ValidationCode::SweepUnsupported);
+    }
+
+    /// F1 (fix round 1, Codex 4238952605), the two arms that skipped the
+    /// check: a `Sweep` `lookback` on `Resistance`/`Support` used to pass
+    /// validation (the all-`Fixed` cross-field `if let` silently skipped it)
+    /// while every later engine construction failed with `UnexpectedSweep`.
+    /// Each now refuses at its own path, with no spurious `FieldRange`.
+    #[test]
+    fn a_sweep_level_lookback_is_refused_at_its_own_path() {
+        for (field, spec) in [
+            (
+                "resistance",
+                IndicatorSpec::Resistance {
+                    left: SweepableValue::Fixed(2),
+                    right: SweepableValue::Fixed(1),
+                    tolerance_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                    min_touches: SweepableValue::Fixed(2),
+                    lookback: SweepableValue::Sweep {
+                        start: 20,
+                        end: 40,
+                        step: 10,
+                    },
+                },
+            ),
+            (
+                "support",
+                IndicatorSpec::Support {
+                    left: SweepableValue::Fixed(2),
+                    right: SweepableValue::Fixed(1),
+                    tolerance_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                    min_touches: SweepableValue::Fixed(2),
+                    lookback: SweepableValue::Sweep {
+                        start: 20,
+                        end: 40,
+                        step: 10,
+                    },
+                },
+            ),
+        ] {
+            let path = format!("entry.lhs.indicator.{field}.lookback");
+            let mut s = valid_base();
+            s.entry = Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec,
+                },
+                op: Comparator::Lt,
+                rhs: ValueSource::Constant {
+                    value: Decimal::new(30, 0),
+                },
+            };
+            let errs = validate(&s).expect_err("a sweep lookback is refused");
+            assert_eq!(
+                errs.errors().len(),
+                1,
+                "{path}: exactly one error, got {:?}",
+                errs.errors()
+            );
+            assert_eq!(errs.errors()[0].path, path, "the error sits at the leaf");
+            assert_eq!(
+                errs.errors()[0].code,
+                ValidationCode::SweepUnsupported,
+                "{path}"
+            );
+        }
+    }
+
+    /// F1, the class guard: EVERY leaf of EVERY schema-1.3.0 structure and
+    /// pattern variant refuses a `Sweep` at its own path, with exactly one
+    /// `SweepUnsupported` error — no silent drop, no spurious `FieldRange`
+    /// for the same leaf. The leaves are enumerated BY NAME here, so a leaf
+    /// that stops being routed to `push_sweep` fails this test first.
+    #[test]
+    fn every_structure_leaf_refuses_a_sweep_at_its_own_path() {
+        fn sweep_u32() -> SweepableValue<u32> {
+            SweepableValue::Sweep {
+                start: 2,
+                end: 4,
+                step: 1,
+            }
+        }
+        fn sweep_dec() -> SweepableValue<Decimal> {
+            SweepableValue::Sweep {
+                start: Decimal::new(1, 2),
+                end: Decimal::new(5, 2),
+                step: Decimal::new(1, 2),
+            }
+        }
+        fn fixed_u32(v: u32) -> SweepableValue<u32> {
+            SweepableValue::Fixed(v)
+        }
+        fn fixed_dec(mantissa: i64, scale: u32) -> SweepableValue<Decimal> {
+            SweepableValue::Fixed(Decimal::new(mantissa, scale))
+        }
+
+        // One sweep per case; every other leaf is fixed and in range, so the
+        // sweep is the only error the strategy can draw.
+        let mut cases: Vec<(String, IndicatorSpec)> = vec![
+            (
+                "pivot_high.left".to_owned(),
+                IndicatorSpec::PivotHigh {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "pivot_high.right".to_owned(),
+                IndicatorSpec::PivotHigh {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+            (
+                "pivot_low.left".to_owned(),
+                IndicatorSpec::PivotLow {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "pivot_low.right".to_owned(),
+                IndicatorSpec::PivotLow {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+        ];
+
+        for (field, resistance) in [("resistance", true), ("support", false)] {
+            let level = |left: SweepableValue<u32>,
+                         right: SweepableValue<u32>,
+                         tolerance_pct: SweepableValue<Decimal>,
+                         min_touches: SweepableValue<u32>,
+                         lookback: SweepableValue<u32>| {
+                if resistance {
+                    IndicatorSpec::Resistance {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                } else {
+                    IndicatorSpec::Support {
+                        left,
+                        right,
+                        tolerance_pct,
+                        min_touches,
+                        lookback,
+                    }
+                }
+            };
+            cases.push((
+                format!("{field}.left"),
+                level(
+                    sweep_u32(),
+                    fixed_u32(1),
+                    fixed_dec(1, 2),
+                    fixed_u32(2),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.right"),
+                level(
+                    fixed_u32(2),
+                    sweep_u32(),
+                    fixed_dec(1, 2),
+                    fixed_u32(2),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.tolerance_pct"),
+                level(
+                    fixed_u32(2),
+                    fixed_u32(1),
+                    sweep_dec(),
+                    fixed_u32(2),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.min_touches"),
+                level(
+                    fixed_u32(2),
+                    fixed_u32(1),
+                    fixed_dec(1, 2),
+                    sweep_u32(),
+                    fixed_u32(20),
+                ),
+            ));
+            cases.push((
+                format!("{field}.lookback"),
+                level(
+                    fixed_u32(2),
+                    fixed_u32(1),
+                    fixed_dec(1, 2),
+                    fixed_u32(2),
+                    sweep_u32(),
+                ),
+            ));
+        }
+
+        for (suffix, spec) in [
+            (
+                "double_top_neckline.left",
+                IndicatorSpec::DoubleTopNeckline {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_top_neckline.right",
+                IndicatorSpec::DoubleTopNeckline {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_top_neckline.tolerance_pct",
+                IndicatorSpec::DoubleTopNeckline {
+                    left: fixed_u32(2),
+                    right: fixed_u32(1),
+                    tolerance_pct: sweep_dec(),
+                },
+            ),
+            (
+                "double_bottom_neckline.left",
+                IndicatorSpec::DoubleBottomNeckline {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_bottom_neckline.right",
+                IndicatorSpec::DoubleBottomNeckline {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                    tolerance_pct: fixed_dec(1, 2),
+                },
+            ),
+            (
+                "double_bottom_neckline.tolerance_pct",
+                IndicatorSpec::DoubleBottomNeckline {
+                    left: fixed_u32(2),
+                    right: fixed_u32(1),
+                    tolerance_pct: sweep_dec(),
+                },
+            ),
+            (
+                "trendline_lows.left",
+                IndicatorSpec::TrendlineLows {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "trendline_lows.right",
+                IndicatorSpec::TrendlineLows {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+            (
+                "trendline_highs.left",
+                IndicatorSpec::TrendlineHighs {
+                    left: sweep_u32(),
+                    right: fixed_u32(1),
+                },
+            ),
+            (
+                "trendline_highs.right",
+                IndicatorSpec::TrendlineHighs {
+                    left: fixed_u32(2),
+                    right: sweep_u32(),
+                },
+            ),
+        ] {
+            cases.push((suffix.to_owned(), spec));
+        }
+
+        for (suffix, spec) in cases {
+            let path = format!("entry.lhs.indicator.{suffix}");
+            let mut s = valid_base();
+            s.entry = Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec,
+                },
+                op: Comparator::Lt,
+                rhs: ValueSource::Constant {
+                    value: Decimal::new(30, 0),
+                },
+            };
+            let errs = validate(&s).expect_err("a sweep leaf is refused");
+            assert_eq!(
+                errs.errors().len(),
+                1,
+                "{path}: exactly one error, got {:?}",
+                errs.errors()
+            );
+            assert_eq!(
+                errs.errors()[0].path,
+                path,
+                "{path}: the error sits at the leaf"
+            );
+            assert_eq!(errs.errors()[0].code, ValidationCode::SweepUnsupported);
+        }
     }
 
     /// `FieldError`/`ValidationCode` serde round-trip (crosses the Tauri boundary
