@@ -24,7 +24,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The `1.2.0 → 1.3.0` migration is identity (only the version string is rewritten), every
   pre-1.3.0 document keeps its meaning and its frozen `result_content_hash`, and the new vocabulary
   reaches the engine, validation, rendering, the one-mutation framework, the builder tools and the
-  indicator read path.
+  indicator read path. On the same pivots, r4.s6.w3 adds the four **pattern** variants —
+  `DoubleTopNeckline`/`DoubleBottomNeckline` (`left`, `right`, `tolerance_pct`: the lowest low /
+  highest high strictly between the last two within-tolerance pivot highs/lows, held until a newer
+  pivot confirms) and `TrendlineLows`/`TrendlineHighs` (`left`, `right`: the line through the last
+  two rising pivot lows / falling pivot highs, extended to the current bar, its quotient rounded to
+  8 decimal places half-even) — through the same engine, validation, rendering, mutation,
+  builder-tool and read-path arms, with a truncation no-repaint test and byte-identical two-run
+  streaming per variant.
 
 - **Off-box backup: the Mini's nightly `pulse backup` as a launchd calendar job, a read-only pull to
   draco-desk over a dedicated forced-command key, and a restore drill from the pulled copy (r4.s2.w5).**

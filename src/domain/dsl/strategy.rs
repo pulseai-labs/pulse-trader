@@ -292,9 +292,20 @@ mod prop_tests {
             (arb_sweepable_u32(), arb_price_field())
                 .prop_map(|(period, source)| IndicatorSpec::Lowest { period, source })
                 .boxed(),
-            // r4.s6.w1 (schema 1.3.0): the structure indicators — any span for
-            // the pivots, any leaf tuple for the levels, and the four
-            // parameterless anatomy variants.
+            // r4.s6.w1 (schema 1.3.0) and r4.s6.w3: the structure and pattern
+            // families — pivots, levels, candle anatomy, necklines and
+            // trendlines — as one arm (their generator has its own function, so
+            // this one stays readable as the catalog grows).
+            arb_structure_indicator_spec(),
+        ]
+    }
+
+    /// The structure (r4.s6.w1) and pattern (r4.s6.w3) variants as one arm of
+    /// the spec generator: any span for the pivots and trendlines, any span plus
+    /// any decimal tolerance for the levels and necklines, and the four
+    /// parameterless anatomy variants.
+    fn arb_structure_indicator_spec() -> impl Strategy<Value = IndicatorSpec> {
+        prop_oneof![
             (arb_sweepable_u32(), arb_sweepable_u32())
                 .prop_map(|(left, right)| IndicatorSpec::PivotHigh { left, right })
                 .boxed(),
@@ -339,6 +350,40 @@ mod prop_tests {
             Just(IndicatorSpec::UpperWick).boxed(),
             Just(IndicatorSpec::LowerWick).boxed(),
             Just(IndicatorSpec::Range).boxed(),
+            // r4.s6.w3 (schema 1.3.0): the pattern indicators — any span for
+            // the trendlines, any span plus a tolerance for the necklines.
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::TrendlineLows { left, right })
+                .boxed(),
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::TrendlineHighs { left, right })
+                .boxed(),
+            (
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+                arb_sweepable_decimal(),
+            )
+                .prop_map(|(left, right, tolerance_pct)| {
+                    IndicatorSpec::DoubleTopNeckline {
+                        left,
+                        right,
+                        tolerance_pct,
+                    }
+                })
+                .boxed(),
+            (
+                arb_sweepable_u32(),
+                arb_sweepable_u32(),
+                arb_sweepable_decimal(),
+            )
+                .prop_map(|(left, right, tolerance_pct)| {
+                    IndicatorSpec::DoubleBottomNeckline {
+                        left,
+                        right,
+                        tolerance_pct,
+                    }
+                })
+                .boxed(),
         ]
     }
 

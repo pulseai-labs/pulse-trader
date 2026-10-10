@@ -87,6 +87,11 @@ const SCAN_TARGETS: &[&str] = &[
     // pure `Decimal`, no `convert` seam, but scanned like every other indicator
     // surface so a future banned call here is not a false-green hole.
     "src/adapters/indicators/structure.rs",
+    // r4.s6.w3: the pattern indicators (double top/bottom necklines, trendlines)
+    // — the same discipline: pure `Decimal` on w1's pivots, one scale-8 half-even
+    // rounding on the trendline slope, scanned like every other indicator
+    // surface.
+    "src/adapters/indicators/patterns.rs",
     "src/domain/backtest/regime.rs",
     "src/adapters/backtest/regime.rs",
     "src/adapters/backtest/engine.rs",

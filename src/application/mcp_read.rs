@@ -162,6 +162,15 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
         return parse_level(token, &kind, rest);
     }
 
+    // r4.s6.w3: the pattern indicators. The necklines mirror the level
+    // grammar's tolerance leaf; the trendlines carry the pivot span alone.
+    if kind == "double_top_neckline" || kind == "double_bottom_neckline" {
+        return parse_neckline(token, &kind, rest);
+    }
+    if kind == "trendline_lows" || kind == "trendline_highs" {
+        return parse_trendline(token, &kind, rest);
+    }
+
     let period = parse_period(token, rest)?;
     let fixed = SweepableValue::Fixed(period);
     let spec = match kind.as_str() {
@@ -326,6 +335,74 @@ fn parse_level(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorC
             "{kind}:{left}-{right}-{}-{min_touches}-{lookback}",
             tolerance_pct.normalize()
         ),
+        spec,
+    })
+}
+
+/// Parse the `double_top_neckline:<left>-<right>-<tolerance_pct>` /
+/// `double_bottom_neckline:<…>` forms (r4.s6.w3). `tolerance_pct` is a decimal
+/// FRACTION on the `distance_pct` convention — `0.003` means 0.3% — and is
+/// normalized in the label, so `0.0030` and `0.003` dedup to one column (the
+/// `parse_level` precedent).
+fn parse_neckline(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    let parts: Vec<&str> = rest.split('-').collect();
+    let [left, right, tolerance] = parts[..] else {
+        anyhow::bail!(
+            "invalid --indicator {token:?}: {kind} expects <left>-<right>-<tolerance_pct>, where \
+             tolerance_pct is a decimal fraction (0.003 means 0.3%)"
+        );
+    };
+    let left = parse_period(token, left)?;
+    let right = parse_period(token, right)?;
+    let tolerance_pct = tolerance.trim().parse::<Decimal>().map_err(|e| {
+        anyhow::anyhow!("invalid --indicator {token:?}: tolerance_pct must be a decimal: {e}")
+    })?;
+    if tolerance_pct <= Decimal::ZERO {
+        anyhow::bail!("invalid --indicator {token:?}: tolerance_pct must be > 0");
+    }
+    let fixed = SweepableValue::Fixed;
+    let spec = if kind == "double_top_neckline" {
+        IndicatorSpec::DoubleTopNeckline {
+            left: fixed(left),
+            right: fixed(right),
+            tolerance_pct: SweepableValue::Fixed(tolerance_pct),
+        }
+    } else {
+        IndicatorSpec::DoubleBottomNeckline {
+            left: fixed(left),
+            right: fixed(right),
+            tolerance_pct: SweepableValue::Fixed(tolerance_pct),
+        }
+    };
+    Ok(IndicatorColumn {
+        label: format!("{kind}:{left}-{right}-{}", tolerance_pct.normalize()),
+        spec,
+    })
+}
+
+/// Parse the `trendline_lows:<left>-<right>` / `trendline_highs:<left>-<right>`
+/// forms (r4.s6.w3) — the pivot span alone, like `pivot_high`/`pivot_low`.
+fn parse_trendline(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    let parts: Vec<&str> = rest.split('-').collect();
+    let [left, right] = parts[..] else {
+        anyhow::bail!("invalid --indicator {token:?}: {kind} expects <left>-<right>");
+    };
+    let left = parse_period(token, left)?;
+    let right = parse_period(token, right)?;
+    let fixed = SweepableValue::Fixed;
+    let spec = if kind == "trendline_lows" {
+        IndicatorSpec::TrendlineLows {
+            left: fixed(left),
+            right: fixed(right),
+        }
+    } else {
+        IndicatorSpec::TrendlineHighs {
+            left: fixed(left),
+            right: fixed(right),
+        }
+    };
+    Ok(IndicatorColumn {
+        label: format!("{kind}:{left}-{right}"),
         spec,
     })
 }
@@ -601,6 +678,15 @@ mod tests {
                 SweepableValue::Fixed(min_touches) => *min_touches,
                 SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
             },
+            // r4.s6.w3: the pattern variants carry their own leaves; the span's
+            // left is the stand-in this helper reads.
+            IndicatorSpec::DoubleTopNeckline { left, .. }
+            | IndicatorSpec::DoubleBottomNeckline { left, .. }
+            | IndicatorSpec::TrendlineLows { left, .. }
+            | IndicatorSpec::TrendlineHighs { left, .. } => match left {
+                SweepableValue::Fixed(left) => *left,
+                SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
+            },
             IndicatorSpec::Macd { .. } => {
                 panic!("MACD is not part of kind:period parsing")
             }
@@ -669,5 +755,48 @@ mod tests {
         assert!(parse_indicator_specs(&["bogus:14".to_owned()]).is_err());
         assert!(parse_indicator_specs(&["rsi".to_owned()]).is_err());
         assert!(parse_indicator_specs(&["rsi:0".to_owned()]).is_err());
+
+        // r4.s6.w3: the pattern tokens — the necklines carry the tolerance
+        // fraction (normalized in the label, the `resistance` precedent), the
+        // trendlines the span alone.
+        let neckline = parse_indicator_specs(&["double_top_neckline:3-3-0.0030".to_owned()])
+            .expect("double_top_neckline:3-3-0.0030 parses");
+        assert_eq!(neckline.len(), 1);
+        assert_eq!(neckline[0].label, "double_top_neckline:3-3-0.003");
+        assert!(matches!(
+            neckline[0].spec,
+            IndicatorSpec::DoubleTopNeckline { .. }
+        ));
+        assert_eq!(fixed_period(&neckline[0].spec), 3);
+
+        let bottom = parse_indicator_specs(&["double_bottom_neckline:2-2-0.05".to_owned()])
+            .expect("double_bottom_neckline:2-2-0.05 parses");
+        assert_eq!(bottom[0].label, "double_bottom_neckline:2-2-0.05");
+        assert!(matches!(
+            bottom[0].spec,
+            IndicatorSpec::DoubleBottomNeckline { .. }
+        ));
+        assert_eq!(fixed_period(&bottom[0].spec), 2);
+
+        let lows = parse_indicator_specs(&["trendline_lows:3-3".to_owned()])
+            .expect("trendline_lows:3-3 parses");
+        assert_eq!(lows[0].label, "trendline_lows:3-3");
+        assert!(matches!(lows[0].spec, IndicatorSpec::TrendlineLows { .. }));
+        assert_eq!(fixed_period(&lows[0].spec), 3);
+
+        let highs = parse_indicator_specs(&["trendline_highs:1-1".to_owned()])
+            .expect("trendline_highs:1-1 parses");
+        assert_eq!(highs[0].label, "trendline_highs:1-1");
+        assert!(matches!(
+            highs[0].spec,
+            IndicatorSpec::TrendlineHighs { .. }
+        ));
+        assert_eq!(fixed_period(&highs[0].spec), 1);
+
+        // The malformed pattern tokens refuse, never silently coerce.
+        assert!(parse_indicator_specs(&["trendline_lows:3".to_owned()]).is_err());
+        assert!(parse_indicator_specs(&["trendline_lows:3-0".to_owned()]).is_err());
+        assert!(parse_indicator_specs(&["double_top_neckline:3-3".to_owned()]).is_err());
+        assert!(parse_indicator_specs(&["double_top_neckline:3-3-0".to_owned()]).is_err());
     }
 }

@@ -54,10 +54,41 @@ anatomy variants take no parameters.
 | `UpperWick` | — | `high − max(open, close)` |
 | `LowerWick` | — | `min(open, close) − low` |
 | `Range` | — | `high − low` |
+| `DoubleTopNeckline` | `left`, `right`, `tolerance_pct` | When the last two confirmed pivot highs are within `tolerance_pct` of each other and at least two bars apart, the lowest low strictly between them; otherwise `None`. The value holds until a newer pivot high is confirmed |
+| `DoubleBottomNeckline` | same | Mirror on the last two within-tolerance pivot lows: the highest high strictly between them |
+| `TrendlineLows` | `left`, `right` | When the last two confirmed pivot lows are rising (`B.price > A.price`), the line through them extended to bar t; otherwise `None` |
+| `TrendlineHighs` | same | Mirror through the last two falling pivot highs (`B.price < A.price`) |
 
 Equality in the pivot rule is deliberate: strictly greater on the left,
 greater-or-equal on the right. A run of equal highs therefore resolves to its
 first bar, and every later equal bar fails the strict-left test.
+
+**The pattern variants (r4.s6.w3) sit on the same tracker.** The eight variants
+above were w1; the four pattern rows are r4.s6.w3, additive inside `1.3.0` (no
+shipped variant renamed or reshaped, no second version step). They ride the
+existing seam unchanged — one `IndicatorSpec` variant each, one engine arm, one
+validation arm, one mutation arm, one formatter arm, one read-path arm — and
+they read through the same `Compare`/`CrossesAbove`/`CrossesBelow` and
+`primary`/`htf`/`d1` operands, so a breakdown reads
+`CrossesBelow(close, htf DoubleTopNeckline{…})` and a trendline break reads
+`CrossesBelow(close, TrendlineLows{…})`.
+
+- **Necklines.** The between-pivot extreme is exact and bounded: the indicator
+  keeps the last two confirmed pivots, one running extreme, and a delay line of
+  `right + 1` values — never the series. Bar `b` folds into the running extreme
+  at bar `b + right + 1`, so at the bar that confirms the pivot `p` the extreme
+  covers precisely the bars strictly between the two pivots; the accumulator
+  restarts at each confirmation, because the newer pivot becomes the anchor of
+  the next pair.
+- **Trendlines.** The line at bar t is
+  `B.price + (B.price − A.price) × (t − B.bar) / (B.bar − A.bar)` over the last
+  two confirmed pivots, and the quotient rounds to **8 decimal places,
+  half-even** (`Decimal::round_dp_with_strategy(8, MidpointNearestEven)` — the
+  scale `convert` pins), then `B.price` is added. Every step is a checked
+  operation: an overflow yields `None`, never a panic (the `group_mean`
+  precedent). The direction gate is part of the definition: a pair that does not
+  rise (for `TrendlineLows`) or does not fall (for `TrendlineHighs`) has no
+  line, and a pair of equal prices is neither.
 
 **No repaint, no look-ahead.** A structure indicator's value at bar t never
 depends on bar t+1 or on any later bar. A swing pivot is confirmed only once its
@@ -71,8 +102,8 @@ higher-timeframe bar.
 
 **Validation bounds.** `left`, `right` ≥ 1; `min_touches` ≥ 2; `lookback` >
 `left + right`; `tolerance_pct` > 0 and ≤ 0.10 (a decimal fraction, so 0.10 is
-10%). An out-of-range fixed parameter refuses with the engine's typed
-`InvalidPeriod`, never a silent clamp.
+10%) — the same `tolerance_pct` rule on the two necklines. An out-of-range fixed
+parameter refuses with the engine's typed `InvalidPeriod`, never a silent clamp.
 
 **Touch surface:** `src/domain/dsl/**`, `src/adapters/indicators/**`.
 
@@ -92,10 +123,10 @@ from it" is the honest answer) while every existing strategy's `result_content_h
 and trade log stay identical — asserted by the frozen pre-bump goldens.
 
 The pivot tracker behind `PivotHigh` / `PivotLow` is shared with the level
-indicators and is reusable by the pattern variants (necklines and trendlines)
-that the next work item builds, so the confirmation rule has exactly one
-implementation. The cost of the next structure indicator stays inside ADR-0024's
-seam list — one variant, one engine arm, one validation arm, one mutation arm,
-one formatter arm, one read-path arm — and an indicator that cannot be expressed
-inside that list remains a revisit trigger rather than a licence to widen the
-seam mid-item.
+indicators and is reused by the four pattern variants (necklines and trendlines,
+`src/adapters/indicators/patterns.rs`, r4.s6.w3), so the confirmation rule has
+exactly one implementation. The cost of the next structure indicator stays inside
+ADR-0024's seam list — one variant, one engine arm, one validation arm, one
+mutation arm, one formatter arm, one read-path arm — and an indicator that cannot
+be expressed inside that list remains a revisit trigger rather than a licence to
+widen the seam mid-item.
