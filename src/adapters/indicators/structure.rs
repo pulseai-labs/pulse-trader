@@ -362,12 +362,11 @@ impl LevelIndicator {
                 let mut acc = Decimal::ZERO;
                 let mut ok = true;
                 for price in &prices[start..end] {
-                    match acc.checked_add(*price) {
-                        Some(sum) => acc = sum,
-                        None => {
-                            ok = false;
-                            break;
-                        }
+                    if let Some(sum) = acc.checked_add(*price) {
+                        acc = sum;
+                    } else {
+                        ok = false;
+                        break;
                     }
                 }
                 total = acc;
