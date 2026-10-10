@@ -40,7 +40,7 @@ use pulse::{
     BacktestConfig, BacktestResult, Candle, CandleSeries, Comparator, CompiledStrategy,
     CompiledValue, Condition, DataVersion, Direction, EvalContext, ExitRule, IndicatorEngine,
     IndicatorSpec, Migrator, Pair, PriceField, RiskParams, SchemaVersion, Series, StrategyDsl,
-    SweepableValue, SymbolFilters, Timeframe, ValueSource, compile, run_backtest, validate,
+    SweepableValue, SymbolFilters, Timeframe, ValueSource, align, compile, run_backtest, validate,
 };
 use rust_decimal::Decimal;
 
@@ -760,15 +760,15 @@ fn a_resistance_on_the_htf_series_compiles_and_steps_on_the_closed_h4_bar() {
         "the H4 level is confirmed exactly when the second swing high's right bar closes"
     );
 
-    // (3) The backtest takes its signal on the M15 bar where H4 bar 7 has just
-    // closed (M15 index 7*16+15 = 127), and fills on the next bar's open. Two
-    // rules put it there, and the assertion pins both:
-    //   * the level first exists at H4 bar 6 (M15 index 111), and
-    //   * the engine's warm gate needs a PREVIOUS value as well as a current
-    //     one (#36), so the first bar a signal may fire on is the one after the
-    //     level's first bar — H4 bar 7's close.
-    // A no-look-ahead violation would surface the level inside H4 bar 6's own
-    // span (M15 96..=110) and fire there, before that H4 bar closed.
+    // (3) The backtest takes its signal on the M15 bar where H4 bar 6 has just
+    // closed (M15 index 6*16+15 = 111), and fills on the next bar's open. A
+    // level slot counts as warm once its `is_ready()` is true (r4.s6 PR-362 fix
+    // round 1, rule (a)), so the first bar a signal may fire on is the level's
+    // FIRST bar — H4 bar 6's close, not the bar after it. A no-look-ahead
+    // violation would surface the level inside H4 bar 6's own span (M15
+    // 96..=110) and fire there, before that H4 bar closed; the assertion below
+    // pins the pairing instead: the signal bar's paired H4 bar has closed at or
+    // before the signal bar's own close.
     let primary = m15_series(
         (0..144)
             .map(|i| {
@@ -786,12 +786,24 @@ fn a_resistance_on_the_htf_series_compiles_and_steps_on_the_closed_h4_bar() {
     let result = run(&strategy, &primary, &htf);
     assert_eq!(result.trades.len(), 1, "exactly one entry");
     let trade = &result.trades[0];
-    assert_eq!(
-        trade.entry_signal_time, primary.candles[127].close_time,
-        "the signal lands on the M15 bar whose paired H4 bar (7) has just closed"
+    // The no-look-ahead rule, asserted on the pairing itself: the signal bar's
+    // paired H4 bar has closed at or before the signal bar's own close.
+    let paired = align(&primary, Some(&htf), None)
+        .into_iter()
+        .find(|bar| bar.primary.close_time == trade.entry_signal_time)
+        .expect("the signal time resolves to a primary bar")
+        .htf
+        .expect("the signal bar is paired with a closed H4 bar");
+    assert!(
+        paired.close_time <= trade.entry_signal_time,
+        "no look-ahead: the paired H4 bar must have closed by the signal bar's close"
     );
     assert_eq!(
-        trade.entry_fill_time, primary.candles[128].open_time,
+        trade.entry_signal_time, primary.candles[111].close_time,
+        "the signal lands on the M15 bar whose paired H4 bar (6) has just closed"
+    );
+    assert_eq!(
+        trade.entry_fill_time, primary.candles[112].open_time,
         "the fill is the next M15 bar's open"
     );
 }
@@ -859,5 +871,205 @@ fn a_1_2_0_document_loads_and_reserializes_as_1_3_0_unchanged_otherwise() {
     assert_eq!(
         reserialized, expected,
         "the identity step changes nothing but the schema_version string"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (i) The warm gate on a level slot — the break bar itself (fix round 1)
+// ---------------------------------------------------------------------------
+
+/// F3 (r4.s6 PR-362 fix round 1, Codex 4238952612 / close review R1): a
+/// level/pattern slot counts as warm once its `is_ready()` is true, so the bar
+/// that breaks the ONLY qualifying resistance — the bar whose own level reads
+/// `None`, nothing sitting above its close any more — still enters through
+/// `CrossesAbove(close, lag(resistance, 1))`, which reads the two EARLIER bars'
+/// level values. Under the old all-history-`Some` gate the whole entry stayed
+/// cold at that bar and this fixture took zero trades; the fixed engine enters
+/// exactly once, on the break bar. The support half mirrors it on
+/// `CrossesBelow`.
+fn run_primary(compiled_strategy: &CompiledStrategy, primary: &CandleSeries) -> BacktestResult {
+    run_backtest(
+        compiled_strategy,
+        primary,
+        None,
+        None,
+        &BacktestConfig {
+            starting_equity: dec(10_000),
+            taker_fee_bps: dec(0),
+            slippage_bps: dec(0),
+        },
+        &SymbolFilters::unconstrained(),
+        pulse::SeriesEnd::SnapshotEnd,
+        None,
+    )
+    .expect("backtest runs")
+}
+
+/// The break fixture's strategy: `crosses_above(close, lag(level, 1))` for a
+/// long (`crosses_below` for a short), one percent stop, no filters.
+fn break_dsl(direction: Direction, spec: IndicatorSpec) -> StrategyDsl {
+    let lagged = ValueSource::Lag {
+        value: Box::new(ValueSource::Indicator {
+            series: Series::Primary,
+            spec,
+        }),
+        bars: 1,
+    };
+    let close = ValueSource::Price {
+        series: Series::Primary,
+        field: PriceField::Close,
+    };
+    let entry = match direction {
+        Direction::Long => Condition::CrossesAbove {
+            lhs: close,
+            rhs: lagged,
+        },
+        Direction::Short => Condition::CrossesBelow {
+            lhs: close,
+            rhs: lagged,
+        },
+    };
+    StrategyDsl {
+        schema_version: SchemaVersion::CURRENT,
+        name: "level break warm gate".to_owned(),
+        direction,
+        entry,
+        filters: vec![],
+        exits: vec![ExitRule::StopLoss {
+            distance_pct: fixed_dec("0.05"),
+        }],
+        risk: RiskParams {
+            risk_per_trade_pct: fixed_dec("0.01"),
+            max_leverage: fixed_dec("3"),
+        },
+    }
+}
+
+fn candles_from(rows: &[(i64, i64, i64, i64)]) -> Vec<Candle> {
+    rows.iter()
+        .enumerate()
+        .map(|(idx, (open, high, low, close))| {
+            candle(
+                i64::try_from(idx).expect("small index"),
+                *open,
+                *high,
+                *low,
+                *close,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_clean_break_of_the_only_resistance_enters_on_the_break_bar() {
+    // The zone forms at bars 2/5 (pivot highs 110 and 109, mean 109.5), holds
+    // while the close stays below it, and bar 8 closes at 110 — the clean
+    // break, with the level reading `None` on that bar itself.
+    let rows: [(i64, i64, i64, i64); 12] = [
+        (100, 101, 99, 100),
+        (100, 102, 100, 101),
+        (101, 110, 101, 105), // pivot high 110
+        (105, 108, 104, 106), // confirms it
+        (106, 107, 105, 106),
+        (106, 109, 105, 108), // second pivot high 109
+        (108, 108, 106, 107), // confirms it → the level exists, 109.5
+        (107, 108, 106, 107), // close below it → resistance 109.5
+        (107, 111, 107, 110), // close 110 breaks it → None on this bar
+        (110, 112, 109, 111), // fills at this bar's open
+        (111, 113, 110, 112),
+        (112, 114, 111, 113),
+    ];
+    let candles = candles_from(&rows);
+
+    let spec = IndicatorSpec::Resistance {
+        left: fixed_u32(1),
+        right: fixed_u32(1),
+        tolerance_pct: fixed_dec(TOLERANCE),
+        min_touches: fixed_u32(2),
+        lookback: fixed_u32(20),
+    };
+    let result = run_primary(
+        &compiled(&break_dsl(Direction::Long, spec.clone())),
+        &m15_series(candles.clone()),
+    );
+
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "exactly one entry — the break bar's"
+    );
+    let trade = &result.trades[0];
+    assert_eq!(
+        trade.entry_signal_time, candles[8].close_time,
+        "the signal lands on the bar whose close breaks the only resistance"
+    );
+    assert_eq!(
+        trade.entry_fill_time, candles[9].open_time,
+        "the fill is the next bar's open"
+    );
+
+    // The mechanism, streamed independently of the engine's decision: the
+    // level holds at bars 6 and 7 and is `None` at bar 8 — the cross reads
+    // bars 6 and 7, so the break bar's own `None` must not gate the entry.
+    let level = Some(Decimal::from_str("109.5").expect("literal"));
+    assert_eq!(
+        step(&spec, &candles)[6..=8].to_vec(),
+        vec![level, level, None],
+        "the level holds, then vanishes on the break bar"
+    );
+}
+
+#[test]
+fn a_clean_break_of_the_only_support_enters_on_the_break_bar() {
+    // The mirror: pivot lows 90 (bar 2) and 91 (bar 5), support 90.5, and bar 8
+    // closes at 90 — below it, so the level reads `None` on the break bar.
+    let rows: [(i64, i64, i64, i64); 12] = [
+        (100, 101, 99, 100),
+        (100, 100, 98, 99),
+        (99, 101, 90, 95), // pivot low 90
+        (95, 97, 91, 96),  // confirms it
+        (96, 98, 92, 97),
+        (97, 98, 91, 95), // second pivot low 91
+        (95, 96, 91, 94), // confirms it → the level exists, 90.5
+        (94, 95, 93, 93), // close above it → support 90.5
+        (93, 94, 90, 90), // close 90 breaks it → None on this bar
+        (89, 90, 88, 89), // fills at this bar's open
+        (89, 90, 88, 89),
+        (89, 90, 89, 89),
+    ];
+    let candles = candles_from(&rows);
+
+    let spec = IndicatorSpec::Support {
+        left: fixed_u32(1),
+        right: fixed_u32(1),
+        tolerance_pct: fixed_dec(TOLERANCE),
+        min_touches: fixed_u32(2),
+        lookback: fixed_u32(20),
+    };
+    let result = run_primary(
+        &compiled(&break_dsl(Direction::Short, spec.clone())),
+        &m15_series(candles.clone()),
+    );
+
+    assert_eq!(
+        result.trades.len(),
+        1,
+        "exactly one entry — the break bar's"
+    );
+    let trade = &result.trades[0];
+    assert_eq!(
+        trade.entry_signal_time, candles[8].close_time,
+        "the signal lands on the bar whose close breaks the only support"
+    );
+    assert_eq!(
+        trade.entry_fill_time, candles[9].open_time,
+        "the fill is the next bar's open"
+    );
+
+    let level = Some(Decimal::from_str("90.5").expect("literal"));
+    assert_eq!(
+        step(&spec, &candles)[6..=8].to_vec(),
+        vec![level, level, None],
+        "the level holds, then vanishes on the break bar"
     );
 }

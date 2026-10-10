@@ -263,6 +263,10 @@ impl CompiledCondition {
             // which — since #36 — also guarantees a previous value for every
             // slot, so a `Not`/`Or` over a previous-reading leaf cannot fire on
             // the first warm bar. Proofs: tests/condition_semantics.rs (iv)/(v).
+            // The six level/pattern slots are the one carve-out (r4.s6 PR-362
+            // fix round 1): they warm on `is_ready()` alone, so after warm-up a
+            // comparison over a "no level at this bar" `None` is false — and a
+            // `Not` over it is true.
             CompiledCondition::Not(condition) => !condition.eval(ctx),
         }
     }

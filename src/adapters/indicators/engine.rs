@@ -91,6 +91,24 @@ impl IndicatorSlot {
     }
 }
 
+/// Whether `spec` is one of the six level/pattern variants whose values are
+/// legitimately `None` on some bars after the indicator is ready — a broken
+/// zone, a within-tolerance neckline not yet paired, a wrong-way trendline.
+/// Their slots are warmed by `is_ready()` alone (see
+/// [`IndicatorEngine::is_warm`]); every other slot keeps the
+/// all-history-`Some` rule.
+fn is_level_or_pattern(spec: &IndicatorSpec) -> bool {
+    matches!(
+        spec,
+        IndicatorSpec::Resistance { .. }
+            | IndicatorSpec::Support { .. }
+            | IndicatorSpec::DoubleTopNeckline { .. }
+            | IndicatorSpec::DoubleBottomNeckline { .. }
+            | IndicatorSpec::TrendlineLows { .. }
+            | IndicatorSpec::TrendlineHighs { .. }
+    )
+}
+
 impl IndicatorEngine {
     /// Build the engine from a compiled strategy's required indicator list.
     ///
@@ -198,12 +216,30 @@ impl IndicatorEngine {
     /// turn into an entry on the first warm bar (#16, spine ruling a1). A
     /// strategy with no lag has `max_lag = 0`, so its warm point is exactly
     /// the pre-expression one.
+    ///
+    /// **The level/pattern carve-out (r4.s6 PR-362 fix round 1, Codex
+    /// 4238952612 / close review R1).** The six level/pattern variants
+    /// (`Resistance`, `Support`, `DoubleTopNeckline`, `DoubleBottomNeckline`,
+    /// `TrendlineLows`, `TrendlineHighs`) yield `None` on a bar where no level
+    /// exists after they are ready — their `is_ready()` reports "a value is
+    /// possible at all", never "the next call returns `Some`" — and a clean
+    /// break of the only zone is exactly such a bar. The taught break
+    /// `CrossesAbove(close, lag(Resistance, 1))` reads the PREVIOUS bars'
+    /// values, so the breakout bar's own `None` must not hold the whole entry
+    /// gate cold. Such a slot therefore counts as warm once its `is_ready()`
+    /// is true; a `None` from it is read by the no-value rule (a comparison
+    /// over it is false), never as "not warm". Every other slot keeps the
+    /// all-history-`Some` rule unchanged.
     #[must_use]
     pub fn is_warm(&self) -> bool {
         self.indicators.iter().all(|slot| {
-            slot.history.len() == slot.max_lag as usize + 2
-                && slot.history.iter().all(Option::is_some)
-                && slot.indicator.is_ready()
+            if is_level_or_pattern(&slot.spec) {
+                slot.indicator.is_ready()
+            } else {
+                slot.history.len() == slot.max_lag as usize + 2
+                    && slot.history.iter().all(Option::is_some)
+                    && slot.indicator.is_ready()
+            }
         }) && (self.price_lag == 0 || self.candles.len() == self.price_lag as usize + 2)
     }
 

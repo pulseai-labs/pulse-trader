@@ -39,7 +39,7 @@ use pulse::{
     BacktestConfig, BacktestResult, Candle, CandleSeries, Comparator, CompiledStrategy,
     CompiledValue, Condition, DataVersion, Direction, EvalContext, ExitRule, IndicatorEngine,
     IndicatorSpec, Pair, PriceField, RiskParams, Series, StrategyDsl, SweepableValue,
-    SymbolFilters, Timeframe, ValueSource, compile, run_backtest, validate,
+    SymbolFilters, Timeframe, ValueSource, align, compile, run_backtest, validate,
 };
 use rust_decimal::Decimal;
 
@@ -611,6 +611,7 @@ fn run(
     .expect("backtest runs")
 }
 
+#[allow(clippy::too_many_lines)] // one fixture: the value trace, the routing checks and the trade assertions
 #[test]
 fn a_double_top_neckline_on_the_htf_series_compiles_and_steps_on_the_closed_h4_bar() {
     let htf_candles: Vec<Candle> = H4_FIXTURE
@@ -680,13 +681,15 @@ fn a_double_top_neckline_on_the_htf_series_compiles_and_steps_on_the_closed_h4_b
         "the H4 neckline is confirmed exactly when the second swing high's right bar closes"
     );
 
-    // (3) The backtest takes its signal on the M15 bar where H4 bar 7 has just
-    // closed (M15 index 7 × 16 + 15 = 127), and fills on the next bar's open:
-    // the level first exists at H4 bar 6 (M15 index 111), and the engine's warm
-    // gate needs a PREVIOUS value as well as a current one (#36), so the first
-    // bar a signal may fire on is the one after the level's first bar — H4 bar
-    // 7's close. A no-look-ahead violation would surface the level inside H4
-    // bar 6's own span (M15 96..=110) and fire there, before that H4 bar closed.
+    // (3) The backtest takes its signal on the M15 bar where H4 bar 6 has just
+    // closed (M15 index 6 × 16 + 15 = 111), and fills on the next bar's open: a
+    // level/pattern slot counts as warm once its `is_ready()` is true (r4.s6
+    // PR-362 fix round 1, rule (a)), so the first bar a signal may fire on is
+    // the level's FIRST bar — H4 bar 6's close, not the bar after it. A
+    // no-look-ahead violation would surface the level inside H4 bar 6's own
+    // span (M15 96..=110) and fire there, before that H4 bar closed; the
+    // assertion below pins the pairing instead: the signal bar's paired H4 bar
+    // has closed at or before the signal bar's own close.
     let primary = m15_series(
         (0..144)
             .map(|i| {
@@ -718,12 +721,24 @@ fn a_double_top_neckline_on_the_htf_series_compiles_and_steps_on_the_closed_h4_b
     let result = run(&strategy, &primary, &htf);
     assert_eq!(result.trades.len(), 1, "exactly one entry");
     let trade = &result.trades[0];
-    assert_eq!(
-        trade.entry_signal_time, primary.candles[127].close_time,
-        "the signal lands on the M15 bar whose paired H4 bar (7) has just closed"
+    // The no-look-ahead rule, asserted on the pairing itself: the signal bar's
+    // paired H4 bar has closed at or before the signal bar's own close.
+    let paired = align(&primary, Some(&htf), None)
+        .into_iter()
+        .find(|bar| bar.primary.close_time == trade.entry_signal_time)
+        .expect("the signal time resolves to a primary bar")
+        .htf
+        .expect("the signal bar is paired with a closed H4 bar");
+    assert!(
+        paired.close_time <= trade.entry_signal_time,
+        "no look-ahead: the paired H4 bar must have closed by the signal bar's close"
     );
     assert_eq!(
-        trade.entry_fill_time, primary.candles[128].open_time,
+        trade.entry_signal_time, primary.candles[111].close_time,
+        "the signal lands on the M15 bar whose paired H4 bar (6) has just closed"
+    );
+    assert_eq!(
+        trade.entry_fill_time, primary.candles[112].open_time,
         "the fill is the next M15 bar's open"
     );
 }

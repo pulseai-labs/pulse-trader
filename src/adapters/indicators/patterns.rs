@@ -195,8 +195,9 @@ impl Indicator for NecklineIndicator {
         // NEXT pivot pair sits within tolerance is the next pivot's own fact.
         // This reports the part the indicator can know — a pair has confirmed, so
         // a value is possible at all — the `LevelIndicator` reading of the same
-        // limit. It is a safe lower bound: the engine's warm gate still needs two
-        // consecutive values, so an entry never fires on a value-less bar.
+        // limit. The engine's warm gate reads this as genuine readiness for a
+        // level/pattern slot (r4.s6 PR-362 fix round 1): past it, a `None` value
+        // is a no-value reading, false in a comparison, never an entry itself.
         self.earlier.is_some()
     }
 }
@@ -281,7 +282,8 @@ impl Indicator for TrendlineIndicator {
 
     fn is_ready(&self) -> bool {
         // The neckline's reading of the same limit: a pair has confirmed, so a
-        // value is possible at all.
+        // value is possible at all — and the engine's warm gate reads it as
+        // readiness for this slot (r4.s6 PR-362 fix round 1).
         self.earlier.is_some()
     }
 }

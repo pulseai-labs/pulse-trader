@@ -361,13 +361,13 @@ impl Indicator for LevelIndicator {
     fn is_ready(&self) -> bool {
         // The trait's `is_ready` is an exact "the next call returns Some" for
         // every other adapter; a level cannot promise that, because whether the
-        // NEXT bar's close sits below (resistance) or above (support) the
-        // qualifying group is the next bar's own fact. This reports the part
-        // the indicator can know: enough touches are in the window for a level
-        // to be possible at all. The direction is the safe one — it never lets
-        // the entry gate fire on an indicator that has not yet produced any
-        // level, and a bar whose close disqualifies the group simply evaluates
-        // `None` (a comparison over it is false, never an entry).
+        // NEXT bar's close sits below (resistance) or above (support) a
+        // qualifying run is the next bar's own fact. This reports the part the
+        // indicator can know: enough pivots are in the window for a level to be
+        // possible at all. The engine's warm gate reads this as genuine
+        // readiness for a level/pattern slot (r4.s6 PR-362 fix round 1): past
+        // it, a `None` value means "no level at this bar" and a comparison over
+        // it is false — it can never be an entry by itself.
         self.pivots.len() >= self.min_touches as usize
     }
 }
