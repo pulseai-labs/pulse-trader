@@ -28,7 +28,9 @@ use rust_decimal::Decimal;
 /// after it is true is a no-value reading (a comparison over it is false), not
 /// a warmup state. Readiness for those six is LATCHED: once true it stays true
 /// for the life of the adapter. [`IndicatorEngine::is_warm`] reads it as the
-/// warm gate for those slots.
+/// warm gate for those slots, together with the ring depth every slot must
+/// hold (`max_lag + 2` values), so the gate opens only once the deepest lag a
+/// leaf reads exists.
 ///
 /// [`IndicatorEngine::is_warm`]: crate::IndicatorEngine::is_warm
 pub trait Indicator {

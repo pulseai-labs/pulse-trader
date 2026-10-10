@@ -683,9 +683,11 @@ fn a_double_top_neckline_on_the_htf_series_compiles_and_steps_on_the_closed_h4_b
 
     // (3) The backtest takes its signal on the M15 bar where H4 bar 6 has just
     // closed (M15 index 6 × 16 + 15 = 111), and fills on the next bar's open: a
-    // level/pattern slot counts as warm once its `is_ready()` is true (r4.s6
-    // PR-362 fix round 1, rule (a)), so the first bar a signal may fire on is
-    // the level's FIRST bar — H4 bar 6's close, not the bar after it. A
+    // level/pattern slot counts as warm once its LATCHED `is_ready()` has become
+    // true AND its ring holds `max_lag + 2` values (r4.s6 PR-362 fix rounds
+    // 1-2); here the strategy carries no lag, so `max_lag` is 0 and the ring is
+    // already two values deep — the first bar a signal may fire on is the
+    // level's FIRST bar, H4 bar 6's close, not the bar after it. A
     // no-look-ahead violation would surface the level inside H4 bar 6's own
     // span (M15 96..=110) and fire there, before that H4 bar closed; the
     // assertion below pins the pairing instead: the signal bar's paired H4 bar

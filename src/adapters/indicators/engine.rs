@@ -202,17 +202,17 @@ impl IndicatorEngine {
         self.indicators.len()
     }
 
-    /// Whether every owned indicator is fully warm: it has a **current** value,
-    /// a **previous** value, and its readiness window is satisfied — plus,
-    /// since r3.s2.w3 (b4), each slot's ring holds `max_lag + 2` values (so
-    /// `previous` of the deepest lag exists) and the candle ring holds
-    /// `price_lag + 2` candles when a lagged `Price` leaf exists.
+    /// Whether every owned indicator is fully warm: its ring holds `max_lag + 2`
+    /// values (since r3.s2.w3 (b4)), its readiness window is satisfied, and —
+    /// for every slot except the six level/pattern variants (the carve-out
+    /// below) — it has both a **current** and a **previous** value. The candle
+    /// ring holds `price_lag + 2` candles when a lagged `Price` leaf exists.
     ///
     /// A driver must not evaluate or fire strategy entry while
     /// [`IndicatorEngine::is_warm`] is false. Since #36 the guarantee includes
-    /// a previous value: on the bar right after an indicator's first value,
-    /// `previous` is still `None`, and a `CrossesAbove`/`CrossesBelow` leaf
-    /// evaluates `false` there — which a `Not`/`Or` composition would otherwise
+    /// a previous value for those slots: on the bar right after an indicator's
+    /// first value, `previous` is still `None`, and a `CrossesAbove`/`CrossesBelow`
+    /// leaf evaluates `false` there — which a `Not`/`Or` composition would otherwise
     /// turn into an entry on the first warm bar (#16, spine ruling a1). A
     /// strategy with no lag has `max_lag = 0`, so its warm point is exactly
     /// the pre-expression one.

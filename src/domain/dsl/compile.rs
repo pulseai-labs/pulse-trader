@@ -259,14 +259,19 @@ impl CompiledCondition {
             // `Not` over an unavailable operand composes the `false` into
             // `true` (#16, closed as covered by spine ruling a1 — no tri-state
             // `eval`). That is safe ONLY behind the engine's entry gate
-            // (`bar.index > 0 && is_warm()`, `adapters/backtest/engine.rs`),
-            // which — since #36 — also guarantees a previous value for every
-            // slot, so a `Not`/`Or` over a previous-reading leaf cannot fire on
-            // the first warm bar. Proofs: tests/condition_semantics.rs (iv)/(v).
-            // The six level/pattern slots are the one carve-out (r4.s6 PR-362
-            // fix round 1): they warm on `is_ready()` alone, so after warm-up a
-            // comparison over a "no level at this bar" `None` is false — and a
-            // `Not` over it is true.
+            // (`bar.index > 0 && is_warm()`, `adapters/backtest/engine.rs`).
+            // For every slot except the six level/pattern variants the gate —
+            // since #36 — guarantees a current AND a previous value, so a
+            // `Not`/`Or` over a previous-reading leaf cannot fire on the first
+            // warm bar (proofs: tests/condition_semantics.rs (iv)/(v)). The six
+            // level/pattern slots are the carve-out (r4.s6 PR-362 fix rounds
+            // 1-2): a slot is warm once its LATCHED `is_ready()` has become true
+            // AND its ring holds `max_lag + 2` values — every LAGGED read is
+            // available — but its CURRENT bar may legitimately read `None` ("no
+            // level at this bar"), which makes a comparison over it false and a
+            // `Not` over it true. So the gate does NOT promise a current value
+            // for those six; dropping the ring-depth clause would re-open the
+            // early-entry class the (iv)/(v) proofs close.
             CompiledCondition::Not(condition) => !condition.eval(ctx),
         }
     }

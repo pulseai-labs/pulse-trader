@@ -568,13 +568,14 @@ mod tests {
 
         /// Rule C's proof (r4.s6 PR-362 fix round 2): over random sorted price
         /// sets (1..=24 prices in 1..=2000), tolerances in (0, 0.10] and
-        /// `min_touches` 1..=5, the two-pointer scan yields exactly the naive
-        /// reference scan's candidate list. Deterministic: fixed seed, 512 cases.
+        /// `min_touches` 2..=5 (the constructor's own floor), the two-pointer
+        /// scan yields exactly the naive reference scan's candidate list.
+        /// Deterministic: fixed seed, 512 cases.
         #[test]
         fn the_two_pointer_scan_matches_the_naive_reference(
             mut prices in prop::collection::vec(1_i64..=2_000, 1..=24),
             tolerance_milli in 1_u32..=100,
-            min_touches in 1_u32..=5,
+            min_touches in 2_u32..=5,
         ) {
             prices.sort_unstable();
             let prices: Vec<Decimal> = prices.into_iter().map(Decimal::from).collect();

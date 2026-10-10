@@ -897,9 +897,11 @@ fn a_resistance_on_the_htf_series_compiles_and_steps_on_the_closed_h4_bar() {
 
     // (3) The backtest takes its signal on the M15 bar where H4 bar 6 has just
     // closed (M15 index 6*16+15 = 111), and fills on the next bar's open. A
-    // level slot counts as warm once its `is_ready()` is true (r4.s6 PR-362 fix
-    // round 1, rule (a)), so the first bar a signal may fire on is the level's
-    // FIRST bar — H4 bar 6's close, not the bar after it. A no-look-ahead
+    // level slot counts as warm once its LATCHED `is_ready()` has become true
+    // AND its ring holds `max_lag + 2` values (r4.s6 PR-362 fix rounds 1-2);
+    // here the strategy carries no lag, so `max_lag` is 0 and the ring is
+    // already two values deep — the first bar a signal may fire on is the
+    // level's FIRST bar, H4 bar 6's close, not the bar after it. A no-look-ahead
     // violation would surface the level inside H4 bar 6's own span (M15
     // 96..=110) and fire there, before that H4 bar closed; the assertion below
     // pins the pairing instead: the signal bar's paired H4 bar has closed at or
@@ -1014,13 +1016,14 @@ fn a_1_2_0_document_loads_and_reserializes_as_1_3_0_unchanged_otherwise() {
 // ---------------------------------------------------------------------------
 
 /// F3 (r4.s6 PR-362 fix round 1, Codex 4238952612 / close review R1): a
-/// level/pattern slot counts as warm once its `is_ready()` is true, so the bar
-/// that breaks the ONLY qualifying resistance — the bar whose own level reads
-/// `None`, nothing sitting above its close any more — still enters through
-/// `CrossesAbove(close, lag(resistance, 1))`, which reads the two EARLIER bars'
-/// level values. Under the old all-history-`Some` gate the whole entry stayed
-/// cold at that bar and this fixture took zero trades; the fixed engine enters
-/// exactly once, on the break bar. The support half mirrors it on
+/// level/pattern slot counts as warm once its LATCHED `is_ready()` has become
+/// true AND its ring holds `max_lag + 2` values (r4.s6 PR-362 fix rounds 1-2),
+/// so the bar that breaks the ONLY qualifying resistance — the bar whose own
+/// level reads `None`, nothing sitting above its close any more — still enters
+/// through `CrossesAbove(close, lag(resistance, 1))`, which reads the two
+/// EARLIER bars' level values. Under the old all-history-`Some` gate the whole
+/// entry stayed cold at that bar and this fixture took zero trades; the fixed
+/// engine enters exactly once, on the break bar. The support half mirrors it on
 /// `CrossesBelow`.
 fn run_primary(compiled_strategy: &CompiledStrategy, primary: &CandleSeries) -> BacktestResult {
     run_backtest(
