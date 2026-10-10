@@ -414,18 +414,21 @@ impl Anatomy {
 
 impl Indicator for Anatomy {
     fn next(&mut self, candle: &Candle) -> Option<Decimal> {
-        // A bar's own anatomy is always defined — the first bar already has one.
-        Some(match self.kind {
-            AnatomyKind::Body => (candle.close - candle.open).abs(),
-            AnatomyKind::UpperWick => candle.high - candle.open.max(candle.close),
-            AnatomyKind::LowerWick => candle.open.min(candle.close) - candle.low,
-            AnatomyKind::Range => candle.high - candle.low,
-        })
+        // A bar's own anatomy is defined from the very first bar. Every step
+        // is a checked operation — an overflow gives `None`, never a panic
+        // (the ADR-0024 addendum's contract, the `group_mean` precedent).
+        match self.kind {
+            AnatomyKind::Body => candle.close.checked_sub(candle.open).map(|body| body.abs()),
+            AnatomyKind::UpperWick => candle.high.checked_sub(candle.open.max(candle.close)),
+            AnatomyKind::LowerWick => candle.open.min(candle.close).checked_sub(candle.low),
+            AnatomyKind::Range => candle.high.checked_sub(candle.low),
+        }
     }
 
     fn is_ready(&self) -> bool {
-        // Every bar has anatomy, including the first: the next call always
-        // returns Some.
+        // Every bar has anatomy, including the first: on every bar a real
+        // candle can carry, the next call returns Some (the checked steps
+        // above are the overflow contract, not an expected `None`).
         true
     }
 }
