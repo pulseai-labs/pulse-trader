@@ -75,9 +75,11 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "`rising`/`falling` mean the value is strictly greater/less than its own value `bars` bars ago on the same series (`bars` in 1..=500, default 1); over a value containing a lag, or mixing both series, they are refused",
     ),
     // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
+    // r4.s6.w1: moved to 1.3.0 (the structure indicator variants); the served
+    // set grows by 1.2.0.
     (
         "schema_version",
-        "this engine writes and serves schema 1.2.0 and also loads 1.0.0 and 1.1.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.2.0",
+        "this engine writes and serves schema 1.3.0 and also loads 1.0.0, 1.1.0 and 1.2.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.3.0",
     ),
 ];
 
@@ -125,12 +127,12 @@ mod tests {
             assert!(properties.contains_key(field), "missing property {field}");
         }
         // F6: `schema_version` publishes the ACCEPTED values, not an
-        // unconstrained string — `Migrator::v1()` loads `1.0.0` and `1.1.0`
-        // (identity-migrated) and `CURRENT`, so the schema a validating agent
-        // reads must pin exactly that enum.
+        // unconstrained string — `Migrator::v1()` loads `1.0.0`, `1.1.0` and
+        // `1.2.0` (identity-migrated) and `CURRENT`, so the schema a validating
+        // agent reads must pin exactly that enum.
         assert_eq!(
             properties["schema_version"]["enum"],
-            serde_json::json!(["1.0.0", "1.1.0", DSL_SCHEMA_VERSION]),
+            serde_json::json!(["1.0.0", "1.1.0", "1.2.0", DSL_SCHEMA_VERSION]),
             "schema_version property must publish the accepted enum"
         );
         let conventions = doc["conventions"].as_object().expect("conventions object");

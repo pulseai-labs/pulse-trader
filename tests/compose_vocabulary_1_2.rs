@@ -512,8 +512,8 @@ async fn d47_journey_composes_arithmetic_slopes_and_d1_with_no_substitution() {
     // migrator into the same typed document (already-current, no migration).
     assert_eq!(
         version.dsl_schema_version.to_string(),
-        "1.2.0",
-        "the persisted version is stamped schema 1.2.0"
+        "1.3.0",
+        "the persisted version is stamped schema 1.3.0"
     );
     assert_eq!(version.dsl.schema_version, SchemaVersion::CURRENT);
     let loaded = Migrator::v1()

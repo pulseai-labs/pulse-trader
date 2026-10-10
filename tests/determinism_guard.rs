@@ -83,6 +83,10 @@ const SCAN_TARGETS: &[&str] = &[
     "src/adapters/indicators/macd.rs",
     "src/adapters/indicators/mod.rs",
     "src/adapters/indicators/rsi.rs",
+    // r4.s6.w1: the structure indicators (pivots, S/R levels, candle anatomy) —
+    // pure `Decimal`, no `convert` seam, but scanned like every other indicator
+    // surface so a future banned call here is not a false-green hole.
+    "src/adapters/indicators/structure.rs",
     "src/domain/backtest/regime.rs",
     "src/adapters/backtest/regime.rs",
     "src/adapters/backtest/engine.rs",

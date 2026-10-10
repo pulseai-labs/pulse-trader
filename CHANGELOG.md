@@ -8,6 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DSL schema 1.3.0: swing pivots, support/resistance and candle anatomy as price-level indicator
+  variants (r4.s6.w1).** Eight new `IndicatorSpec` variants — `PivotHigh`/`PivotLow` (`left`,
+  `right`), `Resistance`/`Support` (`left`, `right`, `tolerance_pct`, `min_touches`, `lookback`) and
+  the parameterless `Body`/`UpperWick`/`LowerWick`/`Range` — so a breakout reads
+  `CrossesAbove(close, htf Resistance{…})` through the existing comparisons and the `htf` operand;
+  the seam stays indicators, not conditions (ADR-0024 addendum,
+  `docs/adr/0024-addendum-structure-indicators-1-3-0.md`). A swing pivot is confirmed only once its
+  `right` bars have closed, and each structure indicator passes a truncation no-repaint test; the
+  level variants keep confirmed pivots within `lookback`, group them by the decimal-fraction
+  `tolerance_pct` (`0.003` = 0.3%, the `distance_pct` convention), keep groups with at least
+  `min_touches` pivots, and return the mean of the nearest qualifying group above (below) the
+  current close. `tolerance_pct` is a `SweepableValue<Decimal>`; the other parameters are
+  `SweepableValue<u32>` with `left`/`right` ≥ 1, `min_touches` ≥ 2 and `lookback` > `left + right`.
+  The `1.2.0 → 1.3.0` migration is identity (only the version string is rewritten), every
+  pre-1.3.0 document keeps its meaning and its frozen `result_content_hash`, and the new vocabulary
+  reaches the engine, validation, rendering, the one-mutation framework, the builder tools and the
+  indicator read path.
+
 - **Off-box backup: the Mini's nightly `pulse backup` as a launchd calendar job, a read-only pull to
   draco-desk over a dedicated forced-command key, and a restore drill from the pulled copy (r4.s2.w5).**
   `deploy/com.pulsetrader.backup.plist` runs the installed binary's `backup` (defaults: the platform
@@ -186,6 +204,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   known limit "a failed unit raises no push alert".
 
 ### Changed
+
+- **DSL schema 1.3.0 is the served and written version (r4.s6.w1).** `DSL_SCHEMA_VERSION` and
+  `SchemaVersion::CURRENT` move to `1.3.0`; `1.0.0`, `1.1.0` and `1.2.0` documents still load
+  (identity-migrated), the composer prompt's frontmatter pin and the `pulse://dsl/schema`
+  conventions string move with them, and the engine fingerprint moves with the schema string
+  while every frozen pre-bump `result_content_hash` stays identical.
 
 - **Engine-sensitive dependency bumps: `polars` 0.54.4, `zip` 8.6.0, `rust_decimal` 1.42.1.** The
   three pins move together under the determinism gate: the determinism lanes, the golden fixture
