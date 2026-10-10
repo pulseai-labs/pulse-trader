@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   variants (r4.s6.w1).** Eight new `IndicatorSpec` variants — `PivotHigh`/`PivotLow` (`left`,
   `right`), `Resistance`/`Support` (`left`, `right`, `tolerance_pct`, `min_touches`, `lookback`) and
   the parameterless `Body`/`UpperWick`/`LowerWick`/`Range` — so a breakout reads
-  `CrossesAbove(close, htf Resistance{…})` through the existing comparisons and the `htf` operand;
+  `CrossesAbove(close, lag(htf Resistance{…}, 1))` through the existing comparisons and the `htf` operand;
   the seam stays indicators, not conditions (ADR-0024 addendum,
   `docs/adr/0024-addendum-structure-indicators-1-3-0.md`). A swing pivot is confirmed only once its
   `right` bars have closed, and each structure indicator passes a truncation no-repaint test; the

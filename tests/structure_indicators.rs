@@ -1,9 +1,12 @@
 //! r4.s6.w1 — the structure-indicator acceptance suite (demo line d78).
 //!
-//! Schema **1.3.0** adds eight price-level indicator variants: the swing pivots
-//! `PivotHigh`/`PivotLow`, the levels `Resistance`/`Support`, and the four
-//! candle-anatomy values `Body`/`UpperWick`/`LowerWick`/`Range`. This suite
-//! pins their behaviour on a hand-built M15 fixture:
+//! Schema **1.3.0** ships twelve structure and pattern indicator variants: the
+//! swing pivots `PivotHigh`/`PivotLow`, the levels `Resistance`/`Support`, the
+//! four candle-anatomy values `Body`/`UpperWick`/`LowerWick`/`Range` (all four
+//! groups pinned here), and the four pattern variants
+//! `DoubleTopNeckline`/`DoubleBottomNeckline`/`TrendlineLows`/`TrendlineHighs`
+//! (`tests/pattern_indicators.rs`). This suite pins its eight on a hand-built
+//! M15 fixture:
 //!
 //! - **(a) Pivots.** The confirmed swing highs and lows land exactly on the
 //!   hand-labelled bars, and a pivot's value first appears `right` bars after

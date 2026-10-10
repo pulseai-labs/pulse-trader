@@ -36,7 +36,8 @@ new variants are `IndicatorSpec` variants — price-level (or price-distance)
 indicators that reuse the existing `Compare` / `CrossesAbove` / `CrossesBelow`
 comparisons and the existing `primary` / `htf` / `d1` `series` operand. No
 `Condition` kind is added, no boolean signal type appears, and a breakout reads
-`CrossesAbove(close, htf Resistance{…})` through machinery that already exists.
+`CrossesAbove(close, lag(htf Resistance{…}, 1))` through machinery that already
+exists.
 
 **The new variants (schema 1.3.0).** All are `None` until defined; the four
 level/pivot variants take `SweepableValue<u32>` parameters, `tolerance_pct` is a
