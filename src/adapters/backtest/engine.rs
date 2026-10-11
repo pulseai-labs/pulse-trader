@@ -8,11 +8,11 @@ use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledExit, CompiledStrategy,
     CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve, EvalContext, ExitReason,
-    Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, Regime, RegimeBreakdown, Series,
-    SeriesEnd, SeriesRole, Side, SizingOutcome, SkipReason, SkippedEntryCounts, SummaryStats,
-    SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource, ValidationError, align,
-    apply_slippage, atr_stop_price, compute_position_size, funding_payment, realized_pnl,
-    realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
+    Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, OpenPositionStops, Regime,
+    RegimeBreakdown, Series, SeriesEnd, SeriesRole, Side, SizingOutcome, SkipReason,
+    SkippedEntryCounts, SummaryStats, SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource,
+    ValidationError, align, apply_slippage, atr_stop_price, compute_position_size, funding_payment,
+    realized_pnl, realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -790,6 +790,19 @@ pub(super) struct OpenPosition {
 }
 
 impl OpenPosition {
+    /// The position's stop geometry, as a read-only caller sees it — the
+    /// paper read's live stops (r4.s4.w1, ADR-0027 addendum). Reads three
+    /// `Copy` fields and mutates nothing; the fields stay private so the
+    /// invariants that maintain them keep their home here.
+    #[must_use]
+    pub(super) fn stops(&self) -> OpenPositionStops {
+        OpenPositionStops {
+            initial_stop: self.initial_stop,
+            stop_price: self.stop_price,
+            take_profit_price: self.take_profit_price,
+        }
+    }
+
     /// Test-only constructor for the close-route rollback proof
     /// (`session.rs`'s labeled injection): assembles a position with
     /// caller-chosen sizing fields — including the zero-R

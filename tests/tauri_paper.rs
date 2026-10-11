@@ -7,8 +7,11 @@
 //!
 //! - (i) each of the eight commands calls its route and decodes the response
 //!   into its DTO, field for field (the DTO's own serialization is compared
-//!   against the route's raw JSON, with the one wire shape the DTO carries as
-//!   exact text normalized);
+//!   against the route's raw JSON as a recursive subset: every field the DTO
+//!   carries must be present and equal — the route may carry additive fields
+//!   the DTO mirrors one round later, ADR-0026; r4.s4.w2 restores the exact
+//!   mirror with r4.s4.w1's money view — with the one wire shape the DTO
+//!   carries as exact text normalized);
 //! - (ii) every paper error code decodes to its `BusErrorCode`,
 //!   `unknown_version`/`unknown_session` map to `not_found`, and E2's message
 //!   keeps both fingerprints;
@@ -348,10 +351,15 @@ async fn post_json(ts: &TestServer, path: &str) -> Value {
     response.json().await.expect("a json body")
 }
 
-/// The DTO's own serialization must equal the route's raw JSON, field for
-/// field. The one normalization: `last_bar_open_time` is epoch milliseconds on
-/// the wire and exact integer text in the DTO (specta refuses `i64`), so the
-/// raw number is rendered as its text before the comparison.
+/// The DTO's own serialization must equal the route's raw JSON on every field
+/// the DTO carries — as a recursive SUBSET, because the server's reads grow
+/// additive fields the mirror picks up one round later (ADR-0026; r4.s4.w1's
+/// money view lands in `src/tauri/paper.rs` in r4.s4.w2, so until then the
+/// route may carry keys the DTO does not mirror). Values still compare
+/// exactly, and a DTO key the route does not carry fails here. The one
+/// normalization: `last_bar_open_time` is epoch milliseconds on the wire and
+/// exact integer text in the DTO (specta refuses `i64`), so the raw number is
+/// rendered as its text before the comparison.
 fn assert_mirrors<T: Serialize>(dto: &T, raw: &Value) {
     let mut expected = raw.clone();
     if let Some(ms) = expected
@@ -361,11 +369,36 @@ fn assert_mirrors<T: Serialize>(dto: &T, raw: &Value) {
     {
         expected["last_bar_open_time"] = json!(ms);
     }
-    assert_eq!(
-        serde_json::to_value(dto).expect("the DTO serializes"),
-        expected,
-        "the DTO must mirror the route's JSON exactly"
-    );
+    let dto_value = serde_json::to_value(dto).expect("the DTO serializes");
+    assert_json_subset(&dto_value, &expected, "the DTO's JSON");
+}
+
+/// Every key/element the `dto` side carries must exist on the `raw` side with
+/// exactly the same value; `raw` may carry additional keys (the additive
+/// fields a later round mirrors). The `last_bar_open_time` normalization
+/// rides at the top level only — the field exists on no nested object.
+fn assert_json_subset(dto: &Value, raw: &Value, path: &str) {
+    match (dto, raw) {
+        (Value::Object(dto_object), Value::Object(raw_object)) => {
+            for (key, value) in dto_object {
+                let raw_value = raw_object
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{path}: the route carries no `{key}`"));
+                assert_json_subset(value, raw_value, &format!("{path}.{key}"));
+            }
+        }
+        (Value::Array(dto_items), Value::Array(raw_items)) => {
+            assert_eq!(
+                dto_items.len(),
+                raw_items.len(),
+                "{path}: the DTO and the route disagree on the length"
+            );
+            for (index, (dto_item, raw_item)) in dto_items.iter().zip(raw_items).enumerate() {
+                assert_json_subset(dto_item, raw_item, &format!("{path}[{index}]"));
+            }
+        }
+        (dto, raw) => assert_eq!(dto, raw, "{path}"),
+    }
 }
 
 /// The DTO's key set must equal the route's raw JSON's key set — the

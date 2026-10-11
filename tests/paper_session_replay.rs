@@ -276,10 +276,12 @@ async fn the_session_read_model_shows_the_engines_fill_times() {
         .expect("the session exists");
     let trade = &trades.closed_trades[0];
     assert_eq!(
-        trade.entry_fill_time.as_deref(),
+        trade.trade.entry_fill_time.as_deref(),
         Some("2026-01-01T00:00:00.000Z")
     );
-    assert_eq!(trade.exit_fill_time, "2026-01-01T00:15:00.000Z");
+    assert_eq!(trade.trade.exit_fill_time, "2026-01-01T00:15:00.000Z");
+    // The read's money view rides the same object (r4.s4.w1).
+    assert!(trade.realized_usdt.is_some());
 }
 
 // ---------------------------------------------------------------------------

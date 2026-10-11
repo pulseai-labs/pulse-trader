@@ -22,6 +22,10 @@ pub(crate) mod runtime;
 // the certifying run's fold-expectancy range, plus the engine-build span and
 // the stale-certification note.
 pub(crate) mod comparison;
+// r4.s4.w1 (ADR-0027 addendum): the read's money view — the pure derivation
+// of the entries, each closed trade's net USDT, the marked open position and
+// the running totals from the log.
+pub(crate) mod pnl;
 
 // The module's curated surface, re-exported once here so `domain/mod.rs` and
 // `lib.rs` can chain the crate and crate-boundary re-exports (an un-re-exported
@@ -44,3 +48,5 @@ pub use runtime::{
 };
 // r3.s4.w4: the OOS comparison's pure surface (spec §3).
 pub use comparison::{ComparisonVerdict, OosComparison, comparison};
+// r4.s4.w1: the read's money view — the pure derivation and its types.
+pub use pnl::{MarkBar, PaperPnl, PaperPnlEntry, PaperPnlOpenPosition, PaperPnlTrade};

@@ -9,14 +9,20 @@
 //!
 //! Pure projection over the ports: no store, no clock, no adapters.
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::application::paper_control::PaperControl;
+use crate::domain::backtest::OpenPositionStops;
 use crate::domain::paper::comparison::{OosComparison, comparison};
 use crate::domain::paper::event::{PaperEvent, StopActor};
+use crate::domain::paper::pnl::{
+    MarkBar, PaperPnl, PaperPnlEntry, PaperPnlOpenPosition, PaperPnlTrade,
+};
 use crate::domain::paper::runtime::ShadowResult;
 use crate::domain::paper::session::{Graduation, NonEmptyLabel, PaperSession, PaperSessionId};
 use crate::domain::paper::state::{
-    PaperClosedTrade, PaperPosition, PaperSessionState, PaperSessionStatus, ReplayError,
+    PaperPosition, PaperSessionState, PaperSessionStatus, ReplayError,
 };
 use crate::domain::strategy::VersionId;
 use crate::domain::{
@@ -80,8 +86,29 @@ pub struct SessionSummary {
     pub last_bar_open_time: Option<i64>,
     /// How many closed trades the log holds.
     pub closed_trade_count: u64,
-    /// The open position, when one stands.
-    pub open_position: Option<PaperPosition>,
+    /// Σ realized USDT over the closed trades that carry a figure (0 when none
+    /// does — [`Self::realized_usdt_count`] says how many did).
+    pub realized_usdt_total: Decimal,
+    /// How many closed trades carry a USDT figure ("n of m" with
+    /// [`Self::closed_trade_count`]).
+    pub realized_usdt_count: u64,
+    /// Σ realized R over the closed trades that recorded one (0 when none
+    /// did).
+    pub realized_r_total: Decimal,
+    /// How many closed trades carry a realized R.
+    pub realized_r_count: u64,
+    /// The open position's unrealized USDT, net of the costs paid so far —
+    /// `None` when the session is flat (and in the unmarkable hand-seeded
+    /// case: a position the log holds but no bar to mark it against).
+    pub unrealized_usdt: Option<Decimal>,
+    /// The session's running total: [`Self::realized_usdt_total`] + the
+    /// unrealized figure when a position stands, else the realized total
+    /// alone. Always present.
+    pub session_pnl_usdt: Decimal,
+    /// The open position, when one stands — the log's position marked at the
+    /// last processed primary bar, with its costs so far and the live stops a
+    /// running engine answered (absent when none did).
+    pub open_position: Option<PaperPnlOpenPosition>,
     /// The latest shadow verdict per epoch, in epoch order.
     pub shadow_checks: Vec<EpochShadowCheck>,
     /// Whether the certifying run's fingerprint is not this build's (E3:
@@ -94,10 +121,14 @@ pub struct SessionSummary {
 /// One session's trades — the `GET .../trades` and `get_paper_trades` shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionTrades {
-    /// The closed trades, in log order, with their realized R.
-    pub closed_trades: Vec<PaperClosedTrade>,
-    /// The open position, when one stands.
+    /// The closed trades, in log order, with their realized R and USDT.
+    pub closed_trades: Vec<PaperPnlTrade>,
+    /// The open position, when one stands (the log's own shape — the summary
+    /// carries the marked one).
     pub open_position: Option<PaperPosition>,
+    /// Every `Order` and `Fill` event, in log order — the entry fills included
+    /// (#344: the trade log's orders and fills).
+    pub entries: Vec<PaperPnlEntry>,
 }
 
 /// Why a read failed. A store or replay failure is an honest error — never a
@@ -140,6 +171,11 @@ impl From<ReplayError> for PaperReadError {
 
 /// One session's summary, or `None` when no such row exists.
 ///
+/// `control` is the installed paper control handle, when the caller has one
+/// (`pulse serve`'s routes and its `/mcp` mount do; the stdio MCP process
+/// does not). The read asks it for the open position's live stops — under a
+/// short timeout, and never failing because of them (r4.s4.w1).
+///
 /// # Errors
 ///
 /// [`PaperReadError`] on a store or replay failure, or an undecodable shadow
@@ -147,6 +183,7 @@ impl From<ReplayError> for PaperReadError {
 pub async fn session_summary<P, W>(
     sessions: &P,
     walk_forwards: &W,
+    control: Option<&PaperControl>,
     id: &PaperSessionId,
 ) -> Result<Option<SessionSummary>, PaperReadError>
 where
@@ -158,11 +195,15 @@ where
     };
     let events = sessions.events(id).await?;
     let state = PaperSessionState::replay(&session, &events)?;
+    let pnl = pnl_for(&session, &events, &state, sessions, control).await?;
     let certifying_run = certifying_run(walk_forwards, &session).await?;
-    summarize(&session, &events, &state, certifying_run.as_ref()).map(Some)
+    summarize(&session, &events, &state, certifying_run.as_ref(), &pnl).map(Some)
 }
 
 /// Every session's summary, in catalog order (the repository's `seq` order).
+///
+/// `control` rides exactly as in [`session_summary`], once per session that
+/// holds an open position.
 ///
 /// # Errors
 ///
@@ -171,6 +212,7 @@ where
 pub async fn list_summaries<P, W>(
     sessions: &P,
     walk_forwards: &W,
+    control: Option<&PaperControl>,
 ) -> Result<Vec<SessionSummary>, PaperReadError>
 where
     P: PaperSessionRepository,
@@ -180,19 +222,60 @@ where
     for session in sessions.list_sessions().await? {
         let events = sessions.events(&session.id).await?;
         let state = PaperSessionState::replay(&session, &events)?;
+        let pnl = pnl_for(&session, &events, &state, sessions, control).await?;
         let certifying_run = certifying_run(walk_forwards, &session).await?;
         summaries.push(summarize(
             &session,
             &events,
             &state,
             certifying_run.as_ref(),
+            &pnl,
         )?);
     }
     Ok(summaries)
 }
 
-/// One session's closed trades and open position, or `None` when no such row
-/// exists.
+/// Derive one session's money view (r4.s4.w1, ADR-0027 addendum).
+///
+/// A flat session pays neither the mark-bar store read nor a runtime query;
+/// a position that stands takes the newest `paper_bar` row of the session's
+/// primary timeframe as its mark, and the runtime's answer — under its own
+/// short timeout — as its live stops. The read NEVER fails because of the
+/// stops: an absent runtime, a gone one, or one that does not answer leaves
+/// the answer without them (spec §3, grill Q3).
+async fn pnl_for<P: PaperSessionRepository>(
+    session: &PaperSession,
+    events: &[PaperEvent],
+    state: &PaperSessionState,
+    sessions: &P,
+    control: Option<&PaperControl>,
+) -> Result<PaperPnl, PaperReadError> {
+    let (mark, stops) = if state.open_position.is_some() {
+        let mark = sessions
+            .latest_bar(&session.id, session.primary_timeframe)
+            .await?
+            .map(|bar| MarkBar {
+                price: bar.close,
+                close_time_ms: bar.close_time,
+            });
+        (mark, live_stops(control, &session.id).await)
+    } else {
+        (None, None)
+    };
+    Ok(PaperPnl::derive(session, events, mark, stops)?)
+}
+
+/// The open position's live stops, when a runtime answers in time.
+async fn live_stops(
+    control: Option<&PaperControl>,
+    id: &PaperSessionId,
+) -> Option<OpenPositionStops> {
+    let control = control?;
+    control.position(id.clone()).await.ok().flatten()
+}
+
+/// One session's closed trades (with their USDT figures) and entries, or
+/// `None` when no such row exists.
 ///
 /// # Errors
 ///
@@ -209,9 +292,13 @@ where
     };
     let events = sessions.events(id).await?;
     let state = PaperSessionState::replay(&session, &events)?;
+    // No mark and no stops here: this read serves the log's trades and
+    // entries, and its own `open_position` keeps the log's own shape.
+    let pnl = PaperPnl::derive(&session, &events, None, None)?;
     Ok(Some(SessionTrades {
-        closed_trades: state.closed_trades,
+        closed_trades: pnl.closed_trades,
         open_position: state.open_position,
+        entries: pnl.entries,
     }))
 }
 
@@ -260,6 +347,7 @@ fn summarize(
     events: &[PaperEvent],
     state: &PaperSessionState,
     certifying_run: Option<&WalkForwardRun>,
+    pnl: &PaperPnl,
 ) -> Result<SessionSummary, PaperReadError> {
     let status = if state.status == PaperSessionStatus::Stopped {
         SessionStatus::Stopped {
@@ -291,7 +379,13 @@ fn summarize(
         epochs: state.epochs.clone(),
         last_bar_open_time: state.last_bar_open_time,
         closed_trade_count: u64::try_from(state.closed_trades.len()).unwrap_or(u64::MAX),
-        open_position: state.open_position.clone(),
+        realized_usdt_total: pnl.realized_usdt_total,
+        realized_usdt_count: pnl.realized_usdt_count,
+        realized_r_total: pnl.realized_r_total,
+        realized_r_count: pnl.realized_r_count,
+        unrealized_usdt: pnl.unrealized_usdt,
+        session_pnl_usdt: pnl.session_pnl_usdt,
+        open_position: pnl.open_position.clone(),
         shadow_checks: shadow_checks(events, state)?,
         certification_stale: comparison.certification_stale,
         comparison,

@@ -108,7 +108,8 @@ pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 // `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{
     BacktestInputs, BacktestRunId, CandleWindow, CandleWindowError, FundingConfig,
-    LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd, SnapshotSelection,
+    LatestReadableRun, OpenPositionMark, OpenPositionStops, PersistedRun, RunSummary, SeriesEnd,
+    SnapshotSelection,
 };
 // r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025).
 // Re-exported so `lib.rs` can curate the crate surface — an un-re-exported
@@ -202,6 +203,11 @@ pub use paper::{
 };
 // r3.s4.w4: the OOS comparison's pure surface (spec §3).
 pub use paper::{ComparisonVerdict, OosComparison, comparison};
+// r4.s4.w1 (ADR-0027 addendum): the paper read's money view — the derivation
+// and its types. Re-exported so `lib.rs` can curate the crate surface; an
+// un-re-exported public domain type is a `dead_code` BUILD error under
+// `deny(warnings)`.
+pub use paper::{MarkBar, PaperPnl, PaperPnlEntry, PaperPnlOpenPosition, PaperPnlTrade};
 // VS-1.1.4 work-1.02: the `StrategyRepository` port (FR-4 / FR-11) alongside
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
 // via the `pub(crate) mod strategy` path directly (matching the

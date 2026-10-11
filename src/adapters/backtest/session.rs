@@ -43,8 +43,8 @@ use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CompiledStrategy, Direction, ExitReason,
-    OpenPositionMark, Pair, Regime, Series, SeriesEnd, SeriesRole, SkippedEntryCounts,
-    SymbolFilters, Timeframe, Trade,
+    OpenPositionMark, OpenPositionStops, Pair, Regime, Series, SeriesEnd, SeriesRole,
+    SkippedEntryCounts, SymbolFilters, Timeframe, Trade,
 };
 
 /// The cadences a session is declared over: the primary timeframe — whose
@@ -689,6 +689,17 @@ impl EngineSession {
             mark_time: last.close_time,
             mark_price: last.close,
         })
+    }
+
+    /// The still-open position's stop geometry — the initial stop, the current
+    /// effective stop and the declared take-profit (r4.s4.w1, ADR-0027
+    /// addendum). The read-only accessor the paper read's live-stops query
+    /// answers from; `None` when the session is flat. It reads three `Copy`
+    /// fields of the position and touches nothing else — no step, no close,
+    /// no indicator, no funding.
+    #[must_use]
+    pub fn open_position_stops(&self) -> Option<OpenPositionStops> {
+        self.state.position.as_ref().map(OpenPosition::stops)
     }
 
     /// Primary bars stepped so far — the aligned feed's last `bar.index` + 1.

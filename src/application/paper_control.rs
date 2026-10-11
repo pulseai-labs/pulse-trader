@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::application::paper_runtime::{PaperRuntimeError, SessionFailure};
+use crate::domain::backtest::OpenPositionStops;
 use crate::domain::paper::event::StopActor;
 use crate::domain::paper::runtime::ShadowResult;
 use crate::domain::paper::session::{NonEmptyLabel, PaperSessionId};
@@ -29,6 +30,12 @@ use crate::domain::paper::session::{NonEmptyLabel, PaperSessionId};
 /// How long a control request waits for its reply by default (spec §1), used
 /// by `ServeConfig` when no override is set.
 pub const DEFAULT_PAPER_REPLY_TIMEOUT_MS: u64 = 30_000;
+
+/// How long the read path's position query waits for the runtime's reply
+/// (r4.s4.w1, spec §3: "a few seconds, a named constant"). Short on purpose —
+/// a read must never stall on a busy runtime, and an unanswered query simply
+/// answers without the stops — while leaving one runtime turn ample room.
+const POSITION_REPLY_TIMEOUT_MS: u64 = 2_000;
 
 /// One control command, with its reply channel. `Attach` is the promote
 /// path's; `Stop`/`StopAll` are the kill switch's; `ShadowCheck` is the
@@ -65,6 +72,16 @@ pub enum PaperCommand {
         session_id: PaperSessionId,
         /// The typed outcome.
         reply: oneshot::Sender<Result<ShadowCheckReply, PaperRuntimeError>>,
+    },
+    /// Answer one session's open-position stop geometry now, read-only — the
+    /// paper read's live stops (r4.s4.w1). Answered from the runtime's own
+    /// attached sessions; `None` when the runtime does not hold the session
+    /// or it is flat. Never touches the store.
+    Position {
+        /// The session to read.
+        session_id: PaperSessionId,
+        /// The stops, or `None` when flat / not attached.
+        reply: oneshot::Sender<Option<OpenPositionStops>>,
     },
 }
 
@@ -217,16 +234,47 @@ impl PaperControl {
             .map_err(PaperControlError::Runtime)
     }
 
+    /// Ask one session's open-position stops now, under the read path's SHORT
+    /// timeout ([`POSITION_REPLY_TIMEOUT_MS`]) — never the command timeout,
+    /// which bounds mutations a caller must actually see (r4.s4.w1). `Ok(None)`
+    /// when the runtime does not hold the session or it is flat.
+    ///
+    /// # Errors
+    ///
+    /// [`PaperControlError`] when no runtime is attached, the reply times out,
+    /// or the runtime dropped the reply channel. Callers on the read path
+    /// answer without the stops on all three.
+    pub async fn position(
+        &self,
+        session_id: PaperSessionId,
+    ) -> Result<Option<OpenPositionStops>, PaperControlError> {
+        self.request_under(Duration::from_millis(POSITION_REPLY_TIMEOUT_MS), |reply| {
+            PaperCommand::Position { session_id, reply }
+        })
+        .await
+    }
+
     /// Send one command and await its reply under the handle's timeout.
     async fn request<T>(
         &self,
+        make: impl FnOnce(oneshot::Sender<T>) -> PaperCommand,
+    ) -> Result<T, PaperControlError> {
+        self.request_under(self.reply_timeout, make).await
+    }
+
+    /// Send one command and await its reply under `timeout` — [`Self::request`]
+    /// with the bound as a parameter, so the read path's short position query
+    /// shares the channel machinery without widening the command timeout.
+    async fn request_under<T>(
+        &self,
+        timeout: Duration,
         make: impl FnOnce(oneshot::Sender<T>) -> PaperCommand,
     ) -> Result<T, PaperControlError> {
         let (reply, done) = oneshot::channel();
         if self.sender.send(make(reply)).await.is_err() {
             return Err(PaperControlError::RuntimeUnavailable);
         }
-        match tokio::time::timeout(self.reply_timeout, done).await {
+        match tokio::time::timeout(timeout, done).await {
             Err(_) => Err(PaperControlError::Timeout),
             // The runtime dropped the reply without answering (it stopped).
             Ok(Err(_)) => Err(PaperControlError::RuntimeUnavailable),
