@@ -31,10 +31,12 @@ use crate::domain::paper::session::{NonEmptyLabel, PaperSessionId};
 /// by `ServeConfig` when no override is set.
 pub const DEFAULT_PAPER_REPLY_TIMEOUT_MS: u64 = 30_000;
 
-/// How long the read path's position query waits for the runtime's reply
-/// (r4.s4.w1, spec §3: "a few seconds, a named constant"). Short on purpose —
-/// a read must never stall on a busy runtime, and an unanswered query simply
-/// answers without the stops — while leaving one runtime turn ample room.
+/// How long the read path's position query may take END TO END — the enqueue
+/// onto the command channel and the runtime's reply together (r4.s4.w1,
+/// spec §3: "a few seconds, a named constant"; r4.s4.w2 bounds the enqueue).
+/// Short on purpose — a read must never stall on a busy runtime or a full
+/// channel, and an unanswered query simply answers without the stops — while
+/// leaving one runtime turn ample room.
 const POSITION_REPLY_TIMEOUT_MS: u64 = 2_000;
 
 /// One control command, with its reply channel. `Attach` is the promote
@@ -251,23 +253,39 @@ impl PaperControl {
 
     /// Ask one session's open-position stops now, under the read path's SHORT
     /// timeout ([`POSITION_REPLY_TIMEOUT_MS`]) — never the command timeout,
-    /// which bounds mutations a caller must actually see (r4.s4.w1). `Ok(None)`
-    /// when the runtime does not hold the session, it is flat, or it owes a
-    /// rebuild.
+    /// which bounds mutations a caller must actually see (r4.s4.w1). The
+    /// bound covers BOTH steps — the enqueue onto the command channel and the
+    /// reply — so a full channel cannot hang a read that only the reply bound
+    /// would cap (r4.s4.w2). `Ok(None)` when the runtime does not hold the
+    /// session, it is flat, or it owes a rebuild.
     ///
     /// # Errors
     ///
-    /// [`PaperControlError`] when no runtime is attached, the reply times out,
-    /// or the runtime dropped the reply channel. Callers on the read path
-    /// answer without the stops on all three.
+    /// [`PaperControlError`] when no runtime is attached, either step times
+    /// out, or the runtime dropped the reply channel. Callers on the read path
+    /// answer without the stops on all of these.
     pub async fn position(
         &self,
         session_id: PaperSessionId,
     ) -> Result<Option<PositionReply>, PaperControlError> {
-        self.request_under(Duration::from_millis(POSITION_REPLY_TIMEOUT_MS), |reply| {
-            PaperCommand::Position { session_id, reply }
-        })
-        .await
+        let (reply, done) = oneshot::channel();
+        let command = PaperCommand::Position { session_id, reply };
+        // One deadline over both the enqueue and the reply: bounding only the
+        // reply would leave a saturated channel (`request`'s other commands
+        // keep their own enqueue semantics) able to stall the read for as long
+        // as the runtime does not drain.
+        let exchange = async {
+            if self.sender.send(command).await.is_err() {
+                return Err(PaperControlError::RuntimeUnavailable);
+            }
+            match done.await {
+                Err(_) => Err(PaperControlError::RuntimeUnavailable),
+                Ok(answer) => Ok(answer),
+            }
+        };
+        tokio::time::timeout(Duration::from_millis(POSITION_REPLY_TIMEOUT_MS), exchange)
+            .await
+            .unwrap_or(Err(PaperControlError::Timeout))
     }
 
     /// Send one command and await its reply under the handle's timeout.
@@ -299,3 +317,57 @@ impl PaperControl {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+
+    use super::{
+        DEFAULT_PAPER_REPLY_TIMEOUT_MS, POSITION_REPLY_TIMEOUT_MS, PaperCommand, PaperControl,
+        PaperControlError, PositionReply,
+    };
+    use crate::domain::paper::session::PaperSessionId;
+
+    /// A full command channel must not hang the read path's position query
+    /// (r4.s4.w2): the enqueue rides the same SHORT bound as the reply, so a
+    /// saturated `mpsc` answers [`PaperControlError::Timeout`] inside
+    /// [`POSITION_REPLY_TIMEOUT_MS`] — and the read then answers without the
+    /// stops. Before the bound covered the enqueue, this test never returned.
+    #[tokio::test]
+    async fn a_full_command_channel_still_bounds_the_position_query() {
+        let (control, receiver) = PaperControl::channel(DEFAULT_PAPER_REPLY_TIMEOUT_MS);
+        // Fill every slot with a position query of its own; the receiver stays
+        // alive but drains nothing (no runtime answers).
+        for _ in 0..64 {
+            let (reply, _done) = oneshot::channel::<Option<PositionReply>>();
+            control
+                .sender
+                .try_send(PaperCommand::Position {
+                    session_id: PaperSessionId::new("sess-full".to_owned()),
+                    reply,
+                })
+                .expect("the channel starts with capacity");
+        }
+        assert_eq!(receiver.len(), 64, "every slot is taken");
+
+        let started = tokio::time::Instant::now();
+        let result = control
+            .position(PaperSessionId::new("sess-full".to_owned()))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(PaperControlError::Timeout)),
+            "a saturated channel times out: {result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(POSITION_REPLY_TIMEOUT_MS),
+            "the bound is the short one: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(POSITION_REPLY_TIMEOUT_MS + 1_000),
+            "the query returns with the bound, not later: {elapsed:?}"
+        );
+    }
+}
