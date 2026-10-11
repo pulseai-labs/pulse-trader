@@ -17,7 +17,7 @@
 //
 // A stopped session is read-only (A4): no stop button, no shadow check.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { commands } from "../bindings";
 import type { PaperSessionSummary, PaperShadowCheck, PaperTrades } from "../bindings";
@@ -50,12 +50,19 @@ export default function SessionDetail({
   const [notice, setNotice] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
 
+  const tradesRequest = useRef(0);
+
   // The trades follow the summary: every refetch (a frame's trigger, a stop)
-  // swaps the summary object, and the log is re-read with it.
+  // swaps the summary object, and the log is re-read with it. Only the newest
+  // request's answer may land (r4.s4.w2): an older read that resolves after a
+  // newer one must not overwrite the newer log.
   useEffect(() => {
     let alive = true;
+    const request = ++tradesRequest.current;
     void commands.paperSessionTrades(sessionId).then((result) => {
-      if (alive && result.status === "ok") setTrades(result.data);
+      if (alive && request === tradesRequest.current && result.status === "ok") {
+        setTrades(result.data);
+      }
     });
     return () => {
       alive = false;
