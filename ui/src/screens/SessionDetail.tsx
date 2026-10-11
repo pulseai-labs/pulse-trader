@@ -1,6 +1,7 @@
-// The session detail (r3.s4.w5, spec §4) — the certificate and engine rows,
-// the stopped note, the open position, the shadow and OOS panels, the trade
-// log and the inline stop.
+// The session detail (r3.s4.w5, spec §4; the money view r4.s4.w2) — the
+// certificate and engine rows, the stopped note, the running total, the marked
+// open position, the orders and fills, the shadow and OOS panels, the closed
+// trades and the inline stop.
 //
 // Every value rendered here is the server's: the summary and the trades come
 // from the reads, the live updates from `usePaperSession`'s stream, the OOS
@@ -9,7 +10,10 @@
 // count is the `shadow_checked` frame's own `bar_count` — shown only when a
 // frame actually delivered one. A verdict without a frame renders the
 // identity WITHOUT a count; the summary's `closed_trades` is never called a
-// bar count.
+// bar count. The money figures (r4.s4.w2) cross as the server's exact decimal
+// text and are rendered as they come — this screen never adds, subtracts,
+// rounds or re-formats one, and the "n of m" counts are the server's own two
+// numbers, not a computed count.
 //
 // A stopped session is read-only (A4): no stop button, no shadow check.
 
@@ -150,6 +154,12 @@ export default function SessionDetail({
               started on {startedOn ?? EM_DASH} · server now {serverEngine ?? EM_DASH}
             </span>
           </div>
+          {/* #340: the newest consumed bar, as the server's own epoch-ms text
+              (r4.s5 owns human units). */}
+          <div className="dm-row">
+            <span className="dm-k">last bar</span>
+            <span className="mono dm-v">{summary.last_bar_open_time ?? EM_DASH}</span>
+          </div>
           {summary.comparison.engine_builds > 1 && (
             <div className="dm-row">
               <span className="dm-k">span</span>
@@ -164,14 +174,41 @@ export default function SessionDetail({
           )}
         </section>
 
-        {/* Spec §4's "Out of this item": the API carries no equity series and
-            the UI must not compute money, so this is where the mock's equity
-            chart would sit — a placeholder that says exactly that, with no
-            numbers and no chart. */}
+        {/* The running total (grill Q2; r4.s4.w2): the realized totals with
+            their "n of m" counts, the open position's unrealized USDT (or
+            "flat") and their sum. Every figure is the server's own text, and
+            the screen still computes no money — so the mock's equity chart is
+            still absent, with the note that says exactly that. */}
         <section className="drawer-section">
           <header className="ds-head">
-            <h3>Equity</h3>
+            <h3>Running total</h3>
           </header>
+          <div className="pos-stats">
+            <div className="ps-item">
+              <span className="ps-lab">realized</span>
+              <span className="ps-val mono">{summary.realized_usdt_total}</span>
+              <span className="ps-count">
+                {summary.realized_usdt_count} of {summary.closed_trade_count} trades
+              </span>
+            </div>
+            <div className="ps-item">
+              <span className="ps-lab">realized R</span>
+              <span className="ps-val mono">{summary.realized_r_total}</span>
+              <span className="ps-count">
+                {summary.realized_r_count} of {summary.closed_trade_count} trades
+              </span>
+            </div>
+            <div className="ps-item">
+              <span className="ps-lab">unrealized</span>
+              <span className="ps-val mono">
+                {summary.open_position === null ? "flat" : (summary.unrealized_usdt ?? EM_DASH)}
+              </span>
+            </div>
+            <div className="ps-item">
+              <span className="ps-lab">session P&L</span>
+              <span className="ps-val mono">{summary.session_pnl_usdt}</span>
+            </div>
+          </div>
           <p className="equity-placeholder">
             No equity chart: the paper API carries no equity series, and this screen computes no
             money.
@@ -186,24 +223,78 @@ export default function SessionDetail({
           {summary.open_position === null ? (
             <div className="ds-empty">No open position.</div>
           ) : (
-            <div className="pos-stats">
-              <div className="ps-item">
-                <span className="ps-lab">side</span>
-                <span className="ps-val">{summary.open_position.side}</span>
+            <>
+              <div className="pos-stats">
+                <div className="ps-item">
+                  <span className="ps-lab">side</span>
+                  <span className="ps-val">{summary.open_position.side}</span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">entry</span>
+                  <span className="ps-val mono">{summary.open_position.entry_price}</span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">size</span>
+                  <span className="ps-val mono">{summary.open_position.qty}</span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">opened</span>
+                  <span className="ps-val mono">{summary.open_position.entry_fill_time}</span>
+                </div>
+                {/* The mark and the money figures (r4.s4.w2): the server's own
+                    text, the dash where the wire carries none. */}
+                <div className="ps-item">
+                  <span className="ps-lab">mark</span>
+                  <span className="ps-val mono">{summary.open_position.mark_price ?? EM_DASH}</span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">mark time</span>
+                  <span className="ps-val mono">{summary.open_position.mark_time ?? EM_DASH}</span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">unrealized</span>
+                  <span className="ps-val mono">
+                    {summary.open_position.unrealized_usdt ?? EM_DASH}
+                  </span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">unrealized R</span>
+                  <span className="ps-val mono">
+                    {summary.open_position.unrealized_r ?? EM_DASH}
+                  </span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">funding</span>
+                  <span className="ps-val mono">{summary.open_position.funding_usdt}</span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">entry fee</span>
+                  <span className="ps-val mono">{summary.open_position.entry_fee_usdt}</span>
+                </div>
+                {/* The live stops (#341): present only while a running engine
+                    answers the read; a null renders the dash, and their
+                    absence carries the one note below. */}
+                <div className="ps-item">
+                  <span className="ps-lab">initial stop</span>
+                  <span className="ps-val mono">
+                    {summary.open_position.initial_stop ?? EM_DASH}
+                  </span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">stop</span>
+                  <span className="ps-val mono">{summary.open_position.stop_price ?? EM_DASH}</span>
+                </div>
+                <div className="ps-item">
+                  <span className="ps-lab">take profit</span>
+                  <span className="ps-val mono">
+                    {summary.open_position.take_profit_price ?? EM_DASH}
+                  </span>
+                </div>
               </div>
-              <div className="ps-item">
-                <span className="ps-lab">entry</span>
-                <span className="ps-val mono">{summary.open_position.entry_price}</span>
-              </div>
-              <div className="ps-item">
-                <span className="ps-lab">size</span>
-                <span className="ps-val mono">{summary.open_position.qty}</span>
-              </div>
-              <div className="ps-item">
-                <span className="ps-lab">opened</span>
-                <span className="ps-val mono">{summary.open_position.entry_fill_time}</span>
-              </div>
-            </div>
+              {summary.open_position.initial_stop === null && (
+                <p className="ds-empty">stops shown only while the session runs</p>
+              )}
+            </>
           )}
         </section>
 
@@ -242,37 +333,101 @@ export default function SessionDetail({
           <OosPanel summary={summary} />
         </section>
 
+        {/* #344: every order and fill the log holds, latest first — the entry
+            fills the old log dropped. Every value is the server's own text. */}
+        <section className="drawer-section" aria-label="Orders and fills">
+          <header className="ds-head">
+            <h3>Orders and fills</h3>
+            <span className="mono dim">latest first</span>
+          </header>
+          {trades === null || trades.entries.length === 0 ? (
+            <div className="ds-empty">No orders or fills yet.</div>
+          ) : (
+            <div className="table-scroll">
+              <table className="bt-trades">
+                <thead>
+                  <tr>
+                    <th scope="col">kind</th>
+                    <th scope="col">time</th>
+                    <th scope="col">side</th>
+                    <th scope="col">qty</th>
+                    <th scope="col">price</th>
+                    <th scope="col">reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trades.entries
+                    .slice()
+                    .reverse()
+                    .map((entry, index) => (
+                      <tr key={`${entry.kind}-${entry.at}-${index}`}>
+                        <td className="mono">{entry.kind}</td>
+                        <td className="mono">
+                          {entry.kind === "fill" ? entry.fill_time : entry.at}
+                        </td>
+                        <td className="mono">{entry.side}</td>
+                        <td className="mono">{entry.qty}</td>
+                        <td className="mono">{entry.kind === "fill" ? entry.price : EM_DASH}</td>
+                        <td className="mono">
+                          {entry.kind === "fill" ? (entry.exit_reason ?? EM_DASH) : EM_DASH}
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
         <section className="drawer-section" aria-label="Trade log">
           <header className="ds-head">
-            <h3>Fills · trade log</h3>
+            <h3>Closed trades</h3>
             <span className="mono dim">latest first</span>
           </header>
           {trades === null || trades.closed_trades.length === 0 ? (
             <div className="ds-empty">No closed trades yet.</div>
           ) : (
-            <table className="bt-trades">
-              <thead>
-                <tr>
-                  <th scope="col">exit</th>
-                  <th scope="col">reason</th>
-                  <th scope="col">price</th>
-                  <th scope="col">R</th>
-                </tr>
-              </thead>
-              <tbody>
-                {trades.closed_trades
-                  .slice()
-                  .reverse()
-                  .map((trade) => (
-                    <tr key={`${trade.exit_fill_time}-${trade.exit_price}`}>
-                      <td className="mono">{trade.exit_fill_time}</td>
-                      <td className="mono">{trade.exit_reason}</td>
-                      <td className="mono">{trade.exit_price}</td>
-                      <td className="mono">{trade.realized_r ?? EM_DASH}</td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
+            <div className="table-scroll">
+              <table className="bt-trades">
+                <thead>
+                  <tr>
+                    <th scope="col">entry</th>
+                    <th scope="col">exit</th>
+                    <th scope="col">side</th>
+                    <th scope="col">qty</th>
+                    <th scope="col">entry px</th>
+                    <th scope="col">exit px</th>
+                    <th scope="col">reason</th>
+                    <th scope="col">R</th>
+                    <th scope="col">USDT</th>
+                    <th scope="col">fee in</th>
+                    <th scope="col">fee out</th>
+                    <th scope="col">funding</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trades.closed_trades
+                    .slice()
+                    .reverse()
+                    .map((trade) => (
+                      <tr key={`${trade.exit_fill_time}-${trade.exit_price}`}>
+                        <td className="mono">{trade.entry_fill_time ?? EM_DASH}</td>
+                        <td className="mono">{trade.exit_fill_time}</td>
+                        <td className="mono">{trade.side}</td>
+                        <td className="mono">{trade.qty}</td>
+                        <td className="mono">{trade.entry_price ?? EM_DASH}</td>
+                        <td className="mono">{trade.exit_price}</td>
+                        <td className="mono">{trade.exit_reason}</td>
+                        <td className="mono">{trade.realized_r ?? EM_DASH}</td>
+                        <td className="mono">{trade.realized_usdt ?? EM_DASH}</td>
+                        <td className="mono">{trade.entry_fee_usdt ?? EM_DASH}</td>
+                        <td className="mono">{trade.exit_fee_usdt}</td>
+                        <td className="mono">{trade.funding_usdt}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
 

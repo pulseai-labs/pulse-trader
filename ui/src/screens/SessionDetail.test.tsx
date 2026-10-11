@@ -30,6 +30,7 @@ vi.mock("../bindings", () => ({
 }));
 
 import type {
+  PaperPnlOpenPosition,
   PaperSessionSummary,
   PaperShadowCheck,
   PaperStreamEvent,
@@ -62,6 +63,12 @@ function summary(over: Partial<PaperSessionSummary> = {}): PaperSessionSummary {
     epochs: [ENGINE],
     last_bar_open_time: "1738368900000",
     closed_trade_count: 4,
+    realized_usdt_total: "0",
+    realized_usdt_count: 0,
+    realized_r_total: "0",
+    realized_r_count: 0,
+    unrealized_usdt: null,
+    session_pnl_usdt: "0",
     open_position: null,
     shadow_checks: [],
     certification_stale: false,
@@ -106,10 +113,69 @@ const TRADES: PaperTrades = {
       exit_fill_time: "2026-10-01T01:00:00.000Z",
       exit_reason: "take_profit",
       realized_r: "0.61",
+      realized_usdt: "6.42",
+      funding_usdt: "-0.13",
+      entry_fee_usdt: "0.05",
+      exit_fee_usdt: "0.06",
+    },
+    {
+      side: "short",
+      qty: "0.01",
+      entry_price: null,
+      entry_fill_time: null,
+      exit_price: "62000",
+      exit_fill_time: "2026-10-02T02:00:00.000Z",
+      exit_reason: "trail",
+      realized_r: null,
+      realized_usdt: null,
+      funding_usdt: "0.01",
+      entry_fee_usdt: null,
+      exit_fee_usdt: "0.03",
     },
   ],
   open_position: null,
+  entries: [
+    { kind: "order", at: "2026-10-01T00:00:00.000Z", side: "long", qty: "0.02" },
+    {
+      kind: "fill",
+      at: "2026-10-01T00:00:00.000Z",
+      side: "long",
+      qty: "0.02",
+      price: "64000",
+      exit_reason: null,
+      fill_time: "2026-10-01T00:00:00.000Z",
+    },
+    {
+      kind: "fill",
+      at: "2026-10-01T01:00:00.000Z",
+      side: "long",
+      qty: "0.02",
+      price: "64400",
+      exit_reason: "take_profit",
+      fill_time: "2026-10-01T01:00:00.000Z",
+    },
+  ],
 };
+
+/** The marked open position the money tests seed. */
+function openPosition(over: Partial<PaperPnlOpenPosition> = {}): PaperPnlOpenPosition {
+  return {
+    side: "long",
+    qty: "0.5",
+    entry_price: "59900",
+    entry_fill_time: "2026-10-03T18:00:00.000Z",
+    mark_price: "60050",
+    mark_time: "2026-10-04T00:44:59.999Z",
+    funding_usdt: "0.42",
+    entry_fee_usdt: "0.1198",
+    unrealized_usdt: "74.38",
+    unrealized_r: "0.14",
+    initial_stop: "59800",
+    stop_price: "59850",
+    take_profit_price: "60200",
+    ...over,
+  };
+}
 
 /** The channel the detail's hook handed to `paper_session_events`. */
 let streamChannel: Channel<PaperStreamEvent> | null = null;
@@ -315,5 +381,110 @@ describe("the trade log", () => {
     const log = await screen.findByRole("region", { name: /Trade log/ });
     expect(within(log).getByText("0.61")).toBeTruthy();
     expect(within(log).getByText(/take_profit/)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The money view (r4.s4.w2, spec §4) — the running total, the marked open
+// position with its stops, the orders and fills, each closed trade's R and
+// USDT, and the last processed bar. Every value asserted here is the fixture's
+// own exact string: the screen renders server text and computes no money.
+// ---------------------------------------------------------------------------
+
+/** The summary the money tests seed. */
+function moneySummary(over: Partial<PaperSessionSummary> = {}): Partial<PaperSessionSummary> {
+  return {
+    closed_trade_count: 2,
+    realized_usdt_total: "12.5",
+    realized_usdt_count: 1,
+    realized_r_total: "1.61",
+    realized_r_count: 2,
+    unrealized_usdt: "3.25",
+    session_pnl_usdt: "15.75",
+    last_bar_open_time: "1738368900000",
+    open_position: openPosition(),
+    ...over,
+  };
+}
+
+describe("the money view", () => {
+  it("renders the running total and its counts from the server's own text", async () => {
+    renderDetail(moneySummary());
+    const total = (await screen.findByText("Running total")).closest("section") as HTMLElement;
+    within(total).getByText("12.5");
+    within(total).getByText("1 of 2 trades");
+    within(total).getByText("1.61");
+    within(total).getByText("2 of 2 trades");
+    within(total).getByText("3.25");
+    within(total).getByText("15.75");
+    within(total).getByText(/carries no equity series/);
+  });
+
+  it("renders the marked open position with its stops and money fields", async () => {
+    renderDetail(moneySummary());
+    const section = (await screen.findByText("Open position")).closest("section") as HTMLElement;
+    within(section).getByText("0.5");
+    within(section).getByText("60050");
+    within(section).getByText("2026-10-04T00:44:59.999Z");
+    within(section).getByText("74.38");
+    within(section).getByText("0.14");
+    within(section).getByText("0.42");
+    within(section).getByText("0.1198");
+    within(section).getByText("59800");
+    within(section).getByText("59850");
+    within(section).getByText("60200");
+    expect(within(section).queryByText(/stops shown only while the session runs/)).toBeNull();
+  });
+
+  it("renders the dash for every absent live field and the one stops note", async () => {
+    renderDetail(
+      moneySummary({
+        unrealized_usdt: null,
+        open_position: openPosition({
+          mark_price: null,
+          mark_time: null,
+          unrealized_usdt: null,
+          unrealized_r: null,
+          initial_stop: null,
+          stop_price: null,
+          take_profit_price: null,
+        }),
+      }),
+    );
+    const section = (await screen.findByText("Open position")).closest("section") as HTMLElement;
+    within(section).getByText("stops shown only while the session runs");
+    expect(within(section).getAllByText("—")).toHaveLength(7);
+  });
+
+  it("renders 'flat' when the session holds no open position", async () => {
+    renderDetail(moneySummary({ open_position: null, unrealized_usdt: null }));
+    const total = (await screen.findByText("Running total")).closest("section") as HTMLElement;
+    within(total).getByText("flat");
+  });
+
+  it("renders every order and fill latest first, the entry fill included", async () => {
+    renderDetail(moneySummary());
+    const section = (await screen.findByText("Orders and fills")).closest("section") as HTMLElement;
+    const rows = within(section).getAllByRole("row");
+    expect(rows).toHaveLength(1 + TRADES.entries.length);
+    expect(rows[1].textContent).toContain("take_profit");
+    expect(rows[rows.length - 1].textContent).toContain("order");
+    within(section).getByText("64000");
+  });
+
+  it("renders each closed trade's R, USDT and fees, the dash for a null USDT", async () => {
+    renderDetail(moneySummary());
+    const log = await screen.findByRole("region", { name: /Trade log/ });
+    within(log).getByText("6.42");
+    within(log).getByText("-0.13");
+    within(log).getByText("0.06");
+    const short = within(log).getByText("62000").closest("tr") as HTMLElement;
+    expect(short.textContent).toContain("—");
+    expect(short.textContent).toContain("0.03");
+  });
+
+  it("shows the last processed bar's own text in the meta block", async () => {
+    renderDetail(moneySummary());
+    expect(await screen.findByText("1738368900000")).toBeTruthy();
   });
 });

@@ -150,7 +150,39 @@ pub struct PaperPosition {
     pub entry_fill_time: String,
 }
 
-/// A closed trade — `PaperClosedTrade`.
+/// The open position marked at the last processed bar — `PaperPnlOpenPosition`
+/// (r4.s4.w2), whose own `position` is flattened exactly as the wire flattens
+/// it. The server computed every figure; the DTO carries its exact text and
+/// this side never re-derives one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct PaperPnlOpenPosition {
+    /// The replayed position — the existing four fields, flattened.
+    #[serde(flatten)]
+    pub position: PaperPosition,
+    /// The mark price (the last processed primary bar's close), when a bar was
+    /// processed.
+    pub mark_price: Option<String>,
+    /// The mark instant (RFC3339), when a bar was processed.
+    pub mark_time: Option<String>,
+    /// The position's funding so far.
+    pub funding_usdt: String,
+    /// The entry fee paid, exact decimal text.
+    pub entry_fee_usdt: String,
+    /// The unrealized P&L in USDT, when the position can be marked.
+    pub unrealized_usdt: Option<String>,
+    /// The unrealized R at the mark, when it can be derived.
+    pub unrealized_r: Option<String>,
+    /// The live initial stop, when a running engine answered the read.
+    pub initial_stop: Option<String>,
+    /// The live current (possibly trailed) stop, when one was answered.
+    pub stop_price: Option<String>,
+    /// The live take-profit, when one is declared and answered.
+    pub take_profit_price: Option<String>,
+}
+
+/// A closed trade — `PaperPnlTrade` (the wire's flattened `PaperClosedTrade`
+/// plus the read's own money fields, r4.s4.w2). Money crosses as the server's
+/// exact decimal text; a figure the log cannot derive is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub struct PaperClosedTrade {
     /// The side that closed.
@@ -169,6 +201,45 @@ pub struct PaperClosedTrade {
     pub exit_reason: String,
     /// The trade's realized R-multiple, when the fill recorded one.
     pub realized_r: Option<String>,
+    /// The trade's net USDT, when the log holds an entry fill for it.
+    pub realized_usdt: Option<String>,
+    /// The trade's funding, Σ the steps it was open for.
+    pub funding_usdt: String,
+    /// The entry fee, when the log holds an entry fill.
+    pub entry_fee_usdt: Option<String>,
+    /// The exit fee paid.
+    pub exit_fee_usdt: String,
+}
+
+/// One order or fill, in log order — `PaperPnlEntry` (#344: the entry fills
+/// included), tagged on `kind` exactly as the wire tags it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaperEntry {
+    /// A signalled order.
+    Order {
+        /// The event's RFC3339 instant.
+        at: String,
+        /// The side signalled.
+        side: String,
+        /// The quantity signalled, exact decimal text.
+        qty: String,
+    },
+    /// A fill.
+    Fill {
+        /// The event's RFC3339 instant.
+        at: String,
+        /// The side that filled.
+        side: String,
+        /// The quantity that filled, exact decimal text.
+        qty: String,
+        /// The (slipped) fill price, exact decimal text.
+        price: String,
+        /// Why the position closed, when this fill closed one.
+        exit_reason: Option<String>,
+        /// The fill's engine instant when the event carries one, else `at`.
+        fill_time: String,
+    },
 }
 
 /// One shadow check's verdict — `ShadowResult`, tagged on `verdict`. `live` and
@@ -301,8 +372,27 @@ pub struct PaperSessionSummary {
     pub last_bar_open_time: Option<PaperEpochMs>,
     /// How many closed trades the log holds.
     pub closed_trade_count: u32,
-    /// The open position, when one stands.
-    pub open_position: Option<PaperPosition>,
+    /// Σ realized USDT over the trades that carry a figure (0 when none does —
+    /// `realized_usdt_count` says how many did).
+    pub realized_usdt_total: String,
+    /// How many closed trades carry a USDT figure ("n of m" with
+    /// `closed_trade_count`).
+    pub realized_usdt_count: u32,
+    /// Σ realized R over the trades that recorded one (0 when none did).
+    pub realized_r_total: String,
+    /// How many closed trades carry a realized R.
+    pub realized_r_count: u32,
+    /// The open position's unrealized USDT, net of the costs paid so far —
+    /// null when the session is flat (and in the unmarkable hand-seeded case:
+    /// a position the log holds but no bar to mark it against).
+    pub unrealized_usdt: Option<String>,
+    /// The session's running total: the realized total plus the unrealized
+    /// figure when a position stands, else the realized total alone.
+    pub session_pnl_usdt: String,
+    /// The open position, when one stands — the log's position marked at the
+    /// last processed primary bar, with its costs so far and the live stops a
+    /// running engine answered (absent when none did).
+    pub open_position: Option<PaperPnlOpenPosition>,
     /// The latest shadow verdict per epoch, in epoch order.
     pub shadow_checks: Vec<PaperShadowCheck>,
     /// Whether the certifying run's fingerprint is not this build's.
@@ -314,10 +404,14 @@ pub struct PaperSessionSummary {
 /// One session's trades — `SessionTrades`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub struct PaperTrades {
-    /// The closed trades, in log order, with their realized R.
+    /// The closed trades, in log order, with their realized R and USDT.
     pub closed_trades: Vec<PaperClosedTrade>,
-    /// The open position, when one stands.
+    /// The open position, when one stands (the log's own shape — the summary
+    /// carries the marked one).
     pub open_position: Option<PaperPosition>,
+    /// Every `Order` and `Fill` event, in log order — the entry fills included
+    /// (#344).
+    pub entries: Vec<PaperEntry>,
 }
 
 // ---------------------------------------------------------------------------
