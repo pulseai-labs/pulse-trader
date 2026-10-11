@@ -1227,11 +1227,19 @@ async fn position_answer(
     runtime: &mut FlakyRuntime,
     id: &PaperSessionId,
 ) -> Option<pulse::PositionReply> {
+    // The read path's reservation permit rides every queued command
+    // (r4.s4.w2, E3); a fresh one-permit semaphore stands in for the read
+    // path's.
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = permits
+        .try_acquire_owned()
+        .expect("a fresh semaphore has its permit");
     let (reply, done) = tokio::sync::oneshot::channel();
     runtime
         .handle_command(pulse::PaperCommand::Position {
             session_id: id.clone(),
             reply,
+            permit,
         })
         .await;
     done.await

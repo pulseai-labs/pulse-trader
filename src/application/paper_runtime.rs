@@ -917,7 +917,15 @@ where
                 let result = self.shadow_check_outcome(&session_id).await;
                 let _ = reply.send(result);
             }
-            PaperCommand::Position { session_id, reply } => {
+            PaperCommand::Position {
+                session_id,
+                reply,
+                permit,
+            } => {
+                // The read's reservation permit returns the moment the command
+                // leaves the channel (r4.s4.w2, E3): a slow answer never holds
+                // queue room.
+                drop(permit);
                 // Read-only and in-memory: the attached session's engine, or
                 // nothing when this runtime does not hold it (flat included),
                 // owes a rebuild (a failed append left the engine past its
