@@ -31,13 +31,22 @@ use crate::domain::paper::session::{NonEmptyLabel, PaperSessionId};
 /// by `ServeConfig` when no override is set.
 pub const DEFAULT_PAPER_REPLY_TIMEOUT_MS: u64 = 30_000;
 
-/// How long the read path's position query may take END TO END — the enqueue
-/// onto the command channel and the runtime's reply together (r4.s4.w1,
-/// spec §3: "a few seconds, a named constant"; r4.s4.w2 bounds the enqueue).
-/// Short on purpose — a read must never stall on a busy runtime or a full
-/// channel, and an unanswered query simply answers without the stops — while
-/// leaving one runtime turn ample room.
+/// How long the read path's position query waits for the runtime's reply —
+/// the reply half of its end-to-end bound; the enqueue half is non-blocking
+/// by construction ([`POSITION_ENQUEUE_RESERVE`]) (r4.s4.w1, spec §3: "a few
+/// seconds, a named constant"). Short on purpose — a read must never stall on
+/// a busy runtime, and an unanswered query simply answers without the stops —
+/// while leaving one runtime turn ample room.
 const POSITION_REPLY_TIMEOUT_MS: u64 = 2_000;
+
+/// How many slots of the command channel the read path's position query keeps
+/// free for control commands (r4.s4.w2, E2): a `Position` query only enqueues
+/// while MORE than this many of the channel's 64 slots are free. Otherwise it
+/// answers without the stops at once — its existing degrade path — so a
+/// wedged runtime plus a flood of summary reads cannot fill the bounded
+/// channel the kill switch's `stop`/`stop_all` must enqueue into. Sized well
+/// above a burst of concurrent reads and well below the channel.
+const POSITION_ENQUEUE_RESERVE: usize = 16;
 
 /// One control command, with its reply channel. `Attach` is the promote
 /// path's; `Stop`/`StopAll` are the kill switch's; `ShadowCheck` is the
@@ -254,38 +263,46 @@ impl PaperControl {
     /// Ask one session's open-position stops now, under the read path's SHORT
     /// timeout ([`POSITION_REPLY_TIMEOUT_MS`]) — never the command timeout,
     /// which bounds mutations a caller must actually see (r4.s4.w1). The
-    /// bound covers BOTH steps — the enqueue onto the command channel and the
-    /// reply — so a full channel cannot hang a read that only the reply bound
-    /// would cap (r4.s4.w2). `Ok(None)` when the runtime does not hold the
-    /// session, it is flat, or it owes a rebuild.
+    /// enqueue NEVER blocks (r4.s4.w2, E2): the query only takes a channel
+    /// slot while more than [`POSITION_ENQUEUE_RESERVE`] of them are free, so
+    /// read traffic can never wedge the control commands that must go
+    /// through; at or below the reserve it answers `Ok(None)` at once — the
+    /// read then carries no stops, its existing degrade path. `Ok(None)` also
+    /// when the runtime does not hold the session, it is flat, or it owes a
+    /// rebuild.
     ///
     /// # Errors
     ///
-    /// [`PaperControlError`] when no runtime is attached, either step times
-    /// out, or the runtime dropped the reply channel. Callers on the read path
-    /// answer without the stops on all of these.
+    /// [`PaperControlError`] when no runtime is attached or the reply times
+    /// out. Callers on the read path answer without the stops on either.
     pub async fn position(
         &self,
         session_id: PaperSessionId,
     ) -> Result<Option<PositionReply>, PaperControlError> {
+        // The channel's tail belongs to the control commands: a read that
+        // finds the reserve already eaten degrades instead of queueing.
+        if self.sender.capacity() <= POSITION_ENQUEUE_RESERVE {
+            return Ok(None);
+        }
         let (reply, done) = oneshot::channel();
         let command = PaperCommand::Position { session_id, reply };
-        // One deadline over both the enqueue and the reply: bounding only the
-        // reply would leave a saturated channel (`request`'s other commands
-        // keep their own enqueue semantics) able to stall the read for as long
-        // as the runtime does not drain.
-        let exchange = async {
-            if self.sender.send(command).await.is_err() {
-                return Err(PaperControlError::RuntimeUnavailable);
-            }
-            match done.await {
-                Err(_) => Err(PaperControlError::RuntimeUnavailable),
-                Ok(answer) => Ok(answer),
-            }
-        };
-        tokio::time::timeout(Duration::from_millis(POSITION_REPLY_TIMEOUT_MS), exchange)
-            .await
-            .unwrap_or(Err(PaperControlError::Timeout))
+        if let Err(error) = self.sender.try_send(command) {
+            return match error {
+                // A racing sender took the last free slot: still a degrade,
+                // never a failure — and never a block.
+                mpsc::error::TrySendError::Full(_) => Ok(None),
+                // The receiver is gone (the runtime is not attached).
+                mpsc::error::TrySendError::Closed(_) => Err(PaperControlError::RuntimeUnavailable),
+            };
+        }
+        // The enqueue landed; only the reply is left to wait for, under the
+        // SHORT bound that leaves one runtime turn ample room.
+        match tokio::time::timeout(Duration::from_millis(POSITION_REPLY_TIMEOUT_MS), done).await {
+            Err(_) => Err(PaperControlError::Timeout),
+            // The runtime dropped the reply without answering (it stopped).
+            Ok(Err(_)) => Err(PaperControlError::RuntimeUnavailable),
+            Ok(Ok(answer)) => Ok(answer),
+        }
     }
 
     /// Send one command and await its reply under the handle's timeout.
@@ -325,41 +342,60 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        DEFAULT_PAPER_REPLY_TIMEOUT_MS, POSITION_REPLY_TIMEOUT_MS, PaperCommand, PaperControl,
-        PaperControlError, PositionReply,
+        DEFAULT_PAPER_REPLY_TIMEOUT_MS, POSITION_ENQUEUE_RESERVE, POSITION_REPLY_TIMEOUT_MS,
+        PaperCommand, PaperControl, PaperControlError, PositionReply,
     };
-    use crate::domain::paper::session::PaperSessionId;
+    use crate::domain::paper::event::StopActor;
+    use crate::domain::paper::session::{NonEmptyLabel, PaperSessionId};
 
-    /// A full command channel must not hang the read path's position query
-    /// (r4.s4.w2): the enqueue rides the same SHORT bound as the reply, so a
-    /// saturated `mpsc` answers [`PaperControlError::Timeout`] inside
-    /// [`POSITION_REPLY_TIMEOUT_MS`] — and the read then answers without the
-    /// stops. Before the bound covered the enqueue, this test never returned.
-    #[tokio::test]
-    async fn a_full_command_channel_still_bounds_the_position_query() {
-        let (control, receiver) = PaperControl::channel(DEFAULT_PAPER_REPLY_TIMEOUT_MS);
-        // Fill every slot with a position query of its own; the receiver stays
-        // alive but drains nothing (no runtime answers).
-        for _ in 0..64 {
-            let (reply, _done) = oneshot::channel::<Option<PositionReply>>();
-            control
-                .sender
-                .try_send(PaperCommand::Position {
-                    session_id: PaperSessionId::new("sess-full".to_owned()),
-                    reply,
-                })
-                .expect("the channel starts with capacity");
+    fn id() -> PaperSessionId {
+        PaperSessionId::new("sess-1".to_owned())
+    }
+
+    /// Queue one `Position` command directly — the very command the read path
+    /// enqueues — with its reply receiver dropped on this side.
+    fn queue_position(control: &PaperControl) {
+        let (reply, _done) = oneshot::channel::<Option<PositionReply>>();
+        control
+            .sender
+            .try_send(PaperCommand::Position {
+                session_id: id(),
+                reply,
+            })
+            .expect("the test keeps the queue below capacity");
+    }
+
+    /// Fill the channel the way the read path would — queue `Position`
+    /// commands — until exactly `free` slots are left.
+    fn fill_to_free(control: &PaperControl, free: usize) {
+        while control.sender.capacity() > free {
+            queue_position(control);
         }
-        assert_eq!(receiver.len(), 64, "every slot is taken");
+        assert_eq!(
+            control.sender.capacity(),
+            free,
+            "the fill stops exactly at the wanted free capacity"
+        );
+    }
+
+    /// A position query that found room keeps the SHORT bound: the command is
+    /// queued, and with nothing draining the reply times out inside
+    /// [`POSITION_REPLY_TIMEOUT_MS`]. (The round-1 test filled the channel to
+    /// the brim; that case now degrades at once instead — the reserve tests
+    /// below.)
+    #[tokio::test]
+    async fn an_enqueued_position_query_is_still_bounded_by_the_reply_timeout() {
+        let (control, receiver) = PaperControl::channel(DEFAULT_PAPER_REPLY_TIMEOUT_MS);
+        // Free capacity one above the reserve: the query still enqueues.
+        fill_to_free(&control, POSITION_ENQUEUE_RESERVE + 1);
+        let queued = receiver.len();
 
         let started = tokio::time::Instant::now();
-        let result = control
-            .position(PaperSessionId::new("sess-full".to_owned()))
-            .await;
+        let result = control.position(id()).await;
         let elapsed = started.elapsed();
         assert!(
             matches!(result, Err(PaperControlError::Timeout)),
-            "a saturated channel times out: {result:?}"
+            "the reply bound expires: {result:?}"
         );
         assert!(
             elapsed >= Duration::from_millis(POSITION_REPLY_TIMEOUT_MS),
@@ -368,6 +404,61 @@ mod tests {
         assert!(
             elapsed <= Duration::from_millis(POSITION_REPLY_TIMEOUT_MS + 1_000),
             "the query returns with the bound, not later: {elapsed:?}"
+        );
+        assert_eq!(
+            receiver.len(),
+            queued + 1,
+            "the query took a slot: its enqueue landed"
+        );
+    }
+
+    /// At the reserve the query answers at once, WITHOUT enqueueing: the
+    /// slots the kill switch needs stay free (r4.s4.w2, E2).
+    #[tokio::test]
+    async fn a_position_query_at_the_reserve_answers_without_enqueueing() {
+        let (control, receiver) = PaperControl::channel(DEFAULT_PAPER_REPLY_TIMEOUT_MS);
+        // Free capacity exactly equal to the reserve: the query degrades.
+        fill_to_free(&control, POSITION_ENQUEUE_RESERVE);
+        let queued = receiver.len();
+
+        let started = tokio::time::Instant::now();
+        let result = control.position(id()).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "no stops and no failure — the read's degrade path: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(POSITION_REPLY_TIMEOUT_MS),
+            "answered at once, never waited for a reply: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(receiver.len(), queued, "nothing was enqueued");
+    }
+
+    /// A channel filled with position reads up to the reserve still takes a
+    /// control command's enqueue: the stop is queued promptly, and only its
+    /// reply waits — the kill switch never wedges behind read traffic
+    /// (r4.s4.w2, E2; N1).
+    #[tokio::test]
+    async fn a_channel_filled_to_the_reserve_still_takes_a_stop() {
+        // A short reply bound keeps the test fast; the ENQUEUE is what this
+        // test measures, and it is not bounded by it.
+        let (control, receiver) = PaperControl::channel(50);
+        fill_to_free(&control, POSITION_ENQUEUE_RESERVE);
+        let queued = receiver.len();
+
+        let actor = StopActor::Token {
+            label: NonEmptyLabel::try_new("test-token").expect("non-empty"),
+        };
+        let stopped = tokio::time::timeout(Duration::from_secs(5), control.stop(id(), actor)).await;
+        assert!(
+            matches!(stopped, Ok(Err(PaperControlError::Timeout))),
+            "the stop enqueued and only its reply timed out: {stopped:?}"
+        );
+        assert_eq!(
+            receiver.len(),
+            queued + 1,
+            "the stop's command sits in the queue"
         );
     }
 }
