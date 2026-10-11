@@ -1,12 +1,17 @@
-// The paper-session stream hook (r3.s4.w5, spec §4).
+// The paper-session stream hook (r3.s4.w5, spec §4; per-bar refetch r4.s4.w2).
 //
 // One channel per invocation (`paper_session_events`), the `useComposeRun`
 // precedent: the hook reads the summary once, subscribes, folds frames into
-// the view, and re-reads the summary on the three events that change it —
-// `shadow_checked`, `stop` and `engine_upgraded`. A frame whose seq is at or
-// below the last one is DROPPED: the server resumes from `Last-Event-ID`, and
-// a resumed stream may replay its boundary, so the duplicate must not reach
-// the view twice.
+// the view, and re-reads the summary on the events that change it —
+// `bar_processed` (every processed bar moves the mark and the money view),
+// `fill`, `funding`, `shadow_checked`, `stop` and `engine_upgraded`. The
+// re-reads are single-flight with one trailing refetch (r4.s4.w2): while a
+// read is in flight further triggers only mark it dirty, so the replayed
+// backlog a long stream sends on mount costs two reads instead of one per
+// frame, and only the newest request's answer is applied. A frame
+// whose seq is at or below the last one is DROPPED: the server resumes from
+// `Last-Event-ID`, and a resumed stream may replay its boundary, so the
+// duplicate must not reach the view twice.
 //
 // `shadowBars` is the latest LIVE-epoch `shadow_checked` frame's `bar_count` —
 // the only place that count exists (`ShadowResult` itself carries just the
@@ -50,6 +55,9 @@ export interface PaperSessionView {
 
 /** The event types that change the summary. */
 const REFETCH_TYPES: Record<string, true> = {
+  // A processed bar moves the mark and every money figure (G4: the view
+  // updates as bars arrive).
+  bar_processed: true,
   // A fill opens or closes the position (`open_position`, the closed trades);
   // a funding payment moves `funding_total`. An `order` is a signal only.
   fill: true,
@@ -70,23 +78,66 @@ export function usePaperSession(id: string): PaperSessionView {
   const alive = useRef(true);
   const seq = useRef<number | null>(null);
   const terminal = useRef(false);
+  // The summary read's single-flight bookkeeping (r4.s4.w2): `generation`
+  // advances when the hook reads a different session (an older generation's
+  // read can neither apply nor gate this one), `readSeq` mints every read so
+  // only the newest request's answer may land, `newestRead` is the read
+  // currently in flight, and `dirty` records a trigger that arrived while one
+  // ran — its one trailing refetch.
+  const generation = useRef(0);
+  const loadedId = useRef<string | null>(null);
+  const newestRead = useRef<number | null>(null);
+  const readSeq = useRef(0);
+  const dirty = useRef(false);
 
   const loadSummary = useCallback(async () => {
-    try {
-      const result = await commands.paperSession(id);
-      if (!alive.current) return;
-      if (result.status === "ok") {
-        setSummary(result.data);
-        setError(null);
-      } else {
-        setError(result.error.message);
+    const gen = generation.current;
+    // Single-flight: a trigger while a read of this generation is in flight
+    // only marks it dirty. A replayed backlog of `bar_processed` frames, or a
+    // burst of them, therefore costs one read plus at most one trailing read.
+    if (newestRead.current !== null) {
+      dirty.current = true;
+      return;
+    }
+    for (;;) {
+      if (gen !== generation.current) return;
+      dirty.current = false;
+      const read = ++readSeq.current;
+      newestRead.current = read;
+      let failed = false;
+      try {
+        const result = await commands.paperSession(id);
+        if (!alive.current) return;
+        // Only the newest request's answer may land: a read an older
+        // generation started never overwrites the current summary.
+        if (gen !== generation.current || read !== readSeq.current) return;
+        if (result.status === "ok") {
+          setSummary(result.data);
+          setError(null);
+        } else {
+          setError(result.error.message);
+          failed = true;
+        }
+      } catch {
+        if (alive.current && gen === generation.current && read === readSeq.current) {
+          setError("The session read failed.");
+        }
+        failed = true;
+      } finally {
+        if (newestRead.current === read) newestRead.current = null;
       }
-    } catch {
-      if (alive.current) setError("The session read failed.");
+      if (failed || !dirty.current) return;
     }
   }, [id]);
 
   useEffect(() => {
+    // A different id is a new read generation: the previous session's
+    // in-flight read can neither apply nor gate this one.
+    if (loadedId.current !== id) {
+      loadedId.current = id;
+      generation.current += 1;
+      newestRead.current = null;
+    }
     void loadSummary();
   }, [loadSummary, reloadKey]);
 

@@ -126,7 +126,9 @@ fn graduation_from_row(
     }
 }
 
-/// A raw `paper_bar` row (`query_as!` needs a named struct).
+/// A raw `paper_bar` row (`query_as!` needs a named struct; the non-macro
+/// `query_as` reads — `latest_bar_at_or_before` — decode through the same `FromRow`).
+#[derive(sqlx::FromRow)]
 struct RawBar {
     open_time: i64,
     close_time: i64,
@@ -136,6 +138,25 @@ struct RawBar {
     close: String,
     volume: String,
     funding_rate: Option<String>,
+}
+
+/// Decode one `paper_bar` row into its candle — the single mapping `bars` and
+/// `latest_bar_at_or_before` share, so the two reads cannot drift.
+fn bar_from_row(row: &RawBar) -> Result<crate::domain::Candle, DataError> {
+    Ok(crate::domain::Candle {
+        open_time: row.open_time,
+        close_time: row.close_time,
+        open: parse_decimal("paper_bar.open", &row.open)?,
+        high: parse_decimal("paper_bar.high", &row.high)?,
+        low: parse_decimal("paper_bar.low", &row.low)?,
+        close: parse_decimal("paper_bar.close", &row.close)?,
+        volume: parse_decimal("paper_bar.volume", &row.volume)?,
+        funding_rate: row
+            .funding_rate
+            .as_ref()
+            .map(|rate| parse_decimal("paper_bar.funding_rate", rate))
+            .transpose()?,
+    })
 }
 
 /// A raw `paper_session` row — shared by `get_session` and `list_sessions`
@@ -515,24 +536,32 @@ impl<C: Clock + Send + Sync> PaperSessionRepository for SqlitePaperSessionRepo<C
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DataError::Db(format!("paper_bar read failed: {e}")))?;
-        rows.iter()
-            .map(|row| {
-                Ok(crate::domain::Candle {
-                    open_time: row.open_time,
-                    close_time: row.close_time,
-                    open: parse_decimal("paper_bar.open", &row.open)?,
-                    high: parse_decimal("paper_bar.high", &row.high)?,
-                    low: parse_decimal("paper_bar.low", &row.low)?,
-                    close: parse_decimal("paper_bar.close", &row.close)?,
-                    volume: parse_decimal("paper_bar.volume", &row.volume)?,
-                    funding_rate: row
-                        .funding_rate
-                        .as_ref()
-                        .map(|rate| parse_decimal("paper_bar.funding_rate", rate))
-                        .transpose()?,
-                })
-            })
-            .collect()
+        rows.iter().map(bar_from_row).collect()
+    }
+
+    async fn latest_bar_at_or_before(
+        &self,
+        session_id: &PaperSessionId,
+        timeframe: Timeframe,
+        at_or_before_ms: i64,
+    ) -> Result<Option<crate::domain::Candle>, DataError> {
+        let session = session_id.as_str().to_owned();
+        let timeframe_text = timeframe.binance_interval();
+        // ONE row: the newest `open_time` at or before the log's own bar (the
+        // read's mark bar). The non-macro `query_as` rides the committed
+        // `.sqlx` cache untouched.
+        let row: Option<RawBar> = sqlx::query_as(
+            "SELECT open_time, close_time, open, high, low, close, volume, funding_rate \
+             FROM paper_bar WHERE session_id = ?1 AND timeframe = ?2 AND close_time <= ?3 \
+             ORDER BY open_time DESC LIMIT 1",
+        )
+        .bind(session)
+        .bind(timeframe_text)
+        .bind(at_or_before_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DataError::Db(format!("paper_bar latest read failed: {e}")))?;
+        row.as_ref().map(bar_from_row).transpose()
     }
 
     async fn count_from_ms(&self, session_id: &PaperSessionId) -> Result<Option<i64>, DataError> {
@@ -611,5 +640,152 @@ fn event_at(event: &crate::domain::paper::event::PaperEvent) -> String {
         | PaperEvent::DataEvent { at, .. }
         | PaperEvent::EngineUpgraded { at, .. }
         | PaperEvent::ShadowChecked { at, .. } => at.clone(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::SqlitePaperSessionRepo;
+    use crate::adapters::clock::FakeClock;
+    use crate::adapters::db::{Db, MIGRATOR};
+    use crate::adapters::store::CandleStore;
+    use crate::domain::paper::session::{
+        Graduation, NonEmptyText, PaperSessionDraft, PaperSessionId,
+    };
+    use crate::domain::strategy::VersionId;
+    use crate::domain::{Candle, EngineFingerprint, Pair, PaperSessionRepository, Timeframe};
+    use rust_decimal::Decimal;
+    use tempfile::TempDir;
+
+    /// A migrated tempfile DB with one strategy + version seeded (the session
+    /// row's FK), and the repo over it. The `TempDir` keeps the DB alive.
+    async fn world() -> (SqlitePaperSessionRepo<FakeClock>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::with_path(&tmp.path().join("pulse.db")).await.unwrap();
+        MIGRATOR.run(db.pool()).await.unwrap();
+        let pool = db.pool().clone();
+        sqlx::query(
+            "INSERT INTO strategy (id, name, created_at) \
+             VALUES ('st-bar', 'latest bar', '2026-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO strategy_version \
+             (id, strategy_id, dsl_schema_version, dsl, dsl_original, version_hash, created_by, \
+              creating_llm_call_ids, created_at) \
+             VALUES ('ver-bar', 'st-bar', '1.2.0', '{}', '{}', 'hash', 'human', '[]', \
+                     '2026-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = SqlitePaperSessionRepo::with_clock(
+            pool,
+            FakeClock::at(1_735_689_600_000),
+            CandleStore::with_base_dir(tmp.path().join("candles")),
+        );
+        (repo, tmp)
+    }
+
+    /// One override session over the seeded version.
+    async fn session(repo: &SqlitePaperSessionRepo<FakeClock>) -> PaperSessionId {
+        let draft = PaperSessionDraft {
+            strategy_version_id: VersionId::new("ver-bar"),
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: None,
+            uses_d1: false,
+            starting_equity: Decimal::from(10_000),
+            taker_fee_bps: Decimal::from(4),
+            slippage_bps: Decimal::from(1),
+            engine_fingerprint: EngineFingerprint::current(),
+            graduation: Graduation::Override {
+                reason: NonEmptyText::try_new("latest bar test").unwrap(),
+                at: "2026-01-01T00:00:00.000Z".to_owned(),
+            },
+            fixture: false,
+            min_trades: 20,
+            promoted_by: NonEmptyText::try_new("test-token").unwrap(),
+        };
+        repo.insert_session(&draft).await.unwrap().id
+    }
+
+    /// One M15 bar on the fixture grid.
+    fn bar(open_time: i64, close: i64) -> Candle {
+        Candle {
+            open_time,
+            close_time: open_time + 899_999,
+            open: Decimal::from(close),
+            high: Decimal::from(close + 10),
+            low: Decimal::from(close - 10),
+            close: Decimal::from(close),
+            volume: Decimal::from(1),
+            funding_rate: None,
+        }
+    }
+
+    /// `latest_bar_at_or_before` reads ONE row — the newest `open_time` whose
+    /// `close_time` is at or before the bound, lead-in included — and answers
+    /// `None` for a session with no rows, for another timeframe, and for a
+    /// bound that cuts every row off.
+    #[tokio::test]
+    async fn latest_bar_reads_the_newest_row_at_or_before_the_bound() {
+        let (repo, _tmp) = world().await;
+        let id = session(&repo).await;
+        let unbounded = i64::MAX;
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, unbounded)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let first = bar(1_735_689_600_000, 60_000);
+        let first_close = first.close_time;
+        let second = bar(1_735_689_600_000 + 900_000, 60_100);
+        repo.append_bar(&id, &[(Timeframe::M15, first.clone(), false)], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, unbounded)
+                .await
+                .unwrap(),
+            Some(first.clone())
+        );
+        repo.append_bar(&id, &[(Timeframe::M15, second.clone(), true)], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, unbounded)
+                .await
+                .unwrap(),
+            Some(second),
+            "the newest open_time wins, lead-in included"
+        );
+        // The bound is the mark rule (r4.s4.w2): the last bar the replayed log
+        // processed bounds the read, so a newer appended row never wins.
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, first_close)
+                .await
+                .unwrap(),
+            Some(first.clone()),
+            "a row past the bound is not read"
+        );
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, first_close - 1)
+                .await
+                .unwrap(),
+            None,
+            "no row at or before the bound answers None, never a newer row"
+        );
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::H4, unbounded)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

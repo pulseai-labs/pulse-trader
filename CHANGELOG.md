@@ -8,6 +8,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The paper session's money view reaches the Mac app (r4.s4.w2).** The session detail now shows, all
+  from the server's own text: the running total (the Σ realized USDT and Σ R totals with their "n of
+  m" counts, the open position's unrealized USDT and the session P&L); the open position marked at
+  the last processed bar with its funding so far, entry fee, unrealized USDT and R and the running
+  engine's initial stop, current stop and take-profit (absent, with one note, when no engine answers);
+  the last processed bar (#340); every order and fill in log order, the entry fills included (#344);
+  and each closed trade's R, USDT, entry/exit fees and funding. The view refetches on every
+  `bar_processed` frame, so the marks and money figures move as bars arrive, and every figure is
+  rendered as it crosses — the app computes no money (G3, ADR-0020). `tests/tauri_paper.rs` is back to
+  its exact DTO-to-wire mirror, over a seeded session with an open position and a closed trade, with
+  the committed bindings regenerated; `scripts/paper-view-test.sh` is the new ledger line over the
+  mirror, the two UI test files and the bindings gate.
+
+- **The paper session's money view: every order and fill, each closed trade's net USDT, the open position
+  marked at the last processed bar with its live stops, and the running totals (r4.s4.w1).** The read
+  side (ADR-0027 addendum) derives every USDT figure from the log at the session's `taker_fee_bps` with
+  the engine's own cost functions — each closed trade's `realized_usdt` equals the engine's
+  `Trade.realized_pnl` exactly — and attributes funding by step, so a bar that closes a position still
+  accrues its funding to that trade. `session_summary` gains `realized_usdt_total`/`realized_usdt_count`,
+  `realized_r_total`/`realized_r_count`, `unrealized_usdt`, `session_pnl_usdt` and a marked
+  `open_position` (mark price and time, funding so far, entry fee, unrealized USDT and R, and the live
+  initial stop, current stop and take-profit read from the running engine under a short timeout); the
+  trades read gains `entries` (every order and fill in log order, the entry fills included) and each
+  closed trade's `realized_usdt`, `funding_usdt`, `entry_fee_usdt` and `exit_fee_usdt`. Additive fields
+  on the existing reads (ADR-0026): the routes and the MCP paper tools share `application::paper_read`,
+  the `/mcp` mount beside the runtime passes it the server's control handle, and no event gains a money
+  field. `tests/paper_pnl.rs` pins the derivation against the real engine (long, short, a funding-bar
+  close, a same-step open and close, a missing entry fill, the marked position and the totals).
+
 - **DSL schema 1.3.0: swing pivots, support/resistance and candle anatomy as price-level indicator
   variants (r4.s6.w1).** Eight new `IndicatorSpec` variants — `PivotHigh`/`PivotLow` (`left`,
   `right`), `Resistance`/`Support` (`left`, `right`, `tolerance_pct`, `min_touches`, `lookback`) and

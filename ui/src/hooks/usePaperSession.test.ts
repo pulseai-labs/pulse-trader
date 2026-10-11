@@ -45,6 +45,12 @@ function summary(): PaperSessionSummary {
     epochs: [ENGINE],
     last_bar_open_time: null,
     closed_trade_count: 0,
+    realized_usdt_total: "0",
+    realized_usdt_count: 0,
+    realized_r_total: "0",
+    realized_r_count: 0,
+    unrealized_usdt: null,
+    session_pnl_usdt: "0",
     open_position: null,
     shadow_checks: [],
     certification_stale: false,
@@ -110,23 +116,80 @@ describe("usePaperSession", () => {
     expect(result.current.lastSeq).toBe(3);
   });
 
-  it("re-fetches the summary on fill, funding, shadow_checked, stop and engine_upgraded", async () => {
+  it("re-fetches the summary on a processed bar", async () => {
     const { result } = renderHook(() => usePaperSession("s-1"));
     await waitFor(() => expect(result.current.summary).not.toBeNull());
     expect(paperSessionMock).toHaveBeenCalledTimes(1);
 
-    const types = [
-      "bar_processed",
-      "order",
-      "fill",
-      "funding",
-      "shadow_checked",
-      "stop",
-      "engine_upgraded",
-    ];
-    types.forEach((type, index) => push(frame(index + 1, type)));
-    // bar_processed and order change no summary field: five re-fetches.
-    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(6));
+    // Every processed bar moves the mark and the running total (G4), so the
+    // summary (and the trades that follow it) re-reads per bar.
+    push(frame(1, "bar_processed"));
+    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("re-fetches the summary on each event that moves it", async () => {
+    const { result } = renderHook(() => usePaperSession("s-1"));
+    await waitFor(() => expect(result.current.summary).not.toBeNull());
+    expect(paperSessionMock).toHaveBeenCalledTimes(1);
+
+    const types = ["fill", "funding", "shadow_checked", "stop", "engine_upgraded"];
+    for (const [index, type] of types.entries()) {
+      push(frame(index + 1, type));
+      await waitFor(() =>
+        expect(paperSessionMock).toHaveBeenCalledTimes(index + 2),
+      );
+    }
+
+    // An `order` is a signal only: it folds, and re-fetches nothing.
+    push(frame(types.length + 1, "order"));
+    await waitFor(() => expect(result.current.lastSeq).toBe(types.length + 1));
+    expect(paperSessionMock).toHaveBeenCalledTimes(types.length + 1);
+  });
+
+  it("collapses a replayed bar backlog into at most two summary reads", async () => {
+    const { result } = renderHook(() => usePaperSession("s-1"));
+    expect(paperSessionMock).toHaveBeenCalledTimes(1);
+
+    // A long session's backlog: every replayed bar is a refetch trigger, and
+    // all of them arrive while the mount read is still in flight.
+    for (let n = 1; n <= 250; n += 1) push(frame(n, "bar_processed"));
+    expect(paperSessionMock).toHaveBeenCalledTimes(1);
+
+    // The in-flight read settles: the whole burst costs exactly ONE trailing
+    // read, not one read per frame.
+    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(2));
+    // Nothing arrives after it: the trailing read is the last one.
+    await act(async () => {});
+    expect(paperSessionMock).toHaveBeenCalledTimes(2);
+    expect(result.current.summary).not.toBeNull();
+  });
+
+  it("drops an older session's read when it answers after the newer one", async () => {
+    let oldDelivered = false;
+    paperSessionMock
+      .mockImplementationOnce(async () => {
+        // Answers after the new session's read has already been applied.
+        await Promise.resolve();
+        await Promise.resolve();
+        oldDelivered = true;
+        return ok({ ...summary(), id: "s-1" });
+      })
+      .mockImplementationOnce(async () => ok({ ...summary(), id: "s-2" }));
+
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => usePaperSession(id),
+      { initialProps: { id: "s-1" } },
+    );
+    expect(paperSessionMock).toHaveBeenCalledTimes(1);
+
+    // The screen switches sessions while the first read is still pending.
+    rerender({ id: "s-2" });
+    await waitFor(() => expect(result.current.summary?.id).toBe("s-2"));
+
+    // The previous session's read answers now — last — and must not win.
+    await waitFor(() => expect(oldDelivered).toBe(true));
+    await act(async () => {});
+    expect(result.current.summary?.id).toBe("s-2");
   });
 
   it("drops the live-epoch bar count when a new epoch opens", async () => {

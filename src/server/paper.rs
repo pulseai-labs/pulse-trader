@@ -191,7 +191,7 @@ async fn promote_route(state: Arc<ServerState>, req: Request) -> Response {
                     session.id
                 ));
             }
-            match session_summary(&paper, &runs, &session.id).await {
+            match session_summary(&paper, &runs, Some(&control), &session.id).await {
                 Ok(Some(summary)) => (StatusCode::CREATED, axum::Json(summary)).into_response(),
                 Ok(None) => internal("the promoted session could not be read back"),
                 Err(error) => read_error(&error),
@@ -331,7 +331,8 @@ async fn shadow_check_route(state: Arc<ServerState>, id: String, _req: Request) 
 async fn list_route(state: Arc<ServerState>) -> Response {
     let paper = paper_repo(&state);
     let runs = SqliteBacktestRunRepo::new(state.db.pool().clone());
-    match list_summaries(&paper, &runs).await {
+    let control = control_of(&state);
+    match list_summaries(&paper, &runs, control.as_ref()).await {
         Ok(summaries) => (StatusCode::OK, axum::Json(summaries)).into_response(),
         Err(error) => read_error(&error),
     }
@@ -341,8 +342,9 @@ async fn list_route(state: Arc<ServerState>) -> Response {
 async fn session_route(state: Arc<ServerState>, id: String) -> Response {
     let paper = paper_repo(&state);
     let runs = SqliteBacktestRunRepo::new(state.db.pool().clone());
+    let control = control_of(&state);
     let session_id = PaperSessionId::new(id.clone());
-    match session_summary(&paper, &runs, &session_id).await {
+    match session_summary(&paper, &runs, control.as_ref(), &session_id).await {
         Ok(Some(summary)) => (StatusCode::OK, axum::Json(summary)).into_response(),
         Ok(None) => unknown_session(&id),
         Err(error) => read_error(&error),

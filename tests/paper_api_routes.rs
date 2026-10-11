@@ -23,11 +23,14 @@ mod support;
 use std::time::{Duration, Instant};
 
 use pulse::{
-    CreatedBy, Db, NewVersion, PaperEvent, PaperSessionId, PaperSessionRepository,
-    SqliteBacktestRunRepo, SqliteClientTokenRepo, SqliteStrategyRepo, StrategyRepository,
-    Timeframe, VersionId, WalkForwardRunDraft, WalkForwardRunRepository, list_summaries,
-    session_summary, session_trades,
+    BarRef, Candle, CandleStore, CreatedBy, Db, Direction, EngineFingerprint, Graduation,
+    NewVersion, NonEmptyReason, Pair, PaperEvent, PaperSessionDraft, PaperSessionId,
+    PaperSessionRepository, PaperSide, SqliteBacktestRunRepo, SqliteClientTokenRepo,
+    SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyRepository, Timeframe, VersionId,
+    WalkForwardRunDraft, WalkForwardRunRepository, list_summaries, realized_pnl, session_summary,
+    session_trades, taker_fee,
 };
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use support::mcp::{seeded_walk_forward_draft, seeded_walk_forward_draft_k};
 use support::paper::PaperHost;
@@ -431,6 +434,7 @@ async fn ii_a_promoted_session_is_attached_at_once() {
     let summary = session_summary(
         &host.paper(),
         &SqliteBacktestRunRepo::new(ts.db.pool().clone()),
+        None,
         &id,
     )
     .await
@@ -472,7 +476,7 @@ async fn iii_list_get_and_trades_match_the_read_model() {
     let list: Vec<Value> = response.json().await.expect("a json list");
     assert_eq!(list.len(), 1, "{list:?}");
     let expected = serde_json::to_value(
-        list_summaries(&paper, &runs)
+        list_summaries(&paper, &runs, None)
             .await
             .expect("the read model")
             .first()
@@ -486,7 +490,7 @@ async fn iii_list_get_and_trades_match_the_read_model() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let one: Value = response.json().await.expect("a json summary");
     let expected = serde_json::to_value(
-        session_summary(&paper, &runs, &id)
+        session_summary(&paper, &runs, None, &id)
             .await
             .expect("the read model")
             .expect("the session"),
@@ -810,4 +814,438 @@ async fn v_shadow_check_answers_identical_then_409_once_stopped() {
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     let body: Value = response.json().await.expect("a json refusal");
     assert_eq!(body["code"], json!("session_stopped"), "{body:?}");
+}
+
+// ---------------------------------------------------------------------------
+// (vi) the money view — a seeded session, no runtime installed
+// ---------------------------------------------------------------------------
+
+/// One M15 bar in milliseconds.
+const SEED_BAR_MS: i64 = 900_000;
+
+/// The seeded log's first bar open — 8-hour aligned.
+const SEED_T0: i64 = 1_735_689_600_000;
+
+/// The default token fee the seeded session runs at (A1), bps.
+const SEED_FEE_BPS: i64 = 4;
+
+/// An instant, rendered the way the runtime stamps events.
+fn millis_text(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+/// A decimal as the wire carries it (exact text).
+fn decimal_of(value: &Value) -> Decimal {
+    value
+        .as_str()
+        .expect("a decimal is exact text on this wire")
+        .parse::<Decimal>()
+        .expect("the text parses as a decimal")
+}
+
+/// One M15 bar on the fixture grid.
+fn seed_bar(open_time: i64, close: i64) -> Candle {
+    Candle {
+        open_time,
+        close_time: open_time + SEED_BAR_MS - 1,
+        open: Decimal::from(close),
+        high: Decimal::from(close + 10),
+        low: Decimal::from(close - 10),
+        close: Decimal::from(close),
+        volume: Decimal::from(1),
+        funding_rate: None,
+    }
+}
+
+/// A `bar_processed` event for one M15 bar.
+fn bar_processed(open_time: i64) -> PaperEvent {
+    PaperEvent::BarProcessed {
+        seq: 0,
+        at: millis_text(open_time),
+        bars: vec![BarRef {
+            timeframe: Timeframe::M15,
+            open_time,
+        }],
+    }
+}
+
+/// An `order` event at one grid instant.
+fn order_at(at: i64, qty: Decimal) -> PaperEvent {
+    PaperEvent::Order {
+        seq: 0,
+        at: millis_text(at),
+        side: PaperSide::Long,
+        qty,
+    }
+}
+
+/// A `fill` event at one grid instant (long, no engine fill time).
+fn fill_at(
+    at: i64,
+    qty: Decimal,
+    price: i64,
+    exit_reason: Option<pulse::ExitReason>,
+    realized_r: Option<Decimal>,
+) -> PaperEvent {
+    PaperEvent::Fill {
+        seq: 0,
+        at: millis_text(at),
+        side: PaperSide::Long,
+        qty,
+        price: Decimal::from(price),
+        exit_reason,
+        realized_r,
+        fill_time_ms: None,
+    }
+}
+
+/// A `funding` event at one grid instant.
+fn funding_at(at: i64, amount: Decimal) -> PaperEvent {
+    PaperEvent::Funding {
+        seq: 0,
+        at: millis_text(at),
+        rate: Decimal::new(1, 5),
+        amount,
+    }
+}
+
+/// Seed a session whose log holds ONE closed trade (its funding accrued on a
+/// step the position was open for) and ONE standing long — the read's money
+/// view without any runtime in the process (r4.s4.w1).
+async fn seed_open_session(ts: &TestServer) -> PaperSessionId {
+    let strategies = SqliteStrategyRepo::new(ts.db.pool().clone());
+    let strategy = strategies
+        .create_strategy("w1-pnl-reads", None, &[])
+        .await
+        .expect("create the strategy");
+    let version = strategies
+        .create_version(NewVersion {
+            strategy_id: strategy.id,
+            parent_version_id: None,
+            dsl_json: serde_json::to_string(&pulse::fixture_strategy_dsl()).expect("serialize DSL"),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create the version");
+    let paper = SqlitePaperSessionRepo::new(
+        ts.db.pool().clone(),
+        CandleStore::with_base_dir(ts.data_dir.clone()),
+    );
+    let session = paper
+        .insert_session(&PaperSessionDraft {
+            strategy_version_id: version.id,
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: None,
+            uses_d1: false,
+            starting_equity: Decimal::from(10_000),
+            taker_fee_bps: Decimal::from(SEED_FEE_BPS),
+            slippage_bps: Decimal::from(1),
+            engine_fingerprint: EngineFingerprint::current(),
+            graduation: Graduation::Override {
+                reason: NonEmptyReason::try_new("w1 seeded read").expect("non-empty"),
+                at: millis_text(SEED_T0),
+            },
+            fixture: false,
+            min_trades: 20,
+            promoted_by: pulse::NonEmptyLabel::try_new("seed-token").expect("non-empty"),
+        })
+        .await
+        .expect("insert the session");
+
+    let t0 = SEED_T0;
+    let t1 = t0 + SEED_BAR_MS;
+    let t2 = t0 + 2 * SEED_BAR_MS;
+    let t3 = t0 + 3 * SEED_BAR_MS;
+    let events = vec![
+        // Step 0: the entry (qty 1 at 60000).
+        bar_processed(t0),
+        order_at(t0, Decimal::ONE),
+        fill_at(t0, Decimal::ONE, 60_000, None, None),
+        // Step 1: the funding on the open position (its funding so far).
+        bar_processed(t1),
+        funding_at(t1, Decimal::new(-6, 1)),
+        // Step 2: the exit (qty 1 at 60100, +1R).
+        bar_processed(t2),
+        fill_at(
+            t2,
+            Decimal::ONE,
+            60_100,
+            Some(pulse::ExitReason::TakeProfit),
+            Some(Decimal::ONE),
+        ),
+        // Step 3: the standing entry (qty 0.5 at 59900) — the open position.
+        bar_processed(t3),
+        order_at(t3, Decimal::new(5, 1)),
+        fill_at(t3, Decimal::new(5, 1), 59_900, None, None),
+    ];
+
+    let bars = vec![
+        (Timeframe::M15, seed_bar(t0, 60_000), false),
+        (Timeframe::M15, seed_bar(t1, 60_050), false),
+        (Timeframe::M15, seed_bar(t2, 60_100), false),
+        (Timeframe::M15, seed_bar(t3, 60_050), false),
+    ];
+    paper
+        .append_bar(&session.id, &bars, &events)
+        .await
+        .expect("append the seeded batch");
+    session.id
+}
+
+/// The two reads carry the money view: the totals, the marked open position
+/// (stops absent — no runtime is installed) and the entries with each trade's
+/// USDT figures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vi_the_reads_carry_the_money_view_for_a_seeded_session() {
+    let ts = spawn_server(ServerOptions::default()).await;
+    let id = seed_open_session(&ts).await;
+    let fee_bps = Decimal::from(SEED_FEE_BPS);
+
+    // The expected figures, from the seeded numbers and the engine's own cost
+    // functions (never from the read model).
+    let entry_fee = taker_fee(Decimal::ONE * Decimal::from(60_000), fee_bps);
+    let exit_fee = taker_fee(Decimal::ONE * Decimal::from(60_100), fee_bps);
+    let trade_usdt = realized_pnl(
+        Decimal::from(60_000),
+        Decimal::from(60_100),
+        Decimal::ONE,
+        Direction::Long,
+    ) + Decimal::new(-6, 1)
+        - entry_fee
+        - exit_fee;
+    let open_fee = taker_fee(Decimal::new(5, 1) * Decimal::from(59_900), fee_bps);
+    let unrealized = realized_pnl(
+        Decimal::from(59_900),
+        Decimal::from(60_050),
+        Decimal::new(5, 1),
+        Direction::Long,
+    ) + Decimal::ZERO
+        - open_fee;
+
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    assert_eq!(summary["closed_trade_count"], json!(1));
+    assert_eq!(decimal_of(&summary["realized_usdt_total"]), trade_usdt);
+    assert_eq!(summary["realized_usdt_count"], json!(1));
+    assert_eq!(decimal_of(&summary["realized_r_total"]), Decimal::ONE);
+    assert_eq!(summary["realized_r_count"], json!(1));
+    assert_eq!(decimal_of(&summary["unrealized_usdt"]), unrealized);
+    assert_eq!(
+        decimal_of(&summary["session_pnl_usdt"]),
+        trade_usdt + unrealized
+    );
+
+    let open = &summary["open_position"];
+    assert_eq!(open["side"], json!("long"));
+    assert_eq!(decimal_of(&open["qty"]), Decimal::new(5, 1));
+    assert_eq!(decimal_of(&open["mark_price"]), Decimal::from(60_050));
+    assert_eq!(
+        open["mark_time"],
+        json!(millis_text(SEED_T0 + 3 * SEED_BAR_MS + SEED_BAR_MS - 1))
+    );
+    assert_eq!(decimal_of(&open["funding_usdt"]), Decimal::ZERO);
+    assert_eq!(decimal_of(&open["entry_fee_usdt"]), open_fee);
+    assert_eq!(decimal_of(&open["unrealized_usdt"]), unrealized);
+    // No runtime is installed: the stops are absent and no R is derivable.
+    assert_eq!(open["unrealized_r"], Value::Null);
+    assert_eq!(open["initial_stop"], Value::Null);
+    assert_eq!(open["stop_price"], Value::Null);
+    assert_eq!(open["take_profit_price"], Value::Null);
+
+    let response = get(
+        &ts,
+        &format!("/api/v1/paper/sessions/{}/trades", id.as_str()),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let trades: Value = response.json().await.expect("a json trades body");
+    let trade = &trades["closed_trades"][0];
+    assert_eq!(decimal_of(&trade["realized_usdt"]), trade_usdt);
+    assert_eq!(decimal_of(&trade["funding_usdt"]), Decimal::new(-6, 1));
+    assert_eq!(decimal_of(&trade["entry_fee_usdt"]), entry_fee);
+    assert_eq!(decimal_of(&trade["exit_fee_usdt"]), exit_fee);
+    let entries = trades["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 5, "two orders and three fills: {entries:?}");
+    assert_eq!(entries[0]["kind"], json!("order"));
+    assert_eq!(entries[1]["kind"], json!("fill"));
+    assert_eq!(entries[1]["exit_reason"], Value::Null);
+    assert_eq!(entries[2]["exit_reason"], json!("take_profit"));
+    assert_eq!(entries[4]["kind"], json!("fill"));
+    assert_eq!(entries[4]["exit_reason"], Value::Null);
+}
+
+// ---------------------------------------------------------------------------
+// (vii) the money view — served beside a running engine
+// ---------------------------------------------------------------------------
+
+/// Drive the host's runtime until the session holds an open position.
+async fn drive_to_open(
+    host: &support::paper::PaperHost,
+    id: &PaperSessionId,
+) -> pulse::OpenPositionStops {
+    for _ in 0..6_000 {
+        host.clock.advance(SEED_BAR_MS);
+        host.tick().await;
+        if let Ok(Some(reply)) = host.control.position(id.clone()).await {
+            return reply.stops;
+        }
+    }
+    panic!("no open position within the fixture series");
+}
+
+/// The summary's marked open position carries the running engine's live stops
+/// (initial, current, take-profit), and its R is derivable because of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vii_the_summary_carries_the_live_stops_from_the_running_engine() {
+    let ts = paper_server().await;
+    let host = ts.paper.as_ref().expect("the paper seam is installed");
+    host.source
+        .script(Timeframe::M15, pulse::fixture_m15_candles());
+    let version_id = uncertified_version(&ts.db, "routes-stops").await;
+    let response = post_promote(
+        &ts,
+        json!({
+            "version_id": version_id.as_str(),
+            "override": {
+                "reason": "live stops",
+                "pair": "BTCUSDT",
+                "primary_timeframe": "15m",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created: Value = response.json().await.expect("a json summary");
+    let id = PaperSessionId::new(created["id"].as_str().expect("id").to_owned());
+
+    let stops = drive_to_open(host, &id).await;
+
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    let open = &summary["open_position"];
+    assert_eq!(decimal_of(&open["initial_stop"]), stops.initial_stop);
+    assert_eq!(decimal_of(&open["stop_price"]), stops.stop_price);
+    match stops.take_profit_price {
+        Some(take_profit) => assert_eq!(decimal_of(&open["take_profit_price"]), take_profit),
+        None => assert_eq!(open["take_profit_price"], Value::Null),
+    }
+    assert!(
+        open["unrealized_r"].is_string(),
+        "the live initial stop makes the R derivable: {open}"
+    );
+    // The mark is the newest processed bar the runtime recorded.
+    let bars = host.paper().bars(&id, Timeframe::M15).await.expect("bars");
+    let newest = bars.last().expect("the session processed bars");
+    assert_eq!(decimal_of(&open["mark_price"]), newest.close);
+    assert_eq!(open["mark_time"], json!(millis_text(newest.close_time)));
+}
+
+// ---------------------------------------------------------------------------
+// (viii) the mark and the live stops describe the replayed log (r4.s4.w2)
+// ---------------------------------------------------------------------------
+
+/// The mark is the bar the replayed log last processed: a newer `paper_bar`
+/// row — the runtime's next bar landing between the events read and the mark
+/// read — is never the mark (it belongs to a log state the summary does not
+/// describe).
+#[tokio::test]
+async fn the_mark_never_jumps_past_the_logs_last_processed_bar() {
+    let ts = spawn_server(ServerOptions::default()).await;
+    let id = seed_open_session(&ts).await;
+    let paper = SqlitePaperSessionRepo::new(
+        ts.db.pool().clone(),
+        CandleStore::with_base_dir(ts.data_dir.clone()),
+    );
+    // The interleaving: the events read ends at the seeded log, while the
+    // store already holds the runtime's NEXT bar row (its log event still
+    // unread by that read).
+    let newer = seed_bar(SEED_T0 + 4 * SEED_BAR_MS, 60_900);
+    paper
+        .append_bar(&id, &[(Timeframe::M15, newer, false)], &[])
+        .await
+        .expect("append the newer row");
+
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    let open = &summary["open_position"];
+    assert_eq!(
+        decimal_of(&open["mark_price"]),
+        Decimal::from(60_050),
+        "the mark stays the replayed log's last processed bar"
+    );
+    assert_eq!(
+        open["mark_time"],
+        json!(millis_text(SEED_T0 + 4 * SEED_BAR_MS - 1)),
+        "the mark time is that bar's close, not the newer row's"
+    );
+}
+
+/// The live stops are shown only while the runtime's answer describes the same
+/// log state the read replayed: a runtime that committed fewer events than the
+/// read saw answers a lagging seq, and the read drops the stops — the reads
+/// before and after prove the drop is the mismatch, not a missing runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_stops_are_dropped_when_the_runtime_describes_another_log_state() {
+    let ts = paper_server().await;
+    let host = ts.paper.as_ref().expect("the paper seam is installed");
+    host.source
+        .script(Timeframe::M15, pulse::fixture_m15_candles());
+    let version_id = uncertified_version(&ts.db, "routes-stops-mismatch").await;
+    let response = post_promote(
+        &ts,
+        json!({
+            "version_id": version_id.as_str(),
+            "override": {
+                "reason": "stops mismatch",
+                "pair": "BTCUSDT",
+                "primary_timeframe": "15m",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created: Value = response.json().await.expect("a json summary");
+    let id = PaperSessionId::new(created["id"].as_str().expect("id").to_owned());
+    drive_to_open(host, &id).await;
+
+    // While the read and the runtime hold the same log, the stops are shown.
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    assert!(
+        summary["open_position"]["initial_stop"].is_string(),
+        "the same log state shows the stops: {summary}"
+    );
+
+    // A log event the runtime never committed moves the replayed log ahead of
+    // the engine's state: the reply's seq no longer matches, so the stops are
+    // dropped and the read still answers.
+    host.paper()
+        .append_bar(
+            &id,
+            &[],
+            &[PaperEvent::DataEvent {
+                seq: 0,
+                at: millis_text(SEED_T0),
+                summary: "a log write the runtime did not commit".to_owned(),
+            }],
+        )
+        .await
+        .expect("append the event behind the runtime");
+
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    let open = &summary["open_position"];
+    assert_eq!(open["initial_stop"], Value::Null, "{summary}");
+    assert_eq!(open["stop_price"], Value::Null);
+    assert_eq!(open["take_profit_price"], Value::Null);
+    assert_eq!(open["unrealized_r"], Value::Null, "no live stop, no R");
 }

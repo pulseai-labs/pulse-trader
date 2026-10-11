@@ -1254,7 +1254,11 @@ export type PaperCertifiedDataVersion = {
 	data_version: string,
 };
 
-/**  A closed trade — `PaperClosedTrade`. */
+/**
+ *  A closed trade — `PaperPnlTrade` (the wire's flattened `PaperClosedTrade`
+ *  plus the read's own money fields, r4.s4.w2). Money crosses as the server's
+ *  exact decimal text; a figure the log cannot derive is `None`.
+ */
 export type PaperClosedTrade = {
 	/**  The side that closed. */
 	side: string,
@@ -1272,6 +1276,14 @@ export type PaperClosedTrade = {
 	exit_reason: string,
 	/**  The trade's realized R-multiple, when the fill recorded one. */
 	realized_r: string | null,
+	/**  The trade's net USDT, when the log holds an entry fill for it. */
+	realized_usdt: string | null,
+	/**  The trade's funding, Σ the steps it was open for. */
+	funding_usdt: string,
+	/**  The entry fee, when the log holds an entry fill. */
+	entry_fee_usdt: string | null,
+	/**  The exit fee paid. */
+	exit_fee_usdt: string,
 };
 
 /**
@@ -1335,6 +1347,34 @@ fold_min: string;
 fold_max: string };
 
 /**
+ *  One order or fill, in log order — `PaperPnlEntry` (#344: the entry fills
+ *  included), tagged on `kind` exactly as the wire tags it.
+ */
+export type PaperEntry = 
+/**  A signalled order. */
+{ kind: "order"; 
+/**  The event's RFC3339 instant. */
+at: string; 
+/**  The side signalled. */
+side: string; 
+/**  The quantity signalled, exact decimal text. */
+qty: string } | 
+/**  A fill. */
+{ kind: "fill"; 
+/**  The event's RFC3339 instant. */
+at: string; 
+/**  The side that filled. */
+side: string; 
+/**  The quantity that filled, exact decimal text. */
+qty: string; 
+/**  The (slipped) fill price, exact decimal text. */
+price: string; 
+/**  Why the position closed, when this fill closed one. */
+exit_reason: string | null; 
+/**  The fill's engine instant when the event carries one, else `at`. */
+fill_time: string };
+
+/**
  *  An epoch-millisecond integer carried as its exact text — `i64` is refused
  *  by the bindings export (the `src/tauri/backtest.rs` `ms()` rule).
  */
@@ -1384,6 +1424,36 @@ at: string };
  */
 export type PaperJsonText = string;
 
+/**
+ *  The open position marked at the last processed bar — `PaperPnlOpenPosition`
+ *  (r4.s4.w2), whose own `position` is flattened exactly as the wire flattens
+ *  it. The server computed every figure; the DTO carries its exact text and
+ *  this side never re-derives one.
+ */
+export type PaperPnlOpenPosition = {
+	/**
+	 *  The mark price (the last processed primary bar's close), when a bar was
+	 *  processed.
+	 */
+	mark_price: string | null,
+	/**  The mark instant (RFC3339), when a bar was processed. */
+	mark_time: string | null,
+	/**  The position's funding so far. */
+	funding_usdt: string,
+	/**  The entry fee paid, exact decimal text. */
+	entry_fee_usdt: string,
+	/**  The unrealized P&L in USDT, when the position can be marked. */
+	unrealized_usdt: string | null,
+	/**  The unrealized R at the mark, when it can be derived. */
+	unrealized_r: string | null,
+	/**  The live initial stop, when a running engine answered the read. */
+	initial_stop: string | null,
+	/**  The live current (possibly trailed) stop, when one was answered. */
+	stop_price: string | null,
+	/**  The live take-profit, when one is declared and answered. */
+	take_profit_price: string | null,
+} & PaperPosition;
+
 /**  The open position — `PaperPosition`. */
 export type PaperPosition = {
 	/**  The position's side (`long`/`short`). */
@@ -1427,8 +1497,37 @@ export type PaperSessionSummary = {
 	last_bar_open_time: PaperEpochMs | null,
 	/**  How many closed trades the log holds. */
 	closed_trade_count: number,
-	/**  The open position, when one stands. */
-	open_position: PaperPosition | null,
+	/**
+	 *  Σ realized USDT over the trades that carry a figure (0 when none does —
+	 *  `realized_usdt_count` says how many did).
+	 */
+	realized_usdt_total: string,
+	/**
+	 *  How many closed trades carry a USDT figure ("n of m" with
+	 *  `closed_trade_count`).
+	 */
+	realized_usdt_count: number,
+	/**  Σ realized R over the trades that recorded one (0 when none did). */
+	realized_r_total: string,
+	/**  How many closed trades carry a realized R. */
+	realized_r_count: number,
+	/**
+	 *  The open position's unrealized USDT, net of the costs paid so far —
+	 *  null when the session is flat (and in the unmarkable hand-seeded case:
+	 *  a position the log holds but no bar to mark it against).
+	 */
+	unrealized_usdt: string | null,
+	/**
+	 *  The session's running total: the realized total plus the unrealized
+	 *  figure when a position stands, else the realized total alone.
+	 */
+	session_pnl_usdt: string,
+	/**
+	 *  The open position, when one stands — the log's position marked at the
+	 *  last processed primary bar, with its costs so far and the live stops a
+	 *  running engine answered (absent when none did).
+	 */
+	open_position: PaperPnlOpenPosition | null,
 	/**  The latest shadow verdict per epoch, in epoch order. */
 	shadow_checks: PaperShadowCheck[],
 	/**  Whether the certifying run's fingerprint is not this build's. */
@@ -1517,10 +1616,18 @@ reason: string };
 
 /**  One session's trades — `SessionTrades`. */
 export type PaperTrades = {
-	/**  The closed trades, in log order, with their realized R. */
+	/**  The closed trades, in log order, with their realized R and USDT. */
 	closed_trades: PaperClosedTrade[],
-	/**  The open position, when one stands. */
+	/**
+	 *  The open position, when one stands (the log's own shape — the summary
+	 *  carries the marked one).
+	 */
 	open_position: PaperPosition | null,
+	/**
+	 *  Every `Order` and `Fill` event, in log order — the entry fills included
+	 *  (#344).
+	 */
+	entries: PaperEntry[],
 };
 
 /**  The typed override half of a promote — `OverrideRequest` on the wire. */

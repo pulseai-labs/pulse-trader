@@ -14,16 +14,18 @@ mod support;
 use std::path::Path;
 
 use pulse::{
-    CandleStore, CreatedBy, Db, EngineFingerprint, Graduation, NewVersion, NonEmptyLabel,
-    PaperEvent, PaperSessionDraft, PaperSessionId, PaperSessionRepository, PaperSide, ShadowResult,
-    SqliteBacktestRunRepo, SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyRepository,
-    Timeframe, WalkForwardRunRepository, session_summary, session_trades,
+    CandleStore, CreatedBy, Db, Direction, EngineFingerprint, Graduation, NewVersion,
+    NonEmptyLabel, PaperEvent, PaperSessionDraft, PaperSessionId, PaperSessionRepository,
+    PaperSide, ShadowResult, SqliteBacktestRunRepo, SqlitePaperSessionRepo, SqliteStrategyRepo,
+    StrategyRepository, Timeframe, VersionId, WalkForwardRunRepository, fixture_m15_candles,
+    realized_pnl, session_summary, session_trades, taker_fee,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use support::mcp::{
     call, copy_tree, manifest, migrated_db, seeded_walk_forward_draft, spawn_client,
 };
+use support::paper::PaperHost;
 use support::server::{ServerOptions, spawn_server};
 use tempfile::TempDir;
 
@@ -168,7 +170,7 @@ async fn expected_summary(db: &Db, store_dir: &Path, id: &PaperSessionId) -> Val
     );
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
     serde_json::to_value(
-        session_summary(&paper, &runs, id)
+        session_summary(&paper, &runs, None, id)
             .await
             .expect("the read model")
             .expect("the session exists"),
@@ -231,6 +233,44 @@ async fn the_four_tools_match_the_read_model_over_stdio() {
         2,
         "{trades}"
     );
+    // The money view: each trade's USDT figures (the seed's two trades fill
+    // at the same prices, so both net the same), the entries in log order,
+    // and the summary's running totals.
+    let entry_fee = taker_fee(Decimal::ONE * Decimal::from(60_000), Decimal::from(4));
+    let exit_fee = taker_fee(Decimal::ONE * Decimal::from(60_100), Decimal::from(4));
+    let per_trade = realized_pnl(
+        Decimal::from(60_000),
+        Decimal::from(60_100),
+        Decimal::ONE,
+        Direction::Long,
+    ) - entry_fee
+        - exit_fee;
+    for trade in trades["closed_trades"].as_array().expect("closed trades") {
+        assert_eq!(
+            trade["realized_usdt"].as_str().expect("decimal text"),
+            per_trade.to_string(),
+            "{trade}"
+        );
+        assert_eq!(trade["funding_usdt"], json!("0"), "{trade}");
+    }
+    let entries = trades["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 4, "two entries and two exits: {entries:?}");
+    assert!(entries.iter().all(|entry| entry["kind"] == json!("fill")));
+    assert_eq!(entries[0]["exit_reason"], Value::Null);
+    assert_eq!(entries[1]["exit_reason"], json!("take_profit"));
+    assert_eq!(
+        one["realized_usdt_total"],
+        json!((per_trade + per_trade).to_string())
+    );
+    assert_eq!(one["realized_usdt_count"], json!(2));
+    assert_eq!(one["realized_r_total"], json!("1.5"));
+    assert_eq!(one["realized_r_count"], json!(2));
+    assert_eq!(one["unrealized_usdt"], Value::Null, "flat: no figure");
+    assert_eq!(
+        one["session_pnl_usdt"],
+        json!((per_trade + per_trade).to_string())
+    );
+    assert_eq!(one["open_position"], Value::Null);
 
     // Comparison.
     let comparison = call(
@@ -523,4 +563,133 @@ async fn paper_mcp_withholds_certifying_fold_results_during_freeze() {
         before
     );
     client.cancel().await.unwrap();
+}
+
+/// A fixture-DSL version with no walk-forward run (uncertified) — the input
+/// for the override promote the runtime-served test rides.
+async fn uncertified_version(db: &Db, name: &str) -> VersionId {
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let strategy = strategies
+        .create_strategy(name, None, &[])
+        .await
+        .expect("create the strategy");
+    strategies
+        .create_version(NewVersion {
+            strategy_id: strategy.id,
+            parent_version_id: None,
+            dsl_json: serde_json::to_string(&pulse::fixture_strategy_dsl()).expect("serialize DSL"),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create the version")
+        .id
+}
+
+/// A tool served BESIDE a runtime answers with the running engine's live stops
+/// (r4.s4.w1, SPINE.md G6): the `/mcp` mount `pulse serve` builds carries the
+/// server's control handle, unlike the stdio process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mcp_mount_beside_a_runtime_carries_the_live_stops() {
+    let ts = spawn_server(ServerOptions {
+        paper: Some(Box::new(PaperHost::spawn)),
+        ..Default::default()
+    })
+    .await;
+    let host = ts.paper.as_ref().expect("the paper seam is installed");
+    host.source.script(Timeframe::M15, fixture_m15_candles());
+    let version_id = uncertified_version(&ts.db, "mcp-stops").await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/v1/paper/promote", ts.base))
+        .header("Authorization", format!("Bearer {}", ts.app_token))
+        .json(&json!({
+            "version_id": version_id.as_str(),
+            "override": {
+                "reason": "mcp live stops",
+                "pair": "BTCUSDT",
+                "primary_timeframe": "15m",
+            },
+        }))
+        .send()
+        .await
+        .expect("promote answers");
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created: Value = response.json().await.expect("a json summary");
+    let id = PaperSessionId::new(created["id"].as_str().expect("id").to_owned());
+
+    // Drive the runtime until the session holds an open position.
+    let mut open_stops = None;
+    for _ in 0..6_000 {
+        host.clock.advance(900_000);
+        host.tick().await;
+        if let Ok(Some(reply)) = host.control.position(id.clone()).await {
+            open_stops = Some(reply.stops);
+            break;
+        }
+    }
+    let stops = open_stops.expect("an open position within the fixture series");
+
+    // The /mcp handshake, then the tool call.
+    let (status, session, payloads) =
+        post_mcp(&ts.base, &ts.agent_token, None, None, &initialize_frame()).await;
+    assert!(status.is_success(), "initialize answers: {status}");
+    let session = session.expect("the server issues an Mcp-Session-Id");
+    let init = payloads
+        .iter()
+        .find(|payload| payload.get("id") == Some(&json!(0)))
+        .expect("an initialize result frame");
+    let protocol_version = init["result"]["protocolVersion"]
+        .as_str()
+        .expect("a protocol version")
+        .to_owned();
+    let (status, _, _) = post_mcp(
+        &ts.base,
+        &ts.agent_token,
+        Some(&session),
+        Some(&protocol_version),
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .await;
+    assert!(status.is_success(), "initialized accepted: {status}");
+
+    let (status, _, payloads) = post_mcp(
+        &ts.base,
+        &ts.agent_token,
+        Some(&session),
+        Some(&protocol_version),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_paper_session", "arguments": { "session_id": id.as_str() } }
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(status.is_success(), "get_paper_session answers: {status}");
+    let call = payloads
+        .iter()
+        .find(|payload| payload.get("id") == Some(&json!(1)))
+        .expect("a tools/call result frame");
+    assert!(call.get("error").is_none(), "{call}");
+    let open = &call["result"]["structuredContent"]["open_position"];
+    assert_eq!(
+        open["initial_stop"].as_str().expect("decimal text"),
+        stops.initial_stop.to_string()
+    );
+    assert_eq!(
+        open["stop_price"].as_str().expect("decimal text"),
+        stops.stop_price.to_string()
+    );
+    match stops.take_profit_price {
+        Some(take_profit) => assert_eq!(
+            open["take_profit_price"].as_str().expect("decimal text"),
+            take_profit.to_string()
+        ),
+        None => assert_eq!(open["take_profit_price"], Value::Null),
+    }
+    assert!(
+        open["unrealized_r"].is_string(),
+        "the live initial stop makes the R derivable: {open}"
+    );
 }

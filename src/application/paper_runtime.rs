@@ -40,7 +40,9 @@ use rust_decimal::Decimal;
 use crate::adapters::backtest::{
     BacktestConfig, EngineSession, SessionTimeframes, first_fully_warm_bar_ms, run_backtest,
 };
-use crate::application::paper_control::{PaperCommand, ShadowCheckReply, StopAllReply, StopReply};
+use crate::application::paper_control::{
+    PaperCommand, PositionReply, ShadowCheckReply, StopAllReply, StopReply,
+};
 use crate::domain::backtest::{BacktestError, OpenPositionMark};
 use crate::domain::paper::event::{PaperEvent, PaperSide, StopActor};
 use crate::domain::paper::runtime::{
@@ -376,6 +378,11 @@ struct RunningSession {
     reported: BTreeMap<i64, String>,
     /// A failed append rebuilds from the log before the next attempt.
     needs_rebuild: bool,
+    /// The last event seq this runtime committed for the session (r4.s4.w2):
+    /// every append it makes advances it, and the `Position` reply carries it
+    /// so the read can tell whether the live engine describes the same log
+    /// state the read replayed.
+    last_committed_seq: i64,
 }
 
 /// The replayed trade state the attach-time check compares exactly: the
@@ -613,9 +620,12 @@ where
                 bar_count: 0,
                 result: serde_json::to_value(&verdict).unwrap_or(serde_json::Value::Null),
             };
-            self.repo.append_bar(session_id, &[], &[event]).await?;
+            let persisted = self.repo.append_bar(session_id, &[], &[event]).await?;
             if let Some(run) = self.sessions.get_mut(session_id) {
                 run.last_shadow_ms = Some(self.clock.now_ms());
+                run.last_committed_seq = persisted
+                    .last()
+                    .map_or(run.last_committed_seq, PaperEvent::seq);
             }
             return Ok(verdict);
         };
@@ -660,9 +670,12 @@ where
             bar_count,
             result: serde_json::to_value(&verdict).unwrap_or(serde_json::Value::Null),
         };
-        self.repo.append_bar(session_id, &[], &[event]).await?;
+        let persisted = self.repo.append_bar(session_id, &[], &[event]).await?;
         if let Some(run) = self.sessions.get_mut(session_id) {
             run.last_shadow_ms = Some(self.clock.now_ms());
+            run.last_committed_seq = persisted
+                .last()
+                .map_or(run.last_committed_seq, PaperEvent::seq);
         }
         if let ShadowResult::Drift {
             first_divergence, ..
@@ -904,6 +917,37 @@ where
                 let result = self.shadow_check_outcome(&session_id).await;
                 let _ = reply.send(result);
             }
+            PaperCommand::Position {
+                session_id,
+                reply,
+                permit,
+            } => {
+                // The read's reservation permit returns the moment the command
+                // leaves the channel (r4.s4.w2, E3): a slow answer never holds
+                // queue room.
+                drop(permit);
+                // Read-only and in-memory: the attached session's engine, or
+                // nothing when this runtime does not hold it (flat included),
+                // owes a rebuild (a failed append left the engine past its
+                // log), or holds no position (r4.s4.w2). No store read — a
+                // session it does not hold has no live state by definition
+                // (r4.s4.w1). The answer carries the last seq the runtime
+                // committed, so the read can drop the stops when its own
+                // replay describes a different log state.
+                let answer = self.sessions.get(&session_id).and_then(|session| {
+                    if session.needs_rebuild {
+                        return None;
+                    }
+                    session
+                        .engine
+                        .open_position_stops()
+                        .map(|stops| PositionReply {
+                            stops,
+                            last_seq: session.last_committed_seq,
+                        })
+                });
+                let _ = reply.send(answer);
+            }
         }
     }
 
@@ -967,6 +1011,9 @@ where
             self.pending_lead_in.remove(&id);
             return Ok(());
         }
+        // The seq the live engine state has committed so far (r4.s4.w2): the
+        // replayed log, advanced by each append made below.
+        let mut last_committed_seq = log.last().map_or(0, PaperEvent::seq);
         // E3: a build change opens exactly one new epoch, before the rebuild's
         // bars are consumed, so the epoch boundary sits at the live bar.
         let mut epoch = epoch_start(&log);
@@ -982,7 +1029,9 @@ where
                 old,
                 new: EngineFingerprint::current(),
             };
-            self.repo.append_bar(&id, &[], &[event]).await?;
+            if let Some(minted) = self.repo.append_bar(&id, &[], &[event]).await?.last() {
+                last_committed_seq = minted.seq();
+            }
             epoch = EpochStart::Empty;
         }
 
@@ -1078,6 +1127,7 @@ where
                 catch_up_to,
                 reported: BTreeMap::new(),
                 needs_rebuild: false,
+                last_committed_seq,
             },
         );
 
@@ -1873,7 +1923,7 @@ where
                 let primary_candle = bars[0].1.clone();
                 let appended = self.repo.append_bar(id, &bars, &events).await;
                 match appended {
-                    Ok(_) => {
+                    Ok(persisted) => {
                         let run = self
                             .sessions
                             .get_mut(id)
@@ -1887,6 +1937,9 @@ where
                         if run.epoch == EpochStart::Empty {
                             run.epoch = EpochStart::Bar(primary_candle.open_time);
                         }
+                        run.last_committed_seq = persisted
+                            .last()
+                            .map_or(run.last_committed_seq, PaperEvent::seq);
                         Ok(true)
                     }
                     Err(error) => {
@@ -1913,11 +1966,14 @@ where
                         at,
                         summary: summary.clone(),
                     };
-                    self.repo.append_bar(id, &[], &[event]).await?;
+                    let persisted = self.repo.append_bar(id, &[], &[event]).await?;
                     // Marked reported only once the event committed: a failed
                     // append leaves it unreported, so the next wake retries it.
                     if let Some(run) = self.sessions.get_mut(id) {
                         run.reported.insert(open_time, tag);
+                        run.last_committed_seq = persisted
+                            .last()
+                            .map_or(run.last_committed_seq, PaperEvent::seq);
                     }
                     self.log
                         .write(format!("paper runtime: session {id}: {summary}"));
