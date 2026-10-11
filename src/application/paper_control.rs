@@ -75,14 +75,29 @@ pub enum PaperCommand {
     },
     /// Answer one session's open-position stop geometry now, read-only — the
     /// paper read's live stops (r4.s4.w1). Answered from the runtime's own
-    /// attached sessions; `None` when the runtime does not hold the session
-    /// or it is flat. Never touches the store.
+    /// attached sessions; `None` when the runtime does not hold the session,
+    /// it is flat, or its engine owes a rebuild (r4.s4.w2). Never touches the
+    /// store.
     Position {
         /// The session to read.
         session_id: PaperSessionId,
-        /// The stops, or `None` when flat / not attached.
-        reply: oneshot::Sender<Option<OpenPositionStops>>,
+        /// The stops with the log seq they describe, or `None` when flat /
+        /// not attached / awaiting a rebuild.
+        reply: oneshot::Sender<Option<PositionReply>>,
     },
+}
+
+/// What a `Position` query answered (r4.s4.w2): the open position's stop
+/// geometry as the live engine holds it, paired with the last log seq the
+/// runtime committed for the session. The read compares that seq with the
+/// last seq of the log it replayed and drops the stops when the two do not
+/// describe the same state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionReply {
+    /// The open position's stop geometry.
+    pub stops: OpenPositionStops,
+    /// The session's last committed log seq when the answer was built.
+    pub last_seq: i64,
 }
 
 /// What a `Stop` did.
@@ -237,7 +252,8 @@ impl PaperControl {
     /// Ask one session's open-position stops now, under the read path's SHORT
     /// timeout ([`POSITION_REPLY_TIMEOUT_MS`]) — never the command timeout,
     /// which bounds mutations a caller must actually see (r4.s4.w1). `Ok(None)`
-    /// when the runtime does not hold the session or it is flat.
+    /// when the runtime does not hold the session, it is flat, or it owes a
+    /// rebuild.
     ///
     /// # Errors
     ///
@@ -247,7 +263,7 @@ impl PaperControl {
     pub async fn position(
         &self,
         session_id: PaperSessionId,
-    ) -> Result<Option<OpenPositionStops>, PaperControlError> {
+    ) -> Result<Option<PositionReply>, PaperControlError> {
         self.request_under(Duration::from_millis(POSITION_REPLY_TIMEOUT_MS), |reply| {
             PaperCommand::Position { session_id, reply }
         })
@@ -282,3 +298,4 @@ impl PaperControl {
         }
     }
 }
+

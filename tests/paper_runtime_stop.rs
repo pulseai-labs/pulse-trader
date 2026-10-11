@@ -332,12 +332,15 @@ impl<R: PaperSessionRepository + Send + Sync> PaperSessionRepository for StopRef
         self.inner.bars(session_id, timeframe).await
     }
 
-    async fn latest_bar(
+    async fn latest_bar_at_or_before(
         &self,
         session_id: &PaperSessionId,
         timeframe: Timeframe,
+        at_or_before_ms: i64,
     ) -> Result<Option<Candle>, DataError> {
-        self.inner.latest_bar(session_id, timeframe).await
+        self.inner
+            .latest_bar_at_or_before(session_id, timeframe, at_or_before_ms)
+            .await
     }
 
     async fn count_from_ms(&self, session_id: &PaperSessionId) -> Result<Option<i64>, DataError> {

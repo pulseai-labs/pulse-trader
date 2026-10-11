@@ -765,12 +765,15 @@ where
         self.inner.bars(session_id, timeframe).await
     }
 
-    async fn latest_bar(
+    async fn latest_bar_at_or_before(
         &self,
         session_id: &PaperSessionId,
         timeframe: Timeframe,
+        at_or_before_ms: i64,
     ) -> Result<Option<Candle>, DataError> {
-        self.inner.latest_bar(session_id, timeframe).await
+        self.inner
+            .latest_bar_at_or_before(session_id, timeframe, at_or_before_ms)
+            .await
     }
 
     async fn count_from_ms(&self, session_id: &PaperSessionId) -> Result<Option<i64>, DataError> {
@@ -1213,4 +1216,105 @@ async fn rest_closed_bars_drops_the_forming_bar_and_stamps_funding() {
         "the 00:00 funding event is stamped on the 00:00 bar"
     );
     assert_eq!(bars[1].funding_rate, None, "funding stays sparse");
+}
+
+// ---------------------------------------------------------------------------
+// the `Position` command (r4.s4.w2)
+// ---------------------------------------------------------------------------
+
+/// One awaited `Position` command against a runtime.
+async fn position_answer(
+    runtime: &mut FlakyRuntime,
+    id: &PaperSessionId,
+) -> Option<pulse::PositionReply> {
+    let (reply, done) = tokio::sync::oneshot::channel();
+    runtime
+        .handle_command(pulse::PaperCommand::Position {
+            session_id: id.clone(),
+            reply,
+        })
+        .await;
+    done.await
+        .expect("the runtime answers every position command")
+}
+
+/// The `Position` answer pairs the stops with the last log seq the runtime
+/// committed, and a session whose engine owes a rebuild answers nothing — that
+/// engine state is not the log's.
+#[tokio::test]
+async fn a_position_answer_is_gated_by_a_rebuild_and_names_the_committed_seq() {
+    let world = ungated_world().await;
+    // A dip on the first live bar opens the long; the later bars hold it
+    // (above the stop, below the reversion exit).
+    world.source.script(
+        Timeframe::M15,
+        vec![
+            m15_bar(BASE - 2 * M15_MS, 60_100, 60_000),
+            m15_bar(BASE - M15_MS, 60_050, 60_000),
+            m15_bar(BASE, 60_000, 60_000),
+            m15_bar(BASE + M15_MS, 60_000, 59_700),
+            m15_bar(BASE + 2 * M15_MS, 59_750, 59_800),
+            m15_bar(BASE + 3 * M15_MS, 59_800, 59_850),
+            m15_bar(BASE + 4 * M15_MS, 59_850, 59_900),
+            m15_bar(BASE + 5 * M15_MS, 59_900, 59_900),
+        ],
+    );
+    let version = create_version(&world, "position-gate", &pulse::fixture_strategy_dsl()).await;
+    let session = promote_session(&world, &version, Timeframe::M15, None, false).await;
+    let repo = FlakyRepo::new(world.paper());
+    let fail_next = repo.flag();
+    let mut runtime = flaky_runtime(&world, repo);
+    assert!(runtime.boot().await.is_empty(), "boot");
+
+    // Drive until the engine holds an open position; the answer must name the
+    // log's own last event.
+    let mut opened = None;
+    for _ in 0..64 {
+        world.clock.advance(M15_MS);
+        runtime.wake().await;
+        if let Some(reply) = position_answer(&mut runtime, &session.id).await {
+            opened = Some(reply);
+            break;
+        }
+    }
+    let reply = opened.expect("the dip bar opens a position within the script");
+    let events = world.paper().events(&session.id).await.unwrap();
+    assert_eq!(
+        reply.last_seq,
+        events.last().map_or(0, PaperEvent::seq),
+        "the answer names the last event the runtime committed"
+    );
+
+    // A failed append leaves the engine a bar past its log: nothing is
+    // answered until the rebuild.
+    fail_next.store(true, Ordering::SeqCst);
+    world.clock.advance(M15_MS);
+    let failures = runtime.wake().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "the injector refused the append: {failures:?}"
+    );
+    assert_eq!(
+        position_answer(&mut runtime, &session.id).await,
+        None,
+        "an engine that owes a rebuild never answers stops"
+    );
+
+    // The next wake rebuilds from the log and consumes the bar; the answer
+    // returns and still names the log's last event.
+    world.clock.advance(M15_MS);
+    assert!(
+        runtime.wake().await.is_empty(),
+        "the rebuild and the retry land"
+    );
+    let events = world.paper().events(&session.id).await.unwrap();
+    let reply = position_answer(&mut runtime, &session.id)
+        .await
+        .expect("the position still stands");
+    assert_eq!(
+        reply.last_seq,
+        events.last().map_or(0, PaperEvent::seq),
+        "the rebuilt answer names the log's last event"
+    );
 }

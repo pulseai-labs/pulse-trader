@@ -622,8 +622,8 @@ async fn the_mcp_mount_beside_a_runtime_carries_the_live_stops() {
     for _ in 0..6_000 {
         host.clock.advance(900_000);
         host.tick().await;
-        if let Ok(Some(stops)) = host.control.position(id.clone()).await {
-            open_stops = Some(stops);
+        if let Ok(Some(reply)) = host.control.position(id.clone()).await {
+            open_stops = Some(reply.stops);
             break;
         }
     }

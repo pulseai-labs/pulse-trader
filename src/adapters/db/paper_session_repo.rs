@@ -127,7 +127,7 @@ fn graduation_from_row(
 }
 
 /// A raw `paper_bar` row (`query_as!` needs a named struct; the non-macro
-/// `query_as` reads — `latest_bar` — decode through the same `FromRow`).
+/// `query_as` reads — `latest_bar_at_or_before` — decode through the same `FromRow`).
 #[derive(sqlx::FromRow)]
 struct RawBar {
     open_time: i64,
@@ -141,7 +141,7 @@ struct RawBar {
 }
 
 /// Decode one `paper_bar` row into its candle — the single mapping `bars` and
-/// `latest_bar` share, so the two reads cannot drift.
+/// `latest_bar_at_or_before` share, so the two reads cannot drift.
 fn bar_from_row(row: &RawBar) -> Result<crate::domain::Candle, DataError> {
     Ok(crate::domain::Candle {
         open_time: row.open_time,
@@ -539,22 +539,25 @@ impl<C: Clock + Send + Sync> PaperSessionRepository for SqlitePaperSessionRepo<C
         rows.iter().map(bar_from_row).collect()
     }
 
-    async fn latest_bar(
+    async fn latest_bar_at_or_before(
         &self,
         session_id: &PaperSessionId,
         timeframe: Timeframe,
+        at_or_before_ms: i64,
     ) -> Result<Option<crate::domain::Candle>, DataError> {
         let session = session_id.as_str().to_owned();
         let timeframe_text = timeframe.binance_interval();
-        // ONE row: the newest `open_time` (the read's mark bar). The
-        // non-macro `query_as` rides the committed `.sqlx` cache untouched.
+        // ONE row: the newest `open_time` at or before the log's own bar (the
+        // read's mark bar). The non-macro `query_as` rides the committed
+        // `.sqlx` cache untouched.
         let row: Option<RawBar> = sqlx::query_as(
             "SELECT open_time, close_time, open, high, low, close, volume, funding_rate \
-             FROM paper_bar WHERE session_id = ?1 AND timeframe = ?2 \
+             FROM paper_bar WHERE session_id = ?1 AND timeframe = ?2 AND close_time <= ?3 \
              ORDER BY open_time DESC LIMIT 1",
         )
         .bind(session)
         .bind(timeframe_text)
+        .bind(at_or_before_ms)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| DataError::Db(format!("paper_bar latest read failed: {e}")))?;
@@ -724,31 +727,65 @@ mod tests {
         }
     }
 
-    /// `latest_bar` reads ONE row — the newest `open_time`, lead-in included —
-    /// and answers `None` for a session with no rows and for another timeframe.
+    /// `latest_bar_at_or_before` reads ONE row — the newest `open_time` whose
+    /// `close_time` is at or before the bound, lead-in included — and answers
+    /// `None` for a session with no rows, for another timeframe, and for a
+    /// bound that cuts every row off.
     #[tokio::test]
-    async fn latest_bar_reads_the_newest_row_of_its_timeframe() {
+    async fn latest_bar_reads_the_newest_row_at_or_before_the_bound() {
         let (repo, _tmp) = world().await;
         let id = session(&repo).await;
-        assert_eq!(repo.latest_bar(&id, Timeframe::M15).await.unwrap(), None);
+        let unbounded = i64::MAX;
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, unbounded)
+                .await
+                .unwrap(),
+            None
+        );
 
         let first = bar(1_735_689_600_000, 60_000);
+        let first_close = first.close_time;
         let second = bar(1_735_689_600_000 + 900_000, 60_100);
         repo.append_bar(&id, &[(Timeframe::M15, first.clone(), false)], &[])
             .await
             .unwrap();
         assert_eq!(
-            repo.latest_bar(&id, Timeframe::M15).await.unwrap(),
-            Some(first)
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, unbounded)
+                .await
+                .unwrap(),
+            Some(first.clone())
         );
         repo.append_bar(&id, &[(Timeframe::M15, second.clone(), true)], &[])
             .await
             .unwrap();
         assert_eq!(
-            repo.latest_bar(&id, Timeframe::M15).await.unwrap(),
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, unbounded)
+                .await
+                .unwrap(),
             Some(second),
             "the newest open_time wins, lead-in included"
         );
-        assert_eq!(repo.latest_bar(&id, Timeframe::H4).await.unwrap(), None);
+        // The bound is the mark rule (r4.s4.w2): the last bar the replayed log
+        // processed bounds the read, so a newer appended row never wins.
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, first_close)
+                .await
+                .unwrap(),
+            Some(first.clone()),
+            "a row past the bound is not read"
+        );
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::M15, first_close - 1)
+                .await
+                .unwrap(),
+            None,
+            "no row at or before the bound answers None, never a newer row"
+        );
+        assert_eq!(
+            repo.latest_bar_at_or_before(&id, Timeframe::H4, unbounded)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

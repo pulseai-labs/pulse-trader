@@ -644,7 +644,7 @@ pub use domain::{
 // server routes and the MCP read tools share. Re-exported for the same
 // `deny(warnings)` reason as the w3 block above.
 pub use application::paper_control::{
-    DEFAULT_PAPER_REPLY_TIMEOUT_MS, PaperCommand, PaperControl, PaperControlError,
+    DEFAULT_PAPER_REPLY_TIMEOUT_MS, PaperCommand, PaperControl, PaperControlError, PositionReply,
     ShadowCheckReply, StopAllReply, StopReply,
 };
 pub use application::paper_read::{

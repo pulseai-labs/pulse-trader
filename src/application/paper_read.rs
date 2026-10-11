@@ -174,7 +174,8 @@ impl From<ReplayError> for PaperReadError {
 /// `control` is the installed paper control handle, when the caller has one
 /// (`pulse serve`'s routes and its `/mcp` mount do; the stdio MCP process
 /// does not). The read asks it for the open position's live stops — under a
-/// short timeout, and never failing because of them (r4.s4.w1).
+/// short timeout, and only when the answer describes the same log state the
+/// read replayed; it never fails because of them (r4.s4.w1/w2).
 ///
 /// # Errors
 ///
@@ -239,10 +240,13 @@ where
 ///
 /// A flat session pays neither the mark-bar store read nor a runtime query;
 /// a position that stands takes the newest `paper_bar` row of the session's
-/// primary timeframe as its mark, and the runtime's answer — under its own
-/// short timeout — as its live stops. The read NEVER fails because of the
-/// stops: an absent runtime, a gone one, or one that does not answer leaves
-/// the answer without them (spec §3, grill Q3).
+/// primary timeframe AT OR BEFORE the log's own last processed bar as its
+/// mark (r4.s4.w2: the mark must describe the replayed log, never a row
+/// appended after the events read), and the runtime's answer — under its own
+/// short timeout, and only when it carries the same last committed log seq —
+/// as its live stops. The read NEVER fails because of the stops: an absent
+/// runtime, a gone one, one that does not answer, or one that describes a
+/// different log state leaves the answer without them (spec §3, grill Q3).
 async fn pnl_for<P: PaperSessionRepository>(
     session: &PaperSession,
     events: &[PaperEvent],
@@ -251,27 +255,54 @@ async fn pnl_for<P: PaperSessionRepository>(
     control: Option<&PaperControl>,
 ) -> Result<PaperPnl, PaperReadError> {
     let (mark, stops) = if state.open_position.is_some() {
-        let mark = sessions
-            .latest_bar(&session.id, session.primary_timeframe)
-            .await?
-            .map(|bar| MarkBar {
-                price: bar.close,
-                close_time_ms: bar.close_time,
-            });
-        (mark, live_stops(control, &session.id).await)
+        let mark = match last_primary_close_ms(session, events) {
+            Some(bound) => sessions
+                .latest_bar_at_or_before(&session.id, session.primary_timeframe, bound)
+                .await?
+                .map(|bar| MarkBar {
+                    price: bar.close,
+                    close_time_ms: bar.close_time,
+                }),
+            None => None,
+        };
+        let replayed_last_seq = events.last().map_or(0, PaperEvent::seq);
+        (
+            mark,
+            live_stops(control, &session.id, replayed_last_seq).await,
+        )
     } else {
         (None, None)
     };
     Ok(PaperPnl::derive(session, events, mark, stops)?)
 }
 
-/// The open position's live stops, when a runtime answers in time.
+/// The close time of the newest primary-timeframe bar the replayed log
+/// processed — the mark read's upper bound (r4.s4.w2). `None` when the log
+/// processed no primary bar: then there is no mark.
+fn last_primary_close_ms(session: &PaperSession, events: &[PaperEvent]) -> Option<i64> {
+    let primary = session.primary_timeframe;
+    events.iter().rev().find_map(|event| match event {
+        PaperEvent::BarProcessed { bars, .. } => bars
+            .iter()
+            .find(|bar| bar.timeframe == primary)
+            .map(|bar| bar.open_time + primary.duration_ms() - 1),
+        _ => None,
+    })
+}
+
+/// The open position's live stops, when a runtime answers in time AND its
+/// answer describes the log state this read replayed (r4.s4.w2): the reply's
+/// last committed seq must equal the replayed log's own last seq, or the
+/// stops describe a different position state and are dropped — the same
+/// degrade path as an absent or silent runtime. Never fails the read.
 async fn live_stops(
     control: Option<&PaperControl>,
     id: &PaperSessionId,
+    replayed_last_seq: i64,
 ) -> Option<OpenPositionStops> {
     let control = control?;
-    control.position(id.clone()).await.ok().flatten()
+    let answer = control.position(id.clone()).await.ok().flatten()?;
+    (answer.last_seq == replayed_last_seq).then_some(answer.stops)
 }
 
 /// One session's closed trades (with their USDT figures) and entries, or

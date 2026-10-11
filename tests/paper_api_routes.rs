@@ -1091,8 +1091,8 @@ async fn drive_to_open(
     for _ in 0..6_000 {
         host.clock.advance(SEED_BAR_MS);
         host.tick().await;
-        if let Ok(Some(stops)) = host.control.position(id.clone()).await {
-            return stops;
+        if let Ok(Some(reply)) = host.control.position(id.clone()).await {
+            return reply.stops;
         }
     }
     panic!("no open position within the fixture series");
@@ -1144,4 +1144,108 @@ async fn vii_the_summary_carries_the_live_stops_from_the_running_engine() {
     let newest = bars.last().expect("the session processed bars");
     assert_eq!(decimal_of(&open["mark_price"]), newest.close);
     assert_eq!(open["mark_time"], json!(millis_text(newest.close_time)));
+}
+
+// ---------------------------------------------------------------------------
+// (viii) the mark and the live stops describe the replayed log (r4.s4.w2)
+// ---------------------------------------------------------------------------
+
+/// The mark is the bar the replayed log last processed: a newer `paper_bar`
+/// row — the runtime's next bar landing between the events read and the mark
+/// read — is never the mark (it belongs to a log state the summary does not
+/// describe).
+#[tokio::test]
+async fn the_mark_never_jumps_past_the_logs_last_processed_bar() {
+    let ts = spawn_server(ServerOptions::default()).await;
+    let id = seed_open_session(&ts).await;
+    let paper = SqlitePaperSessionRepo::new(
+        ts.db.pool().clone(),
+        CandleStore::with_base_dir(ts.data_dir.clone()),
+    );
+    // The interleaving: the events read ends at the seeded log, while the
+    // store already holds the runtime's NEXT bar row (its log event still
+    // unread by that read).
+    let newer = seed_bar(SEED_T0 + 4 * SEED_BAR_MS, 60_900);
+    paper
+        .append_bar(&id, &[(Timeframe::M15, newer, false)], &[])
+        .await
+        .expect("append the newer row");
+
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    let open = &summary["open_position"];
+    assert_eq!(
+        decimal_of(&open["mark_price"]),
+        Decimal::from(60_050),
+        "the mark stays the replayed log's last processed bar"
+    );
+    assert_eq!(
+        open["mark_time"],
+        json!(millis_text(SEED_T0 + 4 * SEED_BAR_MS - 1)),
+        "the mark time is that bar's close, not the newer row's"
+    );
+}
+
+/// The live stops are shown only while the runtime's answer describes the same
+/// log state the read replayed: a runtime that committed fewer events than the
+/// read saw answers a lagging seq, and the read drops the stops — the reads
+/// before and after prove the drop is the mismatch, not a missing runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_stops_are_dropped_when_the_runtime_describes_another_log_state() {
+    let ts = paper_server().await;
+    let host = ts.paper.as_ref().expect("the paper seam is installed");
+    host.source
+        .script(Timeframe::M15, pulse::fixture_m15_candles());
+    let version_id = uncertified_version(&ts.db, "routes-stops-mismatch").await;
+    let response = post_promote(
+        &ts,
+        json!({
+            "version_id": version_id.as_str(),
+            "override": {
+                "reason": "stops mismatch",
+                "pair": "BTCUSDT",
+                "primary_timeframe": "15m",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let created: Value = response.json().await.expect("a json summary");
+    let id = PaperSessionId::new(created["id"].as_str().expect("id").to_owned());
+    drive_to_open(host, &id).await;
+
+    // While the read and the runtime hold the same log, the stops are shown.
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    assert!(
+        summary["open_position"]["initial_stop"].is_string(),
+        "the same log state shows the stops: {summary}"
+    );
+
+    // A log event the runtime never committed moves the replayed log ahead of
+    // the engine's state: the reply's seq no longer matches, so the stops are
+    // dropped and the read still answers.
+    host.paper()
+        .append_bar(
+            &id,
+            &[],
+            &[PaperEvent::DataEvent {
+                seq: 0,
+                at: millis_text(SEED_T0),
+                summary: "a log write the runtime did not commit".to_owned(),
+            }],
+        )
+        .await
+        .expect("append the event behind the runtime");
+
+    let response = get(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: Value = response.json().await.expect("a json summary");
+    let open = &summary["open_position"];
+    assert_eq!(open["initial_stop"], Value::Null, "{summary}");
+    assert_eq!(open["stop_price"], Value::Null);
+    assert_eq!(open["take_profit_price"], Value::Null);
+    assert_eq!(open["unrealized_r"], Value::Null, "no live stop, no R");
 }
