@@ -765,6 +765,14 @@ where
         self.inner.bars(session_id, timeframe).await
     }
 
+    async fn latest_bar(
+        &self,
+        session_id: &PaperSessionId,
+        timeframe: Timeframe,
+    ) -> Result<Option<Candle>, DataError> {
+        self.inner.latest_bar(session_id, timeframe).await
+    }
+
     async fn count_from_ms(&self, session_id: &PaperSessionId) -> Result<Option<i64>, DataError> {
         self.inner.count_from_ms(session_id).await
     }

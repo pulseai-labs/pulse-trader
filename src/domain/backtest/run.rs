@@ -243,6 +243,27 @@ pub struct OpenPositionMark {
     pub mark_price: Decimal,
 }
 
+/// One open position's stop geometry, as the live engine holds it (r4.s4.w1):
+/// the initial stop — the R denominator, fixed at fill — the current
+/// effective stop (the trailing stop tightens it bar by bar), and the
+/// declared take-profit when one exists.
+///
+/// This is a read-only projection of the engine's own position; it carries no
+/// behaviour and no history, and it is what
+/// [`EngineSession::open_position_stops`](crate::EngineSession::open_position_stops)
+/// answers the paper read's live-stops query with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenPositionStops {
+    /// The initial stop: the sizing basis and the whole position's R
+    /// denominator, fixed at fill.
+    pub initial_stop: Decimal,
+    /// The current effective stop every price check sees (a trailing stop
+    /// tightens it bar by bar).
+    pub stop_price: Decimal,
+    /// The declared take-profit, when the exit plan declares one.
+    pub take_profit_price: Option<Decimal>,
+}
+
 /// Why [`CandleWindow::new`] refused: an empty or backwards window is not a
 /// window.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

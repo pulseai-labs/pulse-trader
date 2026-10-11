@@ -887,6 +887,22 @@ pub trait PaperSessionRepository {
         timeframe: Timeframe,
     ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
 
+    /// The NEWEST recorded bar for a `timeframe`, when one exists — ONE row
+    /// (the session's mark-bar read, r4.s4.w1), never the whole table. The
+    /// read passes the session's primary timeframe, so this is the newest
+    /// primary bar; lead-in bars included, exactly as [`Self::bars`] orders
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt/un-parseable row or a store
+    /// failure.
+    fn latest_bar(
+        &self,
+        session_id: &crate::domain::paper::session::PaperSessionId,
+        timeframe: Timeframe,
+    ) -> impl Future<Output = Result<Option<Candle>, DataError>> + Send;
+
     /// The session's counted-span boundary: the `open_time` of the first
     /// primary-timeframe bar NOT flagged `lead_in` — or, while only lead-in
     /// bars are recorded, the `open_time` the next primary bar will have. `None`

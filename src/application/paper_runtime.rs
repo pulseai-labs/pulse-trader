@@ -904,6 +904,17 @@ where
                 let result = self.shadow_check_outcome(&session_id).await;
                 let _ = reply.send(result);
             }
+            PaperCommand::Position { session_id, reply } => {
+                // Read-only and in-memory: the attached session's engine, or
+                // nothing when this runtime does not hold it (flat included).
+                // No store read — a session it does not hold has no live
+                // state by definition (r4.s4.w1).
+                let stops = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.engine.open_position_stops());
+                let _ = reply.send(stops);
+            }
         }
     }
 

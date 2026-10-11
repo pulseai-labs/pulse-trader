@@ -581,8 +581,8 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // lookup's answer, beside the port method it belongs to.
 pub use domain::{
     BacktestInputs, BacktestRunId, BacktestRunRepository, CandleWindow, CandleWindowError,
-    FundingConfig, LatestReadableRun, OpenPositionMark, PersistedRun, RunSummary, SeriesEnd,
-    SnapshotSelection,
+    FundingConfig, LatestReadableRun, OpenPositionMark, OpenPositionStops, PersistedRun,
+    RunSummary, SeriesEnd, SnapshotSelection,
 };
 
 // r2.s3.w3: walk-forward as a run kind (`rolling-oos/v1` + `wf-v1`, ADR-0025) —
@@ -652,6 +652,11 @@ pub use application::paper_read::{
     session_events, session_summary, session_trades,
 };
 pub use domain::{ComparisonVerdict, OosComparison, comparison};
+
+// r4.s4.w1 (ADR-0027 addendum): the paper read's money view — the pure
+// derivation and its types (the entries, the per-trade figures, the marked
+// open position), re-exported for the same `deny(warnings)` reason.
+pub use domain::{MarkBar, PaperPnl, PaperPnlEntry, PaperPnlOpenPosition, PaperPnlTrade};
 
 // r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
 // `d11`). Re-exported because `tests/tauri_backtest.rs` injects post-save read

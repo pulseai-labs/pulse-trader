@@ -38,6 +38,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool_ha
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::db::Db;
 use crate::adapters::store::CandleStore;
+use crate::application::paper_control::PaperControl;
 
 use export::Exports;
 use identity::AgentIdentity;
@@ -71,6 +72,11 @@ pub(crate) struct PulseMcp {
     /// given. `Mutex`, not the handler: `ServerHandler` methods take `&self`.
     identity: Mutex<AgentIdentity>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
+    /// The paper runtime's control handle, when this handler runs BESIDE a
+    /// runtime (the `/mcp` mount `pulse serve` builds, r4.s4.w1): the paper
+    /// read tools then serve the running sessions' live stops (SPINE.md G6).
+    /// The stdio process holds no runtime and leaves it `None`.
+    paper_control: Option<PaperControl>,
 }
 
 impl PulseMcp {
@@ -79,7 +85,16 @@ impl PulseMcp {
             identity: Mutex::new(state.identity.clone()),
             state,
             tool_router: Self::tool_router(),
+            paper_control: None,
         }
+    }
+
+    /// The handler beside a paper runtime: carry the server's control handle
+    /// so the paper read tools answer with the live stops (r4.s4.w1). The
+    /// stdio transport's [`serve`] never calls this.
+    fn with_paper_control(mut self, control: Option<PaperControl>) -> Self {
+        self.paper_control = control;
+        self
     }
 
     fn identity_lock(&self) -> MutexGuard<'_, AgentIdentity> {

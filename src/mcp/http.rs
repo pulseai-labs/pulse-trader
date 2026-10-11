@@ -29,12 +29,17 @@ use crate::adapters::db::Db;
 use crate::adapters::store::CandleStore;
 
 /// The handles the `/mcp` mount needs from the server: the pool and the data
-/// dir — the same two the server itself was built over.
+/// dir — the same two the server itself was built over — and the paper
+/// runtime's control handle when the server holds one (r4.s4.w1: the `/mcp`
+/// mount runs beside the runtime, so its paper read tools answer with the
+/// running sessions' live stops).
 pub(crate) struct McpHttpDeps {
     /// The server's own pool (the one-pool rule).
     pub(crate) db: Db,
     /// The server's data dir: the candle store's root and the exports parent.
     pub(crate) data_dir: std::path::PathBuf,
+    /// The server's installed paper control handle, when a runtime runs.
+    pub(crate) paper_control: Option<crate::application::paper_control::PaperControl>,
 }
 
 /// Build the `/mcp` route: an agent-scoped [`StreamableHttpService`] over a
@@ -55,6 +60,7 @@ pub(crate) fn mcp_http_router(
     let exports = Arc::new(Exports::create(&deps.data_dir)?);
     let db = deps.db.clone();
     let data_dir = deps.data_dir.clone();
+    let paper_control = deps.paper_control.clone();
     let factory = move || {
         Ok(PulseMcp::new(McpState {
             db: db.clone(),
@@ -66,7 +72,8 @@ pub(crate) fn mcp_http_router(
             // protocol enforces that ordering for us.
             identity: AgentIdentity::resolve(None, None),
             exchange: BinanceAdapter::new(),
-        }))
+        })
+        .with_paper_control(paper_control.clone()))
     };
 
     // The bind policy (D6) is the Host control: the server never accepts

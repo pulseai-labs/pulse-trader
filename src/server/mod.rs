@@ -307,6 +307,14 @@ pub fn router(state: Arc<ServerState>) -> axum::Router {
     let mcp = crate::mcp::http::mcp_http_router(&crate::mcp::http::McpHttpDeps {
         db: state.db.clone(),
         data_dir: state.data_dir.clone(),
+        // The `/mcp` mount runs beside the paper runtime: when the server
+        // holds a live control handle, the paper read tools answer with the
+        // running sessions' live stops (r4.s4.w1, SPINE.md G6). A dead handle
+        // is filtered out exactly as the routes' `control_of` does.
+        paper_control: state
+            .paper_control
+            .clone()
+            .filter(crate::application::paper_control::PaperControl::is_available),
     })
     .unwrap_or_else(|error| panic!("mount /mcp: cannot create the exports directory: {error}"));
     let base = mount_scoped(base, &state, auth::Scope::Agent, "/mcp", mcp);

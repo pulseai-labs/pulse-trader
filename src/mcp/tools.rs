@@ -1644,7 +1644,7 @@ impl PulseMcp {
         };
         let paper = self.paper_repo();
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
-        let summaries = match list_summaries(&paper, &runs).await {
+        let summaries = match list_summaries(&paper, &runs, self.paper_control.as_ref()).await {
             Ok(summaries) => summaries,
             Err(error) => return Ok(tool_error(error)),
         };
@@ -1689,7 +1689,14 @@ impl PulseMcp {
         };
         let paper = self.paper_repo();
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
-        match session_summary(&paper, &runs, &PaperSessionId::new(args.session_id)).await {
+        match session_summary(
+            &paper,
+            &runs,
+            self.paper_control.as_ref(),
+            &PaperSessionId::new(args.session_id),
+        )
+        .await
+        {
             Ok(Some(summary)) => {
                 if let Err(result) = guard_paper_run_read(&self.state, holdout, &summary).await {
                     return Ok(result);
@@ -1736,7 +1743,14 @@ impl PulseMcp {
         };
         let paper = self.paper_repo();
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
-        match session_summary(&paper, &runs, &PaperSessionId::new(args.session_id)).await {
+        match session_summary(
+            &paper,
+            &runs,
+            self.paper_control.as_ref(),
+            &PaperSessionId::new(args.session_id),
+        )
+        .await
+        {
             Ok(Some(summary)) => {
                 if let Err(result) = guard_paper_run_read(&self.state, holdout, &summary).await {
                     return Ok(result);
