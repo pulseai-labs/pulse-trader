@@ -73,6 +73,12 @@ function session(over: Partial<PaperSessionSummary> = {}): PaperSessionSummary {
     epochs: [ENGINE],
     last_bar_open_time: "1738368900000",
     closed_trade_count: 4,
+    realized_usdt_total: "0",
+    realized_usdt_count: 0,
+    realized_r_total: "0",
+    realized_r_count: 0,
+    unrealized_usdt: null,
+    session_pnl_usdt: "0",
     open_position: null,
     shadow_checks: [identical()],
     certification_stale: false,
@@ -111,7 +117,9 @@ beforeEach(() => {
   paperSessionMock.mockImplementation((id: string) =>
     Promise.resolve(ok(session({ id }))),
   );
-  paperSessionTradesMock.mockResolvedValue(ok({ closed_trades: [], open_position: null }));
+  paperSessionTradesMock.mockResolvedValue(
+    ok({ closed_trades: [], open_position: null, entries: [] }),
+  );
   paperSessionEventsMock.mockImplementation(() => new Promise(() => {}));
   paperShadowCheckMock.mockResolvedValue(
     ok({ verdict: "identical", closed_trades: 0, open_position: false }),

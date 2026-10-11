@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The paper session's money view reaches the Mac app (r4.s4.w2).** The session detail now shows, all
+  from the server's own text: the running total (the Σ realized USDT and Σ R totals with their "n of
+  m" counts, the open position's unrealized USDT and the session P&L); the open position marked at
+  the last processed bar with its funding so far, entry fee, unrealized USDT and R and the running
+  engine's initial stop, current stop and take-profit (absent, with one note, when no engine answers);
+  the last processed bar (#340); every order and fill in log order, the entry fills included (#344);
+  and each closed trade's R, USDT, entry/exit fees and funding. The view refetches on every
+  `bar_processed` frame, so the marks and money figures move as bars arrive, and every figure is
+  rendered as it crosses — the app computes no money (G3, ADR-0020). `tests/tauri_paper.rs` is back to
+  its exact DTO-to-wire mirror, over a seeded session with an open position and a closed trade, with
+  the committed bindings regenerated; `scripts/paper-view-test.sh` is the new ledger line over the
+  mirror, the two UI test files and the bindings gate.
+
 - **The paper session's money view: every order and fill, each closed trade's net USDT, the open position
   marked at the last processed bar with its live stops, and the running totals (r4.s4.w1).** The read
   side (ADR-0027 addendum) derives every USDT figure from the log at the session's `taker_fee_bps` with

@@ -6,12 +6,10 @@
 //! deeper:
 //!
 //! - (i) each of the eight commands calls its route and decodes the response
-//!   into its DTO, field for field (the DTO's own serialization is compared
-//!   against the route's raw JSON as a recursive subset: every field the DTO
-//!   carries must be present and equal — the route may carry additive fields
-//!   the DTO mirrors one round later, ADR-0026; r4.s4.w2 restores the exact
-//!   mirror with r4.s4.w1's money view — with the one wire shape the DTO
-//!   carries as exact text normalized);
+//!   into its DTO, field for field — the DTO's own serialization equals the
+//!   route's raw JSON exactly (r4.s4.w2 restored the exact mirror over
+//!   r4.s4.w1's money view, ADR-0026), with the one wire shape the DTO
+//!   carries as exact text normalized;
 //! - (ii) every paper error code decodes to its `BusErrorCode`,
 //!   `unknown_version`/`unknown_session` map to `not_found`, and E2's message
 //!   keeps both fingerprints;
@@ -20,7 +18,11 @@
 //!   (driven over a raw TCP stub, the `client_proxy.rs` wire-stub precedent);
 //!   revocation emits a terminal `TokenRefused` and stops; a dropped channel
 //!   stops the reader;
-//! - (iv) `paper_stop_all` returns every failure, never a bare success.
+//! - (iv) `paper_stop_all` returns every failure, never a bare success;
+//! - (v) the exact mirror over a seeded session that holds an open position
+//!   and a closed trade — the marked position, each trade's money fields and
+//!   the entries array are inside the comparison (the
+//!   `paper_api_routes.rs` seeded fixture, no runtime in the process).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 
 mod support;
@@ -29,13 +31,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pulse::{
-    BusError, BusErrorCode, CandleStore, ClientState, ConnectOutcome, CreatedBy, Db, NewVersion,
-    NonEmptyLabel, PaperEvent, PaperEventFrame, PaperJsonText, PaperSessionId,
-    PaperSessionRepository, PaperStreamEvent, PaperStreamSink, PromoteOverride, PromoteRequest,
-    RetryBackoff, ServerClient, SqliteBacktestRunRepo, SqliteClientTokenRepo,
-    SqlitePaperSessionRepo, SqliteStrategyRepo, StopActor, StrategyRepository, Timeframe,
-    VersionId, WalkForwardRunDraft, WalkForwardRunRepository, promote,
+    BarRef, BusError, BusErrorCode, Candle, CandleStore, ClientState, ConnectOutcome, CreatedBy,
+    Db, EngineFingerprint, Graduation, NewVersion, NonEmptyLabel, NonEmptyReason, Pair, PaperEvent,
+    PaperEventFrame, PaperJsonText, PaperSessionDraft, PaperSessionId, PaperSessionRepository,
+    PaperSide, PaperStreamEvent, PaperStreamSink, PromoteOverride, PromoteRequest, RetryBackoff,
+    ServerClient, SqliteBacktestRunRepo, SqliteClientTokenRepo, SqlitePaperSessionRepo,
+    SqliteStrategyRepo, StopActor, StrategyRepository, Timeframe, VersionId, WalkForwardRunDraft,
+    WalkForwardRunRepository, promote,
 };
+use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Value, json};
 use support::mcp::seeded_walk_forward_draft;
@@ -351,15 +355,16 @@ async fn post_json(ts: &TestServer, path: &str) -> Value {
     response.json().await.expect("a json body")
 }
 
-/// The DTO's own serialization must equal the route's raw JSON on every field
-/// the DTO carries — as a recursive SUBSET, because the server's reads grow
-/// additive fields the mirror picks up one round later (ADR-0026; r4.s4.w1's
-/// money view lands in `src/tauri/paper.rs` in r4.s4.w2, so until then the
-/// route may carry keys the DTO does not mirror). Values still compare
-/// exactly, and a DTO key the route does not carry fails here. The one
+/// The DTO's own serialization must equal the route's raw JSON **exactly**:
+/// every key the DTO carries and every key the route sends, each value equal
+/// (r4.s4.w2 restored the exact mirror over r4.s4.w1's money view, replacing
+/// the additive-subset check the split had to leave behind). The one
 /// normalization: `last_bar_open_time` is epoch milliseconds on the wire and
 /// exact integer text in the DTO (specta refuses `i64`), so the raw number is
-/// rendered as its text before the comparison.
+/// rendered as its text before the comparison. No other normalization is
+/// needed — any other epoch-ms integer the wire carried would be normalized
+/// the same way here, and the mark and fill instants cross as RFC3339 text on
+/// both sides already.
 fn assert_mirrors<T: Serialize>(dto: &T, raw: &Value) {
     let mut expected = raw.clone();
     if let Some(ms) = expected
@@ -370,34 +375,55 @@ fn assert_mirrors<T: Serialize>(dto: &T, raw: &Value) {
         expected["last_bar_open_time"] = json!(ms);
     }
     let dto_value = serde_json::to_value(dto).expect("the DTO serializes");
-    assert_json_subset(&dto_value, &expected, "the DTO's JSON");
+    if let Some(difference) = mirror_difference(&dto_value, &expected, "the DTO's JSON") {
+        panic!("the DTO must mirror the route exactly: {difference}");
+    }
 }
 
-/// Every key/element the `dto` side carries must exist on the `raw` side with
-/// exactly the same value; `raw` may carry additional keys (the additive
-/// fields a later round mirrors). The `last_bar_open_time` normalization
-/// rides at the top level only — the field exists on no nested object.
-fn assert_json_subset(dto: &Value, raw: &Value, path: &str) {
+/// The first place `dto` and `raw` disagree — a key only one side carries, an
+/// array length, or a leaf value — or `None` when the two documents are
+/// equal. Objects compare by content, so key order never matters.
+fn mirror_difference(dto: &Value, raw: &Value, path: &str) -> Option<String> {
     match (dto, raw) {
         (Value::Object(dto_object), Value::Object(raw_object)) => {
             for (key, value) in dto_object {
-                let raw_value = raw_object
-                    .get(key)
-                    .unwrap_or_else(|| panic!("{path}: the route carries no `{key}`"));
-                assert_json_subset(value, raw_value, &format!("{path}.{key}"));
+                match raw_object.get(key) {
+                    None => return Some(format!("{path}: the route carries no `{key}`")),
+                    Some(raw_value) => {
+                        if let Some(difference) =
+                            mirror_difference(value, raw_value, &format!("{path}.{key}"))
+                        {
+                            return Some(difference);
+                        }
+                    }
+                }
             }
+            for key in raw_object.keys() {
+                if !dto_object.contains_key(key) {
+                    return Some(format!(
+                        "{path}: the DTO does not mirror the route's `{key}`"
+                    ));
+                }
+            }
+            None
         }
         (Value::Array(dto_items), Value::Array(raw_items)) => {
-            assert_eq!(
-                dto_items.len(),
-                raw_items.len(),
-                "{path}: the DTO and the route disagree on the length"
-            );
-            for (index, (dto_item, raw_item)) in dto_items.iter().zip(raw_items).enumerate() {
-                assert_json_subset(dto_item, raw_item, &format!("{path}[{index}]"));
+            if dto_items.len() != raw_items.len() {
+                return Some(format!(
+                    "{path}: the DTO and the route disagree on the length ({} vs {})",
+                    dto_items.len(),
+                    raw_items.len()
+                ));
             }
+            dto_items
+                .iter()
+                .zip(raw_items)
+                .enumerate()
+                .find_map(|(index, (dto_item, raw_item))| {
+                    mirror_difference(dto_item, raw_item, &format!("{path}[{index}]"))
+                })
         }
-        (dto, raw) => assert_eq!(dto, raw, "{path}"),
+        (dto, raw) => (dto != raw).then(|| format!("{path}: {dto} != {raw}")),
     }
 }
 
@@ -1157,4 +1183,213 @@ fn the_frame_payload_is_the_events_json_text() {
     let payload: Value =
         serde_json::from_str(value["payload"].as_str().expect("text")).expect("json");
     assert_eq!(payload["seq"], json!(7));
+}
+
+// ---------------------------------------------------------------------------
+// (v) the money view — the exact mirror over a seeded session
+// ---------------------------------------------------------------------------
+
+/// One M15 bar in milliseconds.
+const SEED_BAR_MS: i64 = 900_000;
+
+/// The seeded log's first bar open — 8-hour aligned.
+const SEED_T0: i64 = 1_735_689_600_000;
+
+/// The default token fee the seeded session runs at (A1), bps.
+const SEED_FEE_BPS: i64 = 4;
+
+/// An instant, rendered the way the runtime stamps events.
+fn millis_text(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+/// One M15 bar on the fixture grid.
+fn seed_bar(open_time: i64, close: i64) -> Candle {
+    Candle {
+        open_time,
+        close_time: open_time + SEED_BAR_MS - 1,
+        open: Decimal::from(close),
+        high: Decimal::from(close + 10),
+        low: Decimal::from(close - 10),
+        close: Decimal::from(close),
+        volume: Decimal::from(1),
+        funding_rate: None,
+    }
+}
+
+/// A `bar_processed` event for one M15 bar.
+fn bar_processed(open_time: i64) -> PaperEvent {
+    PaperEvent::BarProcessed {
+        seq: 0,
+        at: millis_text(open_time),
+        bars: vec![BarRef {
+            timeframe: Timeframe::M15,
+            open_time,
+        }],
+    }
+}
+
+/// An `order` event at one grid instant.
+fn order_at(at: i64, qty: Decimal) -> PaperEvent {
+    PaperEvent::Order {
+        seq: 0,
+        at: millis_text(at),
+        side: PaperSide::Long,
+        qty,
+    }
+}
+
+/// A `fill` event at one grid instant (long, no engine fill time).
+fn fill_at(
+    at: i64,
+    qty: Decimal,
+    price: i64,
+    exit_reason: Option<pulse::ExitReason>,
+    realized_r: Option<Decimal>,
+) -> PaperEvent {
+    PaperEvent::Fill {
+        seq: 0,
+        at: millis_text(at),
+        side: PaperSide::Long,
+        qty,
+        price: Decimal::from(price),
+        exit_reason,
+        realized_r,
+        fill_time_ms: None,
+    }
+}
+
+/// A `funding` event at one grid instant.
+fn funding_at(at: i64, amount: Decimal) -> PaperEvent {
+    PaperEvent::Funding {
+        seq: 0,
+        at: millis_text(at),
+        rate: Decimal::new(1, 5),
+        amount,
+    }
+}
+
+/// Seed a session whose log holds ONE closed trade (its funding accrued on a
+/// step the position was open for) and ONE standing long — the read's money
+/// view with no runtime in the process (the `paper_api_routes.rs` (vi)
+/// fixture, reused here so the exact mirror runs over money, not over empty
+/// arrays).
+async fn seed_money_session(ts: &TestServer) -> PaperSessionId {
+    let version = uncertified_version(&ts.db, "w2-mirror").await;
+    let paper = SqlitePaperSessionRepo::new(
+        ts.db.pool().clone(),
+        CandleStore::with_base_dir(ts.data_dir.clone()),
+    );
+    let session = paper
+        .insert_session(&PaperSessionDraft {
+            strategy_version_id: version,
+            pair: Pair::new("BTCUSDT"),
+            primary_timeframe: Timeframe::M15,
+            htf_timeframe: None,
+            uses_d1: false,
+            starting_equity: Decimal::from(10_000),
+            taker_fee_bps: Decimal::from(SEED_FEE_BPS),
+            slippage_bps: Decimal::from(1),
+            engine_fingerprint: EngineFingerprint::current(),
+            graduation: Graduation::Override {
+                reason: NonEmptyReason::try_new("w2 seeded mirror").expect("non-empty"),
+                at: millis_text(SEED_T0),
+            },
+            fixture: false,
+            min_trades: 20,
+            promoted_by: NonEmptyLabel::try_new("seed-token").expect("non-empty"),
+        })
+        .await
+        .expect("insert the seeded session");
+
+    let t0 = SEED_T0;
+    let t1 = t0 + SEED_BAR_MS;
+    let t2 = t0 + 2 * SEED_BAR_MS;
+    let t3 = t0 + 3 * SEED_BAR_MS;
+    let events = vec![
+        // Step 0: the entry (qty 1 at 60000).
+        bar_processed(t0),
+        order_at(t0, Decimal::ONE),
+        fill_at(t0, Decimal::ONE, 60_000, None, None),
+        // Step 1: the funding on the open position (its funding so far).
+        bar_processed(t1),
+        funding_at(t1, Decimal::new(-6, 1)),
+        // Step 2: the exit (qty 1 at 60100, +1R).
+        bar_processed(t2),
+        fill_at(
+            t2,
+            Decimal::ONE,
+            60_100,
+            Some(pulse::ExitReason::TakeProfit),
+            Some(Decimal::ONE),
+        ),
+        // Step 3: the standing entry (qty 0.5 at 59900) — the open position.
+        bar_processed(t3),
+        order_at(t3, Decimal::new(5, 1)),
+        fill_at(t3, Decimal::new(5, 1), 59_900, None, None),
+    ];
+
+    let bars = vec![
+        (Timeframe::M15, seed_bar(t0, 60_000), false),
+        (Timeframe::M15, seed_bar(t1, 60_050), false),
+        (Timeframe::M15, seed_bar(t2, 60_100), false),
+        (Timeframe::M15, seed_bar(t3, 60_050), false),
+    ];
+    paper
+        .append_bar(&session.id, &bars, &events)
+        .await
+        .expect("append the seeded batch");
+    session.id
+}
+
+/// The exact mirror over a seeded session with an open position and a closed
+/// trade: the summary's marked position and running totals, and the trades'
+/// entries and per-trade money fields, are compared field for field against
+/// the routes' own JSON (the one normalization is `last_bar_open_time`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v_the_exact_mirror_over_a_seeded_session_with_a_position_and_a_trade() {
+    let ts = paper_server().await;
+    let state = paper_state(&ts).await;
+    let id = seed_money_session(&ts).await;
+
+    let one = state.paper_session(id.as_str()).await.expect("get decodes");
+    let raw = get_json(&ts, &format!("/api/v1/paper/sessions/{}", id.as_str())).await;
+    assert_mirrors(&one, &raw);
+    assert_eq!(
+        raw["closed_trade_count"],
+        json!(1),
+        "the seeded log holds one closed trade: {raw}"
+    );
+    assert_eq!(
+        raw["realized_usdt_count"],
+        json!(1),
+        "the closed trade's USDT is derivable: {raw}"
+    );
+    assert!(
+        raw["open_position"]["mark_price"].is_string(),
+        "the seeded bars mark the open position: {raw}"
+    );
+    assert!(
+        raw["open_position"]["initial_stop"].is_null(),
+        "no runtime answered, so the stops are absent: {raw}"
+    );
+
+    let trades = state
+        .paper_session_trades(id.as_str())
+        .await
+        .expect("trades decode");
+    let raw_trades = get_json(
+        &ts,
+        &format!("/api/v1/paper/sessions/{}/trades", id.as_str()),
+    )
+    .await;
+    assert_mirrors(&trades, &raw_trades);
+    let entries = raw_trades["entries"].as_array().expect("an entries array");
+    assert_eq!(
+        entries.len(),
+        5,
+        "every order and fill, in log order, the entry fills included: {raw_trades}"
+    );
 }

@@ -1,12 +1,13 @@
-// The paper-session stream hook (r3.s4.w5, spec §4).
+// The paper-session stream hook (r3.s4.w5, spec §4; per-bar refetch r4.s4.w2).
 //
 // One channel per invocation (`paper_session_events`), the `useComposeRun`
 // precedent: the hook reads the summary once, subscribes, folds frames into
-// the view, and re-reads the summary on the three events that change it —
-// `shadow_checked`, `stop` and `engine_upgraded`. A frame whose seq is at or
-// below the last one is DROPPED: the server resumes from `Last-Event-ID`, and
-// a resumed stream may replay its boundary, so the duplicate must not reach
-// the view twice.
+// the view, and re-reads the summary on the events that change it —
+// `bar_processed` (every processed bar moves the mark and the money view),
+// `fill`, `funding`, `shadow_checked`, `stop` and `engine_upgraded`. A frame
+// whose seq is at or below the last one is DROPPED: the server resumes from
+// `Last-Event-ID`, and a resumed stream may replay its boundary, so the
+// duplicate must not reach the view twice.
 //
 // `shadowBars` is the latest LIVE-epoch `shadow_checked` frame's `bar_count` —
 // the only place that count exists (`ShadowResult` itself carries just the
@@ -50,6 +51,9 @@ export interface PaperSessionView {
 
 /** The event types that change the summary. */
 const REFETCH_TYPES: Record<string, true> = {
+  // A processed bar moves the mark and every money figure (G4: the view
+  // updates as bars arrive).
+  bar_processed: true,
   // A fill opens or closes the position (`open_position`, the closed trades);
   // a funding payment moves `funding_total`. An `order` is a signal only.
   fill: true,

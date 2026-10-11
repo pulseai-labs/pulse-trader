@@ -407,6 +407,10 @@
   padding: var(--sp-4);
 }
 .drawer-section { display: flex; flex-direction: column; gap: var(--sp-2); }
+/* The orders-and-fills and closed-trades tables are wider than the drawer:
+   they scroll inside their own section rather than clipping at its edge
+   (the trade-log clipping class of #288). */
+.table-scroll { overflow-x: auto; }
 .dmeta { gap: var(--sp-1); }
 .dm-row { display: flex; gap: var(--sp-2); font-size: var(--fs-12); }
 .dm-k { flex: 0 0 72px; color: var(--text-3); }
@@ -445,6 +449,7 @@
 }
 .ps-item { display: flex; flex-direction: column; }
 .ps-val { font-size: var(--fs-13); }
+.ps-count { font-size: var(--fs-11); color: var(--text-3); }
 .drawer-foot {
   display: flex;
   align-items: center;

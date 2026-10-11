@@ -45,6 +45,12 @@ function summary(): PaperSessionSummary {
     epochs: [ENGINE],
     last_bar_open_time: null,
     closed_trade_count: 0,
+    realized_usdt_total: "0",
+    realized_usdt_count: 0,
+    realized_r_total: "0",
+    realized_r_count: 0,
+    unrealized_usdt: null,
+    session_pnl_usdt: "0",
     open_position: null,
     shadow_checks: [],
     certification_stale: false,
@@ -110,23 +116,30 @@ describe("usePaperSession", () => {
     expect(result.current.lastSeq).toBe(3);
   });
 
-  it("re-fetches the summary on fill, funding, shadow_checked, stop and engine_upgraded", async () => {
+  it("re-fetches the summary on a processed bar", async () => {
     const { result } = renderHook(() => usePaperSession("s-1"));
     await waitFor(() => expect(result.current.summary).not.toBeNull());
     expect(paperSessionMock).toHaveBeenCalledTimes(1);
 
-    const types = [
-      "bar_processed",
-      "order",
-      "fill",
-      "funding",
-      "shadow_checked",
-      "stop",
-      "engine_upgraded",
-    ];
+    // Every processed bar moves the mark and the running total (G4), so the
+    // summary (and the trades that follow it) re-reads per bar.
+    push(frame(1, "bar_processed"));
+    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("re-fetches the summary on each event that moves it", async () => {
+    const { result } = renderHook(() => usePaperSession("s-1"));
+    await waitFor(() => expect(result.current.summary).not.toBeNull());
+    expect(paperSessionMock).toHaveBeenCalledTimes(1);
+
+    const types = ["fill", "funding", "shadow_checked", "stop", "engine_upgraded"];
     types.forEach((type, index) => push(frame(index + 1, type)));
-    // bar_processed and order change no summary field: five re-fetches.
     await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(6));
+
+    // An `order` is a signal only: it folds, and re-fetches nothing.
+    push(frame(types.length + 1, "order"));
+    await waitFor(() => expect(result.current.lastSeq).toBe(types.length + 1));
+    expect(paperSessionMock).toHaveBeenCalledTimes(6);
   });
 
   it("drops the live-epoch bar count when a new epoch opens", async () => {
