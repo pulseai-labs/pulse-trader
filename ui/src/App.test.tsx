@@ -496,4 +496,49 @@ describe("<App /> keeps an operation alive across navigation (#141)", () => {
     expect(await screen.findByText("run-landed-while-away")).toBeTruthy();
     expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
   });
+
+  // r4.s3 fix round (B2): the Connect detour is not a remount of the provider
+  // either. `ActiveOperationsProvider` used to wrap only the app branch, so
+  // opening Connect over a live app unmounted it and dropped the in-flight
+  // record (and its single-flight latch) on the floor.
+  it("keeps the operation record alive across the Connect screen", async () => {
+    let settle!: (value: { status: "ok"; data: BacktestRunDto }) => void;
+    const pending = new Promise<{ status: "ok"; data: BacktestRunDto }>((resolve) => {
+      settle = resolve;
+    });
+    vi.mocked(commands.runBacktestVersion).mockReturnValue(pending);
+
+    setHash("#/backtest");
+    const { container } = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+
+    // Open Connect over the live app — the "Change server" entry, whose Back
+    // button is the way out — and watch the app branch actually give way.
+    await act(async () => {
+      setHash("#/settings");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Change server" }));
+    expect(screen.getByRole("heading", { name: "Connect to your Pulse server" })).toBeTruthy();
+    expect(container.querySelector(".sidebar")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Back to the app" }));
+
+    // Back on the app branch: the record is STILL there — the Lab shows the run
+    // still running and nothing was invoked again by the detour.
+    await act(async () => {
+      setHash("#/backtest");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(await screen.findByText(/running the backtest/i)).toBeTruthy();
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+
+    // And the result lands in the SAME store: no re-run, no lost channel.
+    await act(async () => {
+      settle({ status: "ok", data: LANDED_RUN });
+      await pending;
+    });
+    expect(await screen.findByText("run-landed-while-away")).toBeTruthy();
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+  });
 });

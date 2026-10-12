@@ -196,21 +196,29 @@ export function App() {
     return null;
   }
   const gated = gateDecision(serverStatus, gateMemory) === "gated";
+  // r4.s3 fix round (B2): the provider wraps both of the SCREEN returns (this
+  // Connect branch and the app branch below), not just the app one. Opening
+  // Connect over a live app used to unmount it — and with it every in-flight
+  // backtest / walk-forward / coach record and its single-flight latch. React
+  // reconciles by position and type, so the same provider element at the root
+  // of either branch stays mounted across the switch.
   if (gated || connectOpen) {
     return (
-      <WindowChrome docTitle="Connect">
-        <ConnectScreen
-          status={serverStatus}
-          onConnected={() => {
-            // Opening the app: leave the override and re-poll so the gate lifts.
-            setConnectOpen(false);
-            refreshStatus();
-          }}
-          // Only the "Change server" entry has somewhere to go back to; the
-          // gate itself is the floor of the app.
-          onBack={gated ? undefined : () => setConnectOpen(false)}
-        />
-      </WindowChrome>
+      <ActiveOperationsProvider>
+        <WindowChrome docTitle="Connect">
+          <ConnectScreen
+            status={serverStatus}
+            onConnected={() => {
+              // Opening the app: leave the override and re-poll so the gate lifts.
+              setConnectOpen(false);
+              refreshStatus();
+            }}
+            // Only the "Change server" entry has somewhere to go back to; the
+            // gate itself is the floor of the app.
+            onBack={gated ? undefined : () => setConnectOpen(false)}
+          />
+        </WindowChrome>
+      </ActiveOperationsProvider>
     );
   }
 
