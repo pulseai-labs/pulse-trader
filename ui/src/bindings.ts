@@ -180,14 +180,16 @@ export const commands = {
 	getBacktestRun: (request: GetBacktestRunRequest) => typedError<BacktestRunDto, BusError>(__TAURI_INVOKE("get_backtest_run", { request })),
 	/**
 	 *  Connect the app to the server: handshake first, then persist the
-	 *  connection file and swap the connection on success. The named outcome
+	 *  connection — the token in the macOS Keychain, the URL in the connection
+	 *  file — and swap the connection on success. The named outcome
 	 *  (`connected` / `unreachable` / `token_refused` / `skew`) is what the
 	 *  Connect screen renders; a `token_refused`/`skew` ALSO records the refusal
 	 *  as the connection state, so `server_status` repeats it.
 	 * 
-	 *  The token argument never appears in an error, a log line, or the
-	 *  connection file's directory listing — it is written `0600` to the
-	 *  connection file beside `server-connection.toml`, and nowhere else.
+	 *  The token argument never crosses back to the frontend, never appears in an
+	 *  error, an outcome or a log line, and is written nowhere but the Keychain
+	 *  item G1 pins; every write logs one line naming that item and its outcome,
+	 *  never the value.
 	 * 
 	 *  The `Result` shell is tauri's rule for async commands taking managed state
 	 *  (a reference input); the outcome carries every failure, so the error arm is

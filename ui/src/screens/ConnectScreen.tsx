@@ -29,12 +29,14 @@ import { commands } from "../bindings";
 import type { ConnectOutcome, ServerStatus } from "../bindings";
 
 /**
- * The one storage sentence (spec §Approach 1). It is written ONCE, here, so w2
- * edits one line when the token moves into its real store. Nothing else in the
- * UI names storage, and no storage mechanism is named anywhere in the frontend.
+ * The one storage sentence (spec §Approach 1). It is written ONCE, here —
+ * r4.s3.w2 moved the token into the macOS Keychain and edited exactly this
+ * line. Nothing else in the UI names storage, and no storage mechanism is named
+ * anywhere in the frontend — the Keychain account name itself never appears
+ * under `ui/src` (AC-8).
  */
 export const STORAGE_NOTE =
-  "Stored on this Mac: the server address and a revocable app token. Nothing else.";
+  "Stored on this Mac: the server address, and a revocable app token in the macOS Keychain. Nothing else.";
 
 /** The command a trader runs on the server to issue (or re-issue) an app token. */
 const ISSUE_TOKEN_COMMAND = "pulse token issue --scope app --label <name>";

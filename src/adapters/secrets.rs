@@ -75,6 +75,18 @@ const KEYCHAIN_SERVICE: &str = "PulseTrader";
 /// The Keychain account (item name) for the GLM API key.
 const GLM_API_KEY_ACCOUNT: &str = "glm_api_key";
 
+/// The Keychain account (item name) of the app token (r4.s3.w2, G1). The UI
+/// never names it (AC-8); the audit lines and refusal reasons do. Not a secret,
+/// and a name of its own on purpose: the app token is a separate item from the
+/// GLM key and from the identity probe.
+pub(crate) const APP_TOKEN_ACCOUNT: &str = "server_app_token";
+
+/// The app token item's display name (`PulseTrader/server_app_token`), so the
+/// audit line, the reasons and the entry construction cannot drift apart.
+pub(crate) fn app_token_item() -> String {
+    format!("{KEYCHAIN_SERVICE}/{APP_TOKEN_ACCOUNT}")
+}
+
 /// Read the GLM API key from the macOS Keychain (FR-1 / NFR-5).
 ///
 /// Returns an opaque [`ApiKey`] tagged [`CredentialSource::Keychain`] (r1.s1.w2
@@ -988,6 +1000,76 @@ fn probe_delete_in(entry: &Entry) -> Result<(), LlmError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// r4.s3.w2 — the app token's store adapter (G5): the production `TokenStore`
+// over the SAME `keyring` path the probe above proves. Split at the store
+// boundary exactly like the probe (`*_in` take an `Entry`), so the unit tests
+// drive a mock credential and no test ever reaches a real Keychain.
+// ---------------------------------------------------------------------------
+
+/// The production token store: the `PulseTrader`/`server_app_token` item on the
+/// platform keychain (the mock store on Linux QA, per r4.s3.w1).
+#[derive(Debug, Default)]
+pub(crate) struct KeychainTokenStore;
+
+impl crate::client::token_store::TokenStore for KeychainTokenStore {
+    fn read(&self) -> Result<Option<String>, String> {
+        token_read_in(&app_token_entry()?)
+    }
+
+    fn write(&self, token: &str) -> Result<(), String> {
+        token_write_in(&app_token_entry()?, token)
+    }
+
+    fn delete(&self) -> Result<(), String> {
+        token_delete_in(&app_token_entry()?)
+    }
+}
+
+/// Open the app token item — the only `Entry` this path can build.
+fn app_token_entry() -> Result<Entry, String> {
+    Entry::new(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT).map_err(|error| {
+        format!(
+            "could not open the Keychain item {}: {error}",
+            app_token_item()
+        )
+    })
+}
+
+/// Read the item. `NoEntry` is ABSENCE (`Ok(None)`), every other error is a
+/// named refusal — the client's start-up rule needs the two apart.
+fn token_read_in(entry: &Entry) -> Result<Option<String>, String> {
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "could not read the Keychain item {}: {error}",
+            app_token_item()
+        )),
+    }
+}
+
+/// Write (overwrite) the item; the reason names the item, never the value.
+fn token_write_in(entry: &Entry, token: &str) -> Result<(), String> {
+    entry.set_password(token).map_err(|error| {
+        format!(
+            "could not write the Keychain item {}: {error}",
+            app_token_item()
+        )
+    })
+}
+
+/// Delete the item. An absent item is already the goal.
+fn token_delete_in(entry: &Entry) -> Result<(), String> {
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!(
+            "could not delete the Keychain item {}: {error}",
+            app_token_item()
+        )),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1294,5 +1376,96 @@ mod probe_tests {
         assert_ne!(KEYCHAIN_PROBE_ACCOUNT, GLM_API_KEY_ACCOUNT);
         assert_ne!(KEYCHAIN_PROBE_ACCOUNT, "server_app_token");
         assert!(!KEYCHAIN_PROBE_MARKER.is_empty());
+    }
+}
+
+/// The r4.s3.w2 app-token store's own tests — **against the mock store, never a
+/// real Keychain** (the probe tests' discipline, same `*_in` seam): keyring
+/// 3.6.3's mock is entry-local, so the round trip is pinned on ONE entry, and
+/// the cross-build read-back is AC-U1's on the `MacBook`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod token_store_tests {
+    use keyring::Entry;
+    use keyring::mock;
+
+    use super::{
+        APP_TOKEN_ACCOUNT, GLM_API_KEY_ACCOUNT, KEYCHAIN_PROBE_ACCOUNT, KEYCHAIN_SERVICE,
+        app_token_item, token_delete_in, token_read_in, token_write_in,
+    };
+
+    /// A fixed, non-secret stand-in for the app token.
+    const TEST_TOKEN: &str = "pt_w2_mock_app_token";
+
+    /// A mock credential for the app token item, as an `Entry` the seam
+    /// functions take.
+    fn mock_token_entry() -> Entry {
+        let credential = mock::default_credential_builder()
+            .build(None, KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT)
+            .expect("build a mock credential for the app token item");
+        Entry::new_with_credential(credential)
+    }
+
+    #[test]
+    fn write_then_read_round_trips() {
+        let entry = mock_token_entry();
+        token_write_in(&entry, TEST_TOKEN).expect("write the token");
+        assert_eq!(
+            token_read_in(&entry).expect("read it back"),
+            Some(TEST_TOKEN.to_owned())
+        );
+    }
+
+    #[test]
+    fn read_without_an_item_is_absence_not_an_error() {
+        let entry = mock_token_entry();
+        assert_eq!(
+            token_read_in(&entry).expect("absence is not a failure"),
+            None,
+            "no item is `Ok(None)`, never `Err`"
+        );
+    }
+
+    #[test]
+    fn delete_without_an_item_is_success() {
+        let entry = mock_token_entry();
+        token_delete_in(&entry).expect("an absent item is already the goal");
+    }
+
+    #[test]
+    fn delete_removes_the_item() {
+        let entry = mock_token_entry();
+        token_write_in(&entry, TEST_TOKEN).expect("write");
+        token_delete_in(&entry).expect("delete");
+        assert_eq!(token_read_in(&entry).expect("read after delete"), None);
+    }
+
+    #[test]
+    fn a_store_error_names_the_item_and_never_the_value() {
+        let entry = mock_token_entry();
+        let mock: &mock::MockCredential = entry
+            .get_credential()
+            .downcast_ref()
+            .expect("the entry carries the mock credential");
+        mock.set_error(keyring::Error::Invalid(
+            "the store refused".to_owned(),
+            "set by the test".to_owned(),
+        ));
+        let error = token_write_in(&entry, TEST_TOKEN).expect_err("a store error is a refusal");
+        assert!(
+            error.contains(&app_token_item()),
+            "the refusal names the item: {error}"
+        );
+        assert!(
+            !error.contains(TEST_TOKEN),
+            "the refusal never carries the value: {error}"
+        );
+    }
+
+    #[test]
+    fn the_app_token_account_is_its_own_and_never_a_credential_account() {
+        assert_ne!(APP_TOKEN_ACCOUNT, GLM_API_KEY_ACCOUNT);
+        assert_ne!(APP_TOKEN_ACCOUNT, KEYCHAIN_PROBE_ACCOUNT);
+        assert_eq!(app_token_item(), "PulseTrader/server_app_token");
     }
 }

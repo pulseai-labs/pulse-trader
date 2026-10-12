@@ -34,10 +34,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulse::{
-    BusErrorCode, ClientState, CompareChildRunRequest, ConnectOutcome, CredentialStatus,
-    LibraryOverview, RunOpOutcome, ServerClient, ServerStatusState, ShellInfo, StreamOutcome,
-    compare_child_run_core, compose_strategy_body, library_overview_core, llm_credential_status,
-    shell_info_core,
+    BusErrorCode, ClientState, ClientWiring, CompareChildRunRequest, ConnectOutcome,
+    CredentialStatus, InMemoryTokenStore, LibraryOverview, RunOpOutcome, ServerClient,
+    ServerStatusState, ShellInfo, StreamOutcome, compare_child_run_core, compose_strategy_body,
+    library_overview_core, llm_credential_status, shell_info_core,
 };
 
 /// Serializes the tests that set or read `$PULSE_CONFIG_DIR` — the
@@ -919,9 +919,10 @@ async fn a_millisecond_backoff_policy_makes_the_resume_fast() {
 // with mcp-connection.toml BESIDE it (login's output, read by the relay)
 // ---------------------------------------------------------------------------
 
-/// A good connect persists THE APP'S OWN file — `server-connection.toml`,
-/// mode 0600, holding `{ url, token }` — and never touches
-/// `mcp-connection.toml` (that one is `pulse mcp login`'s artifact).
+/// A good connect persists THE APP'S OWN file — `server-connection.toml`, mode
+/// 0600, holding `{ url }` ONLY (r4.s3.w2: the token lives in the token store,
+/// never in this file) — and never touches `mcp-connection.toml` (that one is
+/// `pulse mcp login`'s artifact).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -936,11 +937,20 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
         std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
     }
 
-    let state = ClientState::new();
+    // The in-memory fake replaces the Keychain adapter: no real Keychain on any
+    // platform, and the store's contents are the test's to assert.
+    let store = Arc::new(InMemoryTokenStore::default());
+    let wiring = ClientWiring::with_store(store.clone());
+    let state = ClientState::with_wiring(wiring.clone());
     let outcome = state.connect(&server.base, &server.app_token).await;
     assert!(
         matches!(outcome, ConnectOutcome::Connected { .. }),
         "the connect must succeed: {outcome:?}"
+    );
+    assert_eq!(
+        store.token().as_deref(),
+        Some(server.app_token.as_str()),
+        "the token landed in the token store"
     );
 
     let app_file = config_dir.path().join("server-connection.toml");
@@ -955,8 +965,12 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
     );
     let text = std::fs::read_to_string(&app_file).expect("read the file");
     assert!(
-        text.contains(server.base.trim_end_matches('/')) && text.contains("token"),
-        "the file names the server and the token: {text}"
+        text.contains(server.base.trim_end_matches('/')),
+        "the file names the server: {text}"
+    );
+    assert!(
+        !text.contains("token"),
+        "the app file keeps the URL only — the token is in the store: {text}"
     );
     let mode = std::fs::metadata(&app_file)
         .expect("stat the file")
@@ -964,12 +978,13 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
         .mode();
     assert_eq!(mode & 0o777, 0o600, "the app file is owner-only");
 
-    // And a fresh app state loads FROM that file: connected on start-up.
-    let reloaded = ClientState::loaded();
+    // And a fresh app state loads FROM the file plus the store: connected on
+    // start-up.
+    let reloaded = ClientState::loaded_with_wiring(wiring);
     assert_eq!(
         reloaded.status().await.state,
         ServerStatusState::Up,
-        "the connection file reconnects a relaunched app"
+        "the URL-only file plus the stored token reconnect a relaunched app"
     );
 
     // SAFETY: see above — the ENV_LOCK guard still held.

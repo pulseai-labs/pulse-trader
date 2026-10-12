@@ -106,7 +106,7 @@ describe("the Connect screen's states (r4.s3.w3)", () => {
     expect(screen.getByText("pulse token issue --scope app --label <name>")).toBeTruthy();
     expect(
       screen.getByText(
-        "Stored on this Mac: the server address and a revocable app token. Nothing else.",
+        "Stored on this Mac: the server address, and a revocable app token in the macOS Keychain. Nothing else.",
       ),
     ).toBeTruthy();
   });
