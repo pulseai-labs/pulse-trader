@@ -1161,6 +1161,20 @@ impl ClientState {
         slot.generation = slot.generation.wrapping_add(1);
     }
 
+    /// Install `link` only while `generation` is still current (#234): the
+    /// compare and the install are ONE write-lock critical section, so a
+    /// connect / disconnect landing between them can no longer be overwritten
+    /// by a stale refusal. Answers whether the install happened.
+    fn install_if_current(&self, generation: u64, link: Link) -> bool {
+        let mut slot = self.write_slot();
+        if slot.generation != generation {
+            return false;
+        }
+        slot.link = link;
+        slot.generation = slot.generation.wrapping_add(1);
+        true
+    }
+
     /// The current generation, for the staleness check an in-flight result
     /// takes before it writes (#234).
     fn current_generation(&self) -> u64 {
@@ -1433,13 +1447,19 @@ impl ClientState {
                     None,
                 ),
             };
-            if self.current_generation() != generation {
+            // The compare and the install share ONE write-lock section (#234):
+            // a connect / disconnect landing between them must not be
+            // overwritten by this stale refusal.
+            let moved = match refusal {
+                Some(err) => !self.install_if_current(generation, Link::Failed(err)),
+                // There is nothing to install on this path: a plain read
+                // answers whether the link moved under the handshake.
+                None => self.current_generation() != generation,
+            };
+            if moved {
                 // The link moved while this handshake was in flight: drop the
                 // result and ask the CURRENT link (#234).
                 continue;
-            }
-            if let Some(err) = refusal {
-                self.install(Link::Failed(err));
             }
             return result;
         }
@@ -1524,9 +1544,11 @@ impl ClientState {
                 if matches!(
                     err,
                     ClientError::TokenRefused { .. } | ClientError::Skew { .. }
-                ) && self.current_generation() == generation
-                {
-                    self.install(Link::Failed(err.clone()));
+                ) {
+                    // The compare and the install are ONE write-lock critical
+                    // section (#234): a connect / disconnect landing between
+                    // them must not be overwritten by this stale refusal.
+                    self.install_if_current(generation, Link::Failed(err.clone()));
                 }
                 Err(err.into())
             }
@@ -1837,6 +1859,64 @@ mod tests {
                 "the frame completes on the split separator: {first:?} {second:?}"
             );
         }
+    }
+
+    /// #234's staleness guard is ONE write-lock section (the fix round's B1):
+    /// a stale generation installs NOTHING — link untouched, generation
+    /// unmoved — while the current one installs and bumps exactly as
+    /// [`ClientState::install`] does, so a connect / disconnect landing between
+    /// the compare and the install can no longer be overwritten.
+    #[test]
+    fn install_if_current_installs_only_while_the_generation_is_current() {
+        let state = ClientState::with_wiring(ClientWiring::with_store(Arc::new(
+            token_store::InMemoryTokenStore::default(),
+        )));
+        let refusal = |reason: &str| {
+            Link::Failed(ClientError::TokenRefused {
+                reason: reason.to_owned(),
+            })
+        };
+
+        let start = state.current_generation();
+        // A stale generation (here, the one before the initial): nothing is
+        // installed and the generation stays exactly where it was.
+        assert!(
+            !state.install_if_current(start.wrapping_sub(1), refusal("stale")),
+            "a stale generation must not install"
+        );
+        assert_eq!(
+            state.current_generation(),
+            start,
+            "a stale refusal must not bump the generation"
+        );
+        assert!(
+            matches!(&state.read_slot().link, Link::Down),
+            "a stale refusal must not change the link"
+        );
+
+        // The current generation installs, and bumps exactly as `install` does.
+        assert!(
+            state.install_if_current(start, refusal("current")),
+            "the current generation installs"
+        );
+        assert_eq!(
+            state.current_generation(),
+            start.wrapping_add(1),
+            "the install bumps the generation"
+        );
+        match &state.read_slot().link {
+            Link::Failed(ClientError::TokenRefused { reason }) => {
+                assert_eq!(reason, "current", "the installed refusal is the link now");
+            }
+            _ => panic!("the refusal must be the installed link"),
+        }
+
+        // The install really did move the generation: the one it replaced is
+        // stale from here on — the same answer a `connect` would now get.
+        assert!(
+            !state.install_if_current(start, refusal("again")),
+            "the generation the install replaced is stale"
+        );
     }
 
     /// A multibyte character split across two network chunks must survive whole
