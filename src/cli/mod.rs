@@ -27,6 +27,10 @@ pub(crate) mod fixture;
 // its candle snapshots; the shared verified-copy engine lives here.
 pub(crate) mod import;
 pub(crate) mod indicators;
+// r4.s3.w1: the HIDDEN `pulse keychain-probe` verb — the signed-build identity
+// probe the MacBook walk runs (write / read / delete one fixed, non-secret item).
+// Hidden via `#[command(hide = true)]`: it is a diagnostic, not a user surface.
+pub(crate) mod keychain_probe;
 pub(crate) mod llm;
 // r2.s1.w2: the `pulse mcp` composition root — validates `--agent-name`,
 // resolves the data dir, opens the migrated DB and hands stdout to `mcp::serve`.
@@ -70,6 +74,7 @@ use fetch_data::{
 };
 use import::{ImportArgs, run_import};
 use indicators::{IndicatorsArgs, run_indicators};
+use keychain_probe::{KeychainProbeArgs, run_keychain_probe};
 use llm::{LlmArgs, run_llm_check};
 use mcp::{McpArgs, run_mcp};
 use runs::{RunsArgs, run_runs};
@@ -163,6 +168,12 @@ pub enum Command {
     /// Restore a verified backup over the local database (r3.s3.w4, D12).
     /// Precondition: the server must be stopped.
     Restore(RestoreArgs),
+    /// HIDDEN from user help (r4.s3.w1): the signed-build identity probe the `MacBook`
+    /// walk runs — `write` / `read` / `delete` one fixed, non-secret Keychain item
+    /// (`PulseTrader/r4s3_identity_probe`) through the same keyring path w2's token
+    /// store will use. It never touches a credential account.
+    #[command(hide = true)]
+    KeychainProbe(KeychainProbeArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> (--years <N> | --from <YYYY-MM-DD>) [--json]`.
@@ -308,6 +319,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // the off-box pull runs on the copy it just fetched.
         Command::BackupVerify(args) => run_backup_verify(&args).await,
         Command::Restore(args) => run_restore(&args).await,
+        // r4.s3.w1: the hidden identity probe — no database, no runtime work: one
+        // store call and one stdout line (or the error, on stderr, non-zero).
+        Command::KeychainProbe(args) => run_keychain_probe(args),
     }
 }
 
