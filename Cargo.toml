@@ -74,14 +74,20 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # the OQ-C lockfile guard).
 pulsehive = { version = "=3.0.0", features = ["openai"] }
 # VS-1.3.1 work-1.03: macOS Keychain READ accessor for the GLM API key (FR-1 /
-# NFR-5, decision 5). Pinned to keyring 3.x: its `Entry::new` + `get_password`
-# bind DIRECTLY to the macOS keychain (default features), so no store-registration
-# is needed. keyring 4.x split into keyring-core + store crates whose lazy default-
-# store init returned `NoDefaultStore` at runtime for our unsigned dev binary
-# (caught by the live user-demo at slice close — the offline test masked it by
-# mapping any error to LlmError::Config). I/O not math — NOT in any determinism
-# fingerprint, so a caret is fine (unlike ta/sqlx). READ path only; the
-# `set_password`/verify half is VS-1.3.4's `pulse setup-keys`.
+# NFR-5, decision 5). Pinned to keyring 3.x. keyring 4.x split into keyring-core +
+# store crates whose lazy default-store init returned `NoDefaultStore` at runtime
+# for our unsigned dev binary (caught by the live user-demo at slice close — the
+# offline test masked it by mapping any error to LlmError::Config).
+#
+# r4.s3.w1 corrects what this comment used to claim: keyring 3.6.3 has NO default
+# store feature, so with no feature enabled it compiled its (entry-local, never
+# persistent) MOCK store on EVERY platform — the read path below was inert in the
+# shipped app. The real macOS store arrives with the target-scoped `apple-native`
+# entry at the bottom of this manifest (macOS targets only; Linux QA keeps the mock).
+#
+# I/O not math — NOT in any determinism fingerprint, so a caret is fine (unlike
+# ta/sqlx). READ path only; the `set_password`/verify half is VS-1.3.4's
+# `pulse setup-keys`.
 keyring = "3"
 # VS-1.3.2 work-2.03: TOML parser for the "moat in DATA" config seam
 # (`config/prices.toml` → `PriceTable::from_config`). Deserialization only; the
@@ -171,6 +177,18 @@ tauri = { version = "2", features = ["specta"] }
 specta = { version = "=2.0.0-rc.25", features = ["derive"] }
 specta-typescript = "=0.0.12"
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
+
+# ---------------------------------------------------------------------------
+# r4.s3.w1 (ADR-0016 / ADR-0020) — the REAL macOS Keychain store, macOS targets ONLY.
+#
+# The `apple-native` feature binds keyring to Security.framework's login-keychain
+# store and replaces the mock on macOS. It is TARGET-SCOPED so the Linux QA build on
+# draco-desk keeps the mock: on macOS this entry's features union with the
+# `[dependencies]` entry above; no other target sees them. Pinned by
+# `scripts/check-signing-config.sh` and by AC-2/AC-3's `cargo tree` pair.
+# ---------------------------------------------------------------------------
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
 
 # VS-1.2.3 work-3.01: the build-time engine_fingerprint script (build.rs) hashes
 # the four D5 inputs. `sha2`/`hex` reuse the versions ALREADY resolved in Cargo.lock

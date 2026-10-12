@@ -880,6 +880,114 @@ fn read_secret(service: &str, account: &str) -> Result<String, LlmError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// r4.s3.w1 — the identity probe (the HIDDEN `pulse keychain-probe` verb; the CLI
+// surface lives in `cli::keychain_probe`).
+//
+// The probe exists so the MacBook walk can prove the premise w2's token store
+// rests on: a REBUILT, signed app reads back what an earlier build wrote. It holds
+// ONE fixed, non-secret marker and its own account, so `keychain-probe` can never
+// read or write a credential item — `server_app_token` (w2's) and `glm_api_key`
+// are separate accounts this path has no literal for.
+// ---------------------------------------------------------------------------
+
+/// The Keychain account (item name) of the identity probe. NOT a secret, and a name
+/// of its own on purpose: the probe can only ever touch this item.
+pub(crate) const KEYCHAIN_PROBE_ACCOUNT: &str = "r4s3_identity_probe";
+
+/// The probe item's fixed marker value — a constant in the source by design. It
+/// proves a rebuilt app reads back what an earlier build wrote; it is not a
+/// credential and carries no information.
+pub(crate) const KEYCHAIN_PROBE_MARKER: &str = "r4s3-identity-probe";
+
+/// The probe item's display name (`PulseTrader/r4s3_identity_probe`), so the printed
+/// line and the entry construction cannot drift apart.
+pub(crate) fn keychain_probe_item() -> String {
+    format!("{KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}")
+}
+
+/// Write the probe's marker into the fixed probe item, through the same `keyring`
+/// path the token store will use. Overwrites an existing item: re-running the probe
+/// is meant to be safe.
+///
+/// # Errors
+///
+/// Returns [`LlmError::Config`] when the platform store refuses the write.
+pub(crate) fn keychain_probe_write() -> Result<(), LlmError> {
+    probe_write_in(&probe_entry()?)
+}
+
+/// Read the probe item back and check it holds THIS build's marker.
+///
+/// # Errors
+///
+/// Returns [`LlmError::Config`] when the item is absent, unreadable, or holds a
+/// different value. The mismatch message names both the found and the expected
+/// value — the marker is a non-secret constant, so the `MacBook` walk can see exactly
+/// what happened.
+pub(crate) fn keychain_probe_read() -> Result<String, LlmError> {
+    probe_read_in(&probe_entry()?)
+}
+
+/// Delete the probe item.
+///
+/// # Errors
+///
+/// Returns [`LlmError::Config`] when the store refuses, including
+/// [`keyring::Error::NoEntry`] — a "delete ok" must mean an item was really removed.
+pub(crate) fn keychain_probe_delete() -> Result<(), LlmError> {
+    probe_delete_in(&probe_entry()?)
+}
+
+/// Open the fixed probe item — the only `Entry` this path can build.
+fn probe_entry() -> Result<Entry, LlmError> {
+    Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT).map_err(|error| {
+        LlmError::Config(format!(
+            "could not open the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}: {error}"
+        ))
+    })
+}
+
+/// Get the password, or a message naming the fixed item.
+fn probe_password(entry: &Entry) -> Result<String, LlmError> {
+    entry.get_password().map_err(|error| {
+        LlmError::Config(format!(
+            "no Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT} to read ({error}); \
+             write it first from a build signed with the same identity"
+        ))
+    })
+}
+
+/// The three operations, split at the store boundary so the unit tests can drive
+/// them with a mock entry (`Entry::new_with_credential`) instead of the platform
+/// store — the same functions the CLI calls.
+fn probe_write_in(entry: &Entry) -> Result<(), LlmError> {
+    entry.set_password(KEYCHAIN_PROBE_MARKER).map_err(|error| {
+        LlmError::Config(format!(
+            "could not write the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}: {error}"
+        ))
+    })
+}
+
+fn probe_read_in(entry: &Entry) -> Result<String, LlmError> {
+    let found = probe_password(entry)?;
+    if found != KEYCHAIN_PROBE_MARKER {
+        return Err(LlmError::Config(format!(
+            "the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT} holds \
+             `{found}`, not this build's marker `{KEYCHAIN_PROBE_MARKER}`"
+        )));
+    }
+    Ok(found)
+}
+
+fn probe_delete_in(entry: &Entry) -> Result<(), LlmError> {
+    entry.delete_credential().map_err(|error| {
+        LlmError::Config(format!(
+            "could not delete the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}: {error}"
+        ))
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1096,5 +1204,95 @@ mod tests {
                 "no manifest dotenv slot under Server: {path:?}"
             );
         }
+    }
+}
+
+/// The r4.s3.w1 identity probe's own tests — **against the mock store, never a real
+/// Keychain** (so they behave identically on draco-desk and macOS CI, and never
+/// touch the operator's login keychain).
+///
+/// keyring 3.6.3's mock is ENTRY-LOCAL (`MockCredentialBuilder::build` returns a
+/// fresh, empty credential per `Entry`; its persistence is `EntryOnly`), so a
+/// write→read→delete round trip is only meaningful on ONE entry — exactly what the
+/// `*_in` seam lets these tests hold. Cross-process, cross-build read-back is a
+/// real-Keychain behaviour and is proven on the `MacBook` by AC-U1, not here.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod probe_tests {
+    use keyring::Entry;
+    use keyring::mock;
+
+    use super::{
+        GLM_API_KEY_ACCOUNT, KEYCHAIN_PROBE_ACCOUNT, KEYCHAIN_PROBE_MARKER, KEYCHAIN_SERVICE,
+        LlmError, probe_delete_in, probe_read_in, probe_write_in,
+    };
+
+    /// A mock credential for the probe item, as an `Entry` the seam functions take.
+    fn mock_probe_entry() -> Entry {
+        let credential = mock::default_credential_builder()
+            .build(None, KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
+            .expect("build a mock credential for the probe item");
+        Entry::new_with_credential(credential)
+    }
+
+    #[test]
+    fn probe_write_then_read_round_trips() {
+        let entry = mock_probe_entry();
+        probe_write_in(&entry).expect("write the marker");
+        let value = probe_read_in(&entry).expect("read the marker back");
+        assert_eq!(value, KEYCHAIN_PROBE_MARKER);
+    }
+
+    #[test]
+    fn probe_read_without_an_item_is_an_error() {
+        let entry = mock_probe_entry();
+        let error = probe_read_in(&entry).expect_err("an unwritten probe item must not read");
+        assert!(matches!(error, LlmError::Config(_)), "got {error:?}");
+        assert!(
+            error.to_string().contains(KEYCHAIN_PROBE_ACCOUNT),
+            "the refusal must name the item, got: {error}"
+        );
+    }
+
+    #[test]
+    fn probe_read_names_both_values_on_a_mismatch() {
+        let entry = mock_probe_entry();
+        entry
+            .set_password("a-foreign-value")
+            .expect("seed a foreign value");
+        let error = probe_read_in(&entry).expect_err("a foreign value must not pass");
+        let message = error.to_string();
+        assert!(
+            message.contains("a-foreign-value"),
+            "the FOUND value must be named, got: {message}"
+        );
+        assert!(
+            message.contains(KEYCHAIN_PROBE_MARKER),
+            "the EXPECTED marker must be named, got: {message}"
+        );
+    }
+
+    #[test]
+    fn probe_delete_removes_the_item() {
+        let entry = mock_probe_entry();
+        probe_write_in(&entry).expect("write");
+        probe_delete_in(&entry).expect("delete");
+        probe_read_in(&entry).expect_err("read after delete must fail");
+    }
+
+    #[test]
+    fn probe_delete_without_an_item_is_an_error() {
+        let entry = mock_probe_entry();
+        let error = probe_delete_in(&entry).expect_err("deleting an absent item is not success");
+        assert!(matches!(error, LlmError::Config(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn the_probe_account_is_never_a_credential_account() {
+        // The probe must not be pointed at a credential item, ever: this is the
+        // guard that a later edit cannot alias the two by accident.
+        assert_ne!(KEYCHAIN_PROBE_ACCOUNT, GLM_API_KEY_ACCOUNT);
+        assert_ne!(KEYCHAIN_PROBE_ACCOUNT, "server_app_token");
+        assert!(!KEYCHAIN_PROBE_MARKER.is_empty());
     }
 }

@@ -57,7 +57,7 @@ test:
 
 # --- content gates (r1.s1.w1, r1.s1.w5, r1.s1.w6, r1.s5.w1, r1.s5.w2, r1.s2.w1, r1.s4.w1) --
 
-# The ten content gates. Each asserts a property that review
+# The content gates. Each asserts a property that review
 # cannot be trusted to hold: ADR-0020's decision is recorded and the ADR-0001 /
 # ADR-0019 class sweep landed; no fs/shell/http capability is reachable from the
 # frontend; the window stays 1440x900 non-resizable with no scale-transform; the
@@ -79,7 +79,9 @@ test:
 # close on 2026-08-29 with check-adr-0021.sh's Status assertion updated in the SAME
 # act -- the check-adr-0020.sh precedent). Only that close may flip it.
 
-# Run the ten content gates (ADR-0020, capabilities, window, bindings, design system, shell navigation, ADR-0022, no-specta-workaround, ADR-0021, coach boundary).
+# Run the content gates (ADR-0020, capabilities, window, bindings, design system,
+# shell navigation, ADR-0022, no-specta-workaround, ADR-0021, coach boundary,
+# mcp boundary, signing config -- r4.s3.w1).
 gates:
     bash scripts/check-adr-0020.sh
     bash scripts/check-capabilities.sh
@@ -92,6 +94,7 @@ gates:
     bash scripts/check-no-specta-workaround.sh
     bash scripts/check-coach-boundary.sh
     bash scripts/check-mcp-boundary.sh
+    bash scripts/check-signing-config.sh
 
 # VS-1.1.4 work-1.01 — regenerate the committed .sqlx offline query cache
 # (NFR-12). Needs sqlx-cli (a developer-local tool, NOT installed in this slice's
@@ -467,18 +470,32 @@ prod-reset:
 
 # --- desktop bundle (r1.s1.w1) ----------------------------------------------
 
-# Build PulseTrader.app for a LOCAL dev run — this is what r1.s1.w5's AC-11 manual
-# walk needs.
+# Build PulseTrader.app — the local bundle (r1.s1.w5's AC-11 manual walk runs it).
+#
+# Signed when PULSE_SIGNING_IDENTITY names a codesigning identity (r4.s3.w1: the
+# ONLY place the identity lives -- no certificate name, team id or identity value is
+# committed here; `scripts/check-signing-config.sh` enforces it). The recipe passes
+# it to the Tauri build as APPLE_SIGNING_IDENTITY, then verifies the bundle
+# (`codesign --verify --strict`) and prints the `Authority=` line. UNSIGNED with one
+# warning line when the variable is unset: an unsigned build gets a fresh ad-hoc
+# identity every time, so it cannot read back a Keychain item an earlier build wrote
+# (grill G6). Notarization and auto-update stay out of scope (ADR-0020).
 #
 # Deliberately NOT part of `just check`: it is a release build of the whole Tauri
 # graph (minutes, not seconds), and gating every local check run on it would make the
-# gate something people skip. Code signing, notarization and auto-update are out of
-# scope for r1.s1.w1 (ADR-0020) — this produces an unsigned local artifact at
-# `target/release/bundle/macos/PulseTrader.app`.
-
-# Build an unsigned local PulseTrader.app (what AC-11's manual walk needs).
+# gate something people skip.
 bundle:
-    npm run bundle
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${PULSE_SIGNING_IDENTITY:-}" ]; then
+        APPLE_SIGNING_IDENTITY="$PULSE_SIGNING_IDENTITY" npm run bundle
+        app="target/release/bundle/macos/PulseTrader.app"
+        codesign --verify --strict "$app"
+        codesign -dvv "$app" 2>&1 | grep '^Authority='
+    else
+        echo 'warning: PULSE_SIGNING_IDENTITY is unset -- building an UNSIGNED bundle; the app token will not survive a rebuild without a signed build' >&2
+        npm run bundle
+    fi
 
 # Run the desktop shell against the Vite dev server (hot reload).
 desktop:
