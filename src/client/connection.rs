@@ -111,10 +111,48 @@ pub(crate) fn mcp_path() -> Result<PathBuf, String> {
     dir().map(|dir| dir.join(MCP_FILE))
 }
 
+/// The refusal for a toml failure over a connection-file body: the path and the
+/// `line:column` its span starts at, and NOTHING else (D1). The toml error's
+/// OWN Display quotes the offending source line, so a legacy `{ url, token }`
+/// file malformed on its token line would otherwise carry the token value into
+/// `server_address`'s `BusError` and into the start-up `refused` reason. The
+/// message is deliberately never formatted in: not the Display, not
+/// `message()`, no source text.
+fn unreadable(display: &Path, text: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => {
+            let (line, column) = line_column(text, span.start);
+            format!(
+                "{} is unreadable at line {line}, column {column}",
+                display.display()
+            )
+        }
+        // A structural error with no span: the path alone — still no message.
+        None => format!("{} is unreadable", display.display()),
+    }
+}
+
+/// The 1-based `(line, column)` of a byte offset in `text`, clamped into the
+/// text and backed up to a character boundary: an error's span is only a
+/// position, and a position must never panic the reader.
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &text[..offset];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(1, |tail| tail.chars().count() + 1);
+    (line, column)
+}
+
 /// Parse a vetted relay-file body: both the URL and the token are required.
 fn parse(text: &str, display: &Path) -> Result<ConnectionFile, String> {
-    let parsed: ConnectionFile = toml::from_str(text)
-        .map_err(|error| format!("{} is unreadable: {error}", display.display()))?;
+    let parsed: ConnectionFile =
+        toml::from_str(text).map_err(|error| unreadable(display, text, &error))?;
     if parsed.url.is_empty() || parsed.token.is_empty() {
         return Err(format!("{} is missing url or token", display.display()));
     }
@@ -124,8 +162,8 @@ fn parse(text: &str, display: &Path) -> Result<ConnectionFile, String> {
 /// Parse a vetted app-file body: the URL is required, the token is an OLDER
 /// file's (the migration's input) — and an empty one counts as absent.
 fn parse_app(text: &str, display: &Path) -> Result<AppConnectionFile, String> {
-    let parsed: AppConnectionFile = toml::from_str(text)
-        .map_err(|error| format!("{} is unreadable: {error}", display.display()))?;
+    let parsed: AppConnectionFile =
+        toml::from_str(text).map_err(|error| unreadable(display, text, &error))?;
     if parsed.url.is_empty() {
         return Err(format!("{} is missing url", display.display()));
     }

@@ -500,7 +500,10 @@ export default function ConnectScreen({
 
             {onBack !== undefined && (
               <div className="connect-back">
-                <button type="button" className="btn-sec-sm" onClick={onBack}>
+                {/* Disabled while a connect is in flight (D4): Back unmounts
+                    this screen, and a success arriving after that would switch
+                    servers without the acceptance callback ever running. */}
+                <button type="button" className="btn-sec-sm" onClick={onBack} disabled={busy}>
                   Back to the app
                 </button>
               </div>

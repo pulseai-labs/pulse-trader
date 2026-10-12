@@ -853,3 +853,74 @@ async fn a_file_write_failure_after_the_store_write_never_comes_up_on_the_next_l
         "a pair nothing verified never comes up connected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// r4.s3 fix round D1: a malformed token line must not put the token into a
+// refusal — the toml error's own Display quotes the offending source line
+// ---------------------------------------------------------------------------
+
+/// A legacy `{ url, token }` file whose token line is malformed (the closing
+/// quote is missing) refuses WITHOUT quoting the line it failed on. The toml
+/// error's Display carries that line, and the refusal reaches `server_address`
+/// and the start-up `refused` reason the Connect screen shows — so the marker
+/// below must appear in none of them. Both readers of a `{ url, token }` body
+/// are covered: the app file (`parse_app`) and the relay file (`parse`).
+///
+/// The marker is a fixed, non-secret string, never a live token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_token_line_never_puts_the_token_into_a_refusal() {
+    const MARKER: &str = "pt_D1_never_in_a_refusal";
+
+    let _guard = ENV_LOCK.lock().await;
+    let world = World::new();
+    let malformed = format!("url = \"http://127.0.0.1:7433\"\ntoken = \"{MARKER}\n");
+
+    // The APP file: the load error, the frontend's `server_address` command and
+    // the start-up refused reason all read this one.
+    world.write_app_file(&malformed);
+
+    let error = load_app().expect_err("the malformed app file refuses");
+    assert!(
+        !error.contains(MARKER) && !error.contains("D1_never_in_a_refusal"),
+        "the app-file refusal quotes no token bytes: {error}"
+    );
+    assert!(
+        error.contains("server-connection.toml"),
+        "and it still names the file: {error}"
+    );
+
+    let address = server_address()
+        .await
+        .expect_err("a file that cannot be read has no address");
+    assert!(
+        !address.message.contains(MARKER) && !address.message.contains("D1_never_in_a_refusal"),
+        "the command error quotes no token bytes: {}",
+        address.message
+    );
+
+    let state = ClientState::loaded_with_wiring(world.wiring.clone());
+    let status = state.status().await;
+    assert_eq!(
+        status.state,
+        ServerStatusState::Refused,
+        "a malformed file starts refused: {status:?}"
+    );
+    let reason = status.reason.expect("a refusal carries its reason");
+    assert!(
+        !reason.contains(MARKER) && !reason.contains("D1_never_in_a_refusal"),
+        "the refused reason quotes no token bytes: {reason}"
+    );
+
+    // The RELAY file goes through the same guard: `parse` is the other reader of
+    // a `{ url, token }` body.
+    write_0600(&world.mcp_file(), &malformed);
+    let error = load_mcp().expect_err("the malformed relay file refuses");
+    assert!(
+        !error.contains(MARKER) && !error.contains("D1_never_in_a_refusal"),
+        "the relay-file refusal quotes no token bytes: {error}"
+    );
+    assert!(
+        error.contains("mcp-connection.toml"),
+        "and it still names the file: {error}"
+    );
+}

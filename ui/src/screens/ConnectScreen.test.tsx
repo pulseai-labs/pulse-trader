@@ -366,4 +366,45 @@ describe("the Connect screen's states (r4.s3.w3)", () => {
       screen.getByRole("heading", { name: "Reconnect to your Pulse server" }),
     ).toBeTruthy();
   });
+
+  // r4.s3 fix round (D4): Back must not unmount this screen while a connect is
+  // in flight — a success arriving afterwards would switch servers with the
+  // acceptance callback (the app's `connectEpoch` bump) never running.
+  it("disables Back while a connect is pending, and re-enables it when it settles", async () => {
+    statusMock.mockResolvedValue(okStatus({ state: "up" }));
+    let settle!: (answer: OutcomeAnswer) => void;
+    const pending = new Promise<OutcomeAnswer>((resolve) => {
+      settle = resolve;
+    });
+    vi.mocked(commands.serverConnect).mockImplementation(() => pending);
+
+    // The Change-server entry: the one Connect screen whose Back exists.
+    window.location.hash = "#/settings";
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Change server" }));
+    const back = () => screen.getByRole("button", { name: "Back to the app" }) as HTMLButtonElement;
+    expect(back().disabled).toBe(false);
+
+    // In flight: Back is refused.
+    await submit("http://100.90.203.12:8420", "pt_app_test_token");
+    expect(back().disabled).toBe(true);
+
+    // Settled (refused — the form stays): Back is usable again, and it really
+    // goes back to the app.
+    await act(async () => {
+      settle({
+        status: "ok",
+        data: {
+          outcome: "token_refused",
+          reason: "the server refused this token (HTTP 401 Unauthorized)",
+        },
+      });
+      await pending;
+    });
+    expect(back().disabled).toBe(false);
+    fireEvent.click(back());
+    expect(document.querySelector(".sidebar")).not.toBeNull();
+
+    window.location.hash = "";
+  });
 });
