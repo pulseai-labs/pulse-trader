@@ -101,6 +101,9 @@ describe("the Connect screen's states (r4.s3.w3)", () => {
     expect(container.querySelector(".sidebar")).toBeNull();
     expect(screen.getByLabelText(/server url/i)).toBeTruthy();
     expect(screen.getByLabelText(/app token/i)).toBeTruthy();
+    // r4.s3 fix round (C2): the hint is the ONE prefix every token carries —
+    // the server issues `pt_…` for both scopes (src/server/auth.rs).
+    expect((screen.getByLabelText(/app token/i) as HTMLInputElement).placeholder).toBe("pt_…");
     // The help block carries the command a trader runs on the server, and the
     // storage sentence states the local footprint in one line.
     expect(screen.getByText("pulse token issue --scope app --label <name>")).toBeTruthy();
@@ -277,6 +280,11 @@ describe("the Connect screen's states (r4.s3.w3)", () => {
     const alert = screen.getByRole("alert");
     expect(alert.textContent).toContain("This is an agent token, for MCP clients");
     expect(alert.textContent).toContain("agent-scoped");
+    // r4.s3 fix round (C2): no scope-specific prefix is claimed — both scopes
+    // carry the one `pt_` prefix (`src/server/auth.rs`'s TOKEN_PREFIX).
+    expect(alert.textContent).toContain("pt_…");
+    expect(alert.textContent).not.toContain("pt_agt_");
+    expect(alert.textContent).not.toContain("pt_app_");
   });
 
   it("recognises a refusal that arrives on a LATER poll, not only one it mounted with", async () => {

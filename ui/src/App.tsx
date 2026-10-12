@@ -160,6 +160,11 @@ export function App() {
   // destination — the trader can step back to the app without a connection
   // having changed.
   const [connectOpen, setConnectOpen] = useState(false);
+  // Which server the operation store belongs to (r4.s3 fix round, C5): the
+  // provider is keyed on this and bumped only when a connect is ACCEPTED
+  // (`onConnected` below), so records made against one server are never shown
+  // against the next one — while Back and a FAILED attempt keep them (B2).
+  const [connectEpoch, setConnectEpoch] = useState(0);
   // The gate's memory. A read that FAILED changes no status (the hook keeps the
   // last one), so it counts nothing here either: only statuses that actually
   // arrived are folded in.
@@ -201,10 +206,11 @@ export function App() {
   // Connect over a live app used to unmount it — and with it every in-flight
   // backtest / walk-forward / coach record and its single-flight latch. React
   // reconciles by position and type, so the same provider element at the root
-  // of either branch stays mounted across the switch.
+  // of either branch stays mounted across the switch. `connectEpoch` is that
+  // element's key (C5), so only an ACCEPTED connect replaces it.
   if (gated || connectOpen) {
     return (
-      <ActiveOperationsProvider>
+      <ActiveOperationsProvider key={connectEpoch}>
         <WindowChrome docTitle="Connect">
           <ConnectScreen
             status={serverStatus}
@@ -212,6 +218,10 @@ export function App() {
               // Opening the app: leave the override and re-poll so the gate lifts.
               setConnectOpen(false);
               refreshStatus();
+              // The accepted connect makes a NEW server identity current: the
+              // store's records belong to the link they were made against, so
+              // the keyed provider is replaced and they go with it (C5).
+              setConnectEpoch((epoch) => epoch + 1);
             }}
             // Only the "Change server" entry has somewhere to go back to; the
             // gate itself is the floor of the app.
@@ -233,7 +243,7 @@ export function App() {
   // remount it exists to survive — which is also why the gate holds rather than
   // unmounts while operations are live.
   return (
-    <ActiveOperationsProvider>
+    <ActiveOperationsProvider key={connectEpoch}>
       {/* One poll, one answer: the screens that render the connection (Settings
           today) read the same `useServerStatus` value the gate and the titlebar
           strip do, and can ask for a fresh read, instead of starting a second

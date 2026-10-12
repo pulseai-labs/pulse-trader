@@ -43,6 +43,9 @@ vi.mock("./bindings", () => ({
     // that reads the stored address and can disconnect.
     serverAddress: vi.fn().mockResolvedValue({ status: "ok", data: null }),
     serverDisconnect: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    // r4.s3 fix round (C5): the Connect screen's own submit — the successful
+    // "Change server" the epoch case drives.
+    serverConnect: vi.fn(),
   },
 }));
 
@@ -540,5 +543,62 @@ describe("<App /> keeps an operation alive across navigation (#141)", () => {
     });
     expect(await screen.findByText("run-landed-while-away")).toBeTruthy();
     expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+  });
+
+  // r4.s3 fix round (C5): Back keeps the records (above), but an ACCEPTED
+  // connect is a new server identity — a record made against the old server
+  // must not show against the new one. The provider is keyed on `connectEpoch`,
+  // bumped in the Connect screen's `onConnected`.
+  it("drops an operation record after a successful Change server", async () => {
+    let settle!: (value: { status: "ok"; data: BacktestRunDto }) => void;
+    const pending = new Promise<{ status: "ok"; data: BacktestRunDto }>((resolve) => {
+      settle = resolve;
+    });
+    vi.mocked(commands.runBacktestVersion).mockReturnValue(pending);
+    vi.mocked(commands.serverConnect).mockResolvedValue({
+      status: "ok",
+      data: { outcome: "connected", binary_version: "0.2.0", engine_fingerprint: "sha256:new" },
+    });
+
+    setHash("#/backtest");
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/running the backtest/i)).toBeTruthy();
+
+    // Change server, and let the connect SUCCEED: the card's "Open the app →"
+    // is the acceptance (the countdown's own path calls the same callback).
+    await act(async () => {
+      setHash("#/settings");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Change server" }));
+    fireEvent.change(screen.getByLabelText(/server url/i), {
+      target: { value: "http://100.90.203.12:8420" },
+    });
+    fireEvent.change(screen.getByLabelText(/app token/i), {
+      target: { value: "pt_new_app_token" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /open the app/i }));
+
+    // Back on the app branch: the record belonged to the OLD server, so it is
+    // gone — and the single-flight latch went with it, so a run is a fresh
+    // invocation rather than a refusal.
+    await act(async () => {
+      setHash("#/backtest");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(screen.queryByText(/running the backtest/i)).toBeNull();
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(2);
+
+    // Leave nothing pending.
+    await act(async () => {
+      settle({ status: "ok", data: LANDED_RUN });
+      await pending;
+    });
   });
 });

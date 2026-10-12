@@ -159,9 +159,9 @@ function ProblemPanel({ outcome, attemptedUrl }: { outcome: ConnectOutcome; atte
       return isAgentRefusal(outcome.reason) ? (
         <Problem tone="warn" title="This is an agent token, for MCP clients">
           <p>
-            Agent tokens (<code className="mono">pt_agt_…</code>) let Claude Code or Codex read,
+            Agent tokens (<code className="mono">pt_…</code>) let Claude Code or Codex read,
             compose and backtest. They can&apos;t drive this app. Use an app token (
-            <code className="mono">pt_app_…</code>).
+            <code className="mono">pt_…</code>).
           </p>
           <p className="problem-reason">{outcome.reason}</p>
           <CmdBlock cmd={ISSUE_TOKEN_COMMAND} />
@@ -426,7 +426,7 @@ export default function ConnectScreen({
                   type={show ? "text" : "password"}
                   value={token}
                   onChange={(event) => setToken(event.target.value)}
-                  placeholder="pt_app_…"
+                  placeholder="pt_…"
                   autoComplete="off"
                   spellCheck={false}
                   disabled={busy}

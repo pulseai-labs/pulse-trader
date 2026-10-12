@@ -162,7 +162,7 @@ describe("the Settings server-connection section (r4.s3.w3)", () => {
 
     expect(stateChip().getAttribute("data-state")).toBe("disconnected");
     const note = screen.getByText(/This Mac no longer holds the token/);
-    expect(note.textContent).toContain("pulse token revoke <label>");
+    expect(note.textContent).toContain("pulse token revoke --label <label>");
     expect(statusMock).toHaveBeenCalled();
     // The pin: the last status that arrived is still `up`, and the screen does
     // not wait for — or take its state from — anything newer.

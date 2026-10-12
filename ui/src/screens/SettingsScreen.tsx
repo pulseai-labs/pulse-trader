@@ -23,7 +23,7 @@ import { commands } from "../bindings";
 import { useConnection } from "../shell/ConnectionContext";
 
 /** The command that revokes the token on the server (the note names it). */
-const REVOKE_COMMAND = "pulse token revoke <label>";
+const REVOKE_COMMAND = "pulse token revoke --label <label>";
 
 /** What the section calls each state, from the polled status. */
 const STATE_LABELS = {
