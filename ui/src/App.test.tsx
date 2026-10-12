@@ -39,6 +39,10 @@ vi.mock("./bindings", () => ({
     // r3.s4.w5: the titlebar's paper pill counts the running sessions App
     // polls; an empty list keeps the strip at "0 paper · 0 live".
     paperSessions: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
+    // r4.s3.w3: the Settings route is live, so `#/settings` mounts the screen
+    // that reads the stored address and can disconnect.
+    serverAddress: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    serverDisconnect: vi.fn().mockResolvedValue({ status: "ok", data: null }),
   },
 }));
 
@@ -64,6 +68,16 @@ function up(): ServerStatus {
 
 function down(): ServerStatus {
   return { state: "down", binary_version: null, engine_fingerprint: null, reason: null, role: null };
+}
+
+function refused(reason: string): ServerStatus {
+  return {
+    state: "refused",
+    binary_version: null,
+    engine_fingerprint: null,
+    reason,
+    role: null,
+  };
 }
 
 function setHash(hash: string) {
@@ -135,7 +149,7 @@ describe("<App /> shell navigation", () => {
   });
 
   it("renders the unbuilt pane, not fabricated content, for a destination with no route", async () => {
-    setHash("#/settings");
+    setHash("#/journal");
     render(<App />);
     expect(await screen.findByText(/not built/i)).toBeTruthy();
   });
@@ -242,12 +256,54 @@ describe("<App /> holds the shell through a dropped poll", () => {
       await act(async () => {
         vi.advanceTimersByTime(POLL_MS);
       });
-      expect(screen.getByRole("heading", { name: "Connect to the server" })).toBeTruthy();
+      // The gate is back; a `down` status is not a refusal, so the screen is
+      // the idle form, not the reconnect one.
+      expect(
+        screen.getByRole("heading", { name: "Connect to your Pulse server" }),
+      ).toBeTruthy();
       expect(container.querySelector(".sidebar")).toBeNull();
     } finally {
       vi.useRealTimers();
       // The file's module-level `up` default, restored for every test that
       // renders the shell after this one.
+      vi.mocked(commands.serverStatus).mockImplementation(() =>
+        Promise.resolve({ status: "ok", data: up() }),
+      );
+    }
+  });
+
+  // r4.s3.w3, #247: a refusal the server answered is not a dropped poll. It
+  // takes the app down on the poll that reports it — no tolerance, no waiting
+  // for three ticks — while the drop cases above keep today's behaviour.
+  it("gates on the FIRST poll that reports an explicit refusal (#247)", async () => {
+    let poll = 0;
+    vi.mocked(commands.serverStatus).mockImplementation(() => {
+      poll += 1;
+      const data =
+        poll === 1 ? up() : refused("the server refused this token (HTTP 401 Unauthorized)");
+      return Promise.resolve({ status: "ok", data });
+    });
+
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      await act(async () => {});
+      // Open on the first poll: the shell is here.
+      expect(container.querySelector(".sidebar")).not.toBeNull();
+
+      // ONE refused poll is enough.
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(container.querySelector(".sidebar")).toBeNull();
+      expect(
+        screen.getByRole("heading", { name: "Reconnect to your Pulse server" }),
+      ).toBeTruthy();
+      expect(screen.getByRole("alert").textContent).toContain(
+        "the server refused this token",
+      );
+    } finally {
+      vi.useRealTimers();
       vi.mocked(commands.serverStatus).mockImplementation(() =>
         Promise.resolve({ status: "ok", data: up() }),
       );

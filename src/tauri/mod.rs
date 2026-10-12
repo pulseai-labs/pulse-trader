@@ -114,10 +114,12 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::run_walk_forward_version,
         commands::get_walk_forward_run,
         commands::get_backtest_run,
-        // r3.s3.w5: the connection trio — Connect's verbs.
+        // r3.s3.w5: the connection trio — Connect's verbs (r4.s3.w3 adds the
+        // stored address the Settings screen reads beside them).
         commands::server_connect,
         commands::server_status,
         commands::server_disconnect,
+        commands::server_address,
         // r3.s4.w5: the paper session surface.
         commands::paper_promote,
         commands::paper_sessions,

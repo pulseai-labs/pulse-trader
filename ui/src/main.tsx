@@ -31,6 +31,7 @@ import "./styles/designer.css";
 import "./styles/backtest.css";
 import "./styles/coach.css";
 import "./styles/paper.css";
+import "./styles/connection.css";
 
 function element(id: string): HTMLElement {
   const found = document.getElementById(id);

@@ -214,6 +214,20 @@ export const commands = {
 	 */
 	serverDisconnect: () => typedError<null, BusError>(__TAURI_INVOKE("server_disconnect")),
 	/**
+	 *  The Settings screen's read (r4.s3.w3): the stored connection's server URL,
+	 *  or `None` when no connection is stored.
+	 * 
+	 *  The URL only, never the token: it reads the same file — through the same
+	 *  safety vetting — that the app's start-up state loads, and returns nothing
+	 *  else. No command result carries the token to the frontend.
+	 * 
+	 *  # Errors
+	 * 
+	 *  A stored connection that fails its safety vetting answers with the named
+	 *  reason (the file and the check that failed, never a secret).
+	 */
+	serverAddress: () => typedError<string | null, BusError>(__TAURI_INVOKE("server_address")),
+	/**
 	 *  Promote a strategy version to a paper session — certified, or explicitly
 	 *  overridden with a typed reason.
 	 * 
