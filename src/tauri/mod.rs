@@ -63,7 +63,7 @@ pub use commands::{
     BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
     DesktopState, OperationGuard, OperationKey, ShellInfo, StreamOutcome, compare_child_run_core,
     compose_strategy_body, compose_strategy_core, demo_stream_core, library_overview_core,
-    run_backtest_version_core, shell_info_core, summarize_dsl,
+    run_backtest_version_core, server_address, shell_info_core, summarize_dsl,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};

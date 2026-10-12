@@ -805,7 +805,7 @@ pub use crate::tauri::{
     LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
     backtest_run_dto, compare_child_run_core, compose_strategy_body, compose_strategy_core,
     demo_stream_core, dsl_summary, export_bindings, library_overview_core,
-    run_backtest_version_core, run_desktop, shell_info_core, summarize_dsl,
+    run_backtest_version_core, run_desktop, server_address, shell_info_core, summarize_dsl,
 };
 // r3.s3.w5: the thin-client surface — `tests/client_proxy.rs` (AC-1) drives the
 // client against the in-process server, and the proxied command wrappers in
@@ -814,6 +814,15 @@ pub use crate::client::{
     ClientError, ClientState, ConnectOutcome, RetryBackoff, RunOpOutcome, ServerClient,
     ServerStatus, ServerStatusState,
 };
+// r4.s3.w2: the token-store surface — the port (`TokenStore`), its audit sink,
+// the in-memory fake and the `ClientWiring` `tests/client_token_store.rs`
+// (AC-1) injects — plus the connection-file readers/writers that suite drives
+// (the `client_proxy.rs` precedent: re-exported so a separate crate can reach
+// them). No Tauri command, capability or binding changes.
+pub use crate::client::connection::{
+    AppConnectionFile, ConnectionFile, load_app, load_mcp, store_mcp,
+};
+pub use crate::client::token_store::{ClientWiring, InMemoryTokenStore, TokenAudit, TokenStore};
 // r2.s3.w5: the walk-forward wire contract — the request/response DTOs plus
 // the three transport-free cores `tests/tauri_walk_forward.rs` (AC-2) drives.
 pub use crate::tauri::{
