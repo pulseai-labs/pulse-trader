@@ -18,6 +18,7 @@ import { ActiveOperationsProvider } from "./hooks/useActiveOperations";
 import { useServerStatus } from "./hooks/useServerStatus";
 import ConnectScreen from "./screens/ConnectScreen";
 import { NAV_ALL, Sidebar, WindowChrome } from "./shell/AppShell";
+import { ConnectionProvider } from "./shell/ConnectionContext";
 import { resolveNavId, resolveRoute } from "./routes";
 import type { Route } from "./routes";
 import type { ServerStatus } from "./bindings";
@@ -61,10 +62,14 @@ export function rememberPoll(previous: GateMemory, status: ServerStatus): GateMe
 
 /**
  * The gate's rule, as a pure function of the polled status and that memory
- * (r3.s3.w5's gate, hardened against a single dropped poll):
+ * (r3.s3.w5's gate, hardened against a single dropped poll; #247 folded in by
+ * r4.s3.w3):
  *
  * - `open` — the status is `up`: render the app.
- * - `gated` — render the Connect screen in place of the app.
+ * - `gated` — render the Connect screen in place of the app. An explicit
+ *   refusal is a definite answer from the server, not a dropped poll, so it
+ *   gates on the FIRST poll that reports it (#247) — the trader sees why
+ *   immediately instead of after the tolerance.
  * - `hold` — keep the app mounted on the state it already has: a drop that has
  *   not yet reached {@link GATE_AFTER_DROPPED_POLLS} consecutive polls. The
  *   titlebar strip still reads the status that actually arrived, so nothing
@@ -81,6 +86,13 @@ export function gateDecision(
 ): "open" | "hold" | "gated" {
   if (status.state === "up") {
     return "open";
+  }
+  // #247: the server answered and refused — a 401/403 handshake or a proxied
+  // refusal. That is not a dropped poll (a `pulse serve` restart, a Wi-Fi
+  // hiccup, a VPN flap), which keeps the tolerance below; it is the server
+  // saying "not this token", and the app comes down on the poll that says so.
+  if (status.state === "refused") {
+    return "gated";
   }
   if (!memory.everOpen) {
     return "gated";
@@ -142,6 +154,12 @@ export function App() {
   // the truth.
   const { status: serverStatus, refresh: refreshStatus } = useServerStatus();
   const paperRunning = usePaperRunningCount();
+  // "Change server" (and the way out of a disconnected Settings section): the
+  // Connect screen opens OVER the live app. It is App state, not a ROUTES
+  // entry, because the Connect screen belongs to the gate and the gate is not a
+  // destination — the trader can step back to the app without a connection
+  // having changed.
+  const [connectOpen, setConnectOpen] = useState(false);
   // The gate's memory. A read that FAILED changes no status (the hook keeps the
   // last one), so it counts nothing here either: only statuses that actually
   // arrived are folded in.
@@ -177,10 +195,21 @@ export function App() {
   if (serverStatus === null) {
     return null;
   }
-  if (gateDecision(serverStatus, gateMemory) === "gated") {
+  const gated = gateDecision(serverStatus, gateMemory) === "gated";
+  if (gated || connectOpen) {
     return (
       <WindowChrome docTitle="Connect">
-        <ConnectScreen status={serverStatus} onConnected={refreshStatus} />
+        <ConnectScreen
+          status={serverStatus}
+          onConnected={() => {
+            // Opening the app: leave the override and re-poll so the gate lifts.
+            setConnectOpen(false);
+            refreshStatus();
+          }}
+          // Only the "Change server" entry has somewhere to go back to; the
+          // gate itself is the floor of the app.
+          onBack={gated ? undefined : () => setConnectOpen(false)}
+        />
       </WindowChrome>
     );
   }
@@ -197,22 +226,34 @@ export function App() {
   // unmounts while operations are live.
   return (
     <ActiveOperationsProvider>
-      {/* The count is only claimed while the server is up: a down server's
-          last-known count would read as a live one beside "server down". */}
-      <WindowChrome
-        docTitle={title}
-        serverStatus={serverStatus}
-        paperRunning={serverStatus.state === "up" ? (paperRunning ?? undefined) : undefined}
+      {/* One poll, one answer: the screens that render the connection (Settings
+          today) read the same `useServerStatus` value the gate and the titlebar
+          strip do, and can ask for a fresh read, instead of starting a second
+          poll that can disagree with this one. */}
+      <ConnectionProvider
+        value={{
+          status: serverStatus,
+          refresh: refreshStatus,
+          openConnect: () => setConnectOpen(true),
+        }}
       >
-        <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
-          <Sidebar active={navId} />
-          <main className="content">
-            <CredentialBanner />
-            <RouteContent route={route} />
-          </main>
-          {showDetailsPane && <aside className="details" id="details-pane" />}
-        </div>
-      </WindowChrome>
+        {/* The count is only claimed while the server is up: a down server's
+            last-known count would read as a live one beside "server down". */}
+        <WindowChrome
+          docTitle={title}
+          serverStatus={serverStatus}
+          paperRunning={serverStatus.state === "up" ? (paperRunning ?? undefined) : undefined}
+        >
+          <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
+            <Sidebar active={navId} />
+            <main className="content">
+              <CredentialBanner />
+              <RouteContent route={route} />
+            </main>
+            {showDetailsPane && <aside className="details" id="details-pane" />}
+          </div>
+        </WindowChrome>
+      </ConnectionProvider>
     </ActiveOperationsProvider>
   );
 }
