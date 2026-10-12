@@ -1312,7 +1312,16 @@ impl ClientState {
     /// (the spec: a refusal from any command returns the UI to Connect with
     /// the reason). An `unreachable` outcome leaves the previous state alone —
     /// there is nothing wrong with the saved connection.
+    ///
+    /// #234 (the Rust half): the refusal and the failed-save record are applied
+    /// only while the link this call STARTED FROM is still current — a slow
+    /// older connect can no longer overwrite a newer, verified link that landed
+    /// while it was in flight. The outcome returned is unchanged.
     pub async fn connect(&self, server_url: &str, token: &str) -> ConnectOutcome {
+        // The link the call starts from, snapshotted BEFORE the handshake
+        // (#234): the compare and the install are one write-lock section, so a
+        // connect that completes in between is not overwritten by this one.
+        let generation = self.current_generation();
         match ServerClient::connect(server_url, token).await {
             Ok((client, outcome @ ConnectOutcome::Connected { .. })) => {
                 if let Err(reason) = self.save_connection(server_url.trim_end_matches('/'), token) {
@@ -1320,9 +1329,12 @@ impl ClientState {
                     // persisted: report it through the outcome rather than
                     // silently running un-persisted.
                     let reason = format!("connected, but saving the connection failed: {reason}");
-                    self.install(Link::Failed(ClientError::Unreachable {
-                        reason: reason.clone(),
-                    }));
+                    self.install_if_current(
+                        generation,
+                        Link::Failed(ClientError::Unreachable {
+                            reason: reason.clone(),
+                        }),
+                    );
                     return ConnectOutcome::Unreachable { reason };
                 }
                 self.install(Link::Up(client));
@@ -1330,7 +1342,7 @@ impl ClientState {
             }
             Ok((_, outcome)) => outcome,
             Err(refusal @ (ClientError::TokenRefused { .. } | ClientError::Skew { .. })) => {
-                self.install(Link::Failed(refusal.clone()));
+                self.install_if_current(generation, Link::Failed(refusal.clone()));
                 match refusal {
                     ClientError::TokenRefused { reason } => ConnectOutcome::TokenRefused { reason },
                     ClientError::Skew { server_api_version } => {

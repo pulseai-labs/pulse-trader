@@ -715,6 +715,83 @@ async fn a_connect_that_completes_during_an_older_poll_keeps_the_new_link() {
     );
 }
 
+/// A stub that HOLDS its one handshake until the test releases it and then
+/// answers 401 — the older connect's refusal, made deterministic.
+async fn spawn_held_refusal_stub() -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub");
+    let base = format!("http://{}", listener.local_addr().expect("stub addr"));
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept the connect");
+        let request = read_request(&mut stream).await;
+        assert!(
+            request.contains("GET /api/v1/handshake"),
+            "the older connect is a handshake: {request}"
+        );
+        let _ = arrived_tx.send(());
+        let _ = release_rx.await;
+        answer(&mut stream, "401 Unauthorized", "{}").await;
+    });
+    (base, arrived_rx, release_tx)
+}
+
+/// An OLDER connect whose handshake is refused only after a NEWER connect has
+/// completed and installed must not overwrite the newer link (#234, the Rust
+/// half: `connect`'s refused arm).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_connects_refusal_does_not_overwrite_the_newer_link() {
+    let _guard = ENV_LOCK.lock().await;
+    let world = World::new();
+    let (stub_base, arrived, release) = spawn_held_refusal_stub().await;
+    let server = spawn_server(ServerOptions::default()).await;
+
+    let state = Arc::new(ClientState::with_wiring(world.wiring.clone()));
+
+    // The older connect starts against the stub and is held mid-handshake.
+    let older = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move { state.connect(&stub_base, "pt_w2_stub_token").await })
+    };
+    arrived
+        .await
+        .expect("the stub received the older connect's handshake");
+
+    // While it is in flight, a NEWER connect completes and installs.
+    let outcome = state.connect(&server.base, &server.app_token).await;
+    assert!(
+        matches!(outcome, ConnectOutcome::Connected { .. }),
+        "the newer connection installs: {outcome:?}"
+    );
+
+    // The older handshake now comes back refused: the caller still gets the
+    // refusal (that call really failed), but the link it was refused on is no
+    // longer the app's.
+    release.send(()).expect("release the held handshake");
+    let older_outcome = older.await.expect("the older connect completes");
+    assert!(
+        matches!(older_outcome, ConnectOutcome::TokenRefused { .. }),
+        "the older connect's own outcome is still the refusal: {older_outcome:?}"
+    );
+
+    let status = state.status().await;
+    assert_eq!(
+        status.state,
+        ServerStatusState::Up,
+        "the newer link survives the older connect's refusal"
+    );
+    assert!(
+        status.binary_version.is_some(),
+        "and it is the live link, not a refusal: {status:?}"
+    );
+}
+
 /// A file-write failure AFTER the store write keeps the stored token, records
 /// `Failed` — and the next launch never comes up `Up` on a URL/token pair
 /// nothing verified.
