@@ -120,3 +120,47 @@ request's `http::request::Parts` into the message extensions, and
 `initialize` reads the label through the nested Parts, so a version submitted
 through a token labelled `claude-code` records `agent_name = claude-code`
 no matter what the client calls itself.
+
+## Addendum (r4.s3.w2, 2026-10-12) — where the app token lives
+
+**The app token moved out of the connection file and into the macOS Keychain.**
+`server-connection.toml` keeps the server URL only (`{ url }`, still 0600,
+still written through a temporary file plus rename — now with an fsync of the
+temporary before the rename and of the parent directory after it, #252); the
+token lives in the Keychain item `PulseTrader`/`server_app_token` (grill G1:
+one item for the one server), reached only through a token-store port — the
+Keychain adapter in `src/adapters/secrets.rs` and an in-memory fake for tests
+(ADR-0015). Absence and failure are distinct: no item means the trader connects
+again (`not_connected`), a store error starts `refused` with the named reason.
+Every store write, migration and delete logs one line naming the item and the
+outcome, never a value.
+
+**The one-time verified migration (grill G3, verbatim):** on the first launch
+after the change, an app file that still holds a token has that token written to
+the Keychain, read back and compared, and only on an equal read-back is the file
+rewritten without it. On ANY failure — the write, the read-back, a mismatch, the
+rewrite — the file is left exactly as it was and the app starts refused with the
+named reason; there is no fallback to the file token, and a failed migration is
+retried on the next launch. An older `{ url, token }` file stays *readable* for
+that purpose only: the app's own file type is deserialize-only, so a token
+cannot be written back into it.
+
+**The signed build is load-bearing.** Access to a Keychain item is tied to the
+writer's code identity, so an unsigned (or differently signed) build cannot read
+the item — `just bundle` warns when `PULSE_SIGNING_IDENTITY` is unset (w1). The
+MacBook proof (AC-U1) covers a signed rebuild reading back what an earlier signed
+build wrote and an unsigned rebuild failing to read it silently.
+
+**The `client-token-storage` fake is replaced** by this real store; there is no
+new fake. **`mcp-connection.toml` is unchanged** — the relay's `pulse mcp login`
+artifact keeps `{ url, token }` and its reader and writer keep their meaning
+(grill G4); only the shared durable rename reaches it. Moving the agent token to
+the Keychain stays open as #384.
+
+**#234, the Rust half.** A status poll (or a proxied call's recorded refusal)
+applies its result only while the link it started from is still current — a
+generation counter, bumped on every link replacement (connect, disconnect, the
+start-up migration, a recorded refusal). A result from an older generation is
+dropped, so a stale poll can no longer overwrite a newer connection. The
+frontend hook's own ordering (`ui/src/hooks/useServerStatus.ts`) is not part of
+this change.

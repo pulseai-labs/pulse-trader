@@ -39,6 +39,13 @@ vi.mock("./bindings", () => ({
     // r3.s4.w5: the titlebar's paper pill counts the running sessions App
     // polls; an empty list keeps the strip at "0 paper · 0 live".
     paperSessions: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
+    // r4.s3.w3: the Settings route is live, so `#/settings` mounts the screen
+    // that reads the stored address and can disconnect.
+    serverAddress: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    serverDisconnect: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    // r4.s3 fix round (C5): the Connect screen's own submit — the successful
+    // "Change server" the epoch case drives.
+    serverConnect: vi.fn(),
   },
 }));
 
@@ -64,6 +71,16 @@ function up(): ServerStatus {
 
 function down(): ServerStatus {
   return { state: "down", binary_version: null, engine_fingerprint: null, reason: null, role: null };
+}
+
+function refused(reason: string): ServerStatus {
+  return {
+    state: "refused",
+    binary_version: null,
+    engine_fingerprint: null,
+    reason,
+    role: null,
+  };
 }
 
 function setHash(hash: string) {
@@ -135,7 +152,7 @@ describe("<App /> shell navigation", () => {
   });
 
   it("renders the unbuilt pane, not fabricated content, for a destination with no route", async () => {
-    setHash("#/settings");
+    setHash("#/journal");
     render(<App />);
     expect(await screen.findByText(/not built/i)).toBeTruthy();
   });
@@ -242,12 +259,54 @@ describe("<App /> holds the shell through a dropped poll", () => {
       await act(async () => {
         vi.advanceTimersByTime(POLL_MS);
       });
-      expect(screen.getByRole("heading", { name: "Connect to the server" })).toBeTruthy();
+      // The gate is back; a `down` status is not a refusal, so the screen is
+      // the idle form, not the reconnect one.
+      expect(
+        screen.getByRole("heading", { name: "Connect to your Pulse server" }),
+      ).toBeTruthy();
       expect(container.querySelector(".sidebar")).toBeNull();
     } finally {
       vi.useRealTimers();
       // The file's module-level `up` default, restored for every test that
       // renders the shell after this one.
+      vi.mocked(commands.serverStatus).mockImplementation(() =>
+        Promise.resolve({ status: "ok", data: up() }),
+      );
+    }
+  });
+
+  // r4.s3.w3, #247: a refusal the server answered is not a dropped poll. It
+  // takes the app down on the poll that reports it — no tolerance, no waiting
+  // for three ticks — while the drop cases above keep today's behaviour.
+  it("gates on the FIRST poll that reports an explicit refusal (#247)", async () => {
+    let poll = 0;
+    vi.mocked(commands.serverStatus).mockImplementation(() => {
+      poll += 1;
+      const data =
+        poll === 1 ? up() : refused("the server refused this token (HTTP 401 Unauthorized)");
+      return Promise.resolve({ status: "ok", data });
+    });
+
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<App />);
+      await act(async () => {});
+      // Open on the first poll: the shell is here.
+      expect(container.querySelector(".sidebar")).not.toBeNull();
+
+      // ONE refused poll is enough.
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(container.querySelector(".sidebar")).toBeNull();
+      expect(
+        screen.getByRole("heading", { name: "Reconnect to your Pulse server" }),
+      ).toBeTruthy();
+      expect(screen.getByRole("alert").textContent).toContain(
+        "the server refused this token",
+      );
+    } finally {
+      vi.useRealTimers();
       vi.mocked(commands.serverStatus).mockImplementation(() =>
         Promise.resolve({ status: "ok", data: up() }),
       );
@@ -439,5 +498,107 @@ describe("<App /> keeps an operation alive across navigation (#141)", () => {
 
     expect(await screen.findByText("run-landed-while-away")).toBeTruthy();
     expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+  });
+
+  // r4.s3 fix round (B2): the Connect detour is not a remount of the provider
+  // either. `ActiveOperationsProvider` used to wrap only the app branch, so
+  // opening Connect over a live app unmounted it and dropped the in-flight
+  // record (and its single-flight latch) on the floor.
+  it("keeps the operation record alive across the Connect screen", async () => {
+    let settle!: (value: { status: "ok"; data: BacktestRunDto }) => void;
+    const pending = new Promise<{ status: "ok"; data: BacktestRunDto }>((resolve) => {
+      settle = resolve;
+    });
+    vi.mocked(commands.runBacktestVersion).mockReturnValue(pending);
+
+    setHash("#/backtest");
+    const { container } = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+
+    // Open Connect over the live app — the "Change server" entry, whose Back
+    // button is the way out — and watch the app branch actually give way.
+    await act(async () => {
+      setHash("#/settings");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Change server" }));
+    expect(screen.getByRole("heading", { name: "Connect to your Pulse server" })).toBeTruthy();
+    expect(container.querySelector(".sidebar")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Back to the app" }));
+
+    // Back on the app branch: the record is STILL there — the Lab shows the run
+    // still running and nothing was invoked again by the detour.
+    await act(async () => {
+      setHash("#/backtest");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(await screen.findByText(/running the backtest/i)).toBeTruthy();
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+
+    // And the result lands in the SAME store: no re-run, no lost channel.
+    await act(async () => {
+      settle({ status: "ok", data: LANDED_RUN });
+      await pending;
+    });
+    expect(await screen.findByText("run-landed-while-away")).toBeTruthy();
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+  });
+
+  // r4.s3 fix round (C5): Back keeps the records (above), but an ACCEPTED
+  // connect is a new server identity — a record made against the old server
+  // must not show against the new one. The provider is keyed on `connectEpoch`,
+  // bumped in the Connect screen's `onConnected`.
+  it("drops an operation record after a successful Change server", async () => {
+    let settle!: (value: { status: "ok"; data: BacktestRunDto }) => void;
+    const pending = new Promise<{ status: "ok"; data: BacktestRunDto }>((resolve) => {
+      settle = resolve;
+    });
+    vi.mocked(commands.runBacktestVersion).mockReturnValue(pending);
+    vi.mocked(commands.serverConnect).mockResolvedValue({
+      status: "ok",
+      data: { outcome: "connected", binary_version: "0.2.0", engine_fingerprint: "sha256:new" },
+    });
+
+    setHash("#/backtest");
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/running the backtest/i)).toBeTruthy();
+
+    // Change server, and let the connect SUCCEED: the card's "Open the app →"
+    // is the acceptance (the countdown's own path calls the same callback).
+    await act(async () => {
+      setHash("#/settings");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Change server" }));
+    fireEvent.change(screen.getByLabelText(/server url/i), {
+      target: { value: "http://100.90.203.12:8420" },
+    });
+    fireEvent.change(screen.getByLabelText(/app token/i), {
+      target: { value: "pt_new_app_token" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /open the app/i }));
+
+    // Back on the app branch: the record belonged to the OLD server, so it is
+    // gone — and the single-flight latch went with it, so a run is a fresh
+    // invocation rather than a refusal.
+    await act(async () => {
+      setHash("#/backtest");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(screen.queryByText(/running the backtest/i)).toBeNull();
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+    expect(commands.runBacktestVersion).toHaveBeenCalledTimes(2);
+
+    // Leave nothing pending.
+    await act(async () => {
+      settle({ status: "ok", data: LANDED_RUN });
+      await pending;
+    });
   });
 });

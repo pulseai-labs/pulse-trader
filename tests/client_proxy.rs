@@ -34,10 +34,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulse::{
-    BusErrorCode, ClientState, CompareChildRunRequest, ConnectOutcome, CredentialStatus,
-    LibraryOverview, RunOpOutcome, ServerClient, ServerStatusState, ShellInfo, StreamOutcome,
-    compare_child_run_core, compose_strategy_body, library_overview_core, llm_credential_status,
-    shell_info_core,
+    BusErrorCode, ClientState, ClientWiring, CompareChildRunRequest, ConnectOutcome,
+    CredentialStatus, InMemoryTokenStore, LibraryOverview, RunOpOutcome, ServerClient,
+    ServerStatusState, ShellInfo, StreamOutcome, compare_child_run_core, compose_strategy_body,
+    library_overview_core, llm_credential_status, shell_info_core,
 };
 
 /// Serializes the tests that set or read `$PULSE_CONFIG_DIR` — the
@@ -126,6 +126,18 @@ async fn connected(server: &TestServer) -> ServerClient {
 /// One JSON value comparison, so DTO `PartialEq` bounds never gate a test.
 fn same_wire<T: serde::Serialize>(a: &T, b: &T) -> bool {
     serde_json::to_value(a).unwrap() == serde_json::to_value(b).unwrap()
+}
+
+/// A fresh, disconnected app state on the IN-MEMORY token store (the fix
+/// round's B3): `ClientState::new()` wires the production Keychain adapter, and
+/// on a Mac every connect / disconnect through it wrote or deleted the
+/// operator's real `PulseTrader`/`server_app_token` item. The store's contents
+/// are the test's to assert; the connection file still resolves
+/// `$PULSE_CONFIG_DIR`, so the `ENV_LOCK` discipline above is unchanged.
+fn disconnected_state() -> ClientState {
+    ClientState::with_wiring(ClientWiring::with_store(Arc::new(
+        InMemoryTokenStore::default(),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -794,7 +806,7 @@ async fn client_state_tracks_connect_refusal_disconnect_and_dead_sockets() {
     // shares the env window with the tests that set it.
     let _guard = ENV_LOCK.lock().await;
     let server = spawn_server(ServerOptions::default()).await;
-    let state = ClientState::new();
+    let state = disconnected_state();
 
     assert_eq!(
         state.status().await.state,
@@ -919,9 +931,10 @@ async fn a_millisecond_backoff_policy_makes_the_resume_fast() {
 // with mcp-connection.toml BESIDE it (login's output, read by the relay)
 // ---------------------------------------------------------------------------
 
-/// A good connect persists THE APP'S OWN file — `server-connection.toml`,
-/// mode 0600, holding `{ url, token }` — and never touches
-/// `mcp-connection.toml` (that one is `pulse mcp login`'s artifact).
+/// A good connect persists THE APP'S OWN file — `server-connection.toml`, mode
+/// 0600, holding `{ url }` ONLY (r4.s3.w2: the token lives in the token store,
+/// never in this file) — and never touches `mcp-connection.toml` (that one is
+/// `pulse mcp login`'s artifact).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -936,11 +949,20 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
         std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
     }
 
-    let state = ClientState::new();
+    // The in-memory fake replaces the Keychain adapter: no real Keychain on any
+    // platform, and the store's contents are the test's to assert.
+    let store = Arc::new(InMemoryTokenStore::default());
+    let wiring = ClientWiring::with_store(store.clone());
+    let state = ClientState::with_wiring(wiring.clone());
     let outcome = state.connect(&server.base, &server.app_token).await;
     assert!(
         matches!(outcome, ConnectOutcome::Connected { .. }),
         "the connect must succeed: {outcome:?}"
+    );
+    assert_eq!(
+        store.token().as_deref(),
+        Some(server.app_token.as_str()),
+        "the token landed in the token store"
     );
 
     let app_file = config_dir.path().join("server-connection.toml");
@@ -955,8 +977,12 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
     );
     let text = std::fs::read_to_string(&app_file).expect("read the file");
     assert!(
-        text.contains(server.base.trim_end_matches('/')) && text.contains("token"),
-        "the file names the server and the token: {text}"
+        text.contains(server.base.trim_end_matches('/')),
+        "the file names the server: {text}"
+    );
+    assert!(
+        !text.contains("token"),
+        "the app file keeps the URL only — the token is in the store: {text}"
     );
     let mode = std::fs::metadata(&app_file)
         .expect("stat the file")
@@ -964,12 +990,13 @@ async fn connect_persists_the_apps_server_connection_file_beside_mcp_connection(
         .mode();
     assert_eq!(mode & 0o777, 0o600, "the app file is owner-only");
 
-    // And a fresh app state loads FROM that file: connected on start-up.
-    let reloaded = ClientState::loaded();
+    // And a fresh app state loads FROM the file plus the store: connected on
+    // start-up.
+    let reloaded = ClientState::loaded_with_wiring(wiring);
     assert_eq!(
         reloaded.status().await.state,
         ServerStatusState::Up,
-        "the connection file reconnects a relaunched app"
+        "the URL-only file plus the stored token reconnect a relaunched app"
     );
 
     // SAFETY: see above — the ENV_LOCK guard still held.
@@ -1056,7 +1083,7 @@ async fn connect_refuses_an_agent_scoped_token_and_writes_no_connection_file() {
         std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
     }
 
-    let state = ClientState::new();
+    let state = disconnected_state();
     let outcome = state.connect(&server.base, &server.agent_token).await;
     let reason = match outcome {
         ConnectOutcome::TokenRefused { reason } => reason,
@@ -1142,7 +1169,7 @@ async fn connect_against_a_server_without_the_scope_field_still_connects() {
     unsafe {
         std::env::set_var("PULSE_CONFIG_DIR", config_dir.path());
     }
-    let state = ClientState::new();
+    let state = disconnected_state();
     let outcome = state.connect(&base, "pt_legacy_server_token").await;
     handle.await.expect("stub completes");
 
@@ -1190,7 +1217,12 @@ async fn a_loose_connection_file_is_refused_on_load_with_a_named_reason() {
     std::fs::set_permissions(&app_file, std::fs::Permissions::from_mode(0o644))
         .expect("make it loose");
 
-    let state = ClientState::loaded();
+    // The loose-file refusal happens in `connection::load_app`, BEFORE the
+    // store is read, so the in-memory store (the fix round's B3) leaves this
+    // path — and this assertion — exactly as it was.
+    let state = ClientState::loaded_with_wiring(ClientWiring::with_store(Arc::new(
+        InMemoryTokenStore::default(),
+    )));
     let status = state.status().await;
     assert_eq!(status.state, ServerStatusState::Refused);
     let reason = status.reason.expect("a refusal carries its reason");

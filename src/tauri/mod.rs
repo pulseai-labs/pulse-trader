@@ -63,7 +63,7 @@ pub use commands::{
     BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
     DesktopState, OperationGuard, OperationKey, ShellInfo, StreamOutcome, compare_child_run_core,
     compose_strategy_body, compose_strategy_core, demo_stream_core, library_overview_core,
-    run_backtest_version_core, shell_info_core, summarize_dsl,
+    run_backtest_version_core, server_address, shell_info_core, summarize_dsl,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -114,10 +114,12 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::run_walk_forward_version,
         commands::get_walk_forward_run,
         commands::get_backtest_run,
-        // r3.s3.w5: the connection trio — Connect's verbs.
+        // r3.s3.w5: the connection trio — Connect's verbs (r4.s3.w3 adds the
+        // stored address the Settings screen reads beside them).
         commands::server_connect,
         commands::server_status,
         commands::server_disconnect,
+        commands::server_address,
         // r3.s4.w5: the paper session surface.
         commands::paper_promote,
         commands::paper_sessions,

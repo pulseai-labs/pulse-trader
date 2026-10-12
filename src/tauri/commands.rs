@@ -135,6 +135,8 @@ pub const BUS_COMMANDS: &[&str] = &[
     "server_connect",
     "server_status",
     "server_disconnect",
+    // r4.s3.w3: the Settings screen's read of the stored server URL.
+    "server_address",
     // r3.s4.w5: the paper session surface — promote, the reads, the shadow
     // check, stop / stop-all and the live session stream.
     "paper_promote",
@@ -1787,14 +1789,16 @@ pub async fn certification_records(
 // ---------------------------------------------------------------------------
 
 /// Connect the app to the server: handshake first, then persist the
-/// connection file and swap the connection on success. The named outcome
+/// connection — the token in the macOS Keychain, the URL in the connection
+/// file — and swap the connection on success. The named outcome
 /// (`connected` / `unreachable` / `token_refused` / `skew`) is what the
 /// Connect screen renders; a `token_refused`/`skew` ALSO records the refusal
 /// as the connection state, so `server_status` repeats it.
 ///
-/// The token argument never appears in an error, a log line, or the
-/// connection file's directory listing — it is written `0600` to the
-/// connection file beside `server-connection.toml`, and nowhere else.
+/// The token argument never crosses back to the frontend, never appears in an
+/// error, an outcome or a log line, and is written nowhere but the Keychain
+/// item G1 pins; every write logs one line naming that item and its outcome,
+/// never the value.
 ///
 /// The `Result` shell is tauri's rule for async commands taking managed state
 /// (a reference input); the outcome carries every failure, so the error arm is
@@ -1832,6 +1836,27 @@ pub async fn server_status(state: tauri::State<'_, ClientState>) -> Result<Serve
 #[specta::specta]
 pub async fn server_disconnect(state: tauri::State<'_, ClientState>) -> Result<(), BusError> {
     state.disconnect()
+}
+
+/// The Settings screen's read (r4.s3.w3): the stored connection's server URL,
+/// or `None` when no connection is stored.
+///
+/// The URL only, never the token: it reads the same file — through the same
+/// safety vetting — that the app's start-up state loads, and returns nothing
+/// else. No command result carries the token to the frontend.
+///
+/// # Errors
+///
+/// A stored connection that fails its safety vetting answers with the named
+/// reason (the file and the check that failed, never a secret).
+#[tauri::command]
+#[specta::specta]
+pub async fn server_address() -> Result<Option<String>, BusError> {
+    match crate::client::connection::load_app() {
+        Ok(Some(file)) => Ok(Some(file.url)),
+        Ok(None) => Ok(None),
+        Err(reason) => Err(BusError::internal(reason)),
+    }
 }
 
 /// A no-op sink for operations the client drives without a channel: a
@@ -2110,6 +2135,66 @@ mod tests {
         assert!(
             !same.contains("lead-in"),
             "equal lead-ins must not be reported: {same}"
+        );
+    }
+
+    /// r4.s3.w3: the Settings screen's read returns the stored URL and never the
+    /// stored token.
+    ///
+    /// The file is written by hand in the LEGACY `{ url, token }` shape (r4.s3.w2
+    /// reads it for the one-time migration, so this shape is reachable): even
+    /// then the command's SERIALISED result must carry the URL and must not
+    /// contain the token string — the credential gate's rule, pinned at the wire
+    /// shape rather than at the type.
+    ///
+    /// The config dir is set once, process-wide, and never mutated again (the
+    /// `tests/tauri_paper.rs` isolation): `cargo nextest`, the gate this repo
+    /// runs, gives every test its own process, so there is nothing to race.
+    #[tokio::test]
+    async fn server_address_returns_the_stored_url_and_never_the_token() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const TOKEN: &str = "pt_app_test_token_never_serialised";
+        const URL: &str = "http://100.90.203.12:8420";
+        static DIR: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+            let dir = tempfile::TempDir::new().expect("config tempdir");
+            let path = dir.keep();
+            // SAFETY: set once inside the initializer, before any other reader of
+            // the variable in this process can run.
+            unsafe {
+                std::env::set_var("PULSE_CONFIG_DIR", &path);
+            }
+            path
+        });
+        let _ = &*DIR;
+
+        let path = crate::client::connection::app_path().expect("the app file's path");
+        std::fs::write(&path, format!("url = \"{URL}\"\ntoken = \"{TOKEN}\"\n"))
+            .expect("write the legacy file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("pin 0600");
+
+        let answer = super::server_address().await.expect("the read answers");
+        assert_eq!(
+            answer.as_deref(),
+            Some(URL),
+            "the command returns the stored URL"
+        );
+
+        let serialised = serde_json::to_string(&answer).expect("serialise the result");
+        assert!(
+            serialised.contains(URL),
+            "the serialised result carries the URL: {serialised}"
+        );
+        assert!(
+            !serialised.contains(TOKEN),
+            "the serialised result must never carry the token: {serialised}"
+        );
+
+        // With nothing stored the command answers `None`, not an error.
+        crate::client::connection::remove_app().expect("remove the connection");
+        assert_eq!(
+            super::server_address().await.expect("the read answers"),
+            None
         );
     }
 }

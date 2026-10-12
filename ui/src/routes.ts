@@ -41,6 +41,7 @@ import DeploymentDashboard from "./screens/DeploymentDashboard";
 import DesignerScreen from "./screens/DesignerScreen";
 
 import LibraryScreen from "./screens/LibraryScreen";
+import SettingsScreen from "./screens/SettingsScreen";
 
 /** One screen in the shell. */
 export interface Route {
@@ -112,6 +113,16 @@ export const ROUTES: readonly Route[] = [
     nav: "deploy",
     element: DeploymentDashboard,
     details: true,
+  },
+  // r4.s3.w3: the Settings screen goes live the same way every screen before it
+  // did — one appended entry, and the existing `settings` nav row's derived
+  // "Soon" badge disappears on its own (`isNavBuilt`, G8), with zero nav-side
+  // edits. `details` stays unset: the screen is a single column of sections.
+  {
+    path: "/settings",
+    title: "Settings",
+    nav: "settings",
+    element: SettingsScreen,
   },
 ];
 

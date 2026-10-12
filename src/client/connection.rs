@@ -1,28 +1,31 @@
-//! The connection files (r3.s3.w5, the `client-token-storage` fake; reshaped
-//! by the dispatch-2 correction).
+//! The connection files (r3.s3.w5, the `client-token-storage` fake; reshaped by
+//! the dispatch-2 correction, and by r4.s3.w2).
 //!
-//! **TWO files**, per spec lines 126 and 199 and reading-3 of the approved
-//! ruling:
+//! **TWO files**, and since r4.s3.w2 they have DIFFERENT shapes:
 //!
-//! - `<data dir>/server-connection.toml` — THE APP'S OWN connection: written
-//!   by a successful `server_connect`, deleted by `server_disconnect`, loaded
-//!   at start-up. Holds `{ url, token }`.
-//! - `<data dir>/mcp-connection.toml` — BESIDE it: `pulse mcp login`'s
-//!   artifact, read by the bare-`pulse mcp` relay. Same shape, same rules.
+//! - `<data dir>/server-connection.toml` — THE APP'S OWN connection: written by
+//!   a successful `server_connect`, deleted by `server_disconnect`, loaded at
+//!   start-up. Holds `{ url }` — the token lives in the Keychain, behind the
+//!   token-store port. An older `{ url, token }` file is still READ (the G3
+//!   migration's input); [`AppConnectionFile`] is `Deserialize`-only, so a
+//!   token cannot be written back into it.
+//! - `<data dir>/mcp-connection.toml` — BESIDE it: `pulse mcp login`'s artifact,
+//!   read by the bare-`pulse mcp` relay. Holds `{ url, token }` (G4; #384
+//!   tracks moving the agent token later).
 //!
-//! Shared rules (both files): written only after a passing handshake, through
-//! a temporary file plus rename, with mode `0600` set BEFORE the token is
-//! written; read through `adapters::secrets`' vetted-file discipline — the
-//! SAME `O_NONBLOCK`/`O_CLOEXEC`/fstat/owner/mode checks, reused, never a
-//! weaker reimplementation. A group/world-readable file is refused on load
-//! with the named reason. **Never** the Keychain, and never logged; the
-//! fake's replacement trigger stays in the spine's `Fakes` ledger (r3.s4
-//! revisits storage). `$PULSE_CONFIG_DIR` overrides the directory **for tests
-//! only** — the same env var the credential resolver honours.
+//! Shared rules (both files): written only after a passing handshake, through a
+//! temporary file plus rename, with mode `0600` set BEFORE any token byte is
+//! written; the temp is synced and the parent directory synced after the rename
+//! (#252); read through `adapters::secrets`' vetted-file discipline — the SAME
+//! `O_NONBLOCK`/`O_CLOEXEC`/fstat/owner/mode checks, reused, never a weaker
+//! reimplementation. A group/world-readable file is refused on load with the
+//! named reason. **Never** logged; the fake's replacement trigger stays in the
+//! spine's `Fakes` ledger. `$PULSE_CONFIG_DIR` overrides the directory **for
+//! tests only** — the same env var the credential resolver honours.
 
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,13 +37,44 @@ const APP_FILE: &str = "server-connection.toml";
 const MCP_FILE: &str = "mcp-connection.toml";
 
 /// One stored connection: where the server is and the token that works.
+///
+/// Since r4.s3.w2 this is the RELAY's shape only — `mcp-connection.toml`, whose
+/// reader and writer keep their meaning (G4). The app's own file is
+/// [`AppConnectionFile`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ConnectionFile {
+pub struct ConnectionFile {
     /// The server's base URL.
     pub url: String,
-    /// The bearer token — stored so the app (and the relay, in its own file)
-    /// reconnects without retyping. Never logged, never in an error.
+    /// The bearer token — stored so the relay reconnects without retyping.
+    /// Never logged, never in an error.
     pub token: String,
+}
+
+/// The app's own connection file, as READ (`server-connection.toml`).
+///
+/// `Deserialize` ONLY, deliberately: a token cannot be serialised into the app
+/// file by construction — [`store_app`] takes the URL alone and writes
+/// [`UrlOnlyBody`].
+///
+/// `token` exists for exactly one reason: an older `{ url, token }` file (the
+/// `client-token-storage` era) must still be readable, because the one-time
+/// verified migration (G3) reads the file token out of it. Every file this app
+/// writes has no token key at all.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AppConnectionFile {
+    /// The server's base URL.
+    pub url: String,
+    /// An older file's bearer token — the migration's input. Never logged,
+    /// never in an error.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// The URL-only body the app file is WRITTEN as. Private on purpose: it is the
+/// only thing [`store_app`] can serialize, and it has no token field.
+#[derive(Serialize)]
+struct UrlOnlyBody<'a> {
+    url: &'a str,
 }
 
 /// The directory both files live in: `$PULSE_CONFIG_DIR` (tests only) or the
@@ -77,18 +111,69 @@ pub(crate) fn mcp_path() -> Result<PathBuf, String> {
     dir().map(|dir| dir.join(MCP_FILE))
 }
 
-/// Parse a vetted file body into a connection. Both files carry the same
-/// `{ url, token }` shape.
-fn parse(text: &str, display: &std::path::Path) -> Result<ConnectionFile, String> {
-    let parsed: ConnectionFile = toml::from_str(text)
-        .map_err(|error| format!("{} is unreadable: {error}", display.display()))?;
+/// The refusal for a toml failure over a connection-file body: the path and the
+/// `line:column` its span starts at, and NOTHING else (D1). The toml error's
+/// OWN Display quotes the offending source line, so a legacy `{ url, token }`
+/// file malformed on its token line would otherwise carry the token value into
+/// `server_address`'s `BusError` and into the start-up `refused` reason. The
+/// message is deliberately never formatted in: not the Display, not
+/// `message()`, no source text.
+fn unreadable(display: &Path, text: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => {
+            let (line, column) = line_column(text, span.start);
+            format!(
+                "{} is unreadable at line {line}, column {column}",
+                display.display()
+            )
+        }
+        // A structural error with no span: the path alone — still no message.
+        None => format!("{} is unreadable", display.display()),
+    }
+}
+
+/// The 1-based `(line, column)` of a byte offset in `text`, clamped into the
+/// text and backed up to a character boundary: an error's span is only a
+/// position, and a position must never panic the reader.
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &text[..offset];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(1, |tail| tail.chars().count() + 1);
+    (line, column)
+}
+
+/// Parse a vetted relay-file body: both the URL and the token are required.
+fn parse(text: &str, display: &Path) -> Result<ConnectionFile, String> {
+    let parsed: ConnectionFile =
+        toml::from_str(text).map_err(|error| unreadable(display, text, &error))?;
     if parsed.url.is_empty() || parsed.token.is_empty() {
         return Err(format!("{} is missing url or token", display.display()));
     }
     Ok(parsed)
 }
 
-/// Load the file at `path`, if one exists and survives the vetting.
+/// Parse a vetted app-file body: the URL is required, the token is an OLDER
+/// file's (the migration's input) — and an empty one counts as absent.
+fn parse_app(text: &str, display: &Path) -> Result<AppConnectionFile, String> {
+    let parsed: AppConnectionFile =
+        toml::from_str(text).map_err(|error| unreadable(display, text, &error))?;
+    if parsed.url.is_empty() {
+        return Err(format!("{} is missing url", display.display()));
+    }
+    Ok(AppConnectionFile {
+        url: parsed.url,
+        token: parsed.token.filter(|token| !token.is_empty()),
+    })
+}
+
+/// The vetted body of the file at `path`, or `None` when nothing answers there.
 ///
 /// # Errors
 ///
@@ -96,40 +181,73 @@ fn parse(text: &str, display: &std::path::Path) -> Result<ConnectionFile, String
 /// refusal carrying the named reason — the caller records it as the
 /// connection's refused state rather than silently ignoring a file it cannot
 /// trust.
-fn load_at(path: &std::path::Path) -> Result<Option<ConnectionFile>, String> {
+fn vetted_text(path: &Path) -> Result<Option<String>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = secrets::read_vetted_file(path).map_err(|refusal| refusal.to_string())?;
-    let Some(text) = text else {
+    let Some(text) = secrets::read_vetted_file(path).map_err(|refusal| refusal.to_string())? else {
         // The vetted read says "not a regular file / vanished mid-check":
         // treated as absent — nothing to connect with.
+        return Ok(None);
+    };
+    Ok(Some(text))
+}
+
+/// Load the app's file at `path`, if one exists and survives the vetting.
+///
+/// # Errors
+///
+/// The vetting refusal, named.
+fn load_app_at(path: &Path) -> Result<Option<AppConnectionFile>, String> {
+    let Some(text) = vetted_text(path)? else {
+        return Ok(None);
+    };
+    parse_app(&text, path).map(Some)
+}
+
+/// Load the relay's file at `path`, if one exists and survives the vetting.
+///
+/// # Errors
+///
+/// The vetting refusal, named.
+fn load_mcp_at(path: &Path) -> Result<Option<ConnectionFile>, String> {
+    let Some(text) = vetted_text(path)? else {
         return Ok(None);
     };
     parse(&text, path).map(Some)
 }
 
-/// [`load_at`] on the app's `server-connection.toml`.
+/// [`load_app_at`] on the app's `server-connection.toml`.
 ///
 /// # Errors
 ///
 /// The vetting refusal, named.
-pub(crate) fn load_app() -> Result<Option<ConnectionFile>, String> {
-    load_at(&app_path()?)
+pub fn load_app() -> Result<Option<AppConnectionFile>, String> {
+    load_app_at(&app_path()?)
 }
 
-/// [`load_at`] on the relay's `mcp-connection.toml`.
+/// [`load_mcp_at`] on the relay's `mcp-connection.toml`.
 ///
 /// # Errors
 ///
 /// The vetting refusal, named.
-pub(crate) fn load_mcp() -> Result<Option<ConnectionFile>, String> {
-    load_at(&mcp_path()?)
+pub fn load_mcp() -> Result<Option<ConnectionFile>, String> {
+    load_mcp_at(&mcp_path()?)
 }
 
-/// Store the file at `path` the spec's way: a temporary file is opened with
-/// mode `0600` set at creation — BEFORE any token byte is written — the body
-/// goes to the temporary, and a rename makes the file atomic for every reader.
+/// A write-path failure before the rename: the temporary is removed (best
+/// effort — a leftover temp is a file some later reader could meet, and for the
+/// relay's file it can hold secret bytes) and the reason names the temporary.
+fn temp_failure(tmp: &Path, action: &str, error: &std::io::Error) -> String {
+    let _ = std::fs::remove_file(tmp);
+    format!("cannot {action} {}: {error}", tmp.display())
+}
+
+/// Store `body` at `path` the spec's way: a temporary file is opened with mode
+/// `0600` set at creation — BEFORE any byte is written — the body goes to the
+/// temporary, the temporary is SYNCED, and a rename makes the file atomic for
+/// every reader; the parent directory is synced afterwards, so the rename
+/// itself survives a power loss (#252).
 ///
 /// The temporary is deliberately NOT reused. `mode(0o600)` applies only when
 /// the file is CREATED, so a temp left behind by a crashed write — or planted
@@ -141,12 +259,12 @@ pub(crate) fn load_mcp() -> Result<Option<ConnectionFile>, String> {
 /// only land in a file this call created, and the explicit `set_permissions`
 /// below pins the mode even if the process umask would have masked it at
 /// creation.
-fn store_at(path: &std::path::Path, connection: &ConnectionFile) -> Result<(), String> {
+fn store_at<T: Serialize>(path: &Path, body: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
-    let body = toml::to_string_pretty(connection)
+    let body = toml::to_string_pretty(body)
         .map_err(|error| format!("cannot serialize the connection: {error}"))?;
     let tmp = path.with_extension("toml.tmp");
     // A symlink at the temp path is refused outright, never removed and never
@@ -172,31 +290,48 @@ fn store_at(path: &std::path::Path, connection: &ConnectionFile) -> Result<(), S
         .open(&tmp)
         .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("cannot secure {}: {error}", tmp.display()))?;
+        .map_err(|error| temp_failure(&tmp, "secure", &error))?;
     file.write_all(body.as_bytes())
-        .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
+        .map_err(|error| temp_failure(&tmp, "write", &error))?;
+    // #252: the bytes must be on disk BEFORE the rename publishes them —
+    // otherwise a power loss can leave the file zero-length or absent.
+    file.sync_all()
+        .map_err(|error| temp_failure(&tmp, "sync", &error))?;
     std::fs::rename(&tmp, path).map_err(|error| {
         let _ = std::fs::remove_file(&tmp);
         format!("cannot put {} in place: {error}", path.display())
     })?;
+    // #252: and the rename itself must be durable — the entry lives in the
+    // parent directory, so that is what has to reach disk.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("cannot sync {}: {error}", parent.display()))?;
+    }
     Ok(())
 }
 
-/// [`store_at`] on the app's `server-connection.toml`.
+/// [`store_at`] on the app's `server-connection.toml`, written as `{ url }`.
+///
+/// Takes the URL ALONE on purpose: the app file has no token field to write
+/// (G2), and this is the only writer of it.
 ///
 /// # Errors
 ///
 /// Directory creation or the write/rename failed; the reason names the path.
-pub(crate) fn store_app(connection: &ConnectionFile) -> Result<(), String> {
-    store_at(&app_path()?, connection)
+pub fn store_app(url: &str) -> Result<(), String> {
+    store_at(&app_path()?, &UrlOnlyBody { url })
 }
 
-/// [`store_at`] on the relay's `mcp-connection.toml`.
+/// [`store_at`] on the relay's `mcp-connection.toml` — still `{ url, token }`
+/// (G4), now with the same durable rename (#252).
 ///
 /// # Errors
 ///
 /// Directory creation or the write/rename failed; the reason names the path.
-pub(crate) fn store_mcp(connection: &ConnectionFile) -> Result<(), String> {
+pub fn store_mcp(connection: &ConnectionFile) -> Result<(), String> {
     store_at(&mcp_path()?, connection)
 }
 

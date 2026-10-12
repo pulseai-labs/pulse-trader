@@ -31,13 +31,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pulse::{
-    BarRef, BusError, BusErrorCode, Candle, CandleStore, ClientState, ConnectOutcome, CreatedBy,
-    Db, EngineFingerprint, Graduation, NewVersion, NonEmptyLabel, NonEmptyReason, Pair, PaperEvent,
-    PaperEventFrame, PaperJsonText, PaperSessionDraft, PaperSessionId, PaperSessionRepository,
-    PaperSide, PaperStreamEvent, PaperStreamSink, PromoteOverride, PromoteRequest, RetryBackoff,
-    ServerClient, SqliteBacktestRunRepo, SqliteClientTokenRepo, SqlitePaperSessionRepo,
-    SqliteStrategyRepo, StopActor, StrategyRepository, Timeframe, VersionId, WalkForwardRunDraft,
-    WalkForwardRunRepository, promote,
+    BarRef, BusError, BusErrorCode, Candle, CandleStore, ClientState, ClientWiring, ConnectOutcome,
+    CreatedBy, Db, EngineFingerprint, Graduation, InMemoryTokenStore, NewVersion, NonEmptyLabel,
+    NonEmptyReason, Pair, PaperEvent, PaperEventFrame, PaperJsonText, PaperSessionDraft,
+    PaperSessionId, PaperSessionRepository, PaperSide, PaperStreamEvent, PaperStreamSink,
+    PromoteOverride, PromoteRequest, RetryBackoff, ServerClient, SqliteBacktestRunRepo,
+    SqliteClientTokenRepo, SqlitePaperSessionRepo, SqliteStrategyRepo, StopActor,
+    StrategyRepository, Timeframe, VersionId, WalkForwardRunDraft, WalkForwardRunRepository,
+    promote,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -112,7 +113,13 @@ async fn paper_state(ts: &TestServer) -> ClientState {
     static CONNECT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = CONNECT_LOCK.lock().await;
     let _ = isolate_config_dir();
-    let state = ClientState::new();
+    // The fix round's B3: the state runs on the IN-MEMORY token store, never
+    // `ClientState::new()`'s production Keychain adapter — on a Mac this
+    // connect would otherwise write the operator's real
+    // `PulseTrader`/`server_app_token` item.
+    let state = ClientState::with_wiring(ClientWiring::with_store(Arc::new(
+        InMemoryTokenStore::default(),
+    )));
     let outcome = state.connect(&ts.base, &ts.app_token).await;
     assert!(
         matches!(outcome, ConnectOutcome::Connected { .. }),

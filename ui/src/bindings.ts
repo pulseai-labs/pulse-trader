@@ -180,14 +180,16 @@ export const commands = {
 	getBacktestRun: (request: GetBacktestRunRequest) => typedError<BacktestRunDto, BusError>(__TAURI_INVOKE("get_backtest_run", { request })),
 	/**
 	 *  Connect the app to the server: handshake first, then persist the
-	 *  connection file and swap the connection on success. The named outcome
+	 *  connection — the token in the macOS Keychain, the URL in the connection
+	 *  file — and swap the connection on success. The named outcome
 	 *  (`connected` / `unreachable` / `token_refused` / `skew`) is what the
 	 *  Connect screen renders; a `token_refused`/`skew` ALSO records the refusal
 	 *  as the connection state, so `server_status` repeats it.
 	 * 
-	 *  The token argument never appears in an error, a log line, or the
-	 *  connection file's directory listing — it is written `0600` to the
-	 *  connection file beside `server-connection.toml`, and nowhere else.
+	 *  The token argument never crosses back to the frontend, never appears in an
+	 *  error, an outcome or a log line, and is written nowhere but the Keychain
+	 *  item G1 pins; every write logs one line naming that item and its outcome,
+	 *  never the value.
 	 * 
 	 *  The `Result` shell is tauri's rule for async commands taking managed state
 	 *  (a reference input); the outcome carries every failure, so the error arm is
@@ -213,6 +215,20 @@ export const commands = {
 	 *  Never — the `Result` is the bus's uniform command shape.
 	 */
 	serverDisconnect: () => typedError<null, BusError>(__TAURI_INVOKE("server_disconnect")),
+	/**
+	 *  The Settings screen's read (r4.s3.w3): the stored connection's server URL,
+	 *  or `None` when no connection is stored.
+	 * 
+	 *  The URL only, never the token: it reads the same file — through the same
+	 *  safety vetting — that the app's start-up state loads, and returns nothing
+	 *  else. No command result carries the token to the frontend.
+	 * 
+	 *  # Errors
+	 * 
+	 *  A stored connection that fails its safety vetting answers with the named
+	 *  reason (the file and the check that failed, never a secret).
+	 */
+	serverAddress: () => typedError<string | null, BusError>(__TAURI_INVOKE("server_address")),
 	/**
 	 *  Promote a strategy version to a paper session — certified, or explicitly
 	 *  overridden with a typed reason.

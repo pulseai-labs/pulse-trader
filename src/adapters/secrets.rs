@@ -75,6 +75,18 @@ const KEYCHAIN_SERVICE: &str = "PulseTrader";
 /// The Keychain account (item name) for the GLM API key.
 const GLM_API_KEY_ACCOUNT: &str = "glm_api_key";
 
+/// The Keychain account (item name) of the app token (r4.s3.w2, G1). The UI
+/// never names it (AC-8); the audit lines and refusal reasons do. Not a secret,
+/// and a name of its own on purpose: the app token is a separate item from the
+/// GLM key and from the identity probe.
+pub(crate) const APP_TOKEN_ACCOUNT: &str = "server_app_token";
+
+/// The app token item's display name (`PulseTrader/server_app_token`), so the
+/// audit line, the reasons and the entry construction cannot drift apart.
+pub(crate) fn app_token_item() -> String {
+    format!("{KEYCHAIN_SERVICE}/{APP_TOKEN_ACCOUNT}")
+}
+
 /// Read the GLM API key from the macOS Keychain (FR-1 / NFR-5).
 ///
 /// Returns an opaque [`ApiKey`] tagged [`CredentialSource::Keychain`] (r1.s1.w2
@@ -880,6 +892,184 @@ fn read_secret(service: &str, account: &str) -> Result<String, LlmError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// r4.s3.w1 — the identity probe (the HIDDEN `pulse keychain-probe` verb; the CLI
+// surface lives in `cli::keychain_probe`).
+//
+// The probe exists so the MacBook walk can prove the premise w2's token store
+// rests on: a REBUILT, signed app reads back what an earlier build wrote. It holds
+// ONE fixed, non-secret marker and its own account, so `keychain-probe` can never
+// read or write a credential item — `server_app_token` (w2's) and `glm_api_key`
+// are separate accounts this path has no literal for.
+// ---------------------------------------------------------------------------
+
+/// The Keychain account (item name) of the identity probe. NOT a secret, and a name
+/// of its own on purpose: the probe can only ever touch this item.
+pub(crate) const KEYCHAIN_PROBE_ACCOUNT: &str = "r4s3_identity_probe";
+
+/// The probe item's fixed marker value — a constant in the source by design. It
+/// proves a rebuilt app reads back what an earlier build wrote; it is not a
+/// credential and carries no information.
+pub(crate) const KEYCHAIN_PROBE_MARKER: &str = "r4s3-identity-probe";
+
+/// The probe item's display name (`PulseTrader/r4s3_identity_probe`), so the printed
+/// line and the entry construction cannot drift apart.
+pub(crate) fn keychain_probe_item() -> String {
+    format!("{KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}")
+}
+
+/// Write the probe's marker into the fixed probe item, through the same `keyring`
+/// path the token store will use. Overwrites an existing item: re-running the probe
+/// is meant to be safe.
+///
+/// # Errors
+///
+/// Returns [`LlmError::Config`] when the platform store refuses the write.
+pub(crate) fn keychain_probe_write() -> Result<(), LlmError> {
+    probe_write_in(&probe_entry()?)
+}
+
+/// Read the probe item back and check it holds THIS build's marker.
+///
+/// # Errors
+///
+/// Returns [`LlmError::Config`] when the item is absent, unreadable, or holds a
+/// different value. The mismatch message names both the found and the expected
+/// value — the marker is a non-secret constant, so the `MacBook` walk can see exactly
+/// what happened.
+pub(crate) fn keychain_probe_read() -> Result<String, LlmError> {
+    probe_read_in(&probe_entry()?)
+}
+
+/// Delete the probe item.
+///
+/// # Errors
+///
+/// Returns [`LlmError::Config`] when the store refuses, including
+/// [`keyring::Error::NoEntry`] — a "delete ok" must mean an item was really removed.
+pub(crate) fn keychain_probe_delete() -> Result<(), LlmError> {
+    probe_delete_in(&probe_entry()?)
+}
+
+/// Open the fixed probe item — the only `Entry` this path can build.
+fn probe_entry() -> Result<Entry, LlmError> {
+    Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT).map_err(|error| {
+        LlmError::Config(format!(
+            "could not open the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}: {error}"
+        ))
+    })
+}
+
+/// Get the password, or a message naming the fixed item.
+fn probe_password(entry: &Entry) -> Result<String, LlmError> {
+    entry.get_password().map_err(|error| {
+        LlmError::Config(format!(
+            "no Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT} to read ({error}); \
+             write it first from a build signed with the same identity"
+        ))
+    })
+}
+
+/// The three operations, split at the store boundary so the unit tests can drive
+/// them with a mock entry (`Entry::new_with_credential`) instead of the platform
+/// store — the same functions the CLI calls.
+fn probe_write_in(entry: &Entry) -> Result<(), LlmError> {
+    entry.set_password(KEYCHAIN_PROBE_MARKER).map_err(|error| {
+        LlmError::Config(format!(
+            "could not write the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}: {error}"
+        ))
+    })
+}
+
+fn probe_read_in(entry: &Entry) -> Result<String, LlmError> {
+    let found = probe_password(entry)?;
+    if found != KEYCHAIN_PROBE_MARKER {
+        return Err(LlmError::Config(format!(
+            "the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT} holds \
+             `{found}`, not this build's marker `{KEYCHAIN_PROBE_MARKER}`"
+        )));
+    }
+    Ok(found)
+}
+
+fn probe_delete_in(entry: &Entry) -> Result<(), LlmError> {
+    entry.delete_credential().map_err(|error| {
+        LlmError::Config(format!(
+            "could not delete the Keychain probe item {KEYCHAIN_SERVICE}/{KEYCHAIN_PROBE_ACCOUNT}: {error}"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// r4.s3.w2 — the app token's store adapter (G5): the production `TokenStore`
+// over the SAME `keyring` path the probe above proves. Split at the store
+// boundary exactly like the probe (`*_in` take an `Entry`), so the unit tests
+// drive a mock credential and no test ever reaches a real Keychain.
+// ---------------------------------------------------------------------------
+
+/// The production token store: the `PulseTrader`/`server_app_token` item on the
+/// platform keychain (the mock store on Linux QA, per r4.s3.w1).
+#[derive(Debug, Default)]
+pub(crate) struct KeychainTokenStore;
+
+impl crate::client::token_store::TokenStore for KeychainTokenStore {
+    fn read(&self) -> Result<Option<String>, String> {
+        token_read_in(&app_token_entry()?)
+    }
+
+    fn write(&self, token: &str) -> Result<(), String> {
+        token_write_in(&app_token_entry()?, token)
+    }
+
+    fn delete(&self) -> Result<(), String> {
+        token_delete_in(&app_token_entry()?)
+    }
+}
+
+/// Open the app token item — the only `Entry` this path can build.
+fn app_token_entry() -> Result<Entry, String> {
+    Entry::new(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT).map_err(|error| {
+        format!(
+            "could not open the Keychain item {}: {error}",
+            app_token_item()
+        )
+    })
+}
+
+/// Read the item. `NoEntry` is ABSENCE (`Ok(None)`), every other error is a
+/// named refusal — the client's start-up rule needs the two apart.
+fn token_read_in(entry: &Entry) -> Result<Option<String>, String> {
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "could not read the Keychain item {}: {error}",
+            app_token_item()
+        )),
+    }
+}
+
+/// Write (overwrite) the item; the reason names the item, never the value.
+fn token_write_in(entry: &Entry, token: &str) -> Result<(), String> {
+    entry.set_password(token).map_err(|error| {
+        format!(
+            "could not write the Keychain item {}: {error}",
+            app_token_item()
+        )
+    })
+}
+
+/// Delete the item. An absent item is already the goal.
+fn token_delete_in(entry: &Entry) -> Result<(), String> {
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!(
+            "could not delete the Keychain item {}: {error}",
+            app_token_item()
+        )),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1096,5 +1286,186 @@ mod tests {
                 "no manifest dotenv slot under Server: {path:?}"
             );
         }
+    }
+}
+
+/// The r4.s3.w1 identity probe's own tests — **against the mock store, never a real
+/// Keychain** (so they behave identically on draco-desk and macOS CI, and never
+/// touch the operator's login keychain).
+///
+/// keyring 3.6.3's mock is ENTRY-LOCAL (`MockCredentialBuilder::build` returns a
+/// fresh, empty credential per `Entry`; its persistence is `EntryOnly`), so a
+/// write→read→delete round trip is only meaningful on ONE entry — exactly what the
+/// `*_in` seam lets these tests hold. Cross-process, cross-build read-back is a
+/// real-Keychain behaviour and is proven on the `MacBook` by AC-U1, not here.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod probe_tests {
+    use keyring::Entry;
+    use keyring::mock;
+
+    use super::{
+        GLM_API_KEY_ACCOUNT, KEYCHAIN_PROBE_ACCOUNT, KEYCHAIN_PROBE_MARKER, KEYCHAIN_SERVICE,
+        LlmError, probe_delete_in, probe_read_in, probe_write_in,
+    };
+
+    /// A mock credential for the probe item, as an `Entry` the seam functions take.
+    fn mock_probe_entry() -> Entry {
+        let credential = mock::default_credential_builder()
+            .build(None, KEYCHAIN_SERVICE, KEYCHAIN_PROBE_ACCOUNT)
+            .expect("build a mock credential for the probe item");
+        Entry::new_with_credential(credential)
+    }
+
+    #[test]
+    fn probe_write_then_read_round_trips() {
+        let entry = mock_probe_entry();
+        probe_write_in(&entry).expect("write the marker");
+        let value = probe_read_in(&entry).expect("read the marker back");
+        assert_eq!(value, KEYCHAIN_PROBE_MARKER);
+    }
+
+    #[test]
+    fn probe_read_without_an_item_is_an_error() {
+        let entry = mock_probe_entry();
+        let error = probe_read_in(&entry).expect_err("an unwritten probe item must not read");
+        assert!(matches!(error, LlmError::Config(_)), "got {error:?}");
+        assert!(
+            error.to_string().contains(KEYCHAIN_PROBE_ACCOUNT),
+            "the refusal must name the item, got: {error}"
+        );
+    }
+
+    #[test]
+    fn probe_read_names_both_values_on_a_mismatch() {
+        let entry = mock_probe_entry();
+        entry
+            .set_password("a-foreign-value")
+            .expect("seed a foreign value");
+        let error = probe_read_in(&entry).expect_err("a foreign value must not pass");
+        let message = error.to_string();
+        assert!(
+            message.contains("a-foreign-value"),
+            "the FOUND value must be named, got: {message}"
+        );
+        assert!(
+            message.contains(KEYCHAIN_PROBE_MARKER),
+            "the EXPECTED marker must be named, got: {message}"
+        );
+    }
+
+    #[test]
+    fn probe_delete_removes_the_item() {
+        let entry = mock_probe_entry();
+        probe_write_in(&entry).expect("write");
+        probe_delete_in(&entry).expect("delete");
+        probe_read_in(&entry).expect_err("read after delete must fail");
+    }
+
+    #[test]
+    fn probe_delete_without_an_item_is_an_error() {
+        let entry = mock_probe_entry();
+        let error = probe_delete_in(&entry).expect_err("deleting an absent item is not success");
+        assert!(matches!(error, LlmError::Config(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn the_probe_account_is_never_a_credential_account() {
+        // The probe must not be pointed at a credential item, ever: this is the
+        // guard that a later edit cannot alias the two by accident.
+        assert_ne!(KEYCHAIN_PROBE_ACCOUNT, GLM_API_KEY_ACCOUNT);
+        assert_ne!(KEYCHAIN_PROBE_ACCOUNT, "server_app_token");
+        assert!(!KEYCHAIN_PROBE_MARKER.is_empty());
+    }
+}
+
+/// The r4.s3.w2 app-token store's own tests — **against the mock store, never a
+/// real Keychain** (the probe tests' discipline, same `*_in` seam): keyring
+/// 3.6.3's mock is entry-local, so the round trip is pinned on ONE entry, and
+/// the cross-build read-back is AC-U1's on the `MacBook`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod token_store_tests {
+    use keyring::Entry;
+    use keyring::mock;
+
+    use super::{
+        APP_TOKEN_ACCOUNT, GLM_API_KEY_ACCOUNT, KEYCHAIN_PROBE_ACCOUNT, KEYCHAIN_SERVICE,
+        app_token_item, token_delete_in, token_read_in, token_write_in,
+    };
+
+    /// A fixed, non-secret stand-in for the app token.
+    const TEST_TOKEN: &str = "pt_w2_mock_app_token";
+
+    /// A mock credential for the app token item, as an `Entry` the seam
+    /// functions take.
+    fn mock_token_entry() -> Entry {
+        let credential = mock::default_credential_builder()
+            .build(None, KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT)
+            .expect("build a mock credential for the app token item");
+        Entry::new_with_credential(credential)
+    }
+
+    #[test]
+    fn write_then_read_round_trips() {
+        let entry = mock_token_entry();
+        token_write_in(&entry, TEST_TOKEN).expect("write the token");
+        assert_eq!(
+            token_read_in(&entry).expect("read it back"),
+            Some(TEST_TOKEN.to_owned())
+        );
+    }
+
+    #[test]
+    fn read_without_an_item_is_absence_not_an_error() {
+        let entry = mock_token_entry();
+        assert_eq!(
+            token_read_in(&entry).expect("absence is not a failure"),
+            None,
+            "no item is `Ok(None)`, never `Err`"
+        );
+    }
+
+    #[test]
+    fn delete_without_an_item_is_success() {
+        let entry = mock_token_entry();
+        token_delete_in(&entry).expect("an absent item is already the goal");
+    }
+
+    #[test]
+    fn delete_removes_the_item() {
+        let entry = mock_token_entry();
+        token_write_in(&entry, TEST_TOKEN).expect("write");
+        token_delete_in(&entry).expect("delete");
+        assert_eq!(token_read_in(&entry).expect("read after delete"), None);
+    }
+
+    #[test]
+    fn a_store_error_names_the_item_and_never_the_value() {
+        let entry = mock_token_entry();
+        let mock: &mock::MockCredential = entry
+            .get_credential()
+            .downcast_ref()
+            .expect("the entry carries the mock credential");
+        mock.set_error(keyring::Error::Invalid(
+            "the store refused".to_owned(),
+            "set by the test".to_owned(),
+        ));
+        let error = token_write_in(&entry, TEST_TOKEN).expect_err("a store error is a refusal");
+        assert!(
+            error.contains(&app_token_item()),
+            "the refusal names the item: {error}"
+        );
+        assert!(
+            !error.contains(TEST_TOKEN),
+            "the refusal never carries the value: {error}"
+        );
+    }
+
+    #[test]
+    fn the_app_token_account_is_its_own_and_never_a_credential_account() {
+        assert_ne!(APP_TOKEN_ACCOUNT, GLM_API_KEY_ACCOUNT);
+        assert_ne!(APP_TOKEN_ACCOUNT, KEYCHAIN_PROBE_ACCOUNT);
+        assert_eq!(app_token_item(), "PulseTrader/server_app_token");
     }
 }

@@ -23,14 +23,19 @@
 //! start-up — see [`connection`].
 
 pub(crate) mod connection;
+// r4.s3.w2: the token-store port (read / write / delete), its audit sink and
+// the in-memory fake — `ClientState` reaches the app token only through these.
+pub(crate) mod token_store;
 
 use std::future::poll_fn;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use futures_core::Stream as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::adapters::secrets;
+use crate::client::token_store::{ClientWiring, TokenAudit, TokenStore};
 use crate::server::API_VERSION;
 use crate::tauri::error::{BusError, BusErrorCode};
 use crate::tauri::events::{BusEvent, EventSink};
@@ -1101,90 +1106,243 @@ enum Link {
     Failed(ClientError),
 }
 
+/// The link together with the GENERATION it was installed under (#234): every
+/// replacement bumps the generation, so a result computed from an older link is
+/// recognisable — and dropped instead of applied.
+struct LinkSlot {
+    link: Link,
+    generation: u64,
+}
+
 /// The Tauri-managed connection to the always-on server (spec: "The app state
 /// becomes `ClientState`").
 ///
-/// In-memory for the app run, seeded from the connection file at start-up: a
-/// file that exists puts the state straight to `Up` (the 15 s status poll then
-/// shows up/down as the server comes and goes, d28 — no relaunch). A file that
-/// fails its safety vetting starts the state `refused` with the named reason.
+/// In-memory for the app run, seeded at start-up from the URL-only connection
+/// file plus the app token in the token store: a stored pair puts the state
+/// straight to `Up` (the 15 s status poll then shows up/down as the server
+/// comes and goes, d28 — no relaunch); no file, or no stored token, is `Down`;
+/// a file that fails its safety vetting, or a store that errors, starts
+/// `refused` with the named reason.
+///
+/// The token is reachable ONLY through [`ClientWiring::store`], and each write
+/// / migration / delete logs one line through [`ClientWiring::audit`] naming
+/// the item `PulseTrader`/`server_app_token` — never a value.
 pub struct ClientState {
-    link: RwLock<Link>,
+    slot: RwLock<LinkSlot>,
+    store: Arc<dyn TokenStore>,
+    audit: Arc<dyn TokenAudit>,
 }
 
 impl ClientState {
-    /// Lock the link for writing, adopting a poisoned guard — the
+    /// Lock the slot for writing, adopting a poisoned guard — the
     /// ops.rs/commands.rs convention: a panic in a holder must not turn into a
-    /// permanently poisoned state for every later call, and the link enum is
-    /// always whole between updates, so adoption is sound.
-    fn write_link(&self) -> std::sync::RwLockWriteGuard<'_, Link> {
-        self.link
+    /// permanently poisoned state for every later call, and the slot is always
+    /// whole between updates, so adoption is sound.
+    fn write_slot(&self) -> std::sync::RwLockWriteGuard<'_, LinkSlot> {
+        self.slot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Lock the link for reading, adopting a poisoned guard (see
-    /// [`Self::write_link`]).
-    fn read_link(&self) -> std::sync::RwLockReadGuard<'_, Link> {
-        self.link
+    /// Lock the slot for reading, adopting a poisoned guard (see
+    /// [`Self::write_slot`]).
+    fn read_slot(&self) -> std::sync::RwLockReadGuard<'_, LinkSlot> {
+        self.slot
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A disconnected app state.
+    /// Install a link, bumping the generation (#234): the ONE writer of the
+    /// slot, so every replacement — connect, disconnect, the start-up migration,
+    /// a recorded refusal — is distinguishable from the state before it.
+    fn install(&self, link: Link) {
+        let mut slot = self.write_slot();
+        slot.link = link;
+        slot.generation = slot.generation.wrapping_add(1);
+    }
+
+    /// Install `link` only while `generation` is still current (#234): the
+    /// compare and the install are ONE write-lock critical section, so a
+    /// connect / disconnect landing between them can no longer be overwritten
+    /// by a stale refusal. Answers whether the install happened.
+    fn install_if_current(&self, generation: u64, link: Link) -> bool {
+        let mut slot = self.write_slot();
+        if slot.generation != generation {
+            return false;
+        }
+        slot.link = link;
+        slot.generation = slot.generation.wrapping_add(1);
+        true
+    }
+
+    /// The current generation, for the staleness check an in-flight result
+    /// takes before it writes (#234).
+    fn current_generation(&self) -> u64 {
+        self.read_slot().generation
+    }
+
+    /// One audit line naming the token item and the outcome, never a value
+    /// (the risk gate's audit-trail control).
+    fn audit(&self, outcome: &str) {
+        self.audit
+            .line(&format!("{}: {outcome}", secrets::app_token_item()));
+    }
+
+    /// A disconnected app state, on the given wiring (the test seam).
+    #[must_use]
+    pub fn with_wiring(wiring: ClientWiring) -> Self {
+        Self {
+            slot: RwLock::new(LinkSlot {
+                link: Link::Down,
+                generation: 0,
+            }),
+            store: wiring.store,
+            audit: wiring.audit,
+        }
+    }
+
+    /// A disconnected app state, on the production wiring.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            link: RwLock::new(Link::Down),
-        }
+        Self::with_wiring(ClientWiring::production())
+    }
+
+    /// The start-up state on the given wiring (the test seam): the connection
+    /// file, the token store, and the one-time migration.
+    #[must_use]
+    pub fn loaded_with_wiring(wiring: ClientWiring) -> Self {
+        let state = Self::with_wiring(wiring);
+        state.load_saved_connection();
+        state
     }
 
     /// The start-up state: the connection file, if one exists and is safe.
     #[must_use]
     pub fn loaded() -> Self {
+        Self::loaded_with_wiring(ClientWiring::production())
+    }
+
+    /// Decide the start-up link from what is on disk and in the store.
+    fn load_saved_connection(&self) {
         match connection::load_app() {
-            Ok(Some(file)) => Self {
-                link: RwLock::new(Link::Up(ServerClient::new(&file.url, &file.token))),
+            Ok(None) => self.install(Link::Down),
+            Ok(Some(file)) => match file.token {
+                // A file that still holds a token is an OLDER one: its token
+                // moves into the store, once, verified (G3).
+                Some(token) => self.migrate(&file.url, &token),
+                None => match self.store.read() {
+                    Ok(Some(token)) => {
+                        self.install(Link::Up(ServerClient::new(&file.url, &token)));
+                    }
+                    Ok(None) => self.install(Link::Down),
+                    Err(reason) => {
+                        self.install(Link::Failed(ClientError::TokenRefused {
+                            reason: format!(
+                                "the app token could not be read from its store ({}): {reason}",
+                                secrets::app_token_item()
+                            ),
+                        }));
+                    }
+                },
             },
-            Ok(None) => Self::new(),
-            Err(reason) => Self {
-                link: RwLock::new(Link::Failed(ClientError::TokenRefused {
+            Err(reason) => {
+                self.install(Link::Failed(ClientError::TokenRefused {
                     reason: format!("the saved connection is not safe to use: {reason}"),
-                })),
-            },
+                }));
+            }
         }
     }
 
+    /// The one-time verified migration (G3, verbatim): write the file's token
+    /// to the store, read it back, compare, and only when the read-back equals
+    /// the file token rewrite the file without it — through the durable store
+    /// of #252.
+    ///
+    /// On ANY failure the file is left exactly as it was and the state starts
+    /// refused with the named reason; a client is **never** built from the file
+    /// token. Every outcome logs one line naming the item, never a value.
+    fn migrate(&self, url: &str, file_token: &str) {
+        if let Err(reason) = self.store.write(file_token) {
+            self.refuse_migration(&format!("write failed: {reason}"));
+            return;
+        }
+        match self.store.read() {
+            Ok(Some(read_back)) if read_back == file_token => {}
+            // A read-back that finds nothing, or something else, is the same
+            // outcome for the trader: the write could not be verified.
+            Ok(Some(_) | None) => {
+                self.refuse_migration("the read-back did not match the saved token");
+                return;
+            }
+            Err(reason) => {
+                self.refuse_migration(&format!("read-back failed: {reason}"));
+                return;
+            }
+        }
+        if let Err(reason) = connection::store_app(url) {
+            self.refuse_migration(&format!(
+                "the app token was moved into its store, but rewriting the connection file \
+                 without it failed: {reason}"
+            ));
+            return;
+        }
+        self.audit(
+            "the app token migrated into the keychain and the connection file now holds the URL only",
+        );
+        self.install(Link::Up(ServerClient::new(url, file_token)));
+    }
+
+    /// Record a migration failure: one audit line naming the item and the
+    /// failing step, and the refused state carrying the same reason.
+    fn refuse_migration(&self, outcome: &str) {
+        self.audit(&format!("the migration was refused — {outcome}"));
+        self.install(Link::Failed(ClientError::TokenRefused {
+            reason: format!(
+                "the saved app token could not be moved into its store ({}): {outcome}",
+                secrets::app_token_item()
+            ),
+        }));
+    }
+
     /// Handshake against `server_url` with `token`; on success, persist the
-    /// connection file and swap the connection.
+    /// connection — the token in the store, then the URL-only file — and swap
+    /// the connection.
     ///
     /// A `token_refused`/`skew` outcome ALSO records the refusal as the state
     /// (the spec: a refusal from any command returns the UI to Connect with
     /// the reason). An `unreachable` outcome leaves the previous state alone —
     /// there is nothing wrong with the saved connection.
+    ///
+    /// #234 (the Rust half): the refusal and the failed-save record are applied
+    /// only while the link this call STARTED FROM is still current — a slow
+    /// older connect can no longer overwrite a newer, verified link that landed
+    /// while it was in flight. The outcome returned is unchanged.
     pub async fn connect(&self, server_url: &str, token: &str) -> ConnectOutcome {
+        // The link the call starts from, snapshotted BEFORE the handshake
+        // (#234): the compare and the install are one write-lock section, so a
+        // connect that completes in between is not overwritten by this one.
+        let generation = self.current_generation();
         match ServerClient::connect(server_url, token).await {
             Ok((client, outcome @ ConnectOutcome::Connected { .. })) => {
-                if let Err(reason) = connection::store_app(&connection::ConnectionFile {
-                    url: server_url.trim_end_matches('/').to_owned(),
-                    token: token.to_owned(),
-                }) {
-                    // The handshake succeeded but the file could not be
-                    // written: report it through the outcome rather than
+                if let Err(reason) = self.save_connection(server_url.trim_end_matches('/'), token) {
+                    // The handshake succeeded but the connection could not be
+                    // persisted: report it through the outcome rather than
                     // silently running un-persisted.
-                    *self.write_link() = Link::Failed(ClientError::Unreachable {
-                        reason: format!("connected, but saving the connection failed: {reason}"),
-                    });
-                    return ConnectOutcome::Unreachable {
-                        reason: format!("connected, but saving the connection failed: {reason}"),
-                    };
+                    let reason = format!("connected, but saving the connection failed: {reason}");
+                    self.install_if_current(
+                        generation,
+                        Link::Failed(ClientError::Unreachable {
+                            reason: reason.clone(),
+                        }),
+                    );
+                    return ConnectOutcome::Unreachable { reason };
                 }
-                *self.write_link() = Link::Up(client);
+                self.install(Link::Up(client));
                 outcome
             }
             Ok((_, outcome)) => outcome,
             Err(refusal @ (ClientError::TokenRefused { .. } | ClientError::Skew { .. })) => {
-                *self.write_link() = Link::Failed(refusal.clone());
+                self.install_if_current(generation, Link::Failed(refusal.clone()));
                 match refusal {
                     ClientError::TokenRefused { reason } => ConnectOutcome::TokenRefused { reason },
                     ClientError::Skew { server_api_version } => {
@@ -1206,35 +1364,137 @@ impl ClientState {
         }
     }
 
+    /// Persist a connection: the token in the store FIRST, then the URL-only
+    /// file. The order is the point — a URL file whose token never landed is a
+    /// coherent "not connected", while a stored token whose URL never landed
+    /// would pair with whatever file was already there.
+    ///
+    /// # Errors
+    ///
+    /// The store refused the write, or the file write failed. Neither reason
+    /// ever carries the token.
+    fn save_connection(&self, url: &str, token: &str) -> Result<(), String> {
+        match self.store.write(token) {
+            Ok(()) => self.audit("the app token was stored for the new connection"),
+            Err(reason) => {
+                self.audit(&format!("the app token could not be stored: {reason}"));
+                return Err(format!("the app token could not be stored: {reason}"));
+            }
+        }
+        if let Err(reason) = connection::store_app(url) {
+            // The file write failed AFTER the token landed in the store: the
+            // pair is incoherent — a file still holding the PREVIOUS URL would
+            // pair with the new token on the next launch, a connection nothing
+            // verified. Remove the file (best effort; an absent one is already
+            // the goal) so the next launch starts `not_connected` instead, and
+            // say so when even that failed.
+            let mut reason = format!("the connection file could not be written: {reason}");
+            if let Err(removal) = connection::remove_app() {
+                reason =
+                    format!("{reason}; and removing the stale connection file failed: {removal}");
+            }
+            return Err(reason);
+        }
+        Ok(())
+    }
+
     /// What the status strip renders: the last refusal, not-connected, or a
     /// FRESH handshake against the stored connection (the 15 s poll — a server
     /// restart shows down, then up, without relaunching the app; d28).
+    ///
+    /// #234 (the Rust half): the handshake is taken against a SNAPSHOT of the
+    /// link, and its result is applied only while that snapshot is still
+    /// current. A poll that completes after a connect / disconnect / migration
+    /// replaced the link is dropped — it is a fact about a link the app no
+    /// longer has — and the poll re-reads the current one (bounded, so a link
+    /// that keeps moving cannot spin here). The 401 that made the snapshot
+    /// stale is never what the caller is told the CURRENT link is.
     pub async fn status(&self) -> ServerStatus {
-        let snapshot = match &*self.read_link() {
-            Link::Down => return ServerStatus::not_connected(),
-            Link::Failed(err) => {
-                return ServerStatus::refused(err.to_string());
+        /// How many times a poll may re-read the link when it keeps moving
+        /// under it. Link replacements are user acts (connect/disconnect) or
+        /// one-time (the migration); more than a couple in flight is already
+        /// pathological, and the fallback below still answers truthfully.
+        const MAX_ATTEMPTS: u32 = 3;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let (client, generation) = match &*self.read_slot() {
+                LinkSlot {
+                    link: Link::Down, ..
+                } => return ServerStatus::not_connected(),
+                LinkSlot {
+                    link: Link::Failed(err),
+                    ..
+                } => return ServerStatus::refused(err.to_string()),
+                LinkSlot {
+                    link: Link::Up(client),
+                    generation,
+                } => (client.clone(), *generation),
+            };
+            let (result, refusal) = match client.handshake().await {
+                Ok(body) => (
+                    ServerStatus {
+                        state: ServerStatusState::Up,
+                        binary_version: Some(body.binary_version),
+                        engine_fingerprint: Some(body.engine_fingerprint),
+                        reason: None,
+                        role: body.role,
+                    },
+                    None,
+                ),
+                // The token stopped working server-side: refused with the reason.
+                Err(err @ ClientError::TokenRefused { .. }) => {
+                    (ServerStatus::refused(err.to_string()), Some(err))
+                }
+                // Unreachable (a restart in progress) or a skew (the server
+                // upgraded past this app): down — the poll shows up again when
+                // the server is back. The connection itself stays stored.
+                Err(_) => (
+                    ServerStatus {
+                        state: ServerStatusState::Down,
+                        binary_version: None,
+                        engine_fingerprint: None,
+                        reason: None,
+                        role: None,
+                    },
+                    None,
+                ),
+            };
+            // The compare and the install share ONE write-lock section (#234):
+            // a connect / disconnect landing between them must not be
+            // overwritten by this stale refusal.
+            let moved = match refusal {
+                Some(err) => !self.install_if_current(generation, Link::Failed(err)),
+                // There is nothing to install on this path: a plain read
+                // answers whether the link moved under the handshake.
+                None => self.current_generation() != generation,
+            };
+            if moved {
+                // The link moved while this handshake was in flight: drop the
+                // result and ask the CURRENT link (#234).
+                continue;
             }
-            Link::Up(client) => client.clone(),
-        };
-        match snapshot.handshake().await {
-            Ok(body) => ServerStatus {
+            return result;
+        }
+        // The link kept moving through every attempt: report the CURRENT link
+        // as it stands rather than a fact about one of its predecessors.
+        self.status_of_current_link()
+    }
+
+    /// The current link's own status shape, without a fresh handshake — the
+    /// bounded-retry fallback in [`Self::status`].
+    fn status_of_current_link(&self) -> ServerStatus {
+        match &*self.read_slot() {
+            LinkSlot {
+                link: Link::Down, ..
+            } => ServerStatus::not_connected(),
+            LinkSlot {
+                link: Link::Failed(err),
+                ..
+            } => ServerStatus::refused(err.to_string()),
+            LinkSlot {
+                link: Link::Up(_), ..
+            } => ServerStatus {
                 state: ServerStatusState::Up,
-                binary_version: Some(body.binary_version),
-                engine_fingerprint: Some(body.engine_fingerprint),
-                reason: None,
-                role: body.role,
-            },
-            // The token stopped working server-side: refused with the reason.
-            Err(err @ ClientError::TokenRefused { .. }) => {
-                *self.write_link() = Link::Failed(err.clone());
-                ServerStatus::refused(err.to_string())
-            }
-            // Unreachable (a restart in progress) or a skew (the server
-            // upgraded past this app): down — the poll shows up again when the
-            // server is back. The connection itself stays stored.
-            Err(_) => ServerStatus {
-                state: ServerStatusState::Down,
                 binary_version: None,
                 engine_fingerprint: None,
                 reason: None,
@@ -1243,19 +1503,34 @@ impl ClientState {
         }
     }
 
-    /// Delete the connection file and drop the live connection.
+    /// Delete the store item AND the connection file, and drop the live
+    /// connection (G9). A missing item or file is already the goal.
     ///
     /// # Errors
     ///
-    /// Never — the `Result` is the bus's uniform command shape; a file-removal
+    /// Never — the `Result` is the bus's uniform command shape; a removal
     /// failure is recorded as the status reason instead of an error, since the
     /// in-memory disconnection has already taken effect.
     pub fn disconnect(&self) -> Result<(), BusError> {
-        *self.write_link() = Link::Down;
+        self.install(Link::Down);
+        let mut failures: Vec<String> = Vec::new();
+        match self.store.delete() {
+            Ok(()) => self.audit("the app token was removed"),
+            Err(reason) => {
+                self.audit(&format!("the app token could not be removed: {reason}"));
+                failures.push(reason);
+            }
+        }
         if let Err(reason) = connection::remove_app() {
-            *self.write_link() = Link::Failed(ClientError::Unreachable {
-                reason: format!("disconnected, but removing the saved connection failed: {reason}"),
-            });
+            failures.push(reason);
+        }
+        if !failures.is_empty() {
+            self.install(Link::Failed(ClientError::Unreachable {
+                reason: format!(
+                    "disconnected, but removing the saved connection failed: {}",
+                    failures.join("; ")
+                ),
+            }));
         }
         Ok(())
     }
@@ -1263,9 +1538,16 @@ impl ClientState {
     /// The proxied-command entry point: run `call` against the live client,
     /// recording a refusal as the connection state before flattening it into
     /// the one [`BusError`] shape.
+    ///
+    /// `generation` is the link the call started from (#234, the Rust half): a
+    /// refusal is recorded only while that link is still current — a call that
+    /// met a refusal on a connection the user has since replaced must not put
+    /// the app back into `refused`. The refusal is still RETURNED: that call
+    /// really failed.
     async fn proxy<T>(
         &self,
-        call: impl std::future::Future<Output = Result<T, WireFailure>>,
+        generation: u64,
+        call: impl Future<Output = Result<T, WireFailure>>,
     ) -> Result<T, BusError> {
         match call.await {
             Ok(value) => Ok(value),
@@ -1275,16 +1557,22 @@ impl ClientState {
                     err,
                     ClientError::TokenRefused { .. } | ClientError::Skew { .. }
                 ) {
-                    *self.write_link() = Link::Failed(err.clone());
+                    // The compare and the install are ONE write-lock critical
+                    // section (#234): a connect / disconnect landing between
+                    // them must not be overwritten by this stale refusal.
+                    self.install_if_current(generation, Link::Failed(err.clone()));
                 }
                 Err(err.into())
             }
         }
     }
 
-    fn client_for_call(&self) -> Result<ServerClient, BusError> {
-        match &*self.read_link() {
-            Link::Up(client) => Ok(client.clone()),
+    /// The live client for a call, with the generation it belongs to — the
+    /// staleness check [`Self::proxy`] applies to a recorded refusal.
+    fn client_for_call(&self) -> Result<(ServerClient, u64), BusError> {
+        let slot = self.read_slot();
+        match &slot.link {
+            Link::Up(client) => Ok((client.clone(), slot.generation)),
             Link::Down => Err(BusError::internal(
                 "not connected to the server — connect first (the Connect screen)",
             )),
@@ -1299,8 +1587,8 @@ impl ClientState {
     ///
     /// The not-connected refusal, or the wire failure flattened.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, BusError> {
-        let client = self.client_for_call()?;
-        self.proxy(client.get_inner(path)).await
+        let (client, generation) = self.client_for_call()?;
+        self.proxy(generation, client.get_inner(path)).await
     }
 
     /// POST a plain route through the live connection.
@@ -1313,8 +1601,8 @@ impl ClientState {
         path: &str,
         body: &B,
     ) -> Result<T, BusError> {
-        let client = self.client_for_call()?;
-        self.proxy(client.post_inner(path, body)).await
+        let (client, generation) = self.client_for_call()?;
+        self.proxy(generation, client.post_inner(path, body)).await
     }
 
     /// Run a server-owned operation through the live connection, forwarding
@@ -1329,8 +1617,9 @@ impl ClientState {
         body: &B,
         sink: &(dyn EventSink + Send + Sync),
     ) -> Result<RunOpOutcome<T>, BusError> {
-        let client = self.client_for_call()?;
-        self.proxy(client.op_inner(op, body, sink)).await
+        let (client, generation) = self.client_for_call()?;
+        self.proxy(generation, client.op_inner(op, body, sink))
+            .await
     }
 
     // -- the paper session surface (r3.s4.w5, spec §1) ---------------------
@@ -1435,9 +1724,12 @@ impl ClientState {
         after_seq: Option<i64>,
         sink: &(dyn PaperStreamSink + Send + Sync),
     ) -> Result<(), BusError> {
-        let client = self.client_for_call()?;
-        self.proxy(client.stream_paper_session_inner(id, after_seq, sink))
-            .await
+        let (client, generation) = self.client_for_call()?;
+        self.proxy(
+            generation,
+            client.stream_paper_session_inner(id, after_seq, sink),
+        )
+        .await
     }
 }
 
@@ -1579,6 +1871,64 @@ mod tests {
                 "the frame completes on the split separator: {first:?} {second:?}"
             );
         }
+    }
+
+    /// #234's staleness guard is ONE write-lock section (the fix round's B1):
+    /// a stale generation installs NOTHING — link untouched, generation
+    /// unmoved — while the current one installs and bumps exactly as
+    /// [`ClientState::install`] does, so a connect / disconnect landing between
+    /// the compare and the install can no longer be overwritten.
+    #[test]
+    fn install_if_current_installs_only_while_the_generation_is_current() {
+        let state = ClientState::with_wiring(ClientWiring::with_store(Arc::new(
+            token_store::InMemoryTokenStore::default(),
+        )));
+        let refusal = |reason: &str| {
+            Link::Failed(ClientError::TokenRefused {
+                reason: reason.to_owned(),
+            })
+        };
+
+        let start = state.current_generation();
+        // A stale generation (here, the one before the initial): nothing is
+        // installed and the generation stays exactly where it was.
+        assert!(
+            !state.install_if_current(start.wrapping_sub(1), refusal("stale")),
+            "a stale generation must not install"
+        );
+        assert_eq!(
+            state.current_generation(),
+            start,
+            "a stale refusal must not bump the generation"
+        );
+        assert!(
+            matches!(&state.read_slot().link, Link::Down),
+            "a stale refusal must not change the link"
+        );
+
+        // The current generation installs, and bumps exactly as `install` does.
+        assert!(
+            state.install_if_current(start, refusal("current")),
+            "the current generation installs"
+        );
+        assert_eq!(
+            state.current_generation(),
+            start.wrapping_add(1),
+            "the install bumps the generation"
+        );
+        match &state.read_slot().link {
+            Link::Failed(ClientError::TokenRefused { reason }) => {
+                assert_eq!(reason, "current", "the installed refusal is the link now");
+            }
+            _ => panic!("the refusal must be the installed link"),
+        }
+
+        // The install really did move the generation: the one it replaced is
+        // stale from here on — the same answer a `connect` would now get.
+        assert!(
+            !state.install_if_current(start, refusal("again")),
+            "the generation the install replaced is stale"
+        );
     }
 
     /// A multibyte character split across two network chunks must survive whole
