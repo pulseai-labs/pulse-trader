@@ -380,6 +380,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Library, Backtest Lab and Designer defects the r3/r4 walks filed (r4.s5.w3).** A version's
+  runs are reachable and legible again. Backtest Lab grows a **Runs** block beside the picker: the
+  version's own backtests and its latest walk-forward run, each row opening the persisted run it
+  names — `getBacktestRun` / `getWalkForwardRun`, nothing re-run (#331, #316) — plus an **Open run
+  by id** field that takes any backtest or walk-forward id, selects that run's version and shows it
+  (a refusal shows the server's own message); the walk-forward pane now names the version it ran on
+  too. Runs that are folds of the version's latest walk-forward are labelled `fold <n> of WF <short
+  id>` and grouped after the version's own runs, in the Lab and in the Library's Recent backtests
+  alike (#330) — one walk-forward read per id, cached; a fold of an older walk-forward stays
+  unmarked, because `LibraryRunSummary` carries no `walk_forward_run_id` (known limit, report §7).
+  The compare-with-parent panel heads each column with its run id (`parentRunId` before,
+  `childRunId` after, the full id on the element) and shows the `inputsNote` beside the `inputs
+  differ` badge instead of only on its hover (#326). The Library's certification run id is now a
+  button deep-linking `#/backtest?wf=<id>` — `resolveNavId` strips a query before resolving the nav
+  id, and the Lab selects the run's version and opens it (#269). The Designer marks a refused
+  composer tool call with ✕ and its error message and reads the composer's next call of that tool
+  as `retry` (#322) — failure is decided from `toolCallResult.outcome`'s own error-shaped JSON
+  (the serialized `FieldError` list or the unknown-tool object), never guessed — and the final step
+  (`finalize_strategy`) now shows its ✓ and result line when the stream closes, because a
+  successful finalize emits no `toolCallResult` and its closing line rides the `finished` event
+  (#317). A version-tree node's creator label truncates to one ellipsized line with the full line
+  on `title`, so `external_agent · claude-code` no longer pushes the hypothesis subline out of the
+  node (#325), and the version picker's created dates now render through w1's `dateUtc` (`YYYY-MM-DD
+  UTC`) instead of a local slice. `scripts/ui-polish-lab-test.sh` is the new ledger line over the
+  four suites.
+
 - **The `pulse://dsl/schema` resource read works from Claude Code (#353).** MCP clients on the
   2026-07-28 protocol revision validate `resources/read` and `resources/list` against that
   revision's result schema, where SEP-2549 makes `ttlMs` (integer ≥ 0) and `cacheScope`

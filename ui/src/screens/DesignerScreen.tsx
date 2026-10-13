@@ -173,11 +173,20 @@ function StepList({ turn }: { turn: AgentTurn }) {
               </div>
             );
           }
-          const open = step.outcome === undefined && turn.status === "streaming";
+          // #322: a correctable refusal closes the step exactly as a success
+          // does (its `outcome` IS the refusal's text), so the mark and the line
+          // are what tell them apart — never the presence of an outcome.
+          const failure = step.failure;
+          const open = failure === undefined && step.outcome === undefined && turn.status === "streaming";
           return (
-            <div key={index} className={`dsg-step${open ? " is-running" : " is-done"}`}>
+            <div
+              key={index}
+              className={`dsg-step${failure !== undefined ? " is-failed" : open ? " is-running" : " is-done"}`}
+            >
               <div className="dsg-step-marker">
-                {step.outcome !== undefined ? (
+                {failure !== undefined ? (
+                  "✕"
+                ) : step.outcome !== undefined ? (
                   "✓"
                 ) : open ? (
                   <span className="spinner-sm" />
@@ -188,9 +197,19 @@ function StepList({ turn }: { turn: AgentTurn }) {
               <div className="dsg-step-body">
                 <div className="dsg-step-row">
                   <code className="dsg-step-name">{step.name}</code>
+                  {/* #322: this call of the tool follows one that was refused —
+                      the composer is correcting itself. */}
+                  {step.retry === true && <span className="dsg-retry">retry</span>}
                   <code className="dsg-step-preview">{step.preview}</code>
                 </div>
-                {step.outcome !== undefined && (
+                {failure !== undefined && (
+                  <div className="dsg-step-error" title={step.outcome}>
+                    {failure.map((message, line) => (
+                      <div key={line}>{message}</div>
+                    ))}
+                  </div>
+                )}
+                {step.outcome !== undefined && failure === undefined && (
                   <div className="dsg-step-outcome">{step.outcome}</div>
                 )}
               </div>

@@ -17,7 +17,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode, useState } from "react";
 import { flushSync } from "react-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../bindings", () => ({
   commands: {
@@ -400,7 +400,7 @@ describe("BacktestLabScreen (catalog states)", () => {
 
     const box = (await screen.findByRole("combobox")) as HTMLInputElement;
     // The closed picker shows the current selection's own text.
-    expect(box.value).toBe("v1 · 2026-08-20 · v-alpha- · human");
+    expect(box.value).toBe("v1 · 2026-08-20 UTC · v-alpha- · human");
 
     fireEvent.focus(box);
     expect(
@@ -412,9 +412,9 @@ describe("BacktestLabScreen (catalog states)", () => {
     expect(
       screen.getAllByRole("option").map((option) => option.textContent),
     ).toEqual([
-      "v1 · 2026-08-20 · v-alpha- · human",
-      "v2 · 2026-08-20 · v-alpha- · human",
-      "v1 · 2026-08-20 · v-beta-1 · human",
+      "v1 · 2026-08-20 UTC · v-alpha- · human",
+      "v2 · 2026-08-20 UTC · v-alpha- · human",
+      "v1 · 2026-08-20 UTC · v-beta-1 · human",
     ]);
   });
 });
@@ -1286,7 +1286,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
     fireEvent.click(screen.getByRole("button", { name: /select the child/i }));
     await waitFor(() => {
       expect((screen.getByRole("combobox") as HTMLInputElement).value).toBe(
-        "v2 · 2026-08-20 · v-alpha- · human",
+        "v2 · 2026-08-20 UTC · v-alpha- · human",
       );
     });
   });
@@ -1686,7 +1686,7 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     await waitFor(() => {
       expect(catalogMock.mock.calls.length).toBeGreaterThan(callsOnMount);
     });
-    expect(box.value).toBe("v2 · 2026-08-20 · v-alpha- · human");
+    expect(box.value).toBe("v2 · 2026-08-20 UTC · v-alpha- · human");
   });
 
   it("falls back to the default when the selected version is gone after a refetch", async () => {
@@ -1705,7 +1705,7 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     fireEvent(window, new Event("focus"));
 
     await waitFor(() => {
-      expect(box.value).toBe("v1 · 2026-08-20 · v-alpha- · human");
+      expect(box.value).toBe("v1 · 2026-08-20 UTC · v-alpha- · human");
     });
   });
 });
@@ -1752,7 +1752,7 @@ describe("BacktestLabScreen (#315 — a reconnect keeps the selection and its re
     fireEvent.click(screen.getByRole("button", { name: /bring the server back/i }));
     const box = (await screen.findByRole("combobox")) as HTMLInputElement;
     await waitFor(() => {
-      expect(box.value).toBe("v1 · 2026-08-20 · v-beta-1 · human");
+      expect(box.value).toBe("v1 · 2026-08-20 UTC · v-beta-1 · human");
     });
 
     // …and the run the trader was reading is still shown for it: the record
@@ -2642,3 +2642,389 @@ function switchVersionOutsideAct(query: string): void {
 type ReopenAnswer =
   | { status: "ok"; data: WalkForwardRunDto }
   | { status: "error"; error: BusError };
+
+// ---------------------------------------------------------------------------
+// r4.s5.w3 — the Library/Lab/Designer walk-filed defects
+// ---------------------------------------------------------------------------
+//
+// #331/#316: a version's runs are reachable and openable — its own backtests and
+// any persisted walk-forward — WITHOUT starting anything. The only commands on
+// those paths are the reads (`getBacktestRun`, `getWalkForwardRun`); the run
+// commands are asserted untouched.
+
+/** A version's own run: the catalogue row AND the run the Lab opens by id. */
+const W3_OWN_RUN: LibraryRunSummary = {
+  id: "ownrun-0001",
+  createdAt: "2026-08-24T09:00:00.000Z",
+  expectancy: "+0.42R",
+  trades: 12,
+};
+
+/** The catalogue the #331/#316 tests read: `ver-own-1` carries one own run and
+ * the walk-forward pointer; `ver-second` carries nothing. */
+function w3Catalog(): LibraryOverview {
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          {
+            ...catalogVersion("ver-own-1", null, W3_OWN_RUN, [W3_OWN_RUN]),
+            latestWalkForwardRunId: "wf-6c1d9f38",
+          },
+          catalogVersion("ver-second", "ver-own-1"),
+        ],
+      },
+    ],
+  };
+}
+
+describe("BacktestLabScreen (#331 — a version's own runs are reachable)", () => {
+  it("opens a version's own backtest run from the Runs list without starting a new run (#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    getRunMock.mockResolvedValue({
+      status: "ok",
+      data: { ...SEEDED_RUN, runId: "ownrun-0001", strategyVersionId: "ver-own-1" },
+    });
+
+    render(<BacktestLabScreen />);
+
+    const runs = await screen.findByRole("region", { name: /version runs/i });
+    fireEvent.click(within(runs).getByRole("button", { name: /open run ownrun-0/i }));
+
+    const provenance = await screen.findByRole("region", { name: /run provenance/i });
+    expect(within(provenance).getByText("ownrun-0001")).toBeTruthy();
+    expect(getRunMock).toHaveBeenCalledWith({ runId: "ownrun-0001" });
+    // A READ: neither run command is reached on this path.
+    expect(runMock).not.toHaveBeenCalled();
+    expect(walkForwardMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("BacktestLabScreen (#316 — any persisted walk-forward run opens)", () => {
+  it("opens the persisted walk-forward run from the Runs list, with its version on the pane, without starting a new one (#316)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+
+    const { container } = render(<BacktestLabScreen />);
+
+    const runs = await screen.findByRole("region", { name: /version runs/i });
+    fireEvent.click(within(runs).getByRole("button", { name: /open walk-forward/i }));
+
+    const pane = (await screen.findByRole("region", {
+      name: /walk-forward result/i,
+    })) as HTMLElement;
+    expect(pane.textContent).toContain("wf-6c1d9f38");
+    expect(pane.textContent).toContain("3 of 6 folds hold (4 required)");
+    // #316's own comment: the pane names the VERSION it ran on, so verifying
+    // that needs no trip to the Library.
+    const meta = container.querySelector(".bt-wf-meta") as HTMLElement;
+    expect(meta).not.toBeNull();
+    expect(within(meta).getByText("version")).toBeTruthy();
+    expect(within(meta).getByText("ver-own-1")).toBeTruthy();
+    // A READ, twice over: neither run command is reached.
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a walk-forward run by id from the field, selecting that run's version (#316)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    // The field asks the backtest read first (a fold id opens as an ordinary
+    // run); a walk-forward id refuses it, and the walk-forward read answers.
+    getRunMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no backtest run wf-9a8b7c6d",
+        run_id: null,
+        session_id: null,
+        child_run_id: "wf-9a8b7c6d",
+      },
+    });
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-9a8b7c6d"
+        ? { status: "ok" as const, data: { ...OTHER_WF_DTO, versionId: "ver-second" } }
+        : { status: "ok" as const, data: { ...REOPENED_DTO, versionId: "ver-own-1" } },
+    );
+
+    render(<BacktestLabScreen />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "wf-9a8b7c6d" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+
+    // The run the id names is on screen — the DTO carries the strategy version,
+    // and the picker moves to it.
+    await screen.findByText("wf-9a8b7c6d");
+    expect(reopenMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-9a8b7c6d" });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's own message when an id names nothing at all (#316)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    const noBacktestRun: BusError = {
+      code: "not_found",
+      message: "no backtest run nope-0001",
+      run_id: null,
+      session_id: null,
+      child_run_id: "nope-0001",
+    };
+    getRunMock.mockResolvedValue({ status: "error", error: noBacktestRun });
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-6c1d9f38"
+        ? { status: "ok" as const, data: { ...REOPENED_DTO, versionId: "ver-own-1" } }
+        : {
+            status: "error" as const,
+            error: {
+              code: "not_found",
+              message: "no walk-forward run nope-0001",
+              run_id: null,
+              session_id: null,
+              child_run_id: null,
+            },
+          },
+    );
+
+    render(<BacktestLabScreen />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "nope-0001" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+
+    // The BACKTEST read's refusal is the one rendered — it is the read that
+    // asked first, and its `child_run_id` carries the id the trader typed.
+    const failure = (await screen.findAllByRole("alert")).find((alert) =>
+      alert.textContent?.includes(noBacktestRun.message),
+    );
+    expect(failure).toBeTruthy();
+    expect(failure?.textContent).toContain("nope-0001");
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #330 — a walk-forward's fold runs are marked and grouped
+// ---------------------------------------------------------------------------
+
+/** Two folds of the latest walk-forward (`REOPENED_DTO`'s index 2 and 0) and a
+ * fold of an OLDER walk-forward, which no pointer on the version can name. */
+const W3_FOLD_LATEST: LibraryRunSummary = {
+  id: "run-fold-reopen-2",
+  createdAt: "2026-08-23T09:00:00.000Z",
+  expectancy: "+0.62R",
+  trades: 4,
+};
+
+const W3_FOLD_LATEST_FIRST: LibraryRunSummary = {
+  id: "run-fold-reopen-0",
+  createdAt: "2026-08-23T09:00:00.000Z",
+  expectancy: "+0.41R",
+  trades: 3,
+};
+
+const W3_FOLD_OLDER: LibraryRunSummary = {
+  id: "oldwf-fold-1",
+  createdAt: "2026-08-21T09:00:00.000Z",
+  expectancy: "+0.10R",
+  trades: 6,
+};
+
+/** The catalogue #330 reads: the version's own run, the latest walk-forward's
+ * folds (payload order: fold 3, own, fold 1) and — in the second fixture — a
+ * fold of an older walk-forward. */
+function w3FoldCatalog(olderFold: LibraryRunSummary | null): LibraryOverview {
+  const runs = [W3_FOLD_LATEST, W3_OWN_RUN, W3_FOLD_LATEST_FIRST];
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          {
+            ...catalogVersion(
+              "ver-own-1",
+              null,
+              W3_OWN_RUN,
+              olderFold === null ? runs : [olderFold, ...runs],
+            ),
+            latestWalkForwardRunId: "wf-6c1d9f38",
+          },
+        ],
+      },
+    ],
+  };
+}
+
+describe("BacktestLabScreen (#330 — fold runs are marked and grouped)", () => {
+  it("labels the latest walk-forward's folds and groups them after the version's own runs (#330)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3FoldCatalog(null) });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+
+    const { container } = render(<BacktestLabScreen />);
+
+    // The fold map rides the pane's own read of the version's pointer.
+    await screen.findByRole("region", { name: /walk-forward result/i });
+    const rows = await waitFor(() => {
+      const found = Array.from(container.querySelectorAll(".bt-runs-list .bt-row"));
+      expect(found).toHaveLength(3);
+      return found;
+    });
+
+    // The version's own run leads; the two folds follow, each carrying its own
+    // label (`index + 1`, the walk-forward's short id) — never a mark the
+    // payload cannot justify.
+    expect(rows.map((row) => row.querySelector(".bt-id")?.textContent)).toEqual([
+      "ownrun-0",
+      "run-fold",
+      "run-fold",
+    ]);
+    expect(rows[0]?.querySelector(".bt-fold-label")).toBeNull();
+    expect(rows[1]?.querySelector(".bt-fold-label")?.textContent).toBe("fold 3 of WF wf-6c1d9");
+    expect(rows[2]?.querySelector(".bt-fold-label")?.textContent).toBe("fold 1 of WF wf-6c1d9");
+  });
+
+  it("leaves an older walk-forward's fold unmarked — the known limit (#330)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3FoldCatalog(W3_FOLD_OLDER) });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+
+    const { container } = render(<BacktestLabScreen />);
+    await screen.findByRole("region", { name: /walk-forward result/i });
+
+    const rows = Array.from(container.querySelectorAll(".bt-runs-list .bt-row"));
+    const older = rows.find(
+      (row) => row.querySelector(".bt-id")?.textContent === "oldwf-fo",
+    );
+    expect(older).toBeDefined();
+    // `LibraryRunSummary` carries no `walk_forward_run_id`, and the version names
+    // only its LATEST walk-forward — so the screen cannot know this run is a fold,
+    // and must not guess. It reads exactly one walk-forward: the pointer.
+    expect(older?.querySelector(".bt-fold-label")).toBeNull();
+    // Non-vacuous: the latest walk-forward's folds in the SAME render do wear
+    // their labels — the absence above is a limit, not a broken feature.
+    expect(
+      rows
+        .filter((row) => row.querySelector(".bt-fold-label") !== null)
+        .map((row) => row.querySelector(".bt-id")?.textContent),
+    ).toEqual(["run-fold", "run-fold"]);
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    expect(reopenMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #326 — the compare panel names its runs and explains the inputs
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (#326 — the compare names its runs)", () => {
+  it("names both compared runs and shows the inputs note beside the inputs-differ badge (#326)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CHILD_CATALOG });
+    compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
+    render(<BacktestLabScreen />);
+
+    await chooseVersion("v2");
+    const section = await screen.findByRole("region", { name: /compare with parent/i });
+
+    // Both columns carry their run: the 8-character short id on screen, the
+    // DTO's full id on the element.
+    const child = within(section).getByText("run-chil");
+    expect(child.getAttribute("title")).toBe(COMPARE_DTO.childRunId);
+    const parent = within(section).getByText("run-pare");
+    expect(parent.getAttribute("title")).toBe(COMPARE_DTO.parentRunId);
+
+    // The reason the inputs cannot be proven equal rides VISIBLY beside the
+    // badge — the hover keeps the exact text too.
+    const badge = within(section).getByText("inputs differ");
+    expect(badge.getAttribute("title")).toBe(COMPARE_DTO.inputsNote);
+    expect(within(section).getByText(COMPARE_DTO.inputsNote as string)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #269 — the certification deep link (`#/backtest?wf=<id>`)
+// ---------------------------------------------------------------------------
+
+/** Two versions, neither with a pointer or a run: the ONLY walk-forward the Lab
+ * can read here is the one the fragment names. */
+function w3LinkCatalog(): LibraryOverview {
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          catalogVersion("ver-own-1", null),
+          catalogVersion("ver-second", "ver-own-1"),
+        ],
+      },
+    ],
+  };
+}
+
+describe("BacktestLabScreen (#269 — the certification deep link)", () => {
+  afterEach(() => {
+    window.location.hash = "";
+  });
+
+  it("opens the run a #/backtest?wf= fragment names, selecting that run's version (#269)", async () => {
+    window.location.hash = "#/backtest?wf=wf-6c1d9f38";
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-second" },
+    });
+
+    render(<BacktestLabScreen />);
+
+    // The run the fragment names is on screen, and the picker moved to the
+    // version the DTO attributes it to.
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    // A READ, exactly like the Runs rows: nothing is started.
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("opens the run a fragment names while the Lab is already open (#269)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-second" },
+    });
+
+    render(<BacktestLabScreen />);
+    // Mounted and idle: neither version carries a pointer, so nothing has been
+    // read yet.
+    await screen.findByRole("region", { name: /version runs/i });
+    expect(reopenMock).not.toHaveBeenCalled();
+
+    window.location.hash = "#/backtest?wf=wf-6c1d9f38";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+    await screen.findByText("wf-6c1d9f38");
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+  });
+});

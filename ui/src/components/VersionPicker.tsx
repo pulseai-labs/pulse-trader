@@ -6,8 +6,7 @@
 // it, and needs a same-named group to say which strategy it is. The picker is
 // display-only over `LibraryStrategy[]`: it invents no row the catalog does not
 // carry, and every value on a row is the DTO's own string (the created date is
-// the RFC3339 text's `YYYY-MM-DD` slice until w1's format module lands and w3
-// folds it in).
+// w1's `dateUtc` — A2's `YYYY-MM-DD` with the `UTC` marker, r4.s5.w3 step 8).
 //
 // ARIA is the select-only combobox pattern: `role="combobox"` on the input, the
 // popup a `role="listbox"` of `role="group"`s and `role="option"`s, focus held
@@ -26,6 +25,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, MouseEvent } from "react";
 
 import type { LibraryStrategy, LibraryVersion } from "../bindings";
+import { dateUtc } from "../format/time";
 import { provenanceLine } from "./provenance";
 
 /** How much of an id the picker shows: the Library's own short-id convention. */
@@ -87,7 +87,7 @@ export function buildVersionGroups(strategies: readonly LibraryStrategy[]): Vers
   const colliding = collidingNames(strategies);
   return strategies.map((strategy) => {
     const header = colliding.has(strategy.name)
-      ? `${strategy.name} · ${strategy.createdAt.slice(0, 10)} · ${strategy.id.slice(0, SHORT_ID_LEN)}`
+      ? `${strategy.name} · ${dateUtc(strategy.createdAt)} · ${strategy.id.slice(0, SHORT_ID_LEN)}`
       : strategy.name;
     return {
       id: strategy.id,
@@ -101,8 +101,11 @@ export function buildVersionGroups(strategies: readonly LibraryStrategy[]): Vers
           id: version.id,
           label,
           shortId,
+          // r4.s5.w3 (spec step 8): the date is w1's own formatter now — A2's
+          // `YYYY-MM-DD` with its `UTC` marker — not a local slice of the
+          // RFC3339 text.
           text:
-            `${label} · ${version.createdAt.slice(0, 10)} · ${shortId} · ` +
+            `${label} · ${dateUtc(version.createdAt)} · ${shortId} · ` +
             `${provenanceLine(version)}${pinned ? " · pinned" : ""}`,
         };
       }),

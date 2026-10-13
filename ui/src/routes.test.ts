@@ -8,7 +8,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_NAV_ID, ROUTES, isNavBuilt, resolveNavId, resolveRoute } from "./routes";
+import {
+  DEFAULT_NAV_ID,
+  ROUTES,
+  backtestDeepLink,
+  isNavBuilt,
+  resolveNavId,
+  resolveRoute,
+} from "./routes";
 
 const KNOWN_NAV_IDS = ["library", "designer", "backtest", "deploy", "journal", "analytics", "settings", "help"];
 
@@ -78,5 +85,40 @@ describe("the path === '/' + nav convention, asserted over the real ROUTES", () 
         expect(route.path).toBe("/" + route.nav);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #269 — the Backtest Lab's deep link (`#/backtest?wf=<id>`)
+// ---------------------------------------------------------------------------
+
+describe("resolveNavId (a query is not part of the nav id — #269)", () => {
+  it("strips a query before resolving the nav id", () => {
+    // The Library's certification line lands here: the fragment names a run,
+    // and the nav id is still the Backtest Lab.
+    expect(resolveNavId("#/backtest?wf=wf-6c1d9f38", KNOWN_NAV_IDS)).toBe("backtest");
+    expect(resolveNavId("/backtest?run=run-1", KNOWN_NAV_IDS)).toBe("backtest");
+  });
+
+  it("leaves every query-less reading exactly as it was", () => {
+    expect(resolveNavId("#/backtest", KNOWN_NAV_IDS)).toBe("backtest");
+    expect(resolveNavId("#/settings", KNOWN_NAV_IDS)).toBe("settings");
+    expect(resolveNavId("#/", KNOWN_NAV_IDS)).toBe(DEFAULT_NAV_ID);
+    expect(resolveNavId("", KNOWN_NAV_IDS)).toBe(DEFAULT_NAV_ID);
+    // An unknown id is still unknown, query or not.
+    expect(resolveNavId("#/not-a-real-destination?wf=1", KNOWN_NAV_IDS)).toBe(DEFAULT_NAV_ID);
+  });
+});
+
+describe("backtestDeepLink (#269)", () => {
+  it("reads the walk-forward run the Backtest Lab's fragment names", () => {
+    expect(backtestDeepLink("#/backtest?wf=wf-6c1d9f38")).toEqual({ wf: "wf-6c1d9f38" });
+  });
+
+  it("is null for every fragment that does not ask for one", () => {
+    expect(backtestDeepLink("#/backtest")).toBeNull();
+    expect(backtestDeepLink("#/backtest?wf=")).toBeNull();
+    expect(backtestDeepLink("#/library?wf=wf-1")).toBeNull();
+    expect(backtestDeepLink("")).toBeNull();
   });
 });
