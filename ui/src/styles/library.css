@@ -282,8 +282,11 @@
 }
 .vnode-kpis .bull { color: var(--bull-1); font-weight: var(--fw-semibold); }
 .vnode-kpis .bear { color: var(--bear-1); font-weight: var(--fw-semibold); }
-/* The row's own separation — it was the flex row's `gap`. */
-.kpi-sep { color: var(--text-4); margin-inline: 4px; }
+/* The node row's own separation — it was the row's flex `gap`. Scoped: the
+   bare `.kpi-sep` is shared with the collapsed card's `.cc-kpis` (its own 6px
+   gap), so the margin must live on the node's row only. */
+.vnode-kpis .kpi-sep { margin-inline: 4px; }
+.kpi-sep { color: var(--text-4); }
 .cc-kpis .bull { color: var(--bull-1); font-weight: var(--fw-semibold); }
 .cc-kpis .bear { color: var(--bear-1); font-weight: var(--fw-semibold); }
 

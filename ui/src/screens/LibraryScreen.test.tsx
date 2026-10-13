@@ -1092,14 +1092,15 @@ function tokenTable(tokensCss: string): Record<string, string | undefined> {
 
 const TOKEN_VALUES = tokenTable(source("styles/tokens.css"));
 
-/** The body of the first `selector { ... }` block in `css`, brace-balanced and
- * COMMENT-STRIPPED (so a selector or value named in a comment cannot satisfy
- * the read), or null when the selector is absent — the reader
- * `styles/backtest.test.ts` uses, with the comment strip added. */
+/** The body of the rule whose selector is exactly `selector` — brace-balanced
+ * and COMMENT-STRIPPED (so a selector named in a comment cannot satisfy the
+ * read), or null when no rule starts with it. Anchored at a rule boundary
+ * (`^` or a preceding `}`) so `.kpi-sep` cannot be satisfied by the
+ * `.vnode-kpis .kpi-sep` rule that follows it. */
 function blockOf(css: string, selector: string): string | null {
   const stripped = css.replace(/\/\*[\s\S]*?\*\//g, "");
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = stripped.match(new RegExp(`${escaped}\\s*\\{`));
+  const match = stripped.match(new RegExp(`(?:^|\\})\\s*${escaped}\\s*\\{`));
   if (match === null || match.index === undefined) return null;
   const open = match.index + match[0].length;
   let depth = 1;
@@ -1312,8 +1313,8 @@ describe("LibraryScreen (#404 — the version node's geometry)", () => {
     // trade count — plus the separators' own spacing, on ONE line.
     const kpiProbe = "-1234.56 R · 100.0% · 12345t";
     const separator = requiredLength(
-      decl(requiredBlock(LIBRARY_CSS, ".kpi-sep"), "margin-inline"),
-      ".kpi-sep margin-inline",
+      decl(requiredBlock(LIBRARY_CSS, ".vnode-kpis .kpi-sep"), "margin-inline"),
+      ".vnode-kpis .kpi-sep margin-inline",
     );
     expect(
       kpiProbe.length * charWidth(fontSizeOf(LIBRARY_CSS, ".vnode-kpis")) + 2 * 2 * separator,
@@ -1331,6 +1332,13 @@ describe("LibraryScreen (#404 — the version node's geometry)", () => {
     const kpis = requiredBlock(LIBRARY_CSS, ".vnode-kpis");
     expect(decl(kpis, "overflow")).toBe("hidden");
     expect(decl(kpis, "text-overflow")).toBe("ellipsis");
+
+    // ...and that spacing stays INSIDE the node: `.kpi-sep` is shared with the
+    // collapsed strategy card's `.cc-kpis` (a 6px flex gap), so the bare rule
+    // must not carry horizontal margin of its own.
+    const bareSeparator = requiredBlock(LIBRARY_CSS, ".kpi-sep");
+    expect(decl(bareSeparator, "margin-inline")).toBeNull();
+    expect(decl(bareSeparator, "margin")).toBeNull();
 
     // ...and nothing in the column may be squeezed to fit: each line keeps its
     // own height, and the hypothesis keeps its two clamped lines.
