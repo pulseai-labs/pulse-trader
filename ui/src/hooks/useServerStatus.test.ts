@@ -87,6 +87,34 @@ describe("useServerStatus", () => {
     expect(result.current.status?.state).toBe("down");
   });
 
+  it("applies a stalled read's answer while no newer answer has applied (#389)", async () => {
+    const stalled = deferred<{ status: "ok"; data: ServerStatus }>();
+    const next = deferred<{ status: "ok"; data: ServerStatus }>();
+    serverStatusMock
+      .mockImplementationOnce(() => stalled.promise)
+      .mockImplementationOnce(() => next.promise);
+
+    const { result } = renderHook(() => useServerStatus());
+    // The mount read (1) stalls; the next poll (2) is issued and is still out.
+    act(() => {
+      result.current.refresh();
+    });
+    expect(serverStatusMock).toHaveBeenCalledTimes(2);
+
+    // Read 1 answers `down` with nothing newer applied: it must land — the
+    // gate cannot stay blank because the next read was merely ISSUED.
+    await act(async () => {
+      stalled.resolve(ok(status("down")));
+    });
+    expect(result.current.status?.state).toBe("down");
+
+    // And the newer read, when it answers, still wins over the older answer.
+    await act(async () => {
+      next.resolve(ok(status("up", { binary_version: "0.3.0" })));
+    });
+    expect(result.current.status?.state).toBe("up");
+  });
+
   it("records the last read that answered up, and only that read (#338)", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-13T18:15:45Z"));
