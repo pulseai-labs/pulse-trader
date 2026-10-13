@@ -141,7 +141,13 @@ fi
 
 # --- case 3: the lockfile changed -> installs again, then no-op --------------
 label="case 3: changed lockfile reinstalls"
-if sed -i '0,/"version": "5\.0\.4"/s//"version": "5.0.5"/' "$scratch/package-lock.json"; then
+# A portable, version-independent mutation: one appended newline rewrites the
+# scratch lockfile's bytes — and with them its `cksum` stamp — with no GNU-only
+# `sed -i` and no assumption that any particular version text is in the file.
+# The stamp is compared before and after, so a mutation that failed to move it
+# fails here instead of letting the case pass by proving nothing.
+stamp_before="$(want_stamp)"
+if printf '\n' >>"$scratch/package-lock.json" && [ "$(want_stamp)" != "$stamp_before" ]; then
   before="$(calls)"
   if run_recipe; then
     after="$(calls)"
