@@ -173,9 +173,12 @@ export function VersionPicker({ strategies, value, onChange, disabled }: Version
     return null;
   }, [groups, value]);
 
-  /** The input shows the query while the trader is typing and the selected
-   * option's own line otherwise — so what is selected is always readable. */
-  const displayed = open && query !== "" ? query : (selected?.text ?? "");
+  /** While the popup is open the input carries the QUERY — opening starts an
+   * empty search, so the first keystroke filters instead of editing the
+   * selected option's text — and the selected option stays readable as the
+   * placeholder. Closed, the input shows the selected option's own line. */
+  const displayed = open ? query : (selected?.text ?? "");
+  const placeholder = open && selected !== null ? selected.text : "Search versions…";
 
   // The active option is scrolled into view as it moves. `scrollIntoView` is
   // optional on purpose: jsdom does not implement it.
@@ -280,9 +283,10 @@ export function VersionPicker({ strategies, value, onChange, disabled }: Version
     setOpen(true);
   }
 
-  function onOptionMouseDown(event: MouseEvent<HTMLLIElement>) {
-    // Keep focus in the input: a real mousedown would blur it, and a blur closes
-    // the popup before the click that selects.
+  function onListboxMouseDown(event: MouseEvent<HTMLUListElement>) {
+    // Keep focus in the input: a real mousedown ANYWHERE in the popup — a row,
+    // a group header, the padding or the empty-state line — would blur it, and
+    // a blur closes the popup before the click that selects.
     event.preventDefault();
   }
 
@@ -297,7 +301,7 @@ export function VersionPicker({ strategies, value, onChange, disabled }: Version
         disabled={disabled}
         autoComplete="off"
         spellCheck={false}
-        placeholder="Search versions…"
+        placeholder={placeholder}
         aria-autocomplete="list"
         aria-expanded={open}
         aria-controls={open ? LISTBOX_ID : undefined}
@@ -319,7 +323,13 @@ export function VersionPicker({ strategies, value, onChange, disabled }: Version
         onBlur={closeList}
       />
       {open && (
-        <ul role="listbox" id={LISTBOX_ID} aria-label="Strategy versions" className="vp-list">
+        <ul
+          role="listbox"
+          id={LISTBOX_ID}
+          aria-label="Strategy versions"
+          className="vp-list"
+          onMouseDown={onListboxMouseDown}
+        >
           {view.flat.length === 0 && (
             <li role="presentation" className="vp-empty">
               No versions match “{query.trim()}”
@@ -338,7 +348,6 @@ export function VersionPicker({ strategies, value, onChange, disabled }: Version
                     role="option"
                     aria-selected={option.id === value}
                     className={`vp-option${index === active ? " is-active" : ""}`}
-                    onMouseDown={onOptionMouseDown}
                     onClick={() => commit(option)}
                   >
                     {option.text}

@@ -18,7 +18,7 @@
 // Escape, Home/End) with focus held in the input and `aria-activedescendant`
 // tracking the active option.
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -368,6 +368,54 @@ describe("VersionPicker (keyboard)", () => {
 
     expect(onSelect).toHaveBeenCalledExactlyOnceWith("3echo55");
     expect(box.value).toBe("v3 · 2026-08-03 UTC · 3echo55 · human");
+    expect(document.activeElement).toBe(box);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Typing with a selection
+// ---------------------------------------------------------------------------
+
+describe("VersionPicker (a selection does not block the search)", () => {
+  it("reopens with an empty query and filters on the first keystroke", () => {
+    render(<Harness />);
+    const box = open();
+
+    // Select v2 through the keyboard, so the Harness holds `2aurora`…
+    fireEvent.keyDown(box, { key: "ArrowDown" });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(box.value).toBe("v2 · 2026-08-02 UTC · 2aurora · human");
+
+    // …and reopen. The input holds the QUERY (empty), never the selected
+    // option's text, so the first keystroke starts a search; the selection
+    // stays readable as the placeholder while the popup is open.
+    open();
+    expect(box.value).toBe("");
+    expect(box.getAttribute("placeholder")).toBe("v2 · 2026-08-02 UTC · 2aurora · human");
+
+    fireEvent.change(box, { target: { value: "lima carry" } });
+    const options = screen.getAllByRole("option");
+    expect(options).toHaveLength(10);
+    expect(options[0]?.textContent).toBe("v1 · 2026-08-01 UTC · 1lima22 · human");
+
+    // Closing without a new choice restores the selected option's own line.
+    fireEvent.keyDown(box, { key: "Escape" });
+    expect(box.value).toBe("v2 · 2026-08-02 UTC · 2aurora · human");
+  });
+
+  it("keeps the popup open when the trader presses a group header", () => {
+    render(<Harness />);
+    const box = open();
+
+    const header = document.querySelector(".vp-group") as HTMLElement;
+    expect(header).not.toBeNull();
+    const press = createEvent.mouseDown(header);
+    fireEvent(header, press);
+
+    // Default-prevented, so a real browser never moves focus out of the input…
+    expect(press.defaultPrevented).toBe(true);
+    // …and the popup, and the focus, are still there.
+    expect(screen.queryAllByRole("option").length).toBeGreaterThan(0);
     expect(document.activeElement).toBe(box);
   });
 });
