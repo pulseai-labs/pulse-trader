@@ -1727,8 +1727,9 @@ function EquityChart({
           {/* One series: a 2px line with a quiet area fill beneath it. */}
           <polygon className="bt-eq-area" points={areaPoints} />
           <polyline className="bt-eq-line" points={linePoints} />
-          {/* The starting-equity reference line, labelled with the DTO's own
-              string — the reference is never colour-only. */}
+          {/* The starting-equity reference line, carrying the DTO's own value:
+              formatted below, its exact string on hover — the reference is
+              never colour-only. */}
           <line
             className="bt-eq-ref"
             x1={EQ_PAD}
@@ -1749,13 +1750,22 @@ function EquityChart({
         </svg>
       </div>
       {/* One readout for both pointer and keyboard — parity is structural:
-          the same state drives the same exact strings either way. */}
+          the same state drives the same formatted text and exact strings
+          either way. */}
       <p className="bt-eq-readout mono" aria-live="polite">
-        <span className="bt-eq-readout-time">{point.timeMs}</span> ·{" "}
-        <span className="bt-eq-readout-equity">{point.equity}</span>
+        <span className="bt-eq-readout-time">
+          <Figure exact={point.timeMs}>{timeUtc(point.timeMs)}</Figure>
+        </span>{" "}
+        ·{" "}
+        <span className="bt-eq-readout-equity">
+          <Figure exact={point.equity}>{usdt(point.equity)}</Figure>
+        </span>
       </p>
       <p className="bt-eq-ref-label">
-        starting equity <span className="mono">{startingEquity}</span>
+        starting equity{" "}
+        <span className="mono">
+          <Figure exact={startingEquity}>{usdt(startingEquity)}</Figure>
+        </span>
       </p>
     </section>
   );

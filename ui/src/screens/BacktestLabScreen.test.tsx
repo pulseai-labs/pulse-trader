@@ -699,18 +699,21 @@ describe("BacktestLabScreen (fresh result render)", () => {
     const container = await renderRun(SEEDED_RUN);
     const chart = container.querySelector(".bt-equity");
     expect(chart).not.toBeNull();
-    const inChart = within(chart as HTMLElement);
 
     // One polyline series (not two), a quiet area fill, and the reference line.
     expect((chart as HTMLElement).querySelectorAll("polyline")).toHaveLength(1);
     expect((chart as HTMLElement).querySelectorAll("polygon")).toHaveLength(1);
     const ref = (chart as HTMLElement).querySelector(".bt-eq-ref");
     expect(ref).not.toBeNull();
-    // The reference is labelled with the DTO's own exact string, and the
-    // readout shows the traversed point's exact strings (point[0] before any
-    // traversal; the full point-to-point path is the parity test below).
-    expect(inChart.getAllByText("10000.00").length).toBeGreaterThan(0);
-    expect(inChart.getByText("1735689600000")).toBeTruthy();
+    // The reference reads in human units with the DTO's own exact string on
+    // the title, and the readout shows the traversed point the same way
+    // (point[0] before any traversal; the full point-to-point path is the
+    // parity test below).
+    const refLabel = (chart as HTMLElement).querySelector(".bt-eq-ref-label") as HTMLElement;
+    expectFigure(refLabel, "10,000.00 USDT", "10000.00");
+    const readout = (chart as HTMLElement).querySelector(".bt-eq-readout") as HTMLElement;
+    expectFigure(readout, "2025-01-01 00:00 UTC", "1735689600000");
+    expectFigure(readout, "10,000.00 USDT", "10000.00");
   });
 
   it("renders the four regime rows in the DTO's fixed order with fixed human labels, legend and direct labels", async () => {
@@ -887,7 +890,7 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     }
   });
 
-  it("exposes identical exact-string readouts for keyboard and pointer on the equity plot", async () => {
+  it("exposes identical human-unit readouts for keyboard and pointer, exact strings on the title", async () => {
     const container = await renderRun(SEEDED_RUN);
     const chart = container.querySelector(".bt-equity") as HTMLElement;
     const plot = chart.querySelector(".bt-eq-plot") as HTMLElement;
@@ -898,23 +901,30 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     // Keyboard: Left/Right step point-to-point, Home/End jump to first/last.
     plot.focus();
     fireEvent.keyDown(plot, { key: "ArrowRight" });
-    expect(readout.textContent).toContain("1736294400000");
-    expect(readout.textContent).toContain("10042.75");
+    expectFigure(readout, "2025-01-08 00:00 UTC", "1736294400000");
+    expectFigure(readout, "10,042.75 USDT", "10042.75");
     fireEvent.keyDown(plot, { key: "End" });
-    expect(readout.textContent).toContain("1737504000000");
+    expectFigure(readout, "2025-01-22 00:00 UTC", "1737504000000");
     fireEvent.keyDown(plot, { key: "Home" });
-    expect(readout.textContent).toContain("1735689600000");
+    expectFigure(readout, "2025-01-01 00:00 UTC", "1735689600000");
     fireEvent.keyDown(plot, { key: "ArrowRight" });
     fireEvent.keyDown(plot, { key: "ArrowLeft" });
-    expect(readout.textContent).toContain("1735689600000");
+    expectFigure(readout, "2025-01-01 00:00 UTC", "1735689600000");
 
     // Pointer: hovering the third point's hit marker drives the SAME readout
-    // element with the same exact strings — parity is structural.
+    // element with the same formatted text and exact strings — parity is
+    // structural.
     const hits = chart.querySelectorAll(".bt-eq-hit");
     expect(hits).toHaveLength(SEEDED_RUN.equity.length);
     fireEvent.mouseOver(hits[2]);
-    expect(readout.textContent).toContain("1736899200000");
-    expect(readout.textContent).toContain("9910.50");
+    expectFigure(readout, "2025-01-15 00:00 UTC", "1736899200000");
+    expectFigure(readout, "9,910.50 USDT", "9910.50");
+
+    // The starting-equity reference line's label reads in USDT too, with the
+    // DTO's own string one hover away.
+    const refLabel = chart.querySelector(".bt-eq-ref-label") as HTMLElement;
+    expect(refLabel).not.toBeNull();
+    expectFigure(refLabel, "10,000.00 USDT", "10000.00");
   });
 
   it("makes the equity plot and the trade-table scroll region focus stops in visual order", async () => {
