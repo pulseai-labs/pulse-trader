@@ -17,12 +17,12 @@
 // and the pair/timeframes all come from the server; "10,000 USDT fixed" is the
 // recorded A4 starting equity, stated as the fixed default it is.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { commands } from "../bindings";
 import type { BacktestRunDto, LibraryVersion, PromoteOverride, WalkForwardRunDto } from "../bindings";
 import { foldsHold } from "../format/numbers";
-import { openBacktestLab } from "../paper/handoff";
+import { openBacktestLab, requestPaperCountRefresh } from "../paper/handoff";
 import { CertBadge } from "./CertBadge";
 
 /** What the sheet promotes: one persisted version and how to label it. */
@@ -135,13 +135,23 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
 
   const trimmed = reason.trim();
 
+  // The in-flight latch (#336): `busy` alone re-renders too late to block a
+  // second activation in the same tick — the second click the walk recorded —
+  // so the guard is synchronous, and every submit path goes through it.
+  const inFlight = useRef(false);
+
   const promote = useCallback(
     async (override: PromoteOverride | null) => {
+      if (inFlight.current) return;
+      inFlight.current = true;
       setBusy(true);
       setRefusal(null);
       try {
         const result = await commands.paperPromote({ version_id: versionId, override });
         if (result.status === "ok") {
+          // The title strip's count follows the promote at once: a request to
+          // the count poll App already runs, never a second poll (#335).
+          requestPaperCountRefresh();
           onPromoted?.(result.data.id);
           return;
         }
@@ -165,6 +175,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
       } catch {
         setRefusal("The promotion call itself failed.");
       } finally {
+        inFlight.current = false;
         setBusy(false);
       }
     },
@@ -205,7 +216,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
               void promote(null);
             }}
           >
-            Promote
+            {busy ? "Promoting…" : "Promote"}
           </button>
         </>
       )}
@@ -252,7 +263,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
               });
             }}
           >
-            Promote uncertified
+            {busy ? "Promoting…" : "Promote uncertified"}
           </button>
         </>
       )}

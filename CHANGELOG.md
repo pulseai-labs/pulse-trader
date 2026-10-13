@@ -406,6 +406,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   UTC`) instead of a local slice. `scripts/ui-polish-lab-test.sh` is the new ledger line over the
   four suites.
 
+- **The r3/r4 walk-filed paper, title-strip and Settings defects no longer reproduce (r4.s5.w4).**
+  Paper session cards and the detail header read `last seen active · <time> UTC` — never a live
+  `● active` — while the server is not answering, both derive that badge from the same summary
+  function, and a session the server reports `running` reads `active` from promotion instead of the
+  invented `starting` (#338, #337, #304). The detail header and the cards show the session's own id
+  (the 8-character short form, the full id on hover) and name the version separately (#333); a
+  certified fixture session carries both the FIXTURE and CERTIFIED badges on the card and in the
+  detail (#334); the detail's certificate names each certified snapshot (#304); an exit fill reads
+  `close long`/`close short` and the table states the bar a fill belongs to and when an order was
+  placed (#382); the promote confirm reads `Promoting…`, cannot be submitted twice, and refreshes
+  the title strip's paper count at once (#336, #335); Settings stops offering Disconnect and Change
+  server once the link is disconnected (#386); an older status poll no longer overwrites a newer one
+  (#389); a failed session read no longer drops the queued trailing refresh (#371); the title strip
+  never wraps its words onto a second line (#319); and the sidebar version comes from the status
+  handshake instead of a hard-coded string (#310). `scripts/ui-polish-paper-test.sh` is the ledger
+  line over the seven test files and the typecheck.
+
 - **The `pulse://dsl/schema` resource read works from Claude Code (#353).** MCP clients on the
   2026-07-28 protocol revision validate `resources/read` and `resources/list` against that
   revision's result schema, where SEP-2549 makes `ttlMs` (integer ≥ 0) and `cacheScope`

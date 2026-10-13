@@ -119,3 +119,100 @@ describe("Sidebar 'New strategy'", () => {
     expect(window.location.hash).toBe("#/designer");
   });
 });
+
+// ---------------------------------------------------------------------------
+// r4.s5.w4 — the sidebar version and the strip's no-wrap rule
+// ---------------------------------------------------------------------------
+
+/** The Node runtime vitest runs on, named rather than accessed through an
+ * inline cast. This toolchain ships no `@types/node` (see package.json), so
+ * the runtime globals are reached through `globalThis` — the
+ * `styles/backtest.test.ts` precedent. */
+interface NodeRuntime {
+  process: { cwd(): string; getBuiltinModule(id: string): unknown };
+}
+
+const nodeRuntime = globalThis as unknown as NodeRuntime;
+
+interface FsLike {
+  readFileSync(path: string, encoding: "utf8"): string;
+}
+
+/** The ported sheet the strip's rules live in, read from disk: vitest stubs
+ * CSS imports, so pinning a rule means reading the file. */
+function readSharedCss(): string {
+  const fs = nodeRuntime.process.getBuiltinModule("node:fs") as FsLike;
+  return fs.readFileSync(`${nodeRuntime.process.cwd()}/ui/src/styles/shared.css`, "utf8");
+}
+
+/** The body of the first `selector { ... }` rule in `css`, or null when the
+ * selector is absent. These rules hold no nested braces, so a plain slice to
+ * the first `}` is exact. */
+function ruleBody(css: string, selector: string): string | null {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+  return match === null ? null : match[1];
+}
+
+function upStatus(version: string): ServerStatus {
+  return {
+    state: "up",
+    binary_version: version,
+    engine_fingerprint: null,
+    reason: null,
+    role: null,
+  };
+}
+
+function downStatus(): ServerStatus {
+  return {
+    state: "down",
+    binary_version: null,
+    engine_fingerprint: null,
+    reason: null,
+    role: null,
+  };
+}
+
+describe("the sidebar version label (#310)", () => {
+  it("reads the version from the status handshake, never a hard-coded string (#310)", () => {
+    const { rerender } = render(<Sidebar serverStatus={upStatus("0.1.3")} />);
+    // The handshake answered `up`: the version comes from it, and the mode
+    // word states the app's actual connection (a server, not `local`).
+    expect(screen.getByText("v0.1.3 · server")).toBeTruthy();
+
+    // No good handshake (down, and nothing read at all): the em dash, not a
+    // stale version.
+    rerender(<Sidebar serverStatus={downStatus()} />);
+    expect(screen.getByText("—")).toBeTruthy();
+    rerender(<Sidebar />);
+    expect(screen.getByText("—")).toBeTruthy();
+  });
+});
+
+describe("the title strip's no-wrap rule (#319)", () => {
+  it("carries each strip text's full words as its title (#319)", () => {
+    render(<WindowChrome serverStatus={upStatus("0.1.2")} paperRunning={3} />);
+
+    const serverText = screen.getByText("server up · 0.1.2");
+    expect(serverText.className).toContain("ts-text");
+    expect(serverText.getAttribute("title")).toBe("server up · 0.1.2");
+
+    const paperText = screen.getByText("3 paper · 0 live");
+    expect(paperText.className).toContain("ts-text");
+    expect(paperText.getAttribute("title")).toBe("3 paper · 0 live");
+  });
+
+  it("pins the nowrap and ellipsis rules in shared.css (#319)", () => {
+    const sheet = readSharedCss();
+    const stripRule = ruleBody(sheet, ".title-status");
+    expect(stripRule).not.toBeNull();
+    expect(stripRule).toContain("white-space: nowrap");
+
+    const textRule = ruleBody(sheet, ".title-status .ts-text");
+    expect(textRule).not.toBeNull();
+    expect(textRule).toContain("overflow: hidden");
+    expect(textRule).toContain("text-overflow: ellipsis");
+    expect(textRule).toContain("white-space: nowrap");
+  });
+});

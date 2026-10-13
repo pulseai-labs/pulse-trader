@@ -30,7 +30,8 @@ vi.mock("../bindings", () => ({
   },
 }));
 
-import type { PaperSessionSummary, PaperShadowCheck } from "../bindings";
+import type { PaperSessionSummary, PaperShadowCheck, ServerStatus } from "../bindings";
+import { ConnectionProvider } from "../shell/ConnectionContext";
 import DeploymentDashboard from "./DeploymentDashboard";
 
 const ENGINE = "engine-current-0123456789abcdef";
@@ -108,12 +109,40 @@ function detailsHost(): HTMLElement {
   return host;
 }
 
+/** The `up` status the rendered cases seed by default. */
+function upStatus(): ServerStatus {
+  return {
+    state: "up",
+    binary_version: "0.3.0",
+    engine_fingerprint: ENGINE,
+    reason: null,
+    role: null,
+  };
+}
+
+/** The dashboard reads the app's one status poll from its provider (r4.s5.w4,
+ * #338) — the same value App hands every screen. */
+function renderDashboard(
+  connection: { status?: ServerStatus; lastGoodAt?: number | null } = {},
+) {
+  return render(
+    <ConnectionProvider
+      value={{
+        status: connection.status ?? upStatus(),
+        refresh: () => {},
+        openConnect: () => {},
+        lastGoodAt: connection.lastGoodAt ?? null,
+      }}
+    >
+      <DeploymentDashboard />
+    </ConnectionProvider>,
+  );
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   detailsHost();
-  serverStatusMock.mockResolvedValue(
-    ok({ state: "up", binary_version: "0.3.0", engine_fingerprint: ENGINE, reason: null, role: null }),
-  );
+  serverStatusMock.mockResolvedValue(ok(upStatus()));
   paperSessionMock.mockImplementation((id: string) =>
     Promise.resolve(ok(session({ id }))),
   );
@@ -145,7 +174,7 @@ describe("the session cards", () => {
         }),
       ]),
     );
-    render(<DeploymentDashboard />);
+    renderDashboard();
 
     expect(await screen.findByText("BTCUSDT · 15m · 4h")).toBeTruthy();
     expect(screen.getByText("ETHUSDT · 1h")).toBeTruthy();
@@ -170,7 +199,7 @@ describe("the session cards", () => {
         }),
       ]),
     );
-    const { container } = render(<DeploymentDashboard />);
+    const { container } = renderDashboard();
 
     const card = (await screen.findByText("BTCUSDT · 15m · 4h")).closest(".dcard") as HTMLElement;
     const figure = within(card).getByText("+0.34 R");
@@ -183,7 +212,7 @@ describe("the session cards", () => {
 
   it("shows the drift alert and badge on a drifted live epoch", async () => {
     paperSessionsMock.mockResolvedValue(ok([session({ shadow_checks: [identical(), drifted()] })]));
-    render(<DeploymentDashboard />);
+    renderDashboard();
 
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.getByText("closed-trade 3 differs")).toBeTruthy();
@@ -206,7 +235,7 @@ describe("stop all", () => {
         failures: [{ id: "s-2", code: "data" }],
       }),
     );
-    render(<DeploymentDashboard />);
+    renderDashboard();
     expect(await screen.findByText("BTCUSDT · 15m · 4h")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /Stop all/ }));
@@ -226,7 +255,7 @@ describe("stop all", () => {
     paperStopAllMock.mockResolvedValue(
       ok({ stopped: [], failures: [{ id: "s-1", code: "data" }] }),
     );
-    render(<DeploymentDashboard />);
+    renderDashboard();
     await screen.findByText("BTCUSDT · 15m · 4h");
 
     fireEvent.click(screen.getByRole("button", { name: /Stop all/ }));
@@ -245,10 +274,76 @@ describe("stop all", () => {
 describe("the session detail", () => {
   it("opens the selected session in the shell's details track", async () => {
     paperSessionsMock.mockResolvedValue(ok([session()]));
-    render(<DeploymentDashboard />);
+    renderDashboard();
     fireEvent.click(await screen.findByRole("button", { name: /Details/ }));
 
     const pane = within(detailsHost());
     expect(await pane.findByText("wf-1")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r4.s5.w4 — the status read, the identity and the badges on the cards
+// ---------------------------------------------------------------------------
+
+describe("the session badge and the server status (#338, #337)", () => {
+  it("renders last seen on the cards while the server is down, never ● active (#338)", async () => {
+    paperSessionsMock.mockResolvedValue(ok([session()]));
+    renderDashboard({
+      status: { ...upStatus(), state: "down", binary_version: null },
+      lastGoodAt: Date.UTC(2026, 9, 13, 18, 15, 45),
+    });
+
+    const card = (await screen.findByText("BTCUSDT · 15m · 4h")).closest(".dcard") as HTMLElement;
+    const badge = within(card).getByText(/^last seen active/);
+    expect(badge.textContent).toBe("last seen active · 2026-10-13 18:15 UTC");
+    expect(badge.className).toContain("is-stale");
+    // Never painted as live: no `st-*` state class, and no pulsing dot.
+    expect(document.querySelector(".dep-status.st-active")).toBeNull();
+    expect(document.querySelector(".dep-status-dot.pulse")).toBeNull();
+  });
+
+  it("agrees with the detail on a running session's status from promotion (#337)", async () => {
+    // A promoted session the server reports `running` before any bar: the card
+    // reads `active` from promotion, and so does the detail when it opens.
+    paperSessionsMock.mockResolvedValue(ok([session({ last_bar_open_time: null })]));
+    paperSessionMock.mockImplementation((id: string) =>
+      Promise.resolve(ok(session({ id, last_bar_open_time: null }))),
+    );
+    renderDashboard();
+
+    const card = (await screen.findByText("BTCUSDT · 15m · 4h")).closest(".dcard") as HTMLElement;
+    expect(within(card).getByText("active")).toBeTruthy();
+
+    fireEvent.click(within(card).getByRole("button", { name: /Details/ }));
+    const pane = within(detailsHost());
+    expect(await pane.findByText("active")).toBeTruthy();
+    expect(pane.queryByText("starting")).toBeNull();
+  });
+});
+
+describe("the card identity and the badges (#333, #334)", () => {
+  const SESSION = "c2d2d8b7-5a28-4830-8605-0d3092485434";
+  const VERSION = "9c65223b-1f4c-4c17-9c2e-8e1c5d6a7b01";
+
+  it("shows the session id, the full id as its title, and the version named separately (#333)", async () => {
+    paperSessionsMock.mockResolvedValue(
+      ok([session({ id: SESSION, strategy_version_id: VERSION })]),
+    );
+    renderDashboard();
+
+    const card = (await screen.findByText("BTCUSDT · 15m · 4h")).closest(".dcard") as HTMLElement;
+    const id = within(card).getByText("c2d2d8b7");
+    expect(id.getAttribute("title")).toBe(SESSION);
+    expect(within(card).getByText("version 9c65223b")).toBeTruthy();
+  });
+
+  it("shows both badges on a certified fixture card (#334)", async () => {
+    paperSessionsMock.mockResolvedValue(ok([session({ fixture: true })]));
+    renderDashboard();
+
+    const card = (await screen.findByText("BTCUSDT · 15m · 4h")).closest(".dcard") as HTMLElement;
+    expect(within(card).getByText("fixture")).toBeTruthy();
+    expect(within(card).getByText("certified")).toBeTruthy();
   });
 });
