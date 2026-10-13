@@ -358,8 +358,11 @@ a:hover { color: var(--ai-2); }
    `external_agent · <agent name>` takes the reserved AI accent — the token's
    own "agent actions" rule.
    r4.s5.w3 (#325): ONE line, ellipsized — a wrapped `external_agent ·
-   claude-code` used to push the hypothesis subline out of the node's fixed
-   64px height; the full line rides `title`. */
+   claude-code` used to push the hypothesis subline out of the node; the full
+   line rides `title`.
+   #404 (d37): `overflow: hidden` gives this flex item an automatic minimum of
+   0, so it collapsed to zero height the moment the node ran out of room.
+   `flex-shrink: 0` keeps it at its own height. */
 .vnode-provenance {
   font-family: var(--font-mono);
   font-size: var(--fs-11);
@@ -368,12 +371,15 @@ a:hover { color: var(--ai-2); }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex-shrink: 0;
 }
 .vnode-provenance.agent { color: var(--ai-1); }
 
 /* C1: the hypothesis subline — clamped to two lines so a long hypothesis does
    not stretch the node; the details pane's .d-hypothesis carries the text in
-   full. */
+   full.
+   #404 (d37): the clamp's own `overflow: hidden` zeroes the automatic minimum
+   just the same, so `flex-shrink: 0` is what keeps both clamped lines. */
 .vnode-hypothesis {
   font-size: var(--fs-11);
   color: var(--text-3);
@@ -383,6 +389,7 @@ a:hover { color: var(--ai-2); }
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 /* C1: the unclamped hypothesis inside the details pane's Hypothesis section. */

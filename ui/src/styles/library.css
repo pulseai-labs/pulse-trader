@@ -219,6 +219,11 @@
   align-items: center;
   gap: 5px;
   line-height: 1;
+  /* #404 (d37): ONE line, always — a crowded head (pin + certification chip +
+     delta) used to wrap its delta onto a second line and grow the head to 28px
+     inside a node whose layout measured it at one. What does not fit is
+     clipped by the node's own `overflow`, never by wrapping. */
+  white-space: nowrap;
 }
 .vnode-name {
   font-family: var(--font-mono);
@@ -255,7 +260,10 @@
   white-space: nowrap;
   text-overflow: ellipsis;
   overflow: hidden;
-  min-height: 30px;
+  /* #404 (d37): no min-height reserve. The 30px came from the mock's TWO-line
+     clamp; this line has been a single ellipsized one since the port, and the
+     reserve starved the node's other lines. The node is now as tall as its
+     lines need (LibraryScreen.tsx NODE_H / NODE_H_AGENT). */
 }
 .vnode-kpis {
   display: flex;
