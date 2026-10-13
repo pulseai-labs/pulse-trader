@@ -105,13 +105,17 @@ export default function SessionDetail({
         <div className="dh-left">
           <span className="dc-pair-tag">{summary.pair}</span>
           <div className="dh-info">
-            {/* The session's own id, short with the full id on hover (#333) —
-                the version id it used to show belongs to the version, below. */}
+            {/* The session's own id, short with the full id on hover (#333).
+                The version below is named separately, its short id carrying the
+                full version id on hover the same way. */}
             <span className="dh-name mono" title={summary.id}>
               {shortId(summary.id)}
             </span>
             <span className="dh-ver mono">
-              version {shortId(summary.strategy_version_id)}
+              version{" "}
+              <span title={summary.strategy_version_id}>
+                {shortId(summary.strategy_version_id)}
+              </span>
               {" · "}
               {summary.primary_timeframe}
               {summary.htf_timeframe === null ? "" : ` · ${summary.htf_timeframe}`}

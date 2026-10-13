@@ -583,13 +583,15 @@ describe("the session identity and the certificate (#333, #334, #304)", () => {
   const SESSION = "c2d2d8b7-5a28-4830-8605-0d3092485434";
   const VERSION = "9c65223b-1f4c-4c17-9c2e-8e1c5d6a7b01";
 
-  it("shows the session id, the full id as its title, and the version named separately (#333)", async () => {
+  it("shows the session id and the separately-named version, both short with the full id on the title (#333)", async () => {
     renderDetail({ id: SESSION, strategy_version_id: VERSION });
     expect(await screen.findByText("c2d2d8b7")).toBeTruthy();
     const head = document.querySelector(".drawer-head") as HTMLElement;
     const name = within(head).getByText("c2d2d8b7");
     expect(name.getAttribute("title")).toBe(SESSION);
-    expect(within(head).getByText(/^version 9c65223b\b/)).toBeTruthy();
+    // The version is named separately, and its full id is on the title too.
+    const version = within(head).getByText("9c65223b");
+    expect(version.getAttribute("title")).toBe(VERSION);
   });
 
   it("shows both the fixture and the certified badge on a certified fixture (#334)", async () => {
