@@ -747,15 +747,26 @@ export default function BacktestLabScreen() {
   // the Lab selects that run's version and opens the run. A READ, like the Runs
   // rows: nothing on this path starts a run. Consumed on mount (the navigation
   // mounts this screen) and on the next hash change (the screen was already
-  // open). The read is shared with the fold labels' cache, so the run the
-  // fragment names costs one `getWalkForwardRun` across both consumers.
+  // open), and replaced with the plain `#/backtest` BEFORE the read so a
+  // remount (a reconnect) cannot replay it over the remembered selection
+  // (#315). A read a later link supersedes never applies its result. The read
+  // is shared with the fold labels' cache, so the run the fragment names costs
+  // one `getWalkForwardRun` across both consumers.
+  /** The deep-link read's generation: each read bumps it, and only the current
+   * one may apply a result. */
+  const deepLinkGeneration = useRef(0);
+
   useEffect(() => {
     const take = () => {
       const link = backtestDeepLink(window.location.hash);
       if (link === null) return;
+      // Consume the fragment before the async read (see the comment above).
+      window.history.replaceState(null, "", "#/backtest");
+      const generation = ++deepLinkGeneration.current;
       void (async () => {
         try {
           const result = await readWalkForwardRunOnce(link.wf);
+          if (generation !== deepLinkGeneration.current) return;
           if (result.status !== "ok") {
             setOpenByIdError(result.error);
             return;
@@ -764,6 +775,7 @@ export default function BacktestLabScreen() {
           selectVersion(result.data.versionId);
           setRequestedWf(result.data.walkForwardRunId);
         } catch {
+          if (generation !== deepLinkGeneration.current) return;
           setOpenByIdError(readFailure());
         }
       })();

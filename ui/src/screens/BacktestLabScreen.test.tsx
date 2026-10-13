@@ -3027,4 +3027,28 @@ describe("BacktestLabScreen (#269 — the certification deep link)", () => {
     await screen.findByText("wf-6c1d9f38");
     expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
   });
+
+  it("consumes the fragment once, so a remount never replays the link (#269, #315)", async () => {
+    window.location.hash = "#/backtest?wf=wf-6c1d9f38";
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-second" },
+    });
+
+    const first = render(<BacktestLabScreen />);
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    // The fragment is consumed as soon as it is taken…
+    expect(window.location.hash).toBe("#/backtest");
+
+    // …so the screen coming back (a reconnect remounts it) neither reads the
+    // run again nor re-opens it from a replayed link.
+    first.unmount();
+    render(<BacktestLabScreen />);
+    await screen.findByRole("region", { name: /version runs/i });
+    await act(async () => {});
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+  });
 });
