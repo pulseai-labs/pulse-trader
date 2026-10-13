@@ -1771,6 +1771,67 @@ describe("BacktestLabScreen (#315 — a reconnect keeps the selection and its re
     // outlived the screen, and the restored selection addresses it again.
     expect(screen.getByText("run-beta-001")).toBeTruthy();
   });
+
+  it("applies nothing from an unmounted Lab: a pending read cannot select or start a run later (#269/#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    // The stale read's version has a parent to compare with; the refusal is the
+    // compare read's own answer — this test is about the read not applying.
+    compareMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no parent run for run-late-0001",
+        run_id: null,
+        session_id: null,
+        child_run_id: "run-late-0001",
+      },
+    });
+    // The backtest read is held open, settled by hand after the unmount.
+    const pending = new Map<
+      string,
+      (answer: { status: "ok"; data: BacktestRunDto }) => void
+    >();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    getRunMock.mockImplementation(
+      (request) =>
+        new Promise((resolve) => {
+          pending.set(request.runId, resolve);
+        }),
+    );
+
+    render(<GatedLab />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "run-late-0001" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-late-0001")).toBe(true);
+
+    // The server drops: the gate takes the screen down while the read is out.
+    fireEvent.click(screen.getByRole("button", { name: /take the server down/i }));
+    expect(screen.queryByLabelText(/open run by id/i)).toBeNull();
+
+    // The read lands with the Lab gone: nothing of it may survive.
+    await act(async () => {
+      pending.get("run-late-0001")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-late-0001", strategyVersionId: "ver-second" },
+      });
+    });
+
+    // Back up: the remembered selection is untouched — the default version, not
+    // the read's — and the run the read carried was never started.
+    fireEvent.click(screen.getByRole("button", { name: /bring the server back/i }));
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    await waitFor(() => {
+      expect(box.value).toContain("ver-own-");
+    });
+    expect(screen.queryByText("run-late-0001")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2890,6 +2951,78 @@ describe("BacktestLabScreen (#316 — any persisted walk-forward run opens)", ()
       });
     });
     expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    expect(screen.queryByText("run-first-01")).toBeNull();
+  });
+
+  it("keeps a listed run when an abandoned open-by-id read lands later (#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    // The abandoned read's version has a parent to compare with; the refusal is
+    // the compare read's own answer — this test is about which run shows.
+    compareMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no parent run for run-first-01",
+        run_id: null,
+        session_id: null,
+        child_run_id: "run-first-01",
+      },
+    });
+    // Every backtest read is held open, settled by hand in the order the test
+    // chooses: the abandoned id's answer is the last one in.
+    const pending = new Map<
+      string,
+      (answer: { status: "ok"; data: BacktestRunDto }) => void
+    >();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    getRunMock.mockImplementation(
+      (request) =>
+        new Promise((resolve) => {
+          pending.set(request.runId, resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+    const runs = await screen.findByRole("region", { name: /version runs/i });
+
+    // The trader submits an id it never comes back to…
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "run-first-01" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-first-01")).toBe(true);
+
+    // …then opens a listed run instead: it answers, and it lands.
+    fireEvent.click(within(runs).getByRole("button", { name: /open run ownrun-0/i }));
+    expect(pending.has("ownrun-0001")).toBe(true);
+    await act(async () => {
+      pending.get("ownrun-0001")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "ownrun-0001", strategyVersionId: "ver-own-1" },
+      });
+    });
+    expect(
+      within(await screen.findByRole("region", { name: /run provenance/i })).getByText(
+        "ownrun-0001",
+      ),
+    ).toBeTruthy();
+
+    // The abandoned id lands LAST: superseded, it applies nothing — the listed
+    // run stays, on the version the trader was looking at.
+    await act(async () => {
+      pending.get("run-first-01")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-first-01", strategyVersionId: "ver-second" },
+      });
+    });
+    expect(
+      within(screen.getByRole("region", { name: /run provenance/i })).getByText("ownrun-0001"),
+    ).toBeTruthy();
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-own-");
     expect(screen.queryByText("run-first-01")).toBeNull();
   });
 });

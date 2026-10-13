@@ -784,7 +784,13 @@ export default function BacktestLabScreen() {
     };
     take();
     window.addEventListener("hashchange", take);
-    return () => window.removeEventListener("hashchange", take);
+    return () => {
+      window.removeEventListener("hashchange", take);
+      // Unmount supersedes every selection read still in flight (the deep
+      // link's, openById's): nothing from an unmounted Lab may select or start
+      // a run.
+      supersedeSelectionReads();
+    };
   }, []);
 
   // C2 (r2.s1.w4): versions and runs written by `pulse mcp` surface on window
@@ -833,6 +839,15 @@ export default function BacktestLabScreen() {
       ? paneStateOf({ kind: "idle" }, reopened)
       : paneStateOf(wf.state, reopened);
 
+  /** An explicit action that changes what the Lab shows — a pick, an accept, a
+   * run opened from the Runs list or the fold table — supersedes every
+   * selection read still in flight (#269/#316/#331): their captured generation
+   * goes stale, so their answers cannot move the screen off what the trader
+   * chose. */
+  function supersedeSelectionReads() {
+    selectionGeneration.current += 1;
+  }
+
   /** Selecting a version shows THAT version's operation. Nothing is cleared and
    * nothing is cancelled: each version's record is its own, so a run still going
    * for the previous selection stays going, and coming back to it shows it. The
@@ -844,10 +859,8 @@ export default function BacktestLabScreen() {
    * whether the id is real: `loadCatalog`'s reconcile drops one it no longer
    * carries, and the next remount re-reconciles against whatever it carries then. */
   function selectVersion(id: string) {
-    // An explicit selection supersedes every read still in flight (the deep
-    // link's, openById's): their captured generation goes stale here, so their
-    // answers never move the picker off what the trader chose.
-    selectionGeneration.current += 1;
+    // A pick supersedes every selection read still in flight (see above).
+    supersedeSelectionReads();
     rememberBacktestSelection(id);
     setSelectedId(id);
     // An explicitly requested run belongs to the version selected when it was
@@ -866,6 +879,9 @@ export default function BacktestLabScreen() {
    * catalog actually contains.
    */
   async function onSelectChild(versionId: string) {
+    // The accept's child select is an explicit action: it supersedes every
+    // selection read still in flight before the catalog refetch it awaits.
+    supersedeSelectionReads();
     const known = await loadCatalog();
     if (known.has(versionId)) {
       selectVersion(versionId);
@@ -1113,8 +1129,14 @@ export default function BacktestLabScreen() {
             version={selectedVersion}
             busy={busy}
             folds={pane.kind === "done" ? foldMapOf(pane.dto) : NO_FOLDS}
-            onOpenRun={wf.openRun}
-            onOpenWalkForward={(walkForwardRunId) => setRequestedWf(walkForwardRunId)}
+            onOpenRun={(runId) => {
+              supersedeSelectionReads();
+              wf.openRun(runId);
+            }}
+            onOpenWalkForward={(walkForwardRunId) => {
+              supersedeSelectionReads();
+              setRequestedWf(walkForwardRunId);
+            }}
           />
           <div className="bt-open-id">
             <label className="bt-select-label" htmlFor="bt-open-run">
@@ -1169,7 +1191,10 @@ export default function BacktestLabScreen() {
           one read back by id. */}
       <WalkForwardPane
         state={pane}
-        onOpenFold={wf.openRun}
+        onOpenFold={(runId) => {
+          supersedeSelectionReads();
+          wf.openRun(runId);
+        }}
         onPromote={selectedVersion === null ? null : () => setPromoting(true)}
       />
 
