@@ -260,21 +260,30 @@
   white-space: nowrap;
   text-overflow: ellipsis;
   overflow: hidden;
+  /* #404 (F2): the width budget above pays for this line, so it keeps its own
+     height even if a future line grows. */
+  flex-shrink: 0;
   /* #404 (d37): no min-height reserve. The 30px came from the mock's TWO-line
      clamp; this line has been a single ellipsized one since the port, and the
      reserve starved the node's other lines. The node is now as tall as its
      lines need (LibraryScreen.tsx NODE_H / NODE_H_AGENT). */
 }
 .vnode-kpis {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
   font-size: var(--fs-11);
   color: var(--text-2);
+  /* #404 (d37, F2): ONE line, always. As a flex row the items wrapped — the
+     `R` unit and the trade count fell onto a second line, which pushed the
+     summary out of the node — so the row is one inline flow now: nowrap, and
+     an end ellipsis rather than a wrap when the width budget is ever tight. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
 }
 .vnode-kpis .bull { color: var(--bull-1); font-weight: var(--fw-semibold); }
 .vnode-kpis .bear { color: var(--bear-1); font-weight: var(--fw-semibold); }
-.kpi-sep { color: var(--text-4); }
+/* The row's own separation — it was the flex row's `gap`. */
+.kpi-sep { color: var(--text-4); margin-inline: 4px; }
 .cc-kpis .bull { color: var(--bull-1); font-weight: var(--fw-semibold); }
 .cc-kpis .bear { color: var(--bear-1); font-weight: var(--fw-semibold); }
 

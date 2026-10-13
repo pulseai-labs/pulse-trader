@@ -408,7 +408,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and hypothesis lines at their own height. jsdom performs no layout, so `LibraryScreen.test.tsx` grew
   a source-reading geometry guard: it reads the node's height constants, its line rules and the tokens
   they resolve through, and fails on the old 64px node (a plain node needs 105.15px) or on either line
-  losing its `flex-shrink: 0`.
+  losing its `flex-shrink: 0`. The node is also as WIDE as its widest line now: the first cut kept the
+  134px node, and in the Mac proof's face (SF Mono / Menlo, 0.6em ≈ 6.6px at 11px) a 33-character
+  `external_agent · <agent name>` label ellipsized to `external_agent…` and the KPI row wrapped its
+  `R` unit and trade count onto a second line, which pushed the summary out of the node — so `NODE_W`
+  is 256px (with its 24px column gap), the kpis row is one nowrap inline flow that ellipsizes at its
+  end instead of wrapping, the summary keeps its own height, and the tree's width maths stops at the
+  rightmost node's edge (a two-version tree needs no scrollbar; a deeper one scrolls horizontally).
+  The guard grew the width budget with it: at 0.6em per mono character — each rule's own font size
+  read, the undefined `--fs-10` inheriting honestly — the 33-character label and a worst-case KPI
+  string must fit the node's content box, and the kpis row may never wrap.
 
 - **The Library, Backtest Lab and Designer defects the r3/r4 walks filed (r4.s5.w3).** A version's
   runs are reachable and legible again. Backtest Lab grows a **Runs** block beside the picker: the

@@ -59,16 +59,22 @@ const DETAILS_PANE_ID = "details-pane";
 
 // Tree geometry (px) — proportions read from the design reference, authored
 // here rather than ported (`check-design-system.sh` forbids the port).
-const NODE_W = 134;
-// #404 (d37): a node is as tall as its own lines — head, provenance, the
-// summary and the kpis in the plain shape, plus the two clamped hypothesis
-// lines when the version carries one. The old single 64px node fit neither
-// shape: `.vnode-summary`'s 30px min-height held the box while the
-// overflow-hidden provenance and hypothesis lines collapsed to zero.
+// #404 (d37, F1/F2): the width is the node's widest line. Treated as a budget:
+// a 33-character `external_agent · <agent name>` label and the widest KPI row
+// the ring's formatters can hand a node, in the macOS mono face (0.6em ≈
+// 6.6px at these 11px lines — the Linux fallback is narrower, which is how a
+// green suite shipped a node whose KPI row wrapped on the Mac). 256px is 230px
+// of content box, ~5% above the label's 217.8px.
+const NODE_W = 256;
+// The node is as tall as its own lines: head, provenance, the summary and the
+// kpis in the plain shape, plus the two clamped hypothesis lines when the
+// version carries one. The old single 64px node fit neither shape.
 const NODE_H = 94;
 const NODE_H_AGENT = 128;
 const NODE_PAD = 8;
-const COL_W = 158;
+/** One column further right: the node plus the 24px the old 158px column left
+ * between two 134px nodes. */
+const COL_W = NODE_W + 24;
 /** Between stacked rows: what the old fixed 78px pitch left between two 64px
  * nodes, now measured from each row's own tallest node (#404). */
 const ROW_GAP = 14;
@@ -451,7 +457,11 @@ function VersionTree({
     }
     return {
       edges: edgeList,
-      width: (maxDepth + 1) * COL_W + NODE_W + NODE_PAD * 2,
+      // The rightmost node's own right edge plus the same NODE_PAD margin the
+      // first column gets. The old formula reserved a whole extra column on
+      // top; with the wider node that slack alone would have put a scrollbar
+      // under every two-version tree (#404 F1/F2).
+      width: maxDepth * COL_W + NODE_W + NODE_PAD * 2,
     };
   }, [layout, strategy.versions]);
 
