@@ -472,6 +472,10 @@
   padding: 4px var(--sp-2);
   cursor: pointer;
 }
+.btn-bear-sec-sm:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
 .btn-bear-solid-sm {
   font: inherit;
   font-size: var(--fs-12);

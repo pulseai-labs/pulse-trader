@@ -213,7 +213,8 @@ a:hover { color: var(--ai-2); }
   border: 1px solid var(--line-1);
   border-radius: 4px; padding: 4px 9px; cursor: pointer;
 }
-.btn-sec-sm:hover { background: var(--bg-overlay); color: var(--text-1); }
+.btn-sec-sm:hover:not(:disabled) { background: var(--bg-overlay); color: var(--text-1); }
+.btn-sec-sm:disabled { opacity: 0.4; cursor: default; }
 .ic-btn-sm {
   width: 22px; height: 22px;
   background: transparent;
