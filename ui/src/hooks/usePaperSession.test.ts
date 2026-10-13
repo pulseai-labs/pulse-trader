@@ -228,4 +228,34 @@ describe("usePaperSession", () => {
     expect(paperSessionMock.mock.calls.length).toBe(fetches);
     expect(result.current.lastSeq).toBeNull();
   });
+
+  it("runs the queued trailing refresh after a failed read, and clears the error on the next good one (#371)", async () => {
+    const { result } = renderHook(() => usePaperSession("s-1"));
+    await waitFor(() => expect(result.current.summary).not.toBeNull());
+    expect(paperSessionMock).toHaveBeenCalledTimes(1);
+
+    // Read 2 fails, and a frame arrives WHILE IT IS IN FLIGHT: the queued
+    // trailing refresh must still run — with the old guard the failure dropped
+    // it, so a stopped session needed a reload to recover.
+    let failRead2!: (reason: unknown) => void;
+    paperSessionMock.mockImplementationOnce(
+      // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+      // ES2022 (tsconfig.json), and the typecheck stage is part of the gate.
+      () =>
+        new Promise((_resolve, reject) => {
+          failRead2 = reject;
+        }),
+    );
+    push(frame(1, "fill"));
+    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(2));
+    push(frame(2, "stop"));
+    await act(async () => {
+      failRead2(new Error("the read failed"));
+    });
+
+    // The trailing read runs and is the one that recovers the view.
+    await waitFor(() => expect(paperSessionMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(result.current.error).toBeNull());
+    expect(result.current.summary).not.toBeNull();
+  });
 });

@@ -163,6 +163,9 @@ describe("the Settings server-connection section (r4.s3.w3)", () => {
     expect(stateChip().getAttribute("data-state")).toBe("disconnected");
     const note = screen.getByText(/This Mac no longer holds the token/);
     expect(note.textContent).toContain("pulse token revoke --label <label>");
+    // #386: with nothing left to forget, neither control stays offered.
+    expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(true);
     expect(statusMock).toHaveBeenCalled();
     // The pin: the last status that arrived is still `up`, and the screen does
     // not wait for — or take its state from — anything newer.
@@ -181,5 +184,37 @@ describe("the Settings server-connection section (r4.s3.w3)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back to the app" }));
     expect(screen.getByRole("heading", { name: "Server connection" })).toBeTruthy();
     expect(document.querySelector(".sidebar")).not.toBeNull();
+  });
+
+  it("disables both controls once the polled link is gone, and re-enables on a new connection (#386)", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<App />);
+      await act(async () => {});
+      // Mounted while the server answers: the app is open, Settings is up.
+      expect(screen.getByRole("heading", { name: "Server connection" })).toBeTruthy();
+      expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(false);
+
+      // The stored connection goes away: the POLLED status says so — no local
+      // Disconnect happened, and the buttons must still stop being offered.
+      statusMock.mockResolvedValue(okStatus({ state: "not_connected" }));
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(stateChip().getAttribute("data-state")).toBe("disconnected");
+      expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(true);
+
+      // A new connection re-enables both.
+      statusMock.mockResolvedValue(okStatus({ state: "up", binary_version: "0.1.0" }));
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(stateChip().getAttribute("data-state")).toBe("connected");
+      expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

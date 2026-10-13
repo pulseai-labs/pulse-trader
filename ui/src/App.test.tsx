@@ -9,7 +9,7 @@
 // deterministic, real (non-"none") DOM to assert against without depending on
 // a live Tauri IPC bridge, which does not exist under `jsdom`.
 
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./bindings", () => ({
@@ -54,6 +54,7 @@ import { GATE_AFTER_DROPPED_POLLS, RouteContent, gateDecision, rememberPoll } fr
 import type { GateMemory } from "./App";
 import { commands } from "./bindings";
 import type { BacktestRunDto, ServerStatus } from "./bindings";
+import { requestPaperCountRefresh } from "./paper/handoff";
 import type { Route } from "./routes";
 
 /** The poll cadence `useServerStatus` runs at (15 s), spelled out once here. */
@@ -600,5 +601,23 @@ describe("<App /> keeps an operation alive across navigation (#141)", () => {
       settle({ status: "ok", data: LANDED_RUN });
       await pending;
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r4.s5.w4 — the strip's count refresh after a promote
+// ---------------------------------------------------------------------------
+
+describe("<App /> — the title strip's paper count (#335)", () => {
+  it("runs the existing count read when a promote asks for a refresh (#335)", async () => {
+    render(<App />);
+    await waitFor(() => expect(commands.paperSessions).toHaveBeenCalledTimes(1));
+
+    // A successful promote asks the strip's count to run now (the sheet's own
+    // call); the request must run the EXISTING read — no second poll.
+    act(() => {
+      requestPaperCountRefresh();
+    });
+    await waitFor(() => expect(commands.paperSessions).toHaveBeenCalledTimes(2));
   });
 });

@@ -21,23 +21,16 @@ import { useEffect, useRef, useState } from "react";
 
 import { commands } from "../bindings";
 import type { PaperSessionSummary, PaperShadowCheck, PaperTrades } from "../bindings";
-import { CertBadge } from "../components/CertBadge";
-import { SessionBadge, sessionBadgeState } from "../components/SessionBadge";
+import { CertBadge, certKinds } from "../components/CertBadge";
+import { SessionBadge, sessionBadgeState, shortId } from "../components/SessionBadge";
 import { Figure } from "../format/Figure";
 import { price, qty, rMultiple, usdt } from "../format/numbers";
 import { timeUtc } from "../format/time";
 import { usePaperSession } from "../hooks/usePaperSession";
+import { useConnection } from "../shell/ConnectionContext";
 
 /** The em dash a null renders — a statement that no value exists. */
 const EM_DASH = "—";
-
-/** How the certificate row states a session's graduation. */
-function certKind(summary: PaperSessionSummary): "certified" | "uncertified" | "fixture" | "stale" {
-  if (summary.certification_stale) return "stale";
-  if (summary.fixture) return "fixture";
-  if (summary.graduation.graduation === "override") return "uncertified";
-  return "certified";
-}
 
 export default function SessionDetail({
   sessionId,
@@ -47,6 +40,9 @@ export default function SessionDetail({
   onChanged?: () => void;
 }) {
   const view = usePaperSession(sessionId);
+  // The app's one status poll (r4.s5.w4, #338): the badge renders `last seen`
+  // from it while the server is not answering, never a live state.
+  const connection = useConnection();
   const [trades, setTrades] = useState<PaperTrades | null>(null);
   const [serverEngine, setServerEngine] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -109,15 +105,25 @@ export default function SessionDetail({
         <div className="dh-left">
           <span className="dc-pair-tag">{summary.pair}</span>
           <div className="dh-info">
-            <span className="dh-name mono">{summary.strategy_version_id}</span>
+            {/* The session's own id, short with the full id on hover (#333) —
+                the version id it used to show belongs to the version, below. */}
+            <span className="dh-name mono" title={summary.id}>
+              {shortId(summary.id)}
+            </span>
             <span className="dh-ver mono">
+              version {shortId(summary.strategy_version_id)}
+              {" · "}
               {summary.primary_timeframe}
               {summary.htf_timeframe === null ? "" : ` · ${summary.htf_timeframe}`}
               {summary.uses_d1 ? " · D1" : ""}
             </span>
           </div>
         </div>
-        <SessionBadge state={sessionBadgeState(summary)} />
+        <SessionBadge
+          state={sessionBadgeState(summary)}
+          live={connection.status.state === "up"}
+          lastSeenAt={connection.lastGoodAt}
+        />
       </header>
 
       {/* The stream's own state (spec §4): a refusal is terminal — the screen
@@ -138,7 +144,9 @@ export default function SessionDetail({
           <div className="dm-row">
             <span className="dm-k">certificate</span>
             <span className="dm-v">
-              <CertBadge kind={certKind(summary)} reason={reason} />
+              {certKinds(summary).map((kind) => (
+                <CertBadge key={kind} kind={kind} reason={kind === "uncertified" ? reason : null} />
+              ))}
               {certifyingRun !== null && (
                 <>
                   <span className="mono">{certifyingRun}</span>
@@ -147,6 +155,26 @@ export default function SessionDetail({
               )}
             </span>
           </div>
+          {/* #304: the snapshots the certification recorded, named here as the
+              promote sheet names the version's — every data version in the
+              certification's own fold order. */}
+          {summary.graduation.graduation === "certified" &&
+            summary.graduation.data_versions.length > 0 && (
+              <div className="dm-row">
+                <span className="dm-k">certified on</span>
+                <span className="dm-v ps-snaps">
+                  {summary.graduation.data_versions.map((version) => (
+                    <span
+                      key={`${version.timeframe}-${version.data_version}`}
+                      className="ps-snap mono"
+                      title={version.timeframe}
+                    >
+                      {version.data_version}
+                    </span>
+                  ))}
+                </span>
+              </div>
+            )}
           {reason !== null && (
             <div className="dm-reason">
               <span>Override reason</span>“<b>{reason}</b>”
@@ -434,11 +462,24 @@ export default function SessionDetail({
                       <tr key={`${entry.kind}-${entry.at}-${index}`}>
                         <td className="mono">{entry.kind}</td>
                         <td className="mono">
-                          <Figure exact={entry.kind === "fill" ? entry.fill_time : entry.at}>
-                            {timeUtc(entry.kind === "fill" ? entry.fill_time : entry.at)}
-                          </Figure>
+                          {/* #382: an order states when it was PLACED; a fill
+                              states the BAR it belongs to — so an order placed
+                              after its bar's open never reads as filled before
+                              ordered. */}
+                          {entry.kind === "fill" ? (
+                            <Figure exact={entry.fill_time}>{`bar ${timeUtc(entry.fill_time)}`}</Figure>
+                          ) : (
+                            <Figure exact={entry.at}>{`placed ${timeUtc(entry.at)}`}</Figure>
+                          )}
                         </td>
-                        <td className="mono">{entry.side}</td>
+                        <td className="mono">
+                          {/* #382: an exit fill closes the position its side
+                              names, so it reads `close long`/`close short`; an
+                              entry fill keeps its own side. */}
+                          {entry.kind === "fill" && entry.exit_reason !== null
+                            ? `close ${entry.side}`
+                            : entry.side}
+                        </td>
                         <td className="mono">
                           <Figure exact={entry.qty}>{qty(entry.qty)}</Figure>
                         </td>

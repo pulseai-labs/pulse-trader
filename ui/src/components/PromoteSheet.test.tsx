@@ -6,7 +6,7 @@
 // `server_status`), the version's own pair/timeframes come from its newest
 // recorded run (`get_backtest_run`), and the server's 422 stays the backstop.
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const getWalkForwardRunMock = vi.fn();
@@ -30,6 +30,7 @@ import type {
   LibraryVersion,
   WalkForwardRunDto,
 } from "../bindings";
+import { subscribePaperCountRefresh } from "../paper/handoff";
 import { PromoteSheet } from "./PromoteSheet";
 
 // ---------------------------------------------------------------------------
@@ -400,3 +401,86 @@ function summaryFixture() {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// r4.s5.w4 — the in-progress promote and the strip's count refresh
+// ---------------------------------------------------------------------------
+
+describe("the promote in progress (#336)", () => {
+  it("reads Promoting…, is disabled, and cannot be submitted twice (#336)", async () => {
+    getWalkForwardRunMock.mockResolvedValue(ok(walkForward(true, SERVER_ENGINE)));
+    let settlePromote!: (value: unknown) => void;
+    paperPromoteMock.mockImplementation(
+      // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+      // ES2022 (tsconfig.json), and the typecheck stage is part of the gate.
+      () =>
+        new Promise((resolve) => {
+          settlePromote = resolve;
+        }),
+    );
+    sheet();
+    expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /^promote$/i }));
+    const running = screen.getByRole("button", { name: "Promoting…" }) as HTMLButtonElement;
+    expect(running.disabled).toBe(true);
+
+    // A second submit cannot send the request again — the repeat click, and
+    // the Enter-key path that activates the same focused button.
+    fireEvent.click(running);
+    fireEvent.keyDown(running, { key: "Enter" });
+    fireEvent.click(running);
+    expect(paperPromoteMock).toHaveBeenCalledTimes(1);
+
+    // A failure re-enables it with the server's own message.
+    await act(async () => {
+      settlePromote({
+        status: "error",
+        error: busError("data", "the promote failed on the server"),
+      });
+    });
+    const again = (await screen.findByRole("button", { name: /^promote$/i })) as HTMLButtonElement;
+    expect(again.disabled).toBe(false);
+    expect(screen.getByRole("alert").textContent).toContain("the promote failed on the server");
+  });
+});
+
+describe("the title strip's count refresh (#335)", () => {
+  it("asks the strip's existing count poll to refresh after a successful promote (#335)", async () => {
+    getWalkForwardRunMock.mockResolvedValue(ok(walkForward(true, SERVER_ENGINE)));
+    const refreshed = vi.fn();
+    const unsubscribe = subscribePaperCountRefresh(refreshed);
+    try {
+      sheet();
+      expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+      expect(refreshed).not.toHaveBeenCalled();
+
+      paperPromoteMock.mockResolvedValue(ok(summaryFixture()));
+      fireEvent.click(screen.getByRole("button", { name: /^promote$/i }));
+      await waitFor(() => expect(refreshed).toHaveBeenCalledTimes(1));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("leaves the count alone when the promote is refused (#335)", async () => {
+    getWalkForwardRunMock.mockResolvedValue(ok(walkForward(true, SERVER_ENGINE)));
+    const refreshed = vi.fn();
+    const unsubscribe = subscribePaperCountRefresh(refreshed);
+    try {
+      sheet();
+      expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+
+      paperPromoteMock.mockResolvedValue({
+        status: "error",
+        error: busError("certified_under_other_engine", "certified under engine engine-old"),
+      });
+      fireEvent.click(screen.getByRole("button", { name: /^promote$/i }));
+      // The sheet re-renders as stale; the strip's count did not move.
+      expect(await screen.findByText("There is no override")).toBeTruthy();
+      expect(refreshed).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+});

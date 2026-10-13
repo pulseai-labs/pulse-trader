@@ -47,7 +47,11 @@ a:hover { color: var(--ai-2); }
 .title-app { font-size: 13px; font-weight: 600; color: var(--text-1); }
 .title-sep { color: var(--text-4); }
 .title-doc { font-size: 13px; color: var(--text-2); }
-.title-status { display: flex; align-items: center; gap: 6px; flex: 1; justify-content: center; }
+.title-status { display: flex; align-items: center; gap: 6px; flex: 1; justify-content: center; min-width: 0; white-space: nowrap; }
+/* r4.s5.w4 (#319): the strip's words stay on ONE line — a narrow title block
+   truncates the text with an ellipsis instead of wrapping `server up · 0.1.2`
+   onto two lines, and the full words ride the element's `title`. */
+.title-status .ts-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* r4.s2.w3 (C5): the QA badge — the status strip's one warning-shaped pill,
    rendered only when the connected server reports `role: "qa"`. QA's database
    is a copy of prod's, so this is the "you are not looking at prod" marker;

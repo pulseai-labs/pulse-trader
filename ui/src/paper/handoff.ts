@@ -35,3 +35,30 @@ export function takeRequestedSession(): string | null {
   requestedSession = null;
   return sessionId;
 }
+
+/** The title strip's paper-count poll (App) subscribes here (r4.s5.w4, #335). */
+type PaperCountListener = () => void;
+
+const paperCountListeners = new Set<PaperCountListener>();
+
+/**
+ * Subscribe the title strip's existing count poll to promote-succeeded
+ * requests (#335). Returns the unsubscribe.
+ */
+export function subscribePaperCountRefresh(listener: PaperCountListener): () => void {
+  paperCountListeners.add(listener);
+  return () => {
+    paperCountListeners.delete(listener);
+  };
+}
+
+/**
+ * Ask the title strip's count to run its existing read NOW (#335): a promote
+ * that succeeded changes the count before the 15 s tick would, and this is a
+ * request to the one poll App already runs — never a second poll.
+ */
+export function requestPaperCountRefresh(): void {
+  for (const listener of paperCountListeners) {
+    listener();
+  }
+}

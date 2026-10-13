@@ -35,7 +35,9 @@ import type {
   PaperShadowCheck,
   PaperStreamEvent,
   PaperTrades,
+  ServerStatus,
 } from "../bindings";
+import { ConnectionProvider } from "../shell/ConnectionContext";
 import SessionDetail from "./SessionDetail";
 
 // ---------------------------------------------------------------------------
@@ -207,9 +209,34 @@ beforeEach(() => {
   );
 });
 
-function renderDetail(over: Partial<PaperSessionSummary> = {}) {
+/** The `up` status the rendered cases seed by default. */
+function upStatus(): ServerStatus {
+  return {
+    state: "up",
+    binary_version: "0.3.0",
+    engine_fingerprint: ENGINE,
+    reason: null,
+    role: null,
+  };
+}
+
+function renderDetail(
+  over: Partial<PaperSessionSummary> = {},
+  connection: { status?: ServerStatus; lastGoodAt?: number | null } = {},
+) {
   paperSessionMock.mockResolvedValue(ok(summary(over)));
-  return render(<SessionDetail sessionId="s-1" />);
+  return render(
+    <ConnectionProvider
+      value={{
+        status: connection.status ?? upStatus(),
+        refresh: () => {},
+        openConnect: () => {},
+        lastGoodAt: connection.lastGoodAt ?? null,
+      }}
+    >
+      <SessionDetail sessionId="s-1" />
+    </ConnectionProvider>,
+  );
 }
 
 /** The figure helper (r4.s5.w1): the A2 display text plus the server's own
@@ -486,7 +513,8 @@ describe("the money view", () => {
     // The price and the event instant, A2-formatted, the server's own text on
     // each element.
     expectFigure(section, "64,000.00", "64000");
-    expectFigure(section, "2026-10-01 01:00 UTC", "2026-10-01T01:00:00.000Z");
+    // #382: a fill's row states the bar it belongs to, not the raw instant.
+    expectFigure(section, "bar 2026-10-01 01:00 UTC", "2026-10-01T01:00:00.000Z");
   });
 
   it("renders each closed trade's R, USDT and fees, the dash for a null USDT", async () => {
@@ -507,5 +535,127 @@ describe("the money view", () => {
     renderDetail(moneySummary());
     const row = (await screen.findByText("last bar")).closest(".dm-row") as HTMLElement;
     expectFigure(row, "2025-02-01 00:15 UTC", "1738368900000");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r4.s5.w4 — the status read, the identity, the certificate and the fills
+// ---------------------------------------------------------------------------
+
+describe("the session badge and the server status (#338, #337)", () => {
+  it("renders last seen while the server is down, never a live badge (#338)", async () => {
+    renderDetail(
+      {},
+      {
+        status: { ...upStatus(), state: "down", binary_version: null },
+        lastGoodAt: Date.UTC(2026, 9, 13, 18, 15, 45),
+      },
+    );
+
+    const badge = await screen.findByText(/^last seen active/);
+    expect(badge.textContent).toBe("last seen active · 2026-10-13 18:15 UTC");
+    expect(badge.className).toContain("is-stale");
+    // Never painted as live: no `st-*` state class, and no pulsing dot.
+    expect(document.querySelector(".dep-status.st-active")).toBeNull();
+    expect(document.querySelector(".dep-status-dot.pulse")).toBeNull();
+  });
+
+  it("drops the time clause when no poll has answered up yet (#338)", async () => {
+    renderDetail(
+      {},
+      {
+        status: { ...upStatus(), state: "down", binary_version: null },
+        lastGoodAt: null,
+      },
+    );
+    expect((await screen.findByText(/^last seen active/)).textContent).toBe("last seen active");
+  });
+
+  it("reads active from promotion, never starting (#337)", async () => {
+    renderDetail({ last_bar_open_time: null });
+    expect(await screen.findByText("active")).toBeTruthy();
+    const head = document.querySelector(".drawer-head") as HTMLElement;
+    expect(within(head).queryByText("starting")).toBeNull();
+  });
+});
+
+describe("the session identity and the certificate (#333, #334, #304)", () => {
+  const SESSION = "c2d2d8b7-5a28-4830-8605-0d3092485434";
+  const VERSION = "9c65223b-1f4c-4c17-9c2e-8e1c5d6a7b01";
+
+  it("shows the session id, the full id as its title, and the version named separately (#333)", async () => {
+    renderDetail({ id: SESSION, strategy_version_id: VERSION });
+    expect(await screen.findByText("c2d2d8b7")).toBeTruthy();
+    const head = document.querySelector(".drawer-head") as HTMLElement;
+    const name = within(head).getByText("c2d2d8b7");
+    expect(name.getAttribute("title")).toBe(SESSION);
+    expect(within(head).getByText(/^version 9c65223b\b/)).toBeTruthy();
+  });
+
+  it("shows both the fixture and the certified badge on a certified fixture (#334)", async () => {
+    renderDetail({ fixture: true });
+    expect(await screen.findByText("fixture")).toBeTruthy();
+    expect(screen.getByText("certified")).toBeTruthy();
+  });
+
+  it("names the certifying run and every certified snapshot (#304)", async () => {
+    renderDetail({
+      graduation: {
+        graduation: "certified",
+        walk_forward_run_id: "wf-074ad8e2",
+        data_versions: [
+          { timeframe: "15m", data_version: "0a2c929a27848083" },
+          { timeframe: "4h", data_version: "76f15836cc357256" },
+        ],
+      },
+    });
+    expect(await screen.findByText("wf-074ad8e2")).toBeTruthy();
+    expect(screen.getByText("0a2c929a27848083")).toBeTruthy();
+    expect(screen.getByText("76f15836cc357256")).toBeTruthy();
+  });
+});
+
+describe("the orders and fills (#382)", () => {
+  it("reads an exit fill as closing the position, with bar and placed times apart (#382)", async () => {
+    paperSessionTradesMock.mockResolvedValue(
+      ok({
+        ...TRADES,
+        entries: [
+          { kind: "order", at: "2026-10-11T15:45:41.594Z", side: "long", qty: "0.02" },
+          {
+            kind: "fill",
+            at: "2026-10-11T15:30:41.594Z",
+            side: "long",
+            qty: "0.02",
+            price: "64000",
+            exit_reason: null,
+            fill_time: "2026-10-11T15:15:00.000Z",
+          },
+          {
+            kind: "fill",
+            at: "2026-10-11T15:45:41.594Z",
+            side: "long",
+            qty: "0.02",
+            price: "64400",
+            exit_reason: "take_profit",
+            fill_time: "2026-10-11T15:30:00.000Z",
+          },
+        ],
+      }),
+    );
+    renderDetail(moneySummary());
+    const section = (await screen.findByText("Orders and fills")).closest("section") as HTMLElement;
+
+    // The exit fill names the side it CLOSES; the entry fill keeps its own side.
+    const exitRow = within(section).getByText("bar 2026-10-11 15:30 UTC").closest("tr") as HTMLElement;
+    expect(exitRow.textContent).toContain("close long");
+    const entryRow = within(section).getByText("bar 2026-10-11 15:15 UTC").closest("tr") as HTMLElement;
+    expect(entryRow.textContent).toContain("long");
+    expect(entryRow.textContent).not.toContain("close");
+
+    // The order states when it was PLACED — 15:45, after the 15:30 bar its fill
+    // belongs to — so the sequence reads order → fill, never filled-before-ordered.
+    const orderRow = within(section).getByText("placed 2026-10-11 15:45 UTC").closest("tr") as HTMLElement;
+    expect(orderRow.textContent).toContain("order");
   });
 });
