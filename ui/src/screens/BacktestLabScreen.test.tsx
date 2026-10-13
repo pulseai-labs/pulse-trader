@@ -578,9 +578,11 @@ describe("BacktestLabScreen (fresh result render)", () => {
     expectFigure(band as HTMLElement, "10,000.00 USDT", "10000.00");
     expectFigure(band as HTMLElement, "2026-09-02 10:15 UTC", "2026-09-02T10:15:30.123Z");
     // r3.s1.w4 (#142): the recorded filters render their four values, formatted.
+    // lot_step is a quantity step, min_qty a quantity, max_leverage leverage —
+    // min_notional is the block's one MONEY amount, so it reads as USDT.
     expectFigure(band as HTMLElement, "0.001000", "0.001");
     expectFigure(band as HTMLElement, "0.005", "0.005");
-    expectFigure(band as HTMLElement, "100.0000", "100");
+    expectFigure(band as HTMLElement, "100.00 USDT", "100");
     expectFigure(band as HTMLElement, "20", "20");
     expect(text).toContain("lot_step");
     expect(text).toContain("min_qty");

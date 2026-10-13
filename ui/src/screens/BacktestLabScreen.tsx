@@ -1569,7 +1569,7 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
             <Figure exact={dto.symbolFilters.minQty}>{qty(dto.symbolFilters.minQty)}</Figure> ·
             min_notional{" "}
             <Figure exact={dto.symbolFilters.minNotional}>
-              {price(dto.symbolFilters.minNotional)}
+              {usdt(dto.symbolFilters.minNotional)}
             </Figure>{" "}
             · max_leverage{" "}
             <Figure exact={dto.symbolFilters.maxLeverage}>
