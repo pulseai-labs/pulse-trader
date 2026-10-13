@@ -21,6 +21,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { commands } from "../bindings";
 import type { BacktestRunDto, LibraryVersion, PromoteOverride, WalkForwardRunDto } from "../bindings";
+import { foldsHold } from "../format/numbers";
 import { openBacktestLab } from "../paper/handoff";
 import { CertBadge } from "./CertBadge";
 
@@ -287,7 +288,11 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
                   <span className="mono">{variant.run.walkForwardRunId}</span>, PASS under wf-v1
                 </b>
                 <span className="mono sh-box-sub">
-                  {variant.run.verdict.foldsHolding}/{variant.run.verdict.foldsRequired} folds hold
+                  {foldsHold(
+                    variant.run.verdict.foldsHolding,
+                    variant.run.k,
+                    variant.run.verdict.foldsRequired,
+                  )}
                 </span>
               </div>
             </div>

@@ -15,12 +15,15 @@
 // "navigate to the new session" lands here.
 
 import { useCallback, useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 import { commands } from "../bindings";
 import type { PaperSessionSummary, StopAllResult } from "../bindings";
 import { CertBadge } from "../components/CertBadge";
 import { SessionBadge, sessionBadgeState } from "../components/SessionBadge";
+import { Figure } from "../format/Figure";
+import { rMultiple } from "../format/numbers";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { takeRequestedSession } from "../paper/handoff";
 import SessionDetail from "./SessionDetail";
@@ -41,8 +44,9 @@ function liveShadow(summary: PaperSessionSummary) {
   return summary.shadow_checks.at(-1) ?? null;
 }
 
-/** The OOS mini-verdict a card shows. */
-function oosMini(summary: PaperSessionSummary): string {
+/** The OOS mini-verdict a card shows. The live mean R is A2-formatted through
+ * the module, with the server's own text on the element (r4.s5.w1). */
+function oosMini(summary: PaperSessionSummary): ReactNode {
   const comparison = summary.comparison;
   switch (comparison.status) {
     case "not_applicable":
@@ -50,11 +54,29 @@ function oosMini(summary: PaperSessionSummary): string {
     case "pending":
       return `OOS pending ${comparison.n}/${comparison.of}`;
     case "within":
-      return `OOS ${comparison.live_mean_r}R within`;
+      return (
+        <>
+          OOS{" "}
+          <Figure exact={comparison.live_mean_r}>{rMultiple(comparison.live_mean_r)}</Figure>{" "}
+          within
+        </>
+      );
     case "below":
-      return `OOS ${comparison.live_mean_r}R below`;
+      return (
+        <>
+          OOS{" "}
+          <Figure exact={comparison.live_mean_r}>{rMultiple(comparison.live_mean_r)}</Figure>{" "}
+          below
+        </>
+      );
     case "above":
-      return `OOS ${comparison.live_mean_r}R above`;
+      return (
+        <>
+          OOS{" "}
+          <Figure exact={comparison.live_mean_r}>{rMultiple(comparison.live_mean_r)}</Figure>{" "}
+          above
+        </>
+      );
   }
 }
 

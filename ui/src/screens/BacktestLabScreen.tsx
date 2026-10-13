@@ -4,14 +4,15 @@
 // (`commands.libraryOverview` — the Library's own read, no second catalog) and
 // presses Run: `commands.runBacktestVersion({ versionId })` executes W3's
 // fixed request/response command and this screen renders only the fresh
-// `BacktestRunDto` it returns. Every decimal and epoch value is the DTO's own
-// exact string — display truth is the string itself. The ONLY numeric
-// conversion in this file is `parseFloat` for chart geometry (pixel
-// positions), never for display, derivation or comparison; the screen does no
-// binning, no money math, no deltas, no re-backtest, and invents no value the
-// DTO does not carry. No sample option, no mock run, no progress percentage,
-// no cancel affordance — the command is request/response and r1's target is
-// <5s.
+// `BacktestRunDto` it returns. Every money, price, quantity, R, percent and
+// time value is formatted by `ui/src/format/` (r4.s5.w1, A2) and carries the
+// DTO's own exact string on the element (`title`/`data-exact`) — display truth
+// is still the string itself, one hover away. The ONLY numeric conversions in
+// this file are the `// chart geometry` ones (pixel positions and bar widths),
+// never for display, derivation or comparison; the screen does no binning, no
+// money math, no deltas, no re-backtest, and invents no value the DTO does not
+// carry. No sample option, no mock run, no progress percentage, no cancel
+// affordance — the command is request/response and r1's target is <5s.
 //
 // Convention (UnbuiltScreen.tsx is the worked example): one file per screen,
 // default export, zero props — the shell mounts it from the route table and
@@ -48,6 +49,17 @@ import type {
   OperationRecord,
 } from "../hooks/useActiveOperations";
 import { PromoteSheet } from "../components/PromoteSheet";
+import { Figure } from "../format/Figure";
+import {
+  decimal,
+  foldsHold,
+  percentFromFraction,
+  price,
+  qty,
+  rMultiple,
+  usdt,
+} from "../format/numbers";
+import { dateRange, timeUtc } from "../format/time";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { openSessionDetail, takeRequestedBacktestVersion } from "../paper/handoff";
 
@@ -59,7 +71,14 @@ const EM_DASH = "—";
  * number ONLY to place a pixel. Never displayed, never compared, never
  * re-formatted. */
 function num(value: string): number {
-  return Number.parseFloat(value);
+  return Number.parseFloat(value); // chart geometry
+}
+
+/** A `number` DTO field (Sharpe, a fold bound — the wire refuses them as text)
+ * as the exact decimal text the module reads. Serialization, never
+ * arithmetic. */
+function asText(value: number | null): string | null {
+  return value === null ? null : String(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +187,10 @@ const K_MAX = 12;
  * field keeps today's meaning — "use the backend default" (the input's own
  * contract, and what the pre-#212 behaviour already did) — an exact integer in
  * `[K_MIN, K_MAX]` goes through as `k`, and ANYTHING else is refused without
- * starting an operation. [`Number.parseInt`] is deliberately not used alone:
- * it silently truncates (`"6.9"` → `6`) and accepts prefixes (`"12x"` → `12`),
- * and both would start a walk the trader did not ask for.
+ * starting an operation. The `/^\d+$/` guard above is what makes the parse
+ * exact: it refuses the truncation (`"6.9"`) and the prefix (`"12x"`) that
+ * `Number.parseInt` alone would silently accept, so the integer read here is
+ * the whole input and never a prefix of it.
  */
 export function parseFoldCount(
   raw: string,
@@ -183,7 +203,7 @@ export function parseFoldCount(
   if (!/^\d+$/.test(text)) {
     return { kind: "refused", message };
   }
-  const k = Number(text);
+  const k = Number.parseInt(text, 10);
   if (!Number.isSafeInteger(k) || k < K_MIN || k > K_MAX) {
     return { kind: "refused", message };
   }
@@ -1089,7 +1109,9 @@ function WalkForwardResult({
         <Field label="rule">{dto.rule}</Field>
         <Field label="folds">{dto.k}</Field>
         <Field label="span">
-          {dto.spanFrom} → {dto.spanTo}
+          <Figure exact={`${dto.spanFrom} → ${dto.spanTo}`}>
+            {dateRange(dto.spanFrom, dto.spanTo)}
+          </Figure>
         </Field>
         {/* `from_defaulted` is stated either way — an explicit bound and a
             defaulted one are different provenance, both worth seeing. */}
@@ -1101,11 +1123,13 @@ function WalkForwardResult({
       </div>
       <p className={`bt-wf-verdict ${verdict.pass ? "bt-wf-pass" : "bt-wf-fail"}`}>
         <span className="bt-wf-verdict-word">{verdict.pass ? "PASS" : "FAIL"}</span>{" "}
+        <span className="mono">{foldsHold(verdict.foldsHolding, dto.k, verdict.foldsRequired)}</span>{" "}
+        · pooled lower bound{" "}
         <span className="mono">
-          {verdict.foldsHolding}/{verdict.foldsRequired}
-        </span>{" "}
-        folds hold · pooled lower bound{" "}
-        <span className="mono">{verdict.pooled.lowerBound ?? EM_DASH}</span>
+          <Figure exact={asText(verdict.pooled.lowerBound)}>
+            {decimal(asText(verdict.pooled.lowerBound), 2)}
+          </Figure>
+        </span>
         {/* r3.s4.w5: spec §2's second entry point — a passing verdict offers
             the promotion right here. The sheet decides the variant from the
             server; this button only opens it. */}
@@ -1134,16 +1158,30 @@ function WalkForwardResult({
             {dto.folds.map((fold) => (
               <tr key={fold.index}>
                 <td className="mono">{fold.index}</td>
-                <td className="mono">{fold.windowFrom}</td>
-                <td className="mono">{fold.windowTo}</td>
+                <td className="mono">
+                  <Figure exact={fold.windowFrom}>{timeUtc(fold.windowFrom)}</Figure>
+                </td>
+                <td className="mono">
+                  <Figure exact={fold.windowTo}>{timeUtc(fold.windowTo)}</Figure>
+                </td>
                 {/* The verdict's own count, not the fold run's (`fold.trades`):
                     this is the per-fold VERDICT table, and bindings document `n`
                     as "the trades the `wf-v1` verdict saw" (equal in production). */}
                 <td className="mono">{fold.n}</td>
-                <td className="mono">{fold.lowerBound ?? EM_DASH}</td>
+                <td className="mono">
+                  <Figure exact={asText(fold.lowerBound)}>
+                    {decimal(asText(fold.lowerBound), 2)}
+                  </Figure>
+                </td>
                 <td>{fold.holds ? "yes" : "no"}</td>
-                <td className="mono">{fold.expectancy}</td>
-                <td className="mono">{fold.winRate}</td>
+                <td className="mono">
+                  <Figure exact={fold.expectancy}>
+                    {usdt(fold.expectancy, { signed: true })}
+                  </Figure>
+                </td>
+                <td className="mono">
+                  <Figure exact={fold.winRate}>{percentFromFraction(fold.winRate)}</Figure>
+                </td>
                 <td>
                   <button
                     type="button"
@@ -1201,9 +1239,13 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
           timeframe is fixed (`1d`), so the version is the whole value. */}
       {dto.d1DataVersion != null && <Field label="d1">{dto.d1DataVersion}</Field>}
       <Field label="date range">
-        {dto.firstOpenTimeMs} → {dto.lastCloseTimeMs}
+        <Figure exact={`${dto.firstOpenTimeMs} → ${dto.lastCloseTimeMs}`}>
+          {dateRange(dto.firstOpenTimeMs, dto.lastCloseTimeMs)}
+        </Figure>
       </Field>
-      <Field label="starting equity">{dto.startingEquity}</Field>
+      <Field label="starting equity">
+        <Figure exact={dto.startingEquity}>{usdt(dto.startingEquity)}</Figure>
+      </Field>
       <Field label="taker fee">{dto.takerFeeBps} bps</Field>
       <Field label="slippage">{dto.slippageBps} bps</Field>
       <Field label="funding">{dto.funding}</Field>
@@ -1212,9 +1254,26 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
           reads loose (`!= null`) so a fixture or cached payload that predates
           the field degrades to "not recorded" instead of a TypeError. */}
       <Field label="filters">
-        {dto.symbolFilters != null
-          ? `lot_step ${dto.symbolFilters.lotStep} · min_qty ${dto.symbolFilters.minQty} · min_notional ${dto.symbolFilters.minNotional} · max_leverage ${dto.symbolFilters.maxLeverage}`
-          : "not recorded"}
+        {dto.symbolFilters != null ? (
+          <>
+            lot_step{" "}
+            <Figure exact={dto.symbolFilters.lotStep}>
+              {price(dto.symbolFilters.lotStep)}
+            </Figure>{" "}
+            · min_qty{" "}
+            <Figure exact={dto.symbolFilters.minQty}>{qty(dto.symbolFilters.minQty)}</Figure> ·
+            min_notional{" "}
+            <Figure exact={dto.symbolFilters.minNotional}>
+              {price(dto.symbolFilters.minNotional)}
+            </Figure>{" "}
+            · max_leverage{" "}
+            <Figure exact={dto.symbolFilters.maxLeverage}>
+              {qty(dto.symbolFilters.maxLeverage)}
+            </Figure>
+          </>
+        ) : (
+          "not recorded"
+        )}
       </Field>
       <Field label="engine">
         {dto.engineFingerprint} · {dto.engineTarget}
@@ -1223,7 +1282,9 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
       <Field label="run">{dto.runId}</Field>
       <Field label="version">{dto.strategyVersionId}</Field>
       <Field label="schema">{dto.schemaVersion}</Field>
-      <Field label="created">{dto.createdAt}</Field>
+      <Field label="created">
+        <Figure exact={dto.createdAt}>{timeUtc(dto.createdAt)}</Figure>
+      </Field>
       {/* The DTO's one control-metadata exception: the pre-save comparison's
           own warning, visibly flagged as such — present only when it exists. */}
       {dto.fingerprintWarning !== null && (
@@ -1251,30 +1312,60 @@ function Kpi({ label, children }: { label: string; children: React.ReactNode }) 
 function KpiTiles({ dto }: { dto: BacktestRunDto }) {
   return (
     <section className="bt-section bt-kpis" aria-label="Headline metrics">
-      {/* Exact strings; null renders an em dash. No deltas, no comparisons,
-          no derived percentages — the coach rail that compares runs is r1.s4. */}
-      <Kpi label="Net P&L">{dto.netPnl}</Kpi>
-      <Kpi label="Expectancy">{dto.expectancy}</Kpi>
-      <Kpi label="Win rate">{dto.winRate}</Kpi>
-      <Kpi label="Profit factor">{dto.profitFactor ?? EM_DASH}</Kpi>
+      {/* Every figure is A2-formatted over the DTO's own text, with that exact
+          text on the element; null renders an em dash. No deltas, no
+          comparisons, no derived percentages — the coach rail that compares
+          runs is r1.s4. */}
+      <Kpi label="Net P&L">
+        <Figure exact={dto.netPnl}>{usdt(dto.netPnl, { signed: true })}</Figure>
+      </Kpi>
+      <Kpi label="Expectancy">
+        <Figure exact={dto.expectancy}>{usdt(dto.expectancy, { signed: true })}</Figure>
+      </Kpi>
+      <Kpi label="Win rate">
+        <Figure exact={dto.winRate}>{percentFromFraction(dto.winRate)}</Figure>
+      </Kpi>
+      <Kpi label="Profit factor">
+        <Figure exact={dto.profitFactor}>{decimal(dto.profitFactor, 2)}</Figure>
+      </Kpi>
       <Kpi label="Trades">{dto.tradeCount}</Kpi>
       <Kpi label="Wins">{dto.winCount}</Kpi>
       <Kpi label="Losses">{dto.lossCount}</Kpi>
       <Kpi label="Max win streak">{dto.maxWinStreak}</Kpi>
       <Kpi label="Max loss streak">{dto.maxLossStreak}</Kpi>
-      <Kpi label="Max drawdown">{dto.maxDrawdown}</Kpi>
-      <Kpi label="Sharpe">{dto.sharpe ?? EM_DASH}</Kpi>
-      <Kpi label="Sortino">{dto.sortino ?? EM_DASH}</Kpi>
+      <Kpi label="Max drawdown">
+        <Figure exact={dto.maxDrawdown}>{usdt(dto.maxDrawdown)}</Figure>
+      </Kpi>
+      <Kpi label="Sharpe">
+        <Figure exact={asText(dto.sharpe)}>{decimal(asText(dto.sharpe), 2)}</Figure>
+      </Kpi>
+      <Kpi label="Sortino">
+        <Figure exact={asText(dto.sortino)}>{decimal(asText(dto.sortino), 2)}</Figure>
+      </Kpi>
       <Kpi label="Skipped sub-lot">{dto.skippedSubLot}</Kpi>
       <Kpi label="Skipped sub-notional">{dto.skippedSubNotional}</Kpi>
       <Kpi label="Skipped leverage-capped">{dto.skippedLeverageCapped}</Kpi>
-      <Kpi label="Fees">{dto.feesTotal}</Kpi>
-      <Kpi label="Funding">{dto.fundingTotal}</Kpi>
-      <Kpi label="Slippage">{dto.slippageTotal}</Kpi>
-      <Kpi label="Gross profit">{dto.grossProfit}</Kpi>
-      <Kpi label="Gross loss">{dto.grossLoss}</Kpi>
-      <Kpi label="Avg win">{dto.avgWin}</Kpi>
-      <Kpi label="Avg loss">{dto.avgLoss}</Kpi>
+      <Kpi label="Fees">
+        <Figure exact={dto.feesTotal}>{usdt(dto.feesTotal)}</Figure>
+      </Kpi>
+      <Kpi label="Funding">
+        <Figure exact={dto.fundingTotal}>{usdt(dto.fundingTotal, { signed: true })}</Figure>
+      </Kpi>
+      <Kpi label="Slippage">
+        <Figure exact={dto.slippageTotal}>{usdt(dto.slippageTotal)}</Figure>
+      </Kpi>
+      <Kpi label="Gross profit">
+        <Figure exact={dto.grossProfit}>{usdt(dto.grossProfit)}</Figure>
+      </Kpi>
+      <Kpi label="Gross loss">
+        <Figure exact={dto.grossLoss}>{usdt(dto.grossLoss)}</Figure>
+      </Kpi>
+      <Kpi label="Avg win">
+        <Figure exact={dto.avgWin}>{usdt(dto.avgWin)}</Figure>
+      </Kpi>
+      <Kpi label="Avg loss">
+        <Figure exact={dto.avgLoss}>{usdt(dto.avgLoss)}</Figure>
+      </Kpi>
     </section>
   );
 }
@@ -1419,7 +1510,9 @@ function RegimeBars({ cells }: { cells: RegimeCellDto[] }) {
                 />
               </span>
               <span className="bt-regime-count mono">{cell.tradeCount}</span>
-              <span className="bt-regime-pnl mono">{cell.netPnl}</span>
+              <span className="bt-regime-pnl mono">
+                <Figure exact={cell.netPnl}>{usdt(cell.netPnl)}</Figure>
+              </span>
             </div>
           );
         })}
@@ -1477,6 +1570,31 @@ function Histogram({ title, className, hist }: { title: string; className: strin
 // Trade table (all 18 fields, seq order, focusable scroll region)
 // ---------------------------------------------------------------------------
 
+/** The per-column formatter for the trade table: every money, price, quantity,
+ * R and time column, keyed by the DTO's own field name. A column absent here is
+ * a label (`direction`, `exitReason`, `source`, `regime`) and renders as
+ * delivered; the header stays the field name itself, so the table remains the
+ * DTO's own column list. */
+const TRADE_FORMATTERS: Partial<
+  Record<(typeof TRADE_FIELDS)[number], (text: string | null) => string>
+> = {
+  qty,
+  entryPrice: price,
+  exitPrice: price,
+  stopPrice: price,
+  entrySignalTime: timeUtc,
+  entryFillTime: timeUtc,
+  exitSignalTime: timeUtc,
+  exitFillTime: timeUtc,
+  feesTotal: (text) => usdt(text),
+  fundingTotal: (text) => usdt(text, { signed: true }),
+  slippageTotal: (text) => usdt(text),
+  realizedPnl: (text) => usdt(text, { signed: true }),
+  realizedR: rMultiple,
+  mfeR: rMultiple,
+  maeR: rMultiple,
+};
+
 function TradeTable({ trades }: { trades: TradeRowDto[] }) {
   return (
     <section className="bt-section bt-trades-section" aria-label="Trades">
@@ -1497,12 +1615,20 @@ function TradeTable({ trades }: { trades: TradeRowDto[] }) {
           <tbody>
             {trades.map((trade, i) => (
               <tr key={i}>
-                {TRADE_FIELDS.map((field) => (
-                  <td key={field} className="mono">
-                    {/* `stopPrice` is `string | null` — a pre-0011 row renders `—` (r2.s2.w2). */}
-                    {trade[field] ?? "—"}
-                  </td>
-                ))}
+                {TRADE_FIELDS.map((field) => {
+                  const format = TRADE_FORMATTERS[field];
+                  const exact = trade[field];
+                  return (
+                    <td key={field} className="mono">
+                      {format === undefined ? (
+                        /* `stopPrice` is `string | null` — a pre-0011 row renders `—` (r2.s2.w2). */
+                        (exact ?? "—")
+                      ) : (
+                        <Figure exact={exact}>{format(exact)}</Figure>
+                      )}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
@@ -1555,7 +1681,9 @@ function ChartTwins({ dto }: { dto: BacktestRunDto }) {
             <tr key={cell.regime} data-regime={cell.regime}>
               <td>{REGIME_LABELS[cell.regime] ?? cell.regime}</td>
               <td className="mono">{cell.tradeCount}</td>
-              <td className="mono">{cell.netPnl}</td>
+              <td className="mono">
+                <Figure exact={cell.netPnl}>{usdt(cell.netPnl)}</Figure>
+              </td>
             </tr>
           ))}
         </tbody>
@@ -1902,10 +2030,35 @@ const SUMMARY_ROWS: { key: keyof SummaryDto; label: string }[] = [
   { key: "sortino", label: "Sortino" },
 ];
 
-/** One summary cell, exactly as delivered — `null` is an em dash, never a zero. */
+/** The formatter for one summary row — the same A2 kinds the KPI tiles use, so
+ * the before/after table and the tiles cannot disagree. A key absent here is a
+ * count and renders as delivered. */
+const SUMMARY_FORMATTERS: Partial<
+  Record<keyof SummaryDto, (text: string | null) => string>
+> = {
+  expectancy: (text) => usdt(text, { signed: true }),
+  netPnl: (text) => usdt(text, { signed: true }),
+  winRate: percentFromFraction,
+  profitFactor: (text) => decimal(text, 2),
+  grossProfit: (text) => usdt(text),
+  grossLoss: (text) => usdt(text),
+  avgWin: (text) => usdt(text),
+  avgLoss: (text) => usdt(text),
+  maxDrawdown: (text) => usdt(text),
+  commissionTotal: (text) => usdt(text),
+  fundingTotal: (text) => usdt(text, { signed: true }),
+  sharpe: (text) => decimal(text, 2),
+  sortino: (text) => decimal(text, 2),
+};
+
+/** One summary cell: the A2 display text, with the DTO's own string on the
+ * element — `null` is an em dash, never a zero. */
 function cell(summary: SummaryDto, key: keyof SummaryDto) {
   const value = summary[key];
-  return value === null ? EM_DASH : String(value);
+  const exact = value === null ? null : String(value);
+  const format = SUMMARY_FORMATTERS[key];
+  if (format === undefined) return <>{exact ?? EM_DASH}</>;
+  return <Figure exact={exact}>{format(exact)}</Figure>;
 }
 
 /**

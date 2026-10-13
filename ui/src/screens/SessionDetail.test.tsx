@@ -212,6 +212,14 @@ function renderDetail(over: Partial<PaperSessionSummary> = {}) {
   return render(<SessionDetail sessionId="s-1" />);
 }
 
+/** The figure helper (r4.s5.w1): the A2 display text plus the server's own
+ * exact string on the same element (`title`/`data-exact`), asserted together. */
+function expectFigure(scope: Element, display: string, exact: string): void {
+  const element = within(scope as HTMLElement).getByText(display);
+  expect(element.getAttribute("data-exact")).toBe(exact);
+  expect(element.getAttribute("title")).toBe(exact);
+}
+
 // ---------------------------------------------------------------------------
 // The certificate and engine rows
 // ---------------------------------------------------------------------------
@@ -336,8 +344,11 @@ describe("the OOS panel", () => {
         },
       });
       expect(await screen.findByText(new RegExp(`Expectancy .* ${word} the OOS range`))).toBeTruthy();
-      expect(screen.getByText("0.18")).toBeTruthy();
-      expect(screen.getByText("0.51")).toBeTruthy();
+      // The verdict's R values are A2-formatted, the server's own text on each
+      // element (r4.s5.w1).
+      expectFigure(document.body, "+0.34 R", "0.34");
+      expectFigure(document.body, "+0.18 R", "0.18");
+      expectFigure(document.body, "+0.51 R", "0.51");
       unmount();
     }
   });
@@ -379,7 +390,7 @@ describe("the trade log", () => {
   it("renders the closed trades with their R", async () => {
     renderDetail();
     const log = await screen.findByRole("region", { name: /Trade log/ });
-    expect(within(log).getByText("0.61")).toBeTruthy();
+    expectFigure(log, "+0.61 R", "0.61");
     expect(within(log).getByText(/take_profit/)).toBeTruthy();
   });
 });
@@ -411,28 +422,31 @@ describe("the money view", () => {
   it("renders the running total and its counts from the server's own text", async () => {
     renderDetail(moneySummary());
     const total = (await screen.findByText("Running total")).closest("section") as HTMLElement;
-    within(total).getByText("12.5");
+    // A2-formatted figures, the server's own strings on the elements.
+    expectFigure(total, "+12.50 USDT", "12.5");
     within(total).getByText("1 of 2 trades");
-    within(total).getByText("1.61");
+    expectFigure(total, "+1.61 R", "1.61");
     within(total).getByText("2 of 2 trades");
-    within(total).getByText("3.25");
-    within(total).getByText("15.75");
+    expectFigure(total, "+3.25 USDT", "3.25");
+    expectFigure(total, "+15.75 USDT", "15.75");
     within(total).getByText(/carries no equity series/);
   });
 
   it("renders the marked open position with its stops and money fields", async () => {
     renderDetail(moneySummary());
     const section = (await screen.findByText("Open position")).closest("section") as HTMLElement;
-    within(section).getByText("0.5");
-    within(section).getByText("60050");
-    within(section).getByText("2026-10-04T00:44:59.999Z");
-    within(section).getByText("74.38");
-    within(section).getByText("0.14");
-    within(section).getByText("0.42");
-    within(section).getByText("0.1198");
-    within(section).getByText("59800");
-    within(section).getByText("59850");
-    within(section).getByText("60200");
+    expectFigure(section, "0.5", "0.5");
+    expectFigure(section, "60,050.00", "60050");
+    // The mark instant says UTC (r4.s5.w1's Dispatch-2 clarification), the
+    // server's RFC 3339 on the element.
+    expectFigure(section, "2026-10-04 00:44 UTC", "2026-10-04T00:44:59.999Z");
+    expectFigure(section, "+74.38 USDT", "74.38");
+    expectFigure(section, "+0.14 R", "0.14");
+    expectFigure(section, "+0.42 USDT", "0.42");
+    expectFigure(section, "0.12 USDT", "0.1198");
+    expectFigure(section, "59,800.00", "59800");
+    expectFigure(section, "59,850.00", "59850");
+    expectFigure(section, "60,200.00", "60200");
     expect(within(section).queryByText(/stops shown only while the session runs/)).toBeNull();
   });
 
@@ -469,22 +483,29 @@ describe("the money view", () => {
     expect(rows).toHaveLength(1 + TRADES.entries.length);
     expect(rows[1].textContent).toContain("take_profit");
     expect(rows[rows.length - 1].textContent).toContain("order");
-    within(section).getByText("64000");
+    // The price and the event instant, A2-formatted, the server's own text on
+    // each element.
+    expectFigure(section, "64,000.00", "64000");
+    expectFigure(section, "2026-10-01 01:00 UTC", "2026-10-01T01:00:00.000Z");
   });
 
   it("renders each closed trade's R, USDT and fees, the dash for a null USDT", async () => {
     renderDetail(moneySummary());
     const log = await screen.findByRole("region", { name: /Trade log/ });
-    within(log).getByText("6.42");
-    within(log).getByText("-0.13");
-    within(log).getByText("0.06");
-    const short = within(log).getByText("62000").closest("tr") as HTMLElement;
+    expectFigure(log, "+6.42", "6.42");
+    expectFigure(log, "−0.13 USDT", "-0.13");
+    expectFigure(log, "0.06 USDT", "0.06");
+    // The closed row's entry and exit instants say UTC.
+    expectFigure(log, "2026-10-01 00:00 UTC", "2026-10-01T00:00:00.000Z");
+    expectFigure(log, "2026-10-01 01:00 UTC", "2026-10-01T01:00:00.000Z");
+    const short = within(log).getByText("62,000.00").closest("tr") as HTMLElement;
     expect(short.textContent).toContain("—");
-    expect(short.textContent).toContain("0.03");
+    expect(short.textContent).toContain("0.03 USDT");
   });
 
-  it("shows the last processed bar's own text in the meta block", async () => {
+  it("shows the last processed bar in A2's UTC form, the server's own epoch-ms text on the element", async () => {
     renderDetail(moneySummary());
-    expect(await screen.findByText("1738368900000")).toBeTruthy();
+    const row = (await screen.findByText("last bar")).closest(".dm-row") as HTMLElement;
+    expectFigure(row, "2025-02-01 00:15 UTC", "1738368900000");
   });
 });

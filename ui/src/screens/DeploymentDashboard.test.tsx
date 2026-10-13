@@ -154,6 +154,33 @@ describe("the session cards", () => {
     expect(screen.getByText("stopped")).toBeTruthy();
   });
 
+  it("renders the OOS mini-verdict's live mean R in A2 form, the server's text on the element", async () => {
+    paperSessionsMock.mockResolvedValue(
+      ok([
+        session({
+          comparison: {
+            status: "within",
+            live_mean_r: "0.34",
+            n: 20,
+            fold_min: "0.18",
+            fold_max: "0.51",
+            engine_builds: 1,
+            certification_stale: false,
+          },
+        }),
+      ]),
+    );
+    const { container } = render(<DeploymentDashboard />);
+
+    const card = (await screen.findByText("BTCUSDT · 15m · 4h")).closest(".dcard") as HTMLElement;
+    const figure = within(card).getByText("+0.34 R");
+    expect(figure.getAttribute("data-exact")).toBe("0.34");
+    expect(figure.getAttribute("title")).toBe("0.34");
+    expect(card.textContent).toContain("OOS");
+    expect(card.textContent).toContain("within");
+    expect(container.querySelector(".dcard")).not.toBeNull();
+  });
+
   it("shows the drift alert and badge on a drifted live epoch", async () => {
     paperSessionsMock.mockResolvedValue(ok([session({ shadow_checks: [identical(), drifted()] })]));
     render(<DeploymentDashboard />);

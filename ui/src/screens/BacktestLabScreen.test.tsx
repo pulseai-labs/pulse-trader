@@ -54,6 +54,8 @@ import type {
 } from "../bindings";
 import BacktestLabScreen, { parseFoldCount } from "./BacktestLabScreen";
 import { RouteContent } from "../App";
+import { decimal } from "../format/numbers";
+import { timeUtc } from "../format/time";
 import { resolveRoute } from "../routes";
 
 const catalogMock = vi.mocked(commands.libraryOverview);
@@ -62,6 +64,19 @@ const compareMock = vi.mocked(commands.compareChildRun);
 const walkForwardMock = vi.mocked(commands.runWalkForwardVersion);
 const getRunMock = vi.mocked(commands.getBacktestRun);
 const reopenMock = vi.mocked(commands.getWalkForwardRun);
+
+// ---------------------------------------------------------------------------
+// The figure helper (r4.s5.w1): every formatted value renders the A2 display
+// text with the DTO's own exact string as `title`/`data-exact`, so the two are
+// asserted together — a formatting change cannot quietly drop the server's
+// text, which is what keeps "the screen renders server text" proven.
+// ---------------------------------------------------------------------------
+
+function expectFigure(scope: Element, display: string, exact: string): void {
+  const element = within(scope as HTMLElement).getByText(display);
+  expect(element.getAttribute("data-exact")).toBe(exact);
+  expect(element.getAttribute("title")).toBe(exact);
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures — shaped exactly like the generated types, values chosen to be
@@ -120,10 +135,18 @@ const CATALOG: LibraryOverview = {
 const MFE_COUNTS = [0, 1, 0, 2, 1, 3, 1, 0, 1, 0, 0, 0];
 const MAE_COUNTS = [1, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
 
+/** The 0.25-wide bin bounds as the DTO carries them — literal display strings,
+ * the same text a two-decimal float format would produce, so the fixture needs
+ * no float call (AC-5's own census reads this file). */
+const BIN_BOUNDS = [
+  "0.00", "0.25", "0.50", "0.75", "1.00", "1.25",
+  "1.50", "1.75", "2.00", "2.25", "2.50", "2.75", "3.00",
+] as const;
+
 function bins(counts: readonly number[]): HistogramBinDto[] {
   return counts.map((count, i) => ({
-    lower: (i * 0.25).toFixed(2),
-    upper: ((i + 1) * 0.25).toFixed(2),
+    lower: BIN_BOUNDS[i],
+    upper: BIN_BOUNDS[i + 1],
     count,
   }));
 }
@@ -508,27 +531,32 @@ describe("BacktestLabScreen (fresh result render)", () => {
       "btcusdt-4h-v3",
       // r3.s2.w4: the daily row, when the run recorded one.
       "btcusdt-1d-v1",
-      "1735689600000",
-      "1756684800000",
-      "10000.00",
-      "4.0000",
-      "2.0000",
       "snapshot_rates",
-      // r3.s1.w4 (#142): the recorded filters render their four values.
-      "lot_step 0.001",
-      "min_qty 0.005",
-      "min_notional 100",
-      "max_leverage 20",
       "sha256:abc123def456",
       "aarch64-apple-darwin",
       "sha256:9876fedcba",
       "run-9f2c41ab",
       "v-alpha-1",
       "3",
-      "2026-09-02T10:15:30.123Z",
     ]) {
       expect(text).toContain(exact);
     }
+    // The A2-formatted values, each with the DTO's own string on the element —
+    // the date range and created instant say UTC (r4.s5.w1).
+    expectFigure(band as HTMLElement, "2025-01-01 → 2025-09-01 UTC", "1735689600000 → 1756684800000");
+    expectFigure(band as HTMLElement, "10,000.00 USDT", "10000.00");
+    expectFigure(band as HTMLElement, "2026-09-02 10:15 UTC", "2026-09-02T10:15:30.123Z");
+    // r3.s1.w4 (#142): the recorded filters render their four values, formatted.
+    expectFigure(band as HTMLElement, "0.001000", "0.001");
+    expectFigure(band as HTMLElement, "0.005", "0.005");
+    expectFigure(band as HTMLElement, "100.0000", "100");
+    expectFigure(band as HTMLElement, "20", "20");
+    expect(text).toContain("lot_step");
+    expect(text).toContain("min_qty");
+    expect(text).toContain("min_notional");
+    expect(text).toContain("max_leverage");
+    expect(text).toContain("4.0000 bps");
+    expect(text).toContain("2.0000 bps");
     // The null fingerprintWarning renders no warning UI and no warning text.
     expect(container.querySelector(".bt-fp-warning")).toBeNull();
     expect(text).not.toContain("fingerprint changed");
@@ -605,33 +633,31 @@ describe("BacktestLabScreen (fresh result render)", () => {
     const container = await renderRun(SEEDED_RUN);
     const tiles = container.querySelector(".bt-kpis");
     expect(tiles).not.toBeNull();
-    const text = (tiles as HTMLElement).textContent ?? "";
 
-    for (const exact of [
-      "-84.125",
-      "-4.20625",
-      "0.4375",
-      "180.000",
-      "264.125",
-      "22.500",
-      "33.016",
-      "412.750",
-      "26.400",
-      "-3.115",
-      "13.200",
-    ]) {
-      expect(text).toContain(exact);
-    }
+    // Every money, percent and ratio tile is A2-formatted, the DTO's own string
+    // on the element.
+    const tileFor = (label: string) =>
+      within(tiles as HTMLElement)
+        .getByText(label)
+        .closest(".bt-kpi") as HTMLElement;
+    expectFigure(tileFor("Net P&L"), "−84.13 USDT", "-84.125");
+    expectFigure(tileFor("Expectancy"), "−4.21 USDT", "-4.20625");
+    expectFigure(tileFor("Win rate"), "43.8%", "0.4375");
+    expectFigure(tileFor("Max drawdown"), "412.75 USDT", "412.750");
+    expectFigure(tileFor("Fees"), "26.40 USDT", "26.400");
+    expectFigure(tileFor("Funding"), "−3.12 USDT", "-3.115");
+    expectFigure(tileFor("Slippage"), "13.20 USDT", "13.200");
+    expectFigure(tileFor("Gross profit"), "180.00 USDT", "180.000");
+    expectFigure(tileFor("Gross loss"), "264.13 USDT", "264.125");
+    expectFigure(tileFor("Avg win"), "22.50 USDT", "22.500");
+    expectFigure(tileFor("Avg loss"), "33.02 USDT", "33.016");
+
     // tradeCount / winCount / lossCount / streaks / skipped counters.
     for (const label of ["Trades", "Wins", "Losses", "Max win streak", "Max loss streak",
       "Skipped sub-lot", "Skipped sub-notional", "Skipped leverage-capped"]) {
       expect(within(tiles as HTMLElement).getByText(label)).toBeTruthy();
     }
     // profitFactor / sharpe / sortino are null in this run → em dash, never 0.
-    const tileFor = (label: string) =>
-      within(tiles as HTMLElement)
-        .getByText(label)
-        .closest(".bt-kpi") as HTMLElement;
     for (const label of ["Profit factor", "Sharpe", "Sortino"]) {
       expect(tileFor(label).textContent).toContain("—");
       expect(tileFor(label).textContent).not.toMatch(/\d/);
@@ -668,10 +694,11 @@ describe("BacktestLabScreen (fresh result render)", () => {
       "Ranging",
       "Unknown",
     ]);
-    // Each row carries its own tradeCount and exact netPnl string.
+    // Each row carries its own tradeCount and its A2-formatted netPnl, the DTO
+    // string on the element.
     const trendingDown = within(rows[1] as HTMLElement);
     expect(trendingDown.getByText("4")).toBeTruthy();
-    expect(trendingDown.getByText("-294.250")).toBeTruthy();
+    expectFigure(rows[1] as HTMLElement, "−294.25 USDT", "-294.250");
 
     // A compact 4-swatch legend, same fixed labels.
     const legend = (section as HTMLElement).querySelector(".bt-legend");
@@ -739,16 +766,20 @@ describe("BacktestLabScreen (fresh result render)", () => {
 
     const rows = Array.from((table as HTMLElement).querySelectorAll("tbody tr"));
     expect(rows).toHaveLength(2);
-    // Seq order, exact strings.
+    // Seq order: the formatted figure, the DTO's own string on the element.
     expect(within(rows[0] as HTMLElement).getAllByText("stop_loss").length).toBeGreaterThan(0);
-    expect(within(rows[0] as HTMLElement).getByText("-166.396250")).toBeTruthy();
-    expect(within(rows[0] as HTMLElement).getByText("0.01500000")).toBeTruthy();
-    // The recorded stop renders its exact decimal string…
-    expect(within(rows[0] as HTMLElement).getByText("61500.00")).toBeTruthy();
+    expectFigure(rows[0] as HTMLElement, "−166.40 USDT", "-166.396250");
+    expectFigure(rows[0] as HTMLElement, "0.015", "0.01500000");
+    // The recorded stop renders its A2 price, exact string on the element…
+    expectFigure(rows[0] as HTMLElement, "61,500.00", "61500.00");
     expect(within(rows[1] as HTMLElement).getByText("take_profit")).toBeTruthy();
-    expect(within(rows[1] as HTMLElement).getByText("129.545000")).toBeTruthy();
+    expectFigure(rows[1] as HTMLElement, "+129.55 USDT", "129.545000");
     // …while a null stop (the pre-0011 row shape) renders the em dash.
     expect(within(rows[1] as HTMLElement).getByText("—")).toBeTruthy();
+    // The four time columns render A2's `YYYY-MM-DD HH:mm` UTC, the epoch-ms
+    // text on the element (r4.s5.w1's Dispatch-2 clarification).
+    expectFigure(rows[0] as HTMLElement, "2025-01-01 00:15 UTC", "1735690500000");
+    expectFigure(rows[0] as HTMLElement, "2025-01-01 00:30 UTC", "1735691400000");
   });
 
   it("renders an em dash for a null HTF pair and visibly flags a non-null fingerprintWarning", async () => {
@@ -768,10 +799,11 @@ describe("BacktestLabScreen (fresh result render)", () => {
     expect((warning as HTMLElement).textContent).toContain(
       "engine fingerprint changed since the prior run",
     );
-    // And the non-null ratio fields render their values, not em dashes.
+    // And the non-null ratio fields render their A2 values, not em dashes, the
+    // DTO's own text on the element.
     const tiles = container.querySelector(".bt-kpis") as HTMLElement;
-    expect(within(tiles).getByText("0.681")).toBeTruthy();
-    expect(within(tiles).getByText("-0.42")).toBeTruthy();
+    expectFigure(tiles, "0.68", "0.681");
+    expectFigure(tiles, "−0.42", "-0.42");
   });
 });
 
@@ -791,14 +823,21 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
       expect(within(eqTwin).getAllByText(p.equity).length).toBeGreaterThan(0);
     }
 
-    // Regime twin: four rows, label + tradeCount + netPnl.
+    // Regime twin: four rows, label + tradeCount + the A2 netPnl with the DTO's
+    // own string on the element.
     const rgTwin = container.querySelector(".bt-twin-regimes") as HTMLElement;
     expect(rgTwin).not.toBeNull();
+    const regimeNetPnl: Record<string, string> = {
+      "180.000": "180.00 USDT",
+      "-294.250": "−294.25 USDT",
+      "30.125": "30.13 USDT",
+      "0.000": "0.00 USDT",
+    };
     for (const cell of SEEDED_RUN.regimes) {
       const row = rgTwin.querySelector(`[data-regime="${cell.regime}"]`);
       expect(row).not.toBeNull();
       expect((row as HTMLElement).textContent).toContain(String(cell.tradeCount));
-      expect((row as HTMLElement).textContent).toContain(cell.netPnl);
+      expectFigure(row as HTMLElement, regimeNetPnl[cell.netPnl], cell.netPnl);
     }
 
     // Histogram twins: underflow + 12 bins + overflow with their counts.
@@ -877,11 +916,13 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     const columns = container.querySelectorAll(".bt-col");
     expect(columns.length).toBeGreaterThan(0);
     for (const col of columns) {
+      // chart geometry: the painted hit target's own pixels, not a displayed figure
       expect(parseFloat((col as HTMLElement).style.minWidth)).toBeGreaterThanOrEqual(24);
     }
     const rows = container.querySelectorAll(".bt-regime-row");
     expect(rows.length).toBeGreaterThan(0);
     for (const row of rows) {
+      // chart geometry: the painted hit target's own pixels, not a displayed figure
       expect(parseFloat((row as HTMLElement).style.minHeight)).toBeGreaterThanOrEqual(24);
     }
   });
@@ -1159,11 +1200,12 @@ describe("BacktestLabScreen (the coach rail)", () => {
     fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
 
     const comparison = await screen.findByRole("table", { name: /before and after/i });
-    // Both expectancies, exactly as the DTO delivered them — no delta, no percent.
-    expect(comparison.textContent).toContain("-10.515625");
-    expect(comparison.textContent).toContain("20.250");
-    expect(comparison.textContent).toContain("0.375");
-    expect(comparison.textContent).toContain("0.666");
+    // Both sides, A2-formatted, each cell carrying the DTO's own string — no
+    // delta, no invented percent. The counts render as delivered.
+    expectFigure(comparison, "−10.52 USDT", "-10.515625");
+    expectFigure(comparison, "+20.25 USDT", "20.250");
+    expectFigure(comparison, "37.5%", "0.375");
+    expectFigure(comparison, "66.6%", "0.666");
 
     const rail = screen.getByRole("region", { name: /coach/i });
     expect(within(rail).getByRole("link", { name: /child version/i }).getAttribute("href")).toBe(
@@ -1477,8 +1519,8 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
       expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
     });
     const table = await screen.findByRole("table", { name: /before and after/i });
-    expect(table.textContent).toContain("-10.515625");
-    expect(table.textContent).toContain("20.250");
+    expectFigure(table, "−10.52 USDT", "-10.515625");
+    expectFigure(table, "+20.25 USDT", "20.250");
 
     const badge = screen.getByText("inputs differ");
     expect(badge.className).toContain("badge-inputs-differ");
@@ -1546,7 +1588,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
 
     fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
     const table = await screen.findByRole("table", { name: /before and after/i });
-    expect(table.textContent).toContain("20.250");
+    expectFigure(table, "+20.25 USDT", "20.250");
     expect(screen.queryByText("inputs differ")).toBeNull();
   });
 
@@ -1841,13 +1883,20 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     // Sentinel values — renderable only off the DTO, never a baked-in label.
     expect(text).toContain("scheme-sentinel/v9");
     expect(text).toContain("rule-sentinel");
-    expect(text).toContain("2026-08-01T00:00:00.000Z");
-    expect(text).toContain("2026-08-31T23:59:59.000Z");
     expect(text).toContain("wf-44aa19c2");
-    // The verdict line: the word, the holding/required tally, the pooled bound.
+    // The span is a date range, A2-formatted, saying UTC, the DTO's own pair on
+    // the element.
+    expectFigure(
+      pane,
+      "2026-08-01 → 2026-08-31 UTC",
+      "2026-08-01T00:00:00.000Z → 2026-08-31T23:59:59.000Z",
+    );
+    // The verdict line: the word, the folds sentence (#328/#305), the pooled
+    // bound — never a bare ratio.
     expect(text).toContain("FAIL");
-    expect(text).toContain("1/2");
-    expect(text).toContain("-0.8123");
+    expect(text).toContain("1 of 2 folds hold (2 required)");
+    expect(text).not.toContain("1/2");
+    expectFigure(pane, "−0.81", "-0.8123");
     // `from_defaulted` is surfaced as provenance, not silently applied.
     expect(text).toContain("defaulted");
   });
@@ -1858,22 +1907,25 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     const rows = Array.from(region.querySelectorAll("tbody tr"));
     expect(rows).toHaveLength(2);
 
+    // Window cells: `YYYY-MM-DD HH:mm` UTC, the DTO's own RFC 3339 on the
+    // element (the fold table is one of the two tables the Dispatch-2
+    // clarification names).
+    expectFigure(rows[0], "2026-08-01 00:00 UTC", "2026-08-01T00:00:00.000Z");
+    expectFigure(rows[0], "2026-08-15 12:00 UTC", "2026-08-15T12:00:00.000Z");
     const first = rows[0].textContent ?? "";
-    expect(first).toContain("2026-08-01T00:00:00.000Z");
-    expect(first).toContain("2026-08-15T12:00:00.000Z");
     expect(first).toContain("2");
-    expect(first).toContain("-0.4");
     expect(first).toContain("yes");
-    // The fold run's own summary fields ride the same row.
-    expect(first).toContain("0.250");
-    expect(first).toContain("0.500");
+    // The fold run's own summary fields ride the same row, A2-formatted.
+    expectFigure(rows[0], "−0.40", "-0.4");
+    expectFigure(rows[0], "+0.25 USDT", "0.250");
+    expectFigure(rows[0], "50.0%", "0.500");
 
     const second = rows[1].textContent ?? "";
     expect(second).toContain("3");
-    expect(second).toContain("-1.7");
     expect(second).toContain("no");
-    expect(second).toContain("-1.000");
-    expect(second).toContain("0.333");
+    expectFigure(rows[1], "−1.70", "-1.7");
+    expectFigure(rows[1], "−1.00 USDT", "-1.000");
+    expectFigure(rows[1], "33.3%", "0.333");
   });
 
   it("opens a fold as an ordinary run: getBacktestRun on the fold's id lands in the existing result view", async () => {
@@ -2101,15 +2153,22 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     const pane = container.querySelector(".bt-walkforward") as HTMLElement;
     expect(pane).not.toBeNull();
     const text = pane.textContent ?? "";
-    // The naming scheme, the rule, the span and the verdict — the DTO's own.
+    // The naming scheme, the rule, the span and the verdict — the DTO's own,
+    // the span and the folds sentence A2-formatted.
     expect(text).toContain("rolling-oos/v1");
     expect(text).toContain("wf-v1");
-    expect(text).toContain("2026-07-01T00:00:00.000Z");
-    expect(text).toContain("2026-07-07T00:00:00.000Z");
     expect(text).toContain("wf-6c1d9f38");
     expect(text).toContain("FAIL");
-    expect(text).toContain("3/4");
-    expect(text).toContain("-0.4321");
+    expectFigure(
+      pane,
+      "2026-07-01 → 2026-07-07 UTC",
+      "2026-07-01T00:00:00.000Z → 2026-07-07T00:00:00.000Z",
+    );
+    // The sentence counts the SCHEME's folds (`k = 6` on this fixture), not the
+    // six rows' holding count.
+    expect(text).toContain("3 of 6 folds hold (4 required)");
+    expect(text).not.toContain("3/6");
+    expectFigure(pane, "−0.43", "-0.4321");
     // The pane says WHERE this run came from — and says it OUTSIDE the result
     // section, which is the same component on both paths.
     expect(container.querySelector(".bt-wf-origin")?.textContent).toContain("reopened by id");
@@ -2123,14 +2182,22 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     const rows = Array.from(region.querySelectorAll("tbody tr"));
     expect(rows).toHaveLength(6);
     REOPENED_FOLDS.forEach((fold, index) => {
-      const cells = Array.from(rows[index].querySelectorAll("td")).map(
-        (cell) => cell.textContent ?? "",
+      const cells = Array.from(rows[index].querySelectorAll("td"));
+      // The window cells render A2's UTC text with the DTO's own RFC 3339 on
+      // the element; the rest are asserted against their own field.
+      expect(cells[1].textContent).toBe(timeUtc(fold.windowFrom));
+      expect(cells[1].querySelector("[data-exact]")?.getAttribute("data-exact")).toBe(
+        fold.windowFrom,
       );
-      expect(cells[1]).toBe(fold.windowFrom);
-      expect(cells[2]).toBe(fold.windowTo);
-      expect(cells[3]).toBe(String(fold.n));
-      expect(cells[4]).toBe(fold.lowerBound === null ? "—" : String(fold.lowerBound));
-      expect(cells[5]).toBe(fold.holds ? "yes" : "no");
+      expect(cells[2].textContent).toBe(timeUtc(fold.windowTo));
+      expect(cells[2].querySelector("[data-exact]")?.getAttribute("data-exact")).toBe(
+        fold.windowTo,
+      );
+      expect(cells[3].textContent).toBe(String(fold.n));
+      expect(cells[4].textContent).toBe(
+        fold.lowerBound === null ? "—" : decimal(String(fold.lowerBound), 2),
+      );
+      expect(cells[5].textContent).toBe(fold.holds ? "yes" : "no");
     });
     // The fold whose two counts differ proves which one the column reads.
     expect(String(REOPENED_FOLDS[2].n)).not.toBe(String(REOPENED_FOLDS[2].trades));
