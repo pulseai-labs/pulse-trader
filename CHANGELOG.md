@@ -394,6 +394,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Library version tree shows every node's provenance line again, and an agent version's
+  hypothesis subline with it (#404, d37).** r4.s5.w3's one-line ellipsis rule on `.vnode-provenance`
+  gave the line `overflow: hidden`, and a flex item with non-visible overflow gets an automatic minimum
+  of 0 — so inside the fixed 64px node, whose `.vnode-summary` still held the mock's 30px two-line
+  reserve and whose `.vnode-hypothesis` was already clamped, both lines shrank to zero height and every
+  node showed only its name and summary line. The node is now as tall as its own lines: `NODE_H` 94px,
+  and 128px when the version carries a hypothesis subline, whose two clamped lines render in full. A
+  row's pitch is its tallest node plus the 14px the old fixed 78px pitch left, the edges anchor at each
+  node's own centre and the canvas follows the rows; the summary's min-height reserve is gone, the head
+  is pinned to ONE nowrap row (a crowded pin + certification chip + delta head used to wrap its delta
+  onto a second line, 14px taller than the layout measured), and `flex-shrink: 0` keeps the provenance
+  and hypothesis lines at their own height. jsdom performs no layout, so `LibraryScreen.test.tsx` grew
+  a source-reading geometry guard: it reads the node's height constants, its line rules and the tokens
+  they resolve through, and fails on the old 64px node (a plain node needs 105.15px) or on either line
+  losing its `flex-shrink: 0`.
+
 - **The Library, Backtest Lab and Designer defects the r3/r4 walks filed (r4.s5.w3).** A version's
   runs are reachable and legible again. Backtest Lab grows a **Runs** block beside the picker: the
   version's own backtests and its latest walk-forward run, each row opening the persisted run it
