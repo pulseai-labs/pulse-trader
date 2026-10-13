@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The Backtest Lab's version picker, and the seeded QA library it searches (r4.s5.w2).** The Lab's
+  native version `<select>` is replaced by a searchable combobox (grill A4): type-to-filter,
+  case-insensitive, on the strategy name, the version label (`v<n>`) and the version id's 8-character
+  short id; options grouped by strategy in `version_tree` order, each row carrying the version number,
+  the created date, the short id and the Library's own creator line; when two strategies share a name,
+  every group with that name adds its created date and short id (#318); the pinned version is marked;
+  an empty filter says so in one line; and the keyboard map is ↓/↑ to move the active option, Enter to
+  select, Escape to close and Home/End to jump, with focus held in the input and
+  `aria-activedescendant` naming the active option — so a 120-version library is searchable without a
+  virtualisation library (#218). The selection now outlives the screen, so a reconnect — or an
+  ordinary tab navigation — keeps both the chosen version and the run the trader was reading (#315),
+  falling back to the first version only when the catalog no longer carries it.
+  `scripts/seed-qa-library.sh` fills QA with 12 strategies × 9 versions through the real MCP
+  `submit_strategy_version` (12 distinct names, both committed DSL families, one parameter varied per
+  child; a run-scoped agent token held only in a 0600 scratch file and revoked by a trap on every exit
+  path; the data dir's `server-role` and the server's handshake role are both checked `qa` before
+  anything is written; idempotent per strategy name), `scripts/seed-qa-library-test.sh` proves it on
+  scratch servers only, and `scripts/picker-test.sh` is the new ledger line over the picker and the
+  Lab.
+
 - **The paper session's money view reaches the Mac app (r4.s4.w2).** The session detail now shows, all
   from the server's own text: the running total (the Σ realized USDT and Σ R totals with their "n of
   m" counts, the open position's unrealized USDT and the session P&L); the open position marked at

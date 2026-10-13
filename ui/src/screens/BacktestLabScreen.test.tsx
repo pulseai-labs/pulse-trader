@@ -15,7 +15,7 @@
 // focusable trade-table scroll region, and the ≥24px inline hit targets.
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 import { flushSync } from "react-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -53,6 +53,8 @@ import type {
   WalkForwardRunDto,
 } from "../bindings";
 import BacktestLabScreen, { parseFoldCount } from "./BacktestLabScreen";
+import { clearBacktestSelection } from "./backtestSelection";
+import { ActiveOperationsProvider } from "../hooks/useActiveOperations";
 import { RouteContent } from "../App";
 import { decimal } from "../format/numbers";
 import { timeUtc } from "../format/time";
@@ -321,6 +323,27 @@ async function renderRun(
   return container;
 }
 
+/** Choose a version through the picker the way a trader does — open it, type a
+ * query, and click the `offset`-th option the filter leaves (0-based, in the
+ * order the list shows). Every call site's own assertions pin WHICH version
+ * that turned out to be; a query with fewer matches than `offset + 1` is a
+ * broken test, not a silent no-op. */
+async function chooseVersion(query: string, offset = 0) {
+  const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+  fireEvent.focus(box);
+  fireEvent.change(box, { target: { value: query } });
+  const options = screen.getAllByRole("option");
+  const option = options[offset] as HTMLElement | undefined;
+  if (option === undefined) {
+    throw new Error(
+      `chooseVersion("${query}", ${offset}): the filter left ${options.length} option(s)`,
+    );
+  }
+  // The picker keeps focus in the input, so the click lands without a blur.
+  fireEvent.mouseDown(option);
+  fireEvent.click(option);
+}
+
 beforeEach(() => {
   catalogMock.mockReset();
   runMock.mockReset();
@@ -328,6 +351,9 @@ beforeEach(() => {
   walkForwardMock.mockReset();
   getRunMock.mockReset();
   reopenMock.mockReset();
+  // The remembered selection is a module singleton that outlives a screen by
+  // design (#315); each test starts from no selection.
+  clearBacktestSelection();
 });
 
 // ---------------------------------------------------------------------------
@@ -367,24 +393,29 @@ describe("BacktestLabScreen (catalog states)", () => {
     expect(screen.queryByText(/sample/i)).toBeNull();
   });
 
-  it("lists exactly the catalog's real (strategy, version) pairs with version ids as values", async () => {
+  it("lists exactly the catalog's real (strategy, version) pairs, grouped, with the first version selected", async () => {
     catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
 
-    render(<BacktestLabScreen />);
+    const { container } = render(<BacktestLabScreen />);
 
-    const select = await screen.findByRole("combobox");
-    const options = within(select).getAllByRole("option");
-    expect(options.map((o) => o.textContent)).toEqual([
-      "Alpha Wave · v1",
-      "Alpha Wave · v2",
-      "Beta Break · v1",
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    // The closed picker shows the current selection's own text.
+    expect(box.value).toBe("v1 · 2026-08-20 · v-alpha- · human");
+
+    fireEvent.focus(box);
+    expect(
+      [...container.querySelectorAll(".vp-group")].map((header) => header.textContent),
+    ).toEqual([
+      "Alpha Wave",
+      "Beta Break",
     ]);
-    expect(options.map((o) => o.getAttribute("value"))).toEqual([
-      "v-alpha-1",
-      "v-alpha-2",
-      "v-beta-1",
+    expect(
+      screen.getAllByRole("option").map((option) => option.textContent),
+    ).toEqual([
+      "v1 · 2026-08-20 · v-alpha- · human",
+      "v2 · 2026-08-20 · v-alpha- · human",
+      "v1 · 2026-08-20 · v-beta-1 · human",
     ]);
-    expect((select as HTMLSelectElement).value).toBe("v-alpha-1");
   });
 });
 
@@ -426,7 +457,7 @@ describe("BacktestLabScreen (run state machine)", () => {
 
     // A different version selected, then Run: the call uses the new id, and
     // the fresh DTO that lands is the new run's.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
     fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
     await screen.findByText("run-beta-001");
     expect(screen.queryByText("run-9f2c41ab")).toBeNull();
@@ -473,20 +504,20 @@ describe("BacktestLabScreen (run state machine)", () => {
     );
     render(<BacktestLabScreen />);
 
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
-    expect(select.disabled).toBe(false);
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    expect(box.disabled).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
 
     expect(
       (screen.getByRole("button", { name: /running…/i }) as HTMLButtonElement).disabled,
     ).toBe(true);
-    expect(select.disabled).toBe(true);
+    expect(box.disabled).toBe(true);
 
     resolveRun({ status: "ok", data: SEEDED_RUN });
     await screen.findByText("run-9f2c41ab");
     // Settled: the selector unlocks alongside the button.
-    expect(select.disabled).toBe(false);
+    expect(box.disabled).toBe(false);
   });
 
   it("renders a run BusError's code and message, and the structured run_id as a saved-run id — never parsed prose", async () => {
@@ -504,7 +535,7 @@ describe("BacktestLabScreen (run state machine)", () => {
   it("clears a rendered result when the selector changes — a stale result is not attributable to the new version", async () => {
     await renderRun(SEEDED_RUN);
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     expect(screen.queryByText("run-9f2c41ab")).toBeNull();
     expect(screen.queryByText("BTCUSDT")).toBeNull();
@@ -889,7 +920,7 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
   it("makes the equity plot and the trade-table scroll region focus stops in visual order", async () => {
     const container = await renderRun(SEEDED_RUN);
 
-    const select = screen.getByRole("combobox");
+    const picker = screen.getByRole("combobox");
     const run = screen.getByRole("button", { name: /run backtest/i });
     const plot = container.querySelector(".bt-eq-plot") as HTMLElement;
     const region = container.querySelector(".bt-table-scroll") as HTMLElement;
@@ -900,7 +931,7 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     // Focus order follows visual order: selector → Run → plot → table region.
     const follows = (a: HTMLElement, b: HTMLElement) =>
       (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
-    expect(follows(select, run)).toBe(true);
+    expect(follows(picker, run)).toBe(true);
     expect(follows(run, plot)).toBe(true);
     expect(follows(plot, region)).toBe(true);
 
@@ -1254,7 +1285,9 @@ describe("BacktestLabScreen (the coach rail)", () => {
     // list would set the selector to an id no option carries.
     fireEvent.click(screen.getByRole("button", { name: /select the child/i }));
     await waitFor(() => {
-      expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("v-alpha-2");
+      expect((screen.getByRole("combobox") as HTMLInputElement).value).toBe(
+        "v2 · 2026-08-20 · v-alpha- · human",
+      );
     });
   });
 
@@ -1447,7 +1480,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
     await openRail(proposedSession());
     expect(screen.getByRole("region", { name: /coach/i })).toBeTruthy();
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
 
     expect(screen.queryByRole("region", { name: /coach/i })).toBeNull();
   });
@@ -1513,7 +1546,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await waitFor(() => {
       expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
@@ -1570,7 +1603,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await waitFor(() => {
       expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
@@ -1586,7 +1619,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     const table = await screen.findByRole("table", { name: /before and after/i });
     expectFigure(table, "+20.25 USDT", "20.250");
     expect(screen.queryByText("inputs differ")).toBeNull();
@@ -1597,7 +1630,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     compareMock.mockResolvedValue({ status: "error", error: COMPARE_REFUSAL });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await screen.findByText(/has no run to compare against/i);
     expect(screen.queryByRole("table", { name: /before and after/i })).toBeNull();
@@ -1609,7 +1642,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
 
     // v-alpha-1 is selected by default and is a ROOT — nothing to compare with.
     // v-alpha-2 has a parent but no recent run in this catalog.
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await waitFor(() => {
       expect(screen.queryByRole("table", { name: /before and after/i })).toBeNull();
@@ -1626,7 +1659,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await waitFor(() => {
       expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
     });
@@ -1644,8 +1677,8 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
   it("refetches the catalog when the window regains focus, and keeps the selection", async () => {
     catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
     render(<BacktestLabScreen />);
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
+    const box = screen.getByRole("combobox") as HTMLInputElement;
     const callsOnMount = catalogMock.mock.calls.length;
 
     fireEvent(window, new Event("focus"));
@@ -1653,14 +1686,14 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     await waitFor(() => {
       expect(catalogMock.mock.calls.length).toBeGreaterThan(callsOnMount);
     });
-    expect(select.value).toBe("v-alpha-2");
+    expect(box.value).toBe("v2 · 2026-08-20 · v-alpha- · human");
   });
 
-  it("falls back to the first option when the selected version is gone after a refetch", async () => {
+  it("falls back to the default when the selected version is gone after a refetch", async () => {
     catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
     render(<BacktestLabScreen />);
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
+    const box = screen.getByRole("combobox") as HTMLInputElement;
 
     // The refetched catalog no longer carries the selected version.
     catalogMock.mockResolvedValue({
@@ -1672,8 +1705,59 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     fireEvent(window, new Event("focus"));
 
     await waitFor(() => {
-      expect(select.value).toBe("v-alpha-1");
+      expect(box.value).toBe("v1 · 2026-08-20 · v-alpha- · human");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #315 — the selection and its shown result survive a reconnect
+// ---------------------------------------------------------------------------
+
+/** The App's own nesting for this item's purposes: `ActiveOperationsProvider`
+ * above the route (`App.tsx`), and a screen the gate can unmount when the
+ * server goes down — exactly what rendering Connect in the app's place does. */
+function GatedLab() {
+  const [up, setUp] = useState(true);
+  return (
+    <ActiveOperationsProvider>
+      <button type="button" onClick={() => setUp((current) => !current)}>
+        {up ? "take the server down" : "bring the server back"}
+      </button>
+      {up ? <BacktestLabScreen /> : null}
+    </ActiveOperationsProvider>
+  );
+}
+
+describe("BacktestLabScreen (#315 — a reconnect keeps the selection and its result)", () => {
+  it("shows the same version and its run after the screen unmounts and comes back", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    runMock.mockResolvedValue({
+      status: "ok",
+      data: { ...SEEDED_RUN, runId: "run-beta-001", strategyVersionId: "v-beta-1" },
+    });
+
+    render(<GatedLab />);
+
+    await chooseVersion("beta");
+    fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
+    await screen.findByText("run-beta-001");
+
+    // The server drops: the gate takes the screen down, and only the screen.
+    fireEvent.click(screen.getByRole("button", { name: /take the server down/i }));
+    expect(screen.queryByRole("combobox")).toBeNull();
+
+    // It comes back: the Lab remounts and reads the catalog again. The version
+    // the trader had chosen is still the selected one…
+    fireEvent.click(screen.getByRole("button", { name: /bring the server back/i }));
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    await waitFor(() => {
+      expect(box.value).toBe("v1 · 2026-08-20 · v-beta-1 · human");
+    });
+
+    // …and the run the trader was reading is still shown for it: the record
+    // outlived the screen, and the restored selection addresses it again.
+    expect(screen.getByText("run-beta-001")).toBeTruthy();
   });
 });
 
@@ -1973,11 +2057,11 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     );
     render(<BacktestLabScreen />);
 
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
     fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
 
     await screen.findByRole("button", { name: /walking forward/i });
-    expect(select.disabled).toBe(true);
+    expect(box.disabled).toBe(true);
     expect(
       (screen.getByRole("button", { name: /run backtest/i }) as HTMLButtonElement).disabled,
     ).toBe(true);
@@ -1988,7 +2072,7 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
 
     resolveWf({ status: "ok", data: WF_DTO });
     await screen.findByText("wf-44aa19c2");
-    expect(select.disabled).toBe(false);
+    expect(box.disabled).toBe(false);
     expect(
       (screen.getByRole("button", { name: /walk forward/i }) as HTMLButtonElement).disabled,
     ).toBe(false);
@@ -1998,7 +2082,7 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     const container = await renderWalkForward(WF_DTO);
     expect(container.querySelector(".bt-walkforward")).not.toBeNull();
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
 
     expect(container.querySelector(".bt-walkforward")).toBeNull();
     expect(screen.queryByText("wf-44aa19c2")).toBeNull();
@@ -2245,13 +2329,13 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
 
     // v-alpha-2 carries a DIFFERENT persisted run — the pane follows the
     // selection, and the previous version's run id goes with it.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await screen.findByText("wf-9a8b7c6d");
     expect(reopenMock).toHaveBeenLastCalledWith({ walkForwardRunId: "wf-9a8b7c6d" });
     expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
 
     // v-beta-1 has no walk-forward run at all: no read, and no pane to fill.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
     await waitFor(() => {
       expect(container.querySelector(".bt-walkforward")).toBeNull();
     });
@@ -2278,7 +2362,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     const { container } = render(<BacktestLabScreen />);
     await screen.findByText("wf-6c1d9f38");
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     // The backend's own typed refusal, rendered like every other failure card.
     const failure = (await screen.findAllByRole("alert")).find((alert) =>
@@ -2318,7 +2402,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     // that re-reads has not run yet. That one frame is what review F1 is about —
     // it must show the NEW target's in-flight state, never the old version's
     // failure or run.
-    switchSelectionOutsideAct(screen.getByRole("combobox") as HTMLSelectElement, "v-alpha-2");
+    switchVersionOutsideAct("v2");
 
     expect(screen.queryByText(dropped.message)).toBeNull();
     expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
@@ -2344,7 +2428,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     await screen.findByText("wf-6c1d9f38");
     expect(container.querySelector(".bt-walkforward")).not.toBeNull();
 
-    switchSelectionOutsideAct(screen.getByRole("combobox") as HTMLSelectElement, "v-alpha-2");
+    switchVersionOutsideAct("v2");
 
     // One frame, un-act-ed: v-alpha-1's six fold rows may not stand in for
     // v-alpha-2 — not even for a paint.
@@ -2415,7 +2499,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     });
 
     // The trader moves on while v-alpha-1's read is still out.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await waitFor(() => {
       expect(pending.has("wf-9a8b7c6d")).toBe(true);
     });
@@ -2461,11 +2545,12 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     });
 
     // Away and back while that read is still out: the SAME id is read twice.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await waitFor(() => {
       expect(pending).toHaveLength(2); // v-alpha-2's read
     });
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-1" } });
+    // Back to v-alpha-1: the same id is read again.
+    await chooseVersion("alpha");
     await waitFor(() => {
       expect(pending).toHaveLength(3); // v-alpha-1 again
     });
@@ -2533,14 +2618,23 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
   });
 });
 
-/** Drive the selector's change through the DOM rather than `fireEvent`, so the
- * render commits while the passive effect that re-reads has NOT run: the frame
- * review F1 found, made deterministic here by `flushSync` instead of relying on
- * React's discrete-event flushing. */
-function switchSelectionOutsideAct(select: HTMLSelectElement, value: string): void {
+/** Pick the first option matching `query` through the DOM rather than
+ * `fireEvent`, so the render commits while the passive effect that re-reads has
+ * NOT run: the frame review F1 found, made deterministic here by `flushSync`
+ * instead of relying on React's discrete-event flushing.
+ *
+ * Opening and filtering go through `fireEvent` (act-wrapped — that frame is not
+ * the one under test); only the COMMIT is dispatched raw, inside `flushSync`. */
+function switchVersionOutsideAct(query: string): void {
+  const box = screen.getByRole("combobox") as HTMLInputElement;
+  fireEvent.focus(box);
+  fireEvent.change(box, { target: { value: query } });
+  const option = screen.getAllByRole("option")[0];
+  if (option === undefined) {
+    throw new Error(`switchVersionOutsideAct: no option matches ${query}`);
+  }
   flushSync(() => {
-    select.value = value;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+    option.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
 }
 

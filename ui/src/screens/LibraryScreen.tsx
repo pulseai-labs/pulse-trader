@@ -37,6 +37,7 @@ import { PromoteSheet } from "../components/PromoteSheet";
 import { Figure } from "../format/Figure";
 import { decimal, percentFromFraction, rMultiple } from "../format/numbers";
 import { dateRange, dateUtc } from "../format/time";
+import { provenanceLine } from "../components/provenance";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { openSessionDetail } from "../paper/handoff";
 
@@ -794,16 +795,6 @@ function latestVersion(strategy: LibraryStrategy): LibraryVersion | undefined {
     (latest, v) => (latest === undefined || v.createdAt > latest.createdAt ? v : latest),
     undefined,
   );
-}
-
-/** A version's provenance label (r2.s1.w4 C1): `external_agent · <agent name>`
- * for an agent-written version, the bare `created_by` label for everything
- * else. An agent version whose submission row is absent still reads
- * `external_agent` — the label, never a guessed name. */
-function provenanceLine(version: LibraryVersion): string {
-  return version.agentName !== null
-    ? `${version.createdBy} · ${version.agentName}`
-    : version.createdBy;
 }
 
 /** A version's one-line summary from its own DSL fields (r3.s2.w5, #193): the
