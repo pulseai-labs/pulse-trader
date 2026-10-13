@@ -38,13 +38,16 @@ const LISTBOX_ID = "bt-version-listbox";
 const OPTION_ID_PREFIX = "bt-version-opt-";
 const GROUP_ID_PREFIX = "bt-version-group-";
 
-/** One selectable version, pre-rendered: the label, the id's short form, and
- * the one line the trader reads. */
+/** One selectable version, pre-rendered: the label, the id's short form, the
+ * one line the trader reads, and the raw `createdAt` behind it. */
 export interface VersionOption {
   readonly id: string;
   readonly label: string;
   readonly shortId: string;
   readonly text: string;
+  /** The server's exact RFC 3339 `createdAt` — the option's title, so the
+   * formatted date in `text` keeps its exact source one hover away. */
+  readonly createdAt: string;
 }
 
 /** One strategy's group in the popup. */
@@ -101,6 +104,7 @@ export function buildVersionGroups(strategies: readonly LibraryStrategy[]): Vers
           id: version.id,
           label,
           shortId,
+          createdAt: version.createdAt,
           // r4.s5.w3 (spec step 8): the date is w1's own formatter now — A2's
           // `YYYY-MM-DD` with its `UTC` marker — not a local slice of the
           // RFC3339 text.
@@ -346,6 +350,7 @@ export function VersionPicker({ strategies, value, onChange, disabled }: Version
                     key={option.id}
                     id={`${OPTION_ID_PREFIX}${index}`}
                     role="option"
+                    title={option.createdAt}
                     aria-selected={option.id === value}
                     className={`vp-option${index === active ? " is-active" : ""}`}
                     onClick={() => commit(option)}

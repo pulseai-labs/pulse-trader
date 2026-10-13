@@ -1588,7 +1588,7 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
           <>
             lot_step{" "}
             <Figure exact={dto.symbolFilters.lotStep}>
-              {price(dto.symbolFilters.lotStep)}
+              {qty(dto.symbolFilters.lotStep)}
             </Figure>{" "}
             · min_qty{" "}
             <Figure exact={dto.symbolFilters.minQty}>{qty(dto.symbolFilters.minQty)}</Figure> ·

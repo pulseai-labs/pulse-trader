@@ -245,6 +245,13 @@ describe("VersionPicker (grouping)", () => {
       "v9 · 2026-08-09 UTC · 9aurora · human",
       "v10 · 2026-08-10 UTC · 10aurora · human",
     ]);
+
+    // Each option carries the version's raw `createdAt` as its title: the
+    // formatted date above stays readable, and the server's exact instant is
+    // one hover away.
+    expect(screen.getAllByRole("option")[0]?.getAttribute("title")).toBe(
+      "2026-08-01T10:00:00.000Z",
+    );
   });
 
   it("disambiguates same-named groups with the strategy's created date and short id (#318)", () => {
