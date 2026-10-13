@@ -48,8 +48,10 @@ import type {
   OperationRecord,
 } from "../hooks/useActiveOperations";
 import { PromoteSheet } from "../components/PromoteSheet";
+import { VersionPicker, buildVersionGroups } from "../components/VersionPicker";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { openSessionDetail, takeRequestedBacktestVersion } from "../paper/handoff";
+import { readBacktestSelection, rememberBacktestSelection } from "./backtestSelection";
 
 /** The em dash every null renders — a statement that no value exists, never
  * a zero dressed up as data (the Library's grill A1 rule, applied here). */
@@ -66,33 +68,38 @@ function num(value: string): number {
 // Catalog state (the selector's four explicit states)
 // ---------------------------------------------------------------------------
 
-/** One selectable option: a real (strategy, version) pair from the payload. */
-interface Option {
-  /** The version's id — the run request's `versionId`. */
-  value: string;
-  /** `Strategy name · vN`, N the version's position in its parent-ordered list. */
-  label: string;
-}
-
 type CatalogState =
   | { kind: "loading" }
   | { kind: "error"; code: string; message: string }
   | { kind: "empty" }
   // The overview rides along (r2.s1.w4 C3): the compare section needs the
-  // selected version's `parentId` and `recentRuns`, which the flattened
-  // options do not carry.
-  | { kind: "ready"; options: Option[]; overview: LibraryOverview };
+  // selected version's `parentId` and `recentRuns`, and the picker renders the
+  // catalog's own groups. `ids` is that overview's version ids in catalog order
+  // — where the default selection comes from and what a refetched selection is
+  // checked against.
+  | { kind: "ready"; overview: LibraryOverview; ids: string[] };
 
-/** Flatten the catalog's strategies into the selector's options — the real
- * versions only; a version not in the payload cannot appear here. */
-function catalogOptions(overview: LibraryOverview): Option[] {
-  const options: Option[] = [];
+/** Every version id the catalog carries, in catalog order. */
+function catalogVersionIds(overview: LibraryOverview): string[] {
+  const ids: string[] = [];
   for (const strategy of overview.strategies) {
-    strategy.versions.forEach((version: LibraryVersion, index: number) => {
-      options.push({ value: version.id, label: `${strategy.name} · v${index + 1}` });
-    });
+    for (const version of strategy.versions) {
+      ids.push(version.id);
+    }
   }
-  return options;
+  return ids;
+}
+
+/** The promote sheet's version label: the picker's own row text for that
+ * version, so the sheet and the picker never describe a version differently. */
+function versionLabelOf(overview: LibraryOverview, versionId: string): string {
+  for (const group of buildVersionGroups(overview.strategies)) {
+    const option = group.options.find((candidate) => candidate.id === versionId);
+    if (option !== undefined) {
+      return option.text;
+    }
+  }
+  return versionId;
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +609,10 @@ const TRADE_FIELDS = [
 
 export default function BacktestLabScreen() {
   const [catalog, setCatalog] = useState<CatalogState>({ kind: "loading" });
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // #315: the selection outlives this screen — it re-mounts on every navigation
+  // and whenever the gate takes the app down for a server restart. `null` until
+  // the trader has chosen; the catalog read then reconciles it.
+  const [selectedId, setSelectedId] = useState<string | null>(() => readBacktestSelection());
   const [promoting, setPromoting] = useState(false);
   /** Every active operation, held above the route (#141). The Lab READS it. */
   const operations = useActiveOperations();
@@ -625,16 +635,18 @@ export default function BacktestLabScreen() {
         const result = await commands.libraryOverview();
         if (!alive()) return new Set();
         if (result.status === "ok") {
-          const options = catalogOptions(result.data);
+          const ids = catalogVersionIds(result.data);
           setCatalog(
-            options.length === 0
+            ids.length === 0
               ? { kind: "empty" }
-              : { kind: "ready", options, overview: result.data },
+              : { kind: "ready", overview: result.data, ids },
           );
-          const known = new Set(options.map((option) => option.value));
-          // C2 (r2.s1.w4): a refetch keeps the selection ONLY while the
+          const known = new Set(ids);
+          // C2 (r2.s1.w4) + #315: a refetch keeps the selection ONLY while the
           // refreshed catalog still carries it — a vanished version falls back
-          // to the first option rather than rendering a blank select.
+          // to the default rather than rendering an empty picker. The
+          // REMEMBERED id is not touched here: the catalog owns validity, and
+          // the next remount re-reconciles against whatever it carries then.
           setSelectedId((current) =>
             current !== null && !known.has(current) ? null : current,
           );
@@ -671,7 +683,7 @@ export default function BacktestLabScreen() {
   useEffect(() => {
     const take = () => {
       const requested = takeRequestedBacktestVersion();
-      if (requested !== null) setSelectedId(requested);
+      if (requested !== null) selectVersion(requested);
     };
     take();
     window.addEventListener("hashchange", take);
@@ -688,8 +700,8 @@ export default function BacktestLabScreen() {
     }, [loadCatalog]),
   );
 
-  const options = catalog.kind === "ready" ? catalog.options : [];
-  const currentId = selectedId ?? options[0]?.value ?? null;
+  const ids = catalog.kind === "ready" ? catalog.ids : [];
+  const currentId = selectedId ?? ids[0] ?? null;
   /** This version's operation, whoever started it and whenever. Keyed by version,
    * so a result can never be attributed to a version it was not run for — the
    * property the old bumped token approximated. */
@@ -722,8 +734,15 @@ export default function BacktestLabScreen() {
   /** Selecting a version shows THAT version's operation. Nothing is cleared and
    * nothing is cancelled: each version's record is its own, so a run still going
    * for the previous selection stays going, and coming back to it shows it. The
-   * coach rail is per-run, so it closes with the selection. */
-  function onSelectorChange(id: string) {
+   * coach rail is per-run, so it closes with the selection.
+   *
+   * Every path that SELECTS — the picker's change, the accept's child select,
+   * the stale sheet's request — lands here, so every one of them REMEMBERS the
+   * id and a remount re-selects the same version (#315). The catalog still owns
+   * whether the id is real: `loadCatalog`'s reconcile drops one it no longer
+   * carries, and the next remount re-reconciles against whatever it carries then. */
+  function selectVersion(id: string) {
+    rememberBacktestSelection(id);
     setSelectedId(id);
   }
 
@@ -739,7 +758,7 @@ export default function BacktestLabScreen() {
   async function onSelectChild(versionId: string) {
     const known = await loadCatalog();
     if (known.has(versionId)) {
-      setSelectedId(versionId);
+      selectVersion(versionId);
     }
   }
 
@@ -865,19 +884,12 @@ export default function BacktestLabScreen() {
           <label className="bt-select-label" htmlFor="bt-version">
             Strategy version
           </label>
-          <select
-            id="bt-version"
-            className="bt-select"
-            value={currentId ?? ""}
-            onChange={(event) => onSelectorChange(event.target.value)}
+          <VersionPicker
+            strategies={catalog.overview.strategies}
+            value={currentId}
+            onChange={selectVersion}
             disabled={busy}
-          >
-            {options.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+          />
           <button
             type="button"
             className="bt-run btn-prim"
@@ -934,12 +946,12 @@ export default function BacktestLabScreen() {
         onPromote={selectedVersion === null ? null : () => setPromoting(true)}
       />
 
-      {promoting && selectedVersion !== null && (
+      {promoting && selectedVersion !== null && catalog.kind === "ready" && (
         <PromoteSheet
           target={{
             version: selectedVersion,
             strategyName: selectedVersion.dsl.name,
-            versionLabel: options.find((option) => option.value === selectedVersion.id)?.label ?? selectedVersion.id,
+            versionLabel: versionLabelOf(catalog.overview, selectedVersion.id),
           }}
           onClose={() => setPromoting(false)}
           onPromoted={openSessionDetail}

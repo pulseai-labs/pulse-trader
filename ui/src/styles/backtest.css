@@ -124,6 +124,72 @@
   outline-offset: 1px;
 }
 
+/* ---- the version picker (r4.s5.w2, A4) ---- */
+
+/* The input IS the toolbar's `bt-version` control and reuses `.bt-select`'s
+   chrome; the popup is the only new surface. Positioned against the root so it
+   opens over the result panes without displacing them. */
+
+.vp-root {
+  position: relative;
+}
+
+.vp-input:disabled {
+  color: var(--text-4);
+}
+
+.vp-list {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + var(--sp-1));
+  left: 0;
+  min-width: 360px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--sp-1) 0;
+  list-style: none;
+  background: var(--bg-overlay);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-6);
+  box-shadow: var(--shadow-pop);
+  font-size: var(--fs-13);
+  color: var(--text-1);
+}
+
+.vp-group {
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  color: var(--text-3);
+  font-size: var(--fs-12);
+  white-space: nowrap;
+}
+
+.vp-options {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vp-option {
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.vp-option.is-active {
+  background: var(--focus-bg);
+}
+
+.vp-option[aria-selected="true"] {
+  font-weight: var(--fw-medium);
+}
+
+.vp-empty {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
 /* ---- run error ---- */
 
 .bt-run-error {
