@@ -41,6 +41,7 @@ import type { ServerStatus } from "../bindings";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { isNavBuilt } from "../routes";
+import { EM_DASH } from "../format/numbers";
 
 // ---------------------------------------------------------------------------
 // Atoms (`app-shell.jsx`'s `Dot` / `Pill`)
@@ -227,6 +228,13 @@ export const NAV_ALL: readonly NavEntry[] = [...NAV_MAIN, ...NAV_BOTTOM];
 interface SidebarProps {
   /** The nav row id to mark `.is-active`, if any is mounted yet. */
   active?: string;
+  /**
+   * The live server connection status (r4.s5.w4, #310). The version label is
+   * read from the handshake's `binary_version`, not a literal: a version bump
+   * that misses this file used to ship a sidebar showing a stale number while
+   * the Connect screen showed the real one.
+   */
+  serverStatus?: ServerStatus;
 }
 
 /** Navigate to the Strategy Designer -- shared by the "New strategy" button's
@@ -245,7 +253,15 @@ function goToDesigner() {
  * "Simplicity First" discipline rules out), and the `.status-card` panel. See this
  * file's header comment.
  */
-export function Sidebar({ active }: SidebarProps) {
+export function Sidebar({ active, serverStatus }: SidebarProps) {
+  // The version label (#310): the handshake's own `binary_version`, and the
+  // mode of the app's actual connection — a client of a server, never the
+  // mock's hard-coded `local`. Until an `up` handshake answers, the em dash
+  // claims nothing (a stale literal is the bug this replaced).
+  const version =
+    serverStatus?.state === "up" && serverStatus.binary_version !== null
+      ? `v${serverStatus.binary_version} · server`
+      : EM_DASH;
   // The `⌘N` hint next to "New strategy" below only means something if the
   // shortcut is actually bound -- this is that binding (`/designer` is a real
   // route as of `r1.s1.w4`).
@@ -286,7 +302,7 @@ export function Sidebar({ active }: SidebarProps) {
         </div>
         <div className="brand-text">
           <div className="brand-name">PulseTrader</div>
-          <div className="brand-ver">v0.1.3 · local</div>
+          <div className="brand-ver">{version}</div>
         </div>
       </div>
 
@@ -540,7 +556,12 @@ export function WindowChrome({
           {serverStatus !== undefined && (
             <span className="title-status">
               <span className="dot" data-state={serverStatus.state} />
-              {serverStatusText(serverStatus)}
+              {/* r4.s5.w4 (#319): the strip stays on ONE line — this span is
+                  what truncates at a narrow width, and the full words ride its
+                  `title`. */}
+              <span className="ts-text" title={serverStatusText(serverStatus)}>
+                {serverStatusText(serverStatus)}
+              </span>
               {/* r4.s2.w3 (C5): QA's database is a copy of prod's, so a stale
                   URL landing on QA must be visible at a glance. `prod` and an
                   absent role (an older server) render nothing new. */}
@@ -552,8 +573,10 @@ export function WindowChrome({
             </span>
           )}
           {paperRunning !== undefined && (
-            <span className="title-status" title="Paper sessions running on the server">
-              {paperRunning} paper · 0 live
+            <span className="title-status">
+              <span className="ts-text" title={`${paperRunning} paper · 0 live`}>
+                {paperRunning} paper · 0 live
+              </span>
             </span>
           )}
         </div>

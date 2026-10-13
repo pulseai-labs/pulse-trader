@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The Backtest Lab's version picker, and the seeded QA library it searches (r4.s5.w2).** The Lab's
+  native version `<select>` is replaced by a searchable combobox (grill A4): type-to-filter,
+  case-insensitive, on the strategy name, the version label (`v<n>`) and the version id's 8-character
+  short id; options grouped by strategy in `version_tree` order, each row carrying the version number,
+  the created date, the short id and the Library's own creator line; when two strategies share a name,
+  every group with that name adds its created date and short id (#318); the pinned version is marked;
+  an empty filter says so in one line; and the keyboard map is ↓/↑ to move the active option, Enter to
+  select, Escape to close and Home/End to jump, with focus held in the input and
+  `aria-activedescendant` naming the active option — so a 120-version library is searchable without a
+  virtualisation library (#218). The selection now outlives the screen, so a reconnect — or an
+  ordinary tab navigation — keeps both the chosen version and the run the trader was reading (#315),
+  falling back to the first version only when the catalog no longer carries it.
+  `scripts/seed-qa-library.sh` fills QA with 12 strategies × 9 versions through the real MCP
+  `submit_strategy_version` (12 distinct names, both committed DSL families, one parameter varied per
+  child; a run-scoped agent token held only in a 0600 scratch file and revoked by a trap on every exit
+  path; the data dir's `server-role` and the server's handshake role are both checked `qa` before
+  anything is written; idempotent per strategy name), `scripts/seed-qa-library-test.sh` proves it on
+  scratch servers only, and `scripts/picker-test.sh` is the new ledger line over the picker and the
+  Lab.
+
 - **The paper session's money view reaches the Mac app (r4.s4.w2).** The session detail now shows, all
   from the server's own text: the running total (the Σ realized USDT and Σ R totals with their "n of
   m" counts, the open position's unrealized USDT and the session P&L); the open position marked at
@@ -258,6 +278,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The desktop frontend builds and tests on Vite 8, and `just ui-deps` follows the lockfile
+  (r4.s5.w5).** `vite` moved `^6.4.3` → `^8.3.4` (rolldown + lightningcss), `@vitejs/plugin-react`
+  `^5.2.0` → `^6.1.2` (its Vite 8 major) and `vitest` `^5.0.0` → `^5.0.4` (its peer range accepts
+  `vite ^8`); esbuild and rollup leave the tree with the old bundler (#121). `vite.config.ts` needs
+  no structural change — `build.target: "safari15"` is honoured by the rolldown/oxc transform, and
+  an unknown target is a hard build error — so the bundle is the same app: same asset set, 2,043,935
+  bytes total against the round-2 build's 2,038,368, with `emptyOutDir`, the jsdom test environment
+  and one config file kept (the before/after asset list and totals are in the work item's report).
+  Every existing vitest file passes unchanged on the new toolchain. `just ui-deps` now runs `npm ci`
+  when `node_modules` is absent **or** when `package-lock.json` no longer matches the `cksum` stamp
+  written after the last successful install, so a dependency bump can no longer leave a stale tree
+  for the next gate to trip on (#114); `scripts/ui-deps-lockfile-test.sh` proves the reinstall, the
+  no-op, the missing-stamp reinstall and the failed-install retry on scratch copies only.
+
+- **Every money, price, quantity, R, percent and time value on the Mac app's screens now reads in
+  human units (r4.s5.w1).** One shared format module — `ui/src/format/numbers.ts`, `time.ts` and the
+  `Figure` display component — turns the server's exact decimal text into A2's display forms on the
+  Backtest Lab (KPI tiles, regime rows and their twin, the 19-column trade log, the run provenance,
+  the walk-forward span, the folds sentence and the fold table, the before/after comparison), the
+  Library (version stats, the expectancies and the holdout window), the session detail (the running
+  total, the marked open position and its stops, orders and fills, the closed trades, the OOS
+  verdict), the deployment cards and the promote sheet. Money is `+1,234.56 USDT`, prices carry 2/4/6
+  decimals by magnitude, quantities trim to 4, R figures read `+1.25 R`, ratios read `41.7%`, the
+  folds sentence reads `6 of 6 folds hold (4 required)` (#305, #328), and every rendered time says it
+  is UTC (`2026-10-09 14:15 UTC`). The server's exact string stays one hover away on every element
+  (`title`/`data-exact`), the rounding is string arithmetic — the UI still computes no money
+  (ADR-0020, ADR-0027 addendum) — and a guard test (`ui/src/format/no-float-money.test.ts`) fails the
+  build if a `toFixed(` or an unmarked float conversion reappears on a screen. Wide tables keep
+  scrolling inside their panels (A3); `scripts/ui-format-test.sh` is the new ledger line.
+
 - **DSL schema 1.3.0 is the served and written version (r4.s6.w1).** `DSL_SCHEMA_VERSION` and
   `SchemaVersion::CURRENT` move to `1.3.0`; `1.0.0`, `1.1.0` and `1.2.0` documents still load
   (identity-migrated), the composer prompt's frontmatter pin and the `pulse://dsl/schema`
@@ -343,6 +393,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Preserved unmerged as [PR #123](https://github.com/pulseai-labs/pulse-trader/pull/123).
 
 ### Fixed
+
+- **The Library, Backtest Lab and Designer defects the r3/r4 walks filed (r4.s5.w3).** A version's
+  runs are reachable and legible again. Backtest Lab grows a **Runs** block beside the picker: the
+  version's own backtests and its latest walk-forward run, each row opening the persisted run it
+  names — `getBacktestRun` / `getWalkForwardRun`, nothing re-run (#331, #316) — plus an **Open run
+  by id** field that takes any backtest or walk-forward id, selects that run's version and shows it
+  (a refusal shows the server's own message); the walk-forward pane now names the version it ran on
+  too. Runs that are folds of the version's latest walk-forward are labelled `fold <n> of WF <short
+  id>` and grouped after the version's own runs, in the Lab and in the Library's Recent backtests
+  alike (#330) — one walk-forward read per id, cached; a fold of an older walk-forward stays
+  unmarked, because `LibraryRunSummary` carries no `walk_forward_run_id` (known limit, report §7).
+  The compare-with-parent panel heads each column with its run id (`parentRunId` before,
+  `childRunId` after, the full id on the element) and shows the `inputsNote` beside the `inputs
+  differ` badge instead of only on its hover (#326). The Library's certification run id is now a
+  button deep-linking `#/backtest?wf=<id>` — `resolveNavId` strips a query before resolving the nav
+  id, and the Lab selects the run's version and opens it (#269). The Designer marks a refused
+  composer tool call with ✕ and its error message and reads the composer's next call of that tool
+  as `retry` (#322) — failure is decided from `toolCallResult.outcome`'s own error-shaped JSON
+  (the serialized `FieldError` list or the unknown-tool object), never guessed — and the final step
+  (`finalize_strategy`) now shows its ✓ and result line when the stream closes, because a
+  successful finalize emits no `toolCallResult` and its closing line rides the `finished` event
+  (#317). A version-tree node's creator label truncates to one ellipsized line with the full line
+  on `title`, so `external_agent · claude-code` no longer pushes the hypothesis subline out of the
+  node (#325), and the version picker's created dates now render through w1's `dateUtc` (`YYYY-MM-DD
+  UTC`) instead of a local slice. `scripts/ui-polish-lab-test.sh` is the new ledger line over the
+  four suites.
+
+- **The r3/r4 walk-filed paper, title-strip and Settings defects no longer reproduce (r4.s5.w4).**
+  Paper session cards and the detail header read `last seen active · <time> UTC` — never a live
+  `● active` — while the server is not answering, both derive that badge from the same summary
+  function, and a session the server reports `running` reads `active` from promotion instead of the
+  invented `starting` (#338, #337, #304). The detail header and the cards show the session's own id
+  (the 8-character short form, the full id on hover) and name the version separately (#333); a
+  certified fixture session carries both the FIXTURE and CERTIFIED badges on the card and in the
+  detail (#334); the detail's certificate names each certified snapshot (#304); an exit fill reads
+  `close long`/`close short` and the table states the bar a fill belongs to and when an order was
+  placed (#382); the promote confirm reads `Promoting…`, cannot be submitted twice, and refreshes
+  the title strip's paper count at once (#336, #335); Settings stops offering Disconnect and Change
+  server once the link is disconnected (#386); an older status poll no longer overwrites a newer one
+  (#389); a failed session read no longer drops the queued trailing refresh (#371); the title strip
+  never wraps its words onto a second line (#319); and the sidebar version comes from the status
+  handshake instead of a hard-coded string (#310). `scripts/ui-polish-paper-test.sh` is the ledger
+  line over the seven test files and the typecheck.
 
 - **The `pulse://dsl/schema` resource read works from Claude Code (#353).** MCP clients on the
   2026-07-28 protocol revision validate `resources/read` and `resources/list` against that

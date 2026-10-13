@@ -124,6 +124,72 @@
   outline-offset: 1px;
 }
 
+/* ---- the version picker (r4.s5.w2, A4) ---- */
+
+/* The input IS the toolbar's `bt-version` control and reuses `.bt-select`'s
+   chrome; the popup is the only new surface. Positioned against the root so it
+   opens over the result panes without displacing them. */
+
+.vp-root {
+  position: relative;
+}
+
+.vp-input:disabled {
+  color: var(--text-4);
+}
+
+.vp-list {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + var(--sp-1));
+  left: 0;
+  min-width: 360px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--sp-1) 0;
+  list-style: none;
+  background: var(--bg-overlay);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-6);
+  box-shadow: var(--shadow-pop);
+  font-size: var(--fs-13);
+  color: var(--text-1);
+}
+
+.vp-group {
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  color: var(--text-3);
+  font-size: var(--fs-12);
+  white-space: nowrap;
+}
+
+.vp-options {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vp-option {
+  padding: var(--sp-1) var(--sp-3);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.vp-option.is-active {
+  background: var(--focus-bg);
+}
+
+.vp-option[aria-selected="true"] {
+  font-weight: var(--fw-medium);
+}
+
+.vp-empty {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
 /* ---- run error ---- */
 
 .bt-run-error {
@@ -141,6 +207,55 @@
 .bt-saved-run {
   margin: 0;
   color: var(--text-2);
+}
+
+/* ---- the version's runs (r4.s5.w3, #331/#316/#330) ---- */
+
+/* The Runs block reuses the Library's `.bt-list`/`.bt-row` shape (library.css,
+   loaded above this sheet) for the rows themselves; these rules own only what
+   the Lab adds — the walk-forward row, the fold label and the open-by-id row. */
+.bt-runs-list {
+  margin-bottom: var(--sp-3);
+}
+
+.bt-runs-wf {
+  border-top: 1px dashed var(--line-1);
+  padding-top: 6px;
+}
+
+/* #330: the walk-forward row's mark — the fold label itself lives with the
+   `.bt-row` family in library.css, because the Library's rows wear it too. */
+.bt-wf-label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--text-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-4);
+  padding: 1px 4px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.bt-run-open {
+  flex-shrink: 0;
+}
+
+.bt-open-id {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.bt-open-input {
+  min-width: 22rem;
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+}
+
+.bt-open-id .bt-open-go {
+  flex-shrink: 0;
 }
 
 /* ---- walk-forward pane (r2.s3.w5) ---- */

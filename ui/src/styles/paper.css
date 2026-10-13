@@ -103,11 +103,6 @@
   border-color: var(--bull-line);
   background: var(--bull-bg);
 }
-.dep-status.st-starting {
-  color: var(--focus);
-  border-color: var(--focus);
-  background: var(--focus-bg);
-}
 .dep-status.st-stopped {
   color: var(--text-3);
   background: var(--bg-sunken);
@@ -116,6 +111,14 @@
   color: var(--bear-1);
   border-color: var(--bear-line);
   background: var(--bear-bg);
+}
+/* r4.s5.w4 (#338): the server is not answering — the badge states what was
+   last seen, so it paints neutral, never the live green. It carries no `st-*`
+   state class and no pulse dot (the component adds neither). */
+.dep-status.is-stale {
+  color: var(--text-3);
+  border-color: var(--line-2);
+  background: var(--bg-sunken);
 }
 
 /* ------------------------------------------------------------
@@ -468,6 +471,10 @@
   border-radius: var(--r-4);
   padding: 4px var(--sp-2);
   cursor: pointer;
+}
+.btn-bear-sec-sm:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 .btn-bear-solid-sm {
   font: inherit;

@@ -4,14 +4,15 @@
 // (`commands.libraryOverview` — the Library's own read, no second catalog) and
 // presses Run: `commands.runBacktestVersion({ versionId })` executes W3's
 // fixed request/response command and this screen renders only the fresh
-// `BacktestRunDto` it returns. Every decimal and epoch value is the DTO's own
-// exact string — display truth is the string itself. The ONLY numeric
-// conversion in this file is `parseFloat` for chart geometry (pixel
-// positions), never for display, derivation or comparison; the screen does no
-// binning, no money math, no deltas, no re-backtest, and invents no value the
-// DTO does not carry. No sample option, no mock run, no progress percentage,
-// no cancel affordance — the command is request/response and r1's target is
-// <5s.
+// `BacktestRunDto` it returns. Every money, price, quantity, R, percent and
+// time value is formatted by `ui/src/format/` (r4.s5.w1, A2) and carries the
+// DTO's own exact string on the element (`title`/`data-exact`) — display truth
+// is still the string itself, one hover away. The ONLY numeric conversions in
+// this file are the `// chart geometry` ones (pixel positions and bar widths),
+// never for display, derivation or comparison; the screen does no binning, no
+// money math, no deltas, no re-backtest, and invents no value the DTO does not
+// carry. No sample option, no mock run, no progress percentage, no cancel
+// affordance — the command is request/response and r1's target is <5s.
 //
 // Convention (UnbuiltScreen.tsx is the worked example): one file per screen,
 // default export, zero props — the shell mounts it from the route table and
@@ -48,51 +49,92 @@ import type {
   OperationRecord,
 } from "../hooks/useActiveOperations";
 import { PromoteSheet } from "../components/PromoteSheet";
+import { Figure } from "../format/Figure";
+import {
+  decimal,
+  foldsHold,
+  percentFromFraction,
+  price,
+  qty,
+  rMultiple,
+  usdt,
+} from "../format/numbers";
+import { dateRange, dateUtc, timeUtc } from "../format/time";
+import { VersionPicker, buildVersionGroups } from "../components/VersionPicker";
+import {
+  foldLabel,
+  foldMapOf,
+  orderRunsWithFolds,
+  readWalkForwardRunOnce,
+} from "../hooks/useWalkForwardFolds";
+import type { FoldMap } from "../hooks/useWalkForwardFolds";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { openSessionDetail, takeRequestedBacktestVersion } from "../paper/handoff";
+import { backtestDeepLink } from "../routes";
+import { readBacktestSelection, rememberBacktestSelection } from "./backtestSelection";
 
 /** The em dash every null renders — a statement that no value exists, never
  * a zero dressed up as data (the Library's grill A1 rule, applied here). */
 const EM_DASH = "—";
 
+/** How much of a run id a row shows: the Library rows' and the picker's own
+ * short-id convention (`8`). */
+const SHORT_ID_LEN = 8;
+
+/** No folds known yet (the pane has no walk-forward in hand): every run is its
+ * own run, no label — never a guess. */
+const NO_FOLDS: FoldMap = new Map();
+
 /** The one window into the chart geometry exception: a DTO string becomes a
  * number ONLY to place a pixel. Never displayed, never compared, never
  * re-formatted. */
 function num(value: string): number {
-  return Number.parseFloat(value);
+  return Number.parseFloat(value); // chart geometry
+}
+
+/** A `number` DTO field (Sharpe, a fold bound — the wire refuses them as text)
+ * as the exact decimal text the module reads. Serialization, never
+ * arithmetic. */
+function asText(value: number | null): string | null {
+  return value === null ? null : String(value);
 }
 
 // ---------------------------------------------------------------------------
 // Catalog state (the selector's four explicit states)
 // ---------------------------------------------------------------------------
 
-/** One selectable option: a real (strategy, version) pair from the payload. */
-interface Option {
-  /** The version's id — the run request's `versionId`. */
-  value: string;
-  /** `Strategy name · vN`, N the version's position in its parent-ordered list. */
-  label: string;
-}
-
 type CatalogState =
   | { kind: "loading" }
   | { kind: "error"; code: string; message: string }
   | { kind: "empty" }
   // The overview rides along (r2.s1.w4 C3): the compare section needs the
-  // selected version's `parentId` and `recentRuns`, which the flattened
-  // options do not carry.
-  | { kind: "ready"; options: Option[]; overview: LibraryOverview };
+  // selected version's `parentId` and `recentRuns`, and the picker renders the
+  // catalog's own groups. `ids` is that overview's version ids in catalog order
+  // — where the default selection comes from and what a refetched selection is
+  // checked against.
+  | { kind: "ready"; overview: LibraryOverview; ids: string[] };
 
-/** Flatten the catalog's strategies into the selector's options — the real
- * versions only; a version not in the payload cannot appear here. */
-function catalogOptions(overview: LibraryOverview): Option[] {
-  const options: Option[] = [];
+/** Every version id the catalog carries, in catalog order. */
+function catalogVersionIds(overview: LibraryOverview): string[] {
+  const ids: string[] = [];
   for (const strategy of overview.strategies) {
-    strategy.versions.forEach((version: LibraryVersion, index: number) => {
-      options.push({ value: version.id, label: `${strategy.name} · v${index + 1}` });
-    });
+    for (const version of strategy.versions) {
+      ids.push(version.id);
+    }
   }
-  return options;
+  return ids;
+}
+
+/** The promote sheet's version label: the picker's own row text for that
+ * version, so the sheet and the picker never describe a version differently. */
+function versionLabelOf(overview: LibraryOverview, versionId: string): string {
+  for (const group of buildVersionGroups(overview.strategies)) {
+    const option = group.options.find((candidate) => candidate.id === versionId);
+    if (option !== undefined) {
+      return option.text;
+    }
+  }
+  return versionId;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +210,10 @@ const K_MAX = 12;
  * field keeps today's meaning — "use the backend default" (the input's own
  * contract, and what the pre-#212 behaviour already did) — an exact integer in
  * `[K_MIN, K_MAX]` goes through as `k`, and ANYTHING else is refused without
- * starting an operation. [`Number.parseInt`] is deliberately not used alone:
- * it silently truncates (`"6.9"` → `6`) and accepts prefixes (`"12x"` → `12`),
- * and both would start a walk the trader did not ask for.
+ * starting an operation. The `/^\d+$/` guard above is what makes the parse
+ * exact: it refuses the truncation (`"6.9"`) and the prefix (`"12x"`) that
+ * `Number.parseInt` alone would silently accept, so the integer read here is
+ * the whole input and never a prefix of it.
  */
 export function parseFoldCount(
   raw: string,
@@ -183,7 +226,7 @@ export function parseFoldCount(
   if (!/^\d+$/.test(text)) {
     return { kind: "refused", message };
   }
-  const k = Number(text);
+  const k = Number.parseInt(text, 10);
   if (!Number.isSafeInteger(k) || k < K_MIN || k > K_MAX) {
     return { kind: "refused", message };
   }
@@ -242,7 +285,7 @@ function useWalkForward(operations: ActiveOperations, versionId: string | null) 
     );
   }, [operations, versionId, folds]);
 
-  const openFold = useCallback(
+  const openRun = useCallback(
     (runId: string) => {
       if (versionId === null) return;
       operations.start(backtestKey(versionId), () => commands.getBacktestRun({ runId }));
@@ -250,7 +293,7 @@ function useWalkForward(operations: ActiveOperations, versionId: string | null) 
     [operations, versionId],
   );
 
-  return { state, folds, setFolds: setFoldsDraft, start, openFold, refusal };
+  return { state, folds, setFolds: setFoldsDraft, start, openRun, refusal };
 }
 
 // ---------------------------------------------------------------------------
@@ -329,15 +372,23 @@ function reopenedStateFor(held: HeldReopened, target: string | null): ReopenedSt
  * that stale id no longer matches the target, the pane then read as loading for
  * good, with no further effect to run. So each started read takes a generation,
  * and `settle` drops anything that is not the current one.
+ *
+ * **An explicit request outranks both (#316).** `requestedId` is a run the trader
+ * asked for by name — the Runs row or the "open run by id" field — and it is read
+ * even when this session holds a walk-forward record for the version, because the
+ * request names a specific run the record cannot stand in for. A selection change
+ * clears it, so the pane never shows one version's requested run under another.
  */
 function useReopenedWalkForward(
   operations: ActiveOperations,
   version: LibraryVersion | null,
+  requestedId: string | null,
 ): ReopenedState {
   const target =
-    version !== null && operations.lookup(walkForwardKey(version.id)) === undefined
+    requestedId ??
+    (version !== null && operations.lookup(walkForwardKey(version.id)) === undefined
       ? version.latestWalkForwardRunId
-      : null;
+      : null);
   const [held, setHeld] = useState<HeldReopened>({
     id: null,
     state: { kind: "idle" },
@@ -602,8 +653,26 @@ const TRADE_FIELDS = [
 
 export default function BacktestLabScreen() {
   const [catalog, setCatalog] = useState<CatalogState>({ kind: "loading" });
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // #315: the selection outlives this screen — it re-mounts on every navigation
+  // and whenever the gate takes the app down for a server restart. `null` until
+  // the trader has chosen; the catalog read then reconciles it.
+  const [selectedId, setSelectedId] = useState<string | null>(() => readBacktestSelection());
   const [promoting, setPromoting] = useState(false);
+  /** The walk-forward a trader asked for by name (#316) — the Runs row, the
+   * "open run by id" field, or the Library's certification deep link — read even
+   * when this session holds a walk-forward record for the version, because the
+   * request names a run the record cannot stand in for. A selection change
+   * clears it (the deep link re-sets it in the same tick it selects). */
+  const [requestedWf, setRequestedWf] = useState<string | null>(null);
+  /** The "open run by id" draft, and the refusal it earned (#316/#331). */
+  const [runIdDraft, setRunIdDraft] = useState("");
+  const [openByIdError, setOpenByIdError] = useState<BusError | null>(null);
+  /** The selection-request generation (#269/#316/#331): each selection read —
+   * the deep-link take, every openById submit — bumps it and captures its
+   * value, and every explicit selection (`selectVersion`) bumps it too. A read
+   * applies its answer only while its captured generation is still current, so
+   * a newer request or a later pick always supersedes it. */
+  const selectionGeneration = useRef(0);
   /** Every active operation, held above the route (#141). The Lab READS it. */
   const operations = useActiveOperations();
 
@@ -625,16 +694,18 @@ export default function BacktestLabScreen() {
         const result = await commands.libraryOverview();
         if (!alive()) return new Set();
         if (result.status === "ok") {
-          const options = catalogOptions(result.data);
+          const ids = catalogVersionIds(result.data);
           setCatalog(
-            options.length === 0
+            ids.length === 0
               ? { kind: "empty" }
-              : { kind: "ready", options, overview: result.data },
+              : { kind: "ready", overview: result.data, ids },
           );
-          const known = new Set(options.map((option) => option.value));
-          // C2 (r2.s1.w4): a refetch keeps the selection ONLY while the
+          const known = new Set(ids);
+          // C2 (r2.s1.w4) + #315: a refetch keeps the selection ONLY while the
           // refreshed catalog still carries it — a vanished version falls back
-          // to the first option rather than rendering a blank select.
+          // to the default rather than rendering an empty picker. The
+          // REMEMBERED id is not touched here: the catalog owns validity, and
+          // the next remount re-reconciles against whatever it carries then.
           setSelectedId((current) =>
             current !== null && !known.has(current) ? null : current,
           );
@@ -671,11 +742,55 @@ export default function BacktestLabScreen() {
   useEffect(() => {
     const take = () => {
       const requested = takeRequestedBacktestVersion();
-      if (requested !== null) setSelectedId(requested);
+      if (requested !== null) selectVersion(requested);
     };
     take();
     window.addEventListener("hashchange", take);
     return () => window.removeEventListener("hashchange", take);
+  }, []);
+
+  // #269: the Library's certification line deep-links to `#/backtest?wf=<id>` —
+  // the Lab selects that run's version and opens the run. A READ, like the Runs
+  // rows: nothing on this path starts a run. Consumed on mount (the navigation
+  // mounts this screen) and on the next hash change (the screen was already
+  // open), and replaced with the plain `#/backtest` BEFORE the read so a
+  // remount (a reconnect) cannot replay it over the remembered selection
+  // (#315). A read a later link or pick supersedes never applies its result.
+  // The read is shared with the fold labels' cache, so the run the fragment
+  // names costs one `getWalkForwardRun` across both consumers.
+  useEffect(() => {
+    const take = () => {
+      const link = backtestDeepLink(window.location.hash);
+      if (link === null) return;
+      // Consume the fragment before the async read (see the comment above).
+      window.history.replaceState(null, "", "#/backtest");
+      const generation = ++selectionGeneration.current;
+      void (async () => {
+        try {
+          const result = await readWalkForwardRunOnce(link.wf);
+          if (generation !== selectionGeneration.current) return;
+          if (result.status !== "ok") {
+            setOpenByIdError(result.error);
+            return;
+          }
+          setOpenByIdError(null);
+          selectVersion(result.data.versionId);
+          setRequestedWf(result.data.walkForwardRunId);
+        } catch {
+          if (generation !== selectionGeneration.current) return;
+          setOpenByIdError(readFailure());
+        }
+      })();
+    };
+    take();
+    window.addEventListener("hashchange", take);
+    return () => {
+      window.removeEventListener("hashchange", take);
+      // Unmount supersedes every selection read still in flight (the deep
+      // link's, openById's): nothing from an unmounted Lab may select or start
+      // a run.
+      supersedeSelectionReads();
+    };
   }, []);
 
   // C2 (r2.s1.w4): versions and runs written by `pulse mcp` surface on window
@@ -688,8 +803,8 @@ export default function BacktestLabScreen() {
     }, [loadCatalog]),
   );
 
-  const options = catalog.kind === "ready" ? catalog.options : [];
-  const currentId = selectedId ?? options[0]?.value ?? null;
+  const ids = catalog.kind === "ready" ? catalog.ids : [];
+  const currentId = selectedId ?? ids[0] ?? null;
   /** This version's operation, whoever started it and whenever. Keyed by version,
    * so a result can never be attributed to a version it was not run for — the
    * property the old bumped token approximated. */
@@ -715,16 +830,43 @@ export default function BacktestLabScreen() {
       : null;
 
   /** #268: the version's persisted walk-forward run, read when this session has
-   * no record of its own — what makes a finished run openable after a relaunch. */
-  const reopened = useReopenedWalkForward(operations, selectedVersion);
-  const pane = paneStateOf(wf.state, reopened);
+   * no record of its own — what makes a finished run openable after a relaunch.
+   * #316: an explicitly requested run (#316) is read instead of the pointer, and
+   * outranks this session's record — the trader named that run. */
+  const reopened = useReopenedWalkForward(operations, selectedVersion, requestedWf);
+  const pane =
+    requestedWf !== null
+      ? paneStateOf({ kind: "idle" }, reopened)
+      : paneStateOf(wf.state, reopened);
+
+  /** An explicit action that changes what the Lab shows — a pick, an accept, a
+   * run opened from the Runs list or the fold table — supersedes every
+   * selection read still in flight (#269/#316/#331): their captured generation
+   * goes stale, so their answers cannot move the screen off what the trader
+   * chose. */
+  function supersedeSelectionReads() {
+    selectionGeneration.current += 1;
+  }
 
   /** Selecting a version shows THAT version's operation. Nothing is cleared and
    * nothing is cancelled: each version's record is its own, so a run still going
    * for the previous selection stays going, and coming back to it shows it. The
-   * coach rail is per-run, so it closes with the selection. */
-  function onSelectorChange(id: string) {
+   * coach rail is per-run, so it closes with the selection.
+   *
+   * Every path that SELECTS — the picker's change, the accept's child select,
+   * the stale sheet's request — lands here, so every one of them REMEMBERS the
+   * id and a remount re-selects the same version (#315). The catalog still owns
+   * whether the id is real: `loadCatalog`'s reconcile drops one it no longer
+   * carries, and the next remount re-reconciles against whatever it carries then. */
+  function selectVersion(id: string) {
+    // A pick supersedes every selection read still in flight (see above).
+    supersedeSelectionReads();
+    rememberBacktestSelection(id);
     setSelectedId(id);
+    // An explicitly requested run belongs to the version selected when it was
+    // asked for; a new selection drops it (the deep link re-sets it in the same
+    // tick it selects the run's version).
+    setRequestedWf(null);
   }
 
   /**
@@ -737,9 +879,12 @@ export default function BacktestLabScreen() {
    * catalog actually contains.
    */
   async function onSelectChild(versionId: string) {
+    // The accept's child select is an explicit action: it supersedes every
+    // selection read still in flight before the catalog refetch it awaits.
+    supersedeSelectionReads();
     const known = await loadCatalog();
     if (known.has(versionId)) {
-      setSelectedId(versionId);
+      selectVersion(versionId);
     }
   }
 
@@ -755,6 +900,62 @@ export default function BacktestLabScreen() {
     operations.start(backtestKey(currentId), () =>
       commands.runBacktestVersion({ versionId: currentId }),
     );
+  }
+
+  /**
+   * Open a run by id (#331/#316): a backtest run first — `getBacktestRun` opens
+   * a walk-forward fold's id as an ordinary run by the server's own contract —
+   * then a walk-forward run when the backtest read refuses `not_found`. Both are
+   * READS; nothing on this path starts a run. When both refuse, the backtest
+   * read's message is the one shown: it is the read that asked first, and its
+   * `child_run_id` carries the id the trader typed. Each submit is a selection
+   * request of its own: it captures the selection generation, and a newer
+   * submit, or a later pick by the trader, makes every remaining apply on its
+   * path a no-op (#269/#316).
+   */
+  async function openById() {
+    const runId = runIdDraft.trim();
+    if (runId === "") return;
+    // Every submit is a selection request of its own: it supersedes earlier
+    // submits, and any newer pick supersedes it (see the ref's comment).
+    const generation = ++selectionGeneration.current;
+    setOpenByIdError(null);
+    let backtest: BusResult<BacktestRunDto>;
+    try {
+      backtest = await commands.getBacktestRun({ runId });
+    } catch {
+      if (generation !== selectionGeneration.current) return;
+      setOpenByIdError(readFailure());
+      return;
+    }
+    if (generation !== selectionGeneration.current) return;
+    if (backtest.status === "ok") {
+      const dto = backtest.data;
+      selectVersion(dto.strategyVersionId);
+      // The store holds exactly the answer just read: no second read, and the
+      // run command is nowhere near this path.
+      operations.start(backtestKey(dto.strategyVersionId), () => Promise.resolve(backtest));
+      return;
+    }
+    if (backtest.error.code !== "not_found") {
+      setOpenByIdError(backtest.error);
+      return;
+    }
+    let walkForward: BusResult<WalkForwardRunDto>;
+    try {
+      walkForward = await readWalkForwardRunOnce(runId);
+    } catch {
+      if (generation !== selectionGeneration.current) return;
+      setOpenByIdError(readFailure());
+      return;
+    }
+    if (generation !== selectionGeneration.current) return;
+    if (walkForward.status === "ok") {
+      selectVersion(walkForward.data.versionId);
+      setRequestedWf(walkForward.data.walkForwardRunId);
+      return;
+    }
+    setOpenByIdError(backtest.error);
   }
 
   // --- the coach rail (r1.s4.w3) ------------------------------------------
@@ -865,19 +1066,12 @@ export default function BacktestLabScreen() {
           <label className="bt-select-label" htmlFor="bt-version">
             Strategy version
           </label>
-          <select
-            id="bt-version"
-            className="bt-select"
-            value={currentId ?? ""}
-            onChange={(event) => onSelectorChange(event.target.value)}
+          <VersionPicker
+            strategies={catalog.overview.strategies}
+            value={currentId}
+            onChange={selectVersion}
             disabled={busy}
-          >
-            {options.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+          />
           <button
             type="button"
             className="bt-run btn-prim"
@@ -906,13 +1100,80 @@ export default function BacktestLabScreen() {
           <button
             type="button"
             className="bt-walk btn-sec"
-            onClick={wf.start}
+            onClick={() => {
+              // A fresh walk-forward is the run the pane must show: a request
+              // for an older one is done with.
+              setRequestedWf(null);
+              wf.start();
+            }}
             disabled={busy || currentId === null}
           >
             {wf.state.kind === "running" ? "Walking forward…" : "Walk forward"}
           </button>
           {/* No percentage, no cancel — both commands are request/response. */}
         </div>
+      )}
+
+      {/* r4.s5.w3 (#331, #316): the version's runs are reachable beside the
+          picker — its own backtests and its latest walk-forward run, each row
+          opening the persisted run it names (a READ: `getBacktestRun` /
+          `getWalkForwardRun`, never a new run). Below the toolbar rather than
+          inside it: the toolbar is one horizontal row, and a list needs a
+          full-width block of its own (A3's rule read the same way). The field
+          opens ANY backtest or walk-forward run id — the Lab selects that run's
+          version and shows it. */}
+      {catalog.kind === "ready" && selectedVersion !== null && (
+        <section className="bt-section bt-runs" aria-label="Version runs">
+          <h3 className="bt-h">Runs</h3>
+          <VersionRuns
+            version={selectedVersion}
+            busy={busy}
+            folds={pane.kind === "done" ? foldMapOf(pane.dto) : NO_FOLDS}
+            onOpenRun={(runId) => {
+              supersedeSelectionReads();
+              wf.openRun(runId);
+            }}
+            onOpenWalkForward={(walkForwardRunId) => {
+              supersedeSelectionReads();
+              setRequestedWf(walkForwardRunId);
+            }}
+          />
+          <div className="bt-open-id">
+            <label className="bt-select-label" htmlFor="bt-open-run">
+              Open run by id
+            </label>
+            <input
+              id="bt-open-run"
+              className="bt-select bt-open-input mono"
+              type="text"
+              value={runIdDraft}
+              placeholder="backtest or walk-forward run id"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={busy}
+              onChange={(event) => {
+                setRunIdDraft(event.target.value);
+                // Editing the draft clears the refusal — it described the old id.
+                setOpenByIdError(null);
+              }}
+            />
+            <button
+              type="button"
+              className="bt-open-go btn-sec"
+              onClick={() => void openById()}
+              disabled={busy || runIdDraft.trim() === ""}
+            >
+              Open
+            </button>
+          </div>
+          {openByIdError !== null && (
+            <div className="bt-run-error" role="alert">
+              <div>
+                <span className="mono">{openByIdError.code}</span> {openByIdError.message}
+              </div>
+            </div>
+          )}
+        </section>
       )}
 
       {/* C3 (r2.s1.w4): a child version's latest run beside its parent's — for
@@ -930,16 +1191,19 @@ export default function BacktestLabScreen() {
           one read back by id. */}
       <WalkForwardPane
         state={pane}
-        onOpenFold={wf.openFold}
+        onOpenFold={(runId) => {
+          supersedeSelectionReads();
+          wf.openRun(runId);
+        }}
         onPromote={selectedVersion === null ? null : () => setPromoting(true)}
       />
 
-      {promoting && selectedVersion !== null && (
+      {promoting && selectedVersion !== null && catalog.kind === "ready" && (
         <PromoteSheet
           target={{
             version: selectedVersion,
             strategyName: selectedVersion.dsl.name,
-            versionLabel: options.find((option) => option.value === selectedVersion.id)?.label ?? selectedVersion.id,
+            versionLabel: versionLabelOf(catalog.overview, selectedVersion.id),
           }}
           onClose={() => setPromoting(false)}
           onPromoted={openSessionDetail}
@@ -1000,6 +1264,88 @@ export default function BacktestLabScreen() {
         </div>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The version's runs (#331, #316) — the persisted runs the trader can open
+// ---------------------------------------------------------------------------
+//
+// Every row names a run the SERVER holds and opens it by id: an own backtest
+// through `getBacktestRun` (the same read the fold table already uses) or the
+// version's latest walk-forward through its own persisted read — never a new
+// run. The list is the version's `recentRuns` plus the catalogue pointer,
+// rendered in the Library's run-row shape, and it renders no row the payload
+// does not carry.
+
+function VersionRuns({
+  version,
+  busy,
+  folds,
+  onOpenRun,
+  onOpenWalkForward,
+}: {
+  version: LibraryVersion;
+  busy: boolean;
+  folds: FoldMap;
+  onOpenRun: (runId: string) => void;
+  onOpenWalkForward: (walkForwardRunId: string) => void;
+}) {
+  const pointer = version.latestWalkForwardRunId;
+  const rows = orderRunsWithFolds(version.recentRuns, folds);
+  return (
+    <>
+      {rows.length === 0 ? (
+        <div className="bt-none dim">None yet.</div>
+      ) : (
+        <div className="bt-list bt-runs-list">
+          {rows.map(({ run, fold }) => (
+            <div key={run.id} className="bt-row">
+              <span className="bt-id mono">{run.id.slice(0, SHORT_ID_LEN)}</span>
+              {/* #330: a fold of the walk-forward the pane read wears its own
+                  label; every other row is an own run and wears none. */}
+              {fold !== null && (
+                <span className="bt-fold-label mono">{foldLabel(fold)}</span>
+              )}
+              <span className="bt-range">
+                <Figure exact={run.createdAt}>{dateUtc(run.createdAt)}</Figure>
+              </span>
+              <span className="bt-spacer" />
+              <span className={`mono ${run.expectancy.startsWith("-") ? "bear" : "bull"}`}>
+                <Figure exact={run.expectancy}>{rMultiple(run.expectancy)}</Figure>
+              </span>
+              <span className="mono dim">{run.trades}t</span>
+              <button
+                type="button"
+                className="bt-run-open btn-sec-sm"
+                onClick={() => onOpenRun(run.id)}
+                disabled={busy}
+              >
+                open run <span className="mono">{run.id.slice(0, SHORT_ID_LEN)}</span>
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* #316: the version's latest walk-forward run — the catalogue's own
+          pointer — opens here like any other run: `getWalkForwardRun` reads it
+          back with its folds and verdict, and starts nothing. */}
+      {pointer !== null && (
+        <div className="bt-row bt-runs-wf">
+          <span className="bt-id mono">{pointer.slice(0, SHORT_ID_LEN)}</span>
+          <span className="bt-wf-label mono">walk-forward</span>
+          <span className="bt-spacer" />
+          <button
+            type="button"
+            className="bt-run-open btn-sec-sm"
+            onClick={() => onOpenWalkForward(pointer)}
+            disabled={busy}
+          >
+            open walk-forward
+          </button>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1085,11 +1431,17 @@ function WalkForwardResult({
     <section className="bt-section bt-walkforward" aria-label="Walk-forward result">
       <h3 className="bt-h">Walk-forward</h3>
       <div className="bt-wf-meta">
+        {/* #316's own comment: the pane names the VERSION it ran on, the way
+            the backtest result band already does — verifying which version a
+            walk-forward ran on must not need the Library's certification line. */}
+        <Field label="version">{dto.versionId}</Field>
         <Field label="scheme">{dto.scheme}</Field>
         <Field label="rule">{dto.rule}</Field>
         <Field label="folds">{dto.k}</Field>
         <Field label="span">
-          {dto.spanFrom} → {dto.spanTo}
+          <Figure exact={`${dto.spanFrom} → ${dto.spanTo}`}>
+            {dateRange(dto.spanFrom, dto.spanTo)}
+          </Figure>
         </Field>
         {/* `from_defaulted` is stated either way — an explicit bound and a
             defaulted one are different provenance, both worth seeing. */}
@@ -1101,11 +1453,13 @@ function WalkForwardResult({
       </div>
       <p className={`bt-wf-verdict ${verdict.pass ? "bt-wf-pass" : "bt-wf-fail"}`}>
         <span className="bt-wf-verdict-word">{verdict.pass ? "PASS" : "FAIL"}</span>{" "}
+        <span className="mono">{foldsHold(verdict.foldsHolding, dto.k, verdict.foldsRequired)}</span>{" "}
+        · pooled lower bound{" "}
         <span className="mono">
-          {verdict.foldsHolding}/{verdict.foldsRequired}
-        </span>{" "}
-        folds hold · pooled lower bound{" "}
-        <span className="mono">{verdict.pooled.lowerBound ?? EM_DASH}</span>
+          <Figure exact={asText(verdict.pooled.lowerBound)}>
+            {decimal(asText(verdict.pooled.lowerBound), 2)}
+          </Figure>
+        </span>
         {/* r3.s4.w5: spec §2's second entry point — a passing verdict offers
             the promotion right here. The sheet decides the variant from the
             server; this button only opens it. */}
@@ -1134,16 +1488,30 @@ function WalkForwardResult({
             {dto.folds.map((fold) => (
               <tr key={fold.index}>
                 <td className="mono">{fold.index}</td>
-                <td className="mono">{fold.windowFrom}</td>
-                <td className="mono">{fold.windowTo}</td>
+                <td className="mono">
+                  <Figure exact={fold.windowFrom}>{timeUtc(fold.windowFrom)}</Figure>
+                </td>
+                <td className="mono">
+                  <Figure exact={fold.windowTo}>{timeUtc(fold.windowTo)}</Figure>
+                </td>
                 {/* The verdict's own count, not the fold run's (`fold.trades`):
                     this is the per-fold VERDICT table, and bindings document `n`
                     as "the trades the `wf-v1` verdict saw" (equal in production). */}
                 <td className="mono">{fold.n}</td>
-                <td className="mono">{fold.lowerBound ?? EM_DASH}</td>
+                <td className="mono">
+                  <Figure exact={asText(fold.lowerBound)}>
+                    {decimal(asText(fold.lowerBound), 2)}
+                  </Figure>
+                </td>
                 <td>{fold.holds ? "yes" : "no"}</td>
-                <td className="mono">{fold.expectancy}</td>
-                <td className="mono">{fold.winRate}</td>
+                <td className="mono">
+                  <Figure exact={fold.expectancy}>
+                    {usdt(fold.expectancy, { signed: true })}
+                  </Figure>
+                </td>
+                <td className="mono">
+                  <Figure exact={fold.winRate}>{percentFromFraction(fold.winRate)}</Figure>
+                </td>
                 <td>
                   <button
                     type="button"
@@ -1201,9 +1569,13 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
           timeframe is fixed (`1d`), so the version is the whole value. */}
       {dto.d1DataVersion != null && <Field label="d1">{dto.d1DataVersion}</Field>}
       <Field label="date range">
-        {dto.firstOpenTimeMs} → {dto.lastCloseTimeMs}
+        <Figure exact={`${dto.firstOpenTimeMs} → ${dto.lastCloseTimeMs}`}>
+          {dateRange(dto.firstOpenTimeMs, dto.lastCloseTimeMs)}
+        </Figure>
       </Field>
-      <Field label="starting equity">{dto.startingEquity}</Field>
+      <Field label="starting equity">
+        <Figure exact={dto.startingEquity}>{usdt(dto.startingEquity)}</Figure>
+      </Field>
       <Field label="taker fee">{dto.takerFeeBps} bps</Field>
       <Field label="slippage">{dto.slippageBps} bps</Field>
       <Field label="funding">{dto.funding}</Field>
@@ -1212,9 +1584,26 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
           reads loose (`!= null`) so a fixture or cached payload that predates
           the field degrades to "not recorded" instead of a TypeError. */}
       <Field label="filters">
-        {dto.symbolFilters != null
-          ? `lot_step ${dto.symbolFilters.lotStep} · min_qty ${dto.symbolFilters.minQty} · min_notional ${dto.symbolFilters.minNotional} · max_leverage ${dto.symbolFilters.maxLeverage}`
-          : "not recorded"}
+        {dto.symbolFilters != null ? (
+          <>
+            lot_step{" "}
+            <Figure exact={dto.symbolFilters.lotStep}>
+              {qty(dto.symbolFilters.lotStep)}
+            </Figure>{" "}
+            · min_qty{" "}
+            <Figure exact={dto.symbolFilters.minQty}>{qty(dto.symbolFilters.minQty)}</Figure> ·
+            min_notional{" "}
+            <Figure exact={dto.symbolFilters.minNotional}>
+              {usdt(dto.symbolFilters.minNotional)}
+            </Figure>{" "}
+            · max_leverage{" "}
+            <Figure exact={dto.symbolFilters.maxLeverage}>
+              {qty(dto.symbolFilters.maxLeverage)}
+            </Figure>
+          </>
+        ) : (
+          "not recorded"
+        )}
       </Field>
       <Field label="engine">
         {dto.engineFingerprint} · {dto.engineTarget}
@@ -1223,7 +1612,9 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
       <Field label="run">{dto.runId}</Field>
       <Field label="version">{dto.strategyVersionId}</Field>
       <Field label="schema">{dto.schemaVersion}</Field>
-      <Field label="created">{dto.createdAt}</Field>
+      <Field label="created">
+        <Figure exact={dto.createdAt}>{timeUtc(dto.createdAt)}</Figure>
+      </Field>
       {/* The DTO's one control-metadata exception: the pre-save comparison's
           own warning, visibly flagged as such — present only when it exists. */}
       {dto.fingerprintWarning !== null && (
@@ -1251,30 +1642,60 @@ function Kpi({ label, children }: { label: string; children: React.ReactNode }) 
 function KpiTiles({ dto }: { dto: BacktestRunDto }) {
   return (
     <section className="bt-section bt-kpis" aria-label="Headline metrics">
-      {/* Exact strings; null renders an em dash. No deltas, no comparisons,
-          no derived percentages — the coach rail that compares runs is r1.s4. */}
-      <Kpi label="Net P&L">{dto.netPnl}</Kpi>
-      <Kpi label="Expectancy">{dto.expectancy}</Kpi>
-      <Kpi label="Win rate">{dto.winRate}</Kpi>
-      <Kpi label="Profit factor">{dto.profitFactor ?? EM_DASH}</Kpi>
+      {/* Every figure is A2-formatted over the DTO's own text, with that exact
+          text on the element; null renders an em dash. No deltas, no
+          comparisons, no derived percentages — the coach rail that compares
+          runs is r1.s4. */}
+      <Kpi label="Net P&L">
+        <Figure exact={dto.netPnl}>{usdt(dto.netPnl, { signed: true })}</Figure>
+      </Kpi>
+      <Kpi label="Expectancy">
+        <Figure exact={dto.expectancy}>{usdt(dto.expectancy, { signed: true })}</Figure>
+      </Kpi>
+      <Kpi label="Win rate">
+        <Figure exact={dto.winRate}>{percentFromFraction(dto.winRate)}</Figure>
+      </Kpi>
+      <Kpi label="Profit factor">
+        <Figure exact={dto.profitFactor}>{decimal(dto.profitFactor, 2)}</Figure>
+      </Kpi>
       <Kpi label="Trades">{dto.tradeCount}</Kpi>
       <Kpi label="Wins">{dto.winCount}</Kpi>
       <Kpi label="Losses">{dto.lossCount}</Kpi>
       <Kpi label="Max win streak">{dto.maxWinStreak}</Kpi>
       <Kpi label="Max loss streak">{dto.maxLossStreak}</Kpi>
-      <Kpi label="Max drawdown">{dto.maxDrawdown}</Kpi>
-      <Kpi label="Sharpe">{dto.sharpe ?? EM_DASH}</Kpi>
-      <Kpi label="Sortino">{dto.sortino ?? EM_DASH}</Kpi>
+      <Kpi label="Max drawdown">
+        <Figure exact={dto.maxDrawdown}>{usdt(dto.maxDrawdown)}</Figure>
+      </Kpi>
+      <Kpi label="Sharpe">
+        <Figure exact={asText(dto.sharpe)}>{decimal(asText(dto.sharpe), 2)}</Figure>
+      </Kpi>
+      <Kpi label="Sortino">
+        <Figure exact={asText(dto.sortino)}>{decimal(asText(dto.sortino), 2)}</Figure>
+      </Kpi>
       <Kpi label="Skipped sub-lot">{dto.skippedSubLot}</Kpi>
       <Kpi label="Skipped sub-notional">{dto.skippedSubNotional}</Kpi>
       <Kpi label="Skipped leverage-capped">{dto.skippedLeverageCapped}</Kpi>
-      <Kpi label="Fees">{dto.feesTotal}</Kpi>
-      <Kpi label="Funding">{dto.fundingTotal}</Kpi>
-      <Kpi label="Slippage">{dto.slippageTotal}</Kpi>
-      <Kpi label="Gross profit">{dto.grossProfit}</Kpi>
-      <Kpi label="Gross loss">{dto.grossLoss}</Kpi>
-      <Kpi label="Avg win">{dto.avgWin}</Kpi>
-      <Kpi label="Avg loss">{dto.avgLoss}</Kpi>
+      <Kpi label="Fees">
+        <Figure exact={dto.feesTotal}>{usdt(dto.feesTotal)}</Figure>
+      </Kpi>
+      <Kpi label="Funding">
+        <Figure exact={dto.fundingTotal}>{usdt(dto.fundingTotal, { signed: true })}</Figure>
+      </Kpi>
+      <Kpi label="Slippage">
+        <Figure exact={dto.slippageTotal}>{usdt(dto.slippageTotal)}</Figure>
+      </Kpi>
+      <Kpi label="Gross profit">
+        <Figure exact={dto.grossProfit}>{usdt(dto.grossProfit)}</Figure>
+      </Kpi>
+      <Kpi label="Gross loss">
+        <Figure exact={dto.grossLoss}>{usdt(dto.grossLoss)}</Figure>
+      </Kpi>
+      <Kpi label="Avg win">
+        <Figure exact={dto.avgWin}>{usdt(dto.avgWin)}</Figure>
+      </Kpi>
+      <Kpi label="Avg loss">
+        <Figure exact={dto.avgLoss}>{usdt(dto.avgLoss)}</Figure>
+      </Kpi>
     </section>
   );
 }
@@ -1347,8 +1768,9 @@ function EquityChart({
           {/* One series: a 2px line with a quiet area fill beneath it. */}
           <polygon className="bt-eq-area" points={areaPoints} />
           <polyline className="bt-eq-line" points={linePoints} />
-          {/* The starting-equity reference line, labelled with the DTO's own
-              string — the reference is never colour-only. */}
+          {/* The starting-equity reference line, carrying the DTO's own value:
+              formatted below, its exact string on hover — the reference is
+              never colour-only. */}
           <line
             className="bt-eq-ref"
             x1={EQ_PAD}
@@ -1369,13 +1791,22 @@ function EquityChart({
         </svg>
       </div>
       {/* One readout for both pointer and keyboard — parity is structural:
-          the same state drives the same exact strings either way. */}
+          the same state drives the same formatted text and exact strings
+          either way. */}
       <p className="bt-eq-readout mono" aria-live="polite">
-        <span className="bt-eq-readout-time">{point.timeMs}</span> ·{" "}
-        <span className="bt-eq-readout-equity">{point.equity}</span>
+        <span className="bt-eq-readout-time">
+          <Figure exact={point.timeMs}>{timeUtc(point.timeMs)}</Figure>
+        </span>{" "}
+        ·{" "}
+        <span className="bt-eq-readout-equity">
+          <Figure exact={point.equity}>{usdt(point.equity)}</Figure>
+        </span>
       </p>
       <p className="bt-eq-ref-label">
-        starting equity <span className="mono">{startingEquity}</span>
+        starting equity{" "}
+        <span className="mono">
+          <Figure exact={startingEquity}>{usdt(startingEquity)}</Figure>
+        </span>
       </p>
     </section>
   );
@@ -1419,7 +1850,9 @@ function RegimeBars({ cells }: { cells: RegimeCellDto[] }) {
                 />
               </span>
               <span className="bt-regime-count mono">{cell.tradeCount}</span>
-              <span className="bt-regime-pnl mono">{cell.netPnl}</span>
+              <span className="bt-regime-pnl mono">
+                <Figure exact={cell.netPnl}>{usdt(cell.netPnl)}</Figure>
+              </span>
             </div>
           );
         })}
@@ -1477,6 +1910,31 @@ function Histogram({ title, className, hist }: { title: string; className: strin
 // Trade table (all 18 fields, seq order, focusable scroll region)
 // ---------------------------------------------------------------------------
 
+/** The per-column formatter for the trade table: every money, price, quantity,
+ * R and time column, keyed by the DTO's own field name. A column absent here is
+ * a label (`direction`, `exitReason`, `source`, `regime`) and renders as
+ * delivered; the header stays the field name itself, so the table remains the
+ * DTO's own column list. */
+const TRADE_FORMATTERS: Partial<
+  Record<(typeof TRADE_FIELDS)[number], (text: string | null) => string>
+> = {
+  qty,
+  entryPrice: price,
+  exitPrice: price,
+  stopPrice: price,
+  entrySignalTime: timeUtc,
+  entryFillTime: timeUtc,
+  exitSignalTime: timeUtc,
+  exitFillTime: timeUtc,
+  feesTotal: (text) => usdt(text),
+  fundingTotal: (text) => usdt(text, { signed: true }),
+  slippageTotal: (text) => usdt(text),
+  realizedPnl: (text) => usdt(text, { signed: true }),
+  realizedR: rMultiple,
+  mfeR: rMultiple,
+  maeR: rMultiple,
+};
+
 function TradeTable({ trades }: { trades: TradeRowDto[] }) {
   return (
     <section className="bt-section bt-trades-section" aria-label="Trades">
@@ -1497,12 +1955,20 @@ function TradeTable({ trades }: { trades: TradeRowDto[] }) {
           <tbody>
             {trades.map((trade, i) => (
               <tr key={i}>
-                {TRADE_FIELDS.map((field) => (
-                  <td key={field} className="mono">
-                    {/* `stopPrice` is `string | null` — a pre-0011 row renders `—` (r2.s2.w2). */}
-                    {trade[field] ?? "—"}
-                  </td>
-                ))}
+                {TRADE_FIELDS.map((field) => {
+                  const format = TRADE_FORMATTERS[field];
+                  const exact = trade[field];
+                  return (
+                    <td key={field} className="mono">
+                      {format === undefined ? (
+                        /* `stopPrice` is `string | null` — a pre-0011 row renders `—` (r2.s2.w2). */
+                        (exact ?? "—")
+                      ) : (
+                        <Figure exact={exact}>{format(exact)}</Figure>
+                      )}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
@@ -1555,7 +2021,9 @@ function ChartTwins({ dto }: { dto: BacktestRunDto }) {
             <tr key={cell.regime} data-regime={cell.regime}>
               <td>{REGIME_LABELS[cell.regime] ?? cell.regime}</td>
               <td className="mono">{cell.tradeCount}</td>
-              <td className="mono">{cell.netPnl}</td>
+              <td className="mono">
+                <Figure exact={cell.netPnl}>{usdt(cell.netPnl)}</Figure>
+              </td>
             </tr>
           ))}
         </tbody>
@@ -1902,10 +2370,35 @@ const SUMMARY_ROWS: { key: keyof SummaryDto; label: string }[] = [
   { key: "sortino", label: "Sortino" },
 ];
 
-/** One summary cell, exactly as delivered — `null` is an em dash, never a zero. */
+/** The formatter for one summary row — the same A2 kinds the KPI tiles use, so
+ * the before/after table and the tiles cannot disagree. A key absent here is a
+ * count and renders as delivered. */
+const SUMMARY_FORMATTERS: Partial<
+  Record<keyof SummaryDto, (text: string | null) => string>
+> = {
+  expectancy: (text) => usdt(text, { signed: true }),
+  netPnl: (text) => usdt(text, { signed: true }),
+  winRate: percentFromFraction,
+  profitFactor: (text) => decimal(text, 2),
+  grossProfit: (text) => usdt(text),
+  grossLoss: (text) => usdt(text),
+  avgWin: (text) => usdt(text),
+  avgLoss: (text) => usdt(text),
+  maxDrawdown: (text) => usdt(text),
+  commissionTotal: (text) => usdt(text),
+  fundingTotal: (text) => usdt(text, { signed: true }),
+  sharpe: (text) => decimal(text, 2),
+  sortino: (text) => decimal(text, 2),
+};
+
+/** One summary cell: the A2 display text, with the DTO's own string on the
+ * element — `null` is an em dash, never a zero. */
 function cell(summary: SummaryDto, key: keyof SummaryDto) {
   const value = summary[key];
-  return value === null ? EM_DASH : String(value);
+  const exact = value === null ? null : String(value);
+  const format = SUMMARY_FORMATTERS[key];
+  if (format === undefined) return <>{exact ?? EM_DASH}</>;
+  return <Figure exact={exact}>{format(exact)}</Figure>;
 }
 
 /**
@@ -1918,10 +2411,16 @@ function CompareTable({
   before,
   after,
   badge,
+  beforeRunId,
+  afterRunId,
 }: {
   before: SummaryDto;
   after: SummaryDto;
   badge?: React.ReactNode;
+  /** The compared runs' ids, when the caller knows them (#326). The coach
+   * accept's inline table posts no ids and renders exactly as it did. */
+  beforeRunId?: string | null;
+  afterRunId?: string | null;
 }) {
   return (
     <table className="coach-compare" aria-label="Before and after">
@@ -1929,8 +2428,22 @@ function CompareTable({
       <thead>
         <tr>
           <th scope="col">metric</th>
-          <th scope="col">before (parent)</th>
-          <th scope="col">after (child)</th>
+          <th scope="col">
+            before (parent)
+            {beforeRunId != null && (
+              <span className="compare-run mono" title={beforeRunId}>
+                {beforeRunId.slice(0, SHORT_ID_LEN)}
+              </span>
+            )}
+          </th>
+          <th scope="col">
+            after (child)
+            {afterRunId != null && (
+              <span className="compare-run mono" title={afterRunId}>
+                {afterRunId.slice(0, SHORT_ID_LEN)}
+              </span>
+            )}
+          </th>
         </tr>
       </thead>
       <tbody>
@@ -2042,14 +2555,25 @@ function CompareWithParent({ version, run }: { version: LibraryVersion; run: Run
         <CompareTable
           before={outcome.dto.before}
           after={outcome.dto.after}
+          // #326: which two runs the columns are — the DTO names both, so the
+          // panel says so.
+          beforeRunId={outcome.dto.parentRunId}
+          afterRunId={outcome.dto.childRunId}
           badge={
             outcome.dto.inputsDiffer ? (
-              <span
-                className="badge-inputs-differ"
-                title={outcome.dto.inputsNote ?? undefined}
-              >
-                inputs differ
-              </span>
+              <>
+                <span
+                  className="badge-inputs-differ"
+                  title={outcome.dto.inputsNote ?? undefined}
+                >
+                  inputs differ
+                </span>
+                {/* #326: WHY they cannot be proven equal, in words beside the
+                    badge — the hover keeps the exact text as well. */}
+                {outcome.dto.inputsNote !== null && (
+                  <span className="compare-inputs-note"> {outcome.dto.inputsNote}</span>
+                )}
+              </>
             ) : undefined
           }
         />

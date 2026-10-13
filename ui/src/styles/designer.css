@@ -211,6 +211,35 @@
   color: var(--text-2);
 }
 
+/* ---- the failed step and its retry (r4.s5.w3, #322) ---- */
+
+.dsg-step.is-failed {
+  border-color: var(--bear-line);
+}
+
+.dsg-step.is-failed .dsg-step-marker {
+  color: var(--bear-1);
+}
+
+.dsg-step-error {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  line-height: var(--lh-snug);
+  color: var(--bear-1);
+}
+
+.dsg-retry {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--warn-1);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-4);
+  padding: 1px 4px;
+  line-height: 1.4;
+}
+
 /* ---- the finalize summary card ---- */
 
 .dsg-ssc {

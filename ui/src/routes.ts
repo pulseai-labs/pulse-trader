@@ -152,8 +152,30 @@ export function resolveNavId(hash: string, knownNavIds: readonly string[]): stri
   if (fragment === "" || fragment === "/") {
     return DEFAULT_NAV_ID;
   }
-  const candidate = fragment.startsWith("/") ? fragment.slice(1) : fragment;
+  // #269: a query is not part of the nav id. `#/backtest?wf=<id>` is the Backtest
+  // Lab's deep link — the id rides the query, the destination is the nav row —
+  // so the query is cut before the id is normalized. A fragment without one is
+  // read exactly as it always was.
+  const queryAt = fragment.indexOf("?");
+  const path = queryAt === -1 ? fragment : fragment.slice(0, queryAt);
+  const candidate = path.startsWith("/") ? path.slice(1) : path;
   return knownNavIds.includes(candidate) ? candidate : DEFAULT_NAV_ID;
+}
+
+/**
+ * The Backtest Lab's deep link (#269): `#/backtest?wf=<run id>` names a
+ * walk-forward run the Lab must open — the Library's certification line lands
+ * here. `null` for every other fragment: another route, no query, or an empty
+ * `wf`. Pure, so the Lab's read of its own hash is testable without a DOM.
+ */
+export function backtestDeepLink(hash: string): { wf: string } | null {
+  const fragment = hash.startsWith("#") ? hash.slice(1) : hash;
+  const queryAt = fragment.indexOf("?");
+  if (queryAt === -1 || fragment.slice(0, queryAt) !== "/backtest") {
+    return null;
+  }
+  const wf = new URLSearchParams(fragment.slice(queryAt + 1)).get("wf");
+  return wf === null || wf === "" ? null : { wf };
 }
 
 /**

@@ -15,9 +15,9 @@
 // focusable trade-table scroll region, and the ≥24px inline hit targets.
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 import { flushSync } from "react-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../bindings", () => ({
   commands: {
@@ -53,7 +53,11 @@ import type {
   WalkForwardRunDto,
 } from "../bindings";
 import BacktestLabScreen, { parseFoldCount } from "./BacktestLabScreen";
+import { clearBacktestSelection } from "./backtestSelection";
+import { ActiveOperationsProvider } from "../hooks/useActiveOperations";
 import { RouteContent } from "../App";
+import { decimal } from "../format/numbers";
+import { timeUtc } from "../format/time";
 import { resolveRoute } from "../routes";
 
 const catalogMock = vi.mocked(commands.libraryOverview);
@@ -62,6 +66,19 @@ const compareMock = vi.mocked(commands.compareChildRun);
 const walkForwardMock = vi.mocked(commands.runWalkForwardVersion);
 const getRunMock = vi.mocked(commands.getBacktestRun);
 const reopenMock = vi.mocked(commands.getWalkForwardRun);
+
+// ---------------------------------------------------------------------------
+// The figure helper (r4.s5.w1): every formatted value renders the A2 display
+// text with the DTO's own exact string as `title`/`data-exact`, so the two are
+// asserted together — a formatting change cannot quietly drop the server's
+// text, which is what keeps "the screen renders server text" proven.
+// ---------------------------------------------------------------------------
+
+function expectFigure(scope: Element, display: string, exact: string): void {
+  const element = within(scope as HTMLElement).getByText(display);
+  expect(element.getAttribute("data-exact")).toBe(exact);
+  expect(element.getAttribute("title")).toBe(exact);
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures — shaped exactly like the generated types, values chosen to be
@@ -120,10 +137,18 @@ const CATALOG: LibraryOverview = {
 const MFE_COUNTS = [0, 1, 0, 2, 1, 3, 1, 0, 1, 0, 0, 0];
 const MAE_COUNTS = [1, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
 
+/** The 0.25-wide bin bounds as the DTO carries them — literal display strings,
+ * the same text a two-decimal float format would produce, so the fixture needs
+ * no float call (AC-5's own census reads this file). */
+const BIN_BOUNDS = [
+  "0.00", "0.25", "0.50", "0.75", "1.00", "1.25",
+  "1.50", "1.75", "2.00", "2.25", "2.50", "2.75", "3.00",
+] as const;
+
 function bins(counts: readonly number[]): HistogramBinDto[] {
   return counts.map((count, i) => ({
-    lower: (i * 0.25).toFixed(2),
-    upper: ((i + 1) * 0.25).toFixed(2),
+    lower: BIN_BOUNDS[i],
+    upper: BIN_BOUNDS[i + 1],
     count,
   }));
 }
@@ -298,6 +323,27 @@ async function renderRun(
   return container;
 }
 
+/** Choose a version through the picker the way a trader does — open it, type a
+ * query, and click the `offset`-th option the filter leaves (0-based, in the
+ * order the list shows). Every call site's own assertions pin WHICH version
+ * that turned out to be; a query with fewer matches than `offset + 1` is a
+ * broken test, not a silent no-op. */
+async function chooseVersion(query: string, offset = 0) {
+  const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+  fireEvent.focus(box);
+  fireEvent.change(box, { target: { value: query } });
+  const options = screen.getAllByRole("option");
+  const option = options[offset] as HTMLElement | undefined;
+  if (option === undefined) {
+    throw new Error(
+      `chooseVersion("${query}", ${offset}): the filter left ${options.length} option(s)`,
+    );
+  }
+  // The picker keeps focus in the input, so the click lands without a blur.
+  fireEvent.mouseDown(option);
+  fireEvent.click(option);
+}
+
 beforeEach(() => {
   catalogMock.mockReset();
   runMock.mockReset();
@@ -305,6 +351,9 @@ beforeEach(() => {
   walkForwardMock.mockReset();
   getRunMock.mockReset();
   reopenMock.mockReset();
+  // The remembered selection is a module singleton that outlives a screen by
+  // design (#315); each test starts from no selection.
+  clearBacktestSelection();
 });
 
 // ---------------------------------------------------------------------------
@@ -344,24 +393,29 @@ describe("BacktestLabScreen (catalog states)", () => {
     expect(screen.queryByText(/sample/i)).toBeNull();
   });
 
-  it("lists exactly the catalog's real (strategy, version) pairs with version ids as values", async () => {
+  it("lists exactly the catalog's real (strategy, version) pairs, grouped, with the first version selected", async () => {
     catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
 
-    render(<BacktestLabScreen />);
+    const { container } = render(<BacktestLabScreen />);
 
-    const select = await screen.findByRole("combobox");
-    const options = within(select).getAllByRole("option");
-    expect(options.map((o) => o.textContent)).toEqual([
-      "Alpha Wave · v1",
-      "Alpha Wave · v2",
-      "Beta Break · v1",
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    // The closed picker shows the current selection's own text.
+    expect(box.value).toBe("v1 · 2026-08-20 UTC · v-alpha- · human");
+
+    fireEvent.focus(box);
+    expect(
+      [...container.querySelectorAll(".vp-group")].map((header) => header.textContent),
+    ).toEqual([
+      "Alpha Wave",
+      "Beta Break",
     ]);
-    expect(options.map((o) => o.getAttribute("value"))).toEqual([
-      "v-alpha-1",
-      "v-alpha-2",
-      "v-beta-1",
+    expect(
+      screen.getAllByRole("option").map((option) => option.textContent),
+    ).toEqual([
+      "v1 · 2026-08-20 UTC · v-alpha- · human",
+      "v2 · 2026-08-20 UTC · v-alpha- · human",
+      "v1 · 2026-08-20 UTC · v-beta-1 · human",
     ]);
-    expect((select as HTMLSelectElement).value).toBe("v-alpha-1");
   });
 });
 
@@ -403,7 +457,7 @@ describe("BacktestLabScreen (run state machine)", () => {
 
     // A different version selected, then Run: the call uses the new id, and
     // the fresh DTO that lands is the new run's.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
     fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
     await screen.findByText("run-beta-001");
     expect(screen.queryByText("run-9f2c41ab")).toBeNull();
@@ -450,20 +504,20 @@ describe("BacktestLabScreen (run state machine)", () => {
     );
     render(<BacktestLabScreen />);
 
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
-    expect(select.disabled).toBe(false);
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    expect(box.disabled).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
 
     expect(
       (screen.getByRole("button", { name: /running…/i }) as HTMLButtonElement).disabled,
     ).toBe(true);
-    expect(select.disabled).toBe(true);
+    expect(box.disabled).toBe(true);
 
     resolveRun({ status: "ok", data: SEEDED_RUN });
     await screen.findByText("run-9f2c41ab");
     // Settled: the selector unlocks alongside the button.
-    expect(select.disabled).toBe(false);
+    expect(box.disabled).toBe(false);
   });
 
   it("renders a run BusError's code and message, and the structured run_id as a saved-run id — never parsed prose", async () => {
@@ -481,7 +535,7 @@ describe("BacktestLabScreen (run state machine)", () => {
   it("clears a rendered result when the selector changes — a stale result is not attributable to the new version", async () => {
     await renderRun(SEEDED_RUN);
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     expect(screen.queryByText("run-9f2c41ab")).toBeNull();
     expect(screen.queryByText("BTCUSDT")).toBeNull();
@@ -508,27 +562,34 @@ describe("BacktestLabScreen (fresh result render)", () => {
       "btcusdt-4h-v3",
       // r3.s2.w4: the daily row, when the run recorded one.
       "btcusdt-1d-v1",
-      "1735689600000",
-      "1756684800000",
-      "10000.00",
-      "4.0000",
-      "2.0000",
       "snapshot_rates",
-      // r3.s1.w4 (#142): the recorded filters render their four values.
-      "lot_step 0.001",
-      "min_qty 0.005",
-      "min_notional 100",
-      "max_leverage 20",
       "sha256:abc123def456",
       "aarch64-apple-darwin",
       "sha256:9876fedcba",
       "run-9f2c41ab",
       "v-alpha-1",
       "3",
-      "2026-09-02T10:15:30.123Z",
     ]) {
       expect(text).toContain(exact);
     }
+    // The A2-formatted values, each with the DTO's own string on the element —
+    // the date range and created instant say UTC (r4.s5.w1).
+    expectFigure(band as HTMLElement, "2025-01-01 → 2025-09-01 UTC", "1735689600000 → 1756684800000");
+    expectFigure(band as HTMLElement, "10,000.00 USDT", "10000.00");
+    expectFigure(band as HTMLElement, "2026-09-02 10:15 UTC", "2026-09-02T10:15:30.123Z");
+    // r3.s1.w4 (#142): the recorded filters render their four values, formatted.
+    // lot_step and min_qty are quantities, max_leverage leverage — min_notional
+    // is the block's one MONEY amount, so it reads as USDT.
+    expectFigure(band as HTMLElement, "0.001", "0.001");
+    expectFigure(band as HTMLElement, "0.005", "0.005");
+    expectFigure(band as HTMLElement, "100.00 USDT", "100");
+    expectFigure(band as HTMLElement, "20", "20");
+    expect(text).toContain("lot_step");
+    expect(text).toContain("min_qty");
+    expect(text).toContain("min_notional");
+    expect(text).toContain("max_leverage");
+    expect(text).toContain("4.0000 bps");
+    expect(text).toContain("2.0000 bps");
     // The null fingerprintWarning renders no warning UI and no warning text.
     expect(container.querySelector(".bt-fp-warning")).toBeNull();
     expect(text).not.toContain("fingerprint changed");
@@ -605,33 +666,31 @@ describe("BacktestLabScreen (fresh result render)", () => {
     const container = await renderRun(SEEDED_RUN);
     const tiles = container.querySelector(".bt-kpis");
     expect(tiles).not.toBeNull();
-    const text = (tiles as HTMLElement).textContent ?? "";
 
-    for (const exact of [
-      "-84.125",
-      "-4.20625",
-      "0.4375",
-      "180.000",
-      "264.125",
-      "22.500",
-      "33.016",
-      "412.750",
-      "26.400",
-      "-3.115",
-      "13.200",
-    ]) {
-      expect(text).toContain(exact);
-    }
+    // Every money, percent and ratio tile is A2-formatted, the DTO's own string
+    // on the element.
+    const tileFor = (label: string) =>
+      within(tiles as HTMLElement)
+        .getByText(label)
+        .closest(".bt-kpi") as HTMLElement;
+    expectFigure(tileFor("Net P&L"), "−84.13 USDT", "-84.125");
+    expectFigure(tileFor("Expectancy"), "−4.21 USDT", "-4.20625");
+    expectFigure(tileFor("Win rate"), "43.8%", "0.4375");
+    expectFigure(tileFor("Max drawdown"), "412.75 USDT", "412.750");
+    expectFigure(tileFor("Fees"), "26.40 USDT", "26.400");
+    expectFigure(tileFor("Funding"), "−3.12 USDT", "-3.115");
+    expectFigure(tileFor("Slippage"), "13.20 USDT", "13.200");
+    expectFigure(tileFor("Gross profit"), "180.00 USDT", "180.000");
+    expectFigure(tileFor("Gross loss"), "264.13 USDT", "264.125");
+    expectFigure(tileFor("Avg win"), "22.50 USDT", "22.500");
+    expectFigure(tileFor("Avg loss"), "33.02 USDT", "33.016");
+
     // tradeCount / winCount / lossCount / streaks / skipped counters.
     for (const label of ["Trades", "Wins", "Losses", "Max win streak", "Max loss streak",
       "Skipped sub-lot", "Skipped sub-notional", "Skipped leverage-capped"]) {
       expect(within(tiles as HTMLElement).getByText(label)).toBeTruthy();
     }
     // profitFactor / sharpe / sortino are null in this run → em dash, never 0.
-    const tileFor = (label: string) =>
-      within(tiles as HTMLElement)
-        .getByText(label)
-        .closest(".bt-kpi") as HTMLElement;
     for (const label of ["Profit factor", "Sharpe", "Sortino"]) {
       expect(tileFor(label).textContent).toContain("—");
       expect(tileFor(label).textContent).not.toMatch(/\d/);
@@ -642,18 +701,21 @@ describe("BacktestLabScreen (fresh result render)", () => {
     const container = await renderRun(SEEDED_RUN);
     const chart = container.querySelector(".bt-equity");
     expect(chart).not.toBeNull();
-    const inChart = within(chart as HTMLElement);
 
     // One polyline series (not two), a quiet area fill, and the reference line.
     expect((chart as HTMLElement).querySelectorAll("polyline")).toHaveLength(1);
     expect((chart as HTMLElement).querySelectorAll("polygon")).toHaveLength(1);
     const ref = (chart as HTMLElement).querySelector(".bt-eq-ref");
     expect(ref).not.toBeNull();
-    // The reference is labelled with the DTO's own exact string, and the
-    // readout shows the traversed point's exact strings (point[0] before any
-    // traversal; the full point-to-point path is the parity test below).
-    expect(inChart.getAllByText("10000.00").length).toBeGreaterThan(0);
-    expect(inChart.getByText("1735689600000")).toBeTruthy();
+    // The reference reads in human units with the DTO's own exact string on
+    // the title, and the readout shows the traversed point the same way
+    // (point[0] before any traversal; the full point-to-point path is the
+    // parity test below).
+    const refLabel = (chart as HTMLElement).querySelector(".bt-eq-ref-label") as HTMLElement;
+    expectFigure(refLabel, "10,000.00 USDT", "10000.00");
+    const readout = (chart as HTMLElement).querySelector(".bt-eq-readout") as HTMLElement;
+    expectFigure(readout, "2025-01-01 00:00 UTC", "1735689600000");
+    expectFigure(readout, "10,000.00 USDT", "10000.00");
   });
 
   it("renders the four regime rows in the DTO's fixed order with fixed human labels, legend and direct labels", async () => {
@@ -668,10 +730,11 @@ describe("BacktestLabScreen (fresh result render)", () => {
       "Ranging",
       "Unknown",
     ]);
-    // Each row carries its own tradeCount and exact netPnl string.
+    // Each row carries its own tradeCount and its A2-formatted netPnl, the DTO
+    // string on the element.
     const trendingDown = within(rows[1] as HTMLElement);
     expect(trendingDown.getByText("4")).toBeTruthy();
-    expect(trendingDown.getByText("-294.250")).toBeTruthy();
+    expectFigure(rows[1] as HTMLElement, "−294.25 USDT", "-294.250");
 
     // A compact 4-swatch legend, same fixed labels.
     const legend = (section as HTMLElement).querySelector(".bt-legend");
@@ -739,16 +802,20 @@ describe("BacktestLabScreen (fresh result render)", () => {
 
     const rows = Array.from((table as HTMLElement).querySelectorAll("tbody tr"));
     expect(rows).toHaveLength(2);
-    // Seq order, exact strings.
+    // Seq order: the formatted figure, the DTO's own string on the element.
     expect(within(rows[0] as HTMLElement).getAllByText("stop_loss").length).toBeGreaterThan(0);
-    expect(within(rows[0] as HTMLElement).getByText("-166.396250")).toBeTruthy();
-    expect(within(rows[0] as HTMLElement).getByText("0.01500000")).toBeTruthy();
-    // The recorded stop renders its exact decimal string…
-    expect(within(rows[0] as HTMLElement).getByText("61500.00")).toBeTruthy();
+    expectFigure(rows[0] as HTMLElement, "−166.40 USDT", "-166.396250");
+    expectFigure(rows[0] as HTMLElement, "0.015", "0.01500000");
+    // The recorded stop renders its A2 price, exact string on the element…
+    expectFigure(rows[0] as HTMLElement, "61,500.00", "61500.00");
     expect(within(rows[1] as HTMLElement).getByText("take_profit")).toBeTruthy();
-    expect(within(rows[1] as HTMLElement).getByText("129.545000")).toBeTruthy();
+    expectFigure(rows[1] as HTMLElement, "+129.55 USDT", "129.545000");
     // …while a null stop (the pre-0011 row shape) renders the em dash.
     expect(within(rows[1] as HTMLElement).getByText("—")).toBeTruthy();
+    // The four time columns render A2's `YYYY-MM-DD HH:mm` UTC, the epoch-ms
+    // text on the element (r4.s5.w1's Dispatch-2 clarification).
+    expectFigure(rows[0] as HTMLElement, "2025-01-01 00:15 UTC", "1735690500000");
+    expectFigure(rows[0] as HTMLElement, "2025-01-01 00:30 UTC", "1735691400000");
   });
 
   it("renders an em dash for a null HTF pair and visibly flags a non-null fingerprintWarning", async () => {
@@ -768,10 +835,11 @@ describe("BacktestLabScreen (fresh result render)", () => {
     expect((warning as HTMLElement).textContent).toContain(
       "engine fingerprint changed since the prior run",
     );
-    // And the non-null ratio fields render their values, not em dashes.
+    // And the non-null ratio fields render their A2 values, not em dashes, the
+    // DTO's own text on the element.
     const tiles = container.querySelector(".bt-kpis") as HTMLElement;
-    expect(within(tiles).getByText("0.681")).toBeTruthy();
-    expect(within(tiles).getByText("-0.42")).toBeTruthy();
+    expectFigure(tiles, "0.68", "0.681");
+    expectFigure(tiles, "−0.42", "-0.42");
   });
 });
 
@@ -791,14 +859,21 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
       expect(within(eqTwin).getAllByText(p.equity).length).toBeGreaterThan(0);
     }
 
-    // Regime twin: four rows, label + tradeCount + netPnl.
+    // Regime twin: four rows, label + tradeCount + the A2 netPnl with the DTO's
+    // own string on the element.
     const rgTwin = container.querySelector(".bt-twin-regimes") as HTMLElement;
     expect(rgTwin).not.toBeNull();
+    const regimeNetPnl: Record<string, string> = {
+      "180.000": "180.00 USDT",
+      "-294.250": "−294.25 USDT",
+      "30.125": "30.13 USDT",
+      "0.000": "0.00 USDT",
+    };
     for (const cell of SEEDED_RUN.regimes) {
       const row = rgTwin.querySelector(`[data-regime="${cell.regime}"]`);
       expect(row).not.toBeNull();
       expect((row as HTMLElement).textContent).toContain(String(cell.tradeCount));
-      expect((row as HTMLElement).textContent).toContain(cell.netPnl);
+      expectFigure(row as HTMLElement, regimeNetPnl[cell.netPnl], cell.netPnl);
     }
 
     // Histogram twins: underflow + 12 bins + overflow with their counts.
@@ -817,7 +892,7 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     }
   });
 
-  it("exposes identical exact-string readouts for keyboard and pointer on the equity plot", async () => {
+  it("exposes identical human-unit readouts for keyboard and pointer, exact strings on the title", async () => {
     const container = await renderRun(SEEDED_RUN);
     const chart = container.querySelector(".bt-equity") as HTMLElement;
     const plot = chart.querySelector(".bt-eq-plot") as HTMLElement;
@@ -828,29 +903,36 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     // Keyboard: Left/Right step point-to-point, Home/End jump to first/last.
     plot.focus();
     fireEvent.keyDown(plot, { key: "ArrowRight" });
-    expect(readout.textContent).toContain("1736294400000");
-    expect(readout.textContent).toContain("10042.75");
+    expectFigure(readout, "2025-01-08 00:00 UTC", "1736294400000");
+    expectFigure(readout, "10,042.75 USDT", "10042.75");
     fireEvent.keyDown(plot, { key: "End" });
-    expect(readout.textContent).toContain("1737504000000");
+    expectFigure(readout, "2025-01-22 00:00 UTC", "1737504000000");
     fireEvent.keyDown(plot, { key: "Home" });
-    expect(readout.textContent).toContain("1735689600000");
+    expectFigure(readout, "2025-01-01 00:00 UTC", "1735689600000");
     fireEvent.keyDown(plot, { key: "ArrowRight" });
     fireEvent.keyDown(plot, { key: "ArrowLeft" });
-    expect(readout.textContent).toContain("1735689600000");
+    expectFigure(readout, "2025-01-01 00:00 UTC", "1735689600000");
 
     // Pointer: hovering the third point's hit marker drives the SAME readout
-    // element with the same exact strings — parity is structural.
+    // element with the same formatted text and exact strings — parity is
+    // structural.
     const hits = chart.querySelectorAll(".bt-eq-hit");
     expect(hits).toHaveLength(SEEDED_RUN.equity.length);
     fireEvent.mouseOver(hits[2]);
-    expect(readout.textContent).toContain("1736899200000");
-    expect(readout.textContent).toContain("9910.50");
+    expectFigure(readout, "2025-01-15 00:00 UTC", "1736899200000");
+    expectFigure(readout, "9,910.50 USDT", "9910.50");
+
+    // The starting-equity reference line's label reads in USDT too, with the
+    // DTO's own string one hover away.
+    const refLabel = chart.querySelector(".bt-eq-ref-label") as HTMLElement;
+    expect(refLabel).not.toBeNull();
+    expectFigure(refLabel, "10,000.00 USDT", "10000.00");
   });
 
   it("makes the equity plot and the trade-table scroll region focus stops in visual order", async () => {
     const container = await renderRun(SEEDED_RUN);
 
-    const select = screen.getByRole("combobox");
+    const picker = screen.getByRole("combobox");
     const run = screen.getByRole("button", { name: /run backtest/i });
     const plot = container.querySelector(".bt-eq-plot") as HTMLElement;
     const region = container.querySelector(".bt-table-scroll") as HTMLElement;
@@ -861,7 +943,7 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     // Focus order follows visual order: selector → Run → plot → table region.
     const follows = (a: HTMLElement, b: HTMLElement) =>
       (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
-    expect(follows(select, run)).toBe(true);
+    expect(follows(picker, run)).toBe(true);
     expect(follows(run, plot)).toBe(true);
     expect(follows(plot, region)).toBe(true);
 
@@ -877,11 +959,13 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     const columns = container.querySelectorAll(".bt-col");
     expect(columns.length).toBeGreaterThan(0);
     for (const col of columns) {
+      // chart geometry: the painted hit target's own pixels, not a displayed figure
       expect(parseFloat((col as HTMLElement).style.minWidth)).toBeGreaterThanOrEqual(24);
     }
     const rows = container.querySelectorAll(".bt-regime-row");
     expect(rows.length).toBeGreaterThan(0);
     for (const row of rows) {
+      // chart geometry: the painted hit target's own pixels, not a displayed figure
       expect(parseFloat((row as HTMLElement).style.minHeight)).toBeGreaterThanOrEqual(24);
     }
   });
@@ -1159,11 +1243,12 @@ describe("BacktestLabScreen (the coach rail)", () => {
     fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
 
     const comparison = await screen.findByRole("table", { name: /before and after/i });
-    // Both expectancies, exactly as the DTO delivered them — no delta, no percent.
-    expect(comparison.textContent).toContain("-10.515625");
-    expect(comparison.textContent).toContain("20.250");
-    expect(comparison.textContent).toContain("0.375");
-    expect(comparison.textContent).toContain("0.666");
+    // Both sides, A2-formatted, each cell carrying the DTO's own string — no
+    // delta, no invented percent. The counts render as delivered.
+    expectFigure(comparison, "−10.52 USDT", "-10.515625");
+    expectFigure(comparison, "+20.25 USDT", "20.250");
+    expectFigure(comparison, "37.5%", "0.375");
+    expectFigure(comparison, "66.6%", "0.666");
 
     const rail = screen.getByRole("region", { name: /coach/i });
     expect(within(rail).getByRole("link", { name: /child version/i }).getAttribute("href")).toBe(
@@ -1212,7 +1297,9 @@ describe("BacktestLabScreen (the coach rail)", () => {
     // list would set the selector to an id no option carries.
     fireEvent.click(screen.getByRole("button", { name: /select the child/i }));
     await waitFor(() => {
-      expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("v-alpha-2");
+      expect((screen.getByRole("combobox") as HTMLInputElement).value).toBe(
+        "v2 · 2026-08-20 UTC · v-alpha- · human",
+      );
     });
   });
 
@@ -1405,7 +1492,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
     await openRail(proposedSession());
     expect(screen.getByRole("region", { name: /coach/i })).toBeTruthy();
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
 
     expect(screen.queryByRole("region", { name: /coach/i })).toBeNull();
   });
@@ -1471,14 +1558,14 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await waitFor(() => {
       expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
     });
     const table = await screen.findByRole("table", { name: /before and after/i });
-    expect(table.textContent).toContain("-10.515625");
-    expect(table.textContent).toContain("20.250");
+    expectFigure(table, "−10.52 USDT", "-10.515625");
+    expectFigure(table, "+20.25 USDT", "20.250");
 
     const badge = screen.getByText("inputs differ");
     expect(badge.className).toContain("badge-inputs-differ");
@@ -1528,7 +1615,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await waitFor(() => {
       expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
@@ -1544,9 +1631,9 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     const table = await screen.findByRole("table", { name: /before and after/i });
-    expect(table.textContent).toContain("20.250");
+    expectFigure(table, "+20.25 USDT", "20.250");
     expect(screen.queryByText("inputs differ")).toBeNull();
   });
 
@@ -1555,7 +1642,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     compareMock.mockResolvedValue({ status: "error", error: COMPARE_REFUSAL });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await screen.findByText(/has no run to compare against/i);
     expect(screen.queryByRole("table", { name: /before and after/i })).toBeNull();
@@ -1567,7 +1654,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
 
     // v-alpha-1 is selected by default and is a ROOT — nothing to compare with.
     // v-alpha-2 has a parent but no recent run in this catalog.
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     await waitFor(() => {
       expect(screen.queryByRole("table", { name: /before and after/i })).toBeNull();
@@ -1584,7 +1671,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
     });
     render(<BacktestLabScreen />);
 
-    fireEvent.change(await screen.findByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await waitFor(() => {
       expect(compareMock).toHaveBeenCalledWith({ childRunId: "run-child-1" });
     });
@@ -1602,8 +1689,8 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
   it("refetches the catalog when the window regains focus, and keeps the selection", async () => {
     catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
     render(<BacktestLabScreen />);
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
+    const box = screen.getByRole("combobox") as HTMLInputElement;
     const callsOnMount = catalogMock.mock.calls.length;
 
     fireEvent(window, new Event("focus"));
@@ -1611,14 +1698,14 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     await waitFor(() => {
       expect(catalogMock.mock.calls.length).toBeGreaterThan(callsOnMount);
     });
-    expect(select.value).toBe("v-alpha-2");
+    expect(box.value).toBe("v2 · 2026-08-20 UTC · v-alpha- · human");
   });
 
-  it("falls back to the first option when the selected version is gone after a refetch", async () => {
+  it("falls back to the default when the selected version is gone after a refetch", async () => {
     catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
     render(<BacktestLabScreen />);
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
+    const box = screen.getByRole("combobox") as HTMLInputElement;
 
     // The refetched catalog no longer carries the selected version.
     catalogMock.mockResolvedValue({
@@ -1630,8 +1717,120 @@ describe("BacktestLabScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     fireEvent(window, new Event("focus"));
 
     await waitFor(() => {
-      expect(select.value).toBe("v-alpha-1");
+      expect(box.value).toBe("v1 · 2026-08-20 UTC · v-alpha- · human");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #315 — the selection and its shown result survive a reconnect
+// ---------------------------------------------------------------------------
+
+/** The App's own nesting for this item's purposes: `ActiveOperationsProvider`
+ * above the route (`App.tsx`), and a screen the gate can unmount when the
+ * server goes down — exactly what rendering Connect in the app's place does. */
+function GatedLab() {
+  const [up, setUp] = useState(true);
+  return (
+    <ActiveOperationsProvider>
+      <button type="button" onClick={() => setUp((current) => !current)}>
+        {up ? "take the server down" : "bring the server back"}
+      </button>
+      {up ? <BacktestLabScreen /> : null}
+    </ActiveOperationsProvider>
+  );
+}
+
+describe("BacktestLabScreen (#315 — a reconnect keeps the selection and its result)", () => {
+  it("shows the same version and its run after the screen unmounts and comes back", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    runMock.mockResolvedValue({
+      status: "ok",
+      data: { ...SEEDED_RUN, runId: "run-beta-001", strategyVersionId: "v-beta-1" },
+    });
+
+    render(<GatedLab />);
+
+    await chooseVersion("beta");
+    fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
+    await screen.findByText("run-beta-001");
+
+    // The server drops: the gate takes the screen down, and only the screen.
+    fireEvent.click(screen.getByRole("button", { name: /take the server down/i }));
+    expect(screen.queryByRole("combobox")).toBeNull();
+
+    // It comes back: the Lab remounts and reads the catalog again. The version
+    // the trader had chosen is still the selected one…
+    fireEvent.click(screen.getByRole("button", { name: /bring the server back/i }));
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    await waitFor(() => {
+      expect(box.value).toBe("v1 · 2026-08-20 UTC · v-beta-1 · human");
+    });
+
+    // …and the run the trader was reading is still shown for it: the record
+    // outlived the screen, and the restored selection addresses it again.
+    expect(screen.getByText("run-beta-001")).toBeTruthy();
+  });
+
+  it("applies nothing from an unmounted Lab: a pending read cannot select or start a run later (#269/#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    // The stale read's version has a parent to compare with; the refusal is the
+    // compare read's own answer — this test is about the read not applying.
+    compareMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no parent run for run-late-0001",
+        run_id: null,
+        session_id: null,
+        child_run_id: "run-late-0001",
+      },
+    });
+    // The backtest read is held open, settled by hand after the unmount.
+    const pending = new Map<
+      string,
+      (answer: { status: "ok"; data: BacktestRunDto }) => void
+    >();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    getRunMock.mockImplementation(
+      (request) =>
+        new Promise((resolve) => {
+          pending.set(request.runId, resolve);
+        }),
+    );
+
+    render(<GatedLab />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "run-late-0001" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-late-0001")).toBe(true);
+
+    // The server drops: the gate takes the screen down while the read is out.
+    fireEvent.click(screen.getByRole("button", { name: /take the server down/i }));
+    expect(screen.queryByLabelText(/open run by id/i)).toBeNull();
+
+    // The read lands with the Lab gone: nothing of it may survive.
+    await act(async () => {
+      pending.get("run-late-0001")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-late-0001", strategyVersionId: "ver-second" },
+      });
+    });
+
+    // Back up: the remembered selection is untouched — the default version, not
+    // the read's — and the run the read carried was never started.
+    fireEvent.click(screen.getByRole("button", { name: /bring the server back/i }));
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
+    await waitFor(() => {
+      expect(box.value).toContain("ver-own-");
+    });
+    expect(screen.queryByText("run-late-0001")).toBeNull();
   });
 });
 
@@ -1841,13 +2040,20 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     // Sentinel values — renderable only off the DTO, never a baked-in label.
     expect(text).toContain("scheme-sentinel/v9");
     expect(text).toContain("rule-sentinel");
-    expect(text).toContain("2026-08-01T00:00:00.000Z");
-    expect(text).toContain("2026-08-31T23:59:59.000Z");
     expect(text).toContain("wf-44aa19c2");
-    // The verdict line: the word, the holding/required tally, the pooled bound.
+    // The span is a date range, A2-formatted, saying UTC, the DTO's own pair on
+    // the element.
+    expectFigure(
+      pane,
+      "2026-08-01 → 2026-08-31 UTC",
+      "2026-08-01T00:00:00.000Z → 2026-08-31T23:59:59.000Z",
+    );
+    // The verdict line: the word, the folds sentence (#328/#305), the pooled
+    // bound — never a bare ratio.
     expect(text).toContain("FAIL");
-    expect(text).toContain("1/2");
-    expect(text).toContain("-0.8123");
+    expect(text).toContain("1 of 2 folds hold (2 required)");
+    expect(text).not.toContain("1/2");
+    expectFigure(pane, "−0.81", "-0.8123");
     // `from_defaulted` is surfaced as provenance, not silently applied.
     expect(text).toContain("defaulted");
   });
@@ -1858,22 +2064,25 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     const rows = Array.from(region.querySelectorAll("tbody tr"));
     expect(rows).toHaveLength(2);
 
+    // Window cells: `YYYY-MM-DD HH:mm` UTC, the DTO's own RFC 3339 on the
+    // element (the fold table is one of the two tables the Dispatch-2
+    // clarification names).
+    expectFigure(rows[0], "2026-08-01 00:00 UTC", "2026-08-01T00:00:00.000Z");
+    expectFigure(rows[0], "2026-08-15 12:00 UTC", "2026-08-15T12:00:00.000Z");
     const first = rows[0].textContent ?? "";
-    expect(first).toContain("2026-08-01T00:00:00.000Z");
-    expect(first).toContain("2026-08-15T12:00:00.000Z");
     expect(first).toContain("2");
-    expect(first).toContain("-0.4");
     expect(first).toContain("yes");
-    // The fold run's own summary fields ride the same row.
-    expect(first).toContain("0.250");
-    expect(first).toContain("0.500");
+    // The fold run's own summary fields ride the same row, A2-formatted.
+    expectFigure(rows[0], "−0.40", "-0.4");
+    expectFigure(rows[0], "+0.25 USDT", "0.250");
+    expectFigure(rows[0], "50.0%", "0.500");
 
     const second = rows[1].textContent ?? "";
     expect(second).toContain("3");
-    expect(second).toContain("-1.7");
     expect(second).toContain("no");
-    expect(second).toContain("-1.000");
-    expect(second).toContain("0.333");
+    expectFigure(rows[1], "−1.70", "-1.7");
+    expectFigure(rows[1], "−1.00 USDT", "-1.000");
+    expectFigure(rows[1], "33.3%", "0.333");
   });
 
   it("opens a fold as an ordinary run: getBacktestRun on the fold's id lands in the existing result view", async () => {
@@ -1921,11 +2130,11 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     );
     render(<BacktestLabScreen />);
 
-    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    const box = (await screen.findByRole("combobox")) as HTMLInputElement;
     fireEvent.click(screen.getByRole("button", { name: /walk forward/i }));
 
     await screen.findByRole("button", { name: /walking forward/i });
-    expect(select.disabled).toBe(true);
+    expect(box.disabled).toBe(true);
     expect(
       (screen.getByRole("button", { name: /run backtest/i }) as HTMLButtonElement).disabled,
     ).toBe(true);
@@ -1936,7 +2145,7 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
 
     resolveWf({ status: "ok", data: WF_DTO });
     await screen.findByText("wf-44aa19c2");
-    expect(select.disabled).toBe(false);
+    expect(box.disabled).toBe(false);
     expect(
       (screen.getByRole("button", { name: /walk forward/i }) as HTMLButtonElement).disabled,
     ).toBe(false);
@@ -1946,7 +2155,7 @@ describe("BacktestLabScreen (walk-forward, r2.s3.w5)", () => {
     const container = await renderWalkForward(WF_DTO);
     expect(container.querySelector(".bt-walkforward")).not.toBeNull();
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
 
     expect(container.querySelector(".bt-walkforward")).toBeNull();
     expect(screen.queryByText("wf-44aa19c2")).toBeNull();
@@ -2101,15 +2310,22 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     const pane = container.querySelector(".bt-walkforward") as HTMLElement;
     expect(pane).not.toBeNull();
     const text = pane.textContent ?? "";
-    // The naming scheme, the rule, the span and the verdict — the DTO's own.
+    // The naming scheme, the rule, the span and the verdict — the DTO's own,
+    // the span and the folds sentence A2-formatted.
     expect(text).toContain("rolling-oos/v1");
     expect(text).toContain("wf-v1");
-    expect(text).toContain("2026-07-01T00:00:00.000Z");
-    expect(text).toContain("2026-07-07T00:00:00.000Z");
     expect(text).toContain("wf-6c1d9f38");
     expect(text).toContain("FAIL");
-    expect(text).toContain("3/4");
-    expect(text).toContain("-0.4321");
+    expectFigure(
+      pane,
+      "2026-07-01 → 2026-07-07 UTC",
+      "2026-07-01T00:00:00.000Z → 2026-07-07T00:00:00.000Z",
+    );
+    // The sentence counts the SCHEME's folds (`k = 6` on this fixture), not the
+    // six rows' holding count.
+    expect(text).toContain("3 of 6 folds hold (4 required)");
+    expect(text).not.toContain("3/6");
+    expectFigure(pane, "−0.43", "-0.4321");
     // The pane says WHERE this run came from — and says it OUTSIDE the result
     // section, which is the same component on both paths.
     expect(container.querySelector(".bt-wf-origin")?.textContent).toContain("reopened by id");
@@ -2123,14 +2339,22 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     const rows = Array.from(region.querySelectorAll("tbody tr"));
     expect(rows).toHaveLength(6);
     REOPENED_FOLDS.forEach((fold, index) => {
-      const cells = Array.from(rows[index].querySelectorAll("td")).map(
-        (cell) => cell.textContent ?? "",
+      const cells = Array.from(rows[index].querySelectorAll("td"));
+      // The window cells render A2's UTC text with the DTO's own RFC 3339 on
+      // the element; the rest are asserted against their own field.
+      expect(cells[1].textContent).toBe(timeUtc(fold.windowFrom));
+      expect(cells[1].querySelector("[data-exact]")?.getAttribute("data-exact")).toBe(
+        fold.windowFrom,
       );
-      expect(cells[1]).toBe(fold.windowFrom);
-      expect(cells[2]).toBe(fold.windowTo);
-      expect(cells[3]).toBe(String(fold.n));
-      expect(cells[4]).toBe(fold.lowerBound === null ? "—" : String(fold.lowerBound));
-      expect(cells[5]).toBe(fold.holds ? "yes" : "no");
+      expect(cells[2].textContent).toBe(timeUtc(fold.windowTo));
+      expect(cells[2].querySelector("[data-exact]")?.getAttribute("data-exact")).toBe(
+        fold.windowTo,
+      );
+      expect(cells[3].textContent).toBe(String(fold.n));
+      expect(cells[4].textContent).toBe(
+        fold.lowerBound === null ? "—" : decimal(String(fold.lowerBound), 2),
+      );
+      expect(cells[5].textContent).toBe(fold.holds ? "yes" : "no");
     });
     // The fold whose two counts differ proves which one the column reads.
     expect(String(REOPENED_FOLDS[2].n)).not.toBe(String(REOPENED_FOLDS[2].trades));
@@ -2178,13 +2402,13 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
 
     // v-alpha-2 carries a DIFFERENT persisted run — the pane follows the
     // selection, and the previous version's run id goes with it.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await screen.findByText("wf-9a8b7c6d");
     expect(reopenMock).toHaveBeenLastCalledWith({ walkForwardRunId: "wf-9a8b7c6d" });
     expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
 
     // v-beta-1 has no walk-forward run at all: no read, and no pane to fill.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    await chooseVersion("beta");
     await waitFor(() => {
       expect(container.querySelector(".bt-walkforward")).toBeNull();
     });
@@ -2211,7 +2435,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     const { container } = render(<BacktestLabScreen />);
     await screen.findByText("wf-6c1d9f38");
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
 
     // The backend's own typed refusal, rendered like every other failure card.
     const failure = (await screen.findAllByRole("alert")).find((alert) =>
@@ -2251,7 +2475,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     // that re-reads has not run yet. That one frame is what review F1 is about —
     // it must show the NEW target's in-flight state, never the old version's
     // failure or run.
-    switchSelectionOutsideAct(screen.getByRole("combobox") as HTMLSelectElement, "v-alpha-2");
+    switchVersionOutsideAct("v2");
 
     expect(screen.queryByText(dropped.message)).toBeNull();
     expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
@@ -2277,7 +2501,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     await screen.findByText("wf-6c1d9f38");
     expect(container.querySelector(".bt-walkforward")).not.toBeNull();
 
-    switchSelectionOutsideAct(screen.getByRole("combobox") as HTMLSelectElement, "v-alpha-2");
+    switchVersionOutsideAct("v2");
 
     // One frame, un-act-ed: v-alpha-1's six fold rows may not stand in for
     // v-alpha-2 — not even for a paint.
@@ -2348,7 +2572,7 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     });
 
     // The trader moves on while v-alpha-1's read is still out.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await waitFor(() => {
       expect(pending.has("wf-9a8b7c6d")).toBe(true);
     });
@@ -2394,11 +2618,12 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
     });
 
     // Away and back while that read is still out: the SAME id is read twice.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+    await chooseVersion("v2");
     await waitFor(() => {
       expect(pending).toHaveLength(2); // v-alpha-2's read
     });
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-1" } });
+    // Back to v-alpha-1: the same id is read again.
+    await chooseVersion("alpha");
     await waitFor(() => {
       expect(pending).toHaveLength(3); // v-alpha-1 again
     });
@@ -2466,14 +2691,23 @@ describe("BacktestLabScreen (#268 — reopening a finished walk-forward run)", (
   });
 });
 
-/** Drive the selector's change through the DOM rather than `fireEvent`, so the
- * render commits while the passive effect that re-reads has NOT run: the frame
- * review F1 found, made deterministic here by `flushSync` instead of relying on
- * React's discrete-event flushing. */
-function switchSelectionOutsideAct(select: HTMLSelectElement, value: string): void {
+/** Pick the first option matching `query` through the DOM rather than
+ * `fireEvent`, so the render commits while the passive effect that re-reads has
+ * NOT run: the frame review F1 found, made deterministic here by `flushSync`
+ * instead of relying on React's discrete-event flushing.
+ *
+ * Opening and filtering go through `fireEvent` (act-wrapped — that frame is not
+ * the one under test); only the COMMIT is dispatched raw, inside `flushSync`. */
+function switchVersionOutsideAct(query: string): void {
+  const box = screen.getByRole("combobox") as HTMLInputElement;
+  fireEvent.focus(box);
+  fireEvent.change(box, { target: { value: query } });
+  const option = screen.getAllByRole("option")[0];
+  if (option === undefined) {
+    throw new Error(`switchVersionOutsideAct: no option matches ${query}`);
+  }
   flushSync(() => {
-    select.value = value;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+    option.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
 }
 
@@ -2481,3 +2715,593 @@ function switchSelectionOutsideAct(select: HTMLSelectElement, value: string): vo
 type ReopenAnswer =
   | { status: "ok"; data: WalkForwardRunDto }
   | { status: "error"; error: BusError };
+
+// ---------------------------------------------------------------------------
+// r4.s5.w3 — the Library/Lab/Designer walk-filed defects
+// ---------------------------------------------------------------------------
+//
+// #331/#316: a version's runs are reachable and openable — its own backtests and
+// any persisted walk-forward — WITHOUT starting anything. The only commands on
+// those paths are the reads (`getBacktestRun`, `getWalkForwardRun`); the run
+// commands are asserted untouched.
+
+/** A version's own run: the catalogue row AND the run the Lab opens by id. */
+const W3_OWN_RUN: LibraryRunSummary = {
+  id: "ownrun-0001",
+  createdAt: "2026-08-24T09:00:00.000Z",
+  expectancy: "+0.42R",
+  trades: 12,
+};
+
+/** The catalogue the #331/#316 tests read: `ver-own-1` carries one own run and
+ * the walk-forward pointer; `ver-second` carries nothing. */
+function w3Catalog(): LibraryOverview {
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          {
+            ...catalogVersion("ver-own-1", null, W3_OWN_RUN, [W3_OWN_RUN]),
+            latestWalkForwardRunId: "wf-6c1d9f38",
+          },
+          catalogVersion("ver-second", "ver-own-1"),
+        ],
+      },
+    ],
+  };
+}
+
+describe("BacktestLabScreen (#331 — a version's own runs are reachable)", () => {
+  it("opens a version's own backtest run from the Runs list without starting a new run (#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    getRunMock.mockResolvedValue({
+      status: "ok",
+      data: { ...SEEDED_RUN, runId: "ownrun-0001", strategyVersionId: "ver-own-1" },
+    });
+
+    render(<BacktestLabScreen />);
+
+    const runs = await screen.findByRole("region", { name: /version runs/i });
+    fireEvent.click(within(runs).getByRole("button", { name: /open run ownrun-0/i }));
+
+    const provenance = await screen.findByRole("region", { name: /run provenance/i });
+    expect(within(provenance).getByText("ownrun-0001")).toBeTruthy();
+    expect(getRunMock).toHaveBeenCalledWith({ runId: "ownrun-0001" });
+    // A READ: neither run command is reached on this path.
+    expect(runMock).not.toHaveBeenCalled();
+    expect(walkForwardMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("BacktestLabScreen (#316 — any persisted walk-forward run opens)", () => {
+  it("opens the persisted walk-forward run from the Runs list, with its version on the pane, without starting a new one (#316)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+
+    const { container } = render(<BacktestLabScreen />);
+
+    const runs = await screen.findByRole("region", { name: /version runs/i });
+    fireEvent.click(within(runs).getByRole("button", { name: /open walk-forward/i }));
+
+    const pane = (await screen.findByRole("region", {
+      name: /walk-forward result/i,
+    })) as HTMLElement;
+    expect(pane.textContent).toContain("wf-6c1d9f38");
+    expect(pane.textContent).toContain("3 of 6 folds hold (4 required)");
+    // #316's own comment: the pane names the VERSION it ran on, so verifying
+    // that needs no trip to the Library.
+    const meta = container.querySelector(".bt-wf-meta") as HTMLElement;
+    expect(meta).not.toBeNull();
+    expect(within(meta).getByText("version")).toBeTruthy();
+    expect(within(meta).getByText("ver-own-1")).toBeTruthy();
+    // A READ, twice over: neither run command is reached.
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a walk-forward run by id from the field, selecting that run's version (#316)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    // The field asks the backtest read first (a fold id opens as an ordinary
+    // run); a walk-forward id refuses it, and the walk-forward read answers.
+    getRunMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no backtest run wf-9a8b7c6d",
+        run_id: null,
+        session_id: null,
+        child_run_id: "wf-9a8b7c6d",
+      },
+    });
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-9a8b7c6d"
+        ? { status: "ok" as const, data: { ...OTHER_WF_DTO, versionId: "ver-second" } }
+        : { status: "ok" as const, data: { ...REOPENED_DTO, versionId: "ver-own-1" } },
+    );
+
+    render(<BacktestLabScreen />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "wf-9a8b7c6d" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+
+    // The run the id names is on screen — the DTO carries the strategy version,
+    // and the picker moves to it.
+    await screen.findByText("wf-9a8b7c6d");
+    expect(reopenMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-9a8b7c6d" });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the server's own message when an id names nothing at all (#316)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    const noBacktestRun: BusError = {
+      code: "not_found",
+      message: "no backtest run nope-0001",
+      run_id: null,
+      session_id: null,
+      child_run_id: "nope-0001",
+    };
+    getRunMock.mockResolvedValue({ status: "error", error: noBacktestRun });
+    reopenMock.mockImplementation(async (request) =>
+      request.walkForwardRunId === "wf-6c1d9f38"
+        ? { status: "ok" as const, data: { ...REOPENED_DTO, versionId: "ver-own-1" } }
+        : {
+            status: "error" as const,
+            error: {
+              code: "not_found",
+              message: "no walk-forward run nope-0001",
+              run_id: null,
+              session_id: null,
+              child_run_id: null,
+            },
+          },
+    );
+
+    render(<BacktestLabScreen />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "nope-0001" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+
+    // The BACKTEST read's refusal is the one rendered — it is the read that
+    // asked first, and its `child_run_id` carries the id the trader typed.
+    const failure = (await screen.findAllByRole("alert")).find((alert) =>
+      alert.textContent?.includes(noBacktestRun.message),
+    );
+    expect(failure).toBeTruthy();
+    expect(failure?.textContent).toContain("nope-0001");
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("drops a superseded open-by-id read: an older answer never replaces a newer run (#269/#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    // The child version's compare panel mounts once a run lands on it; the
+    // refusal is the read's own answer — this test is about which run shows.
+    compareMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no parent run for run-second-1",
+        run_id: null,
+        session_id: null,
+        child_run_id: "run-second-1",
+      },
+    });
+    // Both backtest reads are held open, settled by hand in the order the test
+    // chooses: the FIRST submit's answer is the last one in.
+    const pending = new Map<
+      string,
+      (answer: { status: "ok"; data: BacktestRunDto }) => void
+    >();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    getRunMock.mockImplementation(
+      (request) =>
+        new Promise((resolve) => {
+          pending.set(request.runId, resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "run-first-01" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-first-01")).toBe(true);
+
+    fireEvent.change(input, { target: { value: "run-second-1" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-second-1")).toBe(true);
+
+    // The second submit answers first: its run lands on its own version.
+    await act(async () => {
+      pending.get("run-second-1")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-second-1", strategyVersionId: "ver-second" },
+      });
+    });
+    const provenance = await screen.findByRole("region", { name: /run provenance/i });
+    expect(within(provenance).getByText("run-second-1")).toBeTruthy();
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+
+    // The first submit lands LAST: superseded, it applies nothing — the newer
+    // run stays, and no older one replaces it.
+    await act(async () => {
+      pending.get("run-first-01")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-first-01", strategyVersionId: "ver-own-1" },
+      });
+    });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    expect(screen.queryByText("run-first-01")).toBeNull();
+  });
+
+  it("keeps a listed run when an abandoned open-by-id read lands later (#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    // The abandoned read's version has a parent to compare with; the refusal is
+    // the compare read's own answer — this test is about which run shows.
+    compareMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no parent run for run-first-01",
+        run_id: null,
+        session_id: null,
+        child_run_id: "run-first-01",
+      },
+    });
+    // Every backtest read is held open, settled by hand in the order the test
+    // chooses: the abandoned id's answer is the last one in.
+    const pending = new Map<
+      string,
+      (answer: { status: "ok"; data: BacktestRunDto }) => void
+    >();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    getRunMock.mockImplementation(
+      (request) =>
+        new Promise((resolve) => {
+          pending.set(request.runId, resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+    const runs = await screen.findByRole("region", { name: /version runs/i });
+
+    // The trader submits an id it never comes back to…
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "run-first-01" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-first-01")).toBe(true);
+
+    // …then opens a listed run instead: it answers, and it lands.
+    fireEvent.click(within(runs).getByRole("button", { name: /open run ownrun-0/i }));
+    expect(pending.has("ownrun-0001")).toBe(true);
+    await act(async () => {
+      pending.get("ownrun-0001")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "ownrun-0001", strategyVersionId: "ver-own-1" },
+      });
+    });
+    expect(
+      within(await screen.findByRole("region", { name: /run provenance/i })).getByText(
+        "ownrun-0001",
+      ),
+    ).toBeTruthy();
+
+    // The abandoned id lands LAST: superseded, it applies nothing — the listed
+    // run stays, on the version the trader was looking at.
+    await act(async () => {
+      pending.get("run-first-01")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-first-01", strategyVersionId: "ver-second" },
+      });
+    });
+    expect(
+      within(screen.getByRole("region", { name: /run provenance/i })).getByText("ownrun-0001"),
+    ).toBeTruthy();
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-own-");
+    expect(screen.queryByText("run-first-01")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #330 — a walk-forward's fold runs are marked and grouped
+// ---------------------------------------------------------------------------
+
+/** Two folds of the latest walk-forward (`REOPENED_DTO`'s index 2 and 0) and a
+ * fold of an OLDER walk-forward, which no pointer on the version can name. */
+const W3_FOLD_LATEST: LibraryRunSummary = {
+  id: "run-fold-reopen-2",
+  createdAt: "2026-08-23T09:00:00.000Z",
+  expectancy: "+0.62R",
+  trades: 4,
+};
+
+const W3_FOLD_LATEST_FIRST: LibraryRunSummary = {
+  id: "run-fold-reopen-0",
+  createdAt: "2026-08-23T09:00:00.000Z",
+  expectancy: "+0.41R",
+  trades: 3,
+};
+
+const W3_FOLD_OLDER: LibraryRunSummary = {
+  id: "oldwf-fold-1",
+  createdAt: "2026-08-21T09:00:00.000Z",
+  expectancy: "+0.10R",
+  trades: 6,
+};
+
+/** The catalogue #330 reads: the version's own run, the latest walk-forward's
+ * folds (payload order: fold 3, own, fold 1) and — in the second fixture — a
+ * fold of an older walk-forward. */
+function w3FoldCatalog(olderFold: LibraryRunSummary | null): LibraryOverview {
+  const runs = [W3_FOLD_LATEST, W3_OWN_RUN, W3_FOLD_LATEST_FIRST];
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          {
+            ...catalogVersion(
+              "ver-own-1",
+              null,
+              W3_OWN_RUN,
+              olderFold === null ? runs : [olderFold, ...runs],
+            ),
+            latestWalkForwardRunId: "wf-6c1d9f38",
+          },
+        ],
+      },
+    ],
+  };
+}
+
+describe("BacktestLabScreen (#330 — fold runs are marked and grouped)", () => {
+  it("labels the latest walk-forward's folds and groups them after the version's own runs (#330)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3FoldCatalog(null) });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+
+    const { container } = render(<BacktestLabScreen />);
+
+    // The fold map rides the pane's own read of the version's pointer.
+    await screen.findByRole("region", { name: /walk-forward result/i });
+    const rows = await waitFor(() => {
+      const found = Array.from(container.querySelectorAll(".bt-runs-list .bt-row"));
+      expect(found).toHaveLength(3);
+      return found;
+    });
+
+    // The version's own run leads; the two folds follow, each carrying its own
+    // label (`index + 1`, the walk-forward's short id) — never a mark the
+    // payload cannot justify.
+    expect(rows.map((row) => row.querySelector(".bt-id")?.textContent)).toEqual([
+      "ownrun-0",
+      "run-fold",
+      "run-fold",
+    ]);
+    expect(rows[0]?.querySelector(".bt-fold-label")).toBeNull();
+    expect(rows[1]?.querySelector(".bt-fold-label")?.textContent).toBe("fold 3 of WF wf-6c1d9");
+    expect(rows[2]?.querySelector(".bt-fold-label")?.textContent).toBe("fold 1 of WF wf-6c1d9");
+  });
+
+  it("leaves an older walk-forward's fold unmarked — the known limit (#330)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3FoldCatalog(W3_FOLD_OLDER) });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+
+    const { container } = render(<BacktestLabScreen />);
+    await screen.findByRole("region", { name: /walk-forward result/i });
+
+    const rows = Array.from(container.querySelectorAll(".bt-runs-list .bt-row"));
+    const older = rows.find(
+      (row) => row.querySelector(".bt-id")?.textContent === "oldwf-fo",
+    );
+    expect(older).toBeDefined();
+    // `LibraryRunSummary` carries no `walk_forward_run_id`, and the version names
+    // only its LATEST walk-forward — so the screen cannot know this run is a fold,
+    // and must not guess. It reads exactly one walk-forward: the pointer.
+    expect(older?.querySelector(".bt-fold-label")).toBeNull();
+    // Non-vacuous: the latest walk-forward's folds in the SAME render do wear
+    // their labels — the absence above is a limit, not a broken feature.
+    expect(
+      rows
+        .filter((row) => row.querySelector(".bt-fold-label") !== null)
+        .map((row) => row.querySelector(".bt-id")?.textContent),
+    ).toEqual(["run-fold", "run-fold"]);
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    expect(reopenMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #326 — the compare panel names its runs and explains the inputs
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (#326 — the compare names its runs)", () => {
+  it("names both compared runs and shows the inputs note beside the inputs-differ badge (#326)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CHILD_CATALOG });
+    compareMock.mockResolvedValue({ status: "ok", data: COMPARE_DTO });
+    render(<BacktestLabScreen />);
+
+    await chooseVersion("v2");
+    const section = await screen.findByRole("region", { name: /compare with parent/i });
+
+    // Both columns carry their run: the 8-character short id on screen, the
+    // DTO's full id on the element.
+    const child = within(section).getByText("run-chil");
+    expect(child.getAttribute("title")).toBe(COMPARE_DTO.childRunId);
+    const parent = within(section).getByText("run-pare");
+    expect(parent.getAttribute("title")).toBe(COMPARE_DTO.parentRunId);
+
+    // The reason the inputs cannot be proven equal rides VISIBLY beside the
+    // badge — the hover keeps the exact text too.
+    const badge = within(section).getByText("inputs differ");
+    expect(badge.getAttribute("title")).toBe(COMPARE_DTO.inputsNote);
+    expect(within(section).getByText(COMPARE_DTO.inputsNote as string)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #269 — the certification deep link (`#/backtest?wf=<id>`)
+// ---------------------------------------------------------------------------
+
+/** Two versions, neither with a pointer or a run: the ONLY walk-forward the Lab
+ * can read here is the one the fragment names. */
+function w3LinkCatalog(): LibraryOverview {
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          catalogVersion("ver-own-1", null),
+          catalogVersion("ver-second", "ver-own-1"),
+        ],
+      },
+    ],
+  };
+}
+
+describe("BacktestLabScreen (#269 — the certification deep link)", () => {
+  afterEach(() => {
+    window.location.hash = "";
+  });
+
+  it("opens the run a #/backtest?wf= fragment names, selecting that run's version (#269)", async () => {
+    window.location.hash = "#/backtest?wf=wf-6c1d9f38";
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-second" },
+    });
+
+    render(<BacktestLabScreen />);
+
+    // The run the fragment names is on screen, and the picker moved to the
+    // version the DTO attributes it to.
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    // A READ, exactly like the Runs rows: nothing is started.
+    expect(walkForwardMock).not.toHaveBeenCalled();
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("opens the run a fragment names while the Lab is already open (#269)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-second" },
+    });
+
+    render(<BacktestLabScreen />);
+    // Mounted and idle: neither version carries a pointer, so nothing has been
+    // read yet.
+    await screen.findByRole("region", { name: /version runs/i });
+    expect(reopenMock).not.toHaveBeenCalled();
+
+    window.location.hash = "#/backtest?wf=wf-6c1d9f38";
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+    await screen.findByText("wf-6c1d9f38");
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+  });
+
+  it("consumes the fragment once, so a remount never replays the link (#269, #315)", async () => {
+    window.location.hash = "#/backtest?wf=wf-6c1d9f38";
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-second" },
+    });
+
+    const first = render(<BacktestLabScreen />);
+    await screen.findByText("wf-6c1d9f38");
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    // The fragment is consumed as soon as it is taken…
+    expect(window.location.hash).toBe("#/backtest");
+
+    // …so the screen coming back (a reconnect remounts it) neither reads the
+    // run again nor re-opens it from a replayed link.
+    first.unmount();
+    render(<BacktestLabScreen />);
+    await screen.findByRole("region", { name: /version runs/i });
+    await act(async () => {});
+    expect(reopenMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+  });
+
+  it("keeps the trader's later pick when a pending deep-link read resolves (#269)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    // A run id no other case reads, so the shared read cache cannot stand in
+    // for the link's own read. The read is held open, settled by hand after the
+    // pick.
+    const LINK_WF = "wf-g1-stale01";
+    const pending = new Map<string, (answer: ReopenAnswer) => void>();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    reopenMock.mockImplementation(
+      (request) =>
+        new Promise<ReopenAnswer>((resolve) => {
+          pending.set(request.walkForwardRunId, resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+    await screen.findByRole("region", { name: /version runs/i });
+
+    // The link arrives while the screen is open; its read is still out when the
+    // trader picks another version.
+    window.location.hash = `#/backtest?wf=${LINK_WF}`;
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(pending.has(LINK_WF)).toBe(true);
+    expect(window.location.hash).toBe("#/backtest");
+
+    await chooseVersion("ver-seco");
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+
+    // The superseded read resolves — and applies nothing: the pick stands, and
+    // no run pane opens from the link.
+    await act(async () => {
+      pending.get(LINK_WF)?.({
+        status: "ok",
+        data: { ...REOPENED_DTO, walkForwardRunId: LINK_WF, versionId: "ver-own-1" },
+      });
+    });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    expect(screen.queryByText(LINK_WF)).toBeNull();
+  });
+});

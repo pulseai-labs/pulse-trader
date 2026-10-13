@@ -15,34 +15,31 @@
 // "navigate to the new session" lands here.
 
 import { useCallback, useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 import { commands } from "../bindings";
 import type { PaperSessionSummary, StopAllResult } from "../bindings";
-import { CertBadge } from "../components/CertBadge";
-import { SessionBadge, sessionBadgeState } from "../components/SessionBadge";
+import { CertBadge, certKinds } from "../components/CertBadge";
+import { SessionBadge, sessionBadgeState, shortId } from "../components/SessionBadge";
+import { Figure } from "../format/Figure";
+import { rMultiple } from "../format/numbers";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { takeRequestedSession } from "../paper/handoff";
+import { useConnection } from "../shell/ConnectionContext";
 import SessionDetail from "./SessionDetail";
 
 /** The details-track host `App.tsx` renders when the route declares the track. */
 const DETAILS_PANE_ID = "details-pane";
-
-/** The certificate badge a session card states. */
-function cardCertKind(summary: PaperSessionSummary): "certified" | "uncertified" | "fixture" | "stale" {
-  if (summary.certification_stale) return "stale";
-  if (summary.fixture) return "fixture";
-  if (summary.graduation.graduation === "override") return "uncertified";
-  return "certified";
-}
 
 /** The live epoch's latest shadow check, when the log recorded one. */
 function liveShadow(summary: PaperSessionSummary) {
   return summary.shadow_checks.at(-1) ?? null;
 }
 
-/** The OOS mini-verdict a card shows. */
-function oosMini(summary: PaperSessionSummary): string {
+/** The OOS mini-verdict a card shows. The live mean R is A2-formatted through
+ * the module, with the server's own text on the element (r4.s5.w1). */
+function oosMini(summary: PaperSessionSummary): ReactNode {
   const comparison = summary.comparison;
   switch (comparison.status) {
     case "not_applicable":
@@ -50,15 +47,36 @@ function oosMini(summary: PaperSessionSummary): string {
     case "pending":
       return `OOS pending ${comparison.n}/${comparison.of}`;
     case "within":
-      return `OOS ${comparison.live_mean_r}R within`;
+      return (
+        <>
+          OOS{" "}
+          <Figure exact={comparison.live_mean_r}>{rMultiple(comparison.live_mean_r)}</Figure>{" "}
+          within
+        </>
+      );
     case "below":
-      return `OOS ${comparison.live_mean_r}R below`;
+      return (
+        <>
+          OOS{" "}
+          <Figure exact={comparison.live_mean_r}>{rMultiple(comparison.live_mean_r)}</Figure>{" "}
+          below
+        </>
+      );
     case "above":
-      return `OOS ${comparison.live_mean_r}R above`;
+      return (
+        <>
+          OOS{" "}
+          <Figure exact={comparison.live_mean_r}>{rMultiple(comparison.live_mean_r)}</Figure>{" "}
+          above
+        </>
+      );
   }
 }
 
 export default function DeploymentDashboard() {
+  // The app's one status poll (r4.s5.w4, #338): the cards' badges render
+  // `last seen` from it while the server is not answering.
+  const connection = useConnection();
   const [sessions, setSessions] = useState<PaperSessionSummary[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -160,14 +178,29 @@ export default function DeploymentDashboard() {
               >
                 <header className="dc-head">
                   <span className="dc-pair-tag">{session.pair}</span>
-                  <CertBadge kind={cardCertKind(session)} />
-                  <SessionBadge state={sessionBadgeState(session)} />
+                  {certKinds(session).map((kind) => (
+                    <CertBadge key={kind} kind={kind} />
+                  ))}
+                  <SessionBadge
+                    state={sessionBadgeState(session)}
+                    live={connection.status.state === "up"}
+                    lastSeenAt={connection.lastGoodAt}
+                  />
                 </header>
                 <div className="dc-body">
                   <span className="dc-tf mono">
                     {session.pair} · {session.primary_timeframe}
                     {session.htf_timeframe === null ? "" : ` · ${session.htf_timeframe}`}
                     {session.uses_d1 ? " · D1" : ""}
+                  </span>
+                  {/* The session's own id, short with the full id on hover, and
+                      the version it ran named apart (#333) — the card follows
+                      the detail header's rule. */}
+                  <span className="dc-id mono" title={session.id}>
+                    {shortId(session.id)}
+                  </span>
+                  <span className="dc-ver mono" title={session.strategy_version_id}>
+                    version {shortId(session.strategy_version_id)}
                   </span>
                   <span className="dc-trades mono">{session.closed_trade_count} closed trades</span>
                   <span className="dc-oos mono">{oosMini(session)}</span>

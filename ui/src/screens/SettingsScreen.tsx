@@ -153,7 +153,13 @@ export default function SettingsScreen() {
 
         <div className="srv-foot">
           <span className="srv-foot-note">The token itself is never shown after connecting.</span>
-          <button type="button" className="btn-sec-sm" onClick={openConnect}>
+          {/* #386: never disabled — from the disconnected state this IS the way
+              back to a connection. */}
+          <button
+            type="button"
+            className="btn-sec-sm"
+            onClick={openConnect}
+          >
             Change server
           </button>
           <button

@@ -24,6 +24,12 @@ export interface ConnectionValue {
   refresh: () => void;
   /** Open the Connect screen over the live app ("Change server"). */
   openConnect: () => void;
+  /**
+   * The epoch-ms instant of the last status poll that answered `up`, when one
+   * has (r4.s5.w4, #338). Screens render `last seen <state> · <time> UTC` from
+   * it while the status is anything but `up`, so no surface invents a time.
+   */
+  lastGoodAt: number | null;
 }
 
 const ConnectionContext = createContext<ConnectionValue | null>(null);

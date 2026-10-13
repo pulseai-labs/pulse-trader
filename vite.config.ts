@@ -9,14 +9,21 @@
 // bundle, because `generate_context!` embeds whatever is in that directory.
 //
 // `@vitejs/plugin-react` (r1.s1.w5, ADR-0020 step 1) is the JSX/Fast-Refresh transform
-// for the ported design system -- pinned to the `^5.x` line because `^6.x` requires
-// Vite 8, and this item ports the design system into the existing Vite 5 toolchain
-// rather than bumping it (an unrelated, larger change this item does not make).
+// for the design system. r4.s5.w5 moved the toolchain to Vite 8 (rolldown +
+// lightningcss, #121/#122) and the plugin to its Vite 8 major (`^6.x`, whose peer
+// range is `vite ^8.0.0`; the `^5.x` line was the pre-Vite-8 major the old note
+// pinned while this repo was still on Vite 6).
+//
+// `build.target: "safari15"` is honoured by Vite 8's rolldown/oxc transform, which
+// matters because the app's renderer is WKWebView (ADR-0020's recorded risk):
+// verified for r4.s5.w5 by lowering a class static block (Safari 16.4+) out of a
+// probe bundle, and an unknown target is a hard build error, not a silent default.
 //
 // `defineConfig` comes from `vitest/config` rather than `vite` (r1.s1.w6, G9): it
 // re-exports Vite's own `defineConfig` with the `test` key merged into the type, so
 // this stays ONE config file/format for both `vite build` and `vitest run` rather than
-// a second config format bolted on beside it. `test.environment` is `jsdom` (not the
+// a second config format bolted on beside it (vitest `^5.0.4` still ships that export,
+// re-checked at r4.s5.w5). `test.environment` is `jsdom` (not the
 // default `node`) because the rendered layer's assertions (exactly one nav row is
 // `.is-active`, no row is a dead link) need a DOM to query.
 import react from "@vitejs/plugin-react";

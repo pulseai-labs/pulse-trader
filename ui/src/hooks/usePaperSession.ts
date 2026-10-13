@@ -8,7 +8,9 @@
 // re-reads are single-flight with one trailing refetch (r4.s4.w2): while a
 // read is in flight further triggers only mark it dirty, so the replayed
 // backlog a long stream sends on mount costs two reads instead of one per
-// frame, and only the newest request's answer is applied. A frame
+// frame, and only the newest request's answer is applied. A read that FAILS
+// still runs its queued trailing refetch (r4.s5.w4, #371) — the failure used
+// to drop it, and a stopped session then needed a reload to recover. A frame
 // whose seq is at or below the last one is DROPPED: the server resumes from
 // `Last-Event-ID`, and a resumed stream may replay its boundary, so the
 // duplicate must not reach the view twice.
@@ -104,7 +106,6 @@ export function usePaperSession(id: string): PaperSessionView {
       dirty.current = false;
       const read = ++readSeq.current;
       newestRead.current = read;
-      let failed = false;
       try {
         const result = await commands.paperSession(id);
         if (!alive.current) return;
@@ -116,17 +117,18 @@ export function usePaperSession(id: string): PaperSessionView {
           setError(null);
         } else {
           setError(result.error.message);
-          failed = true;
         }
       } catch {
         if (alive.current && gen === generation.current && read === readSeq.current) {
           setError("The session read failed.");
         }
-        failed = true;
       } finally {
         if (newestRead.current === read) newestRead.current = null;
       }
-      if (failed || !dirty.current) return;
+      // A trigger that arrived while this read ran gets its one trailing read
+      // — a FAILED read included (#371): dropping it left a stopped session
+      // stuck until a reload. With no new dirt this is the exit.
+      if (!dirty.current) return;
     }
   }, [id]);
 

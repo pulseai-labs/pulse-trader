@@ -21,20 +21,16 @@ import { useEffect, useRef, useState } from "react";
 
 import { commands } from "../bindings";
 import type { PaperSessionSummary, PaperShadowCheck, PaperTrades } from "../bindings";
-import { CertBadge } from "../components/CertBadge";
-import { SessionBadge, sessionBadgeState } from "../components/SessionBadge";
+import { CertBadge, certKinds } from "../components/CertBadge";
+import { SessionBadge, sessionBadgeState, shortId } from "../components/SessionBadge";
+import { Figure } from "../format/Figure";
+import { price, qty, rMultiple, usdt } from "../format/numbers";
+import { timeUtc } from "../format/time";
 import { usePaperSession } from "../hooks/usePaperSession";
+import { useConnection } from "../shell/ConnectionContext";
 
 /** The em dash a null renders — a statement that no value exists. */
 const EM_DASH = "—";
-
-/** How the certificate row states a session's graduation. */
-function certKind(summary: PaperSessionSummary): "certified" | "uncertified" | "fixture" | "stale" {
-  if (summary.certification_stale) return "stale";
-  if (summary.fixture) return "fixture";
-  if (summary.graduation.graduation === "override") return "uncertified";
-  return "certified";
-}
 
 export default function SessionDetail({
   sessionId,
@@ -44,6 +40,9 @@ export default function SessionDetail({
   onChanged?: () => void;
 }) {
   const view = usePaperSession(sessionId);
+  // The app's one status poll (r4.s5.w4, #338): the badge renders `last seen`
+  // from it while the server is not answering, never a live state.
+  const connection = useConnection();
   const [trades, setTrades] = useState<PaperTrades | null>(null);
   const [serverEngine, setServerEngine] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -106,15 +105,29 @@ export default function SessionDetail({
         <div className="dh-left">
           <span className="dc-pair-tag">{summary.pair}</span>
           <div className="dh-info">
-            <span className="dh-name mono">{summary.strategy_version_id}</span>
+            {/* The session's own id, short with the full id on hover (#333).
+                The version below is named separately, its short id carrying the
+                full version id on hover the same way. */}
+            <span className="dh-name mono" title={summary.id}>
+              {shortId(summary.id)}
+            </span>
             <span className="dh-ver mono">
+              version{" "}
+              <span title={summary.strategy_version_id}>
+                {shortId(summary.strategy_version_id)}
+              </span>
+              {" · "}
               {summary.primary_timeframe}
               {summary.htf_timeframe === null ? "" : ` · ${summary.htf_timeframe}`}
               {summary.uses_d1 ? " · D1" : ""}
             </span>
           </div>
         </div>
-        <SessionBadge state={sessionBadgeState(summary)} />
+        <SessionBadge
+          state={sessionBadgeState(summary)}
+          live={connection.status.state === "up"}
+          lastSeenAt={connection.lastGoodAt}
+        />
       </header>
 
       {/* The stream's own state (spec §4): a refusal is terminal — the screen
@@ -135,7 +148,9 @@ export default function SessionDetail({
           <div className="dm-row">
             <span className="dm-k">certificate</span>
             <span className="dm-v">
-              <CertBadge kind={certKind(summary)} reason={reason} />
+              {certKinds(summary).map((kind) => (
+                <CertBadge key={kind} kind={kind} reason={kind === "uncertified" ? reason : null} />
+              ))}
               {certifyingRun !== null && (
                 <>
                   <span className="mono">{certifyingRun}</span>
@@ -144,6 +159,26 @@ export default function SessionDetail({
               )}
             </span>
           </div>
+          {/* #304: the snapshots the certification recorded, named here as the
+              promote sheet names the version's — every data version in the
+              certification's own fold order. */}
+          {summary.graduation.graduation === "certified" &&
+            summary.graduation.data_versions.length > 0 && (
+              <div className="dm-row">
+                <span className="dm-k">certified on</span>
+                <span className="dm-v ps-snaps">
+                  {summary.graduation.data_versions.map((version) => (
+                    <span
+                      key={`${version.timeframe}-${version.data_version}`}
+                      className="ps-snap mono"
+                      title={version.timeframe}
+                    >
+                      {version.data_version}
+                    </span>
+                  ))}
+                </span>
+              </div>
+            )}
           {reason !== null && (
             <div className="dm-reason">
               <span>Override reason</span>“<b>{reason}</b>”
@@ -161,11 +196,16 @@ export default function SessionDetail({
               started on {startedOn ?? EM_DASH} · server now {serverEngine ?? EM_DASH}
             </span>
           </div>
-          {/* #340: the newest consumed bar, as the server's own epoch-ms text
-              (r4.s5 owns human units). */}
+          {/* #340: the newest consumed bar — the server's own epoch-ms text,
+              formatted to A2's `YYYY-MM-DD HH:mm` UTC (r4.s5.w1) with the
+              server's text on the element. */}
           <div className="dm-row">
             <span className="dm-k">last bar</span>
-            <span className="mono dm-v">{summary.last_bar_open_time ?? EM_DASH}</span>
+            <span className="mono dm-v">
+              <Figure exact={summary.last_bar_open_time}>
+                {timeUtc(summary.last_bar_open_time)}
+              </Figure>
+            </span>
           </div>
           {summary.comparison.engine_builds > 1 && (
             <div className="dm-row">
@@ -193,14 +233,22 @@ export default function SessionDetail({
           <div className="pos-stats">
             <div className="ps-item">
               <span className="ps-lab">realized</span>
-              <span className="ps-val mono">{summary.realized_usdt_total}</span>
+              <span className="ps-val mono">
+                <Figure exact={summary.realized_usdt_total}>
+                  {usdt(summary.realized_usdt_total, { signed: true })}
+                </Figure>
+              </span>
               <span className="ps-count">
                 {summary.realized_usdt_count} of {summary.closed_trade_count} trades
               </span>
             </div>
             <div className="ps-item">
               <span className="ps-lab">realized R</span>
-              <span className="ps-val mono">{summary.realized_r_total}</span>
+              <span className="ps-val mono">
+                <Figure exact={summary.realized_r_total}>
+                  {rMultiple(summary.realized_r_total)}
+                </Figure>
+              </span>
               <span className="ps-count">
                 {summary.realized_r_count} of {summary.closed_trade_count} trades
               </span>
@@ -208,12 +256,22 @@ export default function SessionDetail({
             <div className="ps-item">
               <span className="ps-lab">unrealized</span>
               <span className="ps-val mono">
-                {summary.open_position === null ? "flat" : (summary.unrealized_usdt ?? EM_DASH)}
+                {summary.open_position === null ? (
+                  "flat"
+                ) : (
+                  <Figure exact={summary.unrealized_usdt}>
+                    {usdt(summary.unrealized_usdt, { signed: true })}
+                  </Figure>
+                )}
               </span>
             </div>
             <div className="ps-item">
               <span className="ps-lab">session P&L</span>
-              <span className="ps-val mono">{summary.session_pnl_usdt}</span>
+              <span className="ps-val mono">
+                <Figure exact={summary.session_pnl_usdt}>
+                  {usdt(summary.session_pnl_usdt, { signed: true })}
+                </Figure>
+              </span>
             </div>
           </div>
           <p className="equity-placeholder">
@@ -238,45 +296,75 @@ export default function SessionDetail({
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">entry</span>
-                  <span className="ps-val mono">{summary.open_position.entry_price}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.entry_price}>
+                      {price(summary.open_position.entry_price)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">size</span>
-                  <span className="ps-val mono">{summary.open_position.qty}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.qty}>{qty(summary.open_position.qty)}</Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">opened</span>
-                  <span className="ps-val mono">{summary.open_position.entry_fill_time}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.entry_fill_time}>
+                      {timeUtc(summary.open_position.entry_fill_time)}
+                    </Figure>
+                  </span>
                 </div>
                 {/* The mark and the money figures (r4.s4.w2): the server's own
-                    text, the dash where the wire carries none. */}
+                    text, formatted to A2, the dash where the wire carries none. */}
                 <div className="ps-item">
                   <span className="ps-lab">mark</span>
-                  <span className="ps-val mono">{summary.open_position.mark_price ?? EM_DASH}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.mark_price}>
+                      {price(summary.open_position.mark_price)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">mark time</span>
-                  <span className="ps-val mono">{summary.open_position.mark_time ?? EM_DASH}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.mark_time}>
+                      {timeUtc(summary.open_position.mark_time)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">unrealized</span>
                   <span className="ps-val mono">
-                    {summary.open_position.unrealized_usdt ?? EM_DASH}
+                    <Figure exact={summary.open_position.unrealized_usdt}>
+                      {usdt(summary.open_position.unrealized_usdt, { signed: true })}
+                    </Figure>
                   </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">unrealized R</span>
                   <span className="ps-val mono">
-                    {summary.open_position.unrealized_r ?? EM_DASH}
+                    <Figure exact={summary.open_position.unrealized_r}>
+                      {rMultiple(summary.open_position.unrealized_r)}
+                    </Figure>
                   </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">funding</span>
-                  <span className="ps-val mono">{summary.open_position.funding_usdt}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.funding_usdt}>
+                      {usdt(summary.open_position.funding_usdt, { signed: true })}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">entry fee</span>
-                  <span className="ps-val mono">{summary.open_position.entry_fee_usdt}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.entry_fee_usdt}>
+                      {usdt(summary.open_position.entry_fee_usdt)}
+                    </Figure>
+                  </span>
                 </div>
                 {/* The live stops (#341): present only while a running engine
                     answers the read; a null renders the dash, and their
@@ -284,17 +372,25 @@ export default function SessionDetail({
                 <div className="ps-item">
                   <span className="ps-lab">initial stop</span>
                   <span className="ps-val mono">
-                    {summary.open_position.initial_stop ?? EM_DASH}
+                    <Figure exact={summary.open_position.initial_stop}>
+                      {price(summary.open_position.initial_stop)}
+                    </Figure>
                   </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">stop</span>
-                  <span className="ps-val mono">{summary.open_position.stop_price ?? EM_DASH}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.stop_price}>
+                      {price(summary.open_position.stop_price)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">take profit</span>
                   <span className="ps-val mono">
-                    {summary.open_position.take_profit_price ?? EM_DASH}
+                    <Figure exact={summary.open_position.take_profit_price}>
+                      {price(summary.open_position.take_profit_price)}
+                    </Figure>
                   </span>
                 </div>
               </div>
@@ -370,11 +466,34 @@ export default function SessionDetail({
                       <tr key={`${entry.kind}-${entry.at}-${index}`}>
                         <td className="mono">{entry.kind}</td>
                         <td className="mono">
-                          {entry.kind === "fill" ? entry.fill_time : entry.at}
+                          {/* #382: an order states when it was PLACED; a fill
+                              states the BAR it belongs to — so an order placed
+                              after its bar's open never reads as filled before
+                              ordered. */}
+                          {entry.kind === "fill" ? (
+                            <Figure exact={entry.fill_time}>{`bar ${timeUtc(entry.fill_time)}`}</Figure>
+                          ) : (
+                            <Figure exact={entry.at}>{`placed ${timeUtc(entry.at)}`}</Figure>
+                          )}
                         </td>
-                        <td className="mono">{entry.side}</td>
-                        <td className="mono">{entry.qty}</td>
-                        <td className="mono">{entry.kind === "fill" ? entry.price : EM_DASH}</td>
+                        <td className="mono">
+                          {/* #382: an exit fill closes the position its side
+                              names, so it reads `close long`/`close short`; an
+                              entry fill keeps its own side. */}
+                          {entry.kind === "fill" && entry.exit_reason !== null
+                            ? `close ${entry.side}`
+                            : entry.side}
+                        </td>
+                        <td className="mono">
+                          <Figure exact={entry.qty}>{qty(entry.qty)}</Figure>
+                        </td>
+                        <td className="mono">
+                          {entry.kind === "fill" ? (
+                            <Figure exact={entry.price}>{price(entry.price)}</Figure>
+                          ) : (
+                            EM_DASH
+                          )}
+                        </td>
                         <td className="mono">
                           {entry.kind === "fill" ? (entry.exit_reason ?? EM_DASH) : EM_DASH}
                         </td>
@@ -418,18 +537,53 @@ export default function SessionDetail({
                     .reverse()
                     .map((trade) => (
                       <tr key={`${trade.exit_fill_time}-${trade.exit_price}`}>
-                        <td className="mono">{trade.entry_fill_time ?? EM_DASH}</td>
-                        <td className="mono">{trade.exit_fill_time}</td>
+                        <td className="mono">
+                          <Figure exact={trade.entry_fill_time}>
+                            {timeUtc(trade.entry_fill_time)}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.exit_fill_time}>
+                            {timeUtc(trade.exit_fill_time)}
+                          </Figure>
+                        </td>
                         <td className="mono">{trade.side}</td>
-                        <td className="mono">{trade.qty}</td>
-                        <td className="mono">{trade.entry_price ?? EM_DASH}</td>
-                        <td className="mono">{trade.exit_price}</td>
+                        <td className="mono">
+                          <Figure exact={trade.qty}>{qty(trade.qty)}</Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.entry_price}>{price(trade.entry_price)}</Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.exit_price}>{price(trade.exit_price)}</Figure>
+                        </td>
                         <td className="mono">{trade.exit_reason}</td>
-                        <td className="mono">{trade.realized_r ?? EM_DASH}</td>
-                        <td className="mono">{trade.realized_usdt ?? EM_DASH}</td>
-                        <td className="mono">{trade.entry_fee_usdt ?? EM_DASH}</td>
-                        <td className="mono">{trade.exit_fee_usdt}</td>
-                        <td className="mono">{trade.funding_usdt}</td>
+                        <td className="mono">
+                          <Figure exact={trade.realized_r}>{rMultiple(trade.realized_r)}</Figure>
+                        </td>
+                        <td className="mono">
+                          {/* The column header carries the unit; the figure is
+                              the server's own signed USDT, exact text on the
+                              element. */}
+                          <Figure exact={trade.realized_usdt}>
+                            {usdt(trade.realized_usdt, { signed: true, unit: false })}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.entry_fee_usdt}>
+                            {usdt(trade.entry_fee_usdt)}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.exit_fee_usdt}>
+                            {usdt(trade.exit_fee_usdt)}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.funding_usdt}>
+                            {usdt(trade.funding_usdt, { signed: true })}
+                          </Figure>
+                        </td>
                       </tr>
                     ))}
                 </tbody>
@@ -559,12 +713,20 @@ function OosPanel({ summary }: { summary: PaperSessionSummary }) {
       return (
         <>
           <p className="oos-verdict">
-            Expectancy {comparison.live_mean_r}R · {word} the OOS range
+            Expectancy{" "}
+            <Figure exact={comparison.live_mean_r}>
+              {rMultiple(comparison.live_mean_r)}
+            </Figure>{" "}
+            · {word} the OOS range
           </p>
           <div className="rbar">
-            <span className="rb-edge mono">{comparison.fold_min}</span>
+            <span className="rb-edge mono">
+              <Figure exact={comparison.fold_min}>{rMultiple(comparison.fold_min)}</Figure>
+            </span>
             <span className="rb-track" />
-            <span className="rb-edge mono">{comparison.fold_max}</span>
+            <span className="rb-edge mono">
+              <Figure exact={comparison.fold_max}>{rMultiple(comparison.fold_max)}</Figure>
+            </span>
           </div>
           <p className="ds-empty">from the certifying run's fold expectancies ({comparison.n} counted trades)</p>
         </>

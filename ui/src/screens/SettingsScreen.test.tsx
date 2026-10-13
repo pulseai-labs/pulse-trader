@@ -163,11 +163,20 @@ describe("the Settings server-connection section (r4.s3.w3)", () => {
     expect(stateChip().getAttribute("data-state")).toBe("disconnected");
     const note = screen.getByText(/This Mac no longer holds the token/);
     expect(note.textContent).toContain("pulse token revoke --label <label>");
+    // #386: Disconnect has nothing left to forget and stops being offered;
+    // Change server stays ENABLED — from here it is the way back to a
+    // connection.
+    expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(false);
     expect(statusMock).toHaveBeenCalled();
     // The pin: the last status that arrived is still `up`, and the screen does
     // not wait for — or take its state from — anything newer.
     const last = await statusMock.mock.results.at(-1)?.value;
     expect(last.data.state).toBe("up");
+
+    // And the enabled control works: it opens the Connect screen over the app.
+    fireEvent.click(screen.getByRole("button", { name: "Change server" }));
+    expect(screen.getByRole("heading", { name: "Connect to your Pulse server" })).toBeTruthy();
   });
 
   it("offers the way to Connect from the disconnected section, and Back returns", async () => {
@@ -181,5 +190,38 @@ describe("the Settings server-connection section (r4.s3.w3)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back to the app" }));
     expect(screen.getByRole("heading", { name: "Server connection" })).toBeTruthy();
     expect(document.querySelector(".sidebar")).not.toBeNull();
+  });
+
+  it("keeps Change server offered once the polled link is gone, and re-enables Disconnect on a new connection (#386)", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<App />);
+      await act(async () => {});
+      // Mounted while the server answers: the app is open, Settings is up.
+      expect(screen.getByRole("heading", { name: "Server connection" })).toBeTruthy();
+      expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(false);
+
+      // The stored connection goes away: the POLLED status says so — no local
+      // Disconnect happened, so Disconnect must still stop being offered while
+      // Change server stays as the way back (#386).
+      statusMock.mockResolvedValue(okStatus({ state: "not_connected" }));
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(stateChip().getAttribute("data-state")).toBe("disconnected");
+      expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(false);
+
+      // A new connection re-enables Disconnect; Change server never left.
+      statusMock.mockResolvedValue(okStatus({ state: "up", binary_version: "0.1.0" }));
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS);
+      });
+      expect(stateChip().getAttribute("data-state")).toBe("connected");
+      expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole("button", { name: "Change server" }) as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

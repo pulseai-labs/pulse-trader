@@ -23,6 +23,7 @@ import { resolveNavId, resolveRoute } from "./routes";
 import type { Route } from "./routes";
 import type { ServerStatus } from "./bindings";
 import UnbuiltScreen from "./screens/UnbuiltScreen";
+import { subscribePaperCountRefresh } from "./paper/handoff";
 
 const KNOWN_NAV_IDS = NAV_ALL.map((item) => item.id);
 
@@ -120,6 +121,9 @@ export function RouteContent({ route }: { route: Route | undefined }): ReactNode
  * Polled on the status strip's own cadence. A failed read keeps the last
  * count — a number nobody reported is never invented — and `null` (nothing
  * read yet, or a disconnected server) renders no pill.
+ *
+ * A successful promote asks this existing read to run at once (r4.s5.w4,
+ * #335): the same read on the same poll, never a second one.
  */
 function usePaperRunningCount(): number | null {
   const [count, setCount] = useState<number | null>(null);
@@ -138,7 +142,11 @@ function usePaperRunningCount(): number | null {
     };
     read();
     const timer = window.setInterval(read, 15_000);
-    return () => window.clearInterval(timer);
+    const unsubscribe = subscribePaperCountRefresh(read);
+    return () => {
+      window.clearInterval(timer);
+      unsubscribe();
+    };
   }, []);
   return count;
 }
@@ -152,7 +160,7 @@ export function App() {
   // renders at all. Until the FIRST read answers, render nothing — a flash of
   // the full app before a "not connected" gate would be a lie on the way to
   // the truth.
-  const { status: serverStatus, refresh: refreshStatus } = useServerStatus();
+  const { status: serverStatus, refresh: refreshStatus, lastGoodAt } = useServerStatus();
   const paperRunning = usePaperRunningCount();
   // "Change server" (and the way out of a disconnected Settings section): the
   // Connect screen opens OVER the live app. It is App state, not a ROUTES
@@ -253,6 +261,7 @@ export function App() {
           status: serverStatus,
           refresh: refreshStatus,
           openConnect: () => setConnectOpen(true),
+          lastGoodAt,
         }}
       >
         {/* The count is only claimed while the server is up: a down server's
@@ -263,7 +272,7 @@ export function App() {
           paperRunning={serverStatus.state === "up" ? (paperRunning ?? undefined) : undefined}
         >
           <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
-            <Sidebar active={navId} />
+            <Sidebar active={navId} serverStatus={serverStatus} />
             <main className="content">
               <CredentialBanner />
               <RouteContent route={route} />
