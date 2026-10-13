@@ -2823,6 +2823,73 @@ describe("BacktestLabScreen (#316 — any persisted walk-forward run opens)", ()
     expect(walkForwardMock).not.toHaveBeenCalled();
     expect(runMock).not.toHaveBeenCalled();
   });
+
+  it("drops a superseded open-by-id read: an older answer never replaces a newer run (#269/#331)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3Catalog() });
+    reopenMock.mockResolvedValue({
+      status: "ok",
+      data: { ...REOPENED_DTO, versionId: "ver-own-1" },
+    });
+    // The child version's compare panel mounts once a run lands on it; the
+    // refusal is the read's own answer — this test is about which run shows.
+    compareMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no parent run for run-second-1",
+        run_id: null,
+        session_id: null,
+        child_run_id: "run-second-1",
+      },
+    });
+    // Both backtest reads are held open, settled by hand in the order the test
+    // chooses: the FIRST submit's answer is the last one in.
+    const pending = new Map<
+      string,
+      (answer: { status: "ok"; data: BacktestRunDto }) => void
+    >();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    getRunMock.mockImplementation(
+      (request) =>
+        new Promise((resolve) => {
+          pending.set(request.runId, resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+
+    const input = (await screen.findByLabelText(/open run by id/i)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "run-first-01" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-first-01")).toBe(true);
+
+    fireEvent.change(input, { target: { value: "run-second-1" } });
+    fireEvent.click(screen.getByRole("button", { name: /^open$/i }));
+    expect(pending.has("run-second-1")).toBe(true);
+
+    // The second submit answers first: its run lands on its own version.
+    await act(async () => {
+      pending.get("run-second-1")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-second-1", strategyVersionId: "ver-second" },
+      });
+    });
+    const provenance = await screen.findByRole("region", { name: /run provenance/i });
+    expect(within(provenance).getByText("run-second-1")).toBeTruthy();
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+
+    // The first submit lands LAST: superseded, it applies nothing — the newer
+    // run stays, and no older one replaces it.
+    await act(async () => {
+      pending.get("run-first-01")?.({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-first-01", strategyVersionId: "ver-own-1" },
+      });
+    });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    expect(screen.queryByText("run-first-01")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3060,5 +3127,46 @@ describe("BacktestLabScreen (#269 — the certification deep link)", () => {
     await act(async () => {});
     expect(reopenMock).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("wf-6c1d9f38")).toBeNull();
+  });
+
+  it("keeps the trader's later pick when a pending deep-link read resolves (#269)", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: w3LinkCatalog() });
+    // A run id no other case reads, so the shared read cache cannot stand in
+    // for the link's own read. The read is held open, settled by hand after the
+    // pick.
+    const LINK_WF = "wf-g1-stale01";
+    const pending = new Map<string, (answer: ReopenAnswer) => void>();
+    // The executor form, not `Promise.withResolvers`: this tree's `lib` is
+    // ES2022 (tsconfig.json), and `npm run typecheck` is a gate.
+    reopenMock.mockImplementation(
+      (request) =>
+        new Promise<ReopenAnswer>((resolve) => {
+          pending.set(request.walkForwardRunId, resolve);
+        }),
+    );
+
+    render(<BacktestLabScreen />);
+    await screen.findByRole("region", { name: /version runs/i });
+
+    // The link arrives while the screen is open; its read is still out when the
+    // trader picks another version.
+    window.location.hash = `#/backtest?wf=${LINK_WF}`;
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    expect(pending.has(LINK_WF)).toBe(true);
+    expect(window.location.hash).toBe("#/backtest");
+
+    await chooseVersion("ver-seco");
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+
+    // The superseded read resolves — and applies nothing: the pick stands, and
+    // no run pane opens from the link.
+    await act(async () => {
+      pending.get(LINK_WF)?.({
+        status: "ok",
+        data: { ...REOPENED_DTO, walkForwardRunId: LINK_WF, versionId: "ver-own-1" },
+      });
+    });
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
+    expect(screen.queryByText(LINK_WF)).toBeNull();
   });
 });

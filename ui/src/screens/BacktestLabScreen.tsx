@@ -667,6 +667,12 @@ export default function BacktestLabScreen() {
   /** The "open run by id" draft, and the refusal it earned (#316/#331). */
   const [runIdDraft, setRunIdDraft] = useState("");
   const [openByIdError, setOpenByIdError] = useState<BusError | null>(null);
+  /** The selection-request generation (#269/#316/#331): each selection read —
+   * the deep-link take, every openById submit — bumps it and captures its
+   * value, and every explicit selection (`selectVersion`) bumps it too. A read
+   * applies its answer only while its captured generation is still current, so
+   * a newer request or a later pick always supersedes it. */
+  const selectionGeneration = useRef(0);
   /** Every active operation, held above the route (#141). The Lab READS it. */
   const operations = useActiveOperations();
 
@@ -749,24 +755,20 @@ export default function BacktestLabScreen() {
   // mounts this screen) and on the next hash change (the screen was already
   // open), and replaced with the plain `#/backtest` BEFORE the read so a
   // remount (a reconnect) cannot replay it over the remembered selection
-  // (#315). A read a later link supersedes never applies its result. The read
-  // is shared with the fold labels' cache, so the run the fragment names costs
-  // one `getWalkForwardRun` across both consumers.
-  /** The deep-link read's generation: each read bumps it, and only the current
-   * one may apply a result. */
-  const deepLinkGeneration = useRef(0);
-
+  // (#315). A read a later link or pick supersedes never applies its result.
+  // The read is shared with the fold labels' cache, so the run the fragment
+  // names costs one `getWalkForwardRun` across both consumers.
   useEffect(() => {
     const take = () => {
       const link = backtestDeepLink(window.location.hash);
       if (link === null) return;
       // Consume the fragment before the async read (see the comment above).
       window.history.replaceState(null, "", "#/backtest");
-      const generation = ++deepLinkGeneration.current;
+      const generation = ++selectionGeneration.current;
       void (async () => {
         try {
           const result = await readWalkForwardRunOnce(link.wf);
-          if (generation !== deepLinkGeneration.current) return;
+          if (generation !== selectionGeneration.current) return;
           if (result.status !== "ok") {
             setOpenByIdError(result.error);
             return;
@@ -775,7 +777,7 @@ export default function BacktestLabScreen() {
           selectVersion(result.data.versionId);
           setRequestedWf(result.data.walkForwardRunId);
         } catch {
-          if (generation !== deepLinkGeneration.current) return;
+          if (generation !== selectionGeneration.current) return;
           setOpenByIdError(readFailure());
         }
       })();
@@ -842,6 +844,10 @@ export default function BacktestLabScreen() {
    * whether the id is real: `loadCatalog`'s reconcile drops one it no longer
    * carries, and the next remount re-reconciles against whatever it carries then. */
   function selectVersion(id: string) {
+    // An explicit selection supersedes every read still in flight (the deep
+    // link's, openById's): their captured generation goes stale here, so their
+    // answers never move the picker off what the trader chose.
+    selectionGeneration.current += 1;
     rememberBacktestSelection(id);
     setSelectedId(id);
     // An explicitly requested run belongs to the version selected when it was
@@ -886,19 +892,27 @@ export default function BacktestLabScreen() {
    * then a walk-forward run when the backtest read refuses `not_found`. Both are
    * READS; nothing on this path starts a run. When both refuse, the backtest
    * read's message is the one shown: it is the read that asked first, and its
-   * `child_run_id` carries the id the trader typed.
+   * `child_run_id` carries the id the trader typed. Each submit is a selection
+   * request of its own: it captures the selection generation, and a newer
+   * submit, or a later pick by the trader, makes every remaining apply on its
+   * path a no-op (#269/#316).
    */
   async function openById() {
     const runId = runIdDraft.trim();
     if (runId === "") return;
+    // Every submit is a selection request of its own: it supersedes earlier
+    // submits, and any newer pick supersedes it (see the ref's comment).
+    const generation = ++selectionGeneration.current;
     setOpenByIdError(null);
     let backtest: BusResult<BacktestRunDto>;
     try {
       backtest = await commands.getBacktestRun({ runId });
     } catch {
+      if (generation !== selectionGeneration.current) return;
       setOpenByIdError(readFailure());
       return;
     }
+    if (generation !== selectionGeneration.current) return;
     if (backtest.status === "ok") {
       const dto = backtest.data;
       selectVersion(dto.strategyVersionId);
@@ -915,9 +929,11 @@ export default function BacktestLabScreen() {
     try {
       walkForward = await readWalkForwardRunOnce(runId);
     } catch {
+      if (generation !== selectionGeneration.current) return;
       setOpenByIdError(readFailure());
       return;
     }
+    if (generation !== selectionGeneration.current) return;
     if (walkForward.status === "ok") {
       selectVersion(walkForward.data.versionId);
       setRequestedWf(walkForward.data.walkForwardRunId);
