@@ -258,6 +258,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Every money, price, quantity, R, percent and time value on the Mac app's screens now reads in
+  human units (r4.s5.w1).** One shared format module — `ui/src/format/numbers.ts`, `time.ts` and the
+  `Figure` display component — turns the server's exact decimal text into A2's display forms on the
+  Backtest Lab (KPI tiles, regime rows and their twin, the 19-column trade log, the run provenance,
+  the walk-forward span, the folds sentence and the fold table, the before/after comparison), the
+  Library (version stats, the expectancies and the holdout window), the session detail (the running
+  total, the marked open position and its stops, orders and fills, the closed trades, the OOS
+  verdict), the deployment cards and the promote sheet. Money is `+1,234.56 USDT`, prices carry 2/4/6
+  decimals by magnitude, quantities trim to 4, R figures read `+1.25 R`, ratios read `41.7%`, the
+  folds sentence reads `6 of 6 folds hold (4 required)` (#305, #328), and every rendered time says it
+  is UTC (`2026-10-09 14:15 UTC`). The server's exact string stays one hover away on every element
+  (`title`/`data-exact`), the rounding is string arithmetic — the UI still computes no money
+  (ADR-0020, ADR-0027 addendum) — and a guard test (`ui/src/format/no-float-money.test.ts`) fails the
+  build if a `toFixed(` or an unmarked float conversion reappears on a screen. Wide tables keep
+  scrolling inside their panels (A3); `scripts/ui-format-test.sh` is the new ledger line.
+
 - **DSL schema 1.3.0 is the served and written version (r4.s6.w1).** `DSL_SCHEMA_VERSION` and
   `SchemaVersion::CURRENT` move to `1.3.0`; `1.0.0`, `1.1.0` and `1.2.0` documents still load
   (identity-migrated), the composer prompt's frontmatter pin and the `pulse://dsl/schema`

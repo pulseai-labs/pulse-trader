@@ -50,6 +50,14 @@ import { resolveRoute } from "../routes";
 const overviewMock = vi.mocked(commands.libraryOverview);
 const certificationRecordsMock = vi.mocked(commands.certificationRecords);
 
+/** The figure helper (r4.s5.w1): the A2 display text plus the ring's own exact
+ * string on the same element (`title`/`data-exact`), asserted together. */
+function expectFigure(scope: Element, display: string, exact: string): void {
+  const element = within(scope as HTMLElement).getByText(display);
+  expect(element.getAttribute("data-exact")).toBe(exact);
+  expect(element.getAttribute("title")).toBe(exact);
+}
+
 /** One certification record, in the generated DTO's shape (r4.s1.w5). */
 function certificationRecord(certified: boolean): CertificationRecordDto {
   return {
@@ -179,6 +187,10 @@ describe("LibraryScreen (seeded payload)", () => {
     expect(await screen.findByText("Alpha Wave")).toBeTruthy();
     expect(screen.getByText("Beta Break")).toBeTruthy();
     expect(screen.getByText("2 strategies · 4 versions")).toBeTruthy();
+    // The card's created date reads A2 (a date, UTC), the ring's own instant on
+    // the element (r4.s5.w1).
+    const alphaCard = screen.getByText("Alpha Wave").closest(".scard") as HTMLElement;
+    expectFigure(alphaCard, "2026-08-01 UTC", "2026-08-01T09:00:00.000Z");
   });
 
   it("shows the version tree with parent-child edges when a card is expanded", async () => {
@@ -324,10 +336,16 @@ describe("LibraryScreen (seeded payload)", () => {
     expect(inPane.getByText("v2")).toBeTruthy();
     expect(inPane.getByText("rsi(14) < 30")).toBeTruthy();
     expect(inPane.getByText("stop 5%")).toBeTruthy();
-    // The KPI block and the recent-run row both carry the run's expectancy —
-    // at least one occurrence, scoped to the pane.
-    expect(inPane.getAllByText("+0.42R").length).toBeGreaterThan(0);
+    // The KPI block and the recent-run row both carry the run's expectancy,
+    // normalised to A2's `+0.42 R` with the ring's own `"+0.42R"` on each
+    // element — at least one occurrence of each, scoped to the pane.
+    expect(inPane.getAllByText("+0.42 R").length).toBeGreaterThan(0);
+    const exactExpectancies = (pane as HTMLElement).querySelectorAll('[data-exact="+0.42R"]');
+    expect(exactExpectancies.length).toBeGreaterThan(0);
+    expect((exactExpectancies[0] as HTMLElement).getAttribute("title")).toBe("+0.42R");
     expect(inPane.getByText("48.3%")).toBeTruthy();
+    // The recent-run row's own date, A2 (UTC), the ring's instant on the element.
+    expectFigure(pane as HTMLElement, "2026-08-21 UTC", "2026-08-21T08:30:00.000Z");
 
     // A3: the coaching block is NOT rendered at all — not rendered-empty.
     expect(screen.queryByText(/recent coaching/i)).toBeNull();
@@ -594,8 +612,11 @@ describe("LibraryScreen (r4.s1.w5 — the certification records)", () => {
     expect(await inPane.findByText("#3")).toBeTruthy();
     expect(inPane.getByText("BTCUSDT")).toBeTruthy();
     expect(inPane.getByText("214t")).toBeTruthy();
-    expect(inPane.getByText("0.412")).toBeTruthy();
-    expect(inPane.getByText("0.181")).toBeTruthy();
+    // The holdout numbers, A2-formatted, the ring's own strings on the
+    // elements: the mean R, the 3-decimal bound, and the window saying UTC.
+    expectFigure(pane, "+0.41 R", "0.412");
+    expectFigure(pane, "0.181", "0.181");
+    expectFigure(pane, "2025-07-01 → 2026-01-01 UTC", "2025-07-01T00:00:00.000Z → 2026-01-01T00:00:00.000Z");
     expect(
       certificationRecordsMock,
     ).toHaveBeenCalledWith({ versionId: "v-alpha-2" });
@@ -738,7 +759,7 @@ describe("LibraryScreen (F5 — the details pane re-renders from the fresh paylo
     const pane = document.getElementById("details-pane") as HTMLElement;
     const inPane = within(pane);
     // The STALE object is what the pane shows first — KPI and run row both.
-    expect((await inPane.findAllByText("+0.42R")).length).toBeGreaterThan(0);
+    expect((await inPane.findAllByText("+0.42 R")).length).toBeGreaterThan(0);
     expect(inPane.queryByText("Hypothesis")).toBeNull();
 
     overviewMock.mockResolvedValue({ status: "ok", data: fresh });
@@ -748,11 +769,11 @@ describe("LibraryScreen (F5 — the details pane re-renders from the fresh paylo
     // object: new expectancy, new win rate, and the hypothesis block the
     // stale object lacked.
     await waitFor(() => {
-      expect(inPane.getAllByText("+0.99R").length).toBeGreaterThan(0);
+      expect(inPane.getAllByText("+0.99 R").length).toBeGreaterThan(0);
     });
     expect(inPane.getByText("55.0%")).toBeTruthy();
     expect(await inPane.findByText("A wider stop cuts noise exits.")).toBeTruthy();
-    expect(inPane.queryByText("+0.42R")).toBeNull();
+    expect(inPane.queryByText("+0.42 R")).toBeNull();
     expect(inPane.getByText("Alpha Wave")).toBeTruthy();
     expect(inPane.getByText("v2")).toBeTruthy();
   });

@@ -5,8 +5,9 @@
 // run exists and an em dash where one does not (grill A1), and — through the
 // third `.layout` track the shell opens for this route — the selected version's
 // details pane. Every figure on screen arrives pre-formatted from the ring
-// (`src/tauri/library.rs`), so the screen does no numeric math and cannot
-// invent a number. No sample rows, no invented metrics, no mock's "pair" /
+// (`src/tauri/library.rs`) and is rendered through `ui/src/format/` (r4.s5.w1,
+// A2) with the ring's own exact string on the element; the screen does no
+// numeric math and cannot invent a number. No sample rows, no invented metrics, no mock's "pair" /
 // "timeframes" lines (`StrategyDsl` has neither field).
 //
 // Convention (UnbuiltScreen.tsx is the worked example): one file per screen,
@@ -33,6 +34,9 @@ import type {
 } from "../bindings";
 import { CertBadge } from "../components/CertBadge";
 import { PromoteSheet } from "../components/PromoteSheet";
+import { Figure } from "../format/Figure";
+import { decimal, percentFromFraction, rMultiple } from "../format/numbers";
+import { dateRange, dateUtc } from "../format/time";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { openSessionDetail } from "../paper/handoff";
 
@@ -249,7 +253,8 @@ function StrategyCard({
           <span className="scard-name">{strategy.name}</span>
           <span className="scard-meta">
             {strategy.versions.length} {strategy.versions.length === 1 ? "version" : "versions"} ·
-            created {datePart(strategy.createdAt)}
+            created{" "}
+            <Figure exact={strategy.createdAt}>{dateUtc(strategy.createdAt)}</Figure>
           </span>
         </div>
         {/* The mock's state dot, sparkline and card actions are omitted: the
@@ -469,7 +474,8 @@ function VersionNode({
         )}
         {delta !== null && (
           <span className={`vnode-delta mono ${down ? "bear" : "bull"}`}>
-            {down ? "▼" : "▲"} {delta}
+            {down ? "▼" : "▲"}{" "}
+            <Figure exact={delta}>{rMultiple(delta)}</Figure>
           </span>
         )}
       </div>
@@ -552,11 +558,24 @@ function CertificationRecords({ versionId }: { versionId: string }) {
           <CertBadge kind={record.certified ? "certified" : "uncertified"} />
           <span className="mono">{record.pair}</span>
           <span className="bt-spacer" />
-          <span className="mono dim">{`${record.holdoutStart} → ${record.holdoutEnd}`}</span>
-          <span className="mono">{`${record.holdoutN}t`}</span>
-          <span className="mono">{record.holdoutMeanR}</span>
           <span className="mono dim">
-            {record.holdoutLowerBound === null ? EM_DASH : record.holdoutLowerBound.toFixed(3)}
+            <Figure exact={`${record.holdoutStart} → ${record.holdoutEnd}`}>
+              {dateRange(record.holdoutStart, record.holdoutEnd)}
+            </Figure>
+          </span>
+          <span className="mono">{`${record.holdoutN}t`}</span>
+          <span className="mono">
+            <Figure exact={record.holdoutMeanR}>{rMultiple(record.holdoutMeanR)}</Figure>
+          </span>
+          <span className="mono dim">
+            <Figure
+              exact={record.holdoutLowerBound === null ? null : String(record.holdoutLowerBound)}
+            >
+              {decimal(
+                record.holdoutLowerBound === null ? null : String(record.holdoutLowerBound),
+                3,
+              )}
+            </Figure>
           </span>
         </div>
       ))}
@@ -593,12 +612,22 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
         <div className="dkpi">
           <span className="dkpi-lab">expectancy</span>
           <span className={`dkpi-val mono${toneClass(stats?.expectancy)}`}>
-            {stats?.expectancy ?? EM_DASH}
+            {stats === null || stats === undefined ? (
+              EM_DASH
+            ) : (
+              <Figure exact={stats.expectancy}>{rMultiple(stats.expectancy)}</Figure>
+            )}
           </span>
         </div>
         <div className="dkpi">
           <span className="dkpi-lab">win rate</span>
-          <span className="dkpi-val mono">{stats?.winRate ?? EM_DASH}</span>
+          <span className="dkpi-val mono">
+            {stats === null || stats === undefined ? (
+              EM_DASH
+            ) : (
+              <Figure exact={stats.winRate}>{percentFromFraction(stats.winRate)}</Figure>
+            )}
+          </span>
         </div>
         <div className="dkpi">
           <span className="dkpi-lab">trades</span>
@@ -677,10 +706,12 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
             {version.recentRuns.map((run) => (
               <div key={run.id} className="bt-row">
                 <span className="bt-id mono">{run.id.slice(0, 8)}</span>
-                <span className="bt-range">{datePart(run.createdAt)}</span>
+                <span className="bt-range">
+                  <Figure exact={run.createdAt}>{dateUtc(run.createdAt)}</Figure>
+                </span>
                 <span className="bt-spacer" />
                 <span className={`mono ${run.expectancy.startsWith("-") ? "bear" : "bull"}`}>
-                  {run.expectancy}
+                  <Figure exact={run.expectancy}>{rMultiple(run.expectancy)}</Figure>
                 </span>
                 <span className="mono dim">{run.trades}t</span>
               </div>
@@ -728,16 +759,23 @@ function DslBlock({ title, lines, empty }: { title: string; lines: string[]; emp
 // Small shared helpers (pure — payload in, display out)
 // ---------------------------------------------------------------------------
 
-/** The three headline KPIs, or a single em dash when no run exists (A1). */
+/** The three headline KPIs, or a single em dash when no run exists (A1). The
+ * ring's `expectancy` arrives as its own `"+0.42R"` shape; the module
+ * normalises it to A2's `"+0.42 R"` and the exact string stays on the element.
+ * `winRate` already crosses as a percent and is passed through unchanged. */
 function Kpis({ stats }: { stats: VersionStats | null }) {
   if (stats === null) {
     return <>{EM_DASH}</>;
   }
   return (
     <>
-      <span className={stats.expectancy.startsWith("-") ? "bear" : "bull"}>{stats.expectancy}</span>
+      <span className={stats.expectancy.startsWith("-") ? "bear" : "bull"}>
+        <Figure exact={stats.expectancy}>{rMultiple(stats.expectancy)}</Figure>
+      </span>
       <span className="kpi-sep">·</span>
-      <span>{stats.winRate}</span>
+      <span>
+        <Figure exact={stats.winRate}>{percentFromFraction(stats.winRate)}</Figure>
+      </span>
       <span className="kpi-sep">·</span>
       <span>{stats.trades}t</span>
     </>
@@ -776,11 +814,6 @@ function provenanceLine(version: LibraryVersion): string {
 function summaryLine(version: LibraryVersion): string {
   const dsl = version.dsl;
   return [dsl.direction, ...dsl.entry, ...dsl.filters, ...dsl.exits].join(" · ");
-}
-
-/** The `YYYY-MM-DD` slice of an RFC3339 timestamp — the record's own date. */
-function datePart(timestamp: string): string {
-  return timestamp.slice(0, 10);
 }
 
 /** The bull/bear class for a signed display string, if one applies. */

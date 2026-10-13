@@ -203,6 +203,9 @@ describe("certified", () => {
   it("shows the run, the snapshots and the server match, and promotes with no override", async () => {
     const { onPromoted } = sheet();
     expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+    // The folds sentence (r4.s5.w1, #305/#328): the scheme's count stated in
+    // words — never the bare `6/4` ratio — from the verdict's own numbers.
+    expect(screen.getByText("6 of 6 folds hold (4 required)")).toBeTruthy();
     expect(screen.getByText(/matches this server/)).toBeTruthy();
     // The snapshots come from the version's recorded run, never the mock.
     expect(await screen.findByText("snap-m15-0001")).toBeTruthy();

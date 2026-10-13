@@ -23,6 +23,9 @@ import { commands } from "../bindings";
 import type { PaperSessionSummary, PaperShadowCheck, PaperTrades } from "../bindings";
 import { CertBadge } from "../components/CertBadge";
 import { SessionBadge, sessionBadgeState } from "../components/SessionBadge";
+import { Figure } from "../format/Figure";
+import { price, qty, rMultiple, usdt } from "../format/numbers";
+import { timeUtc } from "../format/time";
 import { usePaperSession } from "../hooks/usePaperSession";
 
 /** The em dash a null renders — a statement that no value exists. */
@@ -161,11 +164,16 @@ export default function SessionDetail({
               started on {startedOn ?? EM_DASH} · server now {serverEngine ?? EM_DASH}
             </span>
           </div>
-          {/* #340: the newest consumed bar, as the server's own epoch-ms text
-              (r4.s5 owns human units). */}
+          {/* #340: the newest consumed bar — the server's own epoch-ms text,
+              formatted to A2's `YYYY-MM-DD HH:mm` UTC (r4.s5.w1) with the
+              server's text on the element. */}
           <div className="dm-row">
             <span className="dm-k">last bar</span>
-            <span className="mono dm-v">{summary.last_bar_open_time ?? EM_DASH}</span>
+            <span className="mono dm-v">
+              <Figure exact={summary.last_bar_open_time}>
+                {timeUtc(summary.last_bar_open_time)}
+              </Figure>
+            </span>
           </div>
           {summary.comparison.engine_builds > 1 && (
             <div className="dm-row">
@@ -193,14 +201,22 @@ export default function SessionDetail({
           <div className="pos-stats">
             <div className="ps-item">
               <span className="ps-lab">realized</span>
-              <span className="ps-val mono">{summary.realized_usdt_total}</span>
+              <span className="ps-val mono">
+                <Figure exact={summary.realized_usdt_total}>
+                  {usdt(summary.realized_usdt_total, { signed: true })}
+                </Figure>
+              </span>
               <span className="ps-count">
                 {summary.realized_usdt_count} of {summary.closed_trade_count} trades
               </span>
             </div>
             <div className="ps-item">
               <span className="ps-lab">realized R</span>
-              <span className="ps-val mono">{summary.realized_r_total}</span>
+              <span className="ps-val mono">
+                <Figure exact={summary.realized_r_total}>
+                  {rMultiple(summary.realized_r_total)}
+                </Figure>
+              </span>
               <span className="ps-count">
                 {summary.realized_r_count} of {summary.closed_trade_count} trades
               </span>
@@ -208,12 +224,22 @@ export default function SessionDetail({
             <div className="ps-item">
               <span className="ps-lab">unrealized</span>
               <span className="ps-val mono">
-                {summary.open_position === null ? "flat" : (summary.unrealized_usdt ?? EM_DASH)}
+                {summary.open_position === null ? (
+                  "flat"
+                ) : (
+                  <Figure exact={summary.unrealized_usdt}>
+                    {usdt(summary.unrealized_usdt, { signed: true })}
+                  </Figure>
+                )}
               </span>
             </div>
             <div className="ps-item">
               <span className="ps-lab">session P&L</span>
-              <span className="ps-val mono">{summary.session_pnl_usdt}</span>
+              <span className="ps-val mono">
+                <Figure exact={summary.session_pnl_usdt}>
+                  {usdt(summary.session_pnl_usdt, { signed: true })}
+                </Figure>
+              </span>
             </div>
           </div>
           <p className="equity-placeholder">
@@ -238,45 +264,75 @@ export default function SessionDetail({
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">entry</span>
-                  <span className="ps-val mono">{summary.open_position.entry_price}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.entry_price}>
+                      {price(summary.open_position.entry_price)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">size</span>
-                  <span className="ps-val mono">{summary.open_position.qty}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.qty}>{qty(summary.open_position.qty)}</Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">opened</span>
-                  <span className="ps-val mono">{summary.open_position.entry_fill_time}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.entry_fill_time}>
+                      {timeUtc(summary.open_position.entry_fill_time)}
+                    </Figure>
+                  </span>
                 </div>
                 {/* The mark and the money figures (r4.s4.w2): the server's own
-                    text, the dash where the wire carries none. */}
+                    text, formatted to A2, the dash where the wire carries none. */}
                 <div className="ps-item">
                   <span className="ps-lab">mark</span>
-                  <span className="ps-val mono">{summary.open_position.mark_price ?? EM_DASH}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.mark_price}>
+                      {price(summary.open_position.mark_price)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">mark time</span>
-                  <span className="ps-val mono">{summary.open_position.mark_time ?? EM_DASH}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.mark_time}>
+                      {timeUtc(summary.open_position.mark_time)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">unrealized</span>
                   <span className="ps-val mono">
-                    {summary.open_position.unrealized_usdt ?? EM_DASH}
+                    <Figure exact={summary.open_position.unrealized_usdt}>
+                      {usdt(summary.open_position.unrealized_usdt, { signed: true })}
+                    </Figure>
                   </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">unrealized R</span>
                   <span className="ps-val mono">
-                    {summary.open_position.unrealized_r ?? EM_DASH}
+                    <Figure exact={summary.open_position.unrealized_r}>
+                      {rMultiple(summary.open_position.unrealized_r)}
+                    </Figure>
                   </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">funding</span>
-                  <span className="ps-val mono">{summary.open_position.funding_usdt}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.funding_usdt}>
+                      {usdt(summary.open_position.funding_usdt, { signed: true })}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">entry fee</span>
-                  <span className="ps-val mono">{summary.open_position.entry_fee_usdt}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.entry_fee_usdt}>
+                      {usdt(summary.open_position.entry_fee_usdt)}
+                    </Figure>
+                  </span>
                 </div>
                 {/* The live stops (#341): present only while a running engine
                     answers the read; a null renders the dash, and their
@@ -284,17 +340,25 @@ export default function SessionDetail({
                 <div className="ps-item">
                   <span className="ps-lab">initial stop</span>
                   <span className="ps-val mono">
-                    {summary.open_position.initial_stop ?? EM_DASH}
+                    <Figure exact={summary.open_position.initial_stop}>
+                      {price(summary.open_position.initial_stop)}
+                    </Figure>
                   </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">stop</span>
-                  <span className="ps-val mono">{summary.open_position.stop_price ?? EM_DASH}</span>
+                  <span className="ps-val mono">
+                    <Figure exact={summary.open_position.stop_price}>
+                      {price(summary.open_position.stop_price)}
+                    </Figure>
+                  </span>
                 </div>
                 <div className="ps-item">
                   <span className="ps-lab">take profit</span>
                   <span className="ps-val mono">
-                    {summary.open_position.take_profit_price ?? EM_DASH}
+                    <Figure exact={summary.open_position.take_profit_price}>
+                      {price(summary.open_position.take_profit_price)}
+                    </Figure>
                   </span>
                 </div>
               </div>
@@ -370,11 +434,21 @@ export default function SessionDetail({
                       <tr key={`${entry.kind}-${entry.at}-${index}`}>
                         <td className="mono">{entry.kind}</td>
                         <td className="mono">
-                          {entry.kind === "fill" ? entry.fill_time : entry.at}
+                          <Figure exact={entry.kind === "fill" ? entry.fill_time : entry.at}>
+                            {timeUtc(entry.kind === "fill" ? entry.fill_time : entry.at)}
+                          </Figure>
                         </td>
                         <td className="mono">{entry.side}</td>
-                        <td className="mono">{entry.qty}</td>
-                        <td className="mono">{entry.kind === "fill" ? entry.price : EM_DASH}</td>
+                        <td className="mono">
+                          <Figure exact={entry.qty}>{qty(entry.qty)}</Figure>
+                        </td>
+                        <td className="mono">
+                          {entry.kind === "fill" ? (
+                            <Figure exact={entry.price}>{price(entry.price)}</Figure>
+                          ) : (
+                            EM_DASH
+                          )}
+                        </td>
                         <td className="mono">
                           {entry.kind === "fill" ? (entry.exit_reason ?? EM_DASH) : EM_DASH}
                         </td>
@@ -418,18 +492,53 @@ export default function SessionDetail({
                     .reverse()
                     .map((trade) => (
                       <tr key={`${trade.exit_fill_time}-${trade.exit_price}`}>
-                        <td className="mono">{trade.entry_fill_time ?? EM_DASH}</td>
-                        <td className="mono">{trade.exit_fill_time}</td>
+                        <td className="mono">
+                          <Figure exact={trade.entry_fill_time}>
+                            {timeUtc(trade.entry_fill_time)}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.exit_fill_time}>
+                            {timeUtc(trade.exit_fill_time)}
+                          </Figure>
+                        </td>
                         <td className="mono">{trade.side}</td>
-                        <td className="mono">{trade.qty}</td>
-                        <td className="mono">{trade.entry_price ?? EM_DASH}</td>
-                        <td className="mono">{trade.exit_price}</td>
+                        <td className="mono">
+                          <Figure exact={trade.qty}>{qty(trade.qty)}</Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.entry_price}>{price(trade.entry_price)}</Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.exit_price}>{price(trade.exit_price)}</Figure>
+                        </td>
                         <td className="mono">{trade.exit_reason}</td>
-                        <td className="mono">{trade.realized_r ?? EM_DASH}</td>
-                        <td className="mono">{trade.realized_usdt ?? EM_DASH}</td>
-                        <td className="mono">{trade.entry_fee_usdt ?? EM_DASH}</td>
-                        <td className="mono">{trade.exit_fee_usdt}</td>
-                        <td className="mono">{trade.funding_usdt}</td>
+                        <td className="mono">
+                          <Figure exact={trade.realized_r}>{rMultiple(trade.realized_r)}</Figure>
+                        </td>
+                        <td className="mono">
+                          {/* The column header carries the unit; the figure is
+                              the server's own signed USDT, exact text on the
+                              element. */}
+                          <Figure exact={trade.realized_usdt}>
+                            {usdt(trade.realized_usdt, { signed: true, unit: false })}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.entry_fee_usdt}>
+                            {usdt(trade.entry_fee_usdt)}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.exit_fee_usdt}>
+                            {usdt(trade.exit_fee_usdt)}
+                          </Figure>
+                        </td>
+                        <td className="mono">
+                          <Figure exact={trade.funding_usdt}>
+                            {usdt(trade.funding_usdt, { signed: true })}
+                          </Figure>
+                        </td>
                       </tr>
                     ))}
                 </tbody>
@@ -559,12 +668,20 @@ function OosPanel({ summary }: { summary: PaperSessionSummary }) {
       return (
         <>
           <p className="oos-verdict">
-            Expectancy {comparison.live_mean_r}R · {word} the OOS range
+            Expectancy{" "}
+            <Figure exact={comparison.live_mean_r}>
+              {rMultiple(comparison.live_mean_r)}
+            </Figure>{" "}
+            · {word} the OOS range
           </p>
           <div className="rbar">
-            <span className="rb-edge mono">{comparison.fold_min}</span>
+            <span className="rb-edge mono">
+              <Figure exact={comparison.fold_min}>{rMultiple(comparison.fold_min)}</Figure>
+            </span>
             <span className="rb-track" />
-            <span className="rb-edge mono">{comparison.fold_max}</span>
+            <span className="rb-edge mono">
+              <Figure exact={comparison.fold_max}>{rMultiple(comparison.fold_max)}</Figure>
+            </span>
           </div>
           <p className="ds-empty">from the certifying run's fold expectancies ({comparison.n} counted trades)</p>
         </>
