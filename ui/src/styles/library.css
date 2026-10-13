@@ -362,6 +362,19 @@
   font-size: var(--fs-11);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  /* #269: this is a <button> now — clear the tag's own additions so the line
+     keeps the metadata tone it had as a span. */
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  font-weight: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+.d-cert-run:hover {
+  color: var(--text-1);
+  text-decoration: underline;
 }
 .dsl-block {
   margin-bottom: var(--sp-3);
@@ -412,6 +425,20 @@
 .bt-id {
   color: var(--text-3);
   font-size: var(--fs-11);
+}
+/* #330: the one mark a fold run wears, on the row it belongs to — rendered in
+   the Library's pane and the Lab's Runs list alike. */
+.bt-fold-label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--text-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-4);
+  padding: 1px 4px;
+  line-height: 1.4;
+  white-space: nowrap;
 }
 .bt-range { color: var(--text-2); }
 .bt-spacer { flex: 1; }

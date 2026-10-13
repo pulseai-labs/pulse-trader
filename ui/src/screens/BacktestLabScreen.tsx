@@ -59,15 +59,31 @@ import {
   rMultiple,
   usdt,
 } from "../format/numbers";
-import { dateRange, timeUtc } from "../format/time";
+import { dateRange, dateUtc, timeUtc } from "../format/time";
 import { VersionPicker, buildVersionGroups } from "../components/VersionPicker";
+import {
+  foldLabel,
+  foldMapOf,
+  orderRunsWithFolds,
+  readWalkForwardRunOnce,
+} from "../hooks/useWalkForwardFolds";
+import type { FoldMap } from "../hooks/useWalkForwardFolds";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { openSessionDetail, takeRequestedBacktestVersion } from "../paper/handoff";
+import { backtestDeepLink } from "../routes";
 import { readBacktestSelection, rememberBacktestSelection } from "./backtestSelection";
 
 /** The em dash every null renders — a statement that no value exists, never
  * a zero dressed up as data (the Library's grill A1 rule, applied here). */
 const EM_DASH = "—";
+
+/** How much of a run id a row shows: the Library rows' and the picker's own
+ * short-id convention (`8`). */
+const SHORT_ID_LEN = 8;
+
+/** No folds known yet (the pane has no walk-forward in hand): every run is its
+ * own run, no label — never a guess. */
+const NO_FOLDS: FoldMap = new Map();
 
 /** The one window into the chart geometry exception: a DTO string becomes a
  * number ONLY to place a pixel. Never displayed, never compared, never
@@ -269,7 +285,7 @@ function useWalkForward(operations: ActiveOperations, versionId: string | null) 
     );
   }, [operations, versionId, folds]);
 
-  const openFold = useCallback(
+  const openRun = useCallback(
     (runId: string) => {
       if (versionId === null) return;
       operations.start(backtestKey(versionId), () => commands.getBacktestRun({ runId }));
@@ -277,7 +293,7 @@ function useWalkForward(operations: ActiveOperations, versionId: string | null) 
     [operations, versionId],
   );
 
-  return { state, folds, setFolds: setFoldsDraft, start, openFold, refusal };
+  return { state, folds, setFolds: setFoldsDraft, start, openRun, refusal };
 }
 
 // ---------------------------------------------------------------------------
@@ -356,15 +372,23 @@ function reopenedStateFor(held: HeldReopened, target: string | null): ReopenedSt
  * that stale id no longer matches the target, the pane then read as loading for
  * good, with no further effect to run. So each started read takes a generation,
  * and `settle` drops anything that is not the current one.
+ *
+ * **An explicit request outranks both (#316).** `requestedId` is a run the trader
+ * asked for by name — the Runs row or the "open run by id" field — and it is read
+ * even when this session holds a walk-forward record for the version, because the
+ * request names a specific run the record cannot stand in for. A selection change
+ * clears it, so the pane never shows one version's requested run under another.
  */
 function useReopenedWalkForward(
   operations: ActiveOperations,
   version: LibraryVersion | null,
+  requestedId: string | null,
 ): ReopenedState {
   const target =
-    version !== null && operations.lookup(walkForwardKey(version.id)) === undefined
+    requestedId ??
+    (version !== null && operations.lookup(walkForwardKey(version.id)) === undefined
       ? version.latestWalkForwardRunId
-      : null;
+      : null);
   const [held, setHeld] = useState<HeldReopened>({
     id: null,
     state: { kind: "idle" },
@@ -634,6 +658,15 @@ export default function BacktestLabScreen() {
   // the trader has chosen; the catalog read then reconciles it.
   const [selectedId, setSelectedId] = useState<string | null>(() => readBacktestSelection());
   const [promoting, setPromoting] = useState(false);
+  /** The walk-forward a trader asked for by name (#316) — the Runs row, the
+   * "open run by id" field, or the Library's certification deep link — read even
+   * when this session holds a walk-forward record for the version, because the
+   * request names a run the record cannot stand in for. A selection change
+   * clears it (the deep link re-sets it in the same tick it selects). */
+  const [requestedWf, setRequestedWf] = useState<string | null>(null);
+  /** The "open run by id" draft, and the refusal it earned (#316/#331). */
+  const [runIdDraft, setRunIdDraft] = useState("");
+  const [openByIdError, setOpenByIdError] = useState<BusError | null>(null);
   /** Every active operation, held above the route (#141). The Lab READS it. */
   const operations = useActiveOperations();
 
@@ -710,6 +743,36 @@ export default function BacktestLabScreen() {
     return () => window.removeEventListener("hashchange", take);
   }, []);
 
+  // #269: the Library's certification line deep-links to `#/backtest?wf=<id>` —
+  // the Lab selects that run's version and opens the run. A READ, like the Runs
+  // rows: nothing on this path starts a run. Consumed on mount (the navigation
+  // mounts this screen) and on the next hash change (the screen was already
+  // open). The read is shared with the fold labels' cache, so the run the
+  // fragment names costs one `getWalkForwardRun` across both consumers.
+  useEffect(() => {
+    const take = () => {
+      const link = backtestDeepLink(window.location.hash);
+      if (link === null) return;
+      void (async () => {
+        try {
+          const result = await readWalkForwardRunOnce(link.wf);
+          if (result.status !== "ok") {
+            setOpenByIdError(result.error);
+            return;
+          }
+          setOpenByIdError(null);
+          selectVersion(result.data.versionId);
+          setRequestedWf(result.data.walkForwardRunId);
+        } catch {
+          setOpenByIdError(readFailure());
+        }
+      })();
+    };
+    take();
+    window.addEventListener("hashchange", take);
+    return () => window.removeEventListener("hashchange", take);
+  }, []);
+
   // C2 (r2.s1.w4): versions and runs written by `pulse mcp` surface on window
   // focus — DOM events only, throttled inside the hook. The refetch is the
   // same `loadCatalog` the mount and the accept paths use, so the selection
@@ -747,9 +810,14 @@ export default function BacktestLabScreen() {
       : null;
 
   /** #268: the version's persisted walk-forward run, read when this session has
-   * no record of its own — what makes a finished run openable after a relaunch. */
-  const reopened = useReopenedWalkForward(operations, selectedVersion);
-  const pane = paneStateOf(wf.state, reopened);
+   * no record of its own — what makes a finished run openable after a relaunch.
+   * #316: an explicitly requested run (#316) is read instead of the pointer, and
+   * outranks this session's record — the trader named that run. */
+  const reopened = useReopenedWalkForward(operations, selectedVersion, requestedWf);
+  const pane =
+    requestedWf !== null
+      ? paneStateOf({ kind: "idle" }, reopened)
+      : paneStateOf(wf.state, reopened);
 
   /** Selecting a version shows THAT version's operation. Nothing is cleared and
    * nothing is cancelled: each version's record is its own, so a run still going
@@ -764,6 +832,10 @@ export default function BacktestLabScreen() {
   function selectVersion(id: string) {
     rememberBacktestSelection(id);
     setSelectedId(id);
+    // An explicitly requested run belongs to the version selected when it was
+    // asked for; a new selection drops it (the deep link re-sets it in the same
+    // tick it selects the run's version).
+    setRequestedWf(null);
   }
 
   /**
@@ -794,6 +866,52 @@ export default function BacktestLabScreen() {
     operations.start(backtestKey(currentId), () =>
       commands.runBacktestVersion({ versionId: currentId }),
     );
+  }
+
+  /**
+   * Open a run by id (#331/#316): a backtest run first — `getBacktestRun` opens
+   * a walk-forward fold's id as an ordinary run by the server's own contract —
+   * then a walk-forward run when the backtest read refuses `not_found`. Both are
+   * READS; nothing on this path starts a run. When both refuse, the backtest
+   * read's message is the one shown: it is the read that asked first, and its
+   * `child_run_id` carries the id the trader typed.
+   */
+  async function openById() {
+    const runId = runIdDraft.trim();
+    if (runId === "") return;
+    setOpenByIdError(null);
+    let backtest: BusResult<BacktestRunDto>;
+    try {
+      backtest = await commands.getBacktestRun({ runId });
+    } catch {
+      setOpenByIdError(readFailure());
+      return;
+    }
+    if (backtest.status === "ok") {
+      const dto = backtest.data;
+      selectVersion(dto.strategyVersionId);
+      // The store holds exactly the answer just read: no second read, and the
+      // run command is nowhere near this path.
+      operations.start(backtestKey(dto.strategyVersionId), () => Promise.resolve(backtest));
+      return;
+    }
+    if (backtest.error.code !== "not_found") {
+      setOpenByIdError(backtest.error);
+      return;
+    }
+    let walkForward: BusResult<WalkForwardRunDto>;
+    try {
+      walkForward = await readWalkForwardRunOnce(runId);
+    } catch {
+      setOpenByIdError(readFailure());
+      return;
+    }
+    if (walkForward.status === "ok") {
+      selectVersion(walkForward.data.versionId);
+      setRequestedWf(walkForward.data.walkForwardRunId);
+      return;
+    }
+    setOpenByIdError(backtest.error);
   }
 
   // --- the coach rail (r1.s4.w3) ------------------------------------------
@@ -938,13 +1056,74 @@ export default function BacktestLabScreen() {
           <button
             type="button"
             className="bt-walk btn-sec"
-            onClick={wf.start}
+            onClick={() => {
+              // A fresh walk-forward is the run the pane must show: a request
+              // for an older one is done with.
+              setRequestedWf(null);
+              wf.start();
+            }}
             disabled={busy || currentId === null}
           >
             {wf.state.kind === "running" ? "Walking forward…" : "Walk forward"}
           </button>
           {/* No percentage, no cancel — both commands are request/response. */}
         </div>
+      )}
+
+      {/* r4.s5.w3 (#331, #316): the version's runs are reachable beside the
+          picker — its own backtests and its latest walk-forward run, each row
+          opening the persisted run it names (a READ: `getBacktestRun` /
+          `getWalkForwardRun`, never a new run). Below the toolbar rather than
+          inside it: the toolbar is one horizontal row, and a list needs a
+          full-width block of its own (A3's rule read the same way). The field
+          opens ANY backtest or walk-forward run id — the Lab selects that run's
+          version and shows it. */}
+      {catalog.kind === "ready" && selectedVersion !== null && (
+        <section className="bt-section bt-runs" aria-label="Version runs">
+          <h3 className="bt-h">Runs</h3>
+          <VersionRuns
+            version={selectedVersion}
+            busy={busy}
+            folds={pane.kind === "done" ? foldMapOf(pane.dto) : NO_FOLDS}
+            onOpenRun={wf.openRun}
+            onOpenWalkForward={(walkForwardRunId) => setRequestedWf(walkForwardRunId)}
+          />
+          <div className="bt-open-id">
+            <label className="bt-select-label" htmlFor="bt-open-run">
+              Open run by id
+            </label>
+            <input
+              id="bt-open-run"
+              className="bt-select bt-open-input mono"
+              type="text"
+              value={runIdDraft}
+              placeholder="backtest or walk-forward run id"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={busy}
+              onChange={(event) => {
+                setRunIdDraft(event.target.value);
+                // Editing the draft clears the refusal — it described the old id.
+                setOpenByIdError(null);
+              }}
+            />
+            <button
+              type="button"
+              className="bt-open-go btn-sec"
+              onClick={() => void openById()}
+              disabled={busy || runIdDraft.trim() === ""}
+            >
+              Open
+            </button>
+          </div>
+          {openByIdError !== null && (
+            <div className="bt-run-error" role="alert">
+              <div>
+                <span className="mono">{openByIdError.code}</span> {openByIdError.message}
+              </div>
+            </div>
+          )}
+        </section>
       )}
 
       {/* C3 (r2.s1.w4): a child version's latest run beside its parent's — for
@@ -962,7 +1141,7 @@ export default function BacktestLabScreen() {
           one read back by id. */}
       <WalkForwardPane
         state={pane}
-        onOpenFold={wf.openFold}
+        onOpenFold={wf.openRun}
         onPromote={selectedVersion === null ? null : () => setPromoting(true)}
       />
 
@@ -1032,6 +1211,88 @@ export default function BacktestLabScreen() {
         </div>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The version's runs (#331, #316) — the persisted runs the trader can open
+// ---------------------------------------------------------------------------
+//
+// Every row names a run the SERVER holds and opens it by id: an own backtest
+// through `getBacktestRun` (the same read the fold table already uses) or the
+// version's latest walk-forward through its own persisted read — never a new
+// run. The list is the version's `recentRuns` plus the catalogue pointer,
+// rendered in the Library's run-row shape, and it renders no row the payload
+// does not carry.
+
+function VersionRuns({
+  version,
+  busy,
+  folds,
+  onOpenRun,
+  onOpenWalkForward,
+}: {
+  version: LibraryVersion;
+  busy: boolean;
+  folds: FoldMap;
+  onOpenRun: (runId: string) => void;
+  onOpenWalkForward: (walkForwardRunId: string) => void;
+}) {
+  const pointer = version.latestWalkForwardRunId;
+  const rows = orderRunsWithFolds(version.recentRuns, folds);
+  return (
+    <>
+      {rows.length === 0 ? (
+        <div className="bt-none dim">None yet.</div>
+      ) : (
+        <div className="bt-list bt-runs-list">
+          {rows.map(({ run, fold }) => (
+            <div key={run.id} className="bt-row">
+              <span className="bt-id mono">{run.id.slice(0, SHORT_ID_LEN)}</span>
+              {/* #330: a fold of the walk-forward the pane read wears its own
+                  label; every other row is an own run and wears none. */}
+              {fold !== null && (
+                <span className="bt-fold-label mono">{foldLabel(fold)}</span>
+              )}
+              <span className="bt-range">
+                <Figure exact={run.createdAt}>{dateUtc(run.createdAt)}</Figure>
+              </span>
+              <span className="bt-spacer" />
+              <span className={`mono ${run.expectancy.startsWith("-") ? "bear" : "bull"}`}>
+                <Figure exact={run.expectancy}>{rMultiple(run.expectancy)}</Figure>
+              </span>
+              <span className="mono dim">{run.trades}t</span>
+              <button
+                type="button"
+                className="bt-run-open btn-sec-sm"
+                onClick={() => onOpenRun(run.id)}
+                disabled={busy}
+              >
+                open run <span className="mono">{run.id.slice(0, SHORT_ID_LEN)}</span>
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* #316: the version's latest walk-forward run — the catalogue's own
+          pointer — opens here like any other run: `getWalkForwardRun` reads it
+          back with its folds and verdict, and starts nothing. */}
+      {pointer !== null && (
+        <div className="bt-row bt-runs-wf">
+          <span className="bt-id mono">{pointer.slice(0, SHORT_ID_LEN)}</span>
+          <span className="bt-wf-label mono">walk-forward</span>
+          <span className="bt-spacer" />
+          <button
+            type="button"
+            className="bt-run-open btn-sec-sm"
+            onClick={() => onOpenWalkForward(pointer)}
+            disabled={busy}
+          >
+            open walk-forward
+          </button>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1117,6 +1378,10 @@ function WalkForwardResult({
     <section className="bt-section bt-walkforward" aria-label="Walk-forward result">
       <h3 className="bt-h">Walk-forward</h3>
       <div className="bt-wf-meta">
+        {/* #316's own comment: the pane names the VERSION it ran on, the way
+            the backtest result band already does — verifying which version a
+            walk-forward ran on must not need the Library's certification line. */}
+        <Field label="version">{dto.versionId}</Field>
         <Field label="scheme">{dto.scheme}</Field>
         <Field label="rule">{dto.rule}</Field>
         <Field label="folds">{dto.k}</Field>
@@ -2083,10 +2348,16 @@ function CompareTable({
   before,
   after,
   badge,
+  beforeRunId,
+  afterRunId,
 }: {
   before: SummaryDto;
   after: SummaryDto;
   badge?: React.ReactNode;
+  /** The compared runs' ids, when the caller knows them (#326). The coach
+   * accept's inline table posts no ids and renders exactly as it did. */
+  beforeRunId?: string | null;
+  afterRunId?: string | null;
 }) {
   return (
     <table className="coach-compare" aria-label="Before and after">
@@ -2094,8 +2365,22 @@ function CompareTable({
       <thead>
         <tr>
           <th scope="col">metric</th>
-          <th scope="col">before (parent)</th>
-          <th scope="col">after (child)</th>
+          <th scope="col">
+            before (parent)
+            {beforeRunId != null && (
+              <span className="compare-run mono" title={beforeRunId}>
+                {beforeRunId.slice(0, SHORT_ID_LEN)}
+              </span>
+            )}
+          </th>
+          <th scope="col">
+            after (child)
+            {afterRunId != null && (
+              <span className="compare-run mono" title={afterRunId}>
+                {afterRunId.slice(0, SHORT_ID_LEN)}
+              </span>
+            )}
+          </th>
         </tr>
       </thead>
       <tbody>
@@ -2207,14 +2492,25 @@ function CompareWithParent({ version, run }: { version: LibraryVersion; run: Run
         <CompareTable
           before={outcome.dto.before}
           after={outcome.dto.after}
+          // #326: which two runs the columns are — the DTO names both, so the
+          // panel says so.
+          beforeRunId={outcome.dto.parentRunId}
+          afterRunId={outcome.dto.childRunId}
           badge={
             outcome.dto.inputsDiffer ? (
-              <span
-                className="badge-inputs-differ"
-                title={outcome.dto.inputsNote ?? undefined}
-              >
-                inputs differ
-              </span>
+              <>
+                <span
+                  className="badge-inputs-differ"
+                  title={outcome.dto.inputsNote ?? undefined}
+                >
+                  inputs differ
+                </span>
+                {/* #326: WHY they cannot be proven equal, in words beside the
+                    badge — the hover keeps the exact text as well. */}
+                {outcome.dto.inputsNote !== null && (
+                  <span className="compare-inputs-note"> {outcome.dto.inputsNote}</span>
+                )}
+              </>
             ) : undefined
           }
         />

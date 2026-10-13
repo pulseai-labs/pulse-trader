@@ -351,12 +351,18 @@ a:hover { color: var(--ai-2); }
 /* C1: the version node's provenance line. The bare label (`human`, `coach`,
    `external_agent`) reads in the metadata tone; an agent-written version's
    `external_agent · <agent name>` takes the reserved AI accent — the token's
-   own "agent actions" rule. */
+   own "agent actions" rule.
+   r4.s5.w3 (#325): ONE line, ellipsized — a wrapped `external_agent ·
+   claude-code` used to push the hypothesis subline out of the node's fixed
+   64px height; the full line rides `title`. */
 .vnode-provenance {
   font-family: var(--font-mono);
   font-size: var(--fs-11);
   color: var(--text-3);
   line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .vnode-provenance.agent { color: var(--ai-1); }
 
@@ -397,6 +403,22 @@ a:hover { color: var(--ai-2); }
   margin: 0;
   font-size: var(--fs-12);
   color: var(--text-2);
+}
+
+/* #326: the compared runs' short ids in the column heads, and the inputs note
+   beside the inputs-differ badge. */
+.coach-compare .compare-run {
+  display: block;
+  margin-top: 2px;
+  font-weight: var(--fw-regular);
+  font-size: var(--fs-10);
+  color: var(--text-3);
+  letter-spacing: 0;
+  text-transform: none;
+}
+.compare-inputs-note {
+  font-size: var(--fs-11);
+  color: var(--text-3);
 }
 .compare-caption {
   caption-side: top;

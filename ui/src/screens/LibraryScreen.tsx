@@ -38,12 +38,21 @@ import { Figure } from "../format/Figure";
 import { decimal, percentFromFraction, rMultiple } from "../format/numbers";
 import { dateRange, dateUtc } from "../format/time";
 import { provenanceLine } from "../components/provenance";
+import {
+  foldLabel,
+  orderRunsWithFolds,
+  useWalkForwardFolds,
+} from "../hooks/useWalkForwardFolds";
+import type { FoldMap } from "../hooks/useWalkForwardFolds";
 import { useRefetchOnFocus } from "../hooks/useRefetchOnFocus";
 import { openSessionDetail } from "../paper/handoff";
 
 /** The em dash a version with no persisted run renders (grill A1) — a statement
  * that no run exists, never a zero dressed up as data. */
 const EM_DASH = "—";
+
+/** No folds known (or none readable): every recent run is its own run, no label. */
+const NO_FOLDS: FoldMap = new Map();
 
 /** The details-track host `App.tsx` renders when the route declares the track. */
 const DETAILS_PANE_ID = "details-pane";
@@ -482,14 +491,23 @@ function VersionNode({
       </div>
       {/* C1 (r2.s1.w4): who authored the version — `external_agent · <agent
           name>` for an agent-written version, the bare label otherwise. The
-          hypothesis rides a clamped subline only when the version carries one. */}
+          hypothesis rides a clamped subline only when the version carries one.
+          #325 (r4.s5.w3): the label truncates to ONE line — the stylesheet
+          ellipsizes it and the full line rides `title` — because a wrapped
+          `external_agent · claude-code` used to push the hypothesis subline out
+          of the node's fixed height. */}
       <div
         className={`vnode-provenance${version.createdBy === "external_agent" ? " agent" : ""}`}
+        title={provenanceLine(version)}
       >
         {provenanceLine(version)}
       </div>
       {version.hypothesis !== null && (
-        <div className="vnode-hypothesis">{version.hypothesis}</div>
+        // #325: the subline is CSS-clamped; the full text stays one hover away,
+        // the same rule the summary line below follows.
+        <div className="vnode-hypothesis" title={version.hypothesis}>
+          {version.hypothesis}
+        </div>
       )}
       {/* #193 (r3.s2.w5): the full line rides the `title`; the stylesheet's
           ellipsis truncates it to the node's width. */}
@@ -658,7 +676,21 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
             <CertBadge kind={version.certified ? "certified" : "uncertified"} />
           </span>
           {version.latestWalkForwardRunId !== null && (
-            <span className="d-cert-run mono">{version.latestWalkForwardRunId}</span>
+            // #269: the run id OPENS the run — a button that deep-links into
+            // the Backtest Lab (never `href="#"`, which the shell-navigation
+            // gate forbids and which would read as navigation this app does not
+            // own). The Lab selects the run's version and reads it back; this
+            // screen starts nothing.
+            <button
+              type="button"
+              className="d-cert-run mono"
+              title={`Open walk-forward run ${version.latestWalkForwardRunId} in the Backtest Lab`}
+              onClick={() => {
+                window.location.hash = `#/backtest?wf=${version.latestWalkForwardRunId}`;
+              }}
+            >
+              {version.latestWalkForwardRunId}
+            </button>
           )}
         </div>
       </section>
@@ -700,25 +732,7 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
 
       <section className="d-section">
         <h4 className="dsl-h">Recent backtests</h4>
-        {version.recentRuns.length === 0 ? (
-          <div className="bt-none dim">None yet.</div>
-        ) : (
-          <div className="bt-list">
-            {version.recentRuns.map((run) => (
-              <div key={run.id} className="bt-row">
-                <span className="bt-id mono">{run.id.slice(0, 8)}</span>
-                <span className="bt-range">
-                  <Figure exact={run.createdAt}>{dateUtc(run.createdAt)}</Figure>
-                </span>
-                <span className="bt-spacer" />
-                <span className={`mono ${run.expectancy.startsWith("-") ? "bear" : "bull"}`}>
-                  <Figure exact={run.expectancy}>{rMultiple(run.expectancy)}</Figure>
-                </span>
-                <span className="mono dim">{run.trades}t</span>
-              </div>
-            ))}
-          </div>
-        )}
+        <RecentBacktests version={version} />
       </section>
 
       {/* "Recent coaching" is not rendered AT ALL (grill A3) — the coach is
@@ -731,6 +745,45 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
         />
       )}
     </>
+  );
+}
+
+/**
+ * The version's recent runs (#330): the latest walk-forward's folds wear their
+ * own label and are grouped after the version's own runs. One read per
+ * walk-forward id (the hook's cache); a run no fold map names — including an
+ * older walk-forward's fold, which no pointer on the version can reach — stays
+ * an unmarked ordinary run. That is the known limit, rendered rather than
+ * guessed at: `LibraryRunSummary` carries no `walk_forward_run_id`.
+ */
+function RecentBacktests({ version }: { version: LibraryVersion }) {
+  const folds = useWalkForwardFolds(version.latestWalkForwardRunId);
+  const rows = orderRunsWithFolds(
+    version.recentRuns,
+    folds.kind === "ready" ? folds.folds : NO_FOLDS,
+  );
+  if (rows.length === 0) {
+    return <div className="bt-none dim">None yet.</div>;
+  }
+  return (
+    <div className="bt-list">
+      {rows.map(({ run, fold }) => (
+        <div key={run.id} className="bt-row">
+          <span className="bt-id mono">{run.id.slice(0, 8)}</span>
+          {fold !== null && (
+            <span className="bt-fold-label mono">{foldLabel(fold)}</span>
+          )}
+          <span className="bt-range">
+            <Figure exact={run.createdAt}>{dateUtc(run.createdAt)}</Figure>
+          </span>
+          <span className="bt-spacer" />
+          <span className={`mono ${run.expectancy.startsWith("-") ? "bear" : "bull"}`}>
+            <Figure exact={run.expectancy}>{rMultiple(run.expectancy)}</Figure>
+          </span>
+          <span className="mono dim">{run.trades}t</span>
+        </div>
+      ))}
+    </div>
   );
 }
 

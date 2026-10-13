@@ -9,7 +9,10 @@
 // the moment its `toolCallStarted` arrives and its outcome appends when the
 // matching `toolCallResult` does — that one-by-one fold is `d1`'s observable.
 // The finalize summary comes from the command's RETURN value, not the event
-// channel; `started` / `finished` carry no step-list mutation of their own.
+// channel; `started` mutates no step, and `finished` closes the last open step
+// with its closing line (#317) — a SUCCESSFUL `finalize_strategy` never emits a
+// `toolCallResult` of its own. A correctable refusal rides the result's own
+// `outcome` text (#322), never a separate error channel.
 //
 // The channel alone is NOT enough correlation, which is why `inFlight` below
 // exists. Three things it fixes, all of them cases where the channel's identity
@@ -45,16 +48,24 @@ export type StrategySummary = NonNullable<ComposeResult["strategy"]>;
  * (r3.s2.w5, Q5 option 1), folded in WHERE it arrived between the tool steps.
  */
 export type StepEntry =
-  | { kind: "tool"; name: string; preview: string; outcome: string | undefined }
+  | {
+      kind: "tool";
+      name: string;
+      preview: string;
+      outcome: string | undefined;
+      /**
+       * The correctable refusal's own messages, when the outcome IS one
+       * (r4.s5.w3, #322): the failure mark's reason line. Absent on every
+       * success, so the success path's shape is unchanged.
+       */
+      failure?: string[];
+      /**
+       * Set on a call of a tool an EARLIER call of which was refused (#322):
+       * the composer correcting itself reads as a retry, not a fresh step.
+       */
+      retry?: true;
+    }
   | { kind: "note"; text: string };
-
-/** One streamed composer step: opened by `toolCallStarted`, closed by its result. */
-export interface ToolStep {
-  kind: "tool";
-  name: string;
-  preview: string;
-  outcome: string | undefined;
-}
 
 export type RunStatus = "streaming" | "finalized" | "cancelled" | "error";
 
@@ -75,13 +86,81 @@ function clockLabel(): string {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-/** Append a tool result to the LAST open TOOL step of that name (names can
- * repeat; a note never captures an outcome). */
-function attachOutcome(steps: StepEntry[], name: string, outcome: string): StepEntry[] {
+/** A `FieldError`-shaped entry of a serialized correctable refusal — the one
+ * shape `errors_to_content` sends, checked field by field so a success summary
+ * that happens to parse as JSON is never read as a failure (#322). */
+function isFieldError(value: unknown): value is { message: string } {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  return (
+    "path" in value &&
+    typeof value.path === "string" &&
+    "code" in value &&
+    typeof value.code === "string" &&
+    "message" in value &&
+    typeof value.message === "string"
+  );
+}
+
+/**
+ * The messages of a correctable refusal, or `null` when the outcome is the
+ * tool's success summary (#322).
+ *
+ * The stream carries no boolean for this: `toolCallResult`'s `outcome` IS the
+ * answer. A success is the tool's own summary text; a refusal is one of the two
+ * JSON shapes the composer sends — the serialized `FieldError` list
+ * (`[{"path","code","message"}, …]`, `errors_to_content`) or the unknown-tool
+ * object (`{"error":"unknown tool …"}`). Parsed and shape-checked, never guessed
+ * from the wording.
+ */
+function toolFailureMessages(outcome: string): string[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(outcome);
+  } catch {
+    return null;
+  }
+  if (Array.isArray(parsed)) {
+    const messages: string[] = [];
+    for (const entry of parsed) {
+      if (!isFieldError(entry)) {
+        return null;
+      }
+      messages.push(entry.message);
+    }
+    return messages.length === 0 ? null : messages;
+  }
+  if (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    "error" in parsed &&
+    typeof parsed.error === "string"
+  ) {
+    return [parsed.error];
+  }
+  return null;
+}
+
+/** Append a result to the LAST open tool step — of `name` when one is given
+ * (names can repeat; a note never captures an outcome), of any tool otherwise:
+ * the closing `finished` line names no tool and belongs to the step the composer
+ * was on (`finalize_strategy`), which a successful run never closes with a
+ * `toolCallResult` (#317). */
+function attachOutcome(
+  steps: StepEntry[],
+  name: string | null,
+  outcome: string,
+  failure?: string[],
+): StepEntry[] {
   let target = -1;
   for (let i = steps.length - 1; i >= 0; i -= 1) {
     const step = steps[i];
-    if (step.kind === "tool" && step.name === name && step.outcome === undefined) {
+    if (
+      step.kind === "tool" &&
+      step.outcome === undefined &&
+      (name === null || step.name === name)
+    ) {
       target = i;
       break;
     }
@@ -92,7 +171,8 @@ function attachOutcome(steps: StepEntry[], name: string, outcome: string): StepE
   const copy = steps.slice();
   const step = copy[target];
   if (step.kind === "tool") {
-    copy[target] = { ...step, outcome };
+    copy[target] =
+      failure === undefined ? { ...step, outcome } : { ...step, outcome, failure };
   }
   return copy;
 }
@@ -100,6 +180,11 @@ function attachOutcome(steps: StepEntry[], name: string, outcome: string): StepE
 /** Fold one streamed event's payload into a run's turn — pure. */
 function applyEvent(turn: AgentTurn, payload: BusEvent["payload"]): AgentTurn {
   if (payload.kind === "toolCallStarted") {
+    // #322: a call of a tool an earlier call of which was refused is the
+    // composer's correction — the same step shape, marked as the retry.
+    const retried = turn.steps.some(
+      (step) => step.kind === "tool" && step.name === payload.name && step.failure !== undefined,
+    );
     return {
       ...turn,
       steps: [
@@ -109,12 +194,26 @@ function applyEvent(turn: AgentTurn, payload: BusEvent["payload"]): AgentTurn {
           name: payload.name,
           preview: payload.argumentsPreview,
           outcome: undefined,
+          ...(retried ? { retry: true as const } : {}),
         },
       ],
     };
   }
   if (payload.kind === "toolCallResult") {
-    return { ...turn, steps: attachOutcome(turn.steps, payload.name, payload.outcome) };
+    const failure = toolFailureMessages(payload.outcome);
+    return {
+      ...turn,
+      steps: attachOutcome(
+        turn.steps,
+        payload.name,
+        payload.outcome,
+        failure === null ? undefined : failure,
+      ),
+    };
+  }
+  if (payload.kind === "finished") {
+    // #317: the composer's closing line is the last step's own result line.
+    return { ...turn, steps: attachOutcome(turn.steps, null, payload.message) };
   }
   if (payload.kind === "assistantText") {
     // The composer's own prose (r3.s2.w5): a note entry in stream order.

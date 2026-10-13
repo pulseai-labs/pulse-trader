@@ -380,3 +380,138 @@ describe("the designer route entry", () => {
     expect(screen.getByPlaceholderText(/describe a strategy/i)).toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// r4.s5.w3 (#322, #317) — the composer's failed step, and its final step's mark
+// ---------------------------------------------------------------------------
+//
+// The stream carries no boolean for "this call failed": `toolCallResult`'s
+// `outcome` is the tool's own text, and a correctable refusal arrives as the
+// serialized `FieldError` list (`errors_to_content`, src/agent/composer.rs) —
+// the d36 walk's own line below. A successful `finalize_strategy` emits NO
+// `toolCallResult` at all: the closing `finished` event carries its result line.
+
+/** d36's own failed `set_exit_rules` outcome, verbatim. */
+const FIELD_RANGE_OUTCOME =
+  '[{"path":"arguments","code":"FieldRange","message":"could not parse tool arguments: Failed to parse"}]';
+
+describe("<DesignerScreen /> (#322 — a failed tool call reads as failed)", () => {
+  it("marks a failed call failed, shows its error, and reads the retry as a retry (#322)", async () => {
+    render(<DesignerScreen />);
+    submitTarget("RSI oversold bounce on BTC");
+    const channel = capturedChannel();
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(1, {
+          kind: "toolCallStarted",
+          name: "set_exit_rules",
+          argumentsPreview: "stop_loss_pct: 5",
+        }),
+      );
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(2, { kind: "toolCallResult", name: "set_exit_rules", outcome: FIELD_RANGE_OUTCOME }),
+      );
+    });
+
+    const afterFailure = Array.from(document.querySelectorAll(".dsg-steps-body .dsg-step"));
+    expect(afterFailure).toHaveLength(1);
+    // A distinct failure mark — not the green ✓ every successful step wears.
+    expect(afterFailure[0].className).toContain("is-failed");
+    expect(afterFailure[0].querySelector(".dsg-step-marker")?.textContent).toBe("✕");
+    // The backend's own message is on screen, and the raw outcome stays
+    // reachable on the element.
+    const failure = afterFailure[0].querySelector(".dsg-step-error");
+    expect(failure?.textContent).toContain("could not parse tool arguments: Failed to parse");
+    expect(failure?.getAttribute("title")).toBe(FIELD_RANGE_OUTCOME);
+
+    // The composer retries the same tool and succeeds: the second call reads as
+    // a retry, and its own mark is the ordinary ✓.
+    await act(async () => {
+      channel.onmessage?.(
+        event(3, {
+          kind: "toolCallStarted",
+          name: "set_exit_rules",
+          argumentsPreview: "stop_loss_pct: 5, take_profit_r: 2",
+        }),
+      );
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(4, { kind: "toolCallResult", name: "set_exit_rules", outcome: "set exits" }),
+      );
+    });
+
+    const afterRetry = Array.from(document.querySelectorAll(".dsg-steps-body .dsg-step"));
+    expect(afterRetry).toHaveLength(2);
+    expect(afterRetry[0].className).toContain("is-failed");
+    expect(afterRetry[0].querySelector(".dsg-retry")).toBeNull();
+    expect(afterRetry[1].className).not.toContain("is-failed");
+    expect(afterRetry[1].querySelector(".dsg-retry")?.textContent).toBe("retry");
+    expect(afterRetry[1].querySelector(".dsg-step-marker")?.textContent).toBe("✓");
+  });
+});
+
+describe("<DesignerScreen /> (#317 — the final step keeps its done mark)", () => {
+  it("shows the final step's done mark and its result line when the stream completes (#317)", async () => {
+    render(<DesignerScreen />);
+    submitTarget("RSI oversold bounce on BTC");
+    const channel = capturedChannel();
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(1, {
+          kind: "toolCallStarted",
+          name: "set_risk_params",
+          argumentsPreview: "risk 1%",
+        }),
+      );
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(2, {
+          kind: "toolCallResult",
+          name: "set_risk_params",
+          outcome: "set risk 1% per trade, 3x max leverage",
+        }),
+      );
+    });
+    // The last call: finalize_strategy. Its SUCCESS emits no toolCallResult —
+    // the stream closes with `finished`, which carries the composer's own
+    // finalize line.
+    await act(async () => {
+      channel.onmessage?.(
+        event(3, {
+          kind: "toolCallStarted",
+          name: "finalize_strategy",
+          argumentsPreview: "{}",
+        }),
+      );
+    });
+    const finalizeLine = "RSI Oversold [Long] — 1 filter(s)";
+    await act(async () => {
+      channel.onmessage?.(event(4, { kind: "finished", message: finalizeLine }));
+    });
+    await act(async () => {
+      resolveInvoke({ status: "ok", data: finalizeResult() });
+    });
+
+    const steps = Array.from(document.querySelectorAll(".dsg-steps-body .dsg-step"));
+    expect(steps).toHaveLength(2);
+    const last = steps[1] as HTMLElement;
+    expect(last.querySelector(".dsg-step-name")?.textContent).toBe("finalize_strategy");
+    // The walk's d34 finding: this step used to keep the `·` of an unclosed
+    // step even though the run had completed.
+    expect(last.querySelector(".dsg-step-marker")?.textContent).toBe("✓");
+    expect(last.querySelector(".dsg-step-outcome")?.textContent).toBe(finalizeLine);
+    expect(screen.getByText(/completed/i)).toBeTruthy();
+  });
+});

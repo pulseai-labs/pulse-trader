@@ -9,7 +9,7 @@
 // re-registered here.
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../bindings", () => ({
   commands: {
@@ -33,6 +33,21 @@ vi.mock("../bindings", () => ({
     certificationRecords: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: { versionId: "", records: [] } }),
+    // r4.s5.w3 (#330): the details pane reads the version's latest walk-forward
+    // once to learn which of its recent runs are folds. Defaults to a
+    // not-found-shaped refusal, so a fixture that carries a pointer but no
+    // walk-forward DTO renders its rows unlabelled — the honest failed-read
+    // state — while the #330 cases answer with their own DTO.
+    getWalkForwardRun: vi.fn().mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no walk-forward run",
+        run_id: null,
+        session_id: null,
+        child_run_id: null,
+      },
+    }),
   },
 }));
 
@@ -41,14 +56,21 @@ import type {
   BusError,
   CertificationRecordDto,
   LibraryOverview,
+  LibraryRunSummary,
   LibraryVersion,
   VersionStats,
+  WalkForwardRunDto,
 } from "../bindings";
 import { App, RouteContent } from "../App";
-import { resolveRoute } from "../routes";
+import { clearWalkForwardFoldReads } from "../hooks/useWalkForwardFolds";
+import { resolveNavId, resolveRoute } from "../routes";
+
+/** The sidebar's nav rows (App's own list), for the #269 fragment assertion. */
+const KNOWN_NAV_IDS = ["library", "designer", "backtest", "deploy", "journal", "analytics", "settings", "help"];
 
 const overviewMock = vi.mocked(commands.libraryOverview);
 const certificationRecordsMock = vi.mocked(commands.certificationRecords);
+const walkForwardRunMock = vi.mocked(commands.getWalkForwardRun);
 
 /** The figure helper (r4.s5.w1): the A2 display text plus the ring's own exact
  * string on the same element (`title`/`data-exact`), asserted together. */
@@ -166,6 +188,9 @@ const SEEDED: LibraryOverview = {
 
 beforeEach(() => {
   overviewMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
+  // r4.s5.w3 (#330): the fold reads are cached by walk-forward id for the
+  // session; each case starts from an empty cache so its call assertions hold.
+  clearWalkForwardFoldReads();
 });
 
 describe("LibraryScreen (empty payload — the anti-fabrication backstop)", () => {
@@ -776,5 +801,230 @@ describe("LibraryScreen (F5 — the details pane re-renders from the fresh paylo
     expect(inPane.queryByText("+0.42 R")).toBeNull();
     expect(inPane.getByText("Alpha Wave")).toBeTruthy();
     expect(inPane.getByText("v2")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r4.s5.w3 (#330) — the fold labels in Recent backtests
+// ---------------------------------------------------------------------------
+
+/** The version's own run, two folds of its LATEST walk-forward (index 2 and 0),
+ * and a fold of an older walk-forward its catalogue row cannot name. */
+const LIB_OWN_RUN: LibraryRunSummary = {
+  id: "ownrun-0001",
+  createdAt: "2026-08-24T09:00:00.000Z",
+  expectancy: "+0.42R",
+  trades: 12,
+};
+
+const LIB_FOLD_RUN: LibraryRunSummary = {
+  id: "run-fold-reopen-2",
+  createdAt: "2026-08-23T09:00:00.000Z",
+  expectancy: "+0.62R",
+  trades: 4,
+};
+
+const LIB_FOLD_RUN_FIRST: LibraryRunSummary = {
+  id: "run-fold-reopen-0",
+  createdAt: "2026-08-23T09:00:00.000Z",
+  expectancy: "+0.41R",
+  trades: 3,
+};
+
+const LIB_FOLD_OLDER: LibraryRunSummary = {
+  id: "oldwf-fold-1",
+  createdAt: "2026-08-21T09:00:00.000Z",
+  expectancy: "+0.10R",
+  trades: 6,
+};
+
+/** The walk-forward the version's pointer names: folds at index 2 and 0, both in
+ * the recent-run list. */
+const LIB_WF_DTO: WalkForwardRunDto = {
+  walkForwardRunId: "wf-6c1d9f38",
+  versionId: "v-alpha-1",
+  scheme: "rolling-oos/v1",
+  k: 2,
+  rule: "wf-v1",
+  spanFrom: "2026-08-01T00:00:00.000Z",
+  spanTo: "2026-08-31T23:59:59.000Z",
+  fromDefaulted: true,
+  engineFingerprint: "sha256:library9",
+  verdict: {
+    pass: true,
+    foldsHolding: 2,
+    foldsRequired: 2,
+    pooled: { n: 7, meanR: "0.500", lowerBound: 0.12, holds: true },
+  },
+  folds: [
+    {
+      index: 2, windowFrom: "2026-08-20T00:00:00.000Z", windowTo: "2026-08-23T00:00:00.000Z",
+      backtestRunId: "run-fold-reopen-2", n: 4, meanR: "0.620", lowerBound: 0.16,
+      holds: true, trades: 4, expectancy: "0.620", winRate: "0.750",
+    },
+    {
+      index: 0, windowFrom: "2026-08-10T00:00:00.000Z", windowTo: "2026-08-14T00:00:00.000Z",
+      backtestRunId: "run-fold-reopen-0", n: 3, meanR: "0.410", lowerBound: -0.4,
+      holds: true, trades: 3, expectancy: "0.410", winRate: "0.667",
+    },
+  ],
+};
+
+/** The one-strategy catalogue the #330 cases select through; `olderFold` mixes a
+ * run no pointer can name into the same list, in first place. */
+function foldCatalog(olderFold: LibraryRunSummary | null): LibraryOverview {
+  const runs = [LIB_FOLD_RUN, LIB_OWN_RUN, LIB_FOLD_RUN_FIRST];
+  return {
+    strategies: [
+      {
+        id: "strat-alpha",
+        name: "Alpha Wave",
+        createdAt: "2026-08-01T09:00:00.000Z",
+        pinnedVersionId: null,
+        versions: [
+          {
+            ...version(
+              "v-alpha-1",
+              null,
+              stats("+0.42R", "48.3%", 64),
+              null,
+              "human",
+              null,
+              null,
+              false,
+              "wf-6c1d9f38",
+            ),
+            recentRuns: olderFold === null ? runs : [olderFold, ...runs],
+            latestRun: LIB_OWN_RUN,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/** Expand the card and select v1 — the pane whose Recent backtests list is
+ * under test. */
+async function openFoldPane(overview: LibraryOverview): Promise<HTMLElement> {
+  overviewMock.mockResolvedValue({ status: "ok", data: overview });
+  const { container } = render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+  const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+  fireEvent.click(within(tree).getByText("v1"));
+  const pane = document.getElementById("details-pane") as HTMLElement;
+  await within(pane).findByText("Recent backtests");
+  return pane;
+}
+
+describe("LibraryScreen (#330 — fold runs are marked in Recent backtests)", () => {
+  it("labels the latest walk-forward's folds and groups them after the version's own runs (#330)", async () => {
+    walkForwardRunMock.mockResolvedValue({ status: "ok", data: LIB_WF_DTO });
+    const pane = await openFoldPane(foldCatalog(null));
+
+    // The labels ride a read of the version's pointer, so they land a tick after
+    // the rows do.
+    const rows = await waitFor(() => {
+      const found = Array.from(pane.querySelectorAll(".bt-row"));
+      expect(found).toHaveLength(3);
+      return found;
+    });
+    expect(rows.map((row) => row.querySelector(".bt-id")?.textContent)).toEqual([
+      "ownrun-0",
+      "run-fold",
+      "run-fold",
+    ]);
+    expect(rows[0]?.querySelector(".bt-fold-label")).toBeNull();
+    expect(rows[1]?.querySelector(".bt-fold-label")?.textContent).toBe("fold 3 of WF wf-6c1d9");
+    expect(rows[2]?.querySelector(".bt-fold-label")?.textContent).toBe("fold 1 of WF wf-6c1d9");
+    expect(walkForwardRunMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-6c1d9f38" });
+  });
+
+  it("leaves an older walk-forward's fold unmarked — the known limit (#330)", async () => {
+    walkForwardRunMock.mockResolvedValue({ status: "ok", data: LIB_WF_DTO });
+    const pane = await openFoldPane(foldCatalog(LIB_FOLD_OLDER));
+
+    const rows = await waitFor(() => {
+      const found = Array.from(pane.querySelectorAll(".bt-row"));
+      expect(found).toHaveLength(4);
+      return found;
+    });
+    const older = rows.find((row) => row.querySelector(".bt-id")?.textContent === "oldwf-fo");
+    expect(older).toBeDefined();
+    // Nothing on the version names that walk-forward, so the screen cannot know
+    // this run is a fold — and must not guess one.
+    expect(older?.querySelector(".bt-fold-label")).toBeNull();
+    // Non-vacuous: the latest walk-forward's own folds are labelled here.
+    expect(
+      rows
+        .filter((row) => row.querySelector(".bt-fold-label") !== null)
+        .map((row) => row.querySelector(".bt-id")?.textContent),
+    ).toEqual(["run-fold", "run-fold"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r4.s5.w3 (#269) — the certification line opens the run in the Lab
+// ---------------------------------------------------------------------------
+
+describe("LibraryScreen (#269 — the certification run id opens the Lab)", () => {
+  afterEach(() => {
+    window.location.hash = "";
+  });
+
+  it("makes the certification run id a button that deep-links to that run in the Lab (#269)", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v2"));
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const link = await within(pane).findByRole("button", { name: "wf-run-7f3a9c21" });
+    // A real button: the shell-navigation gate forbids `href="#"`, and a link
+    // would read as navigation the app does not own.
+    expect(link.getAttribute("href")).toBeNull();
+
+    fireEvent.click(link);
+
+    // The fragment names the run; the route table reads it as the Backtest Lab
+    // (the query is not part of the nav id).
+    expect(window.location.hash).toBe("#/backtest?wf=wf-run-7f3a9c21");
+    expect(resolveNavId(window.location.hash, KNOWN_NAV_IDS)).toBe("backtest");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r4.s5.w3 (#325) — a wrapped creator label must not clip the sublines
+// ---------------------------------------------------------------------------
+
+describe("LibraryScreen (#325 — the hypothesis subline survives a long label)", () => {
+  it("keeps the agent label to one line and the hypothesis subline readable (#325)", async () => {
+    // The walked case: `external_agent · claude-code` wraps at a normal window
+    // width, which used to push the DSL/hypothesis subline out of the node's
+    // fixed height (d37's clipped `long · (rsi(14)…` sliver).
+    overviewMock.mockResolvedValue({ status: "ok", data: WITH_AGENT });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    const node = within(tree).getByText("v2").closest(".vnode") as HTMLElement;
+
+    // PROXY, stated plainly: the ellipsis itself is the stylesheet's job
+    // (`.vnode-provenance` carries `white-space: nowrap; overflow: hidden;
+    // text-overflow: ellipsis`) and jsdom performs no layout, so what is
+    // asserted here is the DOM contract that keeps the label to ONE line — the
+    // truncating class and the FULL line on `title` — plus the sublines that
+    // must stay in the node.
+    const label = node.querySelector(".vnode-provenance") as HTMLElement;
+    expect(label.className).toContain("agent");
+    expect(label.getAttribute("title")).toBe("external_agent · claude-code");
+    // The hypothesis subline renders, with its full text reachable (#193's own
+    // discipline, applied to the subline the walk found clipped).
+    const hypothesis = node.querySelector(".vnode-hypothesis") as HTMLElement;
+    expect(hypothesis.textContent).toBe("A wider stop cuts noise exits.");
+    expect(hypothesis.getAttribute("title")).toBe("A wider stop cuts noise exits.");
+    // ...and the DSL subline is still in the node.
+    expect((node.querySelector(".vnode-summary")?.textContent ?? "").length).toBeGreaterThan(0);
   });
 });

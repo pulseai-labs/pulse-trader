@@ -229,21 +229,21 @@ describe("VersionPicker (grouping)", () => {
     );
     expect(headers).toHaveLength(12);
     expect(headers[0]).toBe("Aurora Momentum");
-    expect(headers[1]).toBe(DUP_NAME + " · 2026-09-20 · dupe20");
+    expect(headers[1]).toBe(DUP_NAME + " · 2026-09-20 UTC · dupe20");
     expect(headers[11]).toBe("Lima Carry");
 
     // Versions inside the first group are v1…v10, in order.
     expect(optionTexts().slice(0, 10)).toEqual([
-      "v1 · 2026-08-01 · 1aurora · human",
-      "v2 · 2026-08-02 · 2aurora · human",
-      "v3 · 2026-08-03 · 3aurora · human",
-      "v4 · 2026-08-04 · 4aurora · human",
-      "v5 · 2026-08-05 · 5aurora · human",
-      "v6 · 2026-08-06 · 6aurora · human",
-      "v7 · 2026-08-07 · 7aurora · human",
-      "v8 · 2026-08-08 · 8aurora · human",
-      "v9 · 2026-08-09 · 9aurora · human",
-      "v10 · 2026-08-10 · 10aurora · human",
+      "v1 · 2026-08-01 UTC · 1aurora · human",
+      "v2 · 2026-08-02 UTC · 2aurora · human",
+      "v3 · 2026-08-03 UTC · 3aurora · human",
+      "v4 · 2026-08-04 UTC · 4aurora · human",
+      "v5 · 2026-08-05 UTC · 5aurora · human",
+      "v6 · 2026-08-06 UTC · 6aurora · human",
+      "v7 · 2026-08-07 UTC · 7aurora · human",
+      "v8 · 2026-08-08 UTC · 8aurora · human",
+      "v9 · 2026-08-09 UTC · 9aurora · human",
+      "v10 · 2026-08-10 UTC · 10aurora · human",
     ]);
   });
 
@@ -256,8 +256,8 @@ describe("VersionPicker (grouping)", () => {
     );
     const dupHeaders = headers.filter((header) => header.includes(DUP_NAME));
     expect(dupHeaders).toEqual([
-      `${DUP_NAME} · 2026-09-20 · dupe20`,
-      `${DUP_NAME} · 2026-09-22 · dupe22`,
+      `${DUP_NAME} · 2026-09-20 UTC · dupe20`,
+      `${DUP_NAME} · 2026-09-22 UTC · dupe22`,
     ]);
     // Exactly one group per colliding strategy, and only the collision carries
     // a disambiguator.
@@ -274,13 +274,13 @@ describe("VersionPicker (grouping)", () => {
     // (`external_agent · <agent name>`); a human's is the bare label.
     fireEvent.change(box, { target: { value: "golf trend" } });
     expect(screen.getAllByRole("option")[0]?.textContent).toBe(
-      "v1 · 2026-08-01 · 1golf77 · external_agent · seed-r4s5",
+      "v1 · 2026-08-01 UTC · 1golf77 · external_agent · seed-r4s5",
     );
 
     fireEvent.change(box, { target: { value: "delta reversion" } });
     const texts = optionTexts();
-    expect(texts[3]).toBe("v4 · 2026-08-04 · 4delta4 · human · pinned");
-    expect(texts[0]).toBe("v1 · 2026-08-01 · 1delta4 · human");
+    expect(texts[3]).toBe("v4 · 2026-08-04 UTC · 4delta4 · human · pinned");
+    expect(texts[0]).toBe("v1 · 2026-08-01 UTC · 1delta4 · human");
   });
 });
 
@@ -295,7 +295,7 @@ describe("VersionPicker (keyboard)", () => {
 
     expect(document.activeElement).toBe(box);
     expect(box.getAttribute("aria-expanded")).toBe("true");
-    expect(activeOptionText()).toBe("v1 · 2026-08-01 · 1aurora · human");
+    expect(activeOptionText()).toBe("v1 · 2026-08-01 UTC · 1aurora · human");
   });
 
   it("moves the active option with ↓/↑ (clamped) and selects it with Enter", () => {
@@ -305,19 +305,19 @@ describe("VersionPicker (keyboard)", () => {
 
     fireEvent.keyDown(box, { key: "ArrowDown" });
     fireEvent.keyDown(box, { key: "ArrowDown" });
-    expect(activeOptionText()).toBe("v3 · 2026-08-03 · 3aurora · human");
+    expect(activeOptionText()).toBe("v3 · 2026-08-03 UTC · 3aurora · human");
 
     // ↑ walks back; at the first option it stays there.
     fireEvent.keyDown(box, { key: "ArrowUp" });
     fireEvent.keyDown(box, { key: "ArrowUp" });
     fireEvent.keyDown(box, { key: "ArrowUp" });
-    expect(activeOptionText()).toBe("v1 · 2026-08-01 · 1aurora · human");
+    expect(activeOptionText()).toBe("v1 · 2026-08-01 UTC · 1aurora · human");
 
     // Enter selects the ACTIVE option — v2 after one ↓ — and closes the list.
     fireEvent.keyDown(box, { key: "ArrowDown" });
     fireEvent.keyDown(box, { key: "Enter" });
     expect(onSelect).toHaveBeenCalledExactlyOnceWith("2aurora");
-    expect(box.value).toBe("v2 · 2026-08-02 · 2aurora · human");
+    expect(box.value).toBe("v2 · 2026-08-02 UTC · 2aurora · human");
     expect(screen.queryAllByRole("option")).toHaveLength(0);
     expect(document.activeElement).toBe(box);
   });
@@ -330,15 +330,15 @@ describe("VersionPicker (keyboard)", () => {
     expect(screen.getAllByRole("option")).toHaveLength(10);
 
     fireEvent.keyDown(box, { key: "End" });
-    expect(activeOptionText()).toBe("v10 · 2026-08-10 · 10juliet · human");
+    expect(activeOptionText()).toBe("v10 · 2026-08-10 UTC · 10juliet · human");
     // Ten more ↓ keep it at the last option rather than wrapping.
     for (let i = 0; i < 10; i += 1) {
       fireEvent.keyDown(box, { key: "ArrowDown" });
     }
-    expect(activeOptionText()).toBe("v10 · 2026-08-10 · 10juliet · human");
+    expect(activeOptionText()).toBe("v10 · 2026-08-10 UTC · 10juliet · human");
 
     fireEvent.keyDown(box, { key: "Home" });
-    expect(activeOptionText()).toBe("v1 · 2026-08-01 · 1juliet · human");
+    expect(activeOptionText()).toBe("v1 · 2026-08-01 UTC · 1juliet · human");
   });
 
   it("closes on Escape without selecting, restoring the selected option's text", () => {
@@ -352,7 +352,7 @@ describe("VersionPicker (keyboard)", () => {
     expect(onSelect).not.toHaveBeenCalled();
     expect(screen.queryAllByRole("option")).toHaveLength(0);
     expect(box.getAttribute("aria-expanded")).toBe("false");
-    expect(box.value).toBe("v1 · 2026-08-01 · 1aurora · human");
+    expect(box.value).toBe("v1 · 2026-08-01 UTC · 1aurora · human");
     expect(document.activeElement).toBe(box);
   });
 
@@ -367,7 +367,7 @@ describe("VersionPicker (keyboard)", () => {
     fireEvent.click(option);
 
     expect(onSelect).toHaveBeenCalledExactlyOnceWith("3echo55");
-    expect(box.value).toBe("v3 · 2026-08-03 · 3echo55 · human");
+    expect(box.value).toBe("v3 · 2026-08-03 UTC · 3echo55 · human");
     expect(document.activeElement).toBe(box);
   });
 });
@@ -396,6 +396,6 @@ describe("VersionPicker (disabled)", () => {
     fireEvent.keyDown(box, { key: "ArrowDown" });
     fireEvent.keyDown(box, { key: "Enter" });
     expect(onSelect).not.toHaveBeenCalled();
-    expect(box.value).toBe("v1 · 2026-08-01 · 1aurora · human");
+    expect(box.value).toBe("v1 · 2026-08-01 UTC · 1aurora · human");
   });
 });
