@@ -29,16 +29,21 @@ ui: ui-deps
     npm run test
     npm run build
 
-# Install node modules only when they are missing. `npm ci` (not `npm install`)
-# so the committed package-lock.json is authoritative and a gate run can never
-# silently change the dependency tree.
-
-# Install node modules when missing (npm ci, lockfile-authoritative).
+# Install node modules when they are missing OR when the lockfile changed since
+# the last successful install (#114). `npm ci` (not `npm install`) so the
+# committed package-lock.json is authoritative and a gate run can never silently
+# change the dependency tree. The stamp is the lockfile's own `cksum` line,
+# written only after a successful `npm ci`, so a failed install is retried on
+# the next run; it lives inside node_modules, so it dies with the tree it
+# describes rather than outliving it in a repo-root file.
 ui-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ ! -d node_modules ]; then
+    stamp="node_modules/.pulse-ui-deps-stamp"
+    want="$(cksum < package-lock.json)"
+    if [ ! -d node_modules ] || [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$want" ]; then
         npm ci
+        printf '%s\n' "$want" > "$stamp"
     fi
 
 # --- rust -------------------------------------------------------------------

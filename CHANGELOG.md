@@ -278,6 +278,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The desktop frontend builds and tests on Vite 8, and `just ui-deps` follows the lockfile
+  (r4.s5.w5).** `vite` moved `^6.4.3` → `^8.3.4` (rolldown + lightningcss), `@vitejs/plugin-react`
+  `^5.2.0` → `^6.1.2` (its Vite 8 major) and `vitest` `^5.0.0` → `^5.0.4` (its peer range accepts
+  `vite ^8`); esbuild and rollup leave the tree with the old bundler (#121). `vite.config.ts` needs
+  no structural change — `build.target: "safari15"` is honoured by the rolldown/oxc transform, and
+  an unknown target is a hard build error — so the bundle is the same app: same asset set, 2,043,935
+  bytes total against the round-2 build's 2,038,368, with `emptyOutDir`, the jsdom test environment
+  and one config file kept (the before/after asset list and totals are in the work item's report).
+  Every existing vitest file passes unchanged on the new toolchain. `just ui-deps` now runs `npm ci`
+  when `node_modules` is absent **or** when `package-lock.json` no longer matches the `cksum` stamp
+  written after the last successful install, so a dependency bump can no longer leave a stale tree
+  for the next gate to trip on (#114); `scripts/ui-deps-lockfile-test.sh` proves the reinstall, the
+  no-op, the missing-stamp reinstall and the failed-install retry on scratch copies only.
+
 - **Every money, price, quantity, R, percent and time value on the Mac app's screens now reads in
   human units (r4.s5.w1).** One shared format module — `ui/src/format/numbers.ts`, `time.ts` and the
   `Figure` display component — turns the server's exact decimal text into A2's display forms on the
