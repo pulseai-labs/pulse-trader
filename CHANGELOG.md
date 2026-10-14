@@ -394,6 +394,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A self-signed `just bundle` now says so, and the Keychain prompt on every new signed Mac build has a
+  cause and a fix (#392).** Every new signed build asked for the login Keychain's password before it could
+  read `PulseTrader/server_app_token`, and the answer did not persist — even for the same build. The cause
+  is securityd's PARTITION check, not the item's ACL: keyring 3.6.3's `apple-native` store uses the
+  file-based login keychain, whose items carry a partition list beside the ACL, and
+  `ClientIdentification::partitionIdForProcess` partitions code signed by an Apple-issued certificate
+  (Apple Development / Developer ID) as `teamid:<team>` but anything else — the self-signed certificate the
+  build used — as `cdhash:<cdhash>`, which changes on every build, so every new build failed the partition
+  check and prompted; no designated requirement can fix that. `just bundle` now runs
+  `codesign --verify -R='anchor apple generic'` on the signed bundle after `codesign --verify --strict`,
+  prints the `Authority=` and `TeamIdentifier=` lines from `codesign -dvv`, and, when the anchor test fails,
+  WARNS on stderr (the build does not fail) that the identity is not issued by Apple and the Keychain will
+  prompt on every new build — so the fix, signing with an Apple Development identity (a free Apple ID
+  personal team, made in Xcode) or a Developer ID identity, is visible in the build's own output. The
+  identity name still comes from `PULSE_SIGNING_IDENTITY` at build time; nothing about it is committed.
+  One prompt remains: the first launch of the first team-signed build asks once ("Always Allow") for the
+  item whose partition list still names the old `cdhash:` partition — answering it adds the new one, and
+  later builds read the token silently. `scripts/check-signing-config.sh` refuses a `bundle` recipe that
+  drops either the anchor test or the #392 warning line, and its banned-identity list now carries the Apple
+  identity VALUE prefixes (`Apple Development:`, `Developer ID Application:`, …) instead of the bare class
+  name, which the recipe's comment and its warning line are allowed to name.
+
 - **The Library version tree shows every node's provenance line again, and an agent version's
   hypothesis subline with it (#404, d37).** r4.s5.w3's one-line ellipsis rule on `.vnode-provenance`
   gave the line `overflow: hidden`, and a flex item with non-visible overflow gets an automatic minimum
