@@ -179,12 +179,16 @@ deploy tag:
     # this release build (and of deploy-mac's): the deploy must not refuse on,
     # or depend on, a frontend bundle the server never reads.
     (cd "$SRC" && PULSE_ALLOW_PLACEHOLDER_DIST=1 cargo build --release --bin pulse)
+    # #229: install from cargo's real target directory — an exported
+    # CARGO_TARGET_DIR sends the build there, and `$SRC/target` would then hold
+    # no binary (or a stale one from an earlier deploy).
+    TARGET_DIR="$(cd "$SRC" && cargo metadata --format-version 1 --no-deps | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
     # The unit comes from the tag too, like the binary above: installing the
     # caller's working-tree unit beside a tagged binary is a mixed release (and
     # a rollback to an old tag would install a new unit).
     install -d -m 0700 "$HOME/.local/share/pulse-qa"
     mkdir -p "$HOME/.local/share/pulse-qa/bin" "$HOME/.config/systemd/user"
-    install -m 0755 "$SRC/target/release/pulse" "$HOME/.local/share/pulse-qa/bin/pulse"
+    install -m 0755 "$TARGET_DIR/release/pulse" "$HOME/.local/share/pulse-qa/bin/pulse"
     install -m 0644 "$SRC/deploy/pulse-qa.service" "$HOME/.config/systemd/user/"
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user daemon-reload
     XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user enable pulse-qa.service
