@@ -531,7 +531,8 @@ fn visit_indicator_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> C
         | IndicatorSpec::Body
         | IndicatorSpec::UpperWick
         | IndicatorSpec::LowerWick
-        | IndicatorSpec::Range => visit_structure_spec(spec, base, f)?,
+        | IndicatorSpec::Range
+        | IndicatorSpec::CandlePattern { .. } => visit_structure_spec(spec, base, f)?,
         IndicatorSpec::DoubleTopNeckline { .. }
         | IndicatorSpec::DoubleBottomNeckline { .. }
         | IndicatorSpec::TrendlineLows { .. }
@@ -608,7 +609,10 @@ fn visit_structure_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> C
         IndicatorSpec::Body
         | IndicatorSpec::UpperWick
         | IndicatorSpec::LowerWick
-        | IndicatorSpec::Range => {}
+        | IndicatorSpec::Range
+        // r5.s1.w1 (schema 1.4.0): the named candle patterns take no
+        // parameter, so they have no sweepable leaf — the anatomy precedent.
+        | IndicatorSpec::CandlePattern { .. } => {}
         other => unreachable!(
             "visit_indicator_spec routes only the structure variants here, never {other:?}"
         ),

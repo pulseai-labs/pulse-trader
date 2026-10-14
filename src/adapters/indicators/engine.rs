@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use super::{
     adx::Adx,
     atr::Atr,
+    candle_patterns::CandlePatternIndicator,
     ema::Ema,
     macd::Macd,
     patterns::{NecklineIndicator, NecklineKind, TrendlineIndicator},
@@ -380,11 +381,12 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
                 .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
                 .ok_or_else(|| invalid_period(spec, format!("Lowest period {period} is invalid")))
         }
-        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
-        // indicators (r4.s6.w3): twelve variants over the `structure` and
-        // `patterns` adapters, built by their own factory. They are listed here
-        // BY NAME — never matched with a wildcard — so a new variant still
-        // breaks this match and has to be routed by hand.
+        // The structure indicators (schema 1.3.0, r4.s6.w1), the pattern
+        // indicators (r4.s6.w3) and the named candlestick patterns (schema
+        // 1.4.0, r5.s1.w1): thirteen variants over the `structure`, `patterns`
+        // and `candle_patterns` adapters, built by their own factory. They are
+        // listed here BY NAME — never matched with a wildcard — so a new variant
+        // still breaks this match and has to be routed by hand.
         IndicatorSpec::PivotHigh { .. }
         | IndicatorSpec::PivotLow { .. }
         | IndicatorSpec::Resistance { .. }
@@ -396,15 +398,17 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
         | IndicatorSpec::Body
         | IndicatorSpec::UpperWick
         | IndicatorSpec::LowerWick
-        | IndicatorSpec::Range => build_structure_indicator(spec),
+        | IndicatorSpec::Range
+        | IndicatorSpec::CandlePattern { .. } => build_structure_indicator(spec),
     }
 }
 
-/// Build the structure and pattern families' adapters (schema 1.3.0, r4.s6.w1
-/// and r4.s6.w3) — the two groups whose math lives in `structure`/`patterns`
-/// rather than behind `convert`.
+/// Build the structure, pattern and candle-pattern families' adapters (schema
+/// 1.3.0, r4.s6.w1 and r4.s6.w3; schema 1.4.0, r5.s1.w1) — the three groups
+/// whose math lives in `structure`/`patterns`/`candle_patterns` rather than
+/// behind `convert`.
 ///
-/// `build_indicator` routes exactly the twelve variants here, so the trailing
+/// `build_indicator` routes exactly the thirteen variants here, so the trailing
 /// arm is a contract guard, unreachable by construction (the house shape at
 /// `agent/tools.rs`'s `Op` dispatch): a new variant is a compile error in the
 /// factory's own match first, and that match is where its builder is chosen.
@@ -472,6 +476,14 @@ fn build_structure_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>,
         IndicatorSpec::UpperWick => Ok(Box::new(Anatomy::new(AnatomyKind::UpperWick))),
         IndicatorSpec::LowerWick => Ok(Box::new(Anatomy::new(AnatomyKind::LowerWick))),
         IndicatorSpec::Range => Ok(Box::new(Anatomy::new(AnatomyKind::Range))),
+        // r5.s1.w1 (schema 1.4.0): the named candlestick patterns. The variant
+        // carries no parameter, so the builder is infallible — and this variant
+        // is deliberately NOT in `is_level_or_pattern` above: after its
+        // lookback it yields a value on every bar, so the engine's ordinary
+        // all-`Some` warm rule is the correct one for it.
+        IndicatorSpec::CandlePattern { pattern } => {
+            Ok(Box::new(CandlePatternIndicator::new(*pattern)))
+        }
         other => unreachable!(
             "build_indicator routes only the structure/pattern variants here, never {other:?}"
         ),

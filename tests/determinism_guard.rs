@@ -92,6 +92,10 @@ const SCAN_TARGETS: &[&str] = &[
     // rounding on the trendline slope, scanned like every other indicator
     // surface.
     "src/adapters/indicators/patterns.rs",
+    // r5.s1.w1: the named candle-pattern adapter — pure `Decimal` on a shared
+    // candle ring, no `convert` seam, scanned like every other indicator surface
+    // so a future banned call here is not a false-green hole.
+    "src/adapters/indicators/candle_patterns.rs",
     "src/domain/backtest/regime.rs",
     "src/adapters/backtest/regime.rs",
     "src/adapters/backtest/engine.rs",

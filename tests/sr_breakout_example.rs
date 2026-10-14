@@ -136,17 +136,26 @@ fn run_example(
     .expect("backtest runs over the fixture")
 }
 
-/// The example is a valid schema-1.3.0 document whose entry is the zone-break
-/// form, and whose filters are the anatomy gate and the pattern break.
+/// The example is a valid document — authored at schema 1.3.0, identity-
+/// migrated to `CURRENT` (1.4.0) on load — whose entry is the zone-break form
+/// and whose filters are the anatomy gate and the pattern break.
+///
+/// The example file itself stays at 1.3.0 on purpose (r5.s1.w1): rewriting it
+/// would put its frozen golden at risk for no gain, and a 1.3.0 document must
+/// keep loading by identity — which this assertion now proves.
 #[test]
 fn example_parses_validates_and_carries_the_zone_break_form() {
     let dsl = load_example();
     assert_eq!(
         dsl.schema_version,
         SchemaVersion::CURRENT,
-        "the example is authored at the current schema"
+        "the example loads to the current schema"
     );
-    assert_eq!(dsl.schema_version.to_string(), "1.3.0");
+    assert_eq!(
+        dsl.schema_version.to_string(),
+        "1.4.0",
+        "the example is identity-migrated from 1.3.0 to CURRENT"
+    );
 
     // Entry: h4:close crosses above lag(h4:resistance{…}, 1) — the previous H4
     // bar's level, never the same bar's (the module header's trap).

@@ -117,8 +117,8 @@ pub use domain::strategy::Hypothesis as AgentHypothesis;
 // same curated-surface pattern as the domain types above. `ArithOp` rides
 // beside `ValueSource` since r3.s2.w3 (schema 1.2.0 expressions, Q2).
 pub use domain::{
-    ArithOp, Comparator, Condition, IndicatorSpec, MacdOutput, PriceField, Series, SweepableValue,
-    ValueSource,
+    ArithOp, CandlePatternName, Comparator, Condition, IndicatorSpec, MacdOutput, PriceField,
+    Series, SweepableValue, ValueSource,
 };
 
 // VS-1.1.2 work-2.02: the whole-strategy document layer. `StrategyDsl` is the
@@ -360,6 +360,13 @@ pub use adapters::indicators::atr::Atr;
 // window value is one of the inputs, so no `convert` seam and no rounding;
 // the indicator engine's factory consumes it.
 pub use adapters::indicators::rolling::RollingExtremes;
+// r5.s1.w1 (schema 1.4.0): the named candle-pattern adapter (TA-Lib's own
+// integer per pattern, on one shared candle ring). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter struct
+// unused outside its module is a `dead_code` build error, not a warning; the
+// indicator engine's factory consumes it, and `tests/candle_patterns.rs` drives
+// the parity suite through this re-export.
+pub use adapters::indicators::candle_patterns::CandlePatternIndicator;
 // VS-1.1.3 work-3.03: the multi-indicator engine that implements the frozen
 // `EvalContext` seam over real candles and streaming adapter values. Its
 // readiness gate is load-bearing for warmup safety under the current boolean DSL
