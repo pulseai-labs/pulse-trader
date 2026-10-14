@@ -487,12 +487,17 @@ prod-reset:
 # self-signed build fails the Keychain item's partition check and prompts for the
 # login Keychain -- no designated requirement can fix that. The recipe passes the
 # identity to the Tauri build as APPLE_SIGNING_IDENTITY, then verifies the bundle
-# (`codesign --verify --strict`), tests it against the Apple-issued anchor (a failure
-# WARNS with the #392 line; it does not fail the build) and prints the `Authority=`
-# and `TeamIdentifier=` lines. UNSIGNED with one warning line when the variable is
-# unset: an unsigned build gets a fresh ad-hoc identity every time, so it cannot read
-# back a Keychain item an earlier build wrote (grill G6). Notarization and auto-update
-# stay out of scope (ADR-0020).
+# (`codesign --verify --strict`), tests it against securityd's own team-ID
+# requirement (`developmentOrDevIDReq`: the Developer ID CA / WWDR Mac Development /
+# WWDR Mac Distribution leaves -- a bare `anchor apple generic` accepts ANY
+# Apple-issued certificate, and a failure WARNS with the #392 line; it does not fail
+# the build) and prints the `Authority=` and `TeamIdentifier=` lines. The
+# requirement is handed to codesign in the `-R='<text>'` form on purpose: codesign
+# compiles an argument that begins with `=` as literal requirement text, while
+# `-R '...'` would be read as a FILE path and the test would fail for every identity.
+# UNSIGNED with one warning line when the variable is unset: an unsigned build gets a
+# fresh ad-hoc identity every time, so it cannot read back a Keychain item an earlier
+# build wrote (grill G6). Notarization and auto-update stay out of scope (ADR-0020).
 #
 # Deliberately NOT part of `just check`: it is a release build of the whole Tauri
 # graph (minutes, not seconds), and gating every local check run on it would make the
@@ -504,13 +509,16 @@ bundle:
         APPLE_SIGNING_IDENTITY="$PULSE_SIGNING_IDENTITY" npm run bundle
         app="target/release/bundle/macos/PulseTrader.app"
         codesign --verify --strict "$app"
-        # #392: strict verification passes for a self-signed certificate too. The
-        # Apple-issued anchor test is what separates the two: a self-signed
-        # certificate partitions as cdhash:<cdhash> under securityd, that hash
+        # #392: strict verification passes for a self-signed certificate too. The test
+        # below is securityd's own team-ID requirement (developmentOrDevIDReq): the
+        # Developer ID CA with a Developer ID leaf, the WWDR CA with a Mac Development
+        # leaf (an Apple Development certificate) or the WWDR CA with a Mac
+        # Distribution leaf. A bare anchor would accept ANY Apple-issued certificate; a
+        # self-signed one partitions as cdhash:<cdhash> under securityd, that hash
         # changes on every build, and the login Keychain item is guarded by that
         # partition -- so the operator sees a password prompt for every new build.
-        if ! codesign --verify -R='anchor apple generic' "$app"; then
-            echo 'warning: the signing identity is not issued by Apple (self-signed) -- the Keychain prompts on every new build (#392); sign with an Apple Development or Developer ID identity' >&2
+        if ! codesign --verify -R='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] and certificate leaf[field.1.2.840.113635.100.6.1.12] or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] and certificate leaf[field.1.2.840.113635.100.6.1.7]' "$app"; then
+            echo 'warning: the bundle is not signed by an Apple Development or Developer ID identity (or codesign could not confirm it) -- the Keychain prompts on every new build (#392); sign with such an identity' >&2
         fi
         codesign -dvv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier)='
     else

@@ -402,19 +402,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ClientIdentification::partitionIdForProcess` partitions code signed by an Apple-issued certificate
   (Apple Development / Developer ID) as `teamid:<team>` but anything else — the self-signed certificate the
   build used — as `cdhash:<cdhash>`, which changes on every build, so every new build failed the partition
-  check and prompted; no designated requirement can fix that. `just bundle` now runs
-  `codesign --verify -R='anchor apple generic'` on the signed bundle after `codesign --verify --strict`,
-  prints the `Authority=` and `TeamIdentifier=` lines from `codesign -dvv`, and, when the anchor test fails,
-  WARNS on stderr (the build does not fail) that the identity is not issued by Apple and the Keychain will
-  prompt on every new build — so the fix, signing with an Apple Development identity (a free Apple ID
-  personal team, made in Xcode) or a Developer ID identity, is visible in the build's own output. The
-  identity name still comes from `PULSE_SIGNING_IDENTITY` at build time; nothing about it is committed.
+  check and prompted; no designated requirement can fix that. `just bundle` now tests the signed bundle
+  against securityd's own team-ID requirement — `developmentOrDevIDReq`, carried in the recipe verbatim: the
+  Developer ID CA with a Developer ID leaf, the WWDR CA with a Mac Development leaf (an Apple Development
+  certificate) or the WWDR CA with a Mac Distribution leaf — through the `-R='<text>'` form codesign reads
+  as literal requirement text (a bare `anchor apple generic` would accept ANY Apple-issued certificate,
+  and `-R '...'` without the `=` makes codesign read the text as a file path) after
+  `codesign --verify --strict`, prints the `Authority=` and `TeamIdentifier=` lines from `codesign -dvv`,
+  and, when that test fails, WARNS on stderr (the build does not fail) that the bundle is not signed by an
+  Apple Development or Developer ID identity — so the fix, signing with an Apple Development identity (a
+  free Apple ID personal team, made in Xcode) or a Developer ID identity, is visible in the build's own
+  output. The identity name still comes from `PULSE_SIGNING_IDENTITY` at build time; nothing about it is
+  committed.
   One prompt remains: the first launch of the first team-signed build asks once ("Always Allow") for the
   item whose partition list still names the old `cdhash:` partition — answering it adds the new one, and
-  later builds read the token silently. `scripts/check-signing-config.sh` refuses a `bundle` recipe that
-  drops either the anchor test or the #392 warning line, and its banned-identity list now carries the Apple
-  identity VALUE prefixes (`Apple Development:`, `Developer ID Application:`, …) instead of the bare class
-  name, which the recipe's comment and its warning line are allowed to name.
+  later builds read the token silently. `scripts/check-signing-config.sh` binds to the recipe's code: the
+  team-ID test must be an uncommented `if ! codesign --verify -R=` line carrying the three team-ID leaf
+  OIDs, the #392 warning line must sit inside that test's `if` block on stderr, and the colon-less identity
+  CLASS names (`Apple Development`, `Developer ID Application`, …) are refused as code too — anywhere in
+  tauri.conf.json and package.json, and on every justfile line that is not a comment and not the #392
+  warning line — because `PULSE_SIGNING_IDENTITY="Apple Development"` selects a certificate just as a full
+  identity value does.
 
 - **The Library version tree shows every node's provenance line again, and an agent version's
   hypothesis subline with it (#404, d37).** r4.s5.w3's one-line ellipsis rule on `.vnode-provenance`
