@@ -479,12 +479,20 @@ prod-reset:
 #
 # Signed when PULSE_SIGNING_IDENTITY names a codesigning identity (r4.s3.w1: the
 # ONLY place the identity lives -- no certificate name, team id or identity value is
-# committed here; `scripts/check-signing-config.sh` enforces it). The recipe passes
-# it to the Tauri build as APPLE_SIGNING_IDENTITY, then verifies the bundle
-# (`codesign --verify --strict`) and prints the `Authority=` line. UNSIGNED with one
-# warning line when the variable is unset: an unsigned build gets a fresh ad-hoc
-# identity every time, so it cannot read back a Keychain item an earlier build wrote
-# (grill G6). Notarization and auto-update stay out of scope (ADR-0020).
+# committed here; `scripts/check-signing-config.sh` enforces it). The identity must be
+# ISSUED BY APPLE -- an Apple Development identity (a free Apple ID personal team,
+# made in Xcode) or a Developer ID identity (#392): securityd's partition ID is
+# `teamid:<team>` for an Apple-issued certificate and `cdhash:<cdhash>` for anything
+# else, and a self-signed certificate's cdhash changes on every build, so every new
+# self-signed build fails the Keychain item's partition check and prompts for the
+# login Keychain -- no designated requirement can fix that. The recipe passes the
+# identity to the Tauri build as APPLE_SIGNING_IDENTITY, then verifies the bundle
+# (`codesign --verify --strict`), tests it against the Apple-issued anchor (a failure
+# WARNS with the #392 line; it does not fail the build) and prints the `Authority=`
+# and `TeamIdentifier=` lines. UNSIGNED with one warning line when the variable is
+# unset: an unsigned build gets a fresh ad-hoc identity every time, so it cannot read
+# back a Keychain item an earlier build wrote (grill G6). Notarization and auto-update
+# stay out of scope (ADR-0020).
 #
 # Deliberately NOT part of `just check`: it is a release build of the whole Tauri
 # graph (minutes, not seconds), and gating every local check run on it would make the
@@ -496,7 +504,15 @@ bundle:
         APPLE_SIGNING_IDENTITY="$PULSE_SIGNING_IDENTITY" npm run bundle
         app="target/release/bundle/macos/PulseTrader.app"
         codesign --verify --strict "$app"
-        codesign -dvv "$app" 2>&1 | grep '^Authority='
+        # #392: strict verification passes for a self-signed certificate too. The
+        # Apple-issued anchor test is what separates the two: a self-signed
+        # certificate partitions as cdhash:<cdhash> under securityd, that hash
+        # changes on every build, and the login Keychain item is guarded by that
+        # partition -- so the operator sees a password prompt for every new build.
+        if ! codesign --verify -R='anchor apple generic' "$app"; then
+            echo 'warning: the signing identity is not issued by Apple (self-signed) -- the Keychain prompts on every new build (#392); sign with an Apple Development or Developer ID identity' >&2
+        fi
+        codesign -dvv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier)='
     else
         echo 'warning: PULSE_SIGNING_IDENTITY is unset -- building an UNSIGNED bundle; the app token will not survive a rebuild without a signed build' >&2
         npm run bundle
