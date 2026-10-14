@@ -22,6 +22,22 @@ const CHECKED_FILES: [&str; 4] = ["tauri.conf.json", "justfile", "package.json",
 /// The script under test, copied under `<temp>/scripts/`.
 const GATE: &str = "scripts/check-signing-config.sh";
 
+/// securityd's `developmentOrDevIDReq`, verbatim (`securityd/src/clientid.cpp`): the
+/// Developer ID CA / WWDR Mac Development / WWDR Mac Distribution leaves. It is the
+/// requirement the `bundle` recipe's signed branch must test the real bundle against,
+/// and the anchor the mutations below spell out.
+const TEAM_ID_REQ: &str = "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] and certificate leaf[field.1.2.840.113635.100.6.1.12] or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] and certificate leaf[field.1.2.840.113635.100.6.1.7]";
+
+/// The recipe's requirement-test line, exactly as the justfile holds it.
+fn team_id_test_line() -> String {
+    format!("        if ! codesign --verify -R='{TEAM_ID_REQ}' \"$app\"; then")
+}
+
+/// The recipe's #392 warning line, exactly as the justfile holds it.
+fn warning_line() -> String {
+    "            echo 'warning: the bundle is not signed by an Apple Development or Developer ID identity (or codesign could not confirm it) -- the Keychain prompts on every new build (#392); sign with such an identity' >&2".to_string()
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -215,8 +231,8 @@ fn a_missing_apple_anchor_test_in_the_bundle_recipe_is_refused() {
     replace_in(
         dir.path(),
         "justfile",
-        "if ! codesign --verify -R='anchor apple generic' \"$app\"; then",
-        "if false; then",
+        &team_id_test_line(),
+        "        if false; then",
     );
     expect_failure(dir.path(), "Apple-issued anchor");
 }
@@ -242,4 +258,73 @@ fn a_committed_apple_identity_value_in_the_justfile_is_refused() {
         "# identity: Apple Development: Jane Roe (ABCDE12345)",
     );
     expect_failure(dir.path(), "Apple Development:");
+}
+
+#[test]
+fn a_commented_out_team_id_test_is_refused() {
+    let dir = temp_copy();
+    replace_in(
+        dir.path(),
+        "justfile",
+        "        if ! codesign --verify -R=",
+        "        # if ! codesign --verify -R=",
+    );
+    expect_failure(dir.path(), "Apple-issued anchor");
+}
+
+#[test]
+fn a_team_id_test_moved_to_the_unsigned_branch_is_refused() {
+    let dir = temp_copy();
+    let block = format!("{}\n{}\n        fi\n", team_id_test_line(), warning_line());
+    replace_in(dir.path(), "justfile", &block, "");
+    replace_in(
+        dir.path(),
+        "justfile",
+        "        npm run bundle\n    fi\n",
+        &format!("{block}        npm run bundle\n    fi\n"),
+    );
+    expect_failure(dir.path(), "Apple-issued anchor");
+}
+
+#[test]
+fn the_392_warning_moved_out_of_the_team_id_test_is_refused() {
+    let dir = temp_copy();
+    let warning = warning_line();
+    replace_in(dir.path(), "justfile", &warning, "");
+    replace_in(
+        dir.path(),
+        "justfile",
+        "        codesign -dvv \"$app\"",
+        &format!("{warning}\n        codesign -dvv \"$app\""),
+    );
+    expect_failure(dir.path(), "is not inside its");
+}
+
+#[test]
+fn a_requirement_without_the_team_id_leaf_oids_is_refused() {
+    let dir = temp_copy();
+    replace_in(dir.path(), "justfile", TEAM_ID_REQ, "anchor apple generic");
+    expect_failure(dir.path(), "team-ID leaf OIDs");
+}
+
+#[test]
+fn an_identity_class_as_code_in_the_bundle_recipe_is_refused() {
+    let dir = temp_copy();
+    replace_in(
+        dir.path(),
+        "justfile",
+        "        APPLE_SIGNING_IDENTITY=\"$PULSE_SIGNING_IDENTITY\" npm run bundle",
+        "        PULSE_SIGNING_IDENTITY=\"Apple Development\"\n        \
+         APPLE_SIGNING_IDENTITY=\"$PULSE_SIGNING_IDENTITY\" npm run bundle",
+    );
+    expect_failure(dir.path(), "as code");
+}
+
+#[test]
+fn an_identity_class_in_package_json_is_refused() {
+    let dir = temp_copy();
+    edit_json(dir.path(), "package.json", |package| {
+        package["pinnedIdentity"] = serde_json::json!("Apple Development");
+    });
+    expect_failure(dir.path(), "names the identity class");
 }
