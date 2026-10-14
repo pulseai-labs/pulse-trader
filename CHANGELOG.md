@@ -394,6 +394,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Library version tree shows every node's provenance line again, and an agent version's
+  hypothesis subline with it (#404, d37).** r4.s5.w3's one-line ellipsis rule on `.vnode-provenance`
+  gave the line `overflow: hidden`, and a flex item with non-visible overflow gets an automatic minimum
+  of 0 — so inside the fixed 64px node, whose `.vnode-summary` still held the mock's 30px two-line
+  reserve and whose `.vnode-hypothesis` was already clamped, both lines shrank to zero height and every
+  node showed only its name and summary line. The node is now as tall as its own lines: `NODE_H` 94px,
+  and 128px when the version carries a hypothesis subline, whose two clamped lines render in full. A
+  row's pitch is its tallest node plus the 14px the old fixed 78px pitch left, the edges anchor at each
+  node's own centre and the canvas follows the rows; the summary's min-height reserve is gone, the head
+  is pinned to ONE nowrap row (a crowded pin + certification chip + delta head used to wrap its delta
+  onto a second line, 14px taller than the layout measured), and `flex-shrink: 0` keeps the provenance
+  and hypothesis lines at their own height. jsdom performs no layout, so `LibraryScreen.test.tsx` grew
+  a source-reading geometry guard: it reads the node's height constants, its line rules and the tokens
+  they resolve through, and fails on the old 64px node (a plain node needs 105.15px) or on either line
+  losing its `flex-shrink: 0`. The node is also as WIDE as its widest line now: the first cut kept the
+  134px node, and in the Mac proof's face (SF Mono / Menlo, 0.6em ≈ 6.6px at 11px) a 33-character
+  `external_agent · <agent name>` label ellipsized to `external_agent…` and the KPI row wrapped its
+  `R` unit and trade count onto a second line, which pushed the summary out of the node — so `NODE_W`
+  is 256px (with its 24px column gap), the kpis row is one nowrap inline flow that ellipsizes at its
+  end instead of wrapping, the summary keeps its own height, and the tree's width maths stops at the
+  rightmost node's edge (a two-version tree needs no scrollbar; a deeper one scrolls horizontally).
+  The guard grew the width budget with it: at 0.6em per mono character — each rule's own font size
+  read, the undefined `--fs-10` inheriting honestly — the 33-character label and a worst-case KPI
+  string must fit the node's content box, and the kpis row may never wrap.
+
 - **The Library, Backtest Lab and Designer defects the r3/r4 walks filed (r4.s5.w3).** A version's
   runs are reachable and legible again. Backtest Lab grows a **Runs** block beside the picker: the
   version's own backtests and its latest walk-forward run, each row opening the persisted run it

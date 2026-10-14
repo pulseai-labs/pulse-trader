@@ -1028,3 +1028,328 @@ describe("LibraryScreen (#325 — the hypothesis subline survives a long label)"
     expect((node.querySelector(".vnode-summary")?.textContent ?? "").length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #404 (d37) — every line the node renders must fit the height it is given
+// ---------------------------------------------------------------------------
+//
+// jsdom performs no layout, so the tests above pass with the regression in
+// place: `.vnode-provenance` (and the already-clipped `.vnode-hypothesis`)
+// shrink to zero height and nothing in the DOM notices. This guard therefore
+// reads the SOURCES back the way `../format/no-float-money.test.ts` and
+// `../styles/backtest.test.ts` do — the node height constants from
+// `LibraryScreen.tsx`, the line rules from `library.css`/`shared.css` (the
+// certification chip's shared `.cbadge` from `paper.css`) and the tokens they
+// resolve through — and does the arithmetic a browser would:
+//
+//   1. head + provenance + [2-line hypothesis] + summary + kpis + the column's
+//      gaps + the node's padding and border, per shape, must fit inside the
+//      height that shape is given (NODE_H; the taller NODE_H_AGENT when the
+//      source declares one for a hypothesis version);
+//   2. `.vnode-provenance` and `.vnode-hypothesis` carry `flex-shrink: 0`: a
+//      flex item with non-visible overflow gets an automatic minimum of 0,
+//      which is exactly how #404 zeroed these lines while `.vnode-summary`'s
+//      30px min-height held the 64px box.
+//
+// Re-read this guard when a node line, a font size or a node height changes:
+// it pins numbers, and a failure here means the numbers, not the CSS, moved.
+
+/** The Node runtime vitest always runs on: this toolchain ships no
+ * `@types/node`, so the global is claimed through one named cast. */
+interface NodeRuntime {
+  process: { cwd(): string; getBuiltinModule(id: string): unknown };
+}
+const nodeGlobal = globalThis as unknown as NodeRuntime;
+const nodeRuntime = nodeGlobal.process;
+
+/** The minimum `fs` surface this guard needs. */
+interface FsLike {
+  readFileSync(path: string, encoding: "utf8"): string;
+}
+
+const fs = nodeRuntime.getBuiltinModule("node:fs") as FsLike;
+
+/** A source file under `ui/src/`, from the repo root vitest runs in. */
+function source(relativePath: string): string {
+  return fs.readFileSync(`${nodeRuntime.cwd()}/ui/src/${relativePath}`, "utf8");
+}
+
+const LIBRARY_SCREEN = source("screens/LibraryScreen.tsx");
+const LIBRARY_CSS = source("styles/library.css");
+const SHARED_CSS = source("styles/shared.css");
+const PAPER_CSS = source("styles/paper.css");
+
+/** Every `--token: value;` first declaration in `tokens.css` — the `:root`
+ * values, not a later theme scope's. */
+function tokenTable(tokensCss: string): Record<string, string | undefined> {
+  const tokens: Record<string, string | undefined> = {};
+  for (const match of tokensCss.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+    if (Object.hasOwn(tokens, match[1])) continue;
+    tokens[match[1]] = match[2].trim();
+  }
+  return tokens;
+}
+
+const TOKEN_VALUES = tokenTable(source("styles/tokens.css"));
+
+/** The body of the rule whose selector is exactly `selector` — brace-balanced
+ * and COMMENT-STRIPPED (so a selector named in a comment cannot satisfy the
+ * read), or null when no rule starts with it. Anchored at a rule boundary
+ * (`^` or a preceding `}`) so `.kpi-sep` cannot be satisfied by the
+ * `.vnode-kpis .kpi-sep` rule that follows it. */
+function blockOf(css: string, selector: string): string | null {
+  const stripped = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = stripped.match(new RegExp(`(?:^|\\})\\s*${escaped}\\s*\\{`));
+  if (match === null || match.index === undefined) return null;
+  const open = match.index + match[0].length;
+  let depth = 1;
+  for (let i = open; i < stripped.length; i++) {
+    if (stripped[i] === "{") depth++;
+    else if (stripped[i] === "}") {
+      depth--;
+      if (depth === 0) return stripped.slice(open, i);
+    }
+  }
+  return null;
+}
+
+/** The block this guard cannot do without; a renamed selector is a failure
+ * with its own name, never an assertion over `null`. */
+function requiredBlock(css: string, selector: string): string {
+  const body = blockOf(css, selector);
+  if (body === null) {
+    throw new Error(`${selector} is not in the stylesheet — re-read this guard`);
+  }
+  return body;
+}
+
+/** A `property: value;` declaration inside a block, or null. */
+function decl(body: string | null, property: string): string | null {
+  if (body === null) return null;
+  const match = body.match(new RegExp(`(?:^|[;{])\\s*${property}\\s*:\\s*([^;]+);`));
+  return match === null ? null : match[1].trim();
+}
+
+/** The first number a CSS value holds, or null when it holds none. Read with a
+ * regex rather than `parseFloat` — this file sits inside the no-float guard's
+ * screens scan (`../format/no-float-money.test.ts`), and a CSS length is not
+ * one of the rendered figures that guard's rule protects. */
+function numberIn(value: string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const found = value.match(/-?\d+(?:\.\d+)?/);
+  return found === null ? null : +found[0];
+}
+
+/** A CSS value's px/number, with `var(--token)` resolved through `tokens.css`
+ * — or null when the value names no number at all. A `var(--token)` that no
+ * sheet defines makes the whole declaration invalid at computed-value time, so
+ * the property keeps the value it would inherit instead (`.vnode-pin`,
+ * `.vnode-cert` and `.vnode-delta` all ask for an undefined `--fs-10`).
+ * `numberIn` reads the TOP component of a shorthand (`8px 12px` → 8, `1px
+ * solid …` → 1) — the only component the node's vertical geometry uses. */
+function lengthOf(value: string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  return numberIn(
+    value.replace(/var\((--[a-z0-9-]+)\)/g, (_, name: string) => TOKEN_VALUES[name] ?? ""),
+  );
+}
+
+/** A mandatory length (the node's chrome, a token): a declaration the rule no
+ * longer makes fails with its own name, never a parse of "". */
+function requiredLength(value: string | null | undefined, where: string): number {
+  const parsed = lengthOf(value);
+  if (parsed === null) throw new Error(`${where} is missing a length — re-read this guard`);
+  return parsed;
+}
+
+/** The horizontal component of a box shorthand (`8px 12px` → 12, a single
+ * value → itself) — the side the width budget needs and the vertical model
+ * ignores. */
+function horizontalLengthOf(value: string | null | undefined, where: string): number {
+  const parts = value?.split(/\s+/) ?? [];
+  const parsed = lengthOf(parts.length > 1 ? parts[1] : parts[0]);
+  if (parsed === null) throw new Error(`${where} is missing a length — re-read this guard`);
+  return parsed;
+}
+
+/** One rule's own line box: font-size × line-height — each its own when the
+ * declaration computes, else the value inherited into it — plus the rule's own
+ * vertical padding and border where it declares them (the certification badge
+ * does). */
+function lineBox(
+  css: string,
+  selector: string,
+  inheritedFontSize: number,
+  inheritedLineHeight: number,
+): number {
+  const rule = requiredBlock(css, selector);
+  const fontSize = lengthOf(decl(rule, "font-size")) ?? inheritedFontSize;
+  const lineHeight = lengthOf(decl(rule, "line-height")) ?? inheritedLineHeight;
+  const vertical =
+    2 * (lengthOf(decl(rule, "padding")) ?? 0) + 2 * (lengthOf(decl(rule, "border")) ?? 0);
+  return fontSize * lineHeight + vertical;
+}
+
+/** A `const NAME = <digits>;` pixel constant from the screen source. */
+function declaredPixels(name: string): number | null {
+  const match = LIBRARY_SCREEN.match(new RegExp(`const ${name} = (\\d+);`));
+  return match === null ? null : +match[1];
+}
+
+/** The document's own font size and line-height, which `.vnode`'s
+ * `font: inherit` hands every rule below that declares neither — and what a
+ * `font-size: var(--fs-10)` (a token no sheet defines) falls back to. */
+const BODY_FONT_SIZE = requiredLength(TOKEN_VALUES["--fs-14"], "tokens.css --fs-14");
+const BODY_LINE_HEIGHT = requiredLength(TOKEN_VALUES["--lh-normal"], "tokens.css --lh-normal");
+
+describe("LibraryScreen (#404 — the version node's geometry)", () => {
+  it("fits every node shape's lines inside the height that shape is given (#404)", () => {
+    // The node's own constants: NODE_H for a plain version; NODE_H_AGENT for
+    // one whose hypothesis subline renders its two clamped lines. When the
+    // source declares no taller agent node, the hypothesis shape shares
+    // NODE_H — and must still fit it.
+    const plainHeight = declaredPixels("NODE_H");
+    if (plainHeight === null) throw new Error("LibraryScreen.tsx no longer declares NODE_H");
+    const agentHeight = declaredPixels("NODE_H_AGENT");
+    const hypothesisHeight = agentHeight ?? plainHeight;
+
+    // The column's chrome, off `.vnode` itself.
+    const vnode = requiredBlock(LIBRARY_CSS, ".vnode");
+    const verticalChrome =
+      2 * requiredLength(decl(vnode, "padding"), ".vnode padding") +
+      2 * requiredLength(decl(vnode, "border"), ".vnode border");
+    const gap = requiredLength(decl(vnode, "gap"), ".vnode gap");
+
+    // The lines, in VersionNode's own order. `.vnode`'s `font: inherit` hands
+    // them the document's own font size and line-height (body's 14px and
+    // --lh-normal); every rule below keeps them unless it declares its own.
+    const headLineHeight = requiredLength(
+      decl(requiredBlock(LIBRARY_CSS, ".vnode-head"), "line-height"),
+      ".vnode-head line-height",
+    );
+    // The certification chip is the shared `.cbadge` (paper.css) inside
+    // `.vnode-cert`'s own padding and border; both rules are read, so the
+    // head line cannot grow unnoticed. A chip is the head's tallest child.
+    const certChip = requiredBlock(LIBRARY_CSS, ".vnode-cert");
+    const chipLineHeight = lengthOf(decl(certChip, "line-height")) ?? headLineHeight;
+    const cert =
+      lineBox(PAPER_CSS, ".cbadge", BODY_FONT_SIZE, chipLineHeight) +
+      2 * (lengthOf(decl(certChip, "padding")) ?? 0) +
+      2 * (lengthOf(decl(certChip, "border")) ?? 0);
+    const head = Math.max(
+      lineBox(LIBRARY_CSS, ".vnode-name", BODY_FONT_SIZE, headLineHeight),
+      lineBox(LIBRARY_CSS, ".vnode-pin", BODY_FONT_SIZE, headLineHeight),
+      cert,
+      lineBox(LIBRARY_CSS, ".vnode-delta", BODY_FONT_SIZE, headLineHeight),
+    );
+    const provenance = lineBox(SHARED_CSS, ".vnode-provenance", BODY_FONT_SIZE, BODY_LINE_HEIGHT);
+    const hypothesisRule = requiredBlock(SHARED_CSS, ".vnode-hypothesis");
+    const clamp = numberIn(decl(hypothesisRule, "-webkit-line-clamp")) ?? 1;
+    const hypothesis =
+      lineBox(SHARED_CSS, ".vnode-hypothesis", BODY_FONT_SIZE, BODY_LINE_HEIGHT) * clamp;
+    const summaryRule = requiredBlock(LIBRARY_CSS, ".vnode-summary");
+    const summaryMinHeight = lengthOf(decl(summaryRule, "min-height"));
+    const summary = Math.max(
+      lineBox(LIBRARY_CSS, ".vnode-summary", BODY_FONT_SIZE, BODY_LINE_HEIGHT),
+      summaryMinHeight ?? 0,
+    );
+    const kpis = lineBox(LIBRARY_CSS, ".vnode-kpis", BODY_FONT_SIZE, BODY_LINE_HEIGHT);
+
+    const needed = (lines: readonly number[]): number =>
+      lines.reduce((sum, line) => sum + line, 0) + gap * (lines.length - 1) + verticalChrome;
+
+    // A plain node: head + provenance + summary + kpis...
+    // ...and an agent version adds the two-line hypothesis subline. Both clear
+    // their height by at least the 2px of sub-pixel slack this arithmetic
+    // cannot see (line boxes and the badge's own baseline).
+    expect(needed([head, provenance, summary, kpis])).toBeLessThanOrEqual(plainHeight - 2);
+    expect(needed([head, provenance, hypothesis, summary, kpis])).toBeLessThanOrEqual(
+      hypothesisHeight - 2,
+    );
+
+    // The head is read as ONE line per child; the row must not wrap (#404: a
+    // crowded head wrapped its delta onto a second line and grew by 14px).
+    expect(decl(requiredBlock(LIBRARY_CSS, ".vnode-head"), "white-space")).toBe("nowrap");
+  });
+
+  it("keeps the provenance and hypothesis lines from shrinking to zero (#404)", () => {
+    // #325 gave `.vnode-provenance` `overflow: hidden` for its ellipsis, and a
+    // flex item with non-visible overflow gets `min-height: 0` — so only
+    // `flex-shrink: 0` keeps these lines at their own height in a tight column.
+    expect(decl(requiredBlock(SHARED_CSS, ".vnode-provenance"), "flex-shrink")).toBe("0");
+    expect(decl(requiredBlock(SHARED_CSS, ".vnode-hypothesis"), "flex-shrink")).toBe("0");
+  });
+
+  it("is wide enough for its widest line, and never wraps one (#404 F1/F2)", () => {
+    // The mono advance is 0.6em: ~6.6px for these 11px lines. The Mac proof of
+    // 9cd7bea measured the shipped face that way (SF Mono, Menlo); the Linux
+    // fallback this suite runs against is narrower, which is why a green
+    // suite shipped a node whose KPI row wrapped on the Mac. Each rule's own
+    // font size is read honestly — one whose `font-size` names the undefined
+    // `--fs-10` inherits (14px), it is never assumed to be 11.
+    const charWidth = (fontSize: number): number => 0.6 * fontSize;
+    const fontSizeOf = (css: string, selector: string): number =>
+      lengthOf(decl(requiredBlock(css, selector), "font-size")) ?? BODY_FONT_SIZE;
+
+    const nodeWidth = declaredPixels("NODE_W");
+    if (nodeWidth === null) throw new Error("LibraryScreen.tsx no longer declares NODE_W");
+    const vnode = requiredBlock(LIBRARY_CSS, ".vnode");
+    const contentWidth =
+      nodeWidth -
+      2 * horizontalLengthOf(decl(vnode, "padding"), ".vnode padding") -
+      2 * requiredLength(decl(vnode, "border"), ".vnode border");
+
+    // F1 (#325 keeps it to ONE line): `external_agent · <agent name>` must
+    // READ for an agent name of 16 characters — 33 characters — not ellipsize
+    // to `external_agent…`.
+    const agentLabel = `external_agent · ${"x".repeat(16)}`;
+    expect(agentLabel.length * charWidth(fontSizeOf(SHARED_CSS, ".vnode-provenance"))).toBeLessThanOrEqual(
+      contentWidth,
+    );
+
+    // F2: the widest KPI row the ring's formatters can hand a node — a signed
+    // four-digit expectancy with its R unit, a full win rate, a five-digit
+    // trade count — plus the separators' own spacing, on ONE line.
+    const kpiProbe = "-1234.56 R · 100.0% · 12345t";
+    const separator = requiredLength(
+      decl(requiredBlock(LIBRARY_CSS, ".vnode-kpis .kpi-sep"), "margin-inline"),
+      ".vnode-kpis .kpi-sep margin-inline",
+    );
+    expect(
+      kpiProbe.length * charWidth(fontSizeOf(LIBRARY_CSS, ".vnode-kpis")) + 2 * 2 * separator,
+    ).toBeLessThanOrEqual(contentWidth);
+
+    // The kpis row and the summary ellipsize at their end, never wrap onto a
+    // second line (the wrap is what pushed the summary out of the node).
+    for (const [css, selector] of [
+      [LIBRARY_CSS, ".vnode-summary"],
+      [LIBRARY_CSS, ".vnode-kpis"],
+      [SHARED_CSS, ".vnode-provenance"],
+    ] as const) {
+      expect(decl(requiredBlock(css, selector), "white-space")).toBe("nowrap");
+    }
+    const kpis = requiredBlock(LIBRARY_CSS, ".vnode-kpis");
+    expect(decl(kpis, "overflow")).toBe("hidden");
+    expect(decl(kpis, "text-overflow")).toBe("ellipsis");
+
+    // ...and that spacing stays INSIDE the node: `.kpi-sep` is shared with the
+    // collapsed strategy card's `.cc-kpis` (a 6px flex gap), so the bare rule
+    // must not carry horizontal margin of its own.
+    const bareSeparator = requiredBlock(LIBRARY_CSS, ".kpi-sep");
+    expect(decl(bareSeparator, "margin-inline")).toBeNull();
+    expect(decl(bareSeparator, "margin")).toBeNull();
+
+    // ...and nothing in the column may be squeezed to fit: each line keeps its
+    // own height, and the hypothesis keeps its two clamped lines.
+    for (const [css, selector] of [
+      [LIBRARY_CSS, ".vnode-summary"],
+      [LIBRARY_CSS, ".vnode-kpis"],
+    ] as const) {
+      expect(decl(requiredBlock(css, selector), "flex-shrink")).toBe("0");
+    }
+    const hypothesis = requiredBlock(SHARED_CSS, ".vnode-hypothesis");
+    expect(numberIn(decl(hypothesis, "-webkit-line-clamp"))).toBe(2);
+    expect(decl(hypothesis, "overflow")).toBe("hidden");
+  });
+});

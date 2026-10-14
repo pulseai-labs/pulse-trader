@@ -219,6 +219,11 @@
   align-items: center;
   gap: 5px;
   line-height: 1;
+  /* #404 (d37): ONE line, always — a crowded head (pin + certification chip +
+     delta) used to wrap its delta onto a second line and grow the head to 28px
+     inside a node whose layout measured it at one. What does not fit is
+     clipped by the node's own `overflow`, never by wrapping. */
+  white-space: nowrap;
 }
 .vnode-name {
   font-family: var(--font-mono);
@@ -255,17 +260,32 @@
   white-space: nowrap;
   text-overflow: ellipsis;
   overflow: hidden;
-  min-height: 30px;
+  /* #404 (F2): the width budget above pays for this line, so it keeps its own
+     height even if a future line grows. */
+  flex-shrink: 0;
+  /* #404 (d37): no min-height reserve. The 30px came from the mock's TWO-line
+     clamp; this line has been a single ellipsized one since the port, and the
+     reserve starved the node's other lines. The node is now as tall as its
+     lines need (LibraryScreen.tsx NODE_H / NODE_H_AGENT). */
 }
 .vnode-kpis {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
   font-size: var(--fs-11);
   color: var(--text-2);
+  /* #404 (d37, F2): ONE line, always. As a flex row the items wrapped — the
+     `R` unit and the trade count fell onto a second line, which pushed the
+     summary out of the node — so the row is one inline flow now: nowrap, and
+     an end ellipsis rather than a wrap when the width budget is ever tight. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
 }
 .vnode-kpis .bull { color: var(--bull-1); font-weight: var(--fw-semibold); }
 .vnode-kpis .bear { color: var(--bear-1); font-weight: var(--fw-semibold); }
+/* The node row's own separation — it was the row's flex `gap`. Scoped: the
+   bare `.kpi-sep` is shared with the collapsed card's `.cc-kpis` (its own 6px
+   gap), so the margin must live on the node's row only. */
+.vnode-kpis .kpi-sep { margin-inline: 4px; }
 .kpi-sep { color: var(--text-4); }
 .cc-kpis .bull { color: var(--bull-1); font-weight: var(--fw-semibold); }
 .cc-kpis .bear { color: var(--bear-1); font-weight: var(--fw-semibold); }

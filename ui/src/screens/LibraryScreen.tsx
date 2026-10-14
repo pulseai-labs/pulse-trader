@@ -59,11 +59,25 @@ const DETAILS_PANE_ID = "details-pane";
 
 // Tree geometry (px) — proportions read from the design reference, authored
 // here rather than ported (`check-design-system.sh` forbids the port).
-const NODE_W = 134;
-const NODE_H = 64;
+// #404 (d37, F1/F2): the width is the node's widest line. Treated as a budget:
+// a 33-character `external_agent · <agent name>` label and the widest KPI row
+// the ring's formatters can hand a node, in the macOS mono face (0.6em ≈
+// 6.6px at these 11px lines — the Linux fallback is narrower, which is how a
+// green suite shipped a node whose KPI row wrapped on the Mac). 256px is 230px
+// of content box, ~5% above the label's 217.8px.
+const NODE_W = 256;
+// The node is as tall as its own lines: head, provenance, the summary and the
+// kpis in the plain shape, plus the two clamped hypothesis lines when the
+// version carries one. The old single 64px node fit neither shape.
+const NODE_H = 94;
+const NODE_H_AGENT = 128;
 const NODE_PAD = 8;
-const COL_W = 158;
-const ROW_H = 78;
+/** One column further right: the node plus the 24px the old 158px column left
+ * between two 134px nodes. */
+const COL_W = NODE_W + 24;
+/** Between stacked rows: what the old fixed 78px pitch left between two 64px
+ * nodes, now measured from each row's own tallest node (#404). */
+const ROW_GAP = 14;
 
 /** Which version the details pane is showing — the ids, not a payload object,
  * so a focus refetch re-renders the pane from the fresher `overview` (F5). */
@@ -304,10 +318,27 @@ function StrategyCard({
 // Version tree
 // ---------------------------------------------------------------------------
 
-/** A node's grid position, in tree-local pixels. */
+/** A node's grid position and box height, in tree-local pixels. */
 interface Placed {
   x: number;
   y: number;
+  /** The node's own height (#404) — the edges anchor at its centre. */
+  h: number;
+}
+
+/** A strategy's laid-out tree: where every node sits, and the canvas height the
+ * absolute placement needs. */
+interface TreeLayout {
+  placed: Map<string, Placed>;
+  /** The whole tree: the last row's top, its tallest node and the same
+   * NODE_PAD margin the first row leaves above itself. */
+  height: number;
+}
+
+/** The node's own height: a version with a hypothesis renders two more clamped
+ * lines (#404), so it gets the taller node rather than a clipped one. */
+function nodeHeight(version: LibraryVersion): number {
+  return version.hypothesis !== null ? NODE_H_AGENT : NODE_H;
 }
 
 /**
@@ -315,8 +346,12 @@ interface Placed {
  * rows (leaves in payload order, a parent at its first child's row) — the tidy
  * shape of the design reference. Roots (and versions whose parent is not in the
  * payload) start their own column-0 row, so nothing is ever dropped.
+ *
+ * A row's pitch is its TALLEST node plus ROW_GAP (#404): an agent version's
+ * hypothesis lines make it taller than its neighbours, and a pitch shared with
+ * them would let it overlap the row below.
  */
-function layoutTree(versions: readonly LibraryVersion[]): Map<string, Placed> {
+function layoutTree(versions: readonly LibraryVersion[]): TreeLayout {
   const ids = new Set(versions.map((v) => v.id));
   const children = new Map<string, string[]>();
   const roots: string[] = [];
@@ -331,30 +366,59 @@ function layoutTree(versions: readonly LibraryVersion[]): Map<string, Placed> {
   }
 
   const depthOf = new Map<string, number>();
-  const placed = new Map<string, Placed>();
+  const rowOf = new Map<string, number>();
   let rowCursor = 0;
 
   const place = (id: string, depth: number): number => {
     depthOf.set(id, depth);
     const kids = children.get(id) ?? [];
     if (kids.length === 0) {
-      const y = rowCursor * ROW_H;
-      placed.set(id, { x: depth * COL_W, y });
+      const row = rowCursor;
       rowCursor += 1;
-      return y;
+      rowOf.set(id, row);
+      return row;
     }
-    let top = Number.POSITIVE_INFINITY;
+    let row = Number.POSITIVE_INFINITY;
     for (const kid of kids) {
-      top = Math.min(top, place(kid, depth + 1));
+      row = Math.min(row, place(kid, depth + 1));
     }
-    placed.set(id, { x: depth * COL_W, y: top });
-    return top;
+    rowOf.set(id, row);
+    return row;
   };
 
   for (const root of roots) {
     place(root, 0);
   }
-  return placed;
+
+  const rowHeights = new Array<number>(rowCursor).fill(0);
+  for (const v of versions) {
+    const row = rowOf.get(v.id);
+    if (row === undefined) continue;
+    rowHeights[row] = Math.max(rowHeights[row], nodeHeight(v));
+  }
+  const rowTops: number[] = [];
+  let nextTop = 0;
+  for (const rowHeight of rowHeights) {
+    rowTops.push(nextTop);
+    nextTop += rowHeight + ROW_GAP;
+  }
+
+  const placed = new Map<string, Placed>();
+  for (const v of versions) {
+    const row = rowOf.get(v.id);
+    if (row === undefined) continue;
+    placed.set(v.id, {
+      x: (depthOf.get(v.id) ?? 0) * COL_W,
+      y: rowTops[row],
+      h: nodeHeight(v),
+    });
+  }
+
+  const lastRow = rowHeights.length - 1;
+  return {
+    placed,
+    height: lastRow < 0 ? 0 : rowTops[lastRow] + rowHeights[lastRow] + NODE_PAD * 2,
+  };
 }
 
 function VersionTree({
@@ -368,24 +432,22 @@ function VersionTree({
   onSelect: (version: LibraryVersion) => void;
   selectedId: string | null;
 }) {
-  const placed = useMemo(() => layoutTree(strategy.versions), [strategy]);
+  const layout = useMemo(() => layoutTree(strategy.versions), [strategy]);
 
-  const { edges, width, height } = useMemo(() => {
+  const { edges, width } = useMemo(() => {
     const edgeList: { key: string; d: string }[] = [];
     let maxDepth = 0;
-    let maxRow = 0;
     for (const v of strategy.versions) {
-      const node = placed.get(v.id);
+      const node = layout.placed.get(v.id);
       if (node === undefined) continue;
       maxDepth = Math.max(maxDepth, node.x / COL_W);
-      maxRow = Math.max(maxRow, node.y / ROW_H);
       if (v.parentId === null) continue;
-      const parent = placed.get(v.parentId);
+      const parent = layout.placed.get(v.parentId);
       if (parent === undefined) continue;
       const x1 = parent.x + NODE_W + NODE_PAD;
-      const y1 = parent.y + NODE_H / 2 + NODE_PAD;
+      const y1 = parent.y + parent.h / 2 + NODE_PAD;
       const x2 = node.x + NODE_PAD;
-      const y2 = node.y + NODE_H / 2 + NODE_PAD;
+      const y2 = node.y + node.h / 2 + NODE_PAD;
       const cx1 = x1 + (x2 - x1) * 0.5;
       const cx2 = x2 - (x2 - x1) * 0.5;
       edgeList.push({
@@ -395,10 +457,15 @@ function VersionTree({
     }
     return {
       edges: edgeList,
-      width: (maxDepth + 1) * COL_W + NODE_W + NODE_PAD * 2,
-      height: (maxRow + 1) * ROW_H + NODE_H + NODE_PAD * 2,
+      // The rightmost node's own right edge plus the same NODE_PAD margin the
+      // first column gets. The old formula reserved a whole extra column on
+      // top; with the wider node that slack alone would have put a scrollbar
+      // under every two-version tree (#404 F1/F2).
+      width: maxDepth * COL_W + NODE_W + NODE_PAD * 2,
     };
-  }, [placed, strategy.versions]);
+  }, [layout, strategy.versions]);
+
+  const height = layout.height;
 
   return (
     <div className="vtree-wrap" style={{ height }}>
@@ -415,7 +482,7 @@ function VersionTree({
         ))}
       </svg>
       {strategy.versions.map((v) => {
-        const node = placed.get(v.id);
+        const node = layout.placed.get(v.id);
         if (node === undefined) return null;
         return (
           <VersionNode
@@ -429,7 +496,7 @@ function VersionTree({
               left: node.x + NODE_PAD,
               top: node.y + NODE_PAD,
               width: NODE_W,
-              height: NODE_H,
+              height: node.h,
             }}
             onClick={() => onSelect(v)}
           />
