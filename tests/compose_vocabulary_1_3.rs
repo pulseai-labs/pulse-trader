@@ -401,7 +401,7 @@ async fn sr_breakout_journey_composes_the_worked_example_with_no_substitution() 
         "the journey composes the checked-in example exactly"
     );
     assert_eq!(version.dsl.schema_version, SchemaVersion::CURRENT);
-    assert_eq!(version.dsl_schema_version.to_string(), "1.3.0");
+    assert_eq!(version.dsl_schema_version.to_string(), "1.4.0");
 
     // The rendered entry line shows the zone-break form in trader language.
     let rendered = render::strategy(&version.dsl);

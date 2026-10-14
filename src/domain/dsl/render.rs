@@ -22,7 +22,7 @@ use super::exit::ExitRule;
 use super::risk::{Direction, RiskParams};
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
-use super::value::{IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
+use super::value::{CandlePatternName, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
 
 /// A [`StrategyDsl`] rendered to summary lines — the fields both wire DTOs
 /// carry (`DslSummary` wraps `entry` in a one-element `Vec`; the compact card
@@ -111,7 +111,8 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
         | IndicatorSpec::Body
         | IndicatorSpec::UpperWick
         | IndicatorSpec::LowerWick
-        | IndicatorSpec::Range => structure_indicator(spec),
+        | IndicatorSpec::Range
+        | IndicatorSpec::CandlePattern { .. } => structure_indicator(spec),
     }
 }
 
@@ -197,9 +198,34 @@ fn structure_indicator(spec: &IndicatorSpec) -> String {
             u32_leaf(left),
             u32_leaf(right)
         ),
+        // r5.s1.w1 (schema 1.4.0): the named candle patterns read in trader
+        // words — the shape's name, lowercase and spaced, so the summary line
+        // reads `engulfing` / `dark cloud cover` rather than the wire token.
+        IndicatorSpec::CandlePattern { pattern } => candle_pattern_word(*pattern).to_owned(),
         other => unreachable!(
             "indicator routes only the structure/pattern variants here, never {other:?}"
         ),
+    }
+}
+
+/// The trader words for a named candle pattern (schema 1.4.0, r5.s1.w1): the
+/// wire variant name, split into words and lowercased, so `DarkCloudCover`
+/// renders `dark cloud cover` and `Doji` renders `doji`.
+fn candle_pattern_word(pattern: CandlePatternName) -> &'static str {
+    match pattern {
+        CandlePatternName::Doji => "doji",
+        CandlePatternName::DragonflyDoji => "dragonfly doji",
+        CandlePatternName::GravestoneDoji => "gravestone doji",
+        CandlePatternName::Hammer => "hammer",
+        CandlePatternName::InvertedHammer => "inverted hammer",
+        CandlePatternName::HangingMan => "hanging man",
+        CandlePatternName::ShootingStar => "shooting star",
+        CandlePatternName::Marubozu => "marubozu",
+        CandlePatternName::SpinningTop => "spinning top",
+        CandlePatternName::Engulfing => "engulfing",
+        CandlePatternName::Harami => "harami",
+        CandlePatternName::Piercing => "piercing",
+        CandlePatternName::DarkCloudCover => "dark cloud cover",
     }
 }
 

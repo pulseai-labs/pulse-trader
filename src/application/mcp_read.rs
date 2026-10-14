@@ -694,6 +694,13 @@ mod tests {
             | IndicatorSpec::UpperWick
             | IndicatorSpec::LowerWick
             | IndicatorSpec::Range => panic!("the anatomy kinds take no period"),
+            // r5.s1.w1 (schema 1.4.0): the named candle patterns take no period
+            // either. The `cdl:<name>` read-path token is r5.s1.w3's, so this
+            // CLI parser cannot build one yet — the arm exists to keep the
+            // match exhaustive.
+            IndicatorSpec::CandlePattern { .. } => {
+                panic!("the candle-pattern kinds take no period")
+            }
         }
     }
 

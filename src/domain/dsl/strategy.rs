@@ -216,7 +216,7 @@ mod prop_tests {
     use crate::domain::dsl::schema_version::SchemaVersion;
     use crate::domain::dsl::sweepable::SweepableValue;
     use crate::domain::dsl::value::{
-        ArithOp, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
+        ArithOp, CandlePatternName, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -384,6 +384,71 @@ mod prop_tests {
                     }
                 })
                 .boxed(),
+            // r5.s1.w1 (schema 1.4.0): the named candle patterns, in their own
+            // generator so this one stays readable as the catalog grows (the
+            // comment above the structure arm's own split).
+            arb_candle_pattern_indicator_spec(),
+        ]
+    }
+
+    /// The schema-1.4.0 named candle patterns (r5.s1.w1): parameterless like the
+    /// anatomy variants, so one `Just` arm per pattern of this item. The four
+    /// three-bar patterns (`MorningStar`, `EveningStar`, `ThreeWhiteSoldiers`,
+    /// `ThreeBlackCrows`) are r5.s1.w2's, additively.
+    fn arb_candle_pattern_indicator_spec() -> impl Strategy<Value = IndicatorSpec> {
+        prop_oneof![
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Doji,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::DragonflyDoji,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::GravestoneDoji,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Hammer,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::InvertedHammer,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::HangingMan,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ShootingStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Marubozu,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::SpinningTop,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Engulfing,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Harami,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Piercing,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::DarkCloudCover,
+            })
+            .boxed(),
         ]
     }
 

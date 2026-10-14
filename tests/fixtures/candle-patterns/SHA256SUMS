@@ -1,0 +1,5 @@
+eae8b1ee60931157750d9be8b3b9476d922217eaf27b00f033dc0ed41aab261d  tests/fixtures/candle-patterns/talib-reference-15m.csv
+6c3d5e3dec474e28cb44e95d93942b5d405001931d48468c8d57fa0824ee8376  tests/fixtures/candle-patterns/talib-reference-4h.csv
+123eb501353d52b75b1081747c7370a295b77f35bb874e717e1af76d91193f7a  tests/fixtures/candle-patterns/talib-synthetic-CDL3BLACKCROWS.csv
+4554ca581989268bb289ea8bd848bb091149bc59037430aa10119add878217e6  tests/fixtures/candle-patterns/talib-synthetic-CDLDARKCLOUDCOVER.csv
+30d2b93dcd50ea3c8cdebbe961c0281442c3c8d6222c3dccaf01b175be5b8cf6  tests/fixtures/candle-patterns/talib-synthetic-CDLPIERCING.csv

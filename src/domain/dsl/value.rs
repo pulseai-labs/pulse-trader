@@ -78,6 +78,54 @@ pub enum MacdOutput {
     Histogram,
 }
 
+/// A named candlestick pattern (schema **1.4.0**, r5.s1.w1) — the 13 one- and
+/// two-bar patterns of TA-Lib's catalog, by TA-Lib's own name with the `CDL`
+/// prefix dropped.
+///
+/// Serialized by **variant name**, like every other enum in this file
+/// ([`PriceField`] writes `"Close"`, and the [`IndicatorSpec::CandlePattern`]
+/// tag itself writes `"CandlePattern"`): the wire form is
+/// `{"indicator":"CandlePattern","pattern":"Engulfing"}`. There is deliberately
+/// no `#[serde(rename_all)]` here — the read path's `snake_case` tokens are a
+/// separate vocabulary (w3's), and this enum is the document's spelling.
+///
+/// The four three-bar patterns (`MorningStar`, `EveningStar`,
+/// `ThreeWhiteSoldiers`, `ThreeBlackCrows`) land in r5.s1.w2 as additive values
+/// inside 1.4.0, on the same candle ring this item builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum CandlePatternName {
+    /// `CDLDOJI` — a bar whose body is at most 10% of the recent mean range.
+    Doji,
+    /// `CDLDRAGONFLYDOJI` — a doji with a long lower shadow and almost no upper.
+    DragonflyDoji,
+    /// `CDLGRAVESTONEDOJI` — a doji with a long upper shadow and almost no lower.
+    GravestoneDoji,
+    /// `CDLHAMMER` — a small body with a long lower shadow at or under the prior low.
+    Hammer,
+    /// `CDLINVERTEDHAMMER` — a small body with a long upper shadow, gapping down.
+    InvertedHammer,
+    /// `CDLHANGINGMAN` — the hammer's shape at or over the prior high.
+    HangingMan,
+    /// `CDLSHOOTINGSTAR` — the inverted hammer's shape, gapping up.
+    ShootingStar,
+    /// `CDLMARUBOZU` — a long body with no shadows; the sign is the bar's colour.
+    Marubozu,
+    /// `CDLSPINNINGTOP` — a small body with shadows longer than it on both sides.
+    SpinningTop,
+    /// `CDLENGULFING` — bar t's body covers bar t-1's; ±100, or ±80 when a body
+    /// end coincides.
+    Engulfing,
+    /// `CDLHARAMI` — a long body followed by a short one inside it; ±100, or ±80
+    /// when an end touches.
+    Harami,
+    /// `CDLPIERCING` — a white bar closing above the midpoint of a prior long
+    /// black body, opening below its low.
+    Piercing,
+    /// `CDLDARKCLOUDCOVER` — a black bar closing below the midpoint of a prior
+    /// long white body, opening above its high.
+    DarkCloudCover,
+}
+
 /// A typed reference to a technical indicator and its parameters.
 ///
 /// Internally-tagged (`#[serde(tag = "indicator")]`) with **all struct
@@ -273,6 +321,28 @@ pub enum IndicatorSpec {
         left: SweepableValue<u32>,
         /// Bars the pivot must be at least equal to on its right.
         right: SweepableValue<u32>,
+    },
+    /// A named candlestick pattern's own signal (schema **1.4.0**, r5.s1.w1) —
+    /// **TA-Lib's integer**: `+100` bullish, `-100` bearish, `0` no pattern,
+    /// and `±80` for the partial forms of [`CandlePatternName::Engulfing`] and
+    /// [`CandlePatternName::Harami`], where one body end coincides with the
+    /// prior body's edge.
+    ///
+    /// The value is defined on **every** bar from the pattern's lookback on —
+    /// it never returns "no value" after warm-up, unlike the level/pattern
+    /// variants above. A rule reads it through the existing comparisons:
+    /// `Compare(CandlePattern{Engulfing}, Gt, 0)` for "a bullish engulfing
+    /// fired", `Eq 100` for "the full bullish form". No boolean type and no
+    /// `Condition` kind is added (grill Q1): TA-Lib's convention is a scalar,
+    /// and the ADR-0024 addendum records that this variant answers the 1.3.0
+    /// addendum's revisit trigger.
+    ///
+    /// The variant takes no parameter: TA-Lib's default candle settings and
+    /// penetrations are fixed in 1.4.0. Making them sweepable is additive and
+    /// deliberately out of scope.
+    CandlePattern {
+        /// Which pattern to evaluate.
+        pattern: CandlePatternName,
     },
 }
 
