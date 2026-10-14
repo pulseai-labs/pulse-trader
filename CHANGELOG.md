@@ -394,6 +394,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A self-signed `just bundle` now says so, and the Keychain prompt on every new signed Mac build has a
+  cause and a fix (#392).** Every new signed build asked for the login Keychain's password before it could
+  read `PulseTrader/server_app_token`, and the answer did not persist — even for the same build. The cause
+  is securityd's PARTITION check, not the item's ACL: keyring 3.6.3's `apple-native` store uses the
+  file-based login keychain, whose items carry a partition list beside the ACL, and
+  `ClientIdentification::partitionIdForProcess` partitions code signed by an Apple-issued certificate
+  (Apple Development / Developer ID) as `teamid:<team>` but anything else — the self-signed certificate the
+  build used — as `cdhash:<cdhash>`, which changes on every build, so every new build failed the partition
+  check and prompted; no designated requirement can fix that. `just bundle` now tests the signed bundle
+  against securityd's own team-ID requirement — `developmentOrDevIDReq`, carried in the recipe verbatim: the
+  Developer ID CA with a Developer ID leaf, the WWDR CA with a Mac Development leaf (an Apple Development
+  certificate) or the WWDR CA with a Mac Distribution leaf — through the `-R='<text>'` form codesign reads
+  as literal requirement text (a bare `anchor apple generic` would accept ANY Apple-issued certificate,
+  and `-R '...'` without the `=` makes codesign read the text as a file path) after
+  `codesign --verify --strict`, prints the `Authority=` and `TeamIdentifier=` lines from `codesign -dvv`,
+  and, when that test fails, WARNS on stderr (the build does not fail) that the bundle is not signed by an
+  Apple Development or Developer ID identity — so the fix, signing with an Apple Development identity (a
+  free Apple ID personal team, made in Xcode) or a Developer ID identity, is visible in the build's own
+  output. The identity name still comes from `PULSE_SIGNING_IDENTITY` at build time; nothing about it is
+  committed.
+  One prompt remains: the first launch of the first team-signed build asks once ("Always Allow") for the
+  item whose partition list still names the old `cdhash:` partition — answering it adds the new one, and
+  later builds read the token silently. `scripts/check-signing-config.sh` binds to the recipe's code: the
+  team-ID test must be an uncommented `if ! codesign --verify -R=` line carrying the three team-ID leaf
+  OIDs, the #392 warning line must sit inside that test's `if` block on stderr, and the colon-less identity
+  CLASS names (`Apple Development`, `Developer ID Application`, …) are refused as code too — anywhere in
+  tauri.conf.json and package.json, and on every justfile line that is not a comment and not the #392
+  warning line — because `PULSE_SIGNING_IDENTITY="Apple Development"` selects a certificate just as a full
+  identity value does.
+
 - **The Library version tree shows every node's provenance line again, and an agent version's
   hypothesis subline with it (#404, d37).** r4.s5.w3's one-line ellipsis rule on `.vnode-provenance`
   gave the line `overflow: hidden`, and a flex item with non-visible overflow gets an automatic minimum

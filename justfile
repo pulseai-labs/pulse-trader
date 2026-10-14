@@ -479,12 +479,25 @@ prod-reset:
 #
 # Signed when PULSE_SIGNING_IDENTITY names a codesigning identity (r4.s3.w1: the
 # ONLY place the identity lives -- no certificate name, team id or identity value is
-# committed here; `scripts/check-signing-config.sh` enforces it). The recipe passes
-# it to the Tauri build as APPLE_SIGNING_IDENTITY, then verifies the bundle
-# (`codesign --verify --strict`) and prints the `Authority=` line. UNSIGNED with one
-# warning line when the variable is unset: an unsigned build gets a fresh ad-hoc
-# identity every time, so it cannot read back a Keychain item an earlier build wrote
-# (grill G6). Notarization and auto-update stay out of scope (ADR-0020).
+# committed here; `scripts/check-signing-config.sh` enforces it). The identity must be
+# ISSUED BY APPLE -- an Apple Development identity (a free Apple ID personal team,
+# made in Xcode) or a Developer ID identity (#392): securityd's partition ID is
+# `teamid:<team>` for an Apple-issued certificate and `cdhash:<cdhash>` for anything
+# else, and a self-signed certificate's cdhash changes on every build, so every new
+# self-signed build fails the Keychain item's partition check and prompts for the
+# login Keychain -- no designated requirement can fix that. The recipe passes the
+# identity to the Tauri build as APPLE_SIGNING_IDENTITY, then verifies the bundle
+# (`codesign --verify --strict`), tests it against securityd's own team-ID
+# requirement (`developmentOrDevIDReq`: the Developer ID CA / WWDR Mac Development /
+# WWDR Mac Distribution leaves -- a bare `anchor apple generic` accepts ANY
+# Apple-issued certificate, and a failure WARNS with the #392 line; it does not fail
+# the build) and prints the `Authority=` and `TeamIdentifier=` lines. The
+# requirement is handed to codesign in the `-R='<text>'` form on purpose: codesign
+# compiles an argument that begins with `=` as literal requirement text, while
+# `-R '...'` would be read as a FILE path and the test would fail for every identity.
+# UNSIGNED with one warning line when the variable is unset: an unsigned build gets a
+# fresh ad-hoc identity every time, so it cannot read back a Keychain item an earlier
+# build wrote (grill G6). Notarization and auto-update stay out of scope (ADR-0020).
 #
 # Deliberately NOT part of `just check`: it is a release build of the whole Tauri
 # graph (minutes, not seconds), and gating every local check run on it would make the
@@ -496,7 +509,18 @@ bundle:
         APPLE_SIGNING_IDENTITY="$PULSE_SIGNING_IDENTITY" npm run bundle
         app="target/release/bundle/macos/PulseTrader.app"
         codesign --verify --strict "$app"
-        codesign -dvv "$app" 2>&1 | grep '^Authority='
+        # #392: strict verification passes for a self-signed certificate too. The test
+        # below is securityd's own team-ID requirement (developmentOrDevIDReq): the
+        # Developer ID CA with a Developer ID leaf, the WWDR CA with a Mac Development
+        # leaf (an Apple Development certificate) or the WWDR CA with a Mac
+        # Distribution leaf. A bare anchor would accept ANY Apple-issued certificate; a
+        # self-signed one partitions as cdhash:<cdhash> under securityd, that hash
+        # changes on every build, and the login Keychain item is guarded by that
+        # partition -- so the operator sees a password prompt for every new build.
+        if ! codesign --verify -R='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] and certificate leaf[field.1.2.840.113635.100.6.1.12] or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] and certificate leaf[field.1.2.840.113635.100.6.1.7]' "$app"; then
+            echo 'warning: the bundle is not signed by an Apple Development or Developer ID identity (or codesign could not confirm it) -- the Keychain prompts on every new build (#392); sign with such an identity' >&2
+        fi
+        codesign -dvv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier)='
     else
         echo 'warning: PULSE_SIGNING_IDENTITY is unset -- building an UNSIGNED bundle; the app token will not survive a rebuild without a signed build' >&2
         npm run bundle
