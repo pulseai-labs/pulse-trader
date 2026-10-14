@@ -10,6 +10,16 @@
 # existence), so an edit that quietly commits an identity, drops the hardened
 # runtime or un-scopes the keyring feature reddens here.
 #
+# #392: the identity must also be ISSUED BY APPLE, not merely present. keyring's
+# `apple-native` store is the file-based login keychain, whose items carry a
+# securityd PARTITION LIST beside their ACL: an Apple-issued certificate (Apple
+# Development / Developer ID) partitions as `teamid:<team>` and any other -- a
+# self-signed one -- as `cdhash:<cdhash>`, which changes on every build, so every
+# new self-signed build fails the partition check and prompts for the Keychain.
+# The signed branch of `bundle` must therefore test the bundle against the
+# Apple-issued anchor and WARN (to stderr, the #392 wording; never fail the build)
+# when the test does not hold.
+#
 # Requires: python3 (json + re only — deliberately NOT tomllib, because the macOS CI
 # python3 can be older than 3.11). Exit 0 iff every check holds; exit 1 naming every
 # failure.
@@ -89,7 +99,17 @@ COMMIT_BANNED = [
     "teamId",
     "teamID",
     "TEAM_ID",
-    "Developer ID",
+    # #392: the bare text `Developer ID` is ALLOWED -- comments and warning lines
+    # name the identity CLASS ("an Apple Development or Developer ID identity"),
+    # which commits nothing. The identity VALUE forms are what must never appear:
+    # codesign prints an Apple-issued identity as `<prefix> <name> (<TEAMID>)`, so
+    # these prefixes (each carrying the certificate name and the team id) are the
+    # banned spellings.
+    "Developer ID Application:",
+    "Developer ID Installer:",
+    "Apple Development:",
+    "Apple Distribution:",
+    "Mac Developer:",
 ]
 for rel in ("tauri.conf.json", "justfile", "package.json"):
     text = text_of(rel)
@@ -102,14 +122,15 @@ for rel in ("tauri.conf.json", "justfile", "package.json"):
 
 # --- 5. the bundle recipe passes PULSE_SIGNING_IDENTITY through --------------
 justfile = text_of("justfile")
+bundle_body = None
 if justfile is not None:
     match = re.search(r"(?ms)^bundle:\s*\n((?:[ \t].*\n|\n)*)", justfile)
     if match is None:
         fail("the justfile has no `bundle:` recipe")
     else:
-        body = match.group(1)
+        bundle_body = match.group(1)
         for var in ("PULSE_SIGNING_IDENTITY", "APPLE_SIGNING_IDENTITY"):
-            if var not in body:
+            if var not in bundle_body:
                 fail(f"the `bundle` recipe does not pass {var} through -- a signed "
                      'build needs APPLE_SIGNING_IDENTITY="$PULSE_SIGNING_IDENTITY" '
                      "(the variable Tauri v2's bundler reads)")
@@ -147,6 +168,31 @@ if cargo_toml is not None:
         fail('no `[target.\'cfg(target_os = "macos")\'.dependencies]` keyring entry '
              "carries `apple-native` -- macOS would keep compiling the mock store "
              "and the Keychain would stay inert")
+
+# --- 7. the signed branch proves the identity is Apple-issued (#392) --------
+# `codesign --verify --strict` passes for a SELF-SIGNED certificate too -- the
+# signature is valid, only the issuer is not Apple -- so the signed branch must
+# also run a requirement test against the Apple-issued anchor (the canonical
+# `anchor apple generic` requirement, in the recipe, on the real bundle) and, when
+# that test fails, WARN on stderr with the #392 wording. A self-signed build warns;
+# it does not fail the build, so the guard is the recipe's own two lines, asserted
+# here.
+if bundle_body is not None:
+    if not re.search(r"codesign\s+--verify\s+-R=\S*anchor\s+apple\s+generic",
+                     bundle_body):
+        fail("the `bundle` recipe's signed branch does not verify the bundle "
+             "against the Apple-issued anchor (`codesign --verify "
+             "-R='anchor apple generic' \"$app\"`) -- a self-signed identity then "
+             "passes `codesign --verify --strict` as a signed build and the Keychain "
+             "prompts on every new build (#392)")
+    if not re.search(
+            r"(?m)^[ \t].*prompts on every new build \(#392\).*>&2[ \t]*$",
+            bundle_body):
+        fail("the `bundle` recipe's signed branch does not warn on stderr when the "
+             "anchor test fails -- an identity that is not issued by Apple makes "
+             "the Keychain prompt on every new build (#392); the warning line must "
+             "carry the literal `prompts on every new build (#392)` and end in "
+             "`>&2`")
 
 # --- report -----------------------------------------------------------------
 if failures:

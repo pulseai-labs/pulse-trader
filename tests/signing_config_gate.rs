@@ -208,3 +208,38 @@ fn apple_native_missing_is_refused() {
     );
     expect_failure(dir.path(), "apple-native");
 }
+
+#[test]
+fn a_missing_apple_anchor_test_in_the_bundle_recipe_is_refused() {
+    let dir = temp_copy();
+    replace_in(
+        dir.path(),
+        "justfile",
+        "if ! codesign --verify -R='anchor apple generic' \"$app\"; then",
+        "if false; then",
+    );
+    expect_failure(dir.path(), "Apple-issued anchor");
+}
+
+#[test]
+fn a_missing_392_warning_in_the_bundle_recipe_is_refused() {
+    let dir = temp_copy();
+    replace_in(
+        dir.path(),
+        "justfile",
+        "prompts on every new build (#392)",
+        "nothing to see here",
+    );
+    expect_failure(dir.path(), "does not warn on stderr");
+}
+
+#[test]
+fn a_committed_apple_identity_value_in_the_justfile_is_refused() {
+    let dir = temp_copy();
+    append_to(
+        dir.path(),
+        "justfile",
+        "# identity: Apple Development: Jane Roe (ABCDE12345)",
+    );
+    expect_failure(dir.path(), "Apple Development:");
+}
