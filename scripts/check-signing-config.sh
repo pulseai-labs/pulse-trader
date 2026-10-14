@@ -103,9 +103,11 @@ COMMIT_BANNED = [
     "teamId",
     "teamID",
     "TEAM_ID",
-    # #392: the bare text `Developer ID` is ALLOWED -- comments and warning lines
-    # name the identity CLASS ("an Apple Development or Developer ID identity"),
-    # which commits nothing. The identity VALUE forms are what must never appear:
+    # #392: the two-word text `Developer ID` is not itself an identity VALUE --
+    # comments and warning lines name the identity CLASS ("an Apple Development or
+    # Developer ID identity"), which commits nothing -- so it has no entry here; it IS
+    # a certificate selector in code, and IDENTITY_CLASS_NAMES bans it there. The
+    # identity VALUE forms are what must never appear anywhere:
     # codesign prints an Apple-issued identity as `<prefix> <name> (<TEAMID>)`, so
     # these prefixes (each carrying the certificate name and the team id) are the
     # banned spellings. `3rd Party Mac Developer` is verbatim, without the colon of
@@ -125,10 +127,13 @@ COMMIT_BANNED = [
 # tauri.conf.json and package.json, pure config with no comment to excuse them, they
 # are banned ANYWHERE; in the justfile they are banned on every line that is not a
 # comment and not the #392 warning line, whose text has to name the classes it talks
-# about.
+# about. The bare two-word `Developer ID` is on the list (Codex 4269177281): codesign
+# resolves an identity by common-name SUBSTRING, so `PULSE_SIGNING_IDENTITY="Developer
+# ID"` already selects a Developer ID certificate.
 IDENTITY_CLASS_NAMES = [
     "Developer ID Application",
     "Developer ID Installer",
+    "Developer ID",
     "Apple Development",
     "Apple Distribution",
     "Mac Developer",

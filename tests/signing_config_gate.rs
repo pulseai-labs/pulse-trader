@@ -328,3 +328,16 @@ fn an_identity_class_in_package_json_is_refused() {
     });
     expect_failure(dir.path(), "names the identity class");
 }
+
+#[test]
+fn the_bare_developer_id_class_as_code_is_refused() {
+    let dir = temp_copy();
+    replace_in(
+        dir.path(),
+        "justfile",
+        "        APPLE_SIGNING_IDENTITY=\"$PULSE_SIGNING_IDENTITY\" npm run bundle",
+        "        PULSE_SIGNING_IDENTITY=\"Developer ID\"\n        \
+         APPLE_SIGNING_IDENTITY=\"$PULSE_SIGNING_IDENTITY\" npm run bundle",
+    );
+    expect_failure(dir.path(), "`Developer ID` as code");
+}
