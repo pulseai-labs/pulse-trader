@@ -573,6 +573,16 @@ pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, class
 // curve on read via the SAME `EquityCurve::from_trades` constructor.
 pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 
+// r5.s4.w1 (PDR-0035): the streak and drawdown card's domain surface — the
+// seeded Monte Carlo's constants and value types and the pure `streak_card`
+// function. REQUIRED under `deny(warnings)` + `pub(crate) mod domain` — an
+// un-re-exported public domain type is a `dead_code` build error, not a warning.
+// The app-side wire shapes and core are re-exported beside the r4.s1.w5 block.
+pub use domain::{
+    ClosedTrade, DecimalPercentiles, FIXED_EQUITY_USDT, HORIZON_TRADES, MIN_CLOSED_TRADES, PATHS,
+    PERCENTILES, STREAK_CARD_SEED, StreakCard, StreakPercentiles, streak_card,
+};
+
 // VS-1.2.4 work-4.04: the persisted backtest-run system-of-record (FR-6 / FR-7 /
 // NFR-2). `BacktestRunRepository` is the create+read-only persistence port (the
 // #39 ownership-on-write / re-validate-on-read / scoped corrupt-isolation seam);
@@ -881,6 +891,13 @@ pub fn run() -> anyhow::Result<()> {
 pub use crate::tauri::{
     CertificationRecordDto, CertificationRecordsDto, CertificationRecordsRequest,
     CertificationSelectionDto, certification_records_core,
+};
+
+// r5.s4.w1 (PDR-0035): the streak and drawdown card's read contract — the wire
+// shapes and the transport-free core behind `POST /api/v1/streak-card` and the
+// `streak_card` bus command (ADR-0020: additive only).
+pub use crate::tauri::{
+    DecimalPercentilesDto, StreakCardDto, StreakCardRequest, StreakPercentilesDto, streak_card_core,
 };
 
 // r4.s1.w5 (spec A2/A3, G7/C1/C4/C5): the certification step and its record.

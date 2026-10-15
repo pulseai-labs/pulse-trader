@@ -26,6 +26,9 @@ mod regime;
 // NFR-2). Pure Decimal/usize folds over the already-final trade log + run totals;
 // oracle-excluded (README C3) so the frozen baseline stays frozen by construction.
 mod stats;
+// r5.s4.w1 (PDR-0035): the streak and drawdown card — a seeded Monte Carlo over
+// a run's own closed trades. Zero-I/O, `Decimal` and integer draws only.
+mod streak_card;
 // VS-1.2.4 work-4.04: the persisted backtest-run projection types (FR-6 / FR-7 /
 // NFR-2). `BacktestRunId`/`PersistedRun`/`RunSummary` are the typed read-back
 // projections of a persisted run (explicit columns per README C4, NOT a
@@ -54,6 +57,13 @@ pub use run::{
     SnapshotSelection,
 };
 pub use stats::{EquityCurve, EquityPoint, SummaryStats};
+// r5.s4.w1 (PDR-0035): the card's constants, value types and the pure card
+// function, re-exported so `domain/mod.rs` and `lib.rs` can curate them onto
+// the crate's public API.
+pub use streak_card::{
+    ClosedTrade, DecimalPercentiles, FIXED_EQUITY_USDT, HORIZON_TRADES, MIN_CLOSED_TRADES, PATHS,
+    PERCENTILES, STREAK_CARD_SEED, StreakCard, StreakPercentiles, streak_card,
+};
 pub use trade::{ExitReason, Fill, Trade, TradeSource};
 pub use walk_forward::{
     FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,

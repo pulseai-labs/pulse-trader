@@ -68,6 +68,7 @@ use super::library::{
     LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
     latest_run_summary, recent_run_summary, version_stats,
 };
+use super::streak_card::{StreakCardDto, StreakCardRequest};
 // r3.s4.w5: the paper session surface's shapes and stream channel.
 use super::paper::{
     PaperSessionSummary, PaperShadowResult, PaperStopResult, PaperStreamEvent, PaperTrades,
@@ -149,6 +150,8 @@ pub const BUS_COMMANDS: &[&str] = &[
     "paper_session_events",
     // r4.s1.w5: the app's full certification-record read (spec A4/C5).
     "certification_records",
+    // r5.s4.w1: the streak and drawdown card's read (PDR-0035 Q4).
+    "streak_card",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1782,6 +1785,26 @@ pub async fn certification_records(
     request: CertificationRecordsRequest,
 ) -> Result<CertificationRecordsDto, BusError> {
     state.post("/api/v1/certification-records", &request).await
+}
+
+/// `streak_card` — the losing streak and drawdown a normal bad run of one
+/// strategy version produces, computed by the engine from that version's
+/// latest full-span backtest run (r5.s4.w1, PDR-0035 Q4). The read the Promote
+/// sheet draws its card from.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`streak_card_core`]. An unknown version id is a
+/// `not_found` refusal, distinct from a version with no run yet (`noRun`).
+///
+/// [`streak_card_core`]: crate::tauri::streak_card::streak_card_core
+#[tauri::command]
+#[specta::specta]
+pub async fn streak_card(
+    state: tauri::State<'_, ClientState>,
+    request: StreakCardRequest,
+) -> Result<StreakCardDto, BusError> {
+    state.post("/api/v1/streak-card", &request).await
 }
 
 // ---------------------------------------------------------------------------

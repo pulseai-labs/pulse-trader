@@ -29,6 +29,7 @@ use super::ServerState;
 use super::auth::Scope;
 use super::ops;
 use crate::tauri::certification::certification_records_core;
+use crate::tauri::streak_card::streak_card_core;
 use crate::tauri::walk_forward::{get_backtest_run_core, get_walk_forward_run_core};
 
 // ---------------------------------------------------------------------------
@@ -97,6 +98,10 @@ pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum:
         // r4.s1.w5 (spec A4/C5): the app's full certification-record read.
         .mount_post_json(state, "/api/v1/certification-records", |state, request| {
             Box::pin(plain_certification_records(state, request))
+        })
+        // r5.s4.w1 (PDR-0035 Q4): the streak and drawdown card's read.
+        .mount_post_json(state, "/api/v1/streak-card", |state, request| {
+            Box::pin(plain_streak_card(state, request))
         })
         .mount_post_json(
             state,
@@ -320,6 +325,20 @@ async fn plain_certification_records(
     request: crate::tauri::CertificationRecordsRequest,
 ) -> Response {
     match certification_records_core(&state.desktop, request).await {
+        Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
+        Err(err) => ops::bus_422(&err),
+    }
+}
+
+/// `POST /api/v1/streak-card` — one version's streak and drawdown card,
+/// straight through the core (r5.s4.w1, PDR-0035 Q4). Mounted `Scope::App`: an
+/// `agent` token is a 403 `scope_refused` with an audit row, exactly like every
+/// other route on this table.
+async fn plain_streak_card(
+    state: Arc<ServerState>,
+    request: crate::tauri::StreakCardRequest,
+) -> Response {
+    match streak_card_core(&state.desktop, request).await {
         Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
         Err(err) => ops::bus_422(&err),
     }
