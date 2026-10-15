@@ -13,8 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ui/src/chart/`, the only place in the app that imports TradingView's Lightweight Charts
   (`5.2.1`, pinned exactly; its attribution logo stays on the chart). It opens on a pair and
   timeframe (BTCUSDT 4h) with no run, and `#/chart?run=<id>` — the link the Backtest Lab's run
-  detail now carries — opens it on a backtest: the run's candles, **every entry and exit** as
-  markers (winners in bull, losers in bear, an open trade in amber), and the rule's **S/R
+  detail now carries — opens it on a backtest: the run's candles, **every entry and exit in the
+  loaded window** as markers (winners in bull, losers in bear, an open trade in amber), and the rule's **S/R
   levels, pivots, candle patterns and EMA lines** exactly as `chart_data` returns them. Levels
   draw stepped and dashed from the engine's per-bar values, never from a later bar; a pivot's
   marker sits on its **confirmation** bar with a faint ghost on the bar it peaked `right` bars

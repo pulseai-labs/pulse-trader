@@ -452,6 +452,63 @@ describe("a leg over the cap before any chart read (CR1)", () => {
   });
 });
 
+describe("a switch to another run (CR3)", () => {
+  it("clears the previous run's chart and trades before the new run's context applies", async () => {
+    // run-old is an ordinary under-cap 4h leg, drawn with its own trade; run-new is a
+    // primary-only 15m run that is over the cap, so it starts by asking for a trade.
+    // Both runs carry a trade, at different entries — the rows must never be the other
+    // run's, and the chart must never keep the other run's candles.
+    vi.mocked(commands.getBacktestRun).mockImplementation((request) =>
+      Promise.resolve({
+        status: "ok",
+        data:
+          request.runId === "run-old"
+            ? runDto({ runId: "run-old", trades: [tradeRow({})] })
+            : runDto({
+                runId: "run-new",
+                primaryTimeframe: "15m",
+                htfTimeframe: null,
+                usesHtf: false,
+                trades: [
+                  tradeRow({
+                    entryFillTime: String(EARLIER_ENTRY),
+                    exitFillTime: String(EARLIER_ENTRY + DAY),
+                  }),
+                ],
+              }),
+      } as never),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ runId: "run-old", series: "htf" }) })),
+    );
+
+    await open("#/chart?run=run-old");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    const before = await screen.findByRole("table", { name: "Trades in the window" });
+    expect(within(before).getByText("2025-04-11 00:00 UTC")).toBeTruthy();
+
+    // The fragment names another run while the tab stays mounted.
+    window.location.hash = "#/chart?run=run-new";
+    fireEvent(window, new HashChangeEvent("hashchange"));
+
+    // The new run's own ask, its own rows — and none of the old run's.
+    expect(await screen.findByText(/Pick a trade to load 15m around it/)).toBeTruthy();
+    expect(screen.getByText("Backtest run run-new · 15m")).toBeTruthy();
+    // The previous run's drawing is gone, not kept under the new run's name.
+    expect(h.adapter.setCandles).toHaveBeenCalledTimes(2);
+    expect(h.adapter.setCandles).toHaveBeenLastCalledWith([]);
+    expect(h.adapter.setOverlays).toHaveBeenLastCalledWith([]);
+    expect(h.adapter.setTrades).toHaveBeenLastCalledWith([]);
+    expect(h.adapter.fitAll).toHaveBeenCalledTimes(1);
+    // The rows are run-new's own stored trades, and the table says so.
+    const after = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(after).queryByText("2025-04-11 00:00 UTC")).toBeNull();
+    expect(within(after).getByText("2025-03-27 00:00 UTC")).toBeTruthy();
+    // The old run's read is not repeated for the new run: it is over the cap.
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("the plain states", () => {
   it("names the withheld bars when the read was cut at a holdout", async () => {
     vi.mocked(commands.chartData).mockResolvedValue(

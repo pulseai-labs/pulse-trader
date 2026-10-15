@@ -158,6 +158,19 @@ export default function ChartScreen() {
   // The free selection, readable from the fragment effect without re-running it.
   const freeRef = useRef(free);
 
+  /** Take whatever is drawn off the canvas, and remember that nothing is. Nothing is
+   *  put back until the next read's own layers arrive: an empty chart is not a stale one
+   *  (PDR-0011). Called by any read that replaces the window, and by a run switch (CR3). */
+  const clearDrawing = (): void => {
+    const adapter = adapterRef.current;
+    if (adapter !== null && drawnRef.current) {
+      adapter.setCandles([]);
+      adapter.setOverlays([]);
+      adapter.setTrades([]);
+    }
+    drawnRef.current = false;
+  };
+
   // --- the chart's own life -------------------------------------------------
   useEffect(() => {
     const element = containerRef.current;
@@ -183,13 +196,24 @@ export default function ChartScreen() {
   }, []);
 
   useEffect(() => {
+    // A new run is a new chart. Everything the previous run left here — its context, its
+    // phase, its notice and its drawing — belongs to THAT run, and none of it is this
+    // one's (CR3): a trader who deep-links from one run to another must never see the
+    // previous run's candles or trades under the new run's name. This effect runs only
+    // when the FRAGMENT changes, so a leg switch inside one run clears nothing and w2's
+    // D4 stands: the window already drawn for that run stays drawn.
+    clearDrawing();
+    setRun(null);
+    setLeg("primary");
+    setAnchorMs(null);
+    setNotice(null);
     if (fragmentRun === null) {
-      setRun(null);
-      setLeg("primary");
-      setAnchorMs(null);
-      setRequest(requestFor(null, freeRef.current.pair, freeRef.current.timeframe, null));
+      const freeRequest = requestFor(null, freeRef.current.pair, freeRef.current.timeframe, null);
+      setPhase({ kind: "loading", what: loadingText(freeRequest) });
+      setRequest(freeRequest);
       return;
     }
+    setPhase({ kind: "loading", what: `Loading backtest run ${fragmentRun}…` });
     let cancelled = false;
     void (async () => {
       try {
@@ -220,7 +244,6 @@ export default function ChartScreen() {
   // --- the read itself ------------------------------------------------------
   useEffect(() => {
     if (request === null) return;
-    const adapter = adapterRef.current;
     // A leg over the cap with nothing selected is not read at all: the previous window
     // stays drawn and the notice says what to do about it. Sending a read the server
     // will refuse, only to render the refusal, would be worse than saying so.
@@ -229,12 +252,7 @@ export default function ChartScreen() {
       return;
     }
     setNotice(null);
-    if (drawnRef.current && adapter !== null) {
-      adapter.setCandles([]);
-      adapter.setOverlays([]);
-      adapter.setTrades([]);
-      drawnRef.current = false;
-    }
+    clearDrawing();
     setPhase({ kind: "loading", what: loadingText(request) });
     let cancelled = false;
     void (async () => {
@@ -263,7 +281,13 @@ export default function ChartScreen() {
   }, [request]);
 
   // --- draw what came back --------------------------------------------------
-  const dto = phase.kind === "ready" ? phase.dto : null;
+  // Only the run the fragment names is this tab's to draw: a DTO read for another run is
+  // not drawn, not listed and not centred on (CR3). The free chart's read carries no run
+  // layer and the tab names no run, so the two agree there. (A named-run read always
+  // answers with its run layer — the server maps a resolved run straight into it — so
+  // this compares like with like.)
+  const dto =
+    phase.kind === "ready" && (phase.dto.run?.runId ?? null) === fragmentRun ? phase.dto : null;
   useEffect(() => {
     const adapter = adapterRef.current;
     // An empty window draws nothing: the read that emptied the chart already cleared
