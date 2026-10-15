@@ -28,6 +28,11 @@
 //    endpoints is in the window, and a pivot's peak bar can be behind the window's first
 //    bar: the library maps a time it cannot place onto the nearest loaded CANDLE, which
 //    would mark a bar the trade or the pivot never touched.
+//  * **G3, on its own bar.** A marker that IS in the window carries the open of the loaded
+//    bar that CONTAINS it (the close review's CR4). The library's time-to-index lookup is a
+//    lower bound — the first loaded open at or after the time — so an exact interior time (a
+//    primary-timeframe fill on a higher-timeframe chart, an exit filing inside the last
+//    bar's period) would draw on the NEXT bar, not the one it happened in.
 
 import type { ChartCandleDto, ChartDataDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
 import { rMultiple } from "../format/numbers";
@@ -238,21 +243,55 @@ function barSeconds(candles: readonly Pick<CandlePoint, "time">[]): number {
   return bar;
 }
 
-/** The markers a loaded window may draw (the close review's CR2).
+/** The open of the loaded bar that contains `time`: the latest loaded bar open at or before
+ *  it. The candles ascend (the read returns them so), a time inside the loaded span always
+ *  has a containing bar, and a time that IS a bar open is its own bar's. */
+function containingOpen(
+  candles: readonly Pick<CandlePoint, "time">[],
+  time: number,
+): number {
+  let lo = 0;
+  let hi = candles.length - 1;
+  let at = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (candles[mid].time <= time) {
+      at = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return candles[at].time;
+}
+
+/** The markers a loaded window draws (the close review's CR2 and CR4).
  *
- *  A marker whose time is outside the loaded bars' own span is dropped here, before the
- *  library ever sees it: the library resolves every marker time against the candle series
- *  and snaps a time it cannot place onto the nearest loaded bar, which would draw a mark
- *  on the first or last candle instead of nowhere.
+ *  Two rules, in this order:
  *
- *  The span runs from the FIRST bar's open, inclusive, to the END of the last bar —
- *  its open plus one bar's own duration, exclusive. A time inside the range that is not
- *  itself a bar open (a primary-timeframe trade time on the higher-timeframe chart, or an
- *  exit filing inside the last loaded bar) is kept: the library's containing-bar mapping
- *  for it is the intended one, which is why this is a range test and not a membership
- *  test. A time at or past the last bar's end belongs to a bar the window does not hold
- *  and is dropped, so the snapping the clip exists for cannot come back. The table below
- *  the chart still carries every exact time and value, clipped or not (PDR-0011). */
+ *  1. CLIP (CR2). A marker whose time is outside the loaded bars' own span is dropped here,
+ *     before the library ever sees it: the library resolves every marker time against the
+ *     candle series and snaps a time it cannot place onto the nearest loaded bar, which
+ *     would draw a mark on the first or last candle instead of nowhere.
+ *
+ *     The span runs from the FIRST bar's open, inclusive, to the END of the last bar — its
+ *     open plus one bar's own duration, exclusive. A time at or past the last bar's end
+ *     belongs to a bar the window does not hold and is dropped, so the snapping the clip
+ *     exists for cannot come back.
+ *
+ *  2. PLACE (CR4). Every retained marker's time becomes the open of the loaded bar that
+ *     CONTAINS it — the latest loaded open at or before its own time. The library's
+ *     time-to-index lookup is a LOWER BOUND: the first loaded open at or after the time,
+ *     with a special case only past the last open. An exact interior time — a
+ *     primary-timeframe fill on an HTF chart, or an exit filing inside the last bar's
+ *     period — would therefore reach the NEXT loaded bar, not its own. A time that already
+ *     equals a loaded open (a pivot confirm or ghost, a pattern event, a fill on its own
+ *     timeframe's open) maps to itself: that open's lookup is its own bar, so placement is
+ *     the final candle the library picks, not an approximation of it. The list is re-sorted
+ *     ascending after placement, stably, so one bar's entry keeps its place before its exit.
+ *
+ *  The table below the chart still carries every exact time and value, clipped or not
+ *  (PDR-0011). */
 export function markersInWindow(
   markers: readonly ChartMarker[],
   candles: readonly Pick<CandlePoint, "time">[],
@@ -263,10 +302,19 @@ export function markersInWindow(
   const lastOpen = candles[candles.length - 1].time;
   const bar = barSeconds(candles);
   // A single loaded bar has no spacing to read: that bar's own open is the whole span.
-  if (bar === 0) return markers.filter((marker) => marker.time === open);
-  return markers.filter(
-    (marker) => marker.time >= open && marker.time < lastOpen + bar,
-  );
+  const kept =
+    bar === 0
+      ? markers.filter((marker) => marker.time === open)
+      : markers.filter((marker) => marker.time >= open && marker.time < lastOpen + bar);
+  // Placement can collapse several markers onto one bar, and equal times must keep their
+  // prior order (an entry before its exit), hence the stable sort on the retained index.
+  return kept
+    .map((marker, index) => ({
+      marker: { ...marker, time: containingOpen(candles, marker.time) },
+      index,
+    }))
+    .sort((a, b) => a.marker.time - b.marker.time || a.index - b.index)
+    .map((entry) => entry.marker);
 }
 
 /** Everything one chart read draws. */
@@ -276,7 +324,8 @@ export function buildLayers(dto: ChartDataDto, palette: ChartPalette): ChartLaye
   return {
     candles,
     overlays: toOverlayLayers(overlays, dto.candles, palette),
-    // The same clip the adapter draws by: a marker whose bar is not loaded draws nothing.
+    // The same clip and placement the adapter draws by: a marker whose bar is not loaded
+    // draws nothing, and every one whose bar is loaded draws on that bar.
     markers: markersInWindow(toMarkers(overlays, dto.run?.trades ?? [], palette), candles),
   };
 }

@@ -11,6 +11,9 @@
 //    candle series, because that is the only order the library accepts;
 //  * a marker whose time is outside the loaded candles is never handed over at all
 //    (the close review's CR2): the library would snap it onto a boundary candle;
+//  * a fill inside a loaded bar's own period is handed over at that bar's open (the close
+//    review's CR4): the library resolves an interior time to the NEXT loaded bar, not the
+//    one that contains it;
 //  * a second draw replaces the layer series instead of stacking a second copy on
 //    top of the first;
 //  * fit, centre and destroy reach the chart's own API.
@@ -94,6 +97,13 @@ const SPANNED_CANDLES: ChartCandleDto[] = [
   ...CANDLES,
   { t: "1735718400000", o: "93660.7", h: "94100", l: "93600.2", c: "94050", v: "6001.19" },
   { t: "1735747200000", o: "94050", h: "94500", l: "93900", c: "94380.4", v: "5102.7" },
+];
+
+/** Three 4h bars — 2025-01-01T00:00Z, 04:00Z and 08:00Z — so an in-bar fill has a wrong bar
+ *  it could be handed over for (CR4). */
+const THREE_BARS: ChartCandleDto[] = [
+  ...CANDLES,
+  { t: "1735718400000", o: "93660.7", h: "94100", l: "93600.2", c: "94050", v: "6001.19" },
 ];
 
 const TRADE: ChartTradeDto = {
@@ -235,7 +245,19 @@ describe("createChartAdapter", () => {
     expect(last[1]).toMatchObject({ color: "bull", text: "+2.00 R" });
   });
 
-  it("draws an exit inside the last loaded bar's own period, and nothing past its end", () => {
+  it("hands an in-bar trade's fills over at their containing bar's open (CR4)", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(THREE_BARS);
+    // 01:00Z entry, 02:00Z exit: primary-timeframe fills inside the 00:00–04:00 bar of this
+    // 4h chart. The library's time-to-index lookup is a lower bound, so 01:00Z alone would
+    // land on the 04:00Z bar; both times are handed over as 00:00Z, the containing bar's own
+    // open, which the library resolves to that bar.
+    adapter.setTrades([{ ...TRADE, entryTime: "1735693200000", exitTime: "1735696800000" }]);
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
+    expect(last.map((marker) => marker.time)).toEqual([1735689600, 1735689600]);
+  });
+
+  it("places an exit inside the last loaded bar's own period on that bar, and nothing past its end (CR4)", () => {
     const adapter = createChartAdapter(container());
     adapter.setCandles(CANDLES);
     adapter.setOverlays([
@@ -248,11 +270,12 @@ describe("createChartAdapter", () => {
       },
     ]);
     // 05:30Z is inside the last loaded bar's period — the run's final exit, on the 4h
-    // chart this walk shows — so it is drawn at its own time and lands on that bar.
+    // chart this walk shows — so it is placed on that bar: the library receives the bar's
+    // own open, 04:00Z, and draws it on the bar the exit happened in.
     adapter.setTrades([{ ...TRADE, entryTime: "1735689600000", exitTime: "1735709400000" }]);
 
     const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
-    expect(last.map((marker) => marker.time)).toEqual([1735689600, 1735689600, 1735709400]);
+    expect(last.map((marker) => marker.time)).toEqual([1735689600, 1735689600, 1735704000]);
     for (const [markers] of h.markersApi.setMarkers.mock.calls) {
       for (const marker of markers as { time: number }[]) {
         // Nothing at or past the end of the last loaded bar (04:00Z + one 4h bar).

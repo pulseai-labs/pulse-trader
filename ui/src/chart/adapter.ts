@@ -19,9 +19,11 @@
 //  * **The markers are one list.** Pivots, patterns and trades all ride the candle
 //    series through ONE `createSeriesMarkers` plugin, merged and time-sorted in
 //    `layers.ts` — the order the library requires and the only one it accepts. The list
-//    handed to the plugin holds only markers the loaded bars can hold (`markersInWindow`,
-//    the close review's CR2): the library places a marker by its time against the candle
-//    series and snaps a time it cannot place onto the first or last loaded candle.
+//    handed to the plugin holds only markers the loaded bars can hold, each carrying the
+//    open of the bar that contains it (`markersInWindow`, the close review's CR2 and CR4):
+//    the library places a marker by its time against the candle series, snapping a time it
+//    cannot place onto the first or last loaded candle and resolving an interior time to
+//    the NEXT loaded bar.
 //  * **The layers are redrawn, not stacked.** A new read removes the previous run's
 //    level and line series before creating its own; only the candle series, and the
 //    marker plugin hanging off it, outlive a read.
@@ -163,8 +165,9 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
   };
 
   /** Rebuild the merged marker list from the overlays and trades last handed in, and
-   *  hand the library ONLY the markers the loaded bars can hold (CR2): a marker time
-   *  the series cannot place is snapped onto the first or last loaded candle. */
+   *  hand the library ONLY the markers the loaded bars can hold, each on its containing
+   *  bar (CR2, CR4): a marker time the series cannot place is snapped onto the first or
+   *  last loaded candle, and a time inside a bar would otherwise resolve to the NEXT one. */
   const drawMarkers = (): void => {
     if (markerPlugin === null) return;
     markerPlugin.setMarkers(

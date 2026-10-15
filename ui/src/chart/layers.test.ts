@@ -12,6 +12,10 @@
 //  * winners are bull, losers bear, open trades amber (design §1.3);
 //  * a marker whose bar is not in the loaded window is not drawn at all (`markersInWindow`,
 //    the close review's CR2): the library would snap it onto the first or last loaded bar.
+//  * a marker whose bar IS in the window carries that bar's open (`markersInWindow`, the
+//    close review's CR4): the library resolves an interior time to the NEXT loaded bar —
+//    its lookup is the first open at or after the time — so an in-bar fill handed over with
+//    its exact time would draw on the bar AFTER the one it happened in.
 
 import { describe, expect, it } from "vitest";
 
@@ -39,6 +43,15 @@ function candles(): ChartCandleDto[] {
   return [
     { t: "1735689600000", o: "93548.8", h: "94449.2", l: "93460.2", c: "93810", v: "13962.019" },
     { t: "1735704000000", o: "93810", h: "93914.7", l: "93502", c: "93660.7", v: "7852.483" },
+  ];
+}
+
+/** The same series one bar longer — 2025-01-01T00:00Z, 04:00Z and 08:00Z — so an in-bar fill
+ *  has a wrong bar it could be placed on (CR4). */
+function threeCandles(): ChartCandleDto[] {
+  return [
+    ...candles(),
+    { t: "1735718400000", o: "93660.7", h: "94100", l: "93600.2", c: "94050", v: "6001.19" },
   ];
 }
 
@@ -270,10 +283,12 @@ describe("markersInWindow", () => {
     ]);
   });
 
-  it("keeps a primary-timeframe time that falls between two loaded higher-timeframe bars", () => {
-    // 2025-01-01T01:00Z on a 4h chart: not a bar open, but inside the loaded range, so
-    // the library maps it to its containing bar (04:00). That mapping is intended; the
-    // clip is only for times the loaded bars do not cover at all.
+  it("places a primary-timeframe time that falls between two loaded bars on its containing bar (CR4)", () => {
+    // 2025-01-01T01:00Z on a 4h chart: not a bar open, but inside the loaded range. Its
+    // containing bar is the 00:00Z–04:00Z bar, so its time becomes that bar's open. The
+    // library's own lookup is a lower bound — the first loaded open at or after 01:00Z is
+    // 04:00Z — so handing over 01:00Z would draw on the 04:00Z bar, not the one the trade
+    // happened in. That placement happens here, before the marker reaches the library.
     const trades: ChartTradeDto[] = [
       {
         side: "long",
@@ -286,7 +301,7 @@ describe("markersInWindow", () => {
       },
     ];
     expect(markersInWindow(toMarkers([], trades, PALETTE), loaded)).toEqual([
-      { time: 1735693200, position: "belowBar", shape: "arrowUp", color: "open" },
+      { time: 1735689600, position: "belowBar", shape: "arrowUp", color: "open" },
     ]);
   });
 
@@ -304,11 +319,10 @@ describe("markersInWindow", () => {
     ]);
   });
 
-  it("keeps an exit inside the last loaded bar's own period, and drops a time at its end", () => {
+  it("places an exit inside the last loaded bar's own period on that bar, and drops a time at its end (CR4)", () => {
     // The last loaded bar opens at 04:00Z and, as a 4h bar, owns everything up to 08:00Z.
-    // An exit that fills inside that period belongs to that bar — the library's
-    // containing-bar mapping places it there — while 08:00Z and later are the NEXT bar,
-    // which the window does not hold and where the library would snap back onto 04:00.
+    // An exit that fills at 05:30Z inside that period belongs to that bar, so its time
+    // becomes 04:00Z — the bar's own open, the one the library resolves to that bar.
     const trades: ChartTradeDto[] = [
       {
         side: "long",
@@ -322,18 +336,19 @@ describe("markersInWindow", () => {
     ];
     const markers = toMarkers([], trades, PALETTE);
     expect(markersInWindow(markers, loaded).map((marker) => marker.time)).toEqual([
-      1735689600, 1735709400,
+      1735689600, 1735704000,
     ]);
 
-    // The end of the last bar is exclusive: 08:00Z is the next bar's open, not this one's.
+    // The end of the last bar is exclusive: 08:00Z is the NEXT bar's open, not this one's.
+    // It is dropped, not placed — and the same for 09:00Z. Were either kept, it would
+    // project onto 04:00Z and this list would carry a third marker.
     const withNextBarTimes: ChartMarker[] = [
       ...markers,
       { time: 1735718400, position: "belowBar", shape: "circle", color: "bull" },
-      // 09:00Z — inside the next bar, well past it.
       { time: 1735722000, position: "belowBar", shape: "circle", color: "bull" },
     ];
     expect(markersInWindow(withNextBarTimes, loaded).map((marker) => marker.time)).toEqual([
-      1735689600, 1735709400,
+      1735689600, 1735704000,
     ]);
   });
 
@@ -402,5 +417,48 @@ describe("buildLayers", () => {
     expect(layers.markers).toEqual([
       { time: 1735704000, position: "belowBar", shape: "circle", color: "bull", text: "+2.00 R" },
     ]);
+  });
+
+  it("places an in-bar trade's entry and exit on their containing bar, keeping order and the table's exact times (CR4)", () => {
+    // A stored primary trade: 01:00Z entry, 02:00Z exit. The chart is 4h with loaded opens
+    // at 00:00Z, 04:00Z and 08:00Z, so both fills belong to the FIRST loaded bar. The
+    // library's lookup would put 01:00Z on 04:00Z (the first open at or after it); both
+    // markers must instead carry the containing bar's open — and the entry must stay
+    // before the exit, on that one bar.
+    const trade: ChartTradeDto = {
+      side: "long",
+      entryTime: "1735693200000",
+      entryPrice: "90000",
+      exitTime: "1735696800000",
+      exitPrice: "92000",
+      exitReason: "take_profit",
+      realizedR: "1",
+    };
+    const layers = buildLayers(
+      {
+        pair: "BTCUSDT",
+        timeframe: "4h",
+        dataVersion: "9a1dcf67cf4ea260",
+        candles: threeCandles(),
+        holdout: null,
+        run: {
+          runId: "run-1",
+          versionId: "v-1",
+          series: "htf",
+          trades: [trade],
+          overlays: [],
+          notDrawn: [],
+        },
+      },
+      PALETTE,
+    );
+    expect(layers.markers).toEqual([
+      { time: 1735689600, position: "belowBar", shape: "arrowUp", color: "bull" },
+      { time: 1735689600, position: "aboveBar", shape: "circle", color: "bull", text: "+1.00 R" },
+    ]);
+    // The placement is the canvas's alone: the trade itself — what the table reads — keeps
+    // its exact 01:00Z and 02:00Z fill times.
+    expect(trade.entryTime).toBe("1735693200000");
+    expect(trade.exitTime).toBe("1735696800000");
   });
 });
