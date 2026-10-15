@@ -36,6 +36,8 @@ import { createElement } from "react";
 
 import BacktestLabScreen from "./screens/BacktestLabScreen";
 
+import ChartScreen from "./screens/ChartScreen";
+
 import DeploymentDashboard from "./screens/DeploymentDashboard";
 
 import DesignerScreen from "./screens/DesignerScreen";
@@ -124,6 +126,16 @@ export const ROUTES: readonly Route[] = [
     nav: "settings",
     element: SettingsScreen,
   },
+  // r5.s2.w2: the Chart tab. One appended entry, and the existing `chart` nav row's
+  // derived "Soon" badge disappears on its own (`isNavBuilt`, G8), with zero nav-side
+  // edits. `details` stays unset: the chart is one full-width column (the chart, then
+  // the trade strip and the table copy under it), not a two-pane reader.
+  {
+    path: "/chart",
+    title: "Chart",
+    nav: "chart",
+    element: ChartScreen,
+  },
 ];
 
 /** Resolve a fragment to a route, or `undefined` when nothing matches. */
@@ -176,6 +188,22 @@ export function backtestDeepLink(hash: string): { wf: string } | null {
   }
   const wf = new URLSearchParams(fragment.slice(queryAt + 1)).get("wf");
   return wf === null || wf === "" ? null : { wf };
+}
+
+/**
+ * The Chart tab's deep link (r5.s2.w2): `#/chart?run=<run id>` names the backtest run
+ * the tab must open. `null` for every other fragment: another route, no query, or an
+ * empty `run`. Pure, so the tab's read of its own hash is testable without a DOM —
+ * `backtestDeepLink`'s twin, one screen over.
+ */
+export function chartDeepLink(hash: string): { run: string } | null {
+  const fragment = hash.startsWith("#") ? hash.slice(1) : hash;
+  const queryAt = fragment.indexOf("?");
+  if (queryAt === -1 || fragment.slice(0, queryAt) !== "/chart") {
+    return null;
+  }
+  const run = new URLSearchParams(fragment.slice(queryAt + 1)).get("run");
+  return run === null || run === "" ? null : { run };
 }
 
 /**

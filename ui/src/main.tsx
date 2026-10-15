@@ -16,7 +16,11 @@
 // Lab's result column and builds on its section rules. `paper.css` (r3.s4.w5)
 // is the promote sheet's, the badges', the Deployment Dashboard's and the
 // session detail's — loaded last because its sheet and drawer render above
-// every screen.
+// every screen. `chart-tab.css` (r5.s2.w2) is the Chart tab's, named after the
+// screen rather than after the mock's own `chart.css` for the reason
+// `check-design-system.sh` gives (`backtest.css` vs the mock's
+// `backtest-lab.css`); it also declares the ten `--chart-*` aliases the chart
+// adapter reads its colours from.
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -32,6 +36,7 @@ import "./styles/backtest.css";
 import "./styles/coach.css";
 import "./styles/paper.css";
 import "./styles/connection.css";
+import "./styles/chart-tab.css";
 
 function element(id: string): HTMLElement {
   const found = document.getElementById(id);

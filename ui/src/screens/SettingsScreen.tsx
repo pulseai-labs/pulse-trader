@@ -1,14 +1,20 @@
-// The Settings screen's "Server connection" section (r4.s3.w3, spec §Approach 2).
+// The Settings screen's "Server connection" section (r4.s3.w3, spec §Approach 2), and
+// the "About" section r5.s2.w2 adds beneath it.
 //
-// The mock's other sections (AI provider, Agents, Appearance, Data, About) are
-// out of scope for this item: nothing is rendered for them, and no placeholder
-// stands in their place.
+// The mock's other sections (AI provider, Agents, Appearance, Data) are still out of
+// scope: nothing is rendered for them, and no placeholder stands in their place. The
+// About section is the one exception the Chart tab owes: the chart library's licence
+// asks every app that uses it to credit TradingView with a link to tradingview.com
+// (grill Q6; PDR-0004), and this is that line.
 //
 // Every fact here is one the app actually has: the state comes from the shared
 // polled `ServerStatus`, the address from the `server_address` command (the
-// stored URL only — the token never crosses to the frontend), and the version
-// and fingerprint from the status the last handshake answered with. No number is
-// invented for a field the wire does not carry.
+// stored URL only — the token never crosses to the frontend), the version
+// and fingerprint from the status the last handshake answered with, and the About
+// section's app version from the app's own bundle (`getVersion`). No number is
+// invented for a field the wire does not carry; a version that cannot be read renders
+// the em dash rather than a literal copied out of `package.json`, which would go stale
+// on the next version bump.
 //
 // Disconnect keeps the connection file's lifecycle in Rust (the same
 // `server_disconnect` the command bus has always had) and, per the Dispatch-3
@@ -19,7 +25,10 @@
 
 import { useEffect, useState } from "react";
 
+import { getVersion } from "@tauri-apps/api/app";
+
 import { commands } from "../bindings";
+import { EM_DASH } from "../format/numbers";
 import { useConnection } from "../shell/ConnectionContext";
 
 /** The command that revokes the token on the server (the note names it). */
@@ -56,6 +65,76 @@ function sectionState(status: string): SectionState {
 }
 
 export default function SettingsScreen() {
+  return (
+    <>
+      <ServerConnectionSection />
+      <AboutSection />
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// About (r5.s2.w2) — the chart library's credit, and the app's own version
+// ---------------------------------------------------------------------------
+
+/**
+ * The app's own bundle version, or `null` while it cannot be read. Read from the app
+ * (`@tauri-apps/api/app`), never from a literal: `package.json`'s version and the
+ * shipped bundle's are two numbers that drift apart, and the one the trader can act on
+ * ("which build am I running?") is the bundle's.
+ */
+function useAppVersion(): string | null {
+  const [version, setVersion] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getVersion()
+      .then((value) => {
+        if (!cancelled) setVersion(value);
+      })
+      .catch(() => {
+        // No version to show. The row says so with the em dash; the About section is
+        // not the app's version gate.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return version;
+}
+
+function AboutSection() {
+  const version = useAppVersion();
+  return (
+    <section className="settings-section" aria-label="About">
+      <div className="settings-head">
+        <h2>About</h2>
+        <p>PulseTrader runs your strategies on your own server; this Mac app is the window onto it.</p>
+      </div>
+
+      <div className="srv-card">
+        <dl className="srv-facts">
+          <div>
+            <dt>App version</dt>
+            <dd className="mono">{version === null ? EM_DASH : `PulseTrader ${version}`}</dd>
+          </div>
+        </dl>
+
+        {/* The chart library's credit (grill Q6). It stays even if a later build hides
+            the logo the library draws on the chart itself. The link opens in a new
+            tab: this app has no opener plugin and no navigation handler of its own, so
+            a same-window link would replace the whole app view with tradingview.com. */}
+        <p className="srv-foot-note">
+          Charts by TradingView Lightweight Charts™ —{" "}
+          <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">
+            tradingview.com
+          </a>
+        </p>
+      </div>
+    </section>
+  );
+}
+
+function ServerConnectionSection() {
   const { status, refresh, openConnect } = useConnection();
   const [address, setAddress] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
