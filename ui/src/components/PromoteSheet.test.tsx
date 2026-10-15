@@ -13,6 +13,7 @@ const getWalkForwardRunMock = vi.fn();
 const getBacktestRunMock = vi.fn();
 const serverStatusMock = vi.fn();
 const paperPromoteMock = vi.fn();
+const streakCardMock = vi.fn();
 
 vi.mock("../bindings", () => ({
   commands: {
@@ -20,6 +21,7 @@ vi.mock("../bindings", () => ({
     getBacktestRun: (...args: unknown[]) => getBacktestRunMock(...args),
     serverStatus: (...args: unknown[]) => serverStatusMock(...args),
     paperPromote: (...args: unknown[]) => paperPromoteMock(...args),
+    streakCard: (...args: unknown[]) => streakCardMock(...args),
   },
 }));
 
@@ -28,6 +30,7 @@ import type {
   BusError,
   BusErrorCode,
   LibraryVersion,
+  StreakCardDto,
   WalkForwardRunDto,
 } from "../bindings";
 import { subscribePaperCountRefresh } from "../paper/handoff";
@@ -161,6 +164,30 @@ const TARGET = {
   versionLabel: "v3.1",
 };
 
+/** The card `streak_card` answers (r5.s4.w2). Its run is the version's latest
+ * FULL-SPAN run, deliberately a different run from `FOLD_RUN` (the sheet's
+ * shape run is the walk-forward fold whenever one exists). */
+function streakCardReady(): StreakCardDto {
+  return {
+    state: "ready",
+    runId: "run-full-span-1",
+    runCreatedAt: "2026-10-01T09:00:00.000Z",
+    closedTrades: 179,
+    horizonTrades: 100,
+    paths: 10000,
+    seed: "0x523553345354524b",
+    streak: { p50: 7, p95: 12, observed: 3 },
+    drawdownR: { p50: "10", p95: "19", observed: "3" },
+    drawdownUsdt: { p50: "1000", p95: "1900", observed: "300" },
+    drawdownPct: { p50: "10", p95: "19", observed: "3" },
+  };
+}
+
+/** The two elements' document order: does `b` follow `a`? */
+function follows(a: HTMLElement, b: HTMLElement): boolean {
+  return (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+}
+
 function ok<T>(data: T) {
   return { status: "ok" as const, data };
 }
@@ -190,6 +217,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   serverStatusMock.mockResolvedValue(up(SERVER_ENGINE));
   getBacktestRunMock.mockResolvedValue(ok(FOLD_RUN));
+  // The card's own read (r5.s4.w2); a test overrides it for the other states.
+  streakCardMock.mockResolvedValue(ok(streakCardReady()));
 });
 
 // ---------------------------------------------------------------------------
@@ -347,6 +376,167 @@ describe("uncertified", () => {
     fireEvent.click(screen.getByRole("button", { name: /^promote$/i }));
 
     expect(await screen.findByText(/No walk-forward run certifies this version\./)).toBeTruthy();
+  });
+
+  it("shows the card in the confirm step after the reason row, and never in the explain step", async () => {
+    renderUncertified();
+    expect(await screen.findByText(/No walk-forward run certifies this version\./)).toBeTruthy();
+    // The explain step asks for a reason; the card belongs at the decision.
+    expect(screen.queryByRole("table", { name: "A normal bad run" })).toBeNull();
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Fold 3 failed on one low-vol week." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Continue uncertified/ }));
+
+    const table = await screen.findByRole("table", { name: "A normal bad run" });
+    const reasonRow = screen.getByText("Your reason").closest(".ps-row") as HTMLElement;
+    const equityRow = screen.getByText("Equity").closest(".ps-row") as HTMLElement;
+    expect(follows(reasonRow, table)).toBe(true);
+    expect(follows(equityRow, table)).toBe(true);
+    expect(
+      follows(table, screen.getByRole("button", { name: /Promote uncertified/ })),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r5.s4.w2 — the streak and drawdown card, before the confirm button
+// ---------------------------------------------------------------------------
+
+describe("the streak and drawdown card", () => {
+  beforeEach(() => {
+    getWalkForwardRunMock.mockResolvedValue(ok(walkForward(true, SERVER_ENGINE)));
+  });
+
+  it("renders before the promote button, naming the card's own run", async () => {
+    sheet();
+    expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+
+    const table = await screen.findByRole("table", { name: "A normal bad run" });
+    expect(streakCardMock).toHaveBeenCalledWith({ versionId: "ver-1" });
+
+    // The card names the run the CARD read, never the sheet's shape run: the
+    // shape is the walk-forward fold, the card is the latest full-span run.
+    expect(getBacktestRunMock).toHaveBeenCalledWith({ runId: FOLD_RUN.runId });
+    expect(screen.getByTitle("run-full-span-1")).toBeTruthy();
+    expect(screen.queryByTitle("run-fold-1")).toBeNull();
+
+    expect(
+      within(table)
+        .getAllByRole("columnheader")
+        .map((header) => header.textContent),
+    ).toEqual(["Typical (p50)", "Bad but normal (p95)", "This backtest"]);
+
+    // Placement: after the certified body's Equity row, before the footer's
+    // Promote — the trader decides with the card in front of them.
+    const equityRow = screen.getByText("Equity").closest(".ps-row") as HTMLElement;
+    expect(follows(equityRow, table)).toBe(true);
+    expect(follows(table, screen.getByRole("button", { name: /^promote$/i }))).toBe(true);
+  });
+
+  it("renders the card's text as the trader reads it", async () => {
+    sheet();
+    expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+
+    const table = await screen.findByRole("table", { name: "A normal bad run" });
+    expect(
+      within(table)
+        .getAllByRole("row")
+        .map((row) => row.textContent),
+    ).toEqual([
+      "Typical (p50)Bad but normal (p95)This backtest",
+      "Longest losing streak7 trades12 trades3 trades",
+      "Max drawdown10.00 R · 1,000.00 USDT (10.00% of 10,000)19.00 R · 1,900.00 USDT (19.00% of 10,000)3.00 R · 300.00 USDT (3.00% of 10,000)",
+    ]);
+  });
+
+  it("is absent in the stale body", async () => {
+    getWalkForwardRunMock.mockResolvedValue(ok(walkForward(true, "engine-old-4f2a91")));
+    sheet();
+    expect(await screen.findByText(/Certified under engine engine-old-4f2a91/)).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "A normal bad run" })).toBeNull();
+  });
+
+  it("shows not-enough-trades with no figures, and leaves Promote enabled", async () => {
+    streakCardMock.mockResolvedValue(
+      ok({ state: "notEnoughTrades", runId: "run-thin-1", closedTrades: 12 }),
+    );
+    sheet();
+    expect(
+      await screen.findByText(
+        "Only 12 closed trades in backtest run-thin — at least 30 are needed to estimate a normal bad run.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+    const promote = screen.getByRole("button", { name: /^promote$/i }) as HTMLButtonElement;
+    expect(promote.disabled).toBe(false);
+  });
+
+  it("shows no-run with no figures, and leaves Promote enabled", async () => {
+    streakCardMock.mockResolvedValue(ok({ state: "noRun" }));
+    sheet();
+    expect(
+      await screen.findByText(
+        "No full backtest of this version yet — run one to see a normal bad run.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+    const promote = screen.getByRole("button", { name: /^promote$/i }) as HTMLButtonElement;
+    expect(promote.disabled).toBe(false);
+  });
+
+  it("keeps the variant, the refusal and the buttons when the card read rejects", async () => {
+    // The card's read settles AFTER the decision on purpose: a stray write from
+    // the card's own chain then has nowhere left to hide (#336's own idiom).
+    let rejectCard!: (reason: unknown) => void;
+    streakCardMock.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectCard = reject;
+        }),
+    );
+    sheet();
+
+    // The certified variant decides without waiting for the card...
+    expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+    expect(screen.getByText("Reading the streak and drawdown card…")).toBeTruthy();
+
+    // ...and the card's own failure lands afterwards, changing only the card:
+    // no figures are invented, no refusal is raised, and the trader can still
+    // promote (the card informs; the server's gate decides).
+    await act(async () => {
+      rejectCard(new Error("the IPC bridge is down"));
+    });
+    expect(screen.getByText("The streak and drawdown card could not be read.")).toBeTruthy();
+    expect(screen.getByText(/PASS under wf-v1/)).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    const promote = screen.getByRole("button", { name: /^promote$/i }) as HTMLButtonElement;
+    expect(promote.disabled).toBe(false);
+  });
+
+  it("keeps the variant when the bus refuses the card read", async () => {
+    let resolveCard!: (value: unknown) => void;
+    streakCardMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCard = resolve;
+        }),
+    );
+    sheet();
+    expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+
+    await act(async () => {
+      resolveCard({
+        status: "error",
+        error: busError("data", "the card read failed on the server"),
+      });
+    });
+    expect(screen.getByText("The streak and drawdown card could not be read.")).toBeTruthy();
+    expect(screen.getByText(/PASS under wf-v1/)).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.getByRole("button", { name: /^promote$/i })).toBeTruthy();
   });
 });
 

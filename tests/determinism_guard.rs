@@ -108,6 +108,15 @@ const SCAN_TARGETS: &[&str] = &[
     // false-green hole; passes because the only transcendental present is the
     // allowed `sqrt`.
     "src/domain/backtest/stats.rs",
+    // r5.s4.w1 (PDR-0035): the shared in-tree splitmix64, moved out of the paper
+    // fixture so the streak card's Monte Carlo draws from the same stream — the
+    // fixture's data versions and the card's goldens both ride it, so it is a
+    // determinism-critical surface like the rest.
+    "src/domain/rng.rs",
+    // r5.s4.w1: the streak and drawdown card itself — pure `Decimal` and integer
+    // draws, no `f64` anywhere; scanned so a future banned call here is not a
+    // false-green hole.
+    "src/domain/backtest/streak_card.rs",
 ];
 
 fn manifest_relative(rel: &str) -> PathBuf {

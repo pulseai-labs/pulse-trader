@@ -58,6 +58,10 @@ mod pair;
 // wiring (`paper_session_repo`).
 pub(crate) mod paper;
 mod port;
+// r5.s4.w1 (PDR-0035): the shared in-tree splitmix64. The paper fixture's noise
+// and the streak card's Monte Carlo draws ride the same stream, so the type now
+// has two consumers and lives here rather than in either one.
+pub(crate) mod rng;
 mod series;
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
 // BACKLOG-5) — the `pulse-broker` money-math home as a module. `pub(crate)`
@@ -101,6 +105,14 @@ pub use backtest::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, cla
 // un-re-exported public domain type is a `dead_code` BUILD error under
 // `deny(warnings)`.
 pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
+// r5.s4.w1 (PDR-0035): the streak and drawdown card's surface (the seeded Monte
+// Carlo's constants, its value types and the pure card function). Re-exported so
+// `lib.rs` can curate the crate surface — an un-re-exported public domain type is
+// a `dead_code` BUILD error under `deny(warnings)`.
+pub use backtest::{
+    ClosedTrade, DecimalPercentiles, FIXED_EQUITY_USDT, HORIZON_TRADES, MIN_CLOSED_TRADES, PATHS,
+    PERCENTILES, STREAK_CARD_SEED, StreakCard, StreakPercentiles, streak_card,
+};
 // VS-1.2.4 work-4.04: the persisted backtest-run projection types (FR-6 / FR-7 /
 // NFR-2). `BacktestRunId`/`PersistedRun`/`RunSummary` are the typed read-back
 // projections the `BacktestRunRepository` port returns; re-exported so `lib.rs`
