@@ -628,4 +628,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Safe dependency bump: `rustls` (r5 chore).** Cargo: `rustls` 0.23.45 → 0.23.46, clearing RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349. Lockfile only (`cargo update -p rustls --precise 0.23.46`; `Cargo.lock` alone, no `Cargo.toml` change), so the required `cargo deny check advisories` check is green again (#410). No product version bump.
+
 - Added repository security hardening, non-commercial license, and supply-chain checks (VS-1.2.3).
