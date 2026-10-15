@@ -304,6 +304,39 @@ describe("markersInWindow", () => {
     ]);
   });
 
+  it("keeps an exit inside the last loaded bar's own period, and drops a time at its end", () => {
+    // The last loaded bar opens at 04:00Z and, as a 4h bar, owns everything up to 08:00Z.
+    // An exit that fills inside that period belongs to that bar — the library's
+    // containing-bar mapping places it there — while 08:00Z and later are the NEXT bar,
+    // which the window does not hold and where the library would snap back onto 04:00.
+    const trades: ChartTradeDto[] = [
+      {
+        side: "long",
+        entryTime: "1735689600000",
+        entryPrice: "90000",
+        exitTime: "1735709400000",
+        exitPrice: "92000",
+        exitReason: "take_profit",
+        realizedR: "2",
+      },
+    ];
+    const markers = toMarkers([], trades, PALETTE);
+    expect(markersInWindow(markers, loaded).map((marker) => marker.time)).toEqual([
+      1735689600, 1735709400,
+    ]);
+
+    // The end of the last bar is exclusive: 08:00Z is the next bar's open, not this one's.
+    const withNextBarTimes: ChartMarker[] = [
+      ...markers,
+      { time: 1735718400, position: "belowBar", shape: "circle", color: "bull" },
+      // 09:00Z — inside the next bar, well past it.
+      { time: 1735722000, position: "belowBar", shape: "circle", color: "bull" },
+    ];
+    expect(markersInWindow(withNextBarTimes, loaded).map((marker) => marker.time)).toEqual([
+      1735689600, 1735709400,
+    ]);
+  });
+
   it("draws nothing at all when the window holds no bar", () => {
     const markers: ChartMarker[] = [
       { time: 1735689600, position: "belowBar", shape: "circle", color: "bull" },

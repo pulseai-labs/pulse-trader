@@ -220,18 +220,45 @@ describe("createChartAdapter", () => {
     // two days earlier, so only its exit may be handed over.
     adapter.setTrades([{ ...TRADE, entryTime: "1735516800000" }]);
 
-    // Nothing this draw ever hands the library is outside the loaded range: a marker
-    // the library cannot place is snapped onto the first or last loaded candle.
+    // Nothing this draw ever hands the library is outside the loaded range — the first
+    // bar's open up to the END of the last loaded bar: a marker the library cannot place
+    // is snapped onto the first or last loaded candle.
     for (const [markers] of h.markersApi.setMarkers.mock.calls) {
       for (const marker of markers as { time: number }[]) {
         expect(marker.time).toBeGreaterThanOrEqual(1735689600);
-        expect(marker.time).toBeLessThanOrEqual(1735704000);
+        expect(marker.time).toBeLessThan(1735718400);
       }
     }
     const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
     expect(last.map((marker) => marker.time)).toEqual([1735689600, 1735704000]);
     expect(last[0]).toMatchObject({ color: "pivot" });
     expect(last[1]).toMatchObject({ color: "bull", text: "+2.00 R" });
+  });
+
+  it("draws an exit inside the last loaded bar's own period, and nothing past its end", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setOverlays([
+      {
+        kind: "pivot",
+        label: "pivot_low:2-2",
+        // The peak is the first loaded bar; the confirmation, at 09:00Z, belongs to the
+        // bar AFTER the last loaded one (04:00Z–08:00Z) and is never handed over.
+        events: [{ confirmTime: "1735722000000", peakTime: "1735689600000", price: "92796.5" }],
+      },
+    ]);
+    // 05:30Z is inside the last loaded bar's period — the run's final exit, on the 4h
+    // chart this walk shows — so it is drawn at its own time and lands on that bar.
+    adapter.setTrades([{ ...TRADE, entryTime: "1735689600000", exitTime: "1735709400000" }]);
+
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
+    expect(last.map((marker) => marker.time)).toEqual([1735689600, 1735689600, 1735709400]);
+    for (const [markers] of h.markersApi.setMarkers.mock.calls) {
+      for (const marker of markers as { time: number }[]) {
+        // Nothing at or past the end of the last loaded bar (04:00Z + one 4h bar).
+        expect(marker.time).toBeLessThan(1735718400);
+      }
+    }
   });
 
   it("keeps markers from overlays and trades when only one of the two is redrawn", () => {

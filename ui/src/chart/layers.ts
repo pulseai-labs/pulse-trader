@@ -22,11 +22,12 @@
 //    key of the palette the screen's sheet owns.
 //  * **PDR-0011.** What is not drawn is never faked: an overlay with no value at a bar
 //    draws nothing at that bar.
-//  * **G3, no false bar.** A marker is drawn only when its own time falls inside the
-//    loaded window (`markersInWindow`, the close review's CR2). A read hands back a
-//    trade when EITHER of its endpoints is in the window, and a pivot's peak bar can be
-//    behind the window's first bar: the library maps a time it cannot place onto the
-//    nearest loaded CANDLE, which would mark a bar the trade or the pivot never touched.
+//  * **G3, no false bar.** A marker is drawn only when its own time falls inside the loaded
+//    window (`markersInWindow`, the close review's CR2) — the first bar's open up to the
+//    end of the last loaded bar, exclusive. A read hands back a trade when EITHER of its
+//    endpoints is in the window, and a pivot's peak bar can be behind the window's first
+//    bar: the library maps a time it cannot place onto the nearest loaded CANDLE, which
+//    would mark a bar the trade or the pivot never touched.
 
 import type { ChartCandleDto, ChartDataDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
 import { rMultiple } from "../format/numbers";
@@ -221,29 +222,51 @@ export function toMarkers(
     .map((entry) => entry.marker);
 }
 
+/** One bar's own duration, in the library's seconds, read off the loaded series: the
+ *  smallest positive gap between two consecutive bars. A missing bar (a holdout cut, a
+ *  gap in the snapshot) leaves a gap WIDER than a bar, never a narrower one, so the
+ *  smallest gap is the interval the series is drawn at. `0` when the series is a single
+ *  bar: there is no spacing to read, and the caller says so rather than guessing one. */
+function barSeconds(candles: readonly Pick<CandlePoint, "time">[]): number {
+  let bar = 0;
+  for (let i = 1; i < candles.length; i += 1) {
+    const gap = candles[i].time - candles[i - 1].time;
+    // The read returns its candles ascending; a non-positive gap would be malformed.
+    if (gap <= 0) continue;
+    if (bar === 0 || gap < bar) bar = gap;
+  }
+  return bar;
+}
+
 /** The markers a loaded window may draw (the close review's CR2).
  *
- *  A marker whose time is outside the loaded candles' `[first, last]` range is dropped
- *  here, before the library ever sees it: the library resolves every marker time against
- *  the candle series and snaps a time it cannot place onto the nearest loaded bar, which
- *  would draw a mark on the first or last candle instead of nowhere.
+ *  A marker whose time is outside the loaded bars' own span is dropped here, before the
+ *  library ever sees it: the library resolves every marker time against the candle series
+ *  and snaps a time it cannot place onto the nearest loaded bar, which would draw a mark
+ *  on the first or last candle instead of nowhere.
  *
- *  The range is the loaded bars' own open times, both ends INCLUDED — a marker exactly
- *  on the first or last loaded bar is drawn. A time inside the range that is not itself
- *  a bar open (a primary-timeframe trade time on the higher-timeframe chart) is kept:
- *  the library's containing-bar mapping for it is the intended one, and it is the reason
- *  this is a range test and not a membership test. A marker past the last loaded bar's
- *  open time belongs to a bar the window does not hold, so it is not drawn either — the
- *  table below the chart still carries its exact time and value (PDR-0011). */
+ *  The span runs from the FIRST bar's open, inclusive, to the END of the last bar —
+ *  its open plus one bar's own duration, exclusive. A time inside the range that is not
+ *  itself a bar open (a primary-timeframe trade time on the higher-timeframe chart, or an
+ *  exit filing inside the last loaded bar) is kept: the library's containing-bar mapping
+ *  for it is the intended one, which is why this is a range test and not a membership
+ *  test. A time at or past the last bar's end belongs to a bar the window does not hold
+ *  and is dropped, so the snapping the clip exists for cannot come back. The table below
+ *  the chart still carries every exact time and value, clipped or not (PDR-0011). */
 export function markersInWindow(
   markers: readonly ChartMarker[],
   candles: readonly Pick<CandlePoint, "time">[],
 ): ChartMarker[] {
   if (candles.length === 0) return [];
-  // The read returns its candles ascending, so the ends are the range.
-  const first = candles[0].time;
-  const last = candles[candles.length - 1].time;
-  return markers.filter((marker) => marker.time >= first && marker.time <= last);
+  // The read returns its candles ascending, so the ends are the span's ends.
+  const open = candles[0].time;
+  const lastOpen = candles[candles.length - 1].time;
+  const bar = barSeconds(candles);
+  // A single loaded bar has no spacing to read: that bar's own open is the whole span.
+  if (bar === 0) return markers.filter((marker) => marker.time === open);
+  return markers.filter(
+    (marker) => marker.time >= open && marker.time < lastOpen + bar,
+  );
 }
 
 /** Everything one chart read draws. */
