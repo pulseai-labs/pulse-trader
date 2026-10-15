@@ -18,17 +18,18 @@
 //! (VS-1.1.4 / agent layer) composes `load → validate → compile`.
 //!
 //! **The production registry.** [`Migrator::v1`] registers the real steps —
-//! currently three: the `1.0.0 → 1.1.0`, `1.1.0 → 1.2.0` and `1.2.0 → 1.3.0`
-//! identity steps (schema 1.1.0 is additive — a new defaulted field and new
-//! enum variants; schema 1.2.0 is additive too — MACD's defaulted `output`
-//! field; schema 1.3.0 is additive as well — the r4.s6 structure indicator
-//! variants — so each step rewrites only the `schema_version` string; every
-//! pre-bump document deserializes identically at `CURRENT`). Chaining + error
-//! paths are additionally proven by synthetic test migrations (see the test
-//! module).
+//! currently four: the `1.0.0 → 1.1.0`, `1.1.0 → 1.2.0`, `1.2.0 → 1.3.0` and
+//! `1.3.0 → 1.4.0` identity steps (schema 1.1.0 is additive — a new defaulted
+//! field and new enum variants; schema 1.2.0 is additive too — MACD's defaulted
+//! `output` field; schema 1.3.0 is additive as well — the r4.s6 structure
+//! indicator variants; schema 1.4.0 is additive — the r5.s1 named candlestick
+//! pattern variant — so each step rewrites only the `schema_version` string;
+//! every pre-bump document deserializes identically at `CURRENT`). Chaining +
+//! error paths are additionally proven by synthetic test migrations (see the
+//! test module).
 //!
 //! **No forward-compatibility** (architect-critic): every `schema_version >
-//! CURRENT` — including a same-major future minor like `1.4.0` vs `1.3.0` — is
+//! CURRENT` — including a same-major future minor like `1.5.0` vs `1.4.0` — is
 //! rejected as [`LoadError::FutureVersion`]. A newer minor may carry semantics
 //! this engine cannot honor, and silently ignoring unknown fields could
 //! mis-execute a real-money strategy.
@@ -230,6 +231,24 @@ fn identity_1_2_0_to_1_3_0(mut value: Value) -> Result<Value, MigrationError> {
     Ok(value)
 }
 
+/// The `1.3.0 → 1.4.0` step: **identity**. Schema 1.4.0 is purely additive
+/// (r5.s1 ADR-0024 addendum — one new indicator variant,
+/// `IndicatorSpec::CandlePattern { pattern }`, whose value is TA-Lib's own
+/// integer per named candlestick pattern), so the document's meaning is
+/// unchanged; `apply` rewrites only the `schema_version` string and leaves every
+/// other byte alone. `dsl_original` is preserved verbatim by [`Loaded`]
+/// regardless — the migration never touches it.
+fn identity_1_3_0_to_1_4_0(mut value: Value) -> Result<Value, MigrationError> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| MigrationError("document is not a JSON object".to_owned()))?;
+    obj.insert(
+        "schema_version".to_owned(),
+        serde_json::Value::String("1.4.0".to_owned()),
+    );
+    Ok(value)
+}
+
 impl Migrator {
     /// The production registry: the three real steps, `1.0.0 → 1.1.0`,
     /// `1.1.0 → 1.2.0` and `1.2.0 → 1.3.0` (all identity).
@@ -283,6 +302,20 @@ impl Migrator {
                     },
                     kind: MigrationKind::Minor,
                     apply: identity_1_2_0_to_1_3_0,
+                },
+                Migration {
+                    from: SchemaVersion {
+                        major: 1,
+                        minor: 3,
+                        patch: 0,
+                    },
+                    to: SchemaVersion {
+                        major: 1,
+                        minor: 4,
+                        patch: 0,
+                    },
+                    kind: MigrationKind::Minor,
+                    apply: identity_1_3_0_to_1_4_0,
                 },
             ],
         }
@@ -558,7 +591,7 @@ mod tests {
     #[test]
     fn rejects_same_major_future_minor() {
         let mut value: Value = serde_json::from_str(&canonical_current_json()).unwrap();
-        value["schema_version"] = json!("1.4.0");
+        value["schema_version"] = json!("1.5.0");
         let json = value.to_string();
 
         let err = Migrator::v1()
@@ -566,7 +599,7 @@ mod tests {
             .expect_err("same-major future minor must reject");
         assert!(
             matches!(err, LoadError::FutureVersion { .. }),
-            "expected FutureVersion for 1.4.0 vs 1.3.0, got {err:?}"
+            "expected FutureVersion for 1.5.0 vs 1.4.0, got {err:?}"
         );
     }
 
@@ -737,6 +770,7 @@ mod tests {
             (v(1, 0, 0), v(1, 1, 0)),
             (v(1, 1, 0), v(1, 2, 0)),
             (v(1, 2, 0), v(1, 3, 0)),
+            (v(1, 3, 0), v(1, 4, 0)),
         ] {
             let step = migrator
                 .migrations

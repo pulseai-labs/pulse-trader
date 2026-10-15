@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.4.0",
+  "name": "Support Rejection 4H",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Price", "series": "htf", "field": "Low" },
+    "op": "Lte",
+    "rhs": {
+      "type": "Arith",
+      "op": "mul",
+      "lhs": {
+        "type": "Lag",
+        "value": {
+          "type": "Indicator",
+          "series": "htf",
+          "spec": {
+            "indicator": "Support",
+            "left": 1,
+            "right": 1,
+            "tolerance_pct": "0.05",
+            "min_touches": 2,
+            "lookback": 50
+          }
+        },
+        "bars": 1
+      },
+      "rhs": { "type": "Constant", "value": "1.005" }
+    }
+  },
+  "filters": [
+    {
+      "type": "Compare",
+      "lhs": { "type": "Price", "series": "htf", "field": "Close" },
+      "op": "Gt",
+      "rhs": {
+        "type": "Lag",
+        "value": {
+          "type": "Indicator",
+          "series": "htf",
+          "spec": {
+            "indicator": "Support",
+            "left": 1,
+            "right": 1,
+            "tolerance_pct": "0.05",
+            "min_touches": 2,
+            "lookback": 50
+          }
+        },
+        "bars": 1
+      }
+    },
+    {
+      "type": "Compare",
+      "lhs": {
+        "type": "Indicator",
+        "series": "htf",
+        "spec": { "indicator": "CandlePattern", "pattern": "Hammer" }
+      },
+      "op": "Gt",
+      "rhs": { "type": "Constant", "value": "0" }
+    }
+  ],
+  "exits": [
+    { "type": "StopLoss", "distance_pct": "0.015" },
+    { "type": "TakeProfit", "target_r": "1" }
+  ],
+  "risk": {
+    "risk_per_trade_pct": "0.01",
+    "max_leverage": "3"
+  }
+}

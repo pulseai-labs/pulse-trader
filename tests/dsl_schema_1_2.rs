@@ -8,8 +8,8 @@
 //!    persisted `version_hash` recomputes UNCHANGED from the schema version the
 //!    row was written under (CURRENT at write time — ADR-0010's hash inputs),
 //!    provably NOT from the authored version string.
-//! 2. **1.3.0 is served; 1.4.0 and 2.0.0 are not.** The served schema's
-//!    `schema_version` enum lists exactly `["1.0.0", "1.1.0", "1.2.0", "1.3.0"]`; a
+//! 2. **1.4.0 is served; 1.5.0 and 2.0.0 are not.** The served schema's
+//!    `schema_version` enum lists exactly `["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]`; a
 //!    same-major future minor and a new major are refused `FutureVersion` on
 //!    both the migrator load path and the MCP write path.
 //! 3. **Re-runs are frozen at the pre-bump values.** For each fixture document,
@@ -319,8 +319,8 @@ fn every_pre_1_2_0_document_loads_to_current() {
         assert!(loaded.migrated, "{label}: a migration step was applied");
         assert_eq!(
             loaded.dsl.schema_version,
-            v(1, 3, 0),
-            "{label}: loads to CURRENT == 1.3.0"
+            v(1, 4, 0),
+            "{label}: loads to CURRENT == 1.4.0"
         );
     }
 }
@@ -409,7 +409,7 @@ async fn persisted_pre_1_2_0_versions_hash_from_the_written_under_version() {
 }
 
 // ---------------------------------------------------------------------------
-// Case 2 — 1.3.0 served; 1.4.0 / 2.0.0 refused.
+// Case 2 — 1.4.0 served; 1.5.0 / 2.0.0 refused.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -418,8 +418,8 @@ fn served_schema_version_enum_is_exactly_the_served_versions() {
         serde_json::to_value(schemars::schema_for!(StrategyDsl)).expect("schema serializes");
     assert_eq!(
         schema["properties"]["schema_version"]["enum"],
-        serde_json::json!(["1.0.0", "1.1.0", "1.2.0", "1.3.0"]),
-        "the served schema_version enum lists exactly the four served versions"
+        serde_json::json!(["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]),
+        "the served schema_version enum lists exactly the five served versions"
     );
 }
 
@@ -431,7 +431,7 @@ fn doc_at_version(template: &str, version: &str) -> String {
 
 #[test]
 fn future_minor_and_new_major_refuse_on_the_load_path() {
-    for future in ["1.4.0", "2.0.0"] {
+    for future in ["1.5.0", "2.0.0"] {
         let doc = doc_at_version(INLINE_1_1_0, future);
         let err = Migrator::v1()
             .load(&doc)

@@ -63,6 +63,13 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "structure_indicators",
         "the schema-1.3.0 structure and pattern variants work on any series (an `h4:` operand reads the last closed H4 bar): `PivotHigh{left,right}`/`PivotLow{left,right}` are the most recent confirmed swing high/low, confirmed only once the `right` bars after them have closed, so a value never repaints; `Resistance{left,right,tolerance_pct,min_touches,lookback}`/`Support{…}` are the nearest level strictly above/below the current close, built from the confirmed pivots within the last `lookback` bars: a candidate level is a run of sorted pivot prices whose highest is within `tolerance_pct` of their lowest (for each start pivot, the maximal run within tolerance of that start's own price; runs may overlap), and a run of at least `min_touches` (>= 2) pivots is a candidate whose value is the mean of its pivots — the value is the LOWEST candidate strictly above the close (`Support`: the HIGHEST strictly below it), a pivot counting while it stays inside `lookback` bars (`lookback` > `left + right`); `tolerance_pct` is a decimal fraction in (0, 0.10] (`0.003` = 0.3%); `Body`/`UpperWick`/`LowerWick`/`Range` are the current bar's `abs(close−open)`, `high−max(open,close)`, `min(open,close)−low` and `high−low`; `DoubleTopNeckline{left,right,tolerance_pct}`/`DoubleBottomNeckline{…}` are the lowest low/highest high strictly between the last two confirmed pivot highs/lows within tolerance; `TrendlineLows{left,right}`/`TrendlineHighs{left,right}` are the line through the last two rising/falling confirmed pivots extended to the current bar, its quotient rounded to 8 decimal places half-even; because a `Resistance`/`Support` level sits strictly above/below the close of its own bar by definition, a break compares the close with the PREVIOUS bar's level — `CrossesAbove(close, lag(Resistance{…}, 1))`, the lag counting H4 bars on an `h4:` operand (the mirror is `CrossesBelow` over `lag(Support{…}, 1)`) — never the same bar's level; after warm-up a comparison over a level/pattern operand with no level at that bar is false, so a `Not` over it is true",
     ),
+    // r5.s1.w1/w2 (schema 1.4.0), published by r5.s1.w3: the named candlestick
+    // patterns, their read-path token, and the support-touch form the example
+    // trades.
+    (
+        "candle_patterns",
+        "the schema-1.4.0 named candlestick patterns are read through the comparisons that already existed (`CandlePattern{pattern}`, on any series — an `h4:` operand reads the last closed H4 bar): the value is TA-Lib's own integer on every bar after the pattern's warm-up — +100 bullish, -100 bearish, 0 no pattern, and ±80 for the PARTIAL `Engulfing` and `Harami` forms (a body end coincides with or touches the prior body's edge) — so a rule that wants \"fired\" reads `Gt 0` / `Lt 0` and one that wants only the full form reads `Eq 100` / `Eq -100`; the 17 names and their signs are bullish only `Hammer`, `InvertedHammer`, `Piercing`, `MorningStar`, `ThreeWhiteSoldiers`; bearish only `HangingMan`, `ShootingStar`, `DarkCloudCover`, `EveningStar`, `ThreeBlackCrows`; both signs, by the bar's own colour, `Marubozu`, `SpinningTop`, `Engulfing`; and `Harami`, which also carries both signs but takes the OPPOSITE of the PRIOR bar's colour (+ when the prior bar is black, a bullish harami), never the colour of the bar it fires on; and `Doji`, `DragonflyDoji`, `GravestoneDoji`, which read +100 only and carry no direction. Warm-up is TA-Lib's own lookback (10–13 bars by pattern) and the value is `None` before it — never \"no pattern\"; the pattern is evaluated on the closed bar and never repaints. `export_indicators`, and the CLI `--indicator` flag that shares its parser, carry the same vocabulary as `cdl:<name>` — the name matches ignoring case and underscores, and the column label is always `cdl:<snake_case>` (`cdl:morning_star`), so spelling variants dedup to one column. The checked-in 4h support-rejection example reads a pattern beside a support touch: `Low{h4} <= lag(Support{h4}, 1) × (1 + k)` AND `Close{h4} > lag(Support{h4}, 1)` AND `CandlePattern{…} > 0` — the level the PREVIOUS H4 bar saw, the same lag doctrine the level entry above states for a break, because a `Support` value sits strictly below its own bar's close",
+    ),
     // r3.s2.w3 (Q2): value expressions — the semantics the grammar cannot
     // express, keyed by the construct each entry covers.
     (
@@ -83,10 +90,11 @@ const CONVENTIONS: &[(&str, &str)] = &[
     ),
     // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
     // r4.s6.w1: moved to 1.3.0 (the structure indicator variants); the served
-    // set grows by 1.2.0.
+    // set grows by 1.2.0. r5.s1.w1: moved to 1.4.0 (the named candlestick
+    // pattern variant); the served set grows by 1.3.0.
     (
         "schema_version",
-        "this engine writes and serves schema 1.3.0 and also loads 1.0.0, 1.1.0 and 1.2.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.3.0",
+        "this engine writes and serves schema 1.4.0 and also loads 1.0.0, 1.1.0, 1.2.0 and 1.3.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.4.0",
     ),
 ];
 
@@ -134,12 +142,12 @@ mod tests {
             assert!(properties.contains_key(field), "missing property {field}");
         }
         // F6: `schema_version` publishes the ACCEPTED values, not an
-        // unconstrained string — `Migrator::v1()` loads `1.0.0`, `1.1.0` and
-        // `1.2.0` (identity-migrated) and `CURRENT`, so the schema a validating
-        // agent reads must pin exactly that enum.
+        // unconstrained string — `Migrator::v1()` loads `1.0.0`, `1.1.0`,
+        // `1.2.0` and `1.3.0` (identity-migrated) and `CURRENT`, so the schema a
+        // validating agent reads must pin exactly that enum.
         assert_eq!(
             properties["schema_version"]["enum"],
-            serde_json::json!(["1.0.0", "1.1.0", "1.2.0", DSL_SCHEMA_VERSION]),
+            serde_json::json!(["1.0.0", "1.1.0", "1.2.0", "1.3.0", DSL_SCHEMA_VERSION]),
             "schema_version property must publish the accepted enum"
         );
         let conventions = doc["conventions"].as_object().expect("conventions object");

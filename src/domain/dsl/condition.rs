@@ -281,7 +281,7 @@ mod prop_tests {
     use super::{Comparator, Condition};
     use crate::domain::dsl::sweepable::SweepableValue;
     use crate::domain::dsl::value::{
-        ArithOp, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
+        ArithOp, CandlePatternName, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -448,6 +448,88 @@ mod prop_tests {
                     }
                 })
                 .boxed(),
+            // r5.s1.w1 (schema 1.4.0): the named candle patterns, in their own
+            // generator so this one stays readable as the catalog grows (the
+            // comment above the structure arm's own split).
+            arb_candle_pattern_indicator_spec(),
+        ]
+    }
+
+    /// The schema-1.4.0 named candle patterns (r5.s1.w1; the four three-bar
+    /// patterns added by r5.s1.w2): parameterless like the anatomy variants, so
+    /// one `Just` arm per pattern — the spine's full 17. The coverage probe
+    /// above asserts this list is complete, so a dropped arm is a red, not a
+    /// silent shrink.
+    fn arb_candle_pattern_indicator_spec() -> impl Strategy<Value = IndicatorSpec> {
+        prop_oneof![
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Doji,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::DragonflyDoji,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::GravestoneDoji,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Hammer,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::InvertedHammer,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::HangingMan,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ShootingStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Marubozu,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::SpinningTop,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Engulfing,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Harami,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::Piercing,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::DarkCloudCover,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::MorningStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::EveningStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ThreeWhiteSoldiers,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ThreeBlackCrows,
+            })
+            .boxed(),
         ]
     }
 
@@ -576,5 +658,67 @@ mod prop_tests {
                 serde_json::from_str(&json).expect("deserialize arbitrary Condition");
             prop_assert_eq!(back, cond);
         }
+    }
+
+    /// r5.s1.w1, extended r5.s1.w2: the generator really does produce every
+    /// schema-1.4.0 candle pattern, so the round-trip property above exercises
+    /// all 17 and a dropped arm cannot silently shrink coverage. The probe draws
+    /// a bounded sample and asserts set equality both ways — an arm for a value
+    /// the catalog does not have would fail too.
+    ///
+    /// The expected set is enumerated here rather than derived from the enum,
+    /// so extending the enum without extending this list is itself a failure:
+    /// the four three-bar patterns of r5.s1.w2 are listed below.
+    ///
+    /// Names are keyed by their `Debug` spelling: `CandlePatternName` deliberately
+    /// derives no `Ord` (nothing in production needs one), and a test must not
+    /// widen a shipped type's trait surface for its own convenience.
+    #[test]
+    fn the_generator_covers_every_candle_pattern() {
+        use proptest::strategy::ValueTree;
+        use std::collections::BTreeSet;
+
+        const CATALOG: [CandlePatternName; 17] = [
+            CandlePatternName::Doji,
+            CandlePatternName::DragonflyDoji,
+            CandlePatternName::GravestoneDoji,
+            CandlePatternName::Hammer,
+            CandlePatternName::InvertedHammer,
+            CandlePatternName::HangingMan,
+            CandlePatternName::ShootingStar,
+            CandlePatternName::Marubozu,
+            CandlePatternName::SpinningTop,
+            CandlePatternName::Engulfing,
+            CandlePatternName::Harami,
+            CandlePatternName::Piercing,
+            CandlePatternName::DarkCloudCover,
+            CandlePatternName::MorningStar,
+            CandlePatternName::EveningStar,
+            CandlePatternName::ThreeWhiteSoldiers,
+            CandlePatternName::ThreeBlackCrows,
+        ];
+
+        let strategy = arb_structure_indicator_spec();
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..4_000 {
+            let spec = strategy
+                .new_tree(&mut runner)
+                .expect("the generator builds a tree")
+                .current();
+            if let IndicatorSpec::CandlePattern { pattern } = spec {
+                let _ = seen.insert(format!("{pattern:?}"));
+            }
+        }
+
+        let want: BTreeSet<String> = CATALOG.iter().map(|p| format!("{p:?}")).collect();
+        assert_eq!(
+            seen,
+            want,
+            "the generator must produce exactly the spine's 17 candle patterns; \
+             missing: {:?}; unexpected: {:?}",
+            want.difference(&seen).collect::<Vec<_>>(),
+            seen.difference(&want).collect::<Vec<_>>(),
+        );
     }
 }

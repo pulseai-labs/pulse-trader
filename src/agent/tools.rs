@@ -441,8 +441,8 @@ mod mapping {
     use serde::Deserialize;
 
     use crate::domain::{
-        ArithOp, Comparator, Condition, FieldError, IndicatorSpec, MacdOutput, PriceField, Series,
-        SweepableValue, ValidationCode, ValueSource,
+        ArithOp, CandlePatternName, Comparator, Condition, FieldError, IndicatorSpec, MacdOutput,
+        PriceField, Series, SweepableValue, ValidationCode, ValueSource,
     };
 
     use super::field_error;
@@ -529,6 +529,11 @@ mod mapping {
         lookback: Option<u32>,
         #[serde(default, with = "rust_decimal::serde::str_option")]
         tolerance_pct: Option<Decimal>,
+        // The named candle patterns (schema 1.4.0, r5.s1.w3): `pattern` names
+        // one of the 17 TA-Lib patterns by its DSL variant name (`"Engulfing"`),
+        // spelled exactly as the advertised enum spells it.
+        #[serde(default)]
+        pattern: Option<String>,
     }
 
     /// The comparator/cross the flat `op` string selects.
@@ -947,11 +952,13 @@ mod mapping {
                 left: fixed_u32(operand.left, &format!("{path}.left"))?,
                 right: fixed_u32(operand.right, &format!("{path}.right"))?,
             }),
+            // The named candle patterns (schema 1.4.0, r5.s1.w3).
+            "candle_pattern" => candle_pattern(operand, path),
             other => Err(field_error(
                 format!("{path}.indicator"),
                 ValidationCode::FieldRange,
                 format!(
-                    "unknown indicator {other:?}; expected rsi|ema|adx|macd|atr|highest|lowest|pivot_high|pivot_low|resistance|support|double_top_neckline|double_bottom_neckline|trendline_lows|trendline_highs|body|upper_wick|lower_wick|range"
+                    "unknown indicator {other:?}; expected rsi|ema|adx|macd|atr|highest|lowest|pivot_high|pivot_low|resistance|support|double_top_neckline|double_bottom_neckline|trendline_lows|trendline_highs|body|upper_wick|lower_wick|range|candle_pattern"
                 ),
             )),
         }
@@ -989,6 +996,49 @@ mod mapping {
                 format!("unknown macd output {other:?}; expected line|signal|histogram"),
             )),
         }
+    }
+
+    /// The spec a `candle_pattern` operand builds (schema 1.4.0, r5.s1.w3): the
+    /// `pattern` field names one of the 17 TA-Lib patterns by its DSL variant
+    /// name, matched exactly as the advertised enum spells it, or a correctable
+    /// `{path}.pattern` error that names the field and lists the 17 names.
+    fn candle_pattern(operand: &Operand, path: &str) -> Result<IndicatorSpec, FieldError> {
+        let name = operand.pattern.as_deref().ok_or_else(|| {
+            field_error(
+                format!("{path}.pattern"),
+                ValidationCode::FieldRange,
+                "a candle_pattern operand requires a `pattern` name, e.g. \"Engulfing\"",
+            )
+        })?;
+        let pattern = match name {
+            "Doji" => CandlePatternName::Doji,
+            "DragonflyDoji" => CandlePatternName::DragonflyDoji,
+            "GravestoneDoji" => CandlePatternName::GravestoneDoji,
+            "Hammer" => CandlePatternName::Hammer,
+            "InvertedHammer" => CandlePatternName::InvertedHammer,
+            "HangingMan" => CandlePatternName::HangingMan,
+            "ShootingStar" => CandlePatternName::ShootingStar,
+            "Marubozu" => CandlePatternName::Marubozu,
+            "SpinningTop" => CandlePatternName::SpinningTop,
+            "Engulfing" => CandlePatternName::Engulfing,
+            "Harami" => CandlePatternName::Harami,
+            "Piercing" => CandlePatternName::Piercing,
+            "DarkCloudCover" => CandlePatternName::DarkCloudCover,
+            "MorningStar" => CandlePatternName::MorningStar,
+            "EveningStar" => CandlePatternName::EveningStar,
+            "ThreeWhiteSoldiers" => CandlePatternName::ThreeWhiteSoldiers,
+            "ThreeBlackCrows" => CandlePatternName::ThreeBlackCrows,
+            other => {
+                return Err(field_error(
+                    format!("{path}.pattern"),
+                    ValidationCode::FieldRange,
+                    format!(
+                        "unknown candle pattern {other:?}; expected Doji|DragonflyDoji|GravestoneDoji|Hammer|InvertedHammer|HangingMan|ShootingStar|Marubozu|SpinningTop|Engulfing|Harami|Piercing|DarkCloudCover|MorningStar|EveningStar|ThreeWhiteSoldiers|ThreeBlackCrows"
+                    ),
+                ));
+            }
+        };
+        Ok(IndicatorSpec::CandlePattern { pattern })
     }
 
     /// Wrap a required `u32` field into `SweepableValue::Fixed`, or a correctable
@@ -1088,8 +1138,20 @@ fn operand_schema_level(nested: &Value) -> Value {
                     "pivot_high", "pivot_low", "resistance", "support",
                     "double_top_neckline", "double_bottom_neckline",
                     "trendline_lows", "trendline_highs",
-                    "body", "upper_wick", "lower_wick", "range"
+                    "body", "upper_wick", "lower_wick", "range",
+                    "candle_pattern"
                 ]
+            },
+            "pattern": {
+                "type": "string",
+                "enum": [
+                    "Doji", "DragonflyDoji", "GravestoneDoji", "Hammer",
+                    "InvertedHammer", "HangingMan", "ShootingStar", "Marubozu",
+                    "SpinningTop", "Engulfing", "Harami", "Piercing",
+                    "DarkCloudCover", "MorningStar", "EveningStar",
+                    "ThreeWhiteSoldiers", "ThreeBlackCrows"
+                ],
+                "description": "candle_pattern only: which of TA-Lib's 17 named candlestick patterns the operand reads, by its DSL name — Doji, DragonflyDoji, GravestoneDoji, Hammer, InvertedHammer, HangingMan, ShootingStar, Marubozu, SpinningTop, Engulfing, Harami, Piercing, DarkCloudCover, MorningStar, EveningStar, ThreeWhiteSoldiers, ThreeBlackCrows. The value is TA-Lib's own integer on the closed bar — +100 bullish, -100 bearish, 0 no pattern, and ±80 for the partial Engulfing/Harami forms — so read `gt 0` for \"a bullish form fired\", `lt 0` for a bearish one, `eq 100`/`eq -100` for the full form only"
             },
             "timeframe": {
                 "type": "string",

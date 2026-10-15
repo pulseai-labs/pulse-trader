@@ -6,6 +6,9 @@
 //! `call_tool` plumbing — instead of forking it.
 
 pub mod mcp;
+// r5.s1.w1: the reference-CSV reader and the pattern streamer shared by
+// `tests/candle_patterns.rs` — its parity suite's plumbing.
+pub mod candle_patterns_support;
 // r4.s1.w5: the certification suites' shared world — a migrated DB, a
 // synthetic candle store with `HEAD`, one version and an open H = 12 freeze,
 // driven by `tests/certification_holdout.rs` (AC-1) and
