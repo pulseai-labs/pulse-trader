@@ -1259,7 +1259,7 @@ export default function BacktestLabScreen() {
           <RegimeBars cells={run.dto.regimes} />
           <Histogram title="MFE (R)" className="bt-mfe" hist={run.dto.mfe} />
           <Histogram title="MAE (R)" className="bt-mae" hist={run.dto.mae} />
-          <TradeTable trades={run.dto.trades} />
+          <TradeTable trades={run.dto.trades} runId={run.dto.runId} />
           <ChartTwins dto={run.dto} />
         </div>
       )}
@@ -1935,10 +1935,16 @@ const TRADE_FORMATTERS: Partial<
   maeR: rMultiple,
 };
 
-function TradeTable({ trades }: { trades: TradeRowDto[] }) {
+function TradeTable({ trades, runId }: { trades: TradeRowDto[]; runId: string }) {
   return (
     <section className="bt-section bt-trades-section" aria-label="Trades">
       <h3 className="bt-h">Trades</h3>
+      {/* r5.s2.w2: the tab that draws these trades on the run's own candles. The
+          handover is the fragment and the run id, never shared state (the #269
+          deep-link pattern one screen over). */}
+      <a className="ch-link" href={`#/chart?run=${runId}`}>
+        Open in Chart →
+      </a>
       {/* Keyboard-focusable scroll region: the table scrolls within it rather
           than being clipped by the pane. */}
       <div className="bt-table-scroll" role="region" aria-label="Trade rows" tabIndex={0}>

@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The Chart tab: a backtest drawn on its candles (r5.s2.w2, PDR-0036, PDR-0004).** The Mac app
+  gains a **Chart** tab — one full-width candle chart behind an adapter of our own in
+  `ui/src/chart/`, the only place in the app that imports TradingView's Lightweight Charts
+  (`5.2.1`, pinned exactly; its attribution logo stays on the chart). It opens on a pair and
+  timeframe (BTCUSDT 4h) with no run, and `#/chart?run=<id>` — the link the Backtest Lab's run
+  detail now carries — opens it on a backtest: the run's candles, **every entry and exit** as
+  markers (winners in bull, losers in bear, an open trade in amber), and the rule's **S/R
+  levels, pivots, candle patterns and EMA lines** exactly as `chart_data` returns them. Levels
+  draw stepped and dashed from the engine's per-bar values, never from a later bar; a pivot's
+  marker sits on its **confirmation** bar with a faint ghost on the bar it peaked `right` bars
+  earlier; a pattern draws below the bar in bull and above it in bear. The **primary / higher
+  timeframe switch** draws each overlay only on the timeframe the engine computed it on. A leg
+  whose whole span is over the 20,000-bar read cap is never sent to be refused: the tab says how
+  many bars it would be and asks for a trade, then reads a window around that trade — and
+  picking another trade outside that window reads around *it* rather than scrolling to a bar
+  that was never loaded. An open freeze's holdout shows as a plain withheld sentence, the
+  rule's other operands (RSI, ADX, MACD, …) are named as not drawn, and loading, a failed read
+  and an empty window each say so — no zero or placeholder ever stands in for a result
+  (PDR-0011). Nothing is reachable only through the canvas: the tab carries a table copy of the
+  window's trades, of every pivot and pattern event (the ghost's peak bar included) and of the
+  per-bar level and line values. Settings gains a minimal **About** section with the app's own
+  version and the line "Charts by TradingView Lightweight Charts™ — tradingview.com", linking
+  out to tradingview.com in a new tab so the app view is never replaced by it. No Rust, no
+  bindings and no fixture changed: this item is the tab.
+
 - **The chart read: a backtest drawn on its candles (r5.s2.w1, PDR-0036).** The app now has one
   app-scope read — `POST /api/v1/chart`, the `chart_data` bus command — that answers everything
   the Chart tab draws: a window of candles for a pair and timeframe (at most **20,000** bars per
