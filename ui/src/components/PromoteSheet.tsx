@@ -24,6 +24,8 @@ import type { BacktestRunDto, LibraryVersion, PromoteOverride, WalkForwardRunDto
 import { foldsHold } from "../format/numbers";
 import { openBacktestLab, requestPaperCountRefresh } from "../paper/handoff";
 import { CertBadge } from "./CertBadge";
+import { StreakCard } from "./StreakCard";
+import type { StreakCardState } from "./StreakCard";
 
 /** What the sheet promotes: one persisted version and how to label it. */
 export interface PromoteTarget {
@@ -53,6 +55,9 @@ interface PromoteSheetProps {
 export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps) {
   const [variant, setVariant] = useState<Variant>({ kind: "loading" });
   const [shape, setShape] = useState<BacktestRunDto | null>(null);
+  // The streak and drawdown card (r5.s4.w2) reads on its OWN state: a failed
+  // card read never changes the variant, the refusal or the buttons.
+  const [card, setCard] = useState<StreakCardState>({ state: "loading" });
   const [step, setStep] = useState<"explain" | "confirm">("explain");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -69,6 +74,21 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
     setVariant({ kind: "loading" });
     setStep("explain");
     setRefusal(null);
+    setCard({ state: "loading" });
+
+    // The card reads in parallel with the decision and independent of it: a
+    // failed card read never changes the variant, the refusal or the buttons —
+    // the trader can still promote (the card informs; the server's gate
+    // decides). Its only writer is `setCard`, and `alive` bounds it too.
+    void commands
+      .streakCard({ versionId })
+      .then((result) => {
+        if (!alive) return;
+        setCard(result.status === "ok" ? result.data : { state: "failed" });
+      })
+      .catch(() => {
+        if (alive) setCard({ state: "failed" });
+      });
 
     const decide = async () => {
       const status = await commands.serverStatus();
@@ -331,6 +351,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
               <span className="ps-lab">Equity</span>
               <span className="ps-eng">10,000 USDT fixed</span>
             </div>
+            <StreakCard card={card} />
             <p className="sh-note">
               The session runs on the server and keeps running while this Mac sleeps. A shadow
               backtest replays its bars to check it trade for trade.
@@ -435,6 +456,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
               <span className="ps-lab">Equity</span>
               <span className="ps-eng">10,000 USDT fixed</span>
             </div>
+            <StreakCard card={card} />
           </div>
         )}
         {refusal !== null && (
