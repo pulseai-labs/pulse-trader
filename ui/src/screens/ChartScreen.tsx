@@ -158,6 +158,17 @@ export default function ChartScreen() {
   // The free selection, readable from the fragment effect without re-running it.
   const freeRef = useRef(free);
 
+  /** The request the tab last asked for, kept in step with the state SYNCHRONOUSLY. An
+   *  answer that arrives after its own request was replaced must write nothing, and a
+   *  render that has not happened yet cannot be relied on to say so — so every path that
+   *  sets the request goes through here, and the read effect's answers compare
+   *  themselves with this ref (CR5). */
+  const requestRef = useRef<ChartRequest | null>(null);
+  const putRequest = (next: ChartRequest | null): void => {
+    requestRef.current = next;
+    setRequest(next);
+  };
+
   /** Take whatever is drawn off the canvas, and remember that nothing is. Nothing is
    *  put back until the next read's own layers arrive: an empty chart is not a stale one
    *  (PDR-0011). Called by any read that replaces the window, and by a run switch (CR3). */
@@ -202,6 +213,12 @@ export default function ChartScreen() {
     // previous run's candles or trades under the new run's name. This effect runs only
     // when the FRAGMENT changes, so a leg switch inside one run clears nothing and w2's
     // D4 stands: the window already drawn for that run stays drawn.
+    //
+    // The previous run's chart request is invalidated before anything else (CR5). That
+    // clears `request`, which cancels the read effect's in-flight read; and because the
+    // new request is a different object, any answer that still slips through — the old
+    // read's success OR its failure — writes nothing for this run (see `stillWanted`).
+    putRequest(null);
     clearDrawing();
     setRun(null);
     setLeg("primary");
@@ -210,7 +227,7 @@ export default function ChartScreen() {
     if (fragmentRun === null) {
       const freeRequest = requestFor(null, freeRef.current.pair, freeRef.current.timeframe, null);
       setPhase({ kind: "loading", what: loadingText(freeRequest) });
-      setRequest(freeRequest);
+      putRequest(freeRequest);
       return;
     }
     setPhase({ kind: "loading", what: `Loading backtest run ${fragmentRun}…` });
@@ -230,7 +247,7 @@ export default function ChartScreen() {
         setRun(context);
         setLeg(startLeg);
         setAnchorMs(null);
-        setRequest(requestFor(context, context.pair, timeframeOf(context, startLeg), null));
+        putRequest(requestFor(context, context.pair, timeframeOf(context, startLeg), null));
       } catch (error) {
         if (cancelled) return;
         setPhase({ kind: "failed", message: messageOf(error), code: "transport" });
@@ -255,6 +272,12 @@ export default function ChartScreen() {
     clearDrawing();
     setPhase({ kind: "loading", what: loadingText(request) });
     let cancelled = false;
+    /** Whether an answer that just arrived is still the answer to the request the tab
+     *  holds now. It is not, when this request was replaced while the read was in flight
+     *  — a leg switch, another trade, a free selection — or when the fragment named
+     *  another run, which invalidates the request outright (CR5): an answer asked for
+     *  under an identity the tab has left writes nothing, neither a refusal nor a window. */
+    const stillWanted = (): boolean => !cancelled && requestRef.current === request;
     void (async () => {
       try {
         const answer = await commands.chartData({
@@ -264,14 +287,14 @@ export default function ChartScreen() {
           toMs: request.plan.kind === "window" ? request.plan.toMs : null,
           runId: request.runId,
         });
-        if (cancelled) return;
+        if (!stillWanted()) return;
         if (answer.status !== "ok") {
           setPhase({ kind: "failed", message: answer.error.message, code: answer.error.code });
           return;
         }
         setPhase({ kind: "ready", dto: answer.data });
       } catch (error) {
-        if (cancelled) return;
+        if (!stillWanted()) return;
         setPhase({ kind: "failed", message: messageOf(error), code: "transport" });
       }
     })();
@@ -312,12 +335,12 @@ export default function ChartScreen() {
     setFree(freeRef.current);
     setRun(null);
     setAnchorMs(null);
-    setRequest(requestFor(null, pair, timeframe, null));
+    putRequest(requestFor(null, pair, timeframe, null));
   };
 
   const selectLeg = (next: Leg) => {
     setLeg(next);
-    setRequest(requestFor(run, run?.pair ?? free.pair, next === "htf" && run !== null
+    putRequest(requestFor(run, run?.pair ?? free.pair, next === "htf" && run !== null
       ? timeframeOf(run, "htf")
       : run === null
         ? free.timeframe
@@ -332,7 +355,7 @@ export default function ChartScreen() {
   const selectTrade = (trade: ChartTradeDto) => {
     setAnchorMs(trade.entryTime);
     if (drawnTimeframe !== timeframe || !covers(dto?.candles ?? [], trade.entryTime)) {
-      setRequest(requestFor(
+      putRequest(requestFor(
         run,
         run?.pair ?? free.pair,
         timeframe,

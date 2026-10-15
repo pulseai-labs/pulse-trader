@@ -13,7 +13,7 @@
 // window re-reads around itself rather than scrolling to a bar that is not drawn), the
 // holdout note, `notDrawn`, the empty/loading/failed states, and the About credit line.
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
@@ -168,17 +168,47 @@ function ok<T>(data: T): { status: "ok"; data: T } {
   return { status: "ok", data };
 }
 
-function failure(message: string) {
+function failure(message: string, code: "validation" | "not_found" = "validation") {
   return {
     status: "error" as const,
     error: {
-      code: "validation" as const,
+      code,
       message,
       run_id: null,
       session_id: null,
       child_run_id: null,
     },
   };
+}
+
+/** A promise the test settles itself, so that two reads' answers can be made to arrive
+ *  in an order the server would never be asked for (CR5). */
+function deferred<T>() {
+  let resolve!: (answer: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { resolve, promise };
+}
+
+/** Open run-old on its 4h leg with that chart read left in flight, then move the
+ *  fragment to run-new while it is still pending. The new run's own read is the
+ *  caller's to settle, so each test below fixes the order of the two answers. */
+async function switchRunWhileChartPending(
+  oldChart: ReturnType<typeof deferred<unknown>>,
+  newRunRead: ReturnType<typeof deferred<unknown>>,
+) {
+  vi.mocked(commands.getBacktestRun)
+    .mockResolvedValueOnce(ok(runDto({ runId: "run-old", trades: [tradeRow()] })) as never)
+    .mockReturnValueOnce(newRunRead.promise as never);
+  vi.mocked(commands.chartData).mockReturnValue(oldChart.promise as never);
+
+  await open("#/chart?run=run-old");
+  await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+
+  window.location.hash = "#/chart?run=run-new";
+  fireEvent(window, new HashChangeEvent("hashchange"));
+  await waitFor(() => expect(commands.getBacktestRun).toHaveBeenCalledTimes(2));
 }
 
 /** The run DTO the screen reads its pair, both timeframes and its span from. Only the
@@ -506,6 +536,93 @@ describe("a switch to another run (CR3)", () => {
     expect(within(after).getByText("2025-03-27 00:00 UTC")).toBeTruthy();
     // The old run's read is not repeated for the new run: it is over the cap.
     expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("an answer that outlived its run (CR5)", () => {
+  it("keeps the new run's not-found refusal when the old run's chart answer lands after it", async () => {
+    const oldChart = deferred<unknown>();
+    const newRun = deferred<unknown>();
+    await switchRunWhileChartPending(oldChart, newRun);
+
+    // The new run is not a run at all: its read refuses with not_found.
+    await act(async () => newRun.resolve(failure("no backtest run run-new", "not_found")));
+    expect((await screen.findByRole("alert")).textContent).toContain("no backtest run run-new");
+
+    // The old run's chart now succeeds. It was asked for under an identity the fragment
+    // no longer names, so it may draw nothing and erase nothing: the refusal stands.
+    await act(async () =>
+      oldChart.resolve(ok(chartDto({ run: runLayer({ runId: "run-old" }) }))),
+    );
+
+    expect(screen.getByRole("alert").textContent).toContain("no backtest run run-new");
+    expect(h.adapter.setCandles).not.toHaveBeenCalled();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops the old run's refusal when the new run is a valid over-cap run", async () => {
+    const oldChart = deferred<unknown>();
+    const newRun = deferred<unknown>();
+    await switchRunWhileChartPending(oldChart, newRun);
+
+    // The old run's failure lands while the new run's read is still in flight: it
+    // belongs to a run the fragment has left, so nothing is shown for it.
+    await act(async () =>
+      oldChart.resolve(failure("run-old chart cannot read old snapshot", "not_found")),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    // The new run is a valid primary-only 15m run whose 400-day span is over the cap:
+    // it asks for a trade and shows its OWN stored rows.
+    await act(async () =>
+      newRun.resolve(
+        ok(
+          runDto({
+            runId: "run-new",
+            primaryTimeframe: "15m",
+            htfTimeframe: null,
+            usesHtf: false,
+            trades: [
+              tradeRow({
+                entryFillTime: String(EARLIER_ENTRY),
+                exitFillTime: String(EARLIER_ENTRY + DAY),
+              }),
+            ],
+          }),
+        ),
+      ),
+    );
+
+    expect(await screen.findByText(/Pick a trade to load 15m around it/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("Backtest run run-new · 15m")).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(table).getByText("2025-03-27 00:00 UTC")).toBeTruthy();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    expect(h.adapter.setCandles).not.toHaveBeenCalled();
+  });
+
+  it("keeps a leg switch inside one run's D4 behaviour while a chart read is in flight", async () => {
+    const firstRead = deferred<unknown>();
+    vi.mocked(commands.chartData).mockReturnValue(firstRead.promise as never);
+
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+
+    // Same run, same fragment: switching to the over-cap 15m leg asks for a trade. It
+    // sends no read and clears nothing (D4) — the tab has not even drawn the 4h read.
+    fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
+    expect(await screen.findByText(/Pick a trade to load 15m around it/)).toBeTruthy();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    expect(h.adapter.setCandles).not.toHaveBeenCalled();
+
+    // The superseded 4h read answers afterwards: it writes nothing — no window under the
+    // 15m chip, no refusal — and the notice it was switched away from stands.
+    await act(async () => firstRead.resolve(ok(chartDto({ run: runLayer() }))));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(h.adapter.setCandles).not.toHaveBeenCalled();
+    expect(screen.getByText(/Pick a trade to load 15m around it/)).toBeTruthy();
+    expect(screen.getByText("Backtest run run-1 · 15m")).toBeTruthy();
   });
 });
 
