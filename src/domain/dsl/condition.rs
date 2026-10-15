@@ -455,10 +455,11 @@ mod prop_tests {
         ]
     }
 
-    /// The schema-1.4.0 named candle patterns (r5.s1.w1): parameterless like the
-    /// anatomy variants, so one `Just` arm per pattern of this item. The four
-    /// three-bar patterns (`MorningStar`, `EveningStar`, `ThreeWhiteSoldiers`,
-    /// `ThreeBlackCrows`) are r5.s1.w2's, additively.
+    /// The schema-1.4.0 named candle patterns (r5.s1.w1; the four three-bar
+    /// patterns added by r5.s1.w2): parameterless like the anatomy variants, so
+    /// one `Just` arm per pattern — the spine's full 17. The coverage probe
+    /// above asserts this list is complete, so a dropped arm is a red, not a
+    /// silent shrink.
     fn arb_candle_pattern_indicator_spec() -> impl Strategy<Value = IndicatorSpec> {
         prop_oneof![
             Just(IndicatorSpec::CandlePattern {
@@ -511,6 +512,22 @@ mod prop_tests {
             .boxed(),
             Just(IndicatorSpec::CandlePattern {
                 pattern: CandlePatternName::DarkCloudCover,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::MorningStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::EveningStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ThreeWhiteSoldiers,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ThreeBlackCrows,
             })
             .boxed(),
         ]
@@ -643,11 +660,15 @@ mod prop_tests {
         }
     }
 
-    /// r5.s1.w1: the generator really does produce every schema-1.4.0 candle
-    /// pattern, so the round-trip property above exercises all 13 and a dropped
-    /// arm cannot silently shrink coverage. The probe draws a bounded sample and
-    /// asserts set equality both ways — an arm for a value the catalog does not
-    /// have would fail too.
+    /// r5.s1.w1, extended r5.s1.w2: the generator really does produce every
+    /// schema-1.4.0 candle pattern, so the round-trip property above exercises
+    /// all 17 and a dropped arm cannot silently shrink coverage. The probe draws
+    /// a bounded sample and asserts set equality both ways — an arm for a value
+    /// the catalog does not have would fail too.
+    ///
+    /// The expected set is enumerated here rather than derived from the enum,
+    /// so extending the enum without extending this list is itself a failure:
+    /// the four three-bar patterns of r5.s1.w2 are listed below.
     ///
     /// Names are keyed by their `Debug` spelling: `CandlePatternName` deliberately
     /// derives no `Ord` (nothing in production needs one), and a test must not
@@ -657,7 +678,7 @@ mod prop_tests {
         use proptest::strategy::ValueTree;
         use std::collections::BTreeSet;
 
-        const CATALOG: [CandlePatternName; 13] = [
+        const CATALOG: [CandlePatternName; 17] = [
             CandlePatternName::Doji,
             CandlePatternName::DragonflyDoji,
             CandlePatternName::GravestoneDoji,
@@ -671,6 +692,10 @@ mod prop_tests {
             CandlePatternName::Harami,
             CandlePatternName::Piercing,
             CandlePatternName::DarkCloudCover,
+            CandlePatternName::MorningStar,
+            CandlePatternName::EveningStar,
+            CandlePatternName::ThreeWhiteSoldiers,
+            CandlePatternName::ThreeBlackCrows,
         ];
 
         let strategy = arb_structure_indicator_spec();
@@ -690,7 +715,7 @@ mod prop_tests {
         assert_eq!(
             seen,
             want,
-            "the generator must produce exactly this item's 13 candle patterns; \
+            "the generator must produce exactly the spine's 17 candle patterns; \
              missing: {:?}; unexpected: {:?}",
             want.difference(&seen).collect::<Vec<_>>(),
             seen.difference(&want).collect::<Vec<_>>(),

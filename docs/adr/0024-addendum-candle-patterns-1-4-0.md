@@ -52,11 +52,15 @@ the seam stays "indicators, not conditions".
 `rename_all`), so the wire form is
 `{"indicator":"CandlePattern","pattern":"Engulfing"}` — the same spelling
 discipline as `PriceField` and the `CandlePattern` tag itself. Its values are
-`Doji`, `DragonflyDoji`, `GravestoneDoji`, `Hammer`, `InvertedHammer`,
-`HangingMan`, `ShootingStar`, `Marubozu`, `SpinningTop`, `Engulfing`, `Harami`,
-`Piercing`, `DarkCloudCover`; r5.s1.w2 adds `MorningStar`, `EveningStar`,
-`ThreeWhiteSoldiers` and `ThreeBlackCrows` as further values **inside 1.4.0**
-(additive, as r4.s6.w3 was inside 1.3.0 — no second version step).
+the spine's full **17** named patterns: the one-bar `Doji`, `DragonflyDoji`,
+`GravestoneDoji`, `Hammer`, `InvertedHammer`, `HangingMan`, `ShootingStar`,
+`Marubozu` and `SpinningTop`; the two-bar `Engulfing`, `Harami`, `Piercing` and
+`DarkCloudCover`; and the three-bar `MorningStar`, `EveningStar`,
+`ThreeWhiteSoldiers` and `ThreeBlackCrows`. `r5.s1.w1` shipped the first 13 and
+`r5.s1.w2` added the four three-bar values **inside 1.4.0** — additive, as
+`r4.s6.w3` was inside 1.3.0, with **no second version step**: the wire form, the
+served schema's version enum and the registered migration chain are unchanged by
+w2, and no existing document's meaning moves.
 
 **The `±80` partial forms, and why they are not folded into `±100`.** TA-Lib
 emits `±80` where a body end of the second candle coincides with the prior
@@ -88,17 +92,26 @@ PDR-0003 allows.
 **The reference pin.** TA-Lib Python **0.6.8** / TA-Lib C **0.6.4**. On the
 committed BTCUSDT fixture series (15m, 2,976 bars; 4h, 186 bars) and three
 hand-built sequences, an exact-decimal implementation of the plain-words
-definitions matches TA-Lib on **every bar of every pattern**, with no tie
+definitions matches TA-Lib on **every bar of all 17 patterns**, with no tie
 deciding any output; the parity suite therefore carries an **empty** exception
-list.
+list. `Piercing`, `DarkCloudCover` and `ThreeBlackCrows` never fire on the
+fixture bars (crypto perpetual bars open at the prior close, so the strict
+real-body gap and "opens inside the prior body" tests reject every bar), so each
+is read from a hand-built sequence of its own; the rest reach the three-occurrence
+floor on the reference series.
 
-**The candle ring.** All 13 variants read one shared ring of the last
+**The candle ring.** All 17 variants read one shared ring of the last
 `RING_LEN = 13` bars, plus the TA-Lib candle settings' trailing averages
-(`BodyLong`, `BodyShort`, `BodyDoji`, `ShadowLong`, `ShadowVeryShort`, `Near`).
-One evaluator function of the ring per pattern, so w2's four three-bar patterns
-add four evaluators and four enum values and **no** new engine, validation,
-mutation or formatter arm. The averages are evaluated as `N × x ⋛ f × sum` (the
-definitions' §2.2 exact-decimal form) so no division enters a comparison.
+(`BodyLong`, `BodyShort`, `BodyDoji`, `ShadowLong`, `ShadowVeryShort`, `Near`,
+and `Far`, which only `ThreeWhiteSoldiers` needs). One evaluator function of the
+ring per pattern, so w2's four three-bar patterns added four evaluators and four
+enum values and **no** new `IndicatorSpec` variant, engine, validation, mutation
+or formatter arm — the one new shared constant is `Far`. The deepest window any
+of the 17 reads is bar `t-12` (offset 12, inside `RING_LEN = 13`): the stars'
+`avg(BodyLong, t-2)` and the crows' `avg(ShadowVeryShort, t-2)` both end there.
+The averages are evaluated as `N × x ⋛ f × sum` (the definitions' §2.2
+exact-decimal form) so no division enters a comparison, and the stars' fixed
+`0.3` penetration is the exact `3 × body / 10`.
 
 **No repaint, no look-ahead.** A pattern's value at bar t reads only bars at or
 before t, so the values on a series truncated at any bar equal the full series'

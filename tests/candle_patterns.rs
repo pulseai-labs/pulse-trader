@@ -1,13 +1,13 @@
-//! r5.s1.w1 — the candle-pattern acceptance suite (demo line d99, w1's half).
+//! r5.s1.w1 and r5.s1.w2 — the candle-pattern acceptance suite (demo line d99).
 //!
 //! Schema **1.4.0** adds one `IndicatorSpec::CandlePattern { pattern }` variant
 //! carrying TA-Lib's own integer (`+100` / `-100` / `0`, and `±80` for the
-//! partial Engulfing and Harami forms), plus this item's 13 one- and two-bar
-//! patterns. This suite pins that against TA-Lib's own output on the committed
-//! BTCUSDT fixture bars:
+//! partial Engulfing and Harami forms), plus the spine's 17 named patterns —
+//! w1's 13 one- and two-bar patterns and w2's four three-bar ones. This suite
+//! pins that against TA-Lib's own output on the committed BTCUSDT fixture bars:
 //!
 //! - **(a) Reference parity.** For each pattern, every bar of both reference
-//!   CSVs and of the two synthetic sequences must equal TA-Lib's integer
+//!   CSVs and of the three synthetic sequences must equal TA-Lib's integer
 //!   exactly, and rows before the pattern's lookback must read `None` — the
 //!   CSV's `0` there is TA-Lib's padding, NOT "no pattern". No tolerance, no
 //!   skipped row, and the exception list is **empty** (a mismatch stops the
@@ -51,9 +51,12 @@ use support::candle_patterns_support as cp;
 // The catalog
 // ---------------------------------------------------------------------------
 
-/// The 13 patterns of this work item, in catalog order, each with its TA-Lib
-/// function name and its lookback `L` (definitions §5, used EXACTLY as listed).
-const CATALOG: [(CandlePatternName, &str, u64); 13] = [
+/// The 17 patterns across both work items of the spine, in catalog order, each
+/// with its TA-Lib function name and its lookback `L` (definitions §5, used
+/// EXACTLY as listed). w1 shipped the first 13; w2 added the four three-bar
+/// patterns, which sit on w1's ring and under the same one `CandlePattern`
+/// variant.
+const CATALOG: [(CandlePatternName, &str, u64); 17] = [
     (CandlePatternName::Doji, "CDLDOJI", 10),
     (CandlePatternName::DragonflyDoji, "CDLDRAGONFLYDOJI", 10),
     (CandlePatternName::GravestoneDoji, "CDLGRAVESTONEDOJI", 10),
@@ -67,13 +70,22 @@ const CATALOG: [(CandlePatternName, &str, u64); 13] = [
     (CandlePatternName::Harami, "CDLHARAMI", 11),
     (CandlePatternName::Piercing, "CDLPIERCING", 11),
     (CandlePatternName::DarkCloudCover, "CDLDARKCLOUDCOVER", 11),
+    // r5.s1.w2: the three-bar patterns. ThreeBlackCrows' `L` is 13, one bar
+    // more than its conditions need — TA-Lib's declared formula, used as listed.
+    (CandlePatternName::MorningStar, "CDLMORNINGSTAR", 12),
+    (CandlePatternName::EveningStar, "CDLEVENINGSTAR", 12),
+    (
+        CandlePatternName::ThreeWhiteSoldiers,
+        "CDL3WHITESOLDIERS",
+        12,
+    ),
+    (CandlePatternName::ThreeBlackCrows, "CDL3BLACKCROWS", 13),
 ];
 
-/// Which CSVs each pattern is read from. `Piercing` and `DarkCloudCover` never
-/// fire on the fixture bars (crypto bars open at the prior close, so the strict
-/// real-body gap tests reject every bar), so they are read from their synthetic
-/// sequence as well. The verdict `ThreeBlackCrows` sequence carries no w1
-/// pattern column and is not read here — it is w2's, and it ships for w2's use.
+/// Which CSVs each pattern is read from. `Piercing`, `DarkCloudCover` and
+/// `ThreeBlackCrows` never fire on the fixture bars (crypto bars open at the
+/// prior close, so the strict real-body gap tests the definitions state reject
+/// every bar), so each is read from its own synthetic sequence as well.
 #[derive(Clone, Copy)]
 struct Source {
     /// The file name under `tests/fixtures/candle-patterns/`.
@@ -82,7 +94,7 @@ struct Source {
     only: Option<CandlePatternName>,
 }
 
-const SOURCES: [Source; 4] = [
+const SOURCES: [Source; 5] = [
     Source {
         file: "talib-reference-15m.csv",
         only: None,
@@ -98,6 +110,10 @@ const SOURCES: [Source; 4] = [
     Source {
         file: "talib-synthetic-CDLDARKCLOUDCOVER.csv",
         only: Some(CandlePatternName::DarkCloudCover),
+    },
+    Source {
+        file: "talib-synthetic-CDL3BLACKCROWS.csv",
+        only: Some(CandlePatternName::ThreeBlackCrows),
     },
 ];
 

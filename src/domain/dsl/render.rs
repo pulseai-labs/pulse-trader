@@ -226,6 +226,10 @@ fn candle_pattern_word(pattern: CandlePatternName) -> &'static str {
         CandlePatternName::Harami => "harami",
         CandlePatternName::Piercing => "piercing",
         CandlePatternName::DarkCloudCover => "dark cloud cover",
+        CandlePatternName::MorningStar => "morning star",
+        CandlePatternName::EveningStar => "evening star",
+        CandlePatternName::ThreeWhiteSoldiers => "three white soldiers",
+        CandlePatternName::ThreeBlackCrows => "three black crows",
     }
 }
 

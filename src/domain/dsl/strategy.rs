@@ -391,10 +391,10 @@ mod prop_tests {
         ]
     }
 
-    /// The schema-1.4.0 named candle patterns (r5.s1.w1): parameterless like the
-    /// anatomy variants, so one `Just` arm per pattern of this item. The four
-    /// three-bar patterns (`MorningStar`, `EveningStar`, `ThreeWhiteSoldiers`,
-    /// `ThreeBlackCrows`) are r5.s1.w2's, additively.
+    /// The schema-1.4.0 named candle patterns (r5.s1.w1; the four three-bar
+    /// patterns added by r5.s1.w2): parameterless like the anatomy variants, so
+    /// one `Just` arm per pattern — the spine's full 17, mirroring the same
+    /// generator in `condition.rs`.
     fn arb_candle_pattern_indicator_spec() -> impl Strategy<Value = IndicatorSpec> {
         prop_oneof![
             Just(IndicatorSpec::CandlePattern {
@@ -447,6 +447,22 @@ mod prop_tests {
             .boxed(),
             Just(IndicatorSpec::CandlePattern {
                 pattern: CandlePatternName::DarkCloudCover,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::MorningStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::EveningStar,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ThreeWhiteSoldiers,
+            })
+            .boxed(),
+            Just(IndicatorSpec::CandlePattern {
+                pattern: CandlePatternName::ThreeBlackCrows,
             })
             .boxed(),
         ]

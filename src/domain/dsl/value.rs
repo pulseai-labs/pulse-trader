@@ -90,8 +90,9 @@ pub enum MacdOutput {
 /// separate vocabulary (w3's), and this enum is the document's spelling.
 ///
 /// The four three-bar patterns (`MorningStar`, `EveningStar`,
-/// `ThreeWhiteSoldiers`, `ThreeBlackCrows`) land in r5.s1.w2 as additive values
-/// inside 1.4.0, on the same candle ring this item builds.
+/// `ThreeWhiteSoldiers`, `ThreeBlackCrows`) landed in r5.s1.w2 as additive
+/// values inside 1.4.0, on the same candle ring w1 built: the enum now carries
+/// the spine's full 17 named patterns, and no second version step was needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum CandlePatternName {
     /// `CDLDOJI` — a bar whose body is at most 10% of the recent mean range.
@@ -124,6 +125,19 @@ pub enum CandlePatternName {
     /// `CDLDARKCLOUDCOVER` — a black bar closing below the midpoint of a prior
     /// long white body, opening above its high.
     DarkCloudCover,
+    /// `CDLMORNINGSTAR` — a long black candle, a small candle gapping down under
+    /// its body, then a white candle closing more than 30% back into the first.
+    MorningStar,
+    /// `CDLEVENINGSTAR` — the morning star's mirror: a long white candle, a
+    /// small candle gapping up over its body, then a black candle closing more
+    /// than 30% back into the first.
+    EveningStar,
+    /// `CDL3WHITESOLDIERS` — three rising white candles with almost no upper
+    /// shadows; only the third is required not to be short.
+    ThreeWhiteSoldiers,
+    /// `CDL3BLACKCROWS` — a white bar, then three falling black candles each
+    /// opening strictly inside the prior body; no body-length condition.
+    ThreeBlackCrows,
 }
 
 /// A typed reference to a technical indicator and its parameters.
