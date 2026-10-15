@@ -44,6 +44,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   patterns were implemented from a plain-words specification and TA-Lib's output only — no
   TA-Lib source was read or ported (PDR-0003).
 
+- **The agent learns the 1.4.0 candle patterns, and a 4h support-rejection example ships with a
+  golden (r5.s1.w3).** Every agent surface now names the 17 patterns. `pulse mcp`'s
+  `export_indicators` takes a `cdl:<name>` token — the name matches ignoring case and underscores,
+  and the column is always labelled `cdl:<snake_case>`, so `cdl:Engulfing` and `cdl:engulfing` are
+  one column — and the CLI's `--indicator` flag shares that parser. The composer's builder tools
+  take a `candle_pattern` operand with a `pattern` field: the advertised enum lists all 17 names,
+  and a missing or unknown one comes back as a correctable error on `pattern`. The composer prompt
+  gains the schema-1.4.0 candle-pattern operand section — the 17 names with their signs, the
+  `Gt 0` = "a bullish form fired" / `Lt 0` / `Eq 100` reading rule, closed-bar evaluation, the ±80
+  partial `Engulfing`/`Harami` forms, and `htf` support — plus a worked "4h support rejection"
+  example, and `pulse://dsl/schema`'s conventions gain a `candle_patterns` entry. The example,
+  `examples/strategies/support-rejection-4h.json`, is a schema-1.4.0 long-only strategy: a closed
+  H4 bar must reach the level the **previous** H4 bar carried as `Support` (within a 0.5% band) and
+  close back above it, and that same bar must be a bullish **hammer**.
+  `tests/candle_pattern_example.rs` pins its frozen golden — 4 trades on the committed fixture —
+  and checks, from independently streamed series, that every entry sits on a bar where both the
+  support touch and the named pattern held.
+
 - **The Backtest Lab's version picker, and the seeded QA library it searches (r4.s5.w2).** The Lab's
   native version `<select>` is replaced by a searchable combobox (grill A4): type-to-filter,
   case-insensitive, on the strategy name, the version label (`v<n>`) and the version id's 8-character
