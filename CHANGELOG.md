@@ -8,6 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The chart read: a backtest drawn on its candles (r5.s2.w1, PDR-0036).** The app now has one
+  app-scope read — `POST /api/v1/chart`, the `chart_data` bus command — that answers everything
+  the Chart tab draws: a window of candles for a pair and timeframe (at most **20,000** bars per
+  read; a window over the cap is refused with the cap and the count named, never silently
+  truncated) and, when a backtest run is named, that run's **stored trades** (entry and exit
+  time and price, side, exit reason, realized R — drawn for the pair *and* the higher timeframe)
+  plus one **overlay series per S/R, pivot, candle-pattern and EMA operand** its version's rule
+  uses on that timeframe, each labelled with the exact token `export_indicators` accepts
+  (`support:3-3-0.005-2-100`, `cdl:engulfing`, `pivot_high:1-1`, `ema:50`) and each computed by
+  the engine over the whole cut series, so an overlay's values equal what an agent sees for the
+  same token, pair, timeframe and data version. Levels and EMA lines arrive as per-bar values
+  (drawn as they stood at each bar, never from a later bar), pivots as one event on their
+  confirmation bar with the peak bar `right` bars earlier, patterns as one event per non-zero
+  bar; the rule's other operands (RSI, ADX, MACD, ATR, wicks, necklines, trendlines) come back
+  named in `notDrawn` instead of guessed. Every read cuts candles at an open freeze's holdout
+  start **before** the engine steps and reports how many bars it withheld inside the window;
+  an unknown run is a 422 `not_found`, and a pair or timeframe the run does not use is a 422
+  naming the field. The token formatter is the parser's inverse, proven by
+  `parse(label(spec)) == spec`, and [ADR-0030](docs/adr/0030-chart-adapter-and-overlay-read.md)
+  records the chart adapter boundary this read serves.
+
 - **The streak and drawdown card in the Promote sheet (r5.s4.w2, PDR-0035).** Before the
   confirm button — in the certified body and in the override confirm step — the Promote sheet
   now shows **"A normal bad run"**: the longest losing streak, and the max drawdown in R and in

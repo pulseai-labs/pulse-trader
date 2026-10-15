@@ -900,6 +900,15 @@ pub use crate::tauri::{
     DecimalPercentilesDto, StreakCardDto, StreakCardRequest, StreakPercentilesDto, streak_card_core,
 };
 
+// r5.s2.w1 (PDR-0036): the chart read contract — the wire shapes and the
+// transport-free core behind `POST /api/v1/chart` and the `chart_data` bus command
+// (ADR-0020: additive only).
+pub use crate::tauri::{
+    CHART_BAR_CAP, ChartCandleDto, ChartDataDto, ChartDataRequest, ChartHoldoutDto,
+    ChartOverlayDto, ChartPatternEventDto, ChartPivotEventDto, ChartRunDto, ChartTradeDto,
+    chart_data_core,
+};
+
 // r4.s1.w5 (spec A2/A3, G7/C1/C4/C5): the certification step and its record.
 // The step is the ONE caller allowed to evaluate the holdout (grill Q4); its
 // store is the certification table's only writer. Surfaced for the MCP tool,

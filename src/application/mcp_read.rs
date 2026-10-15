@@ -420,6 +420,192 @@ fn parse_trendline(token: &str, kind: &str, rest: &str) -> anyhow::Result<Indica
     })
 }
 
+/// The token a client accepts for `spec` (r5.s2.w1) — the exact inverse of
+/// [`parse_indicator_specs`], so a label this ring's callers emit is always a
+/// token `pulse indicators` and MCP `export_indicators` read back:
+/// `parse_indicator_specs(&[indicator_label(spec)])` returns one column whose
+/// `spec` is `spec`.
+///
+/// Spelled exactly as the parser's own labels: the case-normalized kind, a
+/// `normalize()`d decimal tolerance, the fixed `cdl:<snake_case>` name, and the
+/// `highest`/`lowest` field elided when it is that kind's default (an explicit
+/// write always shows, the macd-output precedent). A [`SweepableValue::Sweep`]
+/// has no token in this grammar — validation rejects every sweep before a
+/// compiled rule can carry one — so a swept leaf renders as its bounds
+/// (`50..100..10`), diagnostic text no parser accepts.
+#[must_use]
+pub fn indicator_label(spec: &IndicatorSpec) -> String {
+    match spec {
+        IndicatorSpec::Rsi { period } => format!("rsi:{}", period_label(period)),
+        IndicatorSpec::Ema { period } => format!("ema:{}", period_label(period)),
+        IndicatorSpec::Adx { period } => format!("adx:{}", period_label(period)),
+        IndicatorSpec::Atr { period } => format!("atr:{}", period_label(period)),
+        IndicatorSpec::Highest { period, source } => {
+            rolling_label("highest", period, *source, PriceField::High)
+        }
+        IndicatorSpec::Lowest { period, source } => {
+            rolling_label("lowest", period, *source, PriceField::Low)
+        }
+        IndicatorSpec::Macd {
+            fast,
+            slow,
+            signal,
+            output,
+        } => {
+            let output = match output {
+                MacdOutput::Line => "",
+                MacdOutput::Signal => ":signal",
+                MacdOutput::Histogram => ":histogram",
+            };
+            format!(
+                "macd:{}-{}-{}{output}",
+                period_label(fast),
+                period_label(slow),
+                period_label(signal)
+            )
+        }
+        IndicatorSpec::PivotHigh { left, right } => {
+            format!("pivot_high:{}-{}", period_label(left), period_label(right))
+        }
+        IndicatorSpec::PivotLow { left, right } => {
+            format!("pivot_low:{}-{}", period_label(left), period_label(right))
+        }
+        IndicatorSpec::Resistance {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => level_label(
+            "resistance",
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        ),
+        IndicatorSpec::Support {
+            left,
+            right,
+            tolerance_pct,
+            min_touches,
+            lookback,
+        } => level_label("support", left, right, tolerance_pct, min_touches, lookback),
+        IndicatorSpec::DoubleTopNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => neckline_label("double_top_neckline", left, right, tolerance_pct),
+        IndicatorSpec::DoubleBottomNeckline {
+            left,
+            right,
+            tolerance_pct,
+        } => neckline_label("double_bottom_neckline", left, right, tolerance_pct),
+        IndicatorSpec::TrendlineLows { left, right } => {
+            format!(
+                "trendline_lows:{}-{}",
+                period_label(left),
+                period_label(right)
+            )
+        }
+        IndicatorSpec::TrendlineHighs { left, right } => {
+            format!(
+                "trendline_highs:{}-{}",
+                period_label(left),
+                period_label(right)
+            )
+        }
+        IndicatorSpec::Body => "body".to_owned(),
+        IndicatorSpec::UpperWick => "upper_wick".to_owned(),
+        IndicatorSpec::LowerWick => "lower_wick".to_owned(),
+        IndicatorSpec::Range => "range".to_owned(),
+        IndicatorSpec::CandlePattern { pattern } => format!("cdl:{}", pattern_snake(*pattern)),
+    }
+}
+
+/// A period leaf as its token text (`50`), or a sweep's bounds (unreachable from
+/// a compiled rule, and read by no parser).
+fn period_label(period: &SweepableValue<u32>) -> String {
+    match period {
+        SweepableValue::Fixed(period) => period.to_string(),
+        SweepableValue::Sweep { start, end, step } => format!("{start}..{end}..{step}"),
+    }
+}
+
+/// A decimal leaf as its token text, `normalize()`d like the parser's own label
+/// (`0.0030` and `0.003` are one column).
+fn decimal_label(value: &SweepableValue<Decimal>) -> String {
+    match value {
+        SweepableValue::Fixed(value) => value.normalize().to_string(),
+        SweepableValue::Sweep { start, end, step } => format!("{start}..{end}..{step}"),
+    }
+}
+
+/// The `highest:` / `lowest:` token — the field elided when it is that kind's
+/// default, exactly as [`parse_rolling_extreme`] builds its label.
+fn rolling_label(
+    kind: &str,
+    period: &SweepableValue<u32>,
+    source: PriceField,
+    default: PriceField,
+) -> String {
+    if source == default {
+        format!("{kind}:{}", period_label(period))
+    } else {
+        format!(
+            "{kind}:{}:{}",
+            period_label(period),
+            price_field_label(source)
+        )
+    }
+}
+
+/// The `support:` / `resistance:` token: the span, the normalized tolerance
+/// fraction, `min_touches` and `lookback`.
+fn level_label(
+    kind: &str,
+    left: &SweepableValue<u32>,
+    right: &SweepableValue<u32>,
+    tolerance_pct: &SweepableValue<Decimal>,
+    min_touches: &SweepableValue<u32>,
+    lookback: &SweepableValue<u32>,
+) -> String {
+    format!(
+        "{kind}:{}-{}-{}-{}-{}",
+        period_label(left),
+        period_label(right),
+        decimal_label(tolerance_pct),
+        period_label(min_touches),
+        period_label(lookback)
+    )
+}
+
+/// The neckline tokens: the span and the normalized tolerance fraction.
+fn neckline_label(
+    kind: &str,
+    left: &SweepableValue<u32>,
+    right: &SweepableValue<u32>,
+    tolerance_pct: &SweepableValue<Decimal>,
+) -> String {
+    format!(
+        "{kind}:{}-{}-{}",
+        period_label(left),
+        period_label(right),
+        decimal_label(tolerance_pct)
+    )
+}
+
+/// The one spelling the parser accepts for a price field.
+fn price_field_label(field: PriceField) -> &'static str {
+    match field {
+        PriceField::Open => "open",
+        PriceField::High => "high",
+        PriceField::Low => "low",
+        PriceField::Close => "close",
+        PriceField::Volume => "volume",
+    }
+}
+
 /// The 17 named candle patterns of schema 1.4.0 (r5.s1.w1) with their
 /// `cdl:` read-path names (r5.s1.w3), in catalog order.
 const CANDLE_PATTERNS: [(CandlePatternName, &str); 17] = [
@@ -444,6 +630,32 @@ const CANDLE_PATTERNS: [(CandlePatternName, &str); 17] = [
     ),
     (CandlePatternName::ThreeBlackCrows, "three_black_crows"),
 ];
+
+/// The `cdl:<snake_case>` name of a pattern — the ONE spelling
+/// [`CANDLE_PATTERNS`] carries, written as an exhaustive match so a new pattern
+/// is a compile error here rather than a mislabelled overlay, and asserted
+/// against that table by this module's own test so the two cannot drift.
+fn pattern_snake(pattern: CandlePatternName) -> &'static str {
+    match pattern {
+        CandlePatternName::Doji => "doji",
+        CandlePatternName::DragonflyDoji => "dragonfly_doji",
+        CandlePatternName::GravestoneDoji => "gravestone_doji",
+        CandlePatternName::Hammer => "hammer",
+        CandlePatternName::InvertedHammer => "inverted_hammer",
+        CandlePatternName::HangingMan => "hanging_man",
+        CandlePatternName::ShootingStar => "shooting_star",
+        CandlePatternName::Marubozu => "marubozu",
+        CandlePatternName::SpinningTop => "spinning_top",
+        CandlePatternName::Engulfing => "engulfing",
+        CandlePatternName::Harami => "harami",
+        CandlePatternName::Piercing => "piercing",
+        CandlePatternName::DarkCloudCover => "dark_cloud_cover",
+        CandlePatternName::MorningStar => "morning_star",
+        CandlePatternName::EveningStar => "evening_star",
+        CandlePatternName::ThreeWhiteSoldiers => "three_white_soldiers",
+        CandlePatternName::ThreeBlackCrows => "three_black_crows",
+    }
+}
 
 /// Parse the `cdl:<name>` form (r5.s1.w3). `<name>` matches a pattern ignoring
 /// case and underscores, so `cdl:morning_star`, `cdl:MorningStar` and
@@ -1021,6 +1233,140 @@ mod tests {
             for (_, snake, _) in CDL_NAMES {
                 assert!(text.contains(snake), "the error lists {snake}: {text}");
             }
+        }
+    }
+
+    /// r5.s2.w1 (SPINE G2/AC-1): every spec a compiled rule can carry has a
+    /// label the token parser accepts, and `parse(label(spec)) == spec` — so the
+    /// chart read's overlays are always addressable through `export_indicators`.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of every spec kind, read in one pass
+    fn indicator_label_round_trips_through_the_token_parser() {
+        use super::{CANDLE_PATTERNS, indicator_label, parse_indicator_specs};
+        use crate::domain::{IndicatorSpec, MacdOutput, PriceField, SweepableValue};
+        use rust_decimal::Decimal;
+
+        /// A fixed period leaf.
+        fn fixed(value: u32) -> SweepableValue<u32> {
+            SweepableValue::Fixed(value)
+        }
+
+        /// A fixed decimal leaf.
+        fn fixed_decimal(value: Decimal) -> SweepableValue<Decimal> {
+            SweepableValue::Fixed(value)
+        }
+
+        let mut specs = vec![
+            IndicatorSpec::Rsi { period: fixed(14) },
+            IndicatorSpec::Ema { period: fixed(50) },
+            IndicatorSpec::Adx { period: fixed(14) },
+            IndicatorSpec::Atr { period: fixed(14) },
+            IndicatorSpec::Highest {
+                period: fixed(20),
+                source: PriceField::High,
+            },
+            IndicatorSpec::Highest {
+                period: fixed(20),
+                source: PriceField::Close,
+            },
+            IndicatorSpec::Lowest {
+                period: fixed(20),
+                source: PriceField::Low,
+            },
+            IndicatorSpec::Lowest {
+                period: fixed(20),
+                source: PriceField::Volume,
+            },
+            IndicatorSpec::Macd {
+                fast: fixed(12),
+                slow: fixed(26),
+                signal: fixed(9),
+                output: MacdOutput::Line,
+            },
+            IndicatorSpec::Macd {
+                fast: fixed(12),
+                slow: fixed(26),
+                signal: fixed(9),
+                output: MacdOutput::Signal,
+            },
+            IndicatorSpec::Macd {
+                fast: fixed(12),
+                slow: fixed(26),
+                signal: fixed(9),
+                output: MacdOutput::Histogram,
+            },
+            IndicatorSpec::PivotHigh {
+                left: fixed(3),
+                right: fixed(3),
+            },
+            IndicatorSpec::PivotLow {
+                left: fixed(1),
+                right: fixed(1),
+            },
+            IndicatorSpec::Resistance {
+                left: fixed(3),
+                right: fixed(3),
+                tolerance_pct: fixed_decimal(Decimal::new(30, 4)),
+                min_touches: fixed(2),
+                lookback: fixed(100),
+            },
+            IndicatorSpec::Support {
+                left: fixed(3),
+                right: fixed(3),
+                tolerance_pct: fixed_decimal(Decimal::new(5, 3)),
+                min_touches: fixed(2),
+                lookback: fixed(100),
+            },
+            IndicatorSpec::DoubleTopNeckline {
+                left: fixed(3),
+                right: fixed(3),
+                tolerance_pct: fixed_decimal(Decimal::new(3, 3)),
+            },
+            IndicatorSpec::DoubleBottomNeckline {
+                left: fixed(2),
+                right: fixed(2),
+                tolerance_pct: fixed_decimal(Decimal::new(5, 2)),
+            },
+            IndicatorSpec::TrendlineLows {
+                left: fixed(3),
+                right: fixed(3),
+            },
+            IndicatorSpec::TrendlineHighs {
+                left: fixed(1),
+                right: fixed(1),
+            },
+            IndicatorSpec::Body,
+            IndicatorSpec::UpperWick,
+            IndicatorSpec::LowerWick,
+            IndicatorSpec::Range,
+        ];
+        // Every one of the 17 named patterns, through the one catalog table.
+        specs.extend(
+            CANDLE_PATTERNS
+                .iter()
+                .map(|(pattern, _)| IndicatorSpec::CandlePattern { pattern: *pattern }),
+        );
+
+        for spec in specs {
+            let label = indicator_label(&spec);
+            let columns = parse_indicator_specs(std::slice::from_ref(&label))
+                .unwrap_or_else(|e| panic!("{label} must parse: {e}"));
+            assert_eq!(columns.len(), 1, "one column for {label}");
+            assert_eq!(columns[0].label, label, "the label is canonical");
+            assert_eq!(
+                columns[0].spec, spec,
+                "parse(label(spec)) == spec for {label}"
+            );
+        }
+    }
+
+    /// The two spellings of a pattern's name live in one place each; this is what
+    /// keeps `pattern_snake` and the parser's own catalog table from drifting.
+    #[test]
+    fn the_pattern_names_agree_with_the_catalog_table() {
+        use super::{CANDLE_PATTERNS, pattern_snake};
+        for (pattern, snake) in CANDLE_PATTERNS {
+            assert_eq!(pattern_snake(pattern), snake);
         }
     }
 }

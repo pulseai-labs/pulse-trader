@@ -26,6 +26,10 @@
 
 // r1.s3.w3: the Backtest Lab wire contract (DTOs + the pure projection).
 pub(crate) mod backtest;
+// r5.s2.w1 (PDR-0036): the Chart tab's read contract — the wire shapes and the
+// transport-free core behind `POST /api/v1/chart` and the `chart_data` bus
+// command (ADR-0020: additive only).
+pub(crate) mod chart;
 // r4.s1.w5 (spec A4/C5): the certification-record read — the app's full view of
 // a version's records, one plain route and one bus command (ADR-0020: additive).
 pub(crate) mod certification;
@@ -95,6 +99,12 @@ pub use certification::{
 pub use streak_card::{
     DecimalPercentilesDto, StreakCardDto, StreakCardRequest, StreakPercentilesDto, streak_card_core,
 };
+// r5.s2.w1 (PDR-0036): the chart read's wire shapes and core.
+pub use chart::{
+    CHART_BAR_CAP, ChartCandleDto, ChartDataDto, ChartDataRequest, ChartHoldoutDto,
+    ChartOverlayDto, ChartPatternEventDto, ChartPivotEventDto, ChartRunDto, ChartTradeDto,
+    chart_data_core,
+};
 
 /// Build the `tauri-specta` builder that owns the command registry.
 ///
@@ -141,6 +151,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::certification_records,
         // r5.s4.w1: the streak and drawdown card's read (PDR-0035 Q4).
         commands::streak_card,
+        // r5.s2.w1: the Chart tab's read (PDR-0036).
+        commands::chart_data,
     ])
 }
 
