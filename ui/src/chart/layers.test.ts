@@ -9,13 +9,16 @@
 //  * a pivot's marker sits on its confirmation bar, with the faint ghost on the peak
 //    bar `right` bars earlier (G3, design §0 rule 2);
 //  * a pattern draws below the bar in bull and above it in bear (design §1.3);
-//  * winners are bull, losers bear, open trades amber (design §1.3).
+//  * winners are bull, losers bear, open trades amber (design §1.3);
+//  * a marker whose bar is not in the loaded window is not drawn at all (`markersInWindow`,
+//    the close review's CR2): the library would snap it onto the first or last loaded bar.
 
 import { describe, expect, it } from "vitest";
 
 import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
+import type { ChartMarker } from "./layers";
 import type { ChartPalette } from "./palette";
-import { buildLayers, toCandles, toMarkers, toOverlayLayers } from "./layers";
+import { buildLayers, markersInWindow, toCandles, toMarkers, toOverlayLayers } from "./layers";
 
 /** The palette as `chartPalette` returns it, with values a test can name. */
 const PALETTE: ChartPalette = {
@@ -224,6 +227,91 @@ describe("toMarkers", () => {
   });
 });
 
+describe("markersInWindow", () => {
+  /** The two candles above, as the series is handed them: 2025-01-01T00:00Z and 04:00Z. */
+  const loaded = toCandles(candles());
+
+  it("keeps a trade's exit and drops its entry when the entry predates the window", () => {
+    // The read returns a trade when EITHER endpoint falls in the window (w1), so this
+    // is a trade the table must list and the canvas may only half-mark.
+    const trades: ChartTradeDto[] = [
+      {
+        side: "long",
+        entryTime: "1735603200000",
+        entryPrice: "90000",
+        exitTime: "1735704000000",
+        exitPrice: "92000",
+        exitReason: "take_profit",
+        realizedR: "2",
+      },
+    ];
+    expect(markersInWindow(toMarkers([], trades, PALETTE), loaded)).toEqual([
+      { time: 1735704000, position: "aboveBar", shape: "circle", color: "bull", text: "+2.00 R" },
+    ]);
+  });
+
+  it("keeps a pivot's confirmation and drops its ghost when the peak predates the window", () => {
+    const overlays: ChartOverlayDto[] = [
+      {
+        kind: "pivot",
+        label: "pivot_low:2-2",
+        // The peak is a week before the window; the confirmation is its first bar.
+        events: [{ confirmTime: "1735689600000", peakTime: "1735084800000", price: "92796.5" }],
+      },
+    ];
+    expect(markersInWindow(toMarkers(overlays, [], PALETTE), loaded)).toEqual([
+      {
+        time: 1735689600,
+        position: "atPriceMiddle",
+        price: 92796.5,
+        shape: "circle",
+        color: "pivot",
+      },
+    ]);
+  });
+
+  it("keeps a primary-timeframe time that falls between two loaded higher-timeframe bars", () => {
+    // 2025-01-01T01:00Z on a 4h chart: not a bar open, but inside the loaded range, so
+    // the library maps it to its containing bar (04:00). That mapping is intended; the
+    // clip is only for times the loaded bars do not cover at all.
+    const trades: ChartTradeDto[] = [
+      {
+        side: "long",
+        entryTime: "1735693200000",
+        entryPrice: "90000",
+        exitTime: null,
+        exitPrice: null,
+        exitReason: null,
+        realizedR: "0",
+      },
+    ];
+    expect(markersInWindow(toMarkers([], trades, PALETTE), loaded)).toEqual([
+      { time: 1735693200, position: "belowBar", shape: "arrowUp", color: "open" },
+    ]);
+  });
+
+  it("keeps both loaded boundaries and drops a marker past the last loaded bar", () => {
+    // 08:00Z is the NEXT 4h bar: not loaded, so a marker there would be snapped back
+    // onto the 04:00 candle and would mark a bar the trade did not happen on.
+    const markers: ChartMarker[] = [
+      { time: 1735689600, position: "belowBar", shape: "circle", color: "bull" },
+      { time: 1735704000, position: "belowBar", shape: "circle", color: "bull" },
+      { time: 1735718400, position: "belowBar", shape: "circle", color: "bull" },
+      { time: 1735603200, position: "belowBar", shape: "circle", color: "bull" },
+    ];
+    expect(markersInWindow(markers, loaded).map((marker) => marker.time)).toEqual([
+      1735689600, 1735704000,
+    ]);
+  });
+
+  it("draws nothing at all when the window holds no bar", () => {
+    const markers: ChartMarker[] = [
+      { time: 1735689600, position: "belowBar", shape: "circle", color: "bull" },
+    ];
+    expect(markersInWindow(markers, [])).toEqual([]);
+  });
+});
+
 describe("buildLayers", () => {
   it("returns the candles, the drawn overlays and the markers for one read", () => {
     const layers = buildLayers(
@@ -247,5 +335,39 @@ describe("buildLayers", () => {
     expect(layers.candles).toHaveLength(2);
     expect(layers.overlays).toHaveLength(1);
     expect(layers.markers).toEqual([]);
+  });
+
+  it("clips a trade's unloaded entry, the same rule the adapter draws by", () => {
+    const layers = buildLayers(
+      {
+        pair: "BTCUSDT",
+        timeframe: "4h",
+        dataVersion: "9a1dcf67cf4ea260",
+        candles: candles(),
+        holdout: null,
+        run: {
+          runId: "run-1",
+          versionId: "v-1",
+          series: "htf",
+          trades: [
+            {
+              side: "short",
+              entryTime: "1735603200000",
+              entryPrice: "90000",
+              exitTime: "1735704000000",
+              exitPrice: "92000",
+              exitReason: "take_profit",
+              realizedR: "2",
+            },
+          ],
+          overlays: [],
+          notDrawn: [],
+        },
+      },
+      PALETTE,
+    );
+    expect(layers.markers).toEqual([
+      { time: 1735704000, position: "belowBar", shape: "circle", color: "bull", text: "+2.00 R" },
+    ]);
   });
 });

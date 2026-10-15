@@ -9,6 +9,8 @@
 //    one, a warm-up bar as whitespace;
 //  * every marker (pivots, patterns, trades) lands in ONE time-sorted list on the
 //    candle series, because that is the only order the library accepts;
+//  * a marker whose time is outside the loaded candles is never handed over at all
+//    (the close review's CR2): the library would snap it onto a boundary candle;
 //  * a second draw replaces the layer series instead of stacking a second copy on
 //    top of the first;
 //  * fit, centre and destroy reach the chart's own API.
@@ -83,6 +85,15 @@ function layerSeries() {
 const CANDLES: ChartCandleDto[] = [
   { t: "1735689600000", o: "93548.8", h: "94449.2", l: "93460.2", c: "93810", v: "13962.019" },
   { t: "1735704000000", o: "93810", h: "93914.7", l: "93502", c: "93660.7", v: "7852.483" },
+];
+
+/** Four 4h bars — 2025-01-01T00:00Z through 12:00Z — for the one test that draws a
+ *  pivot two bars past the trade: every marker under test has to sit on a loaded bar,
+ *  or `markersInWindow` correctly refuses to hand it over (CR2). */
+const SPANNED_CANDLES: ChartCandleDto[] = [
+  ...CANDLES,
+  { t: "1735718400000", o: "93660.7", h: "94100", l: "93600.2", c: "94050", v: "6001.19" },
+  { t: "1735747200000", o: "94050", h: "94500", l: "93900", c: "94380.4", v: "5102.7" },
 ];
 
 const TRADE: ChartTradeDto = {
@@ -173,7 +184,9 @@ describe("createChartAdapter", () => {
 
   it("puts every marker on the candle series, in ONE ascending list", () => {
     const adapter = createChartAdapter(container());
-    adapter.setCandles(CANDLES);
+    // The bars span both the trade (00:00 → 04:00) and the pivot's peak (08:00) and
+    // confirmation (12:00), so all four markers are the window's own.
+    adapter.setCandles(SPANNED_CANDLES);
     adapter.setOverlays([
       {
         kind: "pivot",
@@ -189,6 +202,36 @@ describe("createChartAdapter", () => {
     expect(last[1]).toMatchObject({ shape: "circle", color: "bull", text: "+2.00 R" });
     expect(last[2]).toMatchObject({ color: "ghost", size: 0.6 });
     expect(last[3]).toMatchObject({ color: "pivot" });
+  });
+
+  it("hands the library no marker outside the loaded bars (CR2)", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setOverlays([
+      {
+        kind: "pivot",
+        label: "pivot_low:2-2",
+        // The peak is two days before the loaded window: the ghost is not drawn, the
+        // confirmation (a loaded bar) is.
+        events: [{ confirmTime: "1735689600000", peakTime: "1735516800000", price: "92796.5" }],
+      },
+    ]);
+    // The read returns a trade when EITHER endpoint is in the window: this one entered
+    // two days earlier, so only its exit may be handed over.
+    adapter.setTrades([{ ...TRADE, entryTime: "1735516800000" }]);
+
+    // Nothing this draw ever hands the library is outside the loaded range: a marker
+    // the library cannot place is snapped onto the first or last loaded candle.
+    for (const [markers] of h.markersApi.setMarkers.mock.calls) {
+      for (const marker of markers as { time: number }[]) {
+        expect(marker.time).toBeGreaterThanOrEqual(1735689600);
+        expect(marker.time).toBeLessThanOrEqual(1735704000);
+      }
+    }
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
+    expect(last.map((marker) => marker.time)).toEqual([1735689600, 1735704000]);
+    expect(last[0]).toMatchObject({ color: "pivot" });
+    expect(last[1]).toMatchObject({ color: "bull", text: "+2.00 R" });
   });
 
   it("keeps markers from overlays and trades when only one of the two is redrawn", () => {

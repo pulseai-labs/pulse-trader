@@ -18,7 +18,10 @@
 //    theme without this file naming a colour.
 //  * **The markers are one list.** Pivots, patterns and trades all ride the candle
 //    series through ONE `createSeriesMarkers` plugin, merged and time-sorted in
-//    `layers.ts` — the order the library requires and the only one it accepts.
+//    `layers.ts` — the order the library requires and the only one it accepts. The list
+//    handed to the plugin holds only markers the loaded bars can hold (`markersInWindow`,
+//    the close review's CR2): the library places a marker by its time against the candle
+//    series and snaps a time it cannot place onto the first or last loaded candle.
 //  * **The layers are redrawn, not stacked.** A new read removes the previous run's
 //    level and line series before creating its own; only the candle series, and the
 //    marker plugin hanging off it, outlive a read.
@@ -46,8 +49,8 @@ import type {
 } from "lightweight-charts";
 
 import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
-import type { ChartMarker, OverlayLayer } from "./layers";
-import { toCandles, toMarkers, toOverlayLayers } from "./layers";
+import type { CandlePoint, ChartMarker, OverlayLayer } from "./layers";
+import { markersInWindow, toCandles, toMarkers, toOverlayLayers } from "./layers";
 import { chartPalette } from "./palette";
 
 /** The chart, as the screen sees it. No library type crosses this interface, so the
@@ -134,6 +137,8 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
   // What the read last handed in. The candle times are kept as the read spelled
   // them, because the overlays' values are positional against them.
   let candleDtos: readonly ChartCandleDto[] = [];
+  // The same bars in the library's units — the window a marker has to fall inside.
+  let candlePoints: readonly CandlePoint[] = [];
   let overlayDtos: readonly ChartOverlayDto[] = [];
   let tradeDtos: readonly ChartTradeDto[] = [];
 
@@ -157,16 +162,23 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     return candleSeries;
   };
 
-  /** Rebuild the merged marker list from the overlays and trades last handed in. */
+  /** Rebuild the merged marker list from the overlays and trades last handed in, and
+   *  hand the library ONLY the markers the loaded bars can hold (CR2): a marker time
+   *  the series cannot place is snapped onto the first or last loaded candle. */
   const drawMarkers = (): void => {
     if (markerPlugin === null) return;
-    markerPlugin.setMarkers(toMarkers(overlayDtos, tradeDtos, palette).map(toSeriesMarker));
+    markerPlugin.setMarkers(
+      markersInWindow(toMarkers(overlayDtos, tradeDtos, palette), candlePoints).map(
+        toSeriesMarker,
+      ),
+    );
   };
 
   return {
     setCandles(next) {
       candleDtos = [...next];
-      ensureCandles().setData(toCandles(candleDtos) as CandlestickData<Time>[]);
+      candlePoints = toCandles(candleDtos);
+      ensureCandles().setData(candlePoints as CandlestickData<Time>[]);
     },
 
     setOverlays(next) {
@@ -226,6 +238,7 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       markerPlugin = null;
       layerSeries = [];
       candleDtos = [];
+      candlePoints = [];
       overlayDtos = [];
       tradeDtos = [];
     },

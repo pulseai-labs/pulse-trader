@@ -22,6 +22,11 @@
 //    key of the palette the screen's sheet owns.
 //  * **PDR-0011.** What is not drawn is never faked: an overlay with no value at a bar
 //    draws nothing at that bar.
+//  * **G3, no false bar.** A marker is drawn only when its own time falls inside the
+//    loaded window (`markersInWindow`, the close review's CR2). A read hands back a
+//    trade when EITHER of its endpoints is in the window, and a pivot's peak bar can be
+//    behind the window's first bar: the library maps a time it cannot place onto the
+//    nearest loaded CANDLE, which would mark a bar the trade or the pivot never touched.
 
 import type { ChartCandleDto, ChartDataDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
 import { rMultiple } from "../format/numbers";
@@ -216,12 +221,39 @@ export function toMarkers(
     .map((entry) => entry.marker);
 }
 
+/** The markers a loaded window may draw (the close review's CR2).
+ *
+ *  A marker whose time is outside the loaded candles' `[first, last]` range is dropped
+ *  here, before the library ever sees it: the library resolves every marker time against
+ *  the candle series and snaps a time it cannot place onto the nearest loaded bar, which
+ *  would draw a mark on the first or last candle instead of nowhere.
+ *
+ *  The range is the loaded bars' own open times, both ends INCLUDED — a marker exactly
+ *  on the first or last loaded bar is drawn. A time inside the range that is not itself
+ *  a bar open (a primary-timeframe trade time on the higher-timeframe chart) is kept:
+ *  the library's containing-bar mapping for it is the intended one, and it is the reason
+ *  this is a range test and not a membership test. A marker past the last loaded bar's
+ *  open time belongs to a bar the window does not hold, so it is not drawn either — the
+ *  table below the chart still carries its exact time and value (PDR-0011). */
+export function markersInWindow(
+  markers: readonly ChartMarker[],
+  candles: readonly Pick<CandlePoint, "time">[],
+): ChartMarker[] {
+  if (candles.length === 0) return [];
+  // The read returns its candles ascending, so the ends are the range.
+  const first = candles[0].time;
+  const last = candles[candles.length - 1].time;
+  return markers.filter((marker) => marker.time >= first && marker.time <= last);
+}
+
 /** Everything one chart read draws. */
 export function buildLayers(dto: ChartDataDto, palette: ChartPalette): ChartLayers {
   const overlays = dto.run?.overlays ?? [];
+  const candles = toCandles(dto.candles);
   return {
-    candles: toCandles(dto.candles),
+    candles,
     overlays: toOverlayLayers(overlays, dto.candles, palette),
-    markers: toMarkers(overlays, dto.run?.trades ?? [], palette),
+    // The same clip the adapter draws by: a marker whose bar is not loaded draws nothing.
+    markers: markersInWindow(toMarkers(overlays, dto.run?.trades ?? [], palette), candles),
   };
 }
