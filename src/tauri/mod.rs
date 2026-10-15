@@ -44,6 +44,10 @@ pub(crate) mod library;
 // sink trait the reader is generic over. A separate module so `commands.rs`
 // stays the registration surface while the shapes live beside their docs.
 pub(crate) mod paper;
+// r5.s4.w1 (PDR-0035): the streak and drawdown card's read contract — the wire
+// shapes and the transport-free core behind `POST /api/v1/streak-card` and the
+// `streak_card` bus command (ADR-0020: additive only).
+pub(crate) mod streak_card;
 // r2.s3.w5: the walk-forward wire contract (DTOs + the projection) and the
 // three command cores. A separate module so `commands.rs` stays the
 // registration surface while the read/run behavior lives beside its own file.
@@ -86,6 +90,10 @@ pub use walk_forward::{
 pub use certification::{
     CertificationRecordDto, CertificationRecordsDto, CertificationRecordsRequest,
     CertificationSelectionDto, certification_records_core,
+};
+// r5.s4.w1 (PDR-0035): the streak and drawdown card's wire shapes and core.
+pub use streak_card::{
+    DecimalPercentilesDto, StreakCardDto, StreakCardRequest, StreakPercentilesDto, streak_card_core,
 };
 
 /// Build the `tauri-specta` builder that owns the command registry.
@@ -131,6 +139,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::paper_session_events,
         // r4.s1.w5: the app's full certification-record read.
         commands::certification_records,
+        // r5.s4.w1: the streak and drawdown card's read (PDR-0035 Q4).
+        commands::streak_card,
     ])
 }
 

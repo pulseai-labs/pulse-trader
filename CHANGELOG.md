@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The streak and drawdown card, and its app read (r5.s4.w1, PDR-0035).** Before a
+  strategy is promoted to paper, the engine now answers what a *normal bad run* of it
+  looks like: a seeded Monte Carlo (one fixed documented seed, 10,000 paths, 100 drawn
+  trades a path, with replacement, `Decimal` and integer draws only) over that version's
+  **latest full-span backtest run** — never a walk-forward fold — reporting the longest
+  losing streak and the max drawdown in R, in USDT and as a percentage of the fixed
+  10,000 USDT equity, at the 50th ("typical") and 95th ("bad but still normal")
+  percentile, with the run's own observed values beside them. A 100-trade run at the
+  PDR-0006 40% win rate reads a typical longest losing streak of **7** (p95 **12**);
+  fewer than 30 closed trades answer "not enough trades" and show no figures. The card
+  is served by the new app-scope `POST /api/v1/streak-card` route and the `streak_card`
+  bus command, which name the run they read. The paper fixture's splitmix64 moved to
+  `src/domain/rng.rs` unchanged — its pinned data versions and the paper replay golden
+  stay byte-identical — and is now shared with the card's draws.
 - **DSL schema 1.4.0: named candlestick patterns as indicators (r5.s1.w1, completed by
   r5.s1.w2).** A strategy can
   now name a candlestick pattern — TA-Lib's own definitions — and read it through the

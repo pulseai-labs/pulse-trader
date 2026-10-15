@@ -323,6 +323,20 @@ export const commands = {
 	 *  [`certification_records_core`]: crate::tauri::certification::certification_records_core
 	 */
 	certificationRecords: (request: CertificationRecordsRequest) => typedError<CertificationRecordsDto, BusError>(__TAURI_INVOKE("certification_records", { request })),
+	/**
+	 *  `streak_card` — the losing streak and drawdown a normal bad run of one
+	 *  strategy version produces, computed by the engine from that version's
+	 *  latest full-span backtest run (r5.s4.w1, PDR-0035 Q4). The read the Promote
+	 *  sheet draws its card from.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`streak_card_core`]. An unknown version id is a
+	 *  `not_found` refusal, distinct from a version with no run yet (`noRun`).
+	 * 
+	 *  [`streak_card_core`]: crate::tauri::streak_card::streak_card_core
+	 */
+	streakCard: (request: StreakCardRequest) => typedError<StreakCardDto, BusError>(__TAURI_INVOKE("streak_card", { request })),
 };
 
 /* Types */
@@ -1059,6 +1073,19 @@ export type CredentialStatus =
  *  permission checks. Both read as "not usable", which is what a banner needs.
  */
 "none";
+
+/**
+ *  A `Decimal` measure's three figures: the two percentiles and the run's own
+ *  observed value, each an exact decimal string (NFR-2).
+ */
+export type DecimalPercentilesDto = {
+	/**  The 50th percentile ("typical"). */
+	p50: string,
+	/**  The 95th percentile ("bad but still normal"). */
+	p95: string,
+	/**  The run's own value. */
+	observed: string,
+};
 
 /**
  *  A version's DSL rendered to summary lines — exactly the fields
@@ -1807,6 +1834,67 @@ export type StopFailure = {
 	id: string,
 	/**  The runtime's typed error code for it. */
 	code: string,
+};
+
+/**
+ *  What `streak_card` answers for one version, tagged on `state`.
+ * 
+ *  `Ready` is the wide variant and it carries the whole card's figures. Boxing
+ *  it would even the variants out and reshape the tagged wire this item's read
+ *  contract (and the generated TypeScript) pins; the DTO is built once per read
+ *  and immediately serialized, never held in a collection, so the size
+ *  difference costs one move of a few hundred bytes at the call boundary.
+ *  Stated rather than silenced blindly — the `coach_decision.rs` precedent.
+ */
+export type StreakCardDto = 
+/**  The version exists but has no readable backtest run yet. */
+{ state: "noRun" } | 
+/**  The version's latest full-span run has too few closed trades. */
+{ state: "notEnoughTrades"; 
+/**  The run the figures would have come from. */
+runId: string; 
+/**  How many closed trades that run does have. */
+closedTrades: number } | 
+/**  The card's figures. */
+{ state: "ready"; 
+/**  The full-span run the figures come from (Q4: always named). */
+runId: string; 
+/**  The run's recorded timestamp, RFC 3339 milliseconds. */
+runCreatedAt: string; 
+/**  How many closed trades the run has. */
+closedTrades: number; 
+/**  The horizon every drawn path used. */
+horizonTrades: number; 
+/**  The number of drawn paths. */
+paths: number; 
+/**  The card's fixed seed, as its documented constant's exact text. */
+seed: string; 
+/**  The longest losing streak, in trades. */
+streak: StreakPercentilesDto; 
+/**  The max drawdown of the cumulative `realized_r`. */
+drawdownR: DecimalPercentilesDto; 
+/**  The max drawdown of the cumulative `realized_pnl`, in USDT. */
+drawdownUsdt: DecimalPercentilesDto; 
+/**  The USDT drawdown as a percentage of the fixed 10,000 USDT equity. */
+drawdownPct: DecimalPercentilesDto };
+
+/**  What `streak_card` is asked for: one strategy version. */
+export type StreakCardRequest = {
+	/**  The version whose latest full-span run the card describes. */
+	versionId: string,
+};
+
+/**
+ *  A count measure's three figures: the two percentiles over the drawn paths
+ *  and the run's own observed value.
+ */
+export type StreakPercentilesDto = {
+	/**  The 50th percentile ("typical"). */
+	p50: number,
+	/**  The 95th percentile ("bad but still normal"). */
+	p95: number,
+	/**  The run's own value. */
+	observed: number,
 };
 
 /**  How a streaming run ended. */

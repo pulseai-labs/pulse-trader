@@ -19,6 +19,9 @@
 use rust_decimal::Decimal;
 
 use crate::domain::candle::Candle;
+// r5.s4.w1: the PRNG moved to `domain::rng` (the streak card is its second
+// consumer); the stream itself is unchanged, byte for byte.
+use crate::domain::rng::SplitMix64;
 
 /// The fixture's pair. `BTCUSDT` only — the fixture is not parameterised.
 pub(crate) const PAIR: &str = "BTCUSDT";
@@ -67,37 +70,6 @@ const WICK_HALF_WIDTH: i64 = 40;
 /// model a carry trade.
 const FUNDING_RATE_SCALED: i64 = 1;
 const FUNDING_RATE_SCALE: u32 = 5;
-
-/// splitmix64 (Steele et al.): the fixed-seed PRNG the fixture's noise comes
-/// from. In-tree and tiny on purpose — a fixture that pulled `rand` would make
-/// the data version depend on a dependency's stream stability.
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    /// Seed the stream.
-    const fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    /// The next 64 bits of the stream.
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A uniform draw from `0..=span` (`span` inclusive), where `span` is
-    /// non-negative.
-    #[allow(clippy::cast_possible_wrap)]
-    fn below_inclusive(&mut self, span: i64) -> i64 {
-        let width = u64::try_from(span).unwrap_or(0).saturating_add(1);
-        (self.next_u64() % width) as i64
-    }
-}
 
 /// The M15 mid prices the fixture's bars are built from.
 ///
