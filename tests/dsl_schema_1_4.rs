@@ -1,4 +1,4 @@
-//! r5.s1.w1 — the schema-1.4.0 acceptance suite (AC-2).
+//! r5.s1.w1 and r5.s1.w2 — the schema-1.4.0 acceptance suite (AC-2).
 //!
 //! Schema **1.4.0** is additive: one new `IndicatorSpec` variant,
 //! `CandlePattern { pattern }`, whose value is TA-Lib's own integer per named
@@ -8,7 +8,7 @@
 //! 1. **The served schema names 1.4.0 and its pattern values.** The
 //!    `pulse://dsl/schema` document carries `schema_version: "1.4.0"`, the
 //!    served version enum lists the five loadable spellings, and the
-//!    `CandlePattern` variant's `pattern` enum lists the 13 names.
+//!    `CandlePattern` variant's `pattern` enum lists the 17 names.
 //! 2. **The wire shape is the spec's, verbatim.** One exact-JSON round-trip
 //!    test: `{"indicator":"CandlePattern","pattern":"Engulfing"}`, spelled by
 //!    variant name (no `rename_all`), for a multi-word name and a one-word name
@@ -33,8 +33,9 @@ use pulse::{
 };
 use rust_decimal::Decimal;
 
-/// The 13 pattern names this item ships, in the enum's own spelling.
-const PATTERNS: [CandlePatternName; 13] = [
+/// The 17 pattern names the spine ships, in the enum's own spelling: w1's 13
+/// and w2's four three-bar patterns, all inside schema 1.4.0.
+const PATTERNS: [CandlePatternName; 17] = [
     CandlePatternName::Doji,
     CandlePatternName::DragonflyDoji,
     CandlePatternName::GravestoneDoji,
@@ -48,6 +49,10 @@ const PATTERNS: [CandlePatternName; 13] = [
     CandlePatternName::Harami,
     CandlePatternName::Piercing,
     CandlePatternName::DarkCloudCover,
+    CandlePatternName::MorningStar,
+    CandlePatternName::EveningStar,
+    CandlePatternName::ThreeWhiteSoldiers,
+    CandlePatternName::ThreeBlackCrows,
 ];
 
 // ---------------------------------------------------------------------------
@@ -55,7 +60,7 @@ const PATTERNS: [CandlePatternName; 13] = [
 // ---------------------------------------------------------------------------
 
 /// The served schema (the `StrategyDsl` JSON Schema the `pulse://dsl/schema`
-/// resource carries) names 1.4.0 and lists the 13 pattern names on the
+/// resource carries) names 1.4.0 and lists the 17 pattern names on the
 /// `CandlePattern` spec.
 #[test]
 fn the_served_dsl_schema_names_1_4_0_and_the_pattern_values() {
@@ -94,7 +99,7 @@ fn the_served_dsl_schema_names_1_4_0_and_the_pattern_values() {
     expected.sort();
     assert_eq!(
         names, expected,
-        "the served schema lists exactly this item's 13 pattern names"
+        "the served schema lists exactly the spine's 17 pattern names"
     );
 
     // The variant itself is advertised, tagged by its `indicator` name.
@@ -361,6 +366,14 @@ fn every_pattern_renders_in_its_trader_words() {
         (CandlePatternName::Harami, "harami"),
         (CandlePatternName::Piercing, "piercing"),
         (CandlePatternName::DarkCloudCover, "dark cloud cover"),
+        // r5.s1.w2: the three-bar patterns render in the same trader words.
+        (CandlePatternName::MorningStar, "morning star"),
+        (CandlePatternName::EveningStar, "evening star"),
+        (
+            CandlePatternName::ThreeWhiteSoldiers,
+            "three white soldiers",
+        ),
+        (CandlePatternName::ThreeBlackCrows, "three black crows"),
     ] {
         assert_eq!(
             render::indicator(&IndicatorSpec::CandlePattern { pattern }),
@@ -374,6 +387,44 @@ fn every_pattern_renders_in_its_trader_words() {
     let rendered = render::strategy(&dsl);
     assert_eq!(rendered.entry, "h4:engulfing = 100");
     assert_eq!(rendered.filters, vec!["hammer > 0".to_owned()]);
+}
+
+/// **r5.s1.w2.** A 1.4.0 strategy on `Compare(CandlePattern{MorningStar}, Gt, 0)`
+/// — the three-bar form the spec's Approach §6 names — validates, renders in
+/// trader words, compiles and backtests deterministically on the fixture store.
+#[test]
+fn a_morning_star_strategy_validates_renders_and_backtests() {
+    let dsl = StrategyDsl {
+        name: "morning star 1.4.0".to_owned(),
+        entry: Condition::Compare {
+            lhs: ValueSource::Indicator {
+                series: Series::Primary,
+                spec: IndicatorSpec::CandlePattern {
+                    pattern: CandlePatternName::MorningStar,
+                },
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::ZERO,
+            },
+        },
+        ..candle_pattern_strategy()
+    };
+    let validated = validate(&dsl).expect("the strategy validates");
+    let compiled = compile(&validated).expect("the strategy compiles");
+
+    let rendered = render::strategy(&dsl);
+    assert_eq!(rendered.entry, "morning star > 0");
+
+    let primary = load_series(Timeframe::M15);
+    let htf = load_series(Timeframe::H4);
+    let first = run(&compiled, &primary, &htf);
+    let second = run(&compiled, &primary, &htf);
+    assert_eq!(
+        first.result_content_hash(),
+        second.result_content_hash(),
+        "two runs of the morning-star strategy must hash identically"
+    );
 }
 
 /// A refusal that names a candle-pattern operand names it through the crate's

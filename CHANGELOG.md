@@ -8,15 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **DSL schema 1.4.0: named candlestick patterns as indicators (r5.s1.w1).** A strategy can
+- **DSL schema 1.4.0: named candlestick patterns as indicators (r5.s1.w1, completed by
+  r5.s1.w2).** A strategy can
   now name a candlestick pattern — TA-Lib's own definitions — and read it through the
   comparisons that already existed: `Compare(CandlePattern{Engulfing}, Gt, 0)` is "a bullish
   engulfing fired", `Eq 100` is "the full bullish form". One new `IndicatorSpec` variant,
   `CandlePattern { pattern }`, serialized `{"indicator":"CandlePattern","pattern":"Engulfing"}`,
-  with the 13 one- and two-bar names `Doji`, `DragonflyDoji`, `GravestoneDoji`, `Hammer`,
-  `InvertedHammer`, `HangingMan`, `ShootingStar`, `Marubozu`, `SpinningTop`, `Engulfing`,
-  `Harami`, `Piercing` and `DarkCloudCover` (the four three-bar patterns follow, additively
-  inside 1.4.0). The value is **TA-Lib's own integer on every bar after the pattern's
+  with the spine's full **17** names: the one-bar `Doji`, `DragonflyDoji`, `GravestoneDoji`,
+  `Hammer`, `InvertedHammer`, `HangingMan`, `ShootingStar`, `Marubozu` and `SpinningTop`; the
+  two-bar `Engulfing`, `Harami`, `Piercing` and `DarkCloudCover`; and the three-bar
+  `MorningStar`, `EveningStar`, `ThreeWhiteSoldiers` and `ThreeBlackCrows`. The four
+  three-bar patterns landed **additively inside 1.4.0** with no second version step, on the
+  same candle ring: `MorningStar` and `ThreeWhiteSoldiers` read `+100`, `EveningStar` and
+  `ThreeBlackCrows` read `-100`, and the crows read **four** bars (a white bar, then three
+  black ones). Their lookbacks are 12, 12, 12 and **13** — TA-Lib's declared values, used
+  exactly as listed — and the deepest window any pattern reads is bar `t-12`, inside the
+  existing ring. The value is **TA-Lib's own integer on every bar after the pattern's
   warm-up** and is never missing: `+100` bullish, `-100` bearish, `0` no pattern, and `±80`
   for the **partial** Engulfing and Harami forms, where a body end coincides with the prior
   body's edge — the common case on continuous crypto bars, which open at the prior close
@@ -25,9 +32,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   no condition kind is added: the ADR-0024 addendum records that a pattern is a scalar by
   TA-Lib's convention, and answers the 1.3.0 addendum's revisit trigger. Parity is exact:
   on both committed BTCUSDT reference series (15m, 2,976 bars; 4h, 186 bars) and three
-  hand-built sequences, every pattern's value equals TA-Lib's on every bar, with an
+  hand-built sequences, all 17 patterns' values equal TA-Lib's on every bar, with an
   **empty** exception list — the reference is pinned to TA-Lib Python 0.6.8 / C 0.6.4 and
-  committed under `tests/fixtures/candle-patterns/`. Each pattern is warm-up safe, never
+  committed under `tests/fixtures/candle-patterns/`. `ThreeBlackCrows`, `Piercing` and
+  `DarkCloudCover` never fire on the fixture bars — crypto perpetual bars open at the prior
+  close, so the strict real-body tests reject every bar — and each is read from its own
+  hand-built sequence instead. Each pattern is warm-up safe, never
   repaints under truncation, streams byte-identically twice, and works on the `htf` operand.
   The `1.3.0 → 1.4.0` migration is identity (only the version string is rewritten), every
   pre-1.4.0 document keeps its meaning and its frozen `result_content_hash`, and the

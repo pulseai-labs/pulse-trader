@@ -207,6 +207,15 @@ const NEAR: Setting = Setting {
     factor_scale: 1,
 };
 
+/// `Far` — high-low range, `N = 5`, `f = 0.6`. w1's 13 patterns did not need
+/// it; `ThreeWhiteSoldiers` does (§3.16's two "not far below" body tests).
+const FAR: Setting = Setting {
+    kind: RangeKind::HighLow,
+    period: 5,
+    factor_mantissa: 6,
+    factor_scale: 1,
+};
+
 /// §1/§2.1: the per-bar quantity a setting's window sums.
 fn range_value(kind: RangeKind, bar: Bar) -> Option<Decimal> {
     match kind {
@@ -353,6 +362,13 @@ const fn lookback(pattern: CandlePatternName) -> u64 {
         | CandlePatternName::Piercing
         | CandlePatternName::DarkCloudCover => 11,
         CandlePatternName::Engulfing => 2,
+        // r5.s1.w2: the three-bar patterns. ThreeBlackCrows' L is 13 — one bar
+        // more than its conditions need (definitions §2.3, §5), so it is used as
+        // listed and not derived from the widest window.
+        CandlePatternName::MorningStar
+        | CandlePatternName::EveningStar
+        | CandlePatternName::ThreeWhiteSoldiers => 12,
+        CandlePatternName::ThreeBlackCrows => 13,
     }
 }
 
@@ -415,6 +431,180 @@ impl CandlePatternIndicator {
             CandlePatternName::Harami => self.harami(),
             CandlePatternName::Piercing => self.piercing(),
             CandlePatternName::DarkCloudCover => self.dark_cloud_cover(),
+            CandlePatternName::MorningStar => self.morning_star(),
+            CandlePatternName::EveningStar => self.evening_star(),
+            CandlePatternName::ThreeWhiteSoldiers => self.three_white_soldiers(),
+            CandlePatternName::ThreeBlackCrows => self.three_black_crows(),
+        }
+    }
+
+    /// §3.14 Morning star: a long black candle, a small star gapping down under
+    /// its body, then a white candle closing more than 30% back into the first
+    /// body. `+100`, else 0.
+    ///
+    /// The star's own colour is **not** checked, and neither is any gap between
+    /// the star and `t`.
+    fn morning_star(&self) -> Decimal {
+        let (Some(t), Some(star), Some(first)) =
+            (self.ring.at(0), self.ring.at(1), self.ring.at(2))
+        else {
+            return Decimal::ZERO;
+        };
+        let (Some(body_t), Some(body_star), Some(body_first)) =
+            (t.body(), star.body(), first.body())
+        else {
+            return Decimal::ZERO;
+        };
+        let Some(penetration) = three_tenths(body_first) else {
+            return Decimal::ZERO;
+        };
+        let Some(threshold) = first.close.checked_add(penetration) else {
+            return Decimal::ZERO;
+        };
+        if cmp_avg(&self.ring, BODY_LONG, 2, body_first, Cmp::Gt)
+            && first.colour() == -1
+            && cmp_avg(&self.ring, BODY_SHORT, 1, body_star, Cmp::Le)
+            && star.top() < first.bot()
+            && cmp_avg(&self.ring, BODY_SHORT, 0, body_t, Cmp::Gt)
+            && t.colour() == 1
+            && t.close > threshold
+        {
+            Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    /// §3.15 Evening star: the morning star's mirror — a long white candle, a
+    /// small star gapping up over its body, then a black candle closing more
+    /// than 30% back into the first body. `-100`, else 0.
+    fn evening_star(&self) -> Decimal {
+        let (Some(t), Some(star), Some(first)) =
+            (self.ring.at(0), self.ring.at(1), self.ring.at(2))
+        else {
+            return Decimal::ZERO;
+        };
+        let (Some(body_t), Some(body_star), Some(body_first)) =
+            (t.body(), star.body(), first.body())
+        else {
+            return Decimal::ZERO;
+        };
+        let Some(penetration) = three_tenths(body_first) else {
+            return Decimal::ZERO;
+        };
+        let Some(threshold) = first.close.checked_sub(penetration) else {
+            return Decimal::ZERO;
+        };
+        if cmp_avg(&self.ring, BODY_LONG, 2, body_first, Cmp::Gt)
+            && first.colour() == 1
+            && cmp_avg(&self.ring, BODY_SHORT, 1, body_star, Cmp::Le)
+            && star.bot() > first.top()
+            && cmp_avg(&self.ring, BODY_SHORT, 0, body_t, Cmp::Gt)
+            && t.colour() == -1
+            && t.close < threshold
+        {
+            Decimal::from(-100)
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    /// §3.16 Three white soldiers: three rising white candles with almost no
+    /// upper shadows, the second and third opening higher but no further than
+    /// "near" above the prior close, and their bodies not far short of the one
+    /// before. `+100`, else 0.
+    ///
+    /// Quirk, kept exactly: the "not short" body test applies to **the third
+    /// candle only**, not to all three as textbooks describe.
+    fn three_white_soldiers(&self) -> Decimal {
+        let (Some(t), Some(second), Some(first)) =
+            (self.ring.at(0), self.ring.at(1), self.ring.at(2))
+        else {
+            return Decimal::ZERO;
+        };
+        let (Some(upper_t), Some(upper_second), Some(upper_first)) =
+            (t.upper(), second.upper(), first.upper())
+        else {
+            return Decimal::ZERO;
+        };
+        let (Some(body_t), Some(body_second), Some(body_first)) =
+            (t.body(), second.body(), first.body())
+        else {
+            return Decimal::ZERO;
+        };
+        // `open(t-1) <= close(t-2) + avg` is `open(t-1) - close(t-2) <= avg`.
+        let Some(open_gap_second) = second.open.checked_sub(first.close) else {
+            return Decimal::ZERO;
+        };
+        let Some(open_gap_t) = t.open.checked_sub(second.close) else {
+            return Decimal::ZERO;
+        };
+        // `body(t-1) > body(t-2) - avg` is `body(t-2) - body(t-1) < avg`.
+        let Some(body_gap_second) = body_first.checked_sub(body_second) else {
+            return Decimal::ZERO;
+        };
+        let Some(body_gap_t) = body_second.checked_sub(body_t) else {
+            return Decimal::ZERO;
+        };
+        if first.colour() == 1
+            && second.colour() == 1
+            && t.colour() == 1
+            && cmp_avg(&self.ring, SHADOW_VERY_SHORT, 2, upper_first, Cmp::Lt)
+            && cmp_avg(&self.ring, SHADOW_VERY_SHORT, 1, upper_second, Cmp::Lt)
+            && cmp_avg(&self.ring, SHADOW_VERY_SHORT, 0, upper_t, Cmp::Lt)
+            && t.close > second.close
+            && second.close > first.close
+            && second.open > first.open
+            && cmp_avg(&self.ring, NEAR, 2, open_gap_second, Cmp::Le)
+            && t.open > second.open
+            && cmp_avg(&self.ring, NEAR, 1, open_gap_t, Cmp::Le)
+            && cmp_avg(&self.ring, FAR, 2, body_gap_second, Cmp::Lt)
+            && cmp_avg(&self.ring, FAR, 1, body_gap_t, Cmp::Lt)
+            && cmp_avg(&self.ring, BODY_SHORT, 0, body_t, Cmp::Gt)
+        {
+            Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    /// §3.17 Three black crows: a white bar, then three falling black candles
+    /// each opening **strictly** inside the prior body, closing below the white
+    /// bar's high, with almost no lower shadows. `-100`, else 0.
+    ///
+    /// **Four** bars are read, and no body-length condition applies.
+    fn three_black_crows(&self) -> Decimal {
+        let (Some(t), Some(second), Some(first), Some(prior)) = (
+            self.ring.at(0),
+            self.ring.at(1),
+            self.ring.at(2),
+            self.ring.at(3),
+        ) else {
+            return Decimal::ZERO;
+        };
+        let (Some(lower_t), Some(lower_second), Some(lower_first)) =
+            (t.lower(), second.lower(), first.lower())
+        else {
+            return Decimal::ZERO;
+        };
+        if prior.colour() == 1
+            && first.colour() == -1
+            && second.colour() == -1
+            && t.colour() == -1
+            && cmp_avg(&self.ring, SHADOW_VERY_SHORT, 2, lower_first, Cmp::Lt)
+            && cmp_avg(&self.ring, SHADOW_VERY_SHORT, 1, lower_second, Cmp::Lt)
+            && cmp_avg(&self.ring, SHADOW_VERY_SHORT, 0, lower_t, Cmp::Lt)
+            && second.open < first.open
+            && second.open > first.close
+            && t.open < second.open
+            && t.open > second.close
+            && prior.high > first.close
+            && first.close > second.close
+            && second.close > t.close
+        {
+            Decimal::from(-100)
+        } else {
+            Decimal::ZERO
         }
     }
 
@@ -722,6 +912,15 @@ fn half(value: Decimal) -> Option<Decimal> {
     value.checked_div(Decimal::TWO)
 }
 
+/// The two stars' fixed penetration `p = 0.3` (definitions §3.14, §3.15), as an
+/// exact operation: `3 × value / 10`. Both factors are exact decimals and the
+/// divisor is a power of ten, so no rounding enters the stars' comparison.
+fn three_tenths(value: Decimal) -> Option<Decimal> {
+    value
+        .checked_mul(Decimal::new(3, 0))?
+        .checked_div(Decimal::new(10, 0))
+}
+
 impl Indicator for CandlePatternIndicator {
     fn next(&mut self, candle: &Candle) -> Option<Decimal> {
         self.ring.push(candle);
@@ -750,7 +949,7 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
-    const ALL: [CandlePatternName; 13] = [
+    const ALL: [CandlePatternName; 17] = [
         CandlePatternName::Doji,
         CandlePatternName::DragonflyDoji,
         CandlePatternName::GravestoneDoji,
@@ -764,6 +963,10 @@ mod tests {
         CandlePatternName::Harami,
         CandlePatternName::Piercing,
         CandlePatternName::DarkCloudCover,
+        CandlePatternName::MorningStar,
+        CandlePatternName::EveningStar,
+        CandlePatternName::ThreeWhiteSoldiers,
+        CandlePatternName::ThreeBlackCrows,
     ];
 
     fn d(value: &str) -> Decimal {
@@ -929,5 +1132,159 @@ mod tests {
         }
         let value = indicator.next(&candle(10, "100", "101", "99", "100"));
         assert_eq!(value, Some(d("100")), "a zero-body doji is +100");
+    }
+
+    /// The three-bar patterns' worked shapes, on hand-built bars, so their
+    /// evaluators are pinned independently of the TA-Lib parity suite. Each
+    /// shape is derived from definitions §3.14–§3.17 on paper first (the windows
+    /// are written out in the comments), then asserted here.
+    ///
+    /// `L` is 12 for the stars and the soldiers and 13 for the crows, so each
+    /// case feeds filler bars and reads the bar at index `L`.
+    #[test]
+    fn hand_built_three_bar_shapes_match_the_definitions() {
+        // Morning star, at index 12 (L = 12). t-2 = 10, t-1 = 11, t = 12.
+        // avg(BodyLong, t-2) averages bars 0..9 = 1.0 each; avg(BodyShort, t-1)
+        // averages bars 1..10 = (9x1 + 50)/10 = 5.9; avg(BodyShort, t) averages
+        // bars 2..11 = (8x1 + 50 + 1)/10 = 5.9. Penetration 0.3 x 50 = 15, so the
+        // close must beat 100 + 15 = 115.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::MorningStar);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "100.5", "98.5", "99")); // body 1
+        }
+        indicator.next(&candle(10, "150", "151", "99", "100")); // long black, body 50
+        indicator.next(&candle(11, "95", "96", "93", "94")); // star: top 95 < bot(10) 100
+        let value = indicator.next(&candle(12, "100", "121", "99", "120")); // white, body 20
+        assert_eq!(value, Some(d("100")), "a morning star is +100");
+
+        // Evening star, the mirror, at index 12.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::EveningStar);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "101.5", "99.5", "99")); // body 1
+        }
+        indicator.next(&candle(10, "100", "151", "99", "150")); // long white, body 50
+        indicator.next(&candle(11, "156", "158", "155", "157")); // star: bot 156 > top(10) 150
+        let value = indicator.next(&candle(12, "150", "151", "129", "130")); // black, body 20
+        assert_eq!(value, Some(d("-100")), "an evening star is -100");
+
+        // Three white soldiers, at index 12. Fillers have hl = 10, so
+        // avg(ShadowVeryShort, k) is 1.0 and avg(Near, k)=avg(Far, k) = 2 / 6.
+        // avg(BodyShort, t) averages bars 2..11 = (8x1 + 10 + 10)/10 = 2.8.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::ThreeWhiteSoldiers);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "105", "95", "101"));
+        }
+        indicator.next(&candle(10, "100", "110", "100", "110")); // white, body 10, no shadows
+        indicator.next(&candle(11, "105", "115", "105", "115")); // white, body 10
+        let value = indicator.next(&candle(12, "115", "125", "115", "125")); // white, body 10
+        assert_eq!(value, Some(d("100")), "three white soldiers is +100");
+
+        // Three black crows, at index 13 (L = 13). t-3 = 10 (white), t-2 = 11,
+        // t-1 = 12, t = 13. Each crow opens strictly inside the prior body, so
+        // each open sits above the prior close and below the prior open.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::ThreeBlackCrows);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "105", "95", "101"));
+        }
+        indicator.next(&candle(10, "100", "115", "95", "110")); // white bar, high 115
+        indicator.next(&candle(11, "108", "110", "105", "105")); // black, body 3
+        indicator.next(&candle(12, "107", "110", "104", "104")); // opens inside 11's body
+        let value = indicator.next(&candle(13, "106", "108", "103", "103")); // opens inside 12's
+        assert_eq!(value, Some(d("-100")), "three black crows is -100");
+    }
+
+    /// The quirks the definitions name, each asserted as a **negative**: a shape
+    /// that meets every condition except the quirky one must read 0. These fail
+    /// if an evaluator "helpfully" relaxes a strict test or widens a window.
+    #[test]
+    fn the_three_bar_quirks_are_kept_exactly() {
+        // Three black crows: `open(t-1) > close(t-2)` is STRICT. Set the second
+        // crow's open exactly at the first crow's close and the pattern must not
+        // fire — the case that keeps crows off continuous crypto bars.
+        //
+        // Every OTHER condition holds for these bars, and the third crow is
+        // well-formed (open 104.5 strictly inside 104..105), so the only thing
+        // that can decide this bar is the second crow's strict open. Relaxing
+        // that test to `>=` fires the pattern, which is what makes this a
+        // negative worth asserting.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::ThreeBlackCrows);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "105", "95", "101"));
+        }
+        indicator.next(&candle(10, "100", "115", "95", "110")); // white bar, high 115
+        indicator.next(&candle(11, "108", "110", "105", "105")); // black, body 3
+        indicator.next(&candle(12, "105", "110", "104", "104")); // open == close(11): NOT strict
+        let value = indicator.next(&candle(13, "104.5", "105", "103.5", "103.5")); // well-formed
+        assert_eq!(
+            value,
+            Some(d("0")),
+            "an open exactly at the prior close is not inside the body"
+        );
+
+        // Three white soldiers, the two halves of the same quirk. The "not
+        // short" test is on the THIRD candle only, so:
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::ThreeWhiteSoldiers);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "105", "95", "101"));
+        }
+        // (a) a SHORT first candle does not stop the pattern: nothing checks it.
+        indicator.next(&candle(10, "100", "100.5", "95", "100.5")); // body 0.5, upper 0
+        indicator.next(&candle(11, "100.2", "100.8", "100.2", "100.8")); // body 0.6
+        let value = indicator.next(&candle(12, "100.5", "102", "100.5", "102")); // body 1.5
+        assert_eq!(
+            value,
+            Some(d("100")),
+            "the first two candles are not required to have long bodies"
+        );
+
+        // (b) a SHORT third candle does stop it: `body(t) > avg(BodyShort, t)`.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::ThreeWhiteSoldiers);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "105", "95", "101"));
+        }
+        indicator.next(&candle(10, "100", "110", "100", "110"));
+        indicator.next(&candle(11, "105", "115", "105", "115"));
+        let value = indicator.next(&candle(12, "115", "116", "115", "115.5")); // short body
+        assert_eq!(
+            value,
+            Some(d("0")),
+            "the third candle's body must not be short"
+        );
+
+        // The stars do not check the star's colour. A white star in the morning
+        // star still fires: only the first and third candles' colours matter.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::MorningStar);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "100.5", "98.5", "99"));
+        }
+        indicator.next(&candle(10, "150", "151", "99", "100"));
+        indicator.next(&candle(11, "94", "96", "93", "95")); // WHITE star, top 96 < 100
+        let value = indicator.next(&candle(12, "100", "121", "99", "120"));
+        assert_eq!(
+            value,
+            Some(d("100")),
+            "the star's colour is not part of the pattern"
+        );
+
+        // The star's gap is a REAL-BODY gap and it is STRICT: `top(t-1) <
+        // bot(t-2)`. A star whose top merely reaches the first candle's body
+        // bottom does not fire. This is the star's counterpart to the crows'
+        // strict open — on continuous crypto bars the two bodies touch, and the
+        // strictness is exactly why the gap patterns are rare there.
+        //
+        // Every condition below holds except the gap, so widening the gap test
+        // (to `<=`, or by a tolerance) is what flips this bar.
+        let mut indicator = CandlePatternIndicator::new(CandlePatternName::MorningStar);
+        for index in 0_i64..10 {
+            indicator.next(&candle(index, "100", "100.5", "98.5", "99"));
+        }
+        indicator.next(&candle(10, "150", "151", "99", "100")); // body bottom 100
+        indicator.next(&candle(11, "99.5", "100", "99", "100")); // top 100 == bot(t-2): no gap
+        let value = indicator.next(&candle(12, "100", "121", "99", "120"));
+        assert_eq!(
+            value,
+            Some(d("0")),
+            "a star that does not gap down under the first body is not a morning star"
+        );
     }
 }
