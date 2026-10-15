@@ -13,7 +13,16 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-BIN="${PULSE_BIN:-target/debug/pulse}"
+# #229: cargo's real target directory, not a cwd-relative `target/` — a shared
+# `[build] target-dir` or an exported CARGO_TARGET_DIR puts the binary elsewhere,
+# and a stale `./target/debug/pulse` would be tested silently. PULSE_BIN overrides.
+if [[ -z "${PULSE_BIN:-}" ]]; then
+  TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["target_directory"])
+')"
+fi
+BIN="${PULSE_BIN:-$TARGET_DIR/debug/pulse}"
 
 # --- Step 1: discover the addresses -----------------------------------------
 TAILNET_IP="$(tailscale ip -4 | head -n1 | tr -d '[:space:]')"
