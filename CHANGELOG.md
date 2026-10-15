@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The streak and drawdown card in the Promote sheet (r5.s4.w2, PDR-0035).** Before the
+  confirm button — in the certified body and in the override confirm step — the Promote sheet
+  now shows **"A normal bad run"**: the longest losing streak, and the max drawdown in R and in
+  USDT (with the USDT figure as a percentage of the fixed 10,000 USDT equity), at the 50th
+  ("typical") and 95th ("bad but still normal") percentile over 100 trades from that version's
+  **latest full-span backtest run**, with the run's own observed values beside them, naming the
+  run the card read. A run with fewer than 30 closed trades says so and shows no figures — as do
+  a version with no run and a card read that fails — and none of those states changes the
+  variant, the refusal or the buttons: the card informs, the server's gate decides.
 - **The streak and drawdown card, and its app read (r5.s4.w1, PDR-0035).** Before a
   strategy is promoted to paper, the engine now answers what a *normal bad run* of it
   looks like: a seeded Monte Carlo (one fixed documented seed, 10,000 paths, 100 drawn

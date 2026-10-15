@@ -262,6 +262,41 @@
   resize: vertical;
 }
 .sh-hint { font-size: var(--fs-11); color: var(--text-3); }
+
+/* ---- the streak and drawdown card (r5.s4.w2, "A normal bad run") ----
+   The card rides the sheet's own row idiom for its title and source line; only
+   the small comparison table needs its own shape. Every value is a token. */
+.sc-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.sc-source { color: var(--text-2); font-size: var(--fs-12); }
+.sc-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-13);
+}
+.sc-table th,
+.sc-table td {
+  padding: var(--sp-1) var(--sp-2);
+  text-align: right;
+  font-weight: var(--fw-regular);
+}
+.sc-table thead th {
+  color: var(--text-3);
+  font-size: var(--fs-11);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+.sc-table th[scope="row"] {
+  text-align: left;
+  color: var(--text-2);
+}
+.sc-table tbody td { color: var(--text-1); }
+.sc-table tbody tr + tr th,
+.sc-table tbody tr + tr td { border-top: 1px solid var(--line-1); }
+
 .sh-foot {
   display: flex;
   align-items: center;
