@@ -19,7 +19,9 @@
 //    each overlay is computed on one of them, server-side, and the tab only draws what
 //    the leg it asked for returned.
 //  * **A leg over the bar cap** is never sent to be refused: the tab says how many bars
-//    it would be and asks for a trade, then reads a window around that trade (Q3/G4).
+//    it would be and asks for a trade — from the run's OWN stored trades, which the run
+//    read already carried, so the ask is one the trader can answer (CR1) — then reads a
+//    bounded window around that trade (Q3/G4).
 //
 // Every state is plain and says what it is (PDR-0011): loading, failed, an empty window,
 // no run, a withheld holdout, the operands the rule uses that are not drawn, and a leg
@@ -28,7 +30,12 @@
 import { useEffect, useRef, useState } from "react";
 
 import { commands } from "../bindings";
-import type { BacktestRunDto, ChartDataDto, ChartTradeDto } from "../bindings";
+import type {
+  BacktestRunDto,
+  ChartDataDto,
+  ChartTradeDto,
+  TradeRowDto,
+} from "../bindings";
 import type { ChartAdapter } from "../chart/adapter";
 import { createChartAdapter } from "../chart/adapter";
 import type { WindowPlan } from "../chart/window";
@@ -60,6 +67,10 @@ interface RunContext {
   readonly usesHtf: boolean;
   readonly firstOpenTimeMs: string;
   readonly lastCloseTimeMs: string;
+  /** The run's stored trades. The run read is the tab's FIRST answer about the run and
+   *  it already carries every trade the run recorded, so a leg over the bar cap has rows
+   *  to pick from before any chart read happens (CR1). */
+  readonly trades: readonly ChartTradeDto[];
 }
 
 /** One thing to ask the read for. */
@@ -309,7 +320,12 @@ export default function ChartScreen() {
   };
 
   // --- what is drawn right now ---------------------------------------------
-  const trades = dto?.run?.trades ?? [];
+  // The rows the trader picks a window from: the DRAWN window's trades when one is
+  // drawn, and the run's own stored trades otherwise — a leg waiting for a trade, a
+  // read in flight, a failed read (CR1). Both are the server's own records; nothing is
+  // derived here. The caption says which of the two the table is showing.
+  const windowTrades = dto?.run != null ? dto.run.trades : null;
+  const trades = windowTrades ?? run?.trades ?? [];
   const overlays = dto?.run?.overlays ?? [];
   const events = overlays.flatMap((overlay) => {
     if (overlay.kind === "pivot") {
@@ -447,10 +463,14 @@ export default function ChartScreen() {
       <section className="cw-strip" aria-label="Trades">
         {run === null ? (
           <p className="cw-note">No run is open, so there are no trades to draw.</p>
-        ) : dto?.run != null ? (
+        ) : (
           <div className="cw-scroll">
             <table className="cw-tbl cw-trades">
-              <caption>Trades in the window</caption>
+              {/* Named by what the rows ARE: a window's trades once one is drawn, the
+                  run's own stored trades while the tab has no window to show (CR1). */}
+              <caption>
+                {windowTrades === null ? "Trades in the run" : "Trades in the window"}
+              </caption>
               <thead>
                 <tr>
                   <th scope="col">#</th>
@@ -493,13 +513,17 @@ export default function ChartScreen() {
                 ))}
                 {trades.length === 0 && (
                   <tr>
-                    <td colSpan={8}>No trades fall in this window.</td>
+                    <td colSpan={8}>
+                      {windowTrades === null
+                        ? "The run recorded no trades."
+                        : "No trades fall in this window."}
+                    </td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
-        ) : null}
+        )}
       </section>
 
       {/* The table copy: no value may be reachable only through the canvas (the
@@ -590,6 +614,21 @@ export default function ChartScreen() {
   );
 }
 
+/** The run's stored trades (`TradeRowDto`) in the chart's own trade shape. Both describe
+ *  the same recorded fills; the run row spells them `entryFillTime`/`exitFillTime`
+ *  because it also records the SIGNAL bar and the size, which this chart never draws. */
+function toChartTrades(rows: readonly TradeRowDto[]): ChartTradeDto[] {
+  return rows.map((row) => ({
+    side: row.direction,
+    entryTime: row.entryFillTime,
+    entryPrice: row.entryPrice,
+    exitTime: row.exitFillTime,
+    exitPrice: row.exitPrice,
+    exitReason: row.exitReason,
+    realizedR: row.realizedR,
+  }));
+}
+
 /** The run's own facts a chart needs, read off the run DTO. */
 function readRun(dto: BacktestRunDto): RunContext {
   return {
@@ -600,6 +639,7 @@ function readRun(dto: BacktestRunDto): RunContext {
     usesHtf: dto.usesHtf,
     firstOpenTimeMs: dto.firstOpenTimeMs,
     lastCloseTimeMs: dto.lastCloseTimeMs,
+    trades: toChartTrades(dto.trades),
   };
 }
 

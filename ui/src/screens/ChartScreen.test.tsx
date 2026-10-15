@@ -60,6 +60,7 @@ import type {
   ChartRunDto,
   ChartTradeDto,
   ServerStatus,
+  TradeRowDto,
 } from "../bindings";
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,33 @@ function trade(over: Partial<ChartTradeDto>): ChartTradeDto {
     exitPrice: "92000",
     exitReason: "take_profit",
     realizedR: "2",
+    ...over,
+  };
+}
+
+/** One stored trade in the RUN read's own shape (`TradeRowDto`) — what
+ *  `getBacktestRun` answers with, which is the tab's first source of trades. */
+function tradeRow(over: Partial<TradeRowDto> = {}): TradeRowDto {
+  return {
+    direction: "long",
+    qty: "0.1",
+    entryPrice: "90000",
+    exitPrice: "92000",
+    entrySignalTime: String(ENTRY),
+    entryFillTime: String(ENTRY),
+    exitSignalTime: String(ENTRY + DAY),
+    exitFillTime: String(ENTRY + DAY),
+    feesTotal: "1.8",
+    fundingTotal: "0",
+    slippageTotal: "0.9",
+    realizedPnl: "180",
+    realizedR: "2",
+    mfeR: "2.4",
+    maeR: "-0.3",
+    exitReason: "take_profit",
+    source: "signal",
+    regime: "trend_up",
+    stopPrice: "89000",
     ...over,
   };
 }
@@ -169,6 +197,9 @@ function runDto(over: Partial<BacktestRunDto> = {}): BacktestRunDto {
     usesHtf: true,
     firstOpenTimeMs: String(FIRST),
     lastCloseTimeMs: String(LAST),
+    // The run read always carries the run's stored trades (the chart tab reads them
+    // before any chart read: CR1), so the fixture carries them too, empty by default.
+    trades: [],
     ...over,
   } as unknown as BacktestRunDto;
 }
@@ -370,6 +401,54 @@ describe("the leg switch", () => {
 
     await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith(String(ENTRY)));
     expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a leg over the cap before any chart read (CR1)", () => {
+  it("offers the run's own stored trades when the leg it opens on is over the cap", async () => {
+    // A primary-only 15m run (no higher timeframe at all, so no leg switch exists) whose
+    // whole span is 38,401 bars: the tab can only ask for a trade. The run read already
+    // carries that run's trades, so there is something to ask WITH.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          primaryTimeframe: "15m",
+          htfTimeframe: null,
+          usesHtf: false,
+          trades: [
+            tradeRow({}),
+            tradeRow({
+              direction: "short",
+              entryFillTime: String(EARLIER_ENTRY),
+              exitFillTime: String(EARLIER_ENTRY + DAY),
+              exitPrice: "88000",
+              realizedR: "-1",
+            }),
+          ],
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+
+    expect(await screen.findByText(/Pick a trade to load 15m around it/)).toBeTruthy();
+    // Nothing is read: a window over the cap is never sent to be refused.
+    expect(commands.chartData).not.toHaveBeenCalled();
+    // The rows are the run's own trades, and the table says which trades it is showing.
+    const table = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(table).getAllByRole("button")).toHaveLength(2);
+    expect(screen.getByText("Backtest run run-1 · 15m")).toBeTruthy();
+
+    // Picking one plans the ±500-bar window around its entry, exactly as amendment B
+    // does for a trade picked after a read: exactly one bounded chart read.
+    fireEvent.click(within(table).getByRole("button", { name: /^Trade 1, long/ }));
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    expect(commands.chartData).toHaveBeenCalledWith({
+      pair: "BTCUSDT",
+      timeframe: "15m",
+      fromMs: String(ENTRY - HALF),
+      toMs: String(ENTRY + HALF),
+      runId: "run-1",
+    });
   });
 });
 
