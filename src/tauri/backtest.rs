@@ -391,7 +391,8 @@ fn dec_opt(value: Option<Decimal>) -> Option<String> {
 }
 
 /// Epoch milliseconds as an exact integer string (see the module docs).
-fn ms(value: i64) -> String {
+/// `pub(crate)` so `chart.rs`'s markers render the identical text (r5.s2.w1).
+pub(crate) fn ms(value: i64) -> String {
     value.to_string()
 }
 
@@ -400,15 +401,17 @@ fn ms(value: i64) -> String {
 // Each returns the SAME `snake_case` token the column stores, and each is an
 // exhaustive `match` rather than a serde round-trip. Infallible by construction: a
 // new variant is a compile error here, not an `"unknown"` on someone's screen.
+// `pub(crate)` (r5.s2.w1) so the chart read's trade markers use the one spelling
+// the Lab and the database already use.
 
-fn direction_label(direction: Direction) -> &'static str {
+pub(crate) fn direction_label(direction: Direction) -> &'static str {
     match direction {
         Direction::Long => "long",
         Direction::Short => "short",
     }
 }
 
-fn exit_reason_label(reason: ExitReason) -> &'static str {
+pub(crate) fn exit_reason_label(reason: ExitReason) -> &'static str {
     match reason {
         ExitReason::StopLoss => "stop_loss",
         ExitReason::TakeProfit => "take_profit",

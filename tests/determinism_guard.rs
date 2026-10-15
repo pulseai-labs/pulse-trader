@@ -117,6 +117,10 @@ const SCAN_TARGETS: &[&str] = &[
     // draws, no `f64` anywhere; scanned so a future banned call here is not a
     // false-green hole.
     "src/domain/backtest/streak_card.rs",
+    // r5.s2.w1: the chart read — the per-bar engine values it projects for the
+    // Chart tab are exact `Decimal` and strings, no `f64` anywhere; scanned so a
+    // future banned call here is not a false-green hole.
+    "src/tauri/chart.rs",
 ];
 
 fn manifest_relative(rel: &str) -> PathBuf {

@@ -103,6 +103,11 @@ pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum:
         .mount_post_json(state, "/api/v1/streak-card", |state, request| {
             Box::pin(plain_streak_card(state, request))
         })
+        // r5.s2.w1 (PDR-0036): the Chart tab's read — a window of candles and,
+        // for a run, its trades and its rule's overlays.
+        .mount_post_json(state, "/api/v1/chart", |state, request| {
+            Box::pin(plain_chart_data(state, request))
+        })
         .mount_post_json(
             state,
             "/api/v1/bus-selftest-failure",
@@ -339,6 +344,21 @@ async fn plain_streak_card(
     request: crate::tauri::StreakCardRequest,
 ) -> Response {
     match streak_card_core(&state.desktop, request).await {
+        Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
+        Err(err) => ops::bus_422(&err),
+    }
+}
+
+/// `POST /api/v1/chart` — the Chart tab's read: a window of candles (capped, cut
+/// at an open freeze's holdout start) and, for a named run, its trades and its
+/// rule's overlays, straight through the core (r5.s2.w1, PDR-0036). Mounted
+/// `Scope::App`: an `agent` token is a 403 `scope_refused` with an audit row,
+/// exactly like every other route on this table.
+async fn plain_chart_data(
+    state: Arc<ServerState>,
+    request: crate::tauri::ChartDataRequest,
+) -> Response {
+    match crate::tauri::chart::chart_data_core(&state.desktop, request).await {
         Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
         Err(err) => ops::bus_422(&err),
     }
