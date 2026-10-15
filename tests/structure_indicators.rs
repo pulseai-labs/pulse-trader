@@ -1,6 +1,8 @@
 //! r4.s6.w1 — the structure-indicator acceptance suite (demo line d78).
 //!
 //! Schema **1.3.0** ships twelve structure and pattern indicator variants: the
+//! (r5.s1.w1 moved `CURRENT` on to 1.4.0, additively: these twelve variants are
+//! untouched, and this suite's migration case now lands on 1.4.0.)
 //! swing pivots `PivotHigh`/`PivotLow`, the levels `Resistance`/`Support`, the
 //! four candle-anatomy values `Body`/`UpperWick`/`LowerWick`/`Range` (all four
 //! groups pinned here), and the four pattern variants
@@ -29,7 +31,7 @@
 //!   its signal on the M15 bar where the paired closed H4 bar first yields the
 //!   level — never on a forming H4 bar.
 //! - **(h) Migration.** A 1.2.0 document loads through the identity step and
-//!   re-serializes as 1.3.0, unchanged otherwise.
+//!   re-serializes as CURRENT, unchanged otherwise.
 //!
 //! The fixture and every expected value are pinned literals, labelled by hand
 //! against the definitions in SPINE.md's primitive table; nothing in this file
@@ -946,7 +948,7 @@ fn a_resistance_on_the_htf_series_compiles_and_steps_on_the_closed_h4_bar() {
 }
 
 // ---------------------------------------------------------------------------
-// (h) Migration — a 1.2.0 document loads and re-serializes as 1.3.0
+// (h) Migration — a 1.2.0 document loads and re-serializes as CURRENT (1.4.0)
 // ---------------------------------------------------------------------------
 
 /// A canonical 1.2.0 document (every defaulted field written explicitly, the
@@ -971,7 +973,7 @@ const DOC_1_2_0: &str = r#"{
 }"#;
 
 #[test]
-fn a_1_2_0_document_loads_and_reserializes_as_1_3_0_unchanged_otherwise() {
+fn a_1_2_0_document_loads_and_reserializes_as_current_unchanged_otherwise() {
     let loaded = Migrator::v1()
         .load(DOC_1_2_0)
         .expect("a 1.2.0 document loads");
@@ -983,7 +985,7 @@ fn a_1_2_0_document_loads_and_reserializes_as_1_3_0_unchanged_otherwise() {
     );
     assert!(
         loaded.migrated,
-        "the 1.2.0 → 1.3.0 identity step was applied"
+        "the 1.2.0 → 1.3.0 identity step was applied (and on to 1.4.0)"
     );
     assert_eq!(
         loaded.dsl_original, DOC_1_2_0,
@@ -996,15 +998,15 @@ fn a_1_2_0_document_loads_and_reserializes_as_1_3_0_unchanged_otherwise() {
     );
     assert_eq!(
         loaded.dsl.schema_version.to_string(),
-        "1.3.0",
-        "CURRENT is 1.3.0"
+        "1.4.0",
+        "CURRENT is 1.4.0"
     );
 
     // Re-serialized, the document differs from the input ONLY in its version.
     let reserialized = serde_json::to_value(&loaded.dsl).expect("re-serializes");
     let mut expected: serde_json::Value =
         serde_json::from_str(DOC_1_2_0).expect("the fixture is valid JSON");
-    expected["schema_version"] = serde_json::json!("1.3.0");
+    expected["schema_version"] = serde_json::json!("1.4.0");
     assert_eq!(
         reserialized, expected,
         "the identity step changes nothing but the schema_version string"

@@ -15,8 +15,8 @@ mod support;
 use std::path::PathBuf;
 
 use pulse::{
-    CandleSeriesRepository, CandleStore, CompiledValue, EvalContext, IndicatorEngine,
-    IndicatorSpec, Pair, Series, SweepableValue, Timeframe,
+    Candle, CandlePatternName, CandleSeriesRepository, CandleStore, CompiledValue, EvalContext,
+    IndicatorEngine, IndicatorSpec, Pair, Series, SweepableValue, Timeframe,
 };
 use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use rust_decimal::Decimal;
@@ -86,7 +86,7 @@ async fn tools_and_dsl_schema_resource_are_served() {
         other => panic!("dsl_schema must be text contents, got {other:?}"),
     };
     let doc: Value = serde_json::from_str(&text).expect("dsl_schema body parses as JSON");
-    assert_eq!(doc["schema_version"], "1.3.0");
+    assert_eq!(doc["schema_version"], "1.4.0");
     let properties = doc["json_schema"]["properties"]
         .as_object()
         .expect("json_schema has properties");
@@ -148,8 +148,8 @@ async fn strategy_and_version_tools_return_the_seed() {
     assert_eq!(version["parent_version_id"], parent_id);
     assert_eq!(version["created_by"], "composer_llm");
     // The seeded `1.0.0` document was identity-migrated on write — the stored
-    // column and the migrated `.dsl` read back at CURRENT (1.3.0).
-    assert_eq!(version["dsl_schema_version"], "1.3.0");
+    // column and the migrated `.dsl` read back at CURRENT (1.4.0).
+    assert_eq!(version["dsl_schema_version"], "1.4.0");
     assert_eq!(version["dsl"]["name"], "RSI Oversold (mcp child)");
     assert_eq!(
         version["dsl_original"],
@@ -401,6 +401,80 @@ async fn run_tools_return_the_seeded_run() {
     client.cancel().await.expect("cancel session");
 }
 
+/// The two indicator columns the export test asks for: `rsi:14` and, since
+/// r5.s1.w3, the `cdl:engulfing` pattern column.
+fn indicator_export_specs() -> [IndicatorSpec; 2] {
+    [
+        IndicatorSpec::Rsi {
+            period: SweepableValue::Fixed(14),
+        },
+        IndicatorSpec::CandlePattern {
+            pattern: CandlePatternName::Engulfing,
+        },
+    ]
+}
+
+/// One row of expected cells per candle: the specs stepped by a fresh
+/// `IndicatorEngine` over the same snapshot the server reads.
+fn expected_indicator_rows(
+    candles: &[Candle],
+    specs: &[IndicatorSpec],
+) -> Vec<Vec<Option<Decimal>>> {
+    let mut engine = IndicatorEngine::from_specs(specs).expect("engine builds");
+    let mut rows = Vec::with_capacity(candles.len());
+    for candle in candles {
+        engine.step(candle);
+        rows.push(
+            specs
+                .iter()
+                .map(|spec| {
+                    engine.current(&CompiledValue::Indicator {
+                        series: Series::Primary,
+                        spec: spec.clone(),
+                        lag: 0,
+                    })
+                })
+                .collect(),
+        );
+    }
+    rows
+}
+
+/// The exported CSV against the expected cells, cell for cell, plus the pattern
+/// column's own promise: TA-Lib's integer renders as an integer — `0`, the ±80
+/// partial Engulfing form, the ±100 full one — never with a decimal tail.
+fn assert_indicator_cells(csv: &str, candles: &[Candle], expected: &[Vec<Option<Decimal>>]) {
+    let mut lines = csv.lines();
+    assert_eq!(lines.next(), Some("open_time\trsi:14\tcdl:engulfing"));
+    let mut cdl_cells: Vec<String> = Vec::with_capacity(candles.len());
+    for (candle, expected_row) in candles.iter().zip(expected) {
+        let line = lines.next().expect("one row per candle");
+        let cells: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cells.len(), 3, "open_time + one cell per spec: {line}");
+        assert_eq!(cells[0], candle.open_time.to_string());
+        for (cell, expected_value) in cells[1..].iter().zip(expected_row) {
+            match expected_value {
+                Some(v) => assert_eq!(*cell, v.normalize().to_string()),
+                None => assert_eq!(*cell, "", "warmup row renders blank"),
+            }
+        }
+        cdl_cells.push(cells[2].to_owned());
+    }
+    assert!(lines.next().is_none(), "no trailing rows");
+    assert!(
+        cdl_cells.iter().any(|cell| cell == "0"),
+        "a no-pattern bar renders 0"
+    );
+    assert!(
+        cdl_cells.iter().any(|cell| cell == "80" || cell == "-80"),
+        "the fixture carries the partial Engulfing form, rendered 80"
+    );
+    assert!(
+        cdl_cells.iter().any(|cell| cell == "100" || cell == "-100"),
+        "the fixture carries the full Engulfing form, rendered 100"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candle_and_indicator_exports_match_the_snapshot() {
     let (fixture, client) = seeded_fixture().await;
@@ -461,26 +535,14 @@ async fn candle_and_indicator_exports_match_the_snapshot() {
         "parquet export is a byte copy of the snapshot"
     );
 
-    // --- export_indicators (rsi:14): cell-for-cell vs IndicatorEngine.
-    let spec = IndicatorSpec::Rsi {
-        period: SweepableValue::Fixed(14),
-    };
-    let mut engine =
-        IndicatorEngine::from_specs(std::slice::from_ref(&spec)).expect("engine builds");
-    let mut expected: Vec<Option<Decimal>> = Vec::with_capacity(candle_count);
-    for candle in &stored.series.candles {
-        engine.step(candle);
-        expected.push(engine.current(&CompiledValue::Indicator {
-            series: Series::Primary,
-            spec: spec.clone(),
-            lag: 0,
-        }));
-    }
-
+    // --- export_indicators (rsi:14 + the r5.s1.w3 cdl:engulfing): cell-for-cell
+    // vs IndicatorEngine, through the two helpers below.
+    let specs = indicator_export_specs();
+    let expected = expected_indicator_rows(&stored.series.candles, &specs);
     let exported = call(
         &client,
         "export_indicators",
-        json!({"pair": "BTCUSDT", "timeframe": "15m", "indicators": ["rsi:14"]}),
+        json!({"pair": "BTCUSDT", "timeframe": "15m", "indicators": ["rsi:14", "cdl:engulfing"]}),
     )
     .await;
     assert_eq!(exported["rows"], candle_count);
@@ -489,21 +551,10 @@ async fn candle_and_indicator_exports_match_the_snapshot() {
     // export_indicators used to drop both.
     assert_eq!(exported["timeframe"], "15m");
     assert_eq!(exported["pair"], "BTCUSDT");
-    assert_eq!(exported["columns"], json!(["rsi:14"]));
+    assert_eq!(exported["columns"], json!(["rsi:14", "cdl:engulfing"]));
     let path = PathBuf::from(exported["path"].as_str().expect("path"));
     let csv = std::fs::read_to_string(&path).expect("read indicators csv");
-    let mut lines = csv.lines();
-    assert_eq!(lines.next(), Some("open_time\trsi:14"));
-    for (candle, expected_value) in stored.series.candles.iter().zip(&expected) {
-        let line = lines.next().expect("one row per candle");
-        let (open_time, cell) = line.split_once('\t').expect("two columns");
-        assert_eq!(open_time, candle.open_time.to_string());
-        match expected_value {
-            Some(v) => assert_eq!(cell, v.normalize().to_string()),
-            None => assert_eq!(cell, "", "warmup row renders blank"),
-        }
-    }
-    assert!(lines.next().is_none(), "no trailing rows");
+    assert_indicator_cells(&csv, &stored.series.candles, &expected);
 
     // A run-scoped export here keeps the session genuinely read-only — the
     // seeded run_id proves trades read back through the same store.

@@ -12,7 +12,7 @@ expected_inputs: >
 expected_outputs: >
   A sequence of builder-tool calls (one visible step each) that compose and
   finalize a schema-valid strategy; never raw DSL JSON.
-dsl_schema_version: "1.3.0"
+dsl_schema_version: "1.4.0"
 ---
 
 # Composer system prompt
@@ -73,6 +73,8 @@ Both take `{ "left": <operand>, "op": <comparator>, "right": <operand> }`.
   - **necklines** — `{ "source": "indicator", "indicator": "double_top_neckline"|"double_bottom_neckline", "left": <number>, "right": <number>, "tolerance_pct": "<decimal fraction>" }`: the barrier a double top / double bottom breaks — the lowest low strictly between the last two confirmed pivot highs when those are within `tolerance_pct` of each other (the mirror: the highest high between the last two within-tolerance pivot lows).
   - **trendlines** — `{ "source": "indicator", "indicator": "trendline_lows"|"trendline_highs", "left": <number>, "right": <number> }`: the line through the last two confirmed pivot lows / pivot highs, extended to the current bar — defined only when the pair rises (lows) / falls (highs).
   - **no level means false** — after warm-up, a structure/pattern operand with no value at a bar (`resistance`/`support` with no qualifying level, a neckline whose pair is out of tolerance, a wrong-way trendline) makes every comparison over it **false** — so a `Not` over such a comparison is true. The zone-break form above is unaffected: it reads the **previous** bar's level, which is where the break is measured.
+
+- **The schema-1.4.0 candle patterns** — `{ "source": "indicator", "indicator": "candle_pattern", "pattern": "Engulfing" }` names one of TA-Lib's 17 candlestick patterns and reads **TA-Lib's own integer** on the current bar: `+100` bullish, `-100` bearish, `0` no pattern, and `±80` for the **partial** `Engulfing` / `Harami` forms, where a body end coincides with or touches the prior body's edge (the common case on continuous crypto bars, which open at the prior close). The 17 names and their signs: bullish only — `"Hammer"`, `"InvertedHammer"`, `"Piercing"`, `"MorningStar"`, `"ThreeWhiteSoldiers"`; bearish only — `"HangingMan"`, `"ShootingStar"`, `"DarkCloudCover"`, `"EveningStar"`, `"ThreeBlackCrows"`; both signs, by the candle's own colour — `"Marubozu"`, `"SpinningTop"`, `"Engulfing"`; **`"Harami"` also carries both signs, but its sign is the opposite of the PRIOR bar's colour** — `+` when the prior bar is black (a bullish harami), never the colour of the bar it fires on; no direction — `"Doji"`, `"DragonflyDoji"` and `"GravestoneDoji"` read `+100` only. **The reading rule:** `Gt 0` is "a bullish form fired", `Lt 0` "a bearish one", and `Eq 100` / `Eq -100` only the **full** form. A pattern is evaluated on the **closed** bar — the last closed H4 bar on a `"timeframe": "h4"` operand — and never repaints; it warms up over TA-Lib's own lookback (10–13 bars by pattern) and has no value before it, so a comparison over it is then false.
 
 - `{ "source": "price", "price_field": "open"|"high"|"low"|"close"|"volume" }`
 - `{ "source": "constant", "value": "<decimal string>" }`  ← a bare threshold like 30 is a **constant**: `{ "source": "constant", "value": "30" }`
@@ -163,6 +165,28 @@ close to have broken the falling trendline through the last two swing highs;
 both are ANDed with the entry. Each structure/pattern operand carries
 `"timeframe": "h4"` because the strategy trades the H4 zone, and every value is
 read on the last **closed** H4 bar.
+
+### Worked example — "4h support rejection with a bullish hammer"
+
+Call the tools one at a time, in this order:
+
+1. `create_strategy` → `{ "name": "Support Rejection 4H", "direction": "long" }`
+2. `add_entry_signal` → `{ "left": { "source": "price", "price_field": "low", "timeframe": "h4" }, "op": "lte", "right": { "source": "arith", "op": "mul", "lhs": { "source": "lag", "bars": 1, "of": { "source": "indicator", "indicator": "support", "left": 1, "right": 1, "tolerance_pct": "0.05", "min_touches": 2, "lookback": 50, "timeframe": "h4" } }, "rhs": { "source": "constant", "value": "1.005" } } }`
+3. `add_filter` → `{ "left": { "source": "price", "price_field": "close", "timeframe": "h4" }, "op": "gt", "right": { "source": "lag", "bars": 1, "of": { "source": "indicator", "indicator": "support", "left": 1, "right": 1, "tolerance_pct": "0.05", "min_touches": 2, "lookback": 50, "timeframe": "h4" } } }`
+4. `add_filter` → `{ "left": { "source": "indicator", "indicator": "candle_pattern", "pattern": "Hammer", "timeframe": "h4" }, "op": "gt", "right": { "source": "constant", "value": "0" } }`
+5. `set_exit_rules` → `{ "stop_loss_pct": "0.015", "take_profit_r": "1" }`
+6. `set_risk_params` → `{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }`
+7. `finalize_strategy` → `{}`
+
+The entry is the **support-touch form**, the mirror of the zone-break form above:
+the H4 low reaches, within a 0.5% band, the level the `support` indicator carried
+on the **previous** H4 bar (`lag(…, 1)`), and step 3 requires the H4 close to
+finish back **above** that same level. Reading the same bar's `support` would say
+nothing — a support value sits strictly below its own bar's close by definition —
+so the touch is always measured against the level as of the bar before. Step 4
+keeps only bars whose 4h candle is a **bullish hammer** (`Gt 0` reads any bullish
+form; `Eq 100` would demand the full one). The three conditions are ANDed, and
+every one of them reads the last **closed** H4 bar.
 
 ## Prompt-level invariants (absolute rules)
 

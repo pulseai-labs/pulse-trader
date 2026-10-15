@@ -711,6 +711,9 @@ fn spec_name(spec: &IndicatorSpec) -> String {
             period_value(left),
             period_value(right)
         ),
+        // r5.s1.w1 (schema 1.4.0): the named candle patterns carry no parameter,
+        // so the name is the pattern alone.
+        IndicatorSpec::CandlePattern { pattern } => format!("CandlePattern({pattern:?})"),
     }
 }
 
@@ -928,10 +931,11 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
                 errors,
             );
         }
-        // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
-        // indicators (r4.s6.w3): twelve variants, checked by their own helper.
-        // They are listed here BY NAME — never matched with a wildcard — so a
-        // new variant still breaks this match and has to be routed by hand.
+        // The structure indicators (schema 1.3.0, r4.s6.w1), the pattern
+        // indicators (r4.s6.w3) and the named candle patterns (schema 1.4.0,
+        // r5.s1.w1): thirteen variants, checked by their own helper. They are
+        // listed here BY NAME — never matched with a wildcard — so a new variant
+        // still breaks this match and has to be routed by hand.
         IndicatorSpec::PivotHigh { .. }
         | IndicatorSpec::PivotLow { .. }
         | IndicatorSpec::Resistance { .. }
@@ -943,7 +947,8 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
         | IndicatorSpec::Body
         | IndicatorSpec::UpperWick
         | IndicatorSpec::LowerWick
-        | IndicatorSpec::Range => check_structure_indicator(spec, path, errors),
+        | IndicatorSpec::Range
+        | IndicatorSpec::CandlePattern { .. } => check_structure_indicator(spec, path, errors),
     }
 }
 
@@ -1034,11 +1039,14 @@ fn check_structure_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<
             );
         }
         // The candle-anatomy variants carry no numeric leaf at all — the
-        // `series`-tag precedent: nothing to range-check.
+        // `series`-tag precedent: nothing to range-check. The named candle
+        // patterns take no parameter either (schema 1.4.0, r5.s1.w1), so they
+        // have the same one rule to state and no leaf to check.
         IndicatorSpec::Body
         | IndicatorSpec::UpperWick
         | IndicatorSpec::LowerWick
-        | IndicatorSpec::Range => {}
+        | IndicatorSpec::Range
+        | IndicatorSpec::CandlePattern { .. } => {}
         other => unreachable!(
             "check_indicator routes only the structure/pattern variants here, never {other:?}"
         ),

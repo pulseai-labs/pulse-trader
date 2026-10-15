@@ -24,8 +24,9 @@ use serde::Serialize;
 
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
-    BacktestInputs, IndicatorSpec, MacdOutput, MfeMaeAggregates, OpenPositionMark, PersistedRun,
-    PriceField, RegimeBreakdown, SkippedEntryCounts, SummaryStats, SweepableValue,
+    BacktestInputs, CandlePatternName, IndicatorSpec, MacdOutput, MfeMaeAggregates,
+    OpenPositionMark, PersistedRun, PriceField, RegimeBreakdown, SkippedEntryCounts, SummaryStats,
+    SweepableValue,
 };
 
 /// One column of indicator output: the label a client sees (`<kind>:<period>`,
@@ -82,10 +83,22 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
         return Ok(IndicatorColumn { label: bare, spec });
     }
 
+    // The named candle patterns (schema 1.4.0, r5.s1.w3) are written
+    // `cdl:<name>`. The name is required, so a bare `cdl` is its own case: it
+    // has no `:` to split on and would otherwise fall into the `<kind>:<period>`
+    // refusal. r5.s1.w1 added the pattern specs; the token is this item's.
+    if bare == "cdl" {
+        anyhow::bail!("{}", cdl_token_error(token, ""));
+    }
+
     let (kind, rest) = token.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("invalid --indicator {token:?}: expected <kind>:<period>")
     })?;
     let kind = kind.trim().to_ascii_lowercase();
+
+    if kind == "cdl" {
+        return parse_candle_pattern(token, rest);
+    }
 
     // MACD carries three periods and (schema 1.2.0, r3.s2 — b2) an optional
     // output selector: `macd:<fast>-<slow>-<signal>` or
@@ -407,6 +420,78 @@ fn parse_trendline(token: &str, kind: &str, rest: &str) -> anyhow::Result<Indica
     })
 }
 
+/// The 17 named candle patterns of schema 1.4.0 (r5.s1.w1) with their
+/// `cdl:` read-path names (r5.s1.w3), in catalog order.
+const CANDLE_PATTERNS: [(CandlePatternName, &str); 17] = [
+    (CandlePatternName::Doji, "doji"),
+    (CandlePatternName::DragonflyDoji, "dragonfly_doji"),
+    (CandlePatternName::GravestoneDoji, "gravestone_doji"),
+    (CandlePatternName::Hammer, "hammer"),
+    (CandlePatternName::InvertedHammer, "inverted_hammer"),
+    (CandlePatternName::HangingMan, "hanging_man"),
+    (CandlePatternName::ShootingStar, "shooting_star"),
+    (CandlePatternName::Marubozu, "marubozu"),
+    (CandlePatternName::SpinningTop, "spinning_top"),
+    (CandlePatternName::Engulfing, "engulfing"),
+    (CandlePatternName::Harami, "harami"),
+    (CandlePatternName::Piercing, "piercing"),
+    (CandlePatternName::DarkCloudCover, "dark_cloud_cover"),
+    (CandlePatternName::MorningStar, "morning_star"),
+    (CandlePatternName::EveningStar, "evening_star"),
+    (
+        CandlePatternName::ThreeWhiteSoldiers,
+        "three_white_soldiers",
+    ),
+    (CandlePatternName::ThreeBlackCrows, "three_black_crows"),
+];
+
+/// Parse the `cdl:<name>` form (r5.s1.w3). `<name>` matches a pattern ignoring
+/// case and underscores, so `cdl:morning_star`, `cdl:MorningStar` and
+/// `cdl:morningstar` are the same pattern; the column label is always the fixed
+/// `cdl:<snake_case>` of the matched pattern, so spelling variants dedup through
+/// the existing label set.
+fn parse_candle_pattern(token: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    // Exactly one `:` field: a second one (the macd shape) is refused, never
+    // read as part of the name.
+    let name = rest.trim();
+    if !name.contains(':') {
+        let wanted = normalize_pattern_name(name);
+        if let Some((pattern, snake)) = CANDLE_PATTERNS
+            .iter()
+            .find(|(_, snake)| normalize_pattern_name(snake) == wanted)
+        {
+            return Ok(IndicatorColumn {
+                label: format!("cdl:{snake}"),
+                spec: IndicatorSpec::CandlePattern { pattern: *pattern },
+            });
+        }
+    }
+    anyhow::bail!("{}", cdl_token_error(token, name))
+}
+
+/// The name normalization the `cdl` token matches on: case and underscores are
+/// ignored.
+fn normalize_pattern_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace('_', "")
+}
+
+/// The one refusal every malformed `cdl` token gets: it names the token and
+/// lists the 17 `snake_case` names.
+fn cdl_token_error(token: &str, name: &str) -> String {
+    let names: Vec<&str> = CANDLE_PATTERNS.iter().map(|(_, snake)| *snake).collect();
+    if name.is_empty() {
+        format!(
+            "invalid --indicator {token:?}: expected cdl:<pattern>, one of {}",
+            names.join(", ")
+        )
+    } else {
+        format!(
+            "invalid --indicator {token:?}: unknown candle pattern {name:?}; expected one of {}",
+            names.join(", ")
+        )
+    }
+}
+
 /// One version row inside [`StrategyEntry::versions`], in `version_tree`
 /// (parent-first) order — the `list_strategies` wire shape.
 #[derive(Debug, Clone, Serialize)]
@@ -652,7 +737,16 @@ pub fn run_detail(run: &PersistedRun, mfe_mae: &MfeMaeAggregates) -> RunDetail {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::parse_indicator_specs;
-    use crate::{IndicatorSpec, SweepableValue};
+    use crate::{CandlePatternName, IndicatorSpec, SweepableValue};
+
+    /// The pattern a `CandlePattern` spec carries (schema 1.4.0, r5.s1.w3) —
+    /// the `cdl:<name>` token's own accessor, since a pattern carries no period.
+    fn pattern_name(spec: &IndicatorSpec) -> CandlePatternName {
+        match spec {
+            IndicatorSpec::CandlePattern { pattern } => *pattern,
+            other => panic!("not a candle pattern: {other:?}"),
+        }
+    }
 
     fn fixed_period(spec: &IndicatorSpec) -> u32 {
         match spec {
@@ -694,6 +788,12 @@ mod tests {
             | IndicatorSpec::UpperWick
             | IndicatorSpec::LowerWick
             | IndicatorSpec::Range => panic!("the anatomy kinds take no period"),
+            // r5.s1.w1 (schema 1.4.0) / r5.s1.w3: the named candle patterns take
+            // no period either — the `cdl:<name>` token builds them, and the
+            // `cdl` tests read the pattern through `pattern_name`.
+            IndicatorSpec::CandlePattern { .. } => {
+                panic!("the candle-pattern kinds take no period; read it with `pattern_name`")
+            }
         }
     }
 
@@ -798,5 +898,129 @@ mod tests {
         assert!(parse_indicator_specs(&["trendline_lows:3-0".to_owned()]).is_err());
         assert!(parse_indicator_specs(&["double_top_neckline:3-3".to_owned()]).is_err());
         assert!(parse_indicator_specs(&["double_top_neckline:3-3-0".to_owned()]).is_err());
+    }
+
+    /// The 17 names and their two spellings, in catalog order (r5.s1.w3).
+    const CDL_NAMES: [(CandlePatternName, &str, &str); 17] = [
+        (CandlePatternName::Doji, "doji", "Doji"),
+        (
+            CandlePatternName::DragonflyDoji,
+            "dragonfly_doji",
+            "DragonflyDoji",
+        ),
+        (
+            CandlePatternName::GravestoneDoji,
+            "gravestone_doji",
+            "GravestoneDoji",
+        ),
+        (CandlePatternName::Hammer, "hammer", "Hammer"),
+        (
+            CandlePatternName::InvertedHammer,
+            "inverted_hammer",
+            "InvertedHammer",
+        ),
+        (CandlePatternName::HangingMan, "hanging_man", "HangingMan"),
+        (
+            CandlePatternName::ShootingStar,
+            "shooting_star",
+            "ShootingStar",
+        ),
+        (CandlePatternName::Marubozu, "marubozu", "Marubozu"),
+        (
+            CandlePatternName::SpinningTop,
+            "spinning_top",
+            "SpinningTop",
+        ),
+        (CandlePatternName::Engulfing, "engulfing", "Engulfing"),
+        (CandlePatternName::Harami, "harami", "Harami"),
+        (CandlePatternName::Piercing, "piercing", "Piercing"),
+        (
+            CandlePatternName::DarkCloudCover,
+            "dark_cloud_cover",
+            "DarkCloudCover",
+        ),
+        (
+            CandlePatternName::MorningStar,
+            "morning_star",
+            "MorningStar",
+        ),
+        (
+            CandlePatternName::EveningStar,
+            "evening_star",
+            "EveningStar",
+        ),
+        (
+            CandlePatternName::ThreeWhiteSoldiers,
+            "three_white_soldiers",
+            "ThreeWhiteSoldiers",
+        ),
+        (
+            CandlePatternName::ThreeBlackCrows,
+            "three_black_crows",
+            "ThreeBlackCrows",
+        ),
+    ];
+
+    /// r5.s1.w3: every one of the 17 named candle patterns resolves from
+    /// `cdl:<name>`, whatever the spelling — the name matches ignoring case and
+    /// underscores, so `cdl:MorningStar`, `cdl:morning_star` and
+    /// `cdl:morningstar` are one pattern — and the parsed spec carries the DSL
+    /// variant.
+    #[test]
+    fn cdl_token_parses_all_seventeen_names_in_both_spellings() {
+        for (pattern, snake, pascal) in CDL_NAMES {
+            let upper = snake.to_ascii_uppercase();
+            let lower = pascal.to_ascii_lowercase();
+            for spelling in [snake, pascal, upper.as_str(), lower.as_str()] {
+                let columns = parse_indicator_specs(&[format!("cdl:{spelling}")])
+                    .unwrap_or_else(|e| panic!("cdl:{spelling} parses: {e}"));
+                assert_eq!(columns.len(), 1, "one column for cdl:{spelling}");
+                assert_eq!(
+                    columns[0].label,
+                    format!("cdl:{snake}"),
+                    "the label is always the snake_case form"
+                );
+                assert_eq!(pattern_name(&columns[0].spec), pattern);
+            }
+        }
+    }
+
+    /// The label is the fixed `cdl:<snake_case>`, so case and underscore
+    /// variants of one pattern dedup to a single column (order preserved), and
+    /// the token mixes freely with the other kinds.
+    #[test]
+    fn cdl_token_label_is_snake_case_and_dedups() {
+        let columns = parse_indicator_specs(&[
+            "cdl:Engulfing".to_owned(),
+            "rsi:14".to_owned(),
+            "cdl:engulfing".to_owned(),
+            "cdl:MORNING_STAR".to_owned(),
+            "cdl:morning_star".to_owned(),
+        ])
+        .expect("the cdl columns parse");
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.label.as_str())
+                .collect::<Vec<_>>(),
+            ["cdl:engulfing", "rsi:14", "cdl:morning_star"],
+            "case/underscore variants of one pattern collapse to one column"
+        );
+    }
+
+    /// An unknown name — and the bare `cdl`, the empty name and the
+    /// second-`:` forms — are refused with one error that names the token and
+    /// lists all 17 `snake_case` names.
+    #[test]
+    fn cdl_token_refuses_unknown_name_and_lists_the_seventeen() {
+        for bad in ["cdl:bogus", "cdl:", "cdl", "cdl:engulfing:1"] {
+            let error = parse_indicator_specs(&[bad.to_owned()])
+                .expect_err("a bad cdl token must be refused");
+            let text = error.to_string();
+            assert!(text.contains(bad), "the error names the token: {text}");
+            for (_, snake, _) in CDL_NAMES {
+                assert!(text.contains(snake), "the error lists {snake}: {text}");
+            }
+        }
     }
 }

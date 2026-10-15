@@ -8,6 +8,9 @@
 
 pub mod adx;
 pub mod atr;
+// r5.s1.w1 (schema 1.4.0): the named candlestick patterns — TA-Lib's own integer
+// per pattern, on one shared candle ring.
+pub mod candle_patterns;
 pub mod convert;
 pub mod ema;
 pub mod engine;
