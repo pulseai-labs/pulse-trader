@@ -26,9 +26,9 @@ use chrono::SecondsFormat;
 use pulse::{
     BacktestConfig, BinanceAdapter, CandleSeries, CandleSeriesRepository, CandleStore, Db,
     EvalContext, ExampleMark, ExampleMarkDraft, ExampleMarkRepository, ExchangeAdapter,
-    ExplainError, ExplainReport, ExplainRequest, MarkSelection, MarkSetup, MarkSide, MarkWriter,
-    MarkWriterKind, Pair, RuleRequest, SqliteExampleMarkRepo, StrategyRepository, SystemClock,
-    Timeframe, compile, explain_marks, run_backtest, validate,
+    ExplainError, ExplainReport, ExplainRequest, MarkError, MarkSelection, MarkSetup, MarkSide,
+    MarkWriter, MarkWriterKind, Pair, RuleRequest, SqliteExampleMarkRepo, StrategyRepository,
+    SystemClock, Timeframe, compile, explain_marks, run_backtest, validate,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1475,6 +1475,32 @@ async fn an_unknown_mark_id_is_refused() {
         matches!(error, ExplainError::Mark(_)),
         "the mark use case's own not-found refusal: {error:?}"
     );
+}
+
+/// **A selection that names one existing mark and one unknown id is REFUSED** (E2).
+/// The unknown id must not be silently dropped: the caller would otherwise read a
+/// report over a smaller example set than it asked for, with nothing saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_selection_with_an_unknown_id_is_refused_naming_that_id() {
+    let world = world().await;
+    let bars = m15_bars(&world.store_dir);
+    let good = world.mark(Timeframe::M15, bars[300], MarkSide::Long).await;
+
+    let error = world
+        .explain(
+            MarkSelection::Ids(vec![good.id.clone(), "no-such-mark".to_owned()]),
+            NEVER_RULE,
+            None,
+        )
+        .await
+        .expect_err("the unknown id is refused, never silently dropped");
+    match error {
+        ExplainError::Mark(MarkError::NotFound { mark_id }) => assert_eq!(
+            mark_id, "no-such-mark",
+            "the refusal names the id that resolved to no row"
+        ),
+        other => panic!("expected a not-found refusal naming the unknown id, got {other:?}"),
+    }
 }
 
 /// An empty id list is a field refusal naming `markIds`.

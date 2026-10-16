@@ -750,9 +750,17 @@ where
                 }
                 found.push(mark);
             }
-            // `NotFound` only when NO requested id resolved at all: a selection of
-            // marks the fence hid (or the writer withdrew) still names marks that
-            // exist, and answering "no such mark" for one of them would be false.
+            // An id that resolved to no row at all is a refusal, whatever else the
+            // selection named: silently dropping it would hand the caller a report
+            // over a smaller example set than it asked for, with nothing saying so.
+            // A hidden or withdrawn mark never lands here — both RESOLVE through
+            // `marks.get` — so this refusal cannot mask one of them.
+            if let Some(mark_id) = missing {
+                return Err(ExplainError::Mark(MarkError::NotFound { mark_id }));
+            }
+            // Unreachable with a non-empty selection (every id either resolves or
+            // sets `missing`), and kept as the `ids.first()` fallback for the empty
+            // case the field check above already refuses.
             if resolved == 0 {
                 return Err(ExplainError::Mark(MarkError::NotFound {
                     mark_id: missing.or_else(|| ids.first().cloned()).unwrap_or_default(),
