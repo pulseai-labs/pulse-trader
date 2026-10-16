@@ -215,6 +215,10 @@ pub fn guard_span(
 /// part of the test: a mark is refused for what its candle would have evaluated,
 /// and a bar that has not closed has evaluated nothing.
 ///
+/// The close is computed with `checked_add`: an open time so extreme that the
+/// close overflows `i64` cannot be before the holdout start, so it is refused.
+/// Every in-range open time keeps exactly the comparison above.
+///
 /// # Errors
 ///
 /// Returns [`HoldoutRefusal`] naming the pair, the `bar_time` member and the
@@ -228,7 +232,13 @@ pub fn guard_candle(
     let Some(freeze) = freeze else {
         return Ok(());
     };
-    if open_ms + timeframe.duration_ms() > freeze.holdout_start_ms {
+    // A close that overflows `i64` is far past any holdout start, so it is refused
+    // like any other close reaching the fence. The write path accepts any `i64` open
+    // time, so an extreme one must not wrap into a legal close.
+    if open_ms
+        .checked_add(timeframe.duration_ms())
+        .is_none_or(|close_ms| close_ms > freeze.holdout_start_ms)
+    {
         return Err(HoldoutRefusal {
             pair: pair.clone(),
             field: "bar_time",
@@ -448,5 +458,34 @@ mod tests {
 
         // No freeze open: the guard is inert, whatever the candle.
         assert!(guard_candle(None, &pair, Timeframe::D1, H).is_ok());
+    }
+
+    /// R3: an open time whose close would overflow `i64` is refused. The write
+    /// path accepts any `i64`, so without `checked_add` such a close wraps to a
+    /// negative number and would read as legal — a candle far past the holdout
+    /// start slipping through the fence.
+    #[test]
+    fn an_open_time_whose_close_overflows_is_refused() {
+        let pair = Pair::new("BTCUSDT");
+        for timeframe in [Timeframe::M15, Timeframe::H4, Timeframe::D1] {
+            // `i64::MAX` is the open time whose close overflows. Unchecked, that
+            // close wraps to a NEGATIVE number and the comparison reads it as
+            // before the holdout start — the mark would be wrongly accepted.
+            let refusal = guard_candle(Some(freeze()), &pair, timeframe, i64::MAX)
+                .expect_err("a close that overflows cannot be before the holdout start");
+            assert_eq!(refusal.field, "bar_time");
+            assert_eq!(refusal.holdout_start_ms, H);
+            // The last open time whose close still FITS is refused on the in-range
+            // rule (its close is far past the start), not on the overflow rule.
+            let last_that_fits = i64::MAX - timeframe.duration_ms();
+            assert!(guard_candle(Some(freeze()), &pair, timeframe, last_that_fits).is_err());
+            // The other end does not overflow, and the fence reads it correctly: a
+            // candle an age before the start clears it.
+            assert!(guard_candle(Some(freeze()), &pair, timeframe, i64::MIN).is_ok());
+        }
+        // The in-range comparison is unchanged: a candle closing exactly one ms
+        // past the start is still refused, and one closing exactly at it passes.
+        assert!(guard_candle(Some(freeze()), &pair, Timeframe::D1, H - 86_400_000 + 1).is_err());
+        assert!(guard_candle(Some(freeze()), &pair, Timeframe::D1, H - 86_400_000).is_ok());
     }
 }

@@ -791,8 +791,13 @@ where
     let wanted = match mark.timeframe {
         Timeframe::M15 => mark.bar_open_ms,
         // The close is the open plus the timeframe's nominal duration — the same
-        // arithmetic `guard_candle` uses.
-        Timeframe::H4 | Timeframe::D1 => mark.bar_open_ms + mark.timeframe.duration_ms(),
+        // arithmetic `guard_candle` uses, including its overflow rule: an open time
+        // whose close overflows `i64` has no evaluation bar, and `guard_candle`
+        // refuses the mark before this mapping runs.
+        Timeframe::H4 | Timeframe::D1 => mark
+            .bar_open_ms
+            .checked_add(mark.timeframe.duration_ms())
+            .unwrap_or(i64::MAX),
     };
     let Some(stored) = candles.load_head(&mark.pair, Timeframe::M15)? else {
         return Ok(None);
