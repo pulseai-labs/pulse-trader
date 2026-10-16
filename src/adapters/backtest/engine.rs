@@ -2,7 +2,7 @@
 
 use rust_decimal::Decimal;
 
-use super::session::{EngineSession, SessionTimeframes};
+use super::session::{EngineSession, SessionTimeframes, step_series};
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
@@ -166,40 +166,12 @@ pub fn run_backtest(
         filters.clone(),
         count_from_ms,
     )?;
-    // Index into `htf.candles` of the next HTF bar not yet drained into the
-    // session (r2.s2 round-1 fix F2). A cursor over the source series — not
-    // the aligned pairing — is what guarantees every closed HTF candle is
-    // handed exactly once, including the lead-in history `align` jumps past
-    // when several H4 closes precede the first primary bar.
-    let mut htf_cursor = 0_usize;
-    let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
-    // The D1 mirror of the HTF cursor (r3.s2.w4): every closed daily candle
-    // is handed to the session exactly once, lead-in history included.
-    let mut d1_cursor = 0_usize;
-    let d1_candles: &[Candle] = d1.map_or(&[][..], |series| series.candles.as_slice());
-
-    for bar in align(primary, htf, d1) {
-        // r3.s4.w1: the per-bar loop lives in `EngineSession::step` — the
-        // fold only drains the higher-timeframe candles that closed at or
-        // before this primary bar's close (the cursor rule
-        // `step_closed_htf_candles` applied on the whole-run path) and hands
-        // them to the session in order.
-        let mut closed_htf: Vec<Candle> = Vec::new();
-        while let Some(candle) = htf_candles.get(htf_cursor)
-            && candle.close_time <= bar.primary.close_time
-        {
-            closed_htf.push(candle.clone());
-            htf_cursor += 1;
-        }
-        let mut closed_d1: Vec<Candle> = Vec::new();
-        while let Some(candle) = d1_candles.get(d1_cursor)
-            && candle.close_time <= bar.primary.close_time
-        {
-            closed_d1.push(candle.clone());
-            d1_cursor += 1;
-        }
-        session.step(bar.primary, &closed_htf, &closed_d1)?;
-    }
+    // r5.s3.w2: the per-bar loop lives in `session::step_series` — the ONE
+    // spelling of the cursor drain (`step_closed_htf_candles`' rule on the
+    // whole-run path), shared with `explain_marks`, which reads the session's
+    // entry-gate truth at each mark's evaluation bar. The right-hand side of a
+    // whole run is this no-op.
+    step_series(&mut session, primary, htf, d1, |_bar_open_ms, _probe| {})?;
 
     // The session's finish carries the same end-of-series rule the loop body
     // used to own: `SnapshotEnd` force-closes at the last bar's close,

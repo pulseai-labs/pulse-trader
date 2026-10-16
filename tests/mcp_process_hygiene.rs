@@ -129,9 +129,9 @@ fn stdout_carries_only_jsonrpc_frames_and_stdin_close_exits_cleanly() {
     let tools: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(
         tools["result"]["tools"].as_array().map(Vec::len),
-        Some(19),
-        "the nineteen declared tools are listed (eleven read + w3's two write + \
-         w5's two walk-forward + r4.s1.w5's certify_version + r5.s3.w1's three \
+        Some(20),
+        "the twenty declared tools are listed (eleven read + w3's two write + \
+         w5's two walk-forward + r4.s1.w5's certify_version + r5.s3's four \
          example-mark tools)"
     );
 

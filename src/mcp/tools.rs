@@ -46,6 +46,10 @@ use crate::application::certification::{
     CertifyError, CertifyRequest, apply_pair_override, certify_version,
 };
 use crate::application::example_marks::{MarkRequest, list_marks, write_mark};
+use crate::application::mark_explain::{
+    ExplainError, ExplainRequest, MarkSelection, RuleRequest,
+    explain_marks as explain_marks_use_case,
+};
 use crate::application::mcp_read::{
     parse_indicator_specs, run_detail, run_list_entry, strategy_entry, version_detail,
     version_entry,
@@ -810,6 +814,39 @@ pub(crate) struct ListMarksArgs {
 pub(crate) struct WithdrawMarkArgs {
     /// The id of the example mark to withdraw.
     mark_id: String,
+}
+
+/// `explain_marks` args (r5.s3.w2, PDR-0037 Q5, ADR-0031).
+///
+/// The marks come from `mark_ids` or a `setup` label (optionally narrowed by
+/// `pair`); the rule comes from an inline `rule` document or a stored
+/// `version_id`. Exactly one of each pair is required. `rule` is typed
+/// `serde_json::Map` for the `submit_strategy_version` reason: the advertised
+/// input schema must say `type: object`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExplainMarksArgs {
+    /// The example marks to explain, by id. Exactly one of `mark_ids` and
+    /// `setup` is required.
+    #[serde(default)]
+    mark_ids: Option<Vec<String>>,
+    /// The setup label naming a group of marks, as `list_marks` stores it.
+    /// Exactly one of `mark_ids` and `setup` is required.
+    #[serde(default)]
+    setup: Option<String>,
+    /// Narrows a `setup` selection to one pair (e.g. `BTCUSDT`). Refused beside
+    /// `mark_ids`.
+    #[serde(default)]
+    pair: Option<String>,
+    /// The candidate rule as an INLINE DSL document, validated exactly as
+    /// `submit_strategy_version` validates one and never stored. Exactly one of
+    /// `rule` and `version_id` is required.
+    #[serde(default)]
+    rule: Option<serde_json::Map<String, serde_json::Value>>,
+    /// A stored strategy version whose rule to explain against. Exactly one of
+    /// `rule` and `version_id` is required.
+    #[serde(default)]
+    version_id: Option<String>,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -1940,6 +1977,104 @@ impl PulseMcp {
             Err(error) => Ok(mark_tool_error(&error)),
         }
     }
+
+    /// Explain the trader's example marks against a candidate rule
+    /// (r5.s3.w2, PDR-0037 Q5, ADR-0031, SPINE G3/G4).
+    ///
+    /// The one truth: this tool reports what the BACKTEST's entry gate sees at
+    /// each mark's evaluation bar. It reaches no evaluator of its own — the use
+    /// case steps the same session a run does. The holdout fence is read HERE,
+    /// inside the call, and handed down; a mark whose evaluation bar opens at or
+    /// after the holdout start is hidden and counted, never explained.
+    #[tool(
+        description = "Explain, for each example trade, which conditions of a candidate rule held at the bar where the backtest could have entered on it, with the operand values behind each answer and the 17 candle-pattern values at the marked candle — so an agent can propose a rule every example satisfies and then backtest it. Name the marks with `mark_ids`, or a `setup` label (optionally narrowed by `pair`). Name the rule with an inline DSL document (`rule`, validated and never stored) or a stored version (`version_id`). A `15m` mark is explained at its own bar; a `4h` or `1d` mark at the first `15m` bar opening at that candle's close. The truth reported is exactly what the backtest's entry gate sees at that bar: every conjunct of `entry AND filters` carries held / not held / not warm. A mark whose evaluation bar opens at or after the open freeze's holdout start is HIDDEN and counted under `hidden_by_holdout`, never explained, and no engine is stepped onto a candle at or after the holdout start. A mark with no `15m` bar at its evaluation instant is reported under `refusals` with reason `no_evaluation_bar`."
+    )]
+    async fn explain_marks(
+        &self,
+        Parameters(args): Parameters<ExplainMarksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // The selection: exactly one of mark_ids / setup, and pair only beside
+        // setup. The shape is checked here so the refusal names the argument.
+        let selection = match (args.mark_ids, args.setup) {
+            (Some(_), Some(_)) => {
+                return Ok(field_error(
+                    "mark_ids",
+                    "pass exactly one of mark_ids or setup, not both",
+                ));
+            }
+            (None, None) => {
+                return Ok(field_error(
+                    "mark_ids",
+                    "exactly one of mark_ids or setup is required",
+                ));
+            }
+            (Some(ids), None) => {
+                if args.pair.is_some() {
+                    return Ok(field_error(
+                        "pair",
+                        "pair narrows a setup selection; it cannot be given beside mark_ids",
+                    ));
+                }
+                MarkSelection::Ids(ids)
+            }
+            (None, Some(setup)) => {
+                let pair = match args.pair {
+                    Some(raw) => match Pair::parse(raw) {
+                        Ok(pair) => Some(pair),
+                        Err(e) => return Ok(field_error("pair", e)),
+                    },
+                    None => None,
+                };
+                MarkSelection::Setup { setup, pair }
+            }
+        };
+        // The rule: exactly one of rule / version_id.
+        let rule = match (args.rule, args.version_id) {
+            (Some(_), Some(_)) => {
+                return Ok(field_error(
+                    "rule",
+                    "pass exactly one of rule or version_id, not both",
+                ));
+            }
+            (None, None) => {
+                return Ok(field_error(
+                    "rule",
+                    "exactly one of rule or version_id is required",
+                ));
+            }
+            (Some(dsl), None) => RuleRequest::Inline(Box::new(serde_json::Value::Object(dsl))),
+            (None, Some(id)) => RuleRequest::Version(VersionId::new(id)),
+        };
+        // The open freeze, read once inside this call and handed to the use case
+        // (G2, G4): a read failure is a tool error, never a silent `None`.
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
+        let marks = self.mark_repo();
+        let candles = self.state.candles.clone();
+        let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
+        let exchange = self.state.exchange;
+        match explain_marks_use_case(
+            &marks,
+            &candles,
+            &strategies,
+            &exchange,
+            holdout,
+            ExplainRequest {
+                marks: selection,
+                rule,
+            },
+        )
+        .await
+        {
+            Ok(report) => match serde_json::to_value(&report) {
+                Ok(value) => Ok(CallToolResult::structured(value)),
+                Err(e) => Ok(tool_error(e)),
+            },
+            Err(error) => Ok(explain_tool_error(&error)),
+        }
+    }
 }
 
 /// The `Binance` interval text as a [`Timeframe`], for `list_marks`'s filter.
@@ -1988,5 +2123,24 @@ fn mark_tool_error(error: &MarkError) -> CallToolResult {
             "code": other.code(),
             "message": other.to_string(),
         })),
+    }
+}
+
+/// The explain use case's typed refusal as this surface's error body.
+///
+/// A field refusal keeps the `{field, message}` shape every other tool error
+/// uses; a DSL failure names `dsl` with the validator's or compiler's own text;
+/// an unknown version names `version_id` — the same vocabulary `run_backtest`
+/// and `submit_strategy_version` already answer with.
+fn explain_tool_error(error: &ExplainError) -> CallToolResult {
+    match error {
+        ExplainError::Field { path, message } => field_error(path, message),
+        ExplainError::Dsl { path, message } => {
+            field_error(if path == "dsl" { "rule" } else { path.as_str() }, message)
+        }
+        ExplainError::VersionNotFound(_) => field_error("version_id", error),
+        ExplainError::Rule(message) => field_error("rule", message),
+        ExplainError::Mark(mark) => mark_tool_error(mark),
+        ExplainError::Data(data) => tool_error(data),
     }
 }

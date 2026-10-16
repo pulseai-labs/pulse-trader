@@ -12,4 +12,4 @@ pub use engine::{
     BacktestConfig, FundingGapWindow, first_fully_warm_bar_ms, funding_gaps, run_backtest,
 };
 pub use regime::RegimeDetector;
-pub use session::{EngineSession, SessionTimeframes};
+pub use session::{EngineSession, EvalProbe, SessionTimeframes, indicator_values_at, step_series};
