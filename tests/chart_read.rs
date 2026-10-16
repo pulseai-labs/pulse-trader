@@ -658,6 +658,184 @@ async fn a_windowed_runs_default_window_is_the_window_it_consumed() {
     );
 }
 
+/// A windowed run's HTF leg stops where the run's own feed stopped. `feed.rs` exposes
+/// an H4 candle only once it has closed at or before a primary bar's `close_time` (G3,
+/// the no-look-ahead invariant), and a fold's last primary bar commonly sits INSIDE the
+/// H4 candle that carries it: an open-time-only window then draws that still-forming
+/// candle — its complete OHLC, and overlays stepped over it — which is information the
+/// run never saw. The ceiling is the close of the last primary bar the window draws,
+/// taken from the run's own consumed slice; the raw `to_ms` is not it.
+///
+/// Fails on e332b98, whose HTF window is open-time only: the leg answers with two H4
+/// bars where the run's feed could have exposed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_runs_htf_leg_stops_at_its_last_primary_close() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    // Synthetic snapshots, so the run's window and the H4 grid can be made to disagree:
+    // the H4 series' own extent is not the run's, and the window is not aligned to it.
+    let m15 = write_series(
+        &server.data_dir,
+        &pair(),
+        Timeframe::M15,
+        i64::from(pulse::CHART_BAR_CAP) + 100,
+    );
+    let h4 = write_series(&server.data_dir, &pair(), Timeframe::H4, 3_000);
+    let store = store(&server.data_dir);
+    let series = store
+        .load_version(&pair(), Timeframe::M15, &m15)
+        .expect("the synthetic M15 reads")
+        .series;
+    let htf = store
+        .load_version(&pair(), Timeframe::H4, &h4)
+        .expect("the synthetic H4 reads")
+        .series;
+    // The fold ends at primary bar 10_017. H4 bar 626 opens at primary bar 10_016 and
+    // runs 16 primary bars, so the last bar the run consumed (10_017) is inside it, and
+    // that H4 bar had not closed when the run's last bar closed.
+    let window = CandleWindow::new(
+        series.candles[10_000].open_time,
+        series.candles[10_018].open_time,
+    )
+    .expect("a window");
+    let last_primary = series.candles[10_017].close_time;
+    let run_id = seed_run_on(
+        &server,
+        &version,
+        SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: m15.clone(),
+        },
+        Some(SnapshotSelection {
+            timeframe: Timeframe::H4,
+            data_version: h4.clone(),
+        }),
+        Some(window.clone()),
+        vec![],
+    )
+    .await;
+
+    // The truth, read off the two stored series: the H4 bars the window's open-times
+    // hold, and, of those, the ones that had closed by the run's last primary close.
+    let open_window: Vec<i64> = htf
+        .candles
+        .iter()
+        .filter(|candle| candle.open_time >= window.from_ms && candle.open_time < window.to_ms)
+        .map(|candle| candle.open_time)
+        .collect();
+    let seen: Vec<i64> = htf
+        .candles
+        .iter()
+        .filter(|candle| {
+            candle.open_time >= window.from_ms
+                && candle.open_time < window.to_ms
+                && candle.close_time <= last_primary
+        })
+        .map(|candle| candle.open_time)
+        .collect();
+    assert!(
+        open_window.len() > seen.len(),
+        "the last H4 bar in the window's open-times had not closed by the run's last \
+         primary close — that is the case this test is about: {open_window:?}"
+    );
+    assert!(!seen.is_empty(), "the window holds H4 bars the run saw");
+
+    // The run's own window default answers with the bars the run saw, and no others.
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id.clone()),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the HTF leg answers");
+    let drawn: Vec<i64> = dto
+        .candles
+        .iter()
+        .map(|candle| candle.t.parse().expect("a time"))
+        .collect();
+    assert_eq!(
+        drawn, seen,
+        "the HTF leg draws only the H4 bars that had closed by the run's last primary \
+         close"
+    );
+
+    // Overlays carry a value per DRAWN bar, so the still-forming bar's value is not
+    // reported either: the line equals an independent pass over exactly those bars.
+    let specs = htf_specs();
+    let (cut, rows) = independent_pass(&store, Timeframe::H4, &h4, None, &specs);
+    let drawn_window: Vec<usize> = cut
+        .candles
+        .iter()
+        .enumerate()
+        .filter(|(_, candle)| {
+            candle.open_time >= window.from_ms
+                && candle.open_time < window.to_ms
+                && candle.close_time <= last_primary
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let run = dto.run.expect("the run layer");
+    let line = overlay(&run.overlays, "ema:20");
+    assert_eq!(*values(line), expected_values(&rows, &drawn_window, 3));
+
+    // The tab's own bounded read — the explicit window it plans around a trade — is
+    // bounded the same way: the ceiling is the run's last consumed primary bar, never
+    // the raw `toMs` it sent.
+    let bounded = read(
+        &state,
+        ChartDataRequest {
+            from_ms: Some(window.from_ms.to_string()),
+            to_ms: Some((window.to_ms - 1).to_string()),
+            run_id: Some(run_id.clone()),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the bounded HTF read answers");
+    let drawn: Vec<i64> = bounded
+        .candles
+        .iter()
+        .map(|candle| candle.t.parse().expect("a time"))
+        .collect();
+    assert_eq!(
+        drawn, seen,
+        "an explicit window is bounded by the run's own last primary bar too"
+    );
+
+    // And bounds that run PAST the fold's own end — the tab clamps to the run's span,
+    // but nothing in the request makes a caller do so — are clamped to the run's last
+    // consumed bar: the later H4 bars the request asked for are not the run's to draw.
+    let past = read(
+        &state,
+        ChartDataRequest {
+            from_ms: Some(window.from_ms.to_string()),
+            to_ms: Some((window.to_ms + 8 * Timeframe::H4.duration_ms()).to_string()),
+            run_id: Some(run_id.clone()),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the read answers");
+    let drawn: Vec<i64> = past
+        .candles
+        .iter()
+        .map(|candle| candle.t.parse().expect("a time"))
+        .collect();
+    assert_eq!(
+        drawn, seen,
+        "bounds past the run's own end expose no later HTF bar"
+    );
+    let run = past.run.expect("the run layer");
+    assert_eq!(
+        *values(overlay(&run.overlays, "ema:20")),
+        expected_values(&rows, &drawn_window, 3),
+        "the overlay output ends at the same bar the candles do"
+    );
+}
+
 /// A windowed run's withheld count is the cut's count INSIDE THE RUN'S WINDOW —
 /// not inside the whole pinned snapshot. Fails on the base commit, where the
 /// defaulted window is the whole snapshot: 200 candles come back instead of the

@@ -475,12 +475,31 @@ struct BlockingRead {
     not_drawn: Vec<String>,
 }
 
+/// How far a read may draw its series' bars, by `close_time`. `Nothing` is the HTF
+/// leg's honest empty answer when the window holds no primary bar the run consumed —
+/// distinct from a primary-leg or run-less read, which is simply unrestricted.
+enum DrawEdge {
+    Unrestricted,
+    ClosedBy(i64),
+    Nothing,
+}
+
+impl DrawEdge {
+    fn admits(&self, close_time: i64) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::ClosedBy(close) => close_time <= *close,
+            Self::Nothing => false,
+        }
+    }
+}
+
 /// The whole synchronous read — load, cut, slice and step. The cut happens BEFORE
 /// the engine's first step and before any window is taken, so no holdout candle
 /// reaches either (Q5); the engine then steps the WHOLE cut series from its first
 /// candle, so warm-up matches `export_indicators` bar for bar (G2), and only
 /// afterwards is the window kept.
-#[allow(clippy::too_many_arguments)] // one read, one place; the caller is the core
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one read in one place; the caller is the core
 fn read_window(
     store: &CandleStore,
     pair: &Pair,
@@ -495,6 +514,12 @@ fn read_window(
 ) -> Result<BlockingRead, BusError> {
     let mut series = load(store, pair, timeframe, version)?.series;
     let data_version = series.version.clone();
+
+    // The run's own consumed bars, when it recorded a window: half-open on opens while
+    // this read's `to` is inclusive, so the last consumed bar opens at `to_ms - 1` —
+    // the same reading the default bounds below use. Taken before the bounds match
+    // moves `window`.
+    let consumed = window.as_ref().map(|held| (held.from_ms, held.to_ms - 1));
 
     // The bounds: an explicit window; else the run's OWN recorded window; else the
     // run's primary span (the run DTO's own definition of the run's range); else the
@@ -561,6 +586,30 @@ fn read_window(
             .retain(|candle| candle.open_time < freeze.holdout_start_ms);
     }
 
+    // The bars this read may DRAW. A run's HTF leg stops where the run's own feed
+    // stopped: `feed.rs` exposes an HTF candle only once it has closed at or before a
+    // primary bar's close (G3), and a fold's last primary bar commonly sits inside the
+    // HTF candle that carries it — so an open-time-only window would draw that
+    // still-forming candle, its complete OHLC and its overlays, values the run never
+    // saw. The endpoint is the close of the last primary bar consumed inside BOTH this
+    // request's bounds and the run's own `inputs.window`, never the raw `to`: bounds
+    // reaching past the run's end expose nothing later, and a window holding no consumed
+    // primary bar draws no HTF bar at all. The primary leg, and a read with no run, are
+    // unrestricted.
+    let edge = match span {
+        Some((primary_timeframe, primary_version)) if primary_timeframe != timeframe => {
+            let (consumed_from, consumed_to) = consumed.unwrap_or((i64::MIN, i64::MAX));
+            let primary = load(store, pair, primary_timeframe, Some(primary_version))?.series;
+            match primary.candles.iter().rev().find(|bar| {
+                bar.open_time <= to.min(consumed_to) && bar.open_time >= from.max(consumed_from)
+            }) {
+                Some(bar) => DrawEdge::ClosedBy(bar.close_time),
+                None => DrawEdge::Nothing,
+            }
+        }
+        _ => DrawEdge::Unrestricted,
+    };
+
     // The window's bars, as indices into the cut series. An unbounded read keeps
     // the latest bars up to the cap.
     let start = if bounded {
@@ -569,7 +618,10 @@ fn read_window(
         series.candles.len().saturating_sub(CHART_BAR_CAP as usize)
     };
     let window: Vec<usize> = (start..series.candles.len())
-        .filter(|&index| (from..=to).contains(&series.candles[index].open_time))
+        .filter(|&index| {
+            let candle = &series.candles[index];
+            (from..=to).contains(&candle.open_time) && edge.admits(candle.close_time)
+        })
         .collect();
 
     // The rule's specs: the four drawn kinds get an engine slot; every other spec
