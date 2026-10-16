@@ -1537,15 +1537,27 @@ async fn a_mark_with_no_evaluation_bar_is_reported_not_dropped() {
         .await
         .expect("the read completes");
 
-    let _ = last;
-    if report.marks_explained == 0 {
-        let refusal = report
-            .refusals
-            .iter()
-            .find(|refusal| refusal.mark_id == mark.id)
-            .expect("the mark is reported as a refusal");
-        assert_eq!(refusal.reason, "no_evaluation_bar");
-    }
+    // The fixture precondition this case rests on: the last 4h candle's close is
+    // past the 15m snapshot's end, so no 15m bar opens there. Asserted, not
+    // assumed — a regenerated fixture that broke it would otherwise make the
+    // assertions below vacuous.
+    assert!(
+        last_h4.open_time + Timeframe::H4.duration_ms() > last.open_time,
+        "the LAST 4h candle must close after the last 15m bar opens, or this case \
+         proves nothing: 4h closes at {}, the 15m series ends at {}",
+        last_h4.open_time + Timeframe::H4.duration_ms(),
+        last.open_time
+    );
+    assert_eq!(
+        report.marks_explained, 0,
+        "no 15m bar opens at the last 4h candle's close, so the mark is not explained"
+    );
+    let refusal = report
+        .refusals
+        .iter()
+        .find(|refusal| refusal.mark_id == mark.id)
+        .expect("the mark is reported as a refusal");
+    assert_eq!(refusal.reason, "no_evaluation_bar");
 }
 
 // ---------------------------------------------------------------------------
