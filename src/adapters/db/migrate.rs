@@ -1546,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn migration_up_down_round_run_undo_rerun() {
-        // run → undo_to(1) → re-run. Index gone then back; max 20→1→20.
+        // run → undo_to(1) → re-run. Index gone then back; max 21→1→21.
         // The embedded max is 21, not 5: `0005`/`0006` were reserved for `r1.s2`
         // and `r1.s3`, allocated at release planning so parallel spines cannot
         // collide on a migration number. sqlx applies versions in numeric order
