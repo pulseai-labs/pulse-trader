@@ -705,6 +705,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Yanked dependency replaces: `zip` 8.6.0 → 9.0.3 (#418).** Every `zip` 8.x release is
+  yanked on crates.io, so the required `cargo deny check advisories` lane failed on `main` and
+  on every new head; 9.0.3 is the only live release. `Cargo.toml` moves `zip = "8"` → `"9"`
+  with the same `default-features = false, features = ["deflate"]` deflate-only set (9.x
+  keeps the feature name, and it still resolves to `flate2` with the zlib-rs backend plus
+  `zopfli`), `cargo update -p zip` resolves 9.0.3, and `build_support/lockfile-guard.txt`
+  moves its `zip` line in the same visible act. The importer needed no source change: the
+  Binance bulk reader (`ZipArchive::new`, `len`, `by_index`) and the test helpers'
+  writers (`ZipWriter`, `SimpleFileOptions`) keep their 9.x signatures. The determinism lanes,
+  the golden fixtures and every `data_version` stay identical; the engine fingerprint moves
+  (it hashes `Cargo.lock`, which is expected).
+
 - **Safe dependency bump: `rustls` (r5 chore).** Cargo: `rustls` 0.23.45 → 0.23.46, clearing RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349. Lockfile only (`cargo update -p rustls --precise 0.23.46`; `Cargo.lock` alone, no `Cargo.toml` change), so the required `cargo deny check advisories` check is green again (#410). No product version bump.
 
 - Added repository security hardening, non-commercial license, and supply-chain checks (VS-1.2.3).

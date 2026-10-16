@@ -32,4 +32,4 @@ sqlx-mysql 0.8.6
 sqlx-postgres 0.8.6
 sqlx-sqlite 0.8.6
 ta 0.5.0
-zip 8.6.0
+zip 9.0.3
