@@ -28,6 +28,12 @@ mod coaching;
 // the crate only through the curated `pub use dsl::{...}` lists below.
 pub(crate) mod dsl;
 mod error;
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade mark's value types — the
+// stored reference trade, its side, its writer, the setup label and note
+// newtypes, and the request's typed refusals. Pure + zero-I/O; the SQLite store
+// is `adapters::db::example_mark_repo` and the one write path is
+// `application::example_marks`.
+mod example_mark;
 // VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
 // NFR-2). Pure accessor over `build.rs`-baked env (`PULSE_ENGINE_FINGERPRINT` /
 // `PULSE_TARGET_TRIPLE`) plus the FR-7 `compare()` warning mechanism (built but
@@ -146,6 +152,14 @@ pub use freeze::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeReques
 pub use certification::{
     CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
 };
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade mark's surface — the stored
+// row, its draft, the read shape, the filter and the refusal vocabulary.
+// Re-exported so `lib.rs` can curate the crate surface — an un-re-exported public
+// domain type is a `dead_code` BUILD error under `deny(warnings)`.
+pub use example_mark::{
+    ExampleMark, ExampleMarkDraft, MarkError, MarkFilter, MarkNote, MarkSetup, MarkSide,
+    MarkWriter, MarkWriterKind, StoredMark,
+};
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
 // concrete indicator adapter implements and the backtester reads through.
 pub use dsl::{
@@ -226,9 +240,9 @@ pub use paper::{MarkBar, PaperPnl, PaperPnlEntry, PaperPnlOpenPosition, PaperPnl
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
     BacktestRunRepository, CandleSeriesRepository, CertificationRepository, ClosedBarSource,
-    CoachAcceptanceRepository, CoachingRepository, ExchangeAdapter, FixtureSnapshotStore,
-    LlmCallRepository, LlmProvider, MarketDataSource, PaperSessionRepository, StrategyRepository,
-    WalkForwardRunRepository,
+    CoachAcceptanceRepository, CoachingRepository, ExampleMarkRepository, ExchangeAdapter,
+    FixtureSnapshotStore, LlmCallRepository, LlmProvider, MarketDataSource, PaperSessionRepository,
+    StrategyRepository, WalkForwardRunRepository,
 };
 // r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
 // live in `port` like every other port and are re-exported `pub(crate)` rather than

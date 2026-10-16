@@ -57,6 +57,13 @@ pub(crate) mod fixture;
 
 pub(crate) mod backtest;
 
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade mark use case — the ONE code
+// that writes `example_mark`, for the app's trader and for every agent (SPINE
+// G1). Its first check is the holdout fence, before any candle is loaded (G2);
+// the read hides what a later freeze covers and counts it (Q4); the withdraw is
+// one-way and carries Q3's authority rule.
+pub(crate) mod example_marks;
+
 // r4.s1.w4 (Q4/G1/F1): the holdout guard — the one application-layer decision
 // (refuse an explicit window into the frozen holdout, clamp a defaulted one)
 // every entry point routes through while a freeze is open.

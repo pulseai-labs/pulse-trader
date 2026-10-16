@@ -113,6 +113,16 @@ impl PulseMcp {
             self.state.candles.clone(),
         )
     }
+
+    /// The example-trade mark store over the session's own pool (r5.s3.w1,
+    /// PDR-0037). The `/mcp` mount builds its sessions over the SERVER's pool,
+    /// so a tool and the app's routes read and write one database (the one-pool
+    /// rule).
+    fn mark_repo(
+        &self,
+    ) -> crate::adapters::db::SqliteExampleMarkRepo<crate::adapters::clock::SystemClock> {
+        crate::adapters::db::SqliteExampleMarkRepo::new(self.state.db.pool().clone())
+    }
 }
 
 #[tool_handler(router = self.tool_router)]

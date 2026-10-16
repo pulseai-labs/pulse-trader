@@ -45,6 +45,7 @@ use crate::application::backtest::{
 use crate::application::certification::{
     CertifyError, CertifyRequest, apply_pair_override, certify_version,
 };
+use crate::application::example_marks::{MarkRequest, list_marks, write_mark};
 use crate::application::mcp_read::{
     parse_indicator_specs, run_detail, run_list_entry, strategy_entry, version_detail,
     version_entry,
@@ -63,10 +64,10 @@ use crate::domain::certification::CertifyRefusal;
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestError, BacktestRunId, BacktestRunRepository, CandleSeriesRepository, CandleWindow,
-    CompiledValue, DataError, DataVersion, EvalContext, ExchangeAdapter as _, FreezeRecord,
-    HoldoutFreeze, MfeMaeAggregates, Pair, PaperSessionId, PersistedRun, Series,
-    StrategyRepository, Timeframe, ValidationCode, VerdictRule, WalkForwardRunId,
-    WalkForwardRunRepository,
+    CompiledValue, DataError, DataVersion, EvalContext, ExampleMark, ExchangeAdapter as _,
+    FreezeRecord, HoldoutFreeze, MarkError, MarkFilter, MarkWriter, MarkWriterKind,
+    MfeMaeAggregates, Pair, PaperSessionId, PersistedRun, Series, StrategyRepository, Timeframe,
+    ValidationCode, VerdictRule, WalkForwardRunId, WalkForwardRunRepository,
 };
 
 use super::PulseMcp;
@@ -760,6 +761,55 @@ fn holdout_note(holdout: Option<HoldoutFreeze>, rows_withheld: usize) -> Option<
             "rows_withheld": rows_withheld,
         })
     })
+}
+
+/// `write_mark` args (r5.s3.w1, PDR-0037).
+///
+/// The candle is named the way a trader sees it — pair, timeframe, the bar's
+/// open time — and `bar_time` crosses as RFC 3339 UTC, the `run_backtest`
+/// convention. There is no writer member: the writer is the MCP session's own
+/// resolved identity (PDR-0015).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WriteMarkArgs {
+    /// The `Binance` pair symbol the marked candle belongs to (e.g. `BTCUSDT`).
+    pair: String,
+    /// The marked candle's timeframe: `15m`, `4h` or `1d`.
+    timeframe: String,
+    /// The marked candle's OPEN time as an RFC 3339 UTC instant (e.g.
+    /// `2025-01-16T00:00:00Z`). It must be a candle the current snapshot holds.
+    bar_time: String,
+    /// `long` or `short` — which way the example trade went.
+    side: String,
+    /// The setup label, in the trader's own words (1–64 characters).
+    setup: String,
+    /// An optional note (at most 280 characters).
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// `list_marks` args: every member is optional and they narrow together.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListMarksArgs {
+    /// Only the marks on this pair (e.g. `BTCUSDT`).
+    #[serde(default)]
+    pair: Option<String>,
+    /// Only the marks on this timeframe (`15m`, `4h` or `1d`).
+    #[serde(default)]
+    timeframe: Option<String>,
+    /// Only the marks carrying this setup label, exactly as it was stored.
+    #[serde(default)]
+    setup: Option<String>,
+}
+
+/// `withdraw_mark` args: the one mark to take back. The withdrawing agent is the
+/// MCP session's own identity, never an argument.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WithdrawMarkArgs {
+    /// The id of the example mark to withdraw.
+    mark_id: String,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -1762,5 +1812,181 @@ impl PulseMcp {
             Ok(None) => Ok(field_error("session_id", "no such paper session")),
             Err(e) => Ok(tool_error(e)),
         }
+    }
+
+    /// Mark ONE candle as an example trade (r5.s3.w1, PDR-0037, ADR-0031).
+    ///
+    /// The writer is this MCP session's own resolved identity, read once and
+    /// stamped as `agent`. The holdout fence is read HERE, in the same call, and
+    /// handed to the one use case that writes the table (G1, G2).
+    #[tool(
+        description = "Mark one candle as an example trade — a REFERENCE TRADE, never an order: the pair, the timeframe, that candle's open time (RFC 3339 UTC), the side, a setup label and an optional note. Marks are stored with their writer; this tool writes them as an agent under this session's own name, which the reads show as self-reported. A mark whose candle reaches the open freeze's holdout start is REFUSED (the candle closes after the holdout begins), for every writer, and a time no candle opens at is refused too. Marks are immutable: use withdraw_mark to take one back."
+    )]
+    async fn write_mark(
+        &self,
+        Parameters(args): Parameters<WriteMarkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // The identity is a lock-read, never an await-held guard.
+        let writer = MarkWriter {
+            kind: MarkWriterKind::Agent,
+            name: self.identity_lock().name.clone(),
+        };
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
+        let bar_open_ms = match parse_rfc3339_ms(&args.bar_time) {
+            Ok(ms) => ms,
+            Err(e) => return Ok(field_error("bar_time", e)),
+        };
+        let marks = self.mark_repo();
+        let candles = self.state.candles.clone();
+        match write_mark(
+            &marks,
+            &candles,
+            holdout,
+            writer,
+            MarkRequest {
+                pair: args.pair,
+                timeframe: args.timeframe,
+                bar_open_ms,
+                side: args.side,
+                setup: args.setup,
+                note: args.note,
+            },
+        )
+        .await
+        {
+            Ok(mark) => Ok(CallToolResult::structured(mark_json(&mark))),
+            Err(error) => Ok(mark_tool_error(&error)),
+        }
+    }
+
+    /// List the example trades that still stand (r5.s3.w1, PDR-0037).
+    ///
+    /// Marks an open freeze now covers are HIDDEN and COUNTED, never silently
+    /// dropped: the response says how many, and where the holdout starts.
+    #[tool(
+        description = "List the example trades marked on the chart, in candle order, narrowed by an optional pair, timeframe and setup label. Each mark carries its candle (pair, timeframe, open time as RFC 3339 UTC), its side, its setup label, its note, its data version and its writer — `trader` for the app, or `agent` with the name that agent reported about itself, shown as self-reported. Marks that were withdrawn are not listed. While a certification freeze is open, marks whose candle reaches its holdout start are hidden and reported under `hidden_by_holdout` with a count and the holdout start; they are hidden, never deleted."
+    )]
+    async fn list_marks(
+        &self,
+        Parameters(args): Parameters<ListMarksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
+        let pair = match args.pair {
+            Some(pair) => match Pair::parse(pair) {
+                Ok(pair) => Some(pair),
+                Err(e) => return Ok(field_error("pair", e)),
+            },
+            None => None,
+        };
+        let timeframe = match args.timeframe.as_deref() {
+            Some(raw) => match mark_timeframe(raw) {
+                Ok(timeframe) => Some(timeframe),
+                Err(message) => return Ok(field_error("timeframe", message)),
+            },
+            None => None,
+        };
+        let marks = self.mark_repo();
+        match list_marks(
+            &marks,
+            holdout,
+            MarkFilter {
+                pair,
+                timeframe,
+                setup: args.setup,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let listed: Vec<serde_json::Value> = outcome.marks.iter().map(mark_json).collect();
+                match outcome.hidden_by_holdout {
+                    Some(hidden) => Ok(CallToolResult::structured(json!({
+                        "marks": listed,
+                        "hidden_by_holdout": {
+                            "holdout_start": window_ms(hidden.holdout_start_ms),
+                            "count": hidden.count,
+                        },
+                    }))),
+                    None => Ok(structured_list("marks", listed)),
+                }
+            }
+            Err(error) => Ok(mark_tool_error(&error)),
+        }
+    }
+
+    /// Withdraw one example trade: a mark is taken back once, and never deleted
+    /// (r5.s3.w1, PDR-0037, Q3). An agent withdraws only the mark it wrote; the
+    /// app's trader (an app token) may withdraw any.
+    #[tool(
+        description = "Withdraw one example mark by id. A withdraw is ONE-WAY and the mark's row stays stored: the mark leaves every list, and a second withdraw is refused. This tool acts as the agent this session identified as, so it withdraws only marks that agent wrote — another writer's mark is refused, and the app's own trader is the surface that withdraws any mark."
+    )]
+    async fn withdraw_mark(
+        &self,
+        Parameters(args): Parameters<WithdrawMarkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = MarkWriter {
+            kind: MarkWriterKind::Agent,
+            name: self.identity_lock().name.clone(),
+        };
+        let marks = self.mark_repo();
+        match crate::application::example_marks::withdraw_mark(&marks, actor, &args.mark_id).await {
+            Ok(mark) => Ok(CallToolResult::structured(mark_json(&mark))),
+            Err(error) => Ok(mark_tool_error(&error)),
+        }
+    }
+}
+
+/// The `Binance` interval text as a [`Timeframe`], for `list_marks`'s filter.
+fn mark_timeframe(raw: &str) -> Result<Timeframe, String> {
+    match raw {
+        "15m" => Ok(Timeframe::M15),
+        "4h" => Ok(Timeframe::H4),
+        "1d" => Ok(Timeframe::D1),
+        other => Err(format!(
+            "timeframe must be `15m`, `4h` or `1d`, got `{other}`"
+        )),
+    }
+}
+
+/// One example mark as the tools return it — the `MarkDto` fields, with times as
+/// RFC 3339 UTC (the `RunBacktestArgs` convention on this surface).
+fn mark_json(mark: &ExampleMark) -> serde_json::Value {
+    json!({
+        "mark_id": mark.id,
+        "pair": mark.pair.to_string(),
+        "timeframe": mark.timeframe.binance_interval(),
+        "bar_time": window_ms(mark.bar_open_ms),
+        "side": mark.side.as_str(),
+        "setup": mark.setup.as_str(),
+        "note": mark.note.as_ref().map(crate::domain::MarkNote::as_str),
+        "writer": {
+            "kind": mark.writer.kind.as_str(),
+            "name": mark.writer.name,
+            "self_reported": mark.writer.kind.is_self_reported(),
+        },
+        "data_version": mark.data_version,
+        "created_at": window_ms(mark.created_at_ms),
+    })
+}
+
+/// The mark use case's typed refusal as this surface's error body.
+///
+/// A field refusal keeps the `{field, message}` shape every other tool error uses;
+/// the four state refusals carry the SAME `code` the app's routes answer with —
+/// `holdout`, `candle_not_found`, `not_found`, `already_withdrawn`, `not_writer` —
+/// so an agent reads one vocabulary whichever door it came through.
+fn mark_tool_error(error: &MarkError) -> CallToolResult {
+    match error {
+        MarkError::Field { path, message } => field_error(path, message),
+        other => CallToolResult::structured_error(json!({
+            "code": other.code(),
+            "message": other.to_string(),
+        })),
     }
 }

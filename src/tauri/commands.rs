@@ -67,10 +67,12 @@ use super::coach::{
 };
 use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks' wire shapes.
 use super::library::{
     LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
     latest_run_summary, recent_run_summary, version_stats,
 };
+use super::marks::{ListMarksRequest, MarkDto, MarkListDto, WithdrawMarkRequest, WriteMarkRequest};
 use super::streak_card::{StreakCardDto, StreakCardRequest};
 // r3.s4.w5: the paper session surface's shapes and stream channel.
 use super::paper::{
@@ -83,7 +85,7 @@ use super::walk_forward::{
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
     Db, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
-    SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path, open_migrated,
+    SqliteExampleMarkRepo, SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path, open_migrated,
 };
 // r3.s3.w5: the thin-client state every proxied command speaks through.
 use crate::agent::ComposerEvent;
@@ -158,6 +160,12 @@ pub const BUS_COMMANDS: &[&str] = &[
     // r5.s2.w1: the Chart tab's read — a window of candles and, for a run, its
     // trades and its rule's overlays (PDR-0036).
     "chart_data",
+    // r5.s3.w1: the example-trade marks — write one, list them, withdraw one
+    // (PDR-0037, ADR-0031). The trader's surface; agents reach the same use case
+    // through `pulse mcp`.
+    "write_mark",
+    "list_marks",
+    "withdraw_mark",
 ];
 
 // ---------------------------------------------------------------------------
@@ -426,6 +434,14 @@ impl DesktopState {
     #[must_use]
     pub fn certification_repo(&self) -> SqliteCertificationRepo<SystemClock> {
         SqliteCertificationRepo::new(self.db.pool().clone())
+    }
+
+    /// The example-trade mark store over the shared pool (r5.s3.w1, PDR-0037) —
+    /// the `example_mark` rows and their one-way withdrawals. Same cheap-wrapper
+    /// pattern as [`DesktopState::strategy_repo`].
+    #[must_use]
+    pub fn example_mark_repo(&self) -> SqliteExampleMarkRepo<SystemClock> {
+        SqliteExampleMarkRepo::new(self.db.pool().clone())
     }
 
     /// The open freeze's holdout start (r4.s1.w4, Q4), read once per app call —
@@ -1835,6 +1851,67 @@ pub async fn chart_data(
     request: ChartDataRequest,
 ) -> Result<ChartDataDto, BusError> {
     state.post("/api/v1/chart", &request).await
+}
+
+/// `write_mark` — mark ONE candle as an example trade: the pair, the timeframe,
+/// the candle's open time, a side, a setup label and an optional note
+/// (r5.s3.w1, PDR-0037). The writer is the app token's label, never a body
+/// member, and the mark is stored as `trader`. A mark whose candle reaches an
+/// open freeze's holdout start is refused; so is a time no candle opens at.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] — `validation` for an unreadable field (the message
+/// names it), `validation` carrying the fence's own words for a holdout refusal
+/// or a missing candle.
+///
+/// [`write_mark_core`]: crate::tauri::marks::write_mark_core
+#[tauri::command]
+#[specta::specta]
+pub async fn write_mark(
+    state: tauri::State<'_, ClientState>,
+    request: WriteMarkRequest,
+) -> Result<MarkDto, BusError> {
+    state.post("/api/v1/marks", &request).await
+}
+
+/// `list_marks` — the example trades that still stand, narrowed by an optional
+/// pair, timeframe and setup label, in candle order (r5.s3.w1, PDR-0037). Marks
+/// an open freeze now covers are hidden and counted, never silently dropped.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] — `validation` for an unreadable filter member, `data`
+/// when the store cannot be read.
+///
+/// [`list_marks_core`]: crate::tauri::marks::list_marks_core
+#[tauri::command]
+#[specta::specta]
+pub async fn list_marks(
+    state: tauri::State<'_, ClientState>,
+    request: ListMarksRequest,
+) -> Result<MarkListDto, BusError> {
+    state.post("/api/v1/marks/list", &request).await
+}
+
+/// `withdraw_mark` — take one example trade back, once (r5.s3.w1, PDR-0037). A
+/// trader may withdraw any mark; the mark's row stays stored and immutable, and
+/// the list stops showing it. A second withdraw is refused, and so is an unknown
+/// id.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] — `not_found` for an unknown id, `validation` for an
+/// already-withdrawn mark or an agent reaching past its own.
+///
+/// [`withdraw_mark_core`]: crate::tauri::marks::withdraw_mark_core
+#[tauri::command]
+#[specta::specta]
+pub async fn withdraw_mark(
+    state: tauri::State<'_, ClientState>,
+    request: WithdrawMarkRequest,
+) -> Result<MarkDto, BusError> {
+    state.post("/api/v1/marks/withdraw", &request).await
 }
 
 // ---------------------------------------------------------------------------
