@@ -22,6 +22,7 @@
 // bound is a number that must never be read as a figure.
 
 import type { ChartCandleDto } from "../bindings";
+import { barSpacing } from "./layers";
 
 /** The bars one read may ask for. The read's own cap, mirrored so the tab can refuse
  *  to send what the server would refuse to answer. */
@@ -79,11 +80,19 @@ export function windowPlan(
 
 /** Whether the window the chart is drawing holds the bar at `ms`. A trade whose bar is
  *  not here cannot be scrolled to — the screen re-reads around it instead (a trade the
- *  read returned may have entered before the window and exited inside it). */
+ *  read returned may have entered before the window and exited inside it).
+ *
+ *  The window's right edge is the END of the last loaded bar, not its open: a fill
+ *  inside that bar's own period is drawn ON that bar (the close review's CR4), so the
+ *  window covers it. The bar's duration is the smallest positive gap between the loaded
+ *  candles — the same reading `markersInWindow` clips by, so the two agree on every
+ *  fill. One loaded bar has no spacing to read: its own open is the whole span. */
 export function covers(candles: readonly Pick<ChartCandleDto, "t">[], ms: string): boolean {
   if (candles.length === 0) return false;
   const target = Number(ms);
-  const first = Number(candles[0].t);
-  const last = Number(candles[candles.length - 1].t);
-  return target >= first && target <= last;
+  const times = candles.map((candle) => Number(candle.t));
+  const first = times[0];
+  const lastOpen = times[times.length - 1];
+  const bar = barSpacing(times);
+  return bar === 0 ? target === first : target >= first && target < lastOpen + bar;
 }

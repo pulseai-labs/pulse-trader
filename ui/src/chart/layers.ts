@@ -227,15 +227,15 @@ export function toMarkers(
     .map((entry) => entry.marker);
 }
 
-/** One bar's own duration, in the library's seconds, read off the loaded series: the
- *  smallest positive gap between two consecutive bars. A missing bar (a holdout cut, a
- *  gap in the snapshot) leaves a gap WIDER than a bar, never a narrower one, so the
- *  smallest gap is the interval the series is drawn at. `0` when the series is a single
- *  bar: there is no spacing to read, and the caller says so rather than guessing one. */
-function barSeconds(candles: readonly Pick<CandlePoint, "time">[]): number {
+/** The smallest positive gap between consecutive times, in the unit those times are
+ *  in: one bar's own duration, read off the loaded series. A missing bar (a holdout
+ *  cut, a gap in the snapshot) leaves a gap WIDER than a bar, never a narrower one, so
+ *  the smallest gap is the interval the series is drawn at. `0` when there is no
+ *  spacing to read (fewer than two bars): the caller says so rather than guessing one. */
+export function barSpacing(times: readonly number[]): number {
   let bar = 0;
-  for (let i = 1; i < candles.length; i += 1) {
-    const gap = candles[i].time - candles[i - 1].time;
+  for (let i = 1; i < times.length; i += 1) {
+    const gap = times[i] - times[i - 1];
     // The read returns its candles ascending; a non-positive gap would be malformed.
     if (gap <= 0) continue;
     if (bar === 0 || gap < bar) bar = gap;
@@ -243,10 +243,15 @@ function barSeconds(candles: readonly Pick<CandlePoint, "time">[]): number {
   return bar;
 }
 
-/** The open of the loaded bar that contains `time`: the latest loaded bar open at or before
- *  it. The candles ascend (the read returns them so), a time inside the loaded span always
- *  has a containing bar, and a time that IS a bar open is its own bar's. */
-function containingOpen(
+/** One bar's own duration, in the library's seconds, read off the loaded series. */
+function barSeconds(candles: readonly Pick<CandlePoint, "time">[]): number {
+  return barSpacing(candles.map((candle) => candle.time));
+}
+
+/** The index of the loaded bar that CONTAINS `time`: the latest loaded bar open at or
+ *  before it. The candles ascend (the read returns them so); a time before the first
+ *  bar answers with the first, a time past the last bar's end with the last. */
+export function containingIndex(
   candles: readonly Pick<CandlePoint, "time">[],
   time: number,
 ): number {
@@ -262,7 +267,17 @@ function containingOpen(
       hi = mid - 1;
     }
   }
-  return candles[at].time;
+  return at;
+}
+
+/** The open of the loaded bar that contains `time`: the latest loaded bar open at or before
+ *  it. A time inside the loaded span always has a containing bar, and a time that IS a bar
+ *  open is its own bar's. */
+function containingOpen(
+  candles: readonly Pick<CandlePoint, "time">[],
+  time: number,
+): number {
+  return candles[containingIndex(candles, time)].time;
 }
 
 /** The markers a loaded window draws (the close review's CR2 and CR4).
@@ -315,6 +330,23 @@ export function markersInWindow(
     }))
     .sort((a, b) => a.marker.time - b.marker.time || a.index - b.index)
     .map((entry) => entry.marker);
+}
+
+/** Whether a trade lies wholly BEFORE the fence (r5.s2 close review, Q5). `null`
+ *  means no freeze was open at the last read and lets every trade through; a trade
+ *  whose entry or exit is at or after the boundary carries an outcome produced in
+ *  the withheld period, so the tab must not list it — the cut withholds those bars,
+ *  so it withholds the trades that ran through them. */
+export function beforeFence(trade: ChartTradeDto, fenceMs: number | null): boolean {
+  if (fenceMs === null) return true;
+  if (!(Number(trade.entryTime) < fenceMs)) return false;
+  return trade.exitTime === null || Number(trade.exitTime) < fenceMs;
+}
+
+/** The fence instant a read's own boundary names: its `holdoutStartMs`, or `null`/absent
+ *  when THAT read saw no freeze open. The caller picks the freshest read it holds. */
+export function fenceStartMs(boundaryMs: string | null | undefined): number | null {
+  return boundaryMs === null || boundaryMs === undefined ? null : Number(boundaryMs);
 }
 
 /** Everything one chart read draws. */

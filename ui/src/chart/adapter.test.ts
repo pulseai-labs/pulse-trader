@@ -316,6 +316,16 @@ describe("createChartAdapter", () => {
     expect(h.timeScale.setVisibleLogicalRange).toHaveBeenCalledWith({ from: -59, to: 61 });
   });
 
+  it("centres on the bar that CONTAINS an in-bar fill, not the next one", () => {
+    // SPANNED_CANDLES are 00:00, 04:00, 08:00 and 12:00Z. 05:00Z falls inside the
+    // 04:00 bar — the bar its marker is drawn on (CR4) — so the view must centre
+    // THAT bar, not the 08:00 one the library's own lookup would snap to.
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    adapter.centerOn("1735707600000");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenCalledWith({ from: -59, to: 61 });
+  });
+
   it("draws nothing at all before a read lands", () => {
     createChartAdapter(container());
     expect(h.chart.addSeries).not.toHaveBeenCalled();

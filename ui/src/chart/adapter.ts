@@ -52,7 +52,13 @@ import type {
 
 import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
 import type { CandlePoint, ChartMarker, OverlayLayer } from "./layers";
-import { markersInWindow, toCandles, toMarkers, toOverlayLayers } from "./layers";
+import {
+  containingIndex,
+  markersInWindow,
+  toCandles,
+  toMarkers,
+  toOverlayLayers,
+} from "./layers";
 import { chartPalette } from "./palette";
 
 /** The chart, as the screen sees it. No library type crosses this interface, so the
@@ -221,14 +227,12 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     },
 
     centerOn(timeMs) {
+      if (candlePoints.length === 0) return;
       const target = Math.floor(Number(timeMs) / 1000);
-      let index = Math.max(0, candleDtos.length - 1);
-      for (let i = 0; i < candleDtos.length; i += 1) {
-        if (Math.floor(Number(candleDtos[i].t) / 1000) >= target) {
-          index = i;
-          break;
-        }
-      }
+      // The bar that CONTAINS the time — exactly the bar `markersInWindow` draws the
+      // marker on, and never the next loaded bar the library's own lower-bound
+      // lookup would pick for a time inside a bar's period (CR4).
+      const index = containingIndex(candlePoints, target);
       chart.timeScale().setVisibleLogicalRange({
         from: index - CENTRE_BARS,
         to: index + CENTRE_BARS,

@@ -76,20 +76,42 @@ describe("windowPlan", () => {
 });
 
 describe("covers", () => {
-  const candles = [{ t: String(ENTRY - HALF_MS) }, { t: String(ENTRY + HALF_MS) }];
+  // Three 15m bars one interval apart. The window's right edge is the END of the last
+  // loaded bar — its open plus the loaded bars' own spacing — so the fixture has to
+  // carry that spacing for either edge to mean anything.
+  const tf = 900_000;
+  const candles = [
+    { t: String(ENTRY) },
+    { t: String(ENTRY + tf) },
+    { t: String(ENTRY + 2 * tf) },
+  ];
 
   it("is true for a bar the window holds", () => {
     expect(covers(candles, String(ENTRY))).toBe(true);
-    expect(covers(candles, String(ENTRY - HALF_MS))).toBe(true);
+    expect(covers(candles, String(ENTRY + tf))).toBe(true);
+  });
+
+  it("covers a fill inside the final loaded bar's own interval", () => {
+    // A fill inside a bar's period — the last one included — is drawn ON that bar (the
+    // close review's CR4), so the window covers it: the same interval the marker clip
+    // reads off the loaded candles' smallest positive gap.
+    expect(covers(candles, String(ENTRY + 2 * tf + tf / 2))).toBe(true);
+    expect(covers(candles, String(ENTRY + tf + tf / 2))).toBe(true);
   });
 
   it("is false for a bar outside the window, on either side", () => {
-    expect(covers(candles, String(ENTRY - HALF_MS - 1))).toBe(false);
-    expect(covers(candles, String(ENTRY + HALF_MS + 1))).toBe(false);
+    expect(covers(candles, String(ENTRY - 1))).toBe(false);
+    // At or past the last bar's END belongs to a bar the window does not hold.
+    expect(covers(candles, String(ENTRY + 3 * tf))).toBe(false);
   });
 
   it("is false when nothing is drawn, whatever the time", () => {
     // Nothing loaded means nothing is on screen, so selecting a trade has to read.
     expect(covers([], String(ENTRY))).toBe(false);
+  });
+
+  it("covers only the open of a single loaded bar, which has no spacing to read", () => {
+    expect(covers([{ t: String(ENTRY) }], String(ENTRY))).toBe(true);
+    expect(covers([{ t: String(ENTRY) }], String(ENTRY + 1))).toBe(false);
   });
 });

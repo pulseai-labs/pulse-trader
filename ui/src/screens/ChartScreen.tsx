@@ -38,6 +38,7 @@ import type {
 } from "../bindings";
 import type { ChartAdapter } from "../chart/adapter";
 import { createChartAdapter } from "../chart/adapter";
+import { beforeFence, fenceStartMs } from "../chart/layers";
 import type { WindowPlan } from "../chart/window";
 import { covers, windowPlan } from "../chart/window";
 import { Figure } from "../format/Figure";
@@ -67,6 +68,11 @@ interface RunContext {
   readonly usesHtf: boolean;
   readonly firstOpenTimeMs: string;
   readonly lastCloseTimeMs: string;
+  /** The open freeze's holdout start as the run read saw it, or null when no freeze
+   *  was open then. The run read is the tab's FIRST answer about a run, so this is the
+   *  only fence the tab can know before its first chart answer — and a trade that
+   *  reaches it carries a withheld-period outcome, so it is never listed. */
+  readonly holdoutStartMs: string | null;
   /** The run's stored trades. The run read is the tab's FIRST answer about the run and
    *  it already carries every trade the run recorded, so a leg over the bar cap has rows
    *  to pick from before any chart read happens (CR1). */
@@ -153,6 +159,11 @@ export default function ChartScreen() {
   const [fragmentRun, setFragmentRun] = useState<string | null>(
     () => chartDeepLink(window.location.hash)?.run ?? null,
   );
+  /** The identity this tab is DRAWING: the fragment's run, or null once a free
+   *  pair/timeframe has been chosen. The fragment says where the tab ENTERED; an
+   *  explicit choice made in the session wins over it, and both the run read's
+   *  continuation and the drawn-answer gate are compared against this. */
+  const [selected, setSelected] = useState<string | null>(fragmentRun);
   const [barsOpen, setBarsOpen] = useState(false);
 
   // The free selection, readable from the fragment effect without re-running it.
@@ -168,6 +179,20 @@ export default function ChartScreen() {
     requestRef.current = next;
     setRequest(next);
   };
+
+  /** The selected identity as an async continuation reads it: `selected` is state, and
+   *  a continuation that resolves before the next render must still see the choice the
+   *  trader made AFTER it started. Every path that selects writes both. */
+  const selectedRef = useRef<string | null>(fragmentRun);
+  const select = (next: string | null): void => {
+    selectedRef.current = next;
+    setSelected(next);
+  };
+
+  /** The anchor the READY answer was read for (`null` for a span read). The draw
+   *  effect centres on it instead of fitting the whole window, so a bounded read the
+   *  plan clamped into the run's span still lands on the trader's trade. */
+  const drawnAnchorRef = useRef<string | null>(null);
 
   /** Take whatever is drawn off the canvas, and remember that nothing is. Nothing is
    *  put back until the next read's own layers arrive: an empty chart is not a stale one
@@ -220,6 +245,7 @@ export default function ChartScreen() {
     // read's success OR its failure — writes nothing for this run (see `stillWanted`).
     putRequest(null);
     clearDrawing();
+    select(fragmentRun);
     setRun(null);
     setLeg("primary");
     setAnchorMs(null);
@@ -232,10 +258,15 @@ export default function ChartScreen() {
     }
     setPhase({ kind: "loading", what: `Loading backtest run ${fragmentRun}…` });
     let cancelled = false;
+    /** Whether this read's answer is still the one to write. `cancelled` covers the
+     *  fragment moving on; the selected identity covers the trader choosing a free
+     *  pair/timeframe while the read was in flight — that choice wins, so neither this
+     *  read's success nor its refusal may write over it. */
+    const stale = (): boolean => cancelled || selectedRef.current !== fragmentRun;
     void (async () => {
       try {
         const answer = await commands.getBacktestRun({ runId: fragmentRun });
-        if (cancelled) return;
+        if (stale()) return;
         if (answer.status !== "ok") {
           setPhase({ kind: "failed", message: answer.error.message, code: answer.error.code });
           return;
@@ -249,7 +280,7 @@ export default function ChartScreen() {
         setAnchorMs(null);
         putRequest(requestFor(context, context.pair, timeframeOf(context, startLeg), null));
       } catch (error) {
-        if (cancelled) return;
+        if (stale()) return;
         setPhase({ kind: "failed", message: messageOf(error), code: "transport" });
       }
     })();
@@ -292,6 +323,10 @@ export default function ChartScreen() {
           setPhase({ kind: "failed", message: answer.error.message, code: answer.error.code });
           return;
         }
+        // The anchor this answer was read FOR, for the draw effect: a bounded read
+        // clamped to the run's span edge must still land on the trade the trader
+        // picked, and the effect that draws has no other way to know which it was.
+        drawnAnchorRef.current = request.anchorMs;
         setPhase({ kind: "ready", dto: answer.data });
       } catch (error) {
         if (!stillWanted()) return;
@@ -304,13 +339,13 @@ export default function ChartScreen() {
   }, [request]);
 
   // --- draw what came back --------------------------------------------------
-  // Only the run the fragment names is this tab's to draw: a DTO read for another run is
-  // not drawn, not listed and not centred on (CR3). The free chart's read carries no run
-  // layer and the tab names no run, so the two agree there. (A named-run read always
-  // answers with its run layer — the server maps a resolved run straight into it — so
-  // this compares like with like.)
+  // Only what the tab has SELECTED is this tab's to draw: an answer read for another
+  // run — or a run's answer that outlived a free choice — is not drawn, not listed and
+  // not centred on (CR3). The gate compares the DTO against the selection, never
+  // against the raw fragment: a free read's answer carries no run layer, and the
+  // fragment may still name the run the trader deep-linked away from.
   const dto =
-    phase.kind === "ready" && (phase.dto.run?.runId ?? null) === fragmentRun ? phase.dto : null;
+    phase.kind === "ready" && (phase.dto.run?.runId ?? null) === selected ? phase.dto : null;
   useEffect(() => {
     const adapter = adapterRef.current;
     // An empty window draws nothing: the read that emptied the chart already cleared
@@ -321,7 +356,14 @@ export default function ChartScreen() {
     adapter.setCandles(dto.candles);
     adapter.setOverlays(overlays);
     adapter.setTrades(dto.run?.trades ?? []);
-    adapter.fitAll();
+    // Where the view lands: on the anchor the read was asked around (a bounded read,
+    // clamped or not), else the whole window.
+    const anchor = drawnAnchorRef.current;
+    if (anchor === null) {
+      adapter.fitAll();
+    } else {
+      adapter.centerOn(anchor);
+    }
     drawnRef.current = true;
   }, [dto]);
 
@@ -333,6 +375,10 @@ export default function ChartScreen() {
   const selectFree = (pair: string, timeframe: string) => {
     freeRef.current = { pair, timeframe };
     setFree(freeRef.current);
+    // An explicit free choice is the tab's selection now, whatever the fragment still
+    // names: the in-flight run read must not take it back (and the drawn-answer gate
+    // must let the free read through).
+    select(null);
     setRun(null);
     setAnchorMs(null);
     putRequest(requestFor(null, pair, timeframe, null));
@@ -367,12 +413,33 @@ export default function ChartScreen() {
   };
 
   // --- what is drawn right now ---------------------------------------------
-  // The rows the trader picks a window from: the DRAWN window's trades when one is
-  // drawn, and the run's own stored trades otherwise — a leg waiting for a trade, a
-  // read in flight, a failed read (CR1). Both are the server's own records; nothing is
-  // derived here. The caption says which of the two the table is showing.
-  const windowTrades = dto?.run != null ? dto.run.trades : null;
-  const trades = windowTrades ?? run?.trades ?? [];
+  // The rows the trader picks a window from. The run's own stored trades are ALWAYS
+  // here: a bounded window's list must never erase the distant trades the trader can
+  // navigate to next — a window response holding one trade is not the run (the close
+  // review's C) — and a drawn window's rows are added to them, in their own order, so
+  // the accessible copy stays the drawn window's twin (F2). Both lists are the server's
+  // own records, and both are fenced at the freeze the tab knows (B): a trade that
+  // reaches the holdout start carries a withheld-period outcome and is never listed.
+  // The freshest word wins: a chart answer's own holdout — a `null` there means no
+  // freeze was open at that read, which is newer than the run read — else the run
+  // read's boundary, the only one available before the first chart answer.
+  const fence = fenceStartMs(
+    dto === null ? run?.holdoutStartMs ?? null : dto.holdout?.holdoutStartMs ?? null,
+  );
+  const runTrades = (run?.trades ?? []).filter((trade) => beforeFence(trade, fence));
+  const windowTrades =
+    dto?.run == null ? null : dto.run.trades.filter((trade) => beforeFence(trade, fence));
+  const trades = (() => {
+    if (windowTrades === null || windowTrades.length === 0) return runTrades;
+    // The run's rows are already listed; a window row is added only when the run read
+    // did not carry it (the two reads are the same server rows, so this is a guard).
+    const listed = new Set(runTrades.map(tradeKey));
+    return [...runTrades, ...windowTrades.filter((trade) => !listed.has(tradeKey(trade)))];
+  })();
+  /** Whether the FENCE emptied the list rather than the run having none: the empty
+   *  state says which of the two it is (PDR-0011 — no state names a trade that is not
+   *  there, and no fence reads as "this run traded nothing"). */
+  const fencedOut = trades.length === 0 && (run?.trades.length ?? 0) > 0;
   const overlays = dto?.run?.overlays ?? [];
   const events = overlays.flatMap((overlay) => {
     if (overlay.kind === "pivot") {
@@ -513,11 +580,10 @@ export default function ChartScreen() {
         ) : (
           <div className="cw-scroll">
             <table className="cw-tbl cw-trades">
-              {/* Named by what the rows ARE: a window's trades once one is drawn, the
-                  run's own stored trades while the tab has no window to show (CR1). */}
-              <caption>
-                {windowTrades === null ? "Trades in the run" : "Trades in the window"}
-              </caption>
+              {/* Named by what the rows ARE: the run's own stored trades, always — a
+                  bounded window narrows what is DRAWN, never which trades the trader
+                  may pick next (the close review's C). */}
+              <caption>Trades in the run</caption>
               <thead>
                 <tr>
                   <th scope="col">#</th>
@@ -561,15 +627,24 @@ export default function ChartScreen() {
                 {trades.length === 0 && (
                   <tr>
                     <td colSpan={8}>
-                      {windowTrades === null
-                        ? "The run recorded no trades."
-                        : "No trades fall in this window."}
+                      {fencedOut
+                        ? "This run's stored trades reach the holdout and are withheld."
+                        : windowTrades === null
+                          ? "The run recorded no trades."
+                          : "No trades fall in this window."}
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
+        )}
+        {/* What the rows are, and how the drawn window narrows them: the table lists the
+            run's trades, and this says how many of them the chart is drawing. */}
+        {windowTrades !== null && (
+          <p className="cw-note" role="note">
+            {`The drawn window holds ${windowTrades.length} of these trades.`}
+          </p>
         )}
       </section>
 
@@ -676,6 +751,12 @@ function toChartTrades(rows: readonly TradeRowDto[]): ChartTradeDto[] {
   }));
 }
 
+/** One trade's identity across the two reads that can carry it — the run's stored rows
+ *  and the drawn window's rows — so the union of the two lists never doubles a trade. */
+function tradeKey(trade: ChartTradeDto): string {
+  return `${trade.entryTime}-${trade.side}-${trade.exitTime ?? ""}`;
+}
+
 /** The run's own facts a chart needs, read off the run DTO. */
 function readRun(dto: BacktestRunDto): RunContext {
   return {
@@ -686,6 +767,7 @@ function readRun(dto: BacktestRunDto): RunContext {
     usesHtf: dto.usesHtf,
     firstOpenTimeMs: dto.firstOpenTimeMs,
     lastCloseTimeMs: dto.lastCloseTimeMs,
+    holdoutStartMs: dto.holdoutStartMs,
     trades: toChartTrades(dto.trades),
   };
 }

@@ -348,7 +348,7 @@ describe("the leg switch", () => {
     fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
     await screen.findByText(/more than one read/);
 
-    fireEvent.click(screen.getByRole("button", { name: /^Trade 1, long/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
 
     await waitFor(() =>
       expect(commands.chartData).toHaveBeenLastCalledWith({
@@ -398,7 +398,7 @@ describe("the leg switch", () => {
     // loads the window around its entry.
     fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
     await screen.findByText(/more than one read/);
-    fireEvent.click(screen.getByRole("button", { name: /^Trade 1, long/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
     await waitFor(() =>
       expect(commands.chartData).toHaveBeenNthCalledWith(2, {
         pair: "BTCUSDT",
@@ -427,7 +427,7 @@ describe("the leg switch", () => {
     await open("#/chart?run=run-1");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole("button", { name: /^Trade 1, long/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
 
     await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith(String(ENTRY)));
     expect(commands.chartData).toHaveBeenCalledTimes(1);
@@ -514,7 +514,7 @@ describe("a switch to another run (CR3)", () => {
 
     await open("#/chart?run=run-old");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
-    const before = await screen.findByRole("table", { name: "Trades in the window" });
+    const before = await screen.findByRole("table", { name: "Trades in the run" });
     expect(within(before).getByText("2025-04-11 00:00 UTC")).toBeTruthy();
 
     // The fragment names another run while the tab stays mounted.
@@ -677,7 +677,7 @@ describe("the table copy", () => {
   it("carries the run's trades with their exact strings beside every figure", async () => {
     await open("#/chart?run=run-1");
 
-    const table = await screen.findByRole("table", { name: "Trades in the window" });
+    const table = await screen.findByRole("table", { name: "Trades in the run" });
     const rows = within(table).getAllByRole("cell");
     const text = rows.map((cell) => cell.textContent).join(" | ");
     expect(text).toContain("long");
@@ -745,5 +745,328 @@ describe("Settings → About", () => {
     expect(link.getAttribute("rel")).toContain("noreferrer");
     // The app's own version, read from the app — never a literal that goes stale.
     expect(await screen.findByText("PulseTrader 0.1.5")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The fence over every trade the tab lists (holdout)
+// ---------------------------------------------------------------------------
+
+describe("the holdout fence over the tab's trades", () => {
+  /** The fence: two days after the first trade's exit, before the second trade. */
+  const HOLDOUT = ENTRY + 2 * DAY;
+  /** A fenced trade's entry — at or after the fence, so it may never be listed. */
+  const FENCED_ENTRY = ENTRY + 3 * DAY;
+
+  /** The run read's own answer: its boundary plus one safe and one fenced trade. */
+  function fencedRunDto(over: Partial<BacktestRunDto> = {}): BacktestRunDto {
+    return {
+      ...runDto({
+        primaryTimeframe: "15m",
+        htfTimeframe: null,
+        usesHtf: false,
+        trades: [
+          tradeRow({}),
+          tradeRow({
+            entryFillTime: String(FENCED_ENTRY),
+            exitFillTime: String(FENCED_ENTRY + DAY),
+          }),
+        ],
+        ...over,
+      }),
+      holdoutStartMs: String(HOLDOUT),
+    } as unknown as BacktestRunDto;
+  }
+
+  it("hides a stored trade that reaches the fence before any chart answer arrives", async () => {
+    // The over-cap leg sends no read at all (CR1), so the run read is the ONLY
+    // source of these rows: the fence has to be applied there, or it leaks.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(ok(fencedRunDto()));
+    await open("#/chart?run=run-1");
+
+    expect(await screen.findByText(/Pick a trade to load 15m around it/)).toBeTruthy();
+    expect(commands.chartData).not.toHaveBeenCalled();
+    const table = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(table).getAllByRole("button")).toHaveLength(1);
+    expect(within(table).getByText("2025-04-11 00:00 UTC")).toBeTruthy();
+    expect(within(table).queryByText("2025-04-14 00:00 UTC")).toBeNull();
+  });
+
+  it("hides a stored trade that reaches the fence a drawn window brings back", async () => {
+    // A window read answers with its own rows, and the tab lists the run's: the
+    // fence has to hold for the run's list too, not only the chart answer's.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(ok(fencedRunDto()));
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ trades: [trade({})] }) })),
+    );
+    await open("#/chart?run=run-1");
+
+    expect(await screen.findByText("Trades in the run")).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(table).queryByText("2025-04-14 00:00 UTC")).toBeNull();
+    expect(within(table).getByText("2025-04-11 00:00 UTC")).toBeTruthy();
+  });
+
+  it("uses the chart answer's own fence when the run read carried none", async () => {    // A freeze opened after the run read: the chart read is the fresher word, and
+    // the tab must not keep listing a trade the fence now covers.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          trades: [
+            tradeRow({}),
+            tradeRow({
+              entryFillTime: String(FENCED_ENTRY),
+              exitFillTime: String(FENCED_ENTRY + DAY),
+            }),
+          ],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          holdout: { holdoutStartMs: String(HOLDOUT), barsWithheld: 3 },
+          run: runLayer({ trades: [trade({})] }),
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+
+    expect(await screen.findByText(/bars withheld/)).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(table).getAllByRole("button")).toHaveLength(1);
+    expect(within(table).queryByText("2025-04-14 00:00 UTC")).toBeNull();
+  });
+
+  it("lets a chart answer with no holdout clear the run read's older boundary", async () => {
+    // The freeze was closed between the two reads. The chart answer is the fresher
+    // word, and a `null` holdout there means no freeze was open at that read — so the
+    // tab must not keep hiding a trade the fence no longer covers.
+    // A two-leg run whose 4h leg fits in one read, so a chart answer really arrives.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(fencedRunDto({ htfTimeframe: "4h", usesHtf: true })),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ trades: [trade({})] }) })),
+    );
+    await open("#/chart?run=run-1");
+
+    expect(await screen.findByText(/of these trades/)).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(table).getAllByRole("button")).toHaveLength(2);
+    expect(within(table).getByText("2025-04-14 00:00 UTC")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The run-wide selector (navigation must never be erased by a window)
+// ---------------------------------------------------------------------------
+
+describe("the run-wide trade selector", () => {
+  it("keeps a distant run trade selectable after a bounded window is drawn", async () => {
+    // The run recorded two trades 15 days apart. The bounded window read returns
+    // ONLY the first: the second is not in the window, so it cannot be drawn or
+    // centred — it is still the trader's next navigation move.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          trades: [
+            tradeRow({}),
+            tradeRow({
+              entryFillTime: String(EARLIER_ENTRY),
+              exitFillTime: String(EARLIER_ENTRY + DAY),
+            }),
+          ],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData)
+      .mockResolvedValueOnce(ok(chartDto({ run: runLayer({ trades: [trade({})] }) })))
+      .mockResolvedValue(
+        ok(
+          chartDto({
+            timeframe: "15m",
+            candles: [candle(ENTRY - HALF), candle(ENTRY + HALF)],
+            run: runLayer({ series: "primary", trades: [trade({})] }),
+          }),
+        ),
+      );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    // The 15m leg is over the cap: the tab asks for a trade, then reads around it.
+    fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
+    await screen.findByText(/more than one read/);
+    const table = await screen.findByRole("table", { name: "Trades in the run" });
+    fireEvent.click(within(table).getByRole("button", { name: /^Trade 1, long/ }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: String(ENTRY - HALF),
+        toMs: String(ENTRY + HALF),
+        runId: "run-1",
+      }),
+    );
+
+    // The window holds only the first trade; the distant one is still here, and
+    // picking it reads a window around ITS entry rather than scrolling nowhere.
+    expect(within(table).getAllByRole("button")).toHaveLength(2);
+    fireEvent.click(within(table).getByRole("button", { name: /^Trade 2, long/ }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: String(EARLIER_ENTRY - HALF),
+        toMs: String(EARLIER_ENTRY + HALF),
+        runId: "run-1",
+      }),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The selection the tab is drawing (a free choice must not be lost)
+// ---------------------------------------------------------------------------
+
+describe("the selection the tab owns", () => {
+  it("draws a free pair and timeframe chosen after the fragment's run read refused", async () => {
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      failure("no backtest run gone", "not_found") as never,
+    );
+    const free = chartDto({ candles: [candle(FIRST), candle(FIRST + 4 * 3_600_000)] });
+    vi.mocked(commands.chartData).mockResolvedValue(ok(free));
+    await open("#/chart?run=gone");
+
+    // The refusal is shown, the free controls are the only controls, and the trader
+    // picks one: the tab must draw what it just read.
+    expect(await screen.findByText(/no backtest run gone/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^ETHUSDT/ }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "ETHUSDT",
+        timeframe: "4h",
+        fromMs: null,
+        toMs: null,
+        runId: null,
+      }),
+    );
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles));
+  });
+
+  it("keeps a free choice made while the run read is still in flight", async () => {
+    const runRead = deferred<unknown>();
+    vi.mocked(commands.getBacktestRun).mockReturnValue(runRead.promise as never);
+    const free = chartDto({ candles: [candle(FIRST), candle(FIRST + 4 * 3_600_000)] });
+    vi.mocked(commands.chartData).mockResolvedValue(ok(free));
+    await open("#/chart?run=run-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /^SOLUSDT/ }));
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles));
+
+    // The run read lands afterwards: it must write nothing for this chart, and the
+    // free controls must stay the trader's.
+    await act(async () => runRead.resolve(ok(runDto())));
+    expect(screen.getByText("No run")).toBeTruthy();
+    expect(screen.queryByText(/Backtest run run-1/)).toBeNull();
+    expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles);
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the free chart when the in-flight run read refuses afterwards", async () => {
+    const runRead = deferred<unknown>();
+    vi.mocked(commands.getBacktestRun).mockReturnValue(runRead.promise as never);
+    const free = chartDto({ candles: [candle(FIRST), candle(FIRST + 4 * 3_600_000)] });
+    vi.mocked(commands.chartData).mockResolvedValue(ok(free));
+    await open("#/chart?run=run-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /^XRPUSDT/ }));
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles));
+
+    await act(async () => runRead.resolve(failure("no backtest run run-1", "not_found")));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("No run")).toBeTruthy();
+    expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Centring: the containing bar, and the clamped window's anchor
+// ---------------------------------------------------------------------------
+
+describe("centring on the trade under the pointer", () => {
+  it("centres a fill inside the final loaded bar without another read", async () => {
+    // The last loaded bar is ENTRY's bar; the fill happens INSIDE it, after its open.
+    // The marker is drawn on that bar (CR4), so the click centres rather than reading.
+    const fill = String(ENTRY + TF_MS_15M / 2);
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          primaryTimeframe: "15m",
+          htfTimeframe: null,
+          usesHtf: false,
+          firstOpenTimeMs: String(ENTRY - TF_MS_15M),
+          lastCloseTimeMs: String(ENTRY + TF_MS_15M - 1),
+          trades: [tradeRow({ entryFillTime: fill, exitFillTime: String(ENTRY + DAY) })],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          timeframe: "15m",
+          candles: [candle(ENTRY - TF_MS_15M), candle(ENTRY)],
+          run: runLayer({
+            series: "primary",
+            trades: [trade({ entryTime: fill, exitTime: String(ENTRY + DAY) })],
+          }),
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+    await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith(fill));
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("centres a clamped window on the trade the trader picked", async () => {
+    // The trade entered one bar after the run's first, so its window is clamped to
+    // the run's start: fitting the whole window would leave the marker at the edge.
+    const entry = FIRST + TF_MS_15M;
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          primaryTimeframe: "15m",
+          htfTimeframe: null,
+          usesHtf: false,
+          trades: [tradeRow({ entryFillTime: String(entry), exitFillTime: String(entry + DAY) })],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          timeframe: "15m",
+          candles: [candle(FIRST), candle(entry + HALF)],
+          run: runLayer({ series: "primary" }),
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    await screen.findByText(/Pick a trade to load 15m around it/);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: String(FIRST),
+        toMs: String(entry + HALF),
+        runId: "run-1",
+      }),
+    );
+    await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith(String(entry)));
   });
 });
