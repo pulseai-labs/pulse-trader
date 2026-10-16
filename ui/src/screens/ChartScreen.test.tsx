@@ -78,8 +78,11 @@ const ENTRY = FIRST + 100 * DAY;
 /** 2025-03-27T00:00Z — the second trade's entry, 15 days before the first. */
 const EARLIER_ENTRY = FIRST + 85 * DAY;
 const TF_MS_15M = 900_000;
+/** The higher timeframe's own bar, and the plan's half-width on it. */
+const TF_MS_4H = 14_400_000;
 /** The window's half-width: ±500 bars, the plan's own reading. */
 const HALF = 500 * TF_MS_15M;
+const HALF_4H = 500 * TF_MS_4H;
 
 const SERIES_OVERLAYS: ChartOverlayDto[] = [
   { kind: "level", label: "support:3-3-0.005-2-100", values: [null, "93460.2"] },
@@ -1092,5 +1095,131 @@ describe("centring on the trade under the pointer", () => {
       }),
     );
     await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith(String(entry)));
+  });
+
+  it("names a trade no window on this leg can draw instead of re-reading it", async () => {
+    // The 4h leg fits one read, so the tab asks for the run's own span — the widest
+    // window this leg can make. Its answer stops before the trade's own candle (the run's
+    // last 4h candle had not closed by its last 15m bar), so no narrower window holds
+    // that bar and asking again can only repeat the answer.
+    const entry = FIRST + 10 * DAY;
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          trades: [
+            tradeRow({ entryFillTime: String(entry), exitFillTime: String(entry + DAY) }),
+          ],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          candles: [candle(FIRST), candle(FIRST + 4 * TF_MS_4H)],
+          run: runLayer({ trades: [] }),
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    await screen.findByText(/is not drawn on 4h/);
+  });
+
+  it("does not repeat the read for a trade the window it asked for cannot hold", async () => {
+    // A leg over the cap reads a bounded window around the trade the trader picks. When
+    // that window answers without the trade's bar, the same row's next click asks the
+    // very same question: it is named, not read a third time.
+    const entry = FIRST + 100 * DAY;
+    const windows = [candle(FIRST), candle(FIRST + TF_MS_4H)];
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          lastCloseTimeMs: String(FIRST + 4_000 * DAY),
+          trades: [
+            tradeRow({ entryFillTime: String(entry), exitFillTime: String(entry + DAY) }),
+          ],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ candles: windows, run: runLayer({ trades: [] }) })),
+    );
+    await open("#/chart?run=run-1");
+    await screen.findByText(/Pick a trade to load 4h around it/);
+
+    const row = await screen.findByRole("button", { name: /^Trade 1, long/ });
+    fireEvent.click(row);
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "4h",
+        fromMs: String(entry - HALF_4H),
+        toMs: String(entry + HALF_4H),
+        runId: "run-1",
+      }),
+    );
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenLastCalledWith(windows));
+
+    // That window has been read and does not hold the bar, so the row's next click asks
+    // the very same question: it is named, and no further read goes out — not then, and
+    // not on the click after that either.
+    fireEvent.click(row);
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    await screen.findByText(/is not drawn on 4h/);
+
+    fireEvent.click(row);
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("still reads a window for an ordinary trade the drawn window does not hold", async () => {
+    // A preservation guard on the same leg (it passes on de919fc too): a far-away trade
+    // is off-window, not undrawable, so its click reads a window at its OWN anchor. The
+    // run-wide selector must keep working.
+    const near = FIRST + 100 * DAY;
+    const far = FIRST + 2_000 * DAY;
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          lastCloseTimeMs: String(FIRST + 4_000 * DAY),
+          trades: [
+            tradeRow({ entryFillTime: String(near), exitFillTime: String(near + DAY) }),
+            tradeRow({ entryFillTime: String(far), exitFillTime: String(far + DAY) }),
+          ],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          candles: [candle(near), candle(near + TF_MS_4H)],
+          run: runLayer({ trades: [] }),
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    await screen.findByText(/Pick a trade to load 4h around it/);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+    await waitFor(() =>
+      expect(h.adapter.setCandles).toHaveBeenLastCalledWith([
+        candle(near),
+        candle(near + TF_MS_4H),
+      ]),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 2, long/ }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "4h",
+        fromMs: String(far - HALF_4H),
+        toMs: String(far + HALF_4H),
+        runId: "run-1",
+      }),
+    );
   });
 });

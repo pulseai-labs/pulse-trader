@@ -139,6 +139,14 @@ function loadingText(request: ChartRequest): string {
   return `Loading ${request.pair} ${request.timeframe}…`;
 }
 
+/** The identity of a read: the four fields the server answers by. Two requests with the
+ *  same identity are the same question, and its answer can only repeat the first. */
+function readKey(request: ChartRequest): string {
+  const from = request.plan.kind === "window" ? request.plan.fromMs : "";
+  const to = request.plan.kind === "window" ? request.plan.toMs : "";
+  return [request.pair, request.timeframe, request.runId ?? "", from, to].join("|");
+}
+
 export default function ChartScreen() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const adapterRef = useRef<ChartAdapter | null>(null);
@@ -197,6 +205,19 @@ export default function ChartScreen() {
    *  plan clamped into the run's span still lands on the trader's trade. */
   const drawnAnchorRef = useRef<string | null>(null);
 
+  /** The read the drawn answer answers: the question it asked, and whether it asked for
+   *  the run's own span with no bounds. A span read is the widest window this leg can
+   *  make, so a bar it does not hold cannot be reached by any narrower one — the read's
+   *  own draw edge trims the same trailing higher-timeframe candle however the window is
+   *  asked; and a question already answered cannot answer differently. Either makes a
+   *  click's read futile, and the tab names the bar instead of reloading for it. */
+  const drawnReadRef = useRef<{ key: string; span: boolean } | null>(null);
+
+  /** The entry time of a trade the trader clicked whose bar no read of this leg can
+   *  draw. Named where the notes are: a click that cannot draw a bar must not read for
+   *  it in silence. */
+  const [undrawn, setUndrawn] = useState<string | null>(null);
+
   /** Take whatever is drawn off the canvas, and remember that nothing is. Nothing is
    *  put back until the next read's own layers arrive: an empty chart is not a stale one
    *  (PDR-0011). Called by any read that replaces the window, and by a run switch (CR3). */
@@ -208,6 +229,7 @@ export default function ChartScreen() {
       adapter.setTrades([]);
     }
     drawnRef.current = false;
+    drawnReadRef.current = null;
   };
 
   // --- the chart's own life -------------------------------------------------
@@ -253,6 +275,7 @@ export default function ChartScreen() {
     setLeg("primary");
     setAnchorMs(null);
     setNotice(null);
+    setUndrawn(null);
     if (fragmentRun === null) {
       const freeRequest = requestFor(null, freeRef.current.pair, freeRef.current.timeframe, null);
       setPhase({ kind: "loading", what: loadingText(freeRequest) });
@@ -336,6 +359,10 @@ export default function ChartScreen() {
         // clamped to the run's span edge must still land on the trade the trader
         // picked, and the effect that draws has no other way to know which it was.
         drawnAnchorRef.current = request.anchorMs;
+        drawnReadRef.current = {
+          key: readKey(request),
+          span: request.plan.kind === "span",
+        };
         setPhase({ kind: "ready", dto: answer.data });
       } catch (error) {
         if (!stillWanted()) return;
@@ -390,11 +417,13 @@ export default function ChartScreen() {
     select(null);
     setRun(null);
     setAnchorMs(null);
+    setUndrawn(null);
     putRequest(requestFor(null, pair, timeframe, null));
   };
 
   const selectLeg = (next: Leg) => {
     setLeg(next);
+    setUndrawn(null);
     putRequest(requestFor(run, run?.pair ?? free.pair, next === "htf" && run !== null
       ? timeframeOf(run, "htf")
       : run === null
@@ -409,13 +438,26 @@ export default function ChartScreen() {
    *  to one of those bars would scroll to nothing. */
   const selectTrade = (trade: ChartTradeDto) => {
     setAnchorMs(trade.entryTime);
-    if (drawnTimeframe !== timeframe || !covers(dto?.candles ?? [], trade.entryTime)) {
-      putRequest(requestFor(
-        run,
-        run?.pair ?? free.pair,
-        timeframe,
-        trade.entryTime,
-      ));
+    setUndrawn(null);
+    const next = requestFor(run, run?.pair ?? free.pair, timeframe, trade.entryTime);
+    const covered = covers(dto?.candles ?? [], trade.entryTime);
+    const drawn = drawnReadRef.current;
+    // Some bars this leg can never draw, and another read cannot change that: the run's
+    // whole span is already on screen (the widest window this leg can ask for, so a
+    // narrower one reaches no further), or the very window this click would ask for has
+    // been read and does not hold the bar. Name it — a silent reload would promise a bar
+    // that never arrives.
+    if (
+      !covered &&
+      dto !== null &&
+      drawnTimeframe === timeframe &&
+      (drawn?.span === true || drawn?.key === readKey(next))
+    ) {
+      setUndrawn(trade.entryTime);
+      return;
+    }
+    if (drawnTimeframe !== timeframe || !covered) {
+      putRequest(next);
       return;
     }
     adapterRef.current?.centerOn(trade.entryTime);
@@ -579,6 +621,11 @@ export default function ChartScreen() {
         {dto?.run != null && dto.run.overlays.length === 0 && dto.run.notDrawn.length === 0 && (
           <p className="cw-note" role="note">
             {`This rule uses no S/R, pivot, candle-pattern or EMA operand on ${dto.timeframe}.`}
+          </p>
+        )}
+        {undrawn !== null && (
+          <p className="cw-note" role="note">
+            {`The trade entering ${timeUtc(undrawn)} is not drawn on ${timeframe}: its ${timeframe} candle had not closed by the run's last ${run?.primaryTimeframe ?? timeframe} bar, so no window on this leg holds that bar.`}
           </p>
         )}
       </div>

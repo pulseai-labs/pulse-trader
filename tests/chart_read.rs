@@ -836,6 +836,196 @@ async fn a_windowed_runs_htf_leg_stops_at_its_last_primary_close() {
     );
 }
 
+/// The run layer's trades and the leg's candles are ONE window: a trade the draw edge
+/// trims out of the bars is not listed either. A fold's last primary bars sit inside the
+/// H4 candle that carries them (the edge test above), so a trade filling there is held by
+/// no candle this leg returns — and the tab must not offer it as a window it can show.
+///
+/// Fails on de919fc, whose trade filter still uses the raw request bounds: the HTF leg
+/// answers with that trade while its candles stop at the earlier bar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_htf_leg_lists_no_trade_its_drawn_candles_cannot_hold() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let m15 = write_series(
+        &server.data_dir,
+        &pair(),
+        Timeframe::M15,
+        i64::from(pulse::CHART_BAR_CAP) + 100,
+    );
+    let h4 = write_series(&server.data_dir, &pair(), Timeframe::H4, 3_000);
+    let store = store(&server.data_dir);
+    let series = store
+        .load_version(&pair(), Timeframe::M15, &m15)
+        .expect("the synthetic M15 reads")
+        .series;
+    let htf = store
+        .load_version(&pair(), Timeframe::H4, &h4)
+        .expect("the synthetic H4 reads")
+        .series;
+    // The edge test's own fold: it ends at primary bar 10_017, inside the H4 bar that
+    // opened at primary bar 10_016 and had not closed by the run's last primary close.
+    let window = CandleWindow::new(
+        series.candles[10_000].open_time,
+        series.candles[10_018].open_time,
+    )
+    .expect("a window");
+    let last_primary = &series.candles[10_017];
+    let run_id = seed_run_on(
+        &server,
+        &version,
+        SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: m15.clone(),
+        },
+        Some(SnapshotSelection {
+            timeframe: Timeframe::H4,
+            data_version: h4.clone(),
+        }),
+        Some(window.clone()),
+        // The trade fills on the run's last primary bar — inside the H4 candle the leg
+        // cannot draw.
+        vec![trade_at(last_primary.open_time, "1")],
+    )
+    .await;
+
+    // The truth, read off the stored H4 series: the bars the window's open-times hold
+    // and that had closed by the run's last primary close.
+    let drawn: Vec<(i64, i64)> = htf
+        .candles
+        .iter()
+        .filter(|candle| {
+            candle.open_time >= window.from_ms
+                && candle.open_time < window.to_ms
+                && candle.close_time <= last_primary.close_time
+        })
+        .map(|candle| (candle.open_time, candle.close_time))
+        .collect();
+    let last_drawn_close = drawn.last().expect("the window holds H4 bars").1;
+    assert!(
+        last_primary.open_time > last_drawn_close,
+        "the trade fills after the last bar this leg can draw — that is the case this \
+         test is about"
+    );
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id.clone()),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the HTF leg answers");
+    assert_eq!(
+        dto.candles
+            .iter()
+            .map(|candle| candle.t.parse::<i64>().expect("a time"))
+            .collect::<Vec<_>>(),
+        drawn.iter().map(|(open, _)| *open).collect::<Vec<_>>(),
+        "the leg draws the H4 bars that had closed by the run's last primary close"
+    );
+    let run = dto.run.expect("the run layer");
+    assert!(
+        run.trades.is_empty(),
+        "no returned candle holds the trade, so the window cannot list it: {:?}",
+        run.trades
+    );
+
+    // The primary leg is untouched: the trade is the run's own, and the bars that hold
+    // it are drawn there.
+    let primary = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the primary leg answers");
+    let run = primary.run.expect("the run layer");
+    assert_eq!(
+        run.trades.len(),
+        1,
+        "the primary leg still lists the run's trade where its bar is drawn"
+    );
+    assert_eq!(run.trades[0].entry_time, last_primary.open_time.to_string());
+}
+
+/// A window that holds no primary bar the run consumed draws no H4 candle — and no trade
+/// either: the run layer's rows are the bars' own window, so a window with no bar has no
+/// row.
+///
+/// Fails on de919fc, which filters the trades by the raw request bounds: the leg answers
+/// with one trade while returning no candle at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_with_no_consumed_primary_bar_draws_no_candle_and_no_trade() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let m15 = write_series(
+        &server.data_dir,
+        &pair(),
+        Timeframe::M15,
+        i64::from(pulse::CHART_BAR_CAP) + 100,
+    );
+    let h4 = write_series(&server.data_dir, &pair(), Timeframe::H4, 3_000);
+    let store = store(&server.data_dir);
+    let series = store
+        .load_version(&pair(), Timeframe::M15, &m15)
+        .expect("the synthetic M15 reads")
+        .series;
+    let window = CandleWindow::new(
+        series.candles[10_000].open_time,
+        series.candles[10_018].open_time,
+    )
+    .expect("a window");
+    // A window INSIDE one primary bar: no M15 bar opens in it, so the run's own feed has
+    // no consumed bar to bound the leg by and the edge admits nothing.
+    let inside = &series.candles[10_017];
+    let from = inside.open_time + 1;
+    let to = inside.open_time + 500;
+    let run_id = seed_run_on(
+        &server,
+        &version,
+        SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: m15.clone(),
+        },
+        Some(SnapshotSelection {
+            timeframe: Timeframe::H4,
+            data_version: h4.clone(),
+        }),
+        Some(window),
+        vec![trade_at(from + 100, "1")],
+    )
+    .await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            from_ms: Some(from.to_string()),
+            to_ms: Some(to.to_string()),
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the windowed HTF read answers");
+    assert!(
+        dto.candles.is_empty(),
+        "a window with no consumed primary bar draws no H4 candle: {:?}",
+        dto.candles
+    );
+    let run = dto.run.expect("the run layer");
+    assert!(
+        run.trades.is_empty(),
+        "and the same window lists no trade: {:?}",
+        run.trades
+    );
+}
+
 /// A windowed run's withheld count is the cut's count INSIDE THE RUN'S WINDOW —
 /// not inside the whole pinned snapshot. Fails on the base commit, where the
 /// defaulted window is the whole snapshot: 200 candles come back instead of the

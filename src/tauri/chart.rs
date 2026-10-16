@@ -194,8 +194,9 @@ pub struct ChartRunDto {
     pub version_id: String,
     /// `primary` / `htf` — the series the overlays were computed on (Q2).
     pub series: String,
-    /// Every stored trade whose entry or exit falls in the window and which ends
-    /// before an open freeze's holdout start (Q5).
+    /// Every stored trade whose entry or exit falls in the DRAWN window — the interval
+    /// the returned candles occupy — and which ends before an open freeze's holdout
+    /// start (Q5).
     ///
     /// A trade that reaches the fence is withheld WHOLE, even when it entered
     /// before the holdout start: its exit price, exit reason and realized R were
@@ -307,7 +308,7 @@ pub async fn chart_data_core(
                 .await?;
             trades
                 .iter()
-                .filter(|trade| trade_in_window(trade, read.from, read.to))
+                .filter(|trade| trade_is_drawable(trade, read.drawable))
                 .filter(|trade| trade_clears_holdout(trade, holdout))
                 .map(trade_dto)
                 .collect()
@@ -461,12 +462,13 @@ async fn compile_specs(
 struct BlockingRead {
     /// The snapshot the candles came from.
     data_version: DataVersion,
-    /// The resolved window's bounds, after the run's span or the series' own
-    /// extent filled a missing bound.
-    from: i64,
-    to: i64,
     /// The window's candles, ascending.
     candles: Vec<ChartCandleDto>,
+    /// The interval a stored trade must fall in to be DRAWN: the resolved bounds narrowed
+    /// to the candles this read returns, or `None` when it returns none at all. The run
+    /// layer's trades and the leg's candles are one window, so wherever the HTF draw edge
+    /// removes a bar the marker goes with it (Codex 4292195903).
+    drawable: Option<(i64, i64)>,
     /// How many candles the holdout cut removed inside the window.
     withheld_in_window: usize,
     /// One overlay per drawn spec, in reference order.
@@ -637,14 +639,24 @@ fn read_window(
     }
 
     let per_bar = engine_pass(&drawn, &series)?;
+    // What the run layer may list: the candles this read actually returns, never the raw
+    // bounds. The two are the same window (Q5's own reading), and where the draw edge
+    // trims an HTF leg's tail the markers go with the bars they cannot sit on — a trade
+    // no returned candle holds is a row the tab could load a window for forever without
+    // ever drawing it (Codex 4292195903).
+    let drawable = window.first().zip(window.last()).map(|(&first, &last)| {
+        (
+            from.max(series.candles[first].open_time),
+            to.min(series.candles[last].close_time),
+        )
+    });
     Ok(BlockingRead {
         data_version,
-        from,
-        to,
         candles: window
             .iter()
             .map(|&index| candle_dto(&series.candles[index]))
             .collect(),
+        drawable,
         withheld_in_window,
         overlays: overlay_dtos(&drawn, &per_bar, &series.candles, &window),
         not_drawn,
@@ -820,9 +832,15 @@ fn candle_dto(candle: &Candle) -> ChartCandleDto {
     }
 }
 
-/// Whether a stored trade's entry OR exit falls in the window — the spec's own
-/// filter: either end of a trade draws it.
-fn trade_in_window(trade: &Trade, from: i64, to: i64) -> bool {
+/// Whether a stored trade falls in the interval this read can DRAW — the spec's own
+/// filter, "either end of a trade draws it" (w1, Q2), against the interval the returned
+/// candles occupy and never the raw request bounds: an HTF leg whose draw edge trims its
+/// tail draws no marker after its last bar, and a read that returned no candle draws no
+/// trade at all.
+fn trade_is_drawable(trade: &Trade, drawable: Option<(i64, i64)>) -> bool {
+    let Some((from, to)) = drawable else {
+        return false;
+    };
     (from..=to).contains(&trade.entry_fill_time) || (from..=to).contains(&trade.exit_fill_time)
 }
 
