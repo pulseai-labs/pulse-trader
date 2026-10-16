@@ -876,10 +876,12 @@ impl EngineSession {
 /// truth at the bar the session last stepped (r5.s3.w2, SPINE G3).
 ///
 /// `explain_marks` asks this at a mark's evaluation bar: `is_warm` is the gate's
-/// warm clause (`EngineSession::entry_gate_warm`), `eval` is the predicate's own
-/// `eval` over the session's routing context, and `operand` reads a value leaf
-/// the same way. There is no second evaluator, so a condition explain reports as
-/// held is exactly what the backtest's entry gate sees at that bar.
+/// warm clause **as the gate read it at the bar just stepped** (`EngineSession::
+/// entry_gate_warm`, corrected for the probe's one-bar lag — see [`EvalProbe::
+/// is_warm`]), `eval` is the predicate's own `eval` over the session's routing
+/// context, and `operand` reads a value leaf the same way. There is no second
+/// evaluator, so a condition explain reports as held is exactly what the
+/// backtest's entry gate sees at that bar.
 ///
 /// The bias is deliberate and is the whole of G3: `is_warm` is a **superset** of
 /// the gate's trading-state clauses (the gate additionally requires `counted`, a
@@ -892,10 +894,16 @@ pub struct EvalProbe<'a> {
 }
 
 impl EvalProbe<'_> {
-    /// Whether the entry gate's warm clause holds at the last stepped bar.
+    /// Whether the entry gate's warm clause held at the last stepped bar.
+    ///
+    /// `step_series` calls the probe AFTER `step` returned, and `step` reads its
+    /// `bars > 0` clause inside `evaluate_blocks` BEFORE incrementing `bars`. The
+    /// bar just stepped is therefore index `bars - 1`, and the gate requires
+    /// `index > 0` — so the probe must ask `bars > 1`, not `bars > 0`, or index 0
+    /// looks warm to the probe while the gate saw it cold.
     #[must_use]
     pub fn is_warm(&self) -> bool {
-        self.session.entry_gate_warm()
+        self.session.bars > 1 && self.session.entry_gate_warm()
     }
 
     /// Evaluate ONE compiled condition against the session's routing context —

@@ -280,6 +280,28 @@ const CROSS_RULE: &str = r#"{
   "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
 }"#;
 
+/// An INDICATOR-FREE rule: `close > open` on the primary series, no filters. Its
+/// engines are warm from the first bar (`IndicatorEngine::is_warm` is vacuous with
+/// no slots, and `price_lag` is 0), so it isolates the gate's OTHER warm clause —
+/// the running bar count standing in for `bar.index > 0`.
+const INDICATOR_FREE_RULE: &str = r#"{
+  "schema_version": "1.4.0",
+  "name": "indicator-free fixture",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": { "type": "Price", "field": "Close" },
+    "op": "Gt",
+    "rhs": { "type": "Price", "field": "Open" }
+  },
+  "filters": [],
+  "exits": [
+    { "type": "StopLoss", "distance_pct": "0.05" },
+    { "type": "TakeProfit", "target_r": "2.0" }
+  ],
+  "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
+}"#;
+
 /// A rule whose single conjunct can never hold.
 const NEVER_RULE: &str = r#"{
   "schema_version": "1.4.0",
@@ -775,6 +797,59 @@ async fn before_warmup_every_conjunct_is_not_warm_and_carries_no_values() {
         );
     }
     assert!(!explained.all_held);
+}
+
+/// **The series' FIRST bar is cold for the probe, exactly as it is for the entry
+/// gate** (E1). The gate reads its `bars > 0` clause BEFORE its own increment, so
+/// index 0 is cold; `step_series` calls the probe AFTER that increment, so the same
+/// clause reads one higher. Without the off-by-one correction the probe reports the
+/// first bar warm and this indicator-free rule `held` — where the backtest's gate is
+/// cold. That is the ADR-0031/G3 claim failing at exactly one bar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_series_first_bar_is_cold_for_the_probe_exactly_as_for_the_entry_gate() {
+    let world = world().await;
+    let bars = m15_bars(&world.store_dir);
+    let mark = world.mark(Timeframe::M15, bars[0], MarkSide::Long).await;
+
+    let report = world
+        .explain(
+            MarkSelection::Ids(vec![mark.id.clone()]),
+            INDICATOR_FREE_RULE,
+            None,
+        )
+        .await
+        .expect("the first bar explains");
+    let explained = &report.marks[0];
+    assert_eq!(
+        explained.conjuncts[0].state, "not_warm",
+        "index 0 is cold: the gate's `bars > 0` clause is read before its increment"
+    );
+    assert!(
+        explained.conjuncts[0].operands.is_empty(),
+        "a not_warm conjunct reports no operand values"
+    );
+    assert!(
+        !explained.all_held,
+        "the first bar is never `all_held`: its gate is cold"
+    );
+
+    // The very next bar is warm for the same rule: the correction is one bar, not a
+    // blanket refusal of the early series.
+    let second = world.mark(Timeframe::M15, bars[1], MarkSide::Long).await;
+    let report = world
+        .explain(
+            MarkSelection::Ids(vec![second.id.clone()]),
+            INDICATOR_FREE_RULE,
+            None,
+        )
+        .await
+        .expect("the second bar explains");
+    let explained = &report.marks[0];
+    assert_ne!(
+        explained.conjuncts[0].state, "not_warm",
+        "the second bar is warm for an indicator-free rule: {:#?}",
+        explained.conjuncts[0]
+    );
 }
 
 /// `sideMatches` is false for a long mark under a short-only rule, and that
