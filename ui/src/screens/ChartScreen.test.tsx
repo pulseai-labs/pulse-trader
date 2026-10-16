@@ -21,6 +21,8 @@ const h = vi.hoisted(() => ({
     setCandles: vi.fn(),
     setOverlays: vi.fn(),
     setTrades: vi.fn(),
+    setMarks: vi.fn(),
+    onCandleClick: vi.fn(),
     fitAll: vi.fn(),
     centerOn: vi.fn(),
     destroy: vi.fn(),
@@ -47,6 +49,9 @@ vi.mock("../bindings", () => ({
     paperSessions: vi.fn().mockResolvedValue({ status: "ok", data: [] }),
     getBacktestRun: vi.fn(),
     chartData: vi.fn(),
+    listMarks: vi.fn(),
+    writeMark: vi.fn(),
+    withdrawMark: vi.fn(),
   },
 }));
 
@@ -54,11 +59,14 @@ import { App } from "../App";
 import { commands } from "../bindings";
 import type {
   BacktestRunDto,
+  BusErrorCode,
   ChartCandleDto,
   ChartDataDto,
   ChartOverlayDto,
   ChartRunDto,
   ChartTradeDto,
+  MarkDto,
+  MarkListDto,
   ServerStatus,
   TradeRowDto,
 } from "../bindings";
@@ -171,7 +179,7 @@ function ok<T>(data: T): { status: "ok"; data: T } {
   return { status: "ok", data };
 }
 
-function failure(message: string, code: "validation" | "not_found" = "validation") {
+function failure(message: string, code: BusErrorCode = "validation") {
   return {
     status: "error" as const,
     error: {
@@ -182,6 +190,28 @@ function failure(message: string, code: "validation" | "not_found" = "validation
       child_run_id: null,
     },
   };
+}
+
+/** One example-trade mark, as `listMarks` reads it (r5.s3.w1). Times are ms strings. */
+function mark(over: Partial<MarkDto> = {}): MarkDto {
+  return {
+    markId: "mark-1",
+    pair: "BTCUSDT",
+    timeframe: "4h",
+    barTime: String(FIRST),
+    side: "long",
+    setup: "support-rejection longs",
+    note: null,
+    writer: { kind: "trader", name: "Alice", selfReported: false },
+    dataVersion: "9a1dcf67cf4ea260",
+    createdAt: String(FIRST + TF_MS_4H),
+    ...over,
+  };
+}
+
+/** The list read's DTO, wrapped as the command's `typedError` union answers it. */
+function markList(over: Partial<MarkListDto> = {}): MarkListDto {
+  return { marks: [], hiddenByHoldout: null, ...over };
 }
 
 /** A promise the test settles itself, so that two reads' answers can be made to arrive
@@ -267,6 +297,12 @@ beforeEach(() => {
   // The common case is a run open, so that is the standing answer; the free-chart case
   // sets its own.
   vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto({ run: runLayer() })));
+  // No marks by default: every existing case below is about the chart, not the marks,
+  // and a hanging or failing marks read would put a state message on its screen.
+  vi.mocked(commands.listMarks).mockReset();
+  vi.mocked(commands.listMarks).mockResolvedValue(ok(markList()));
+  vi.mocked(commands.writeMark).mockReset();
+  vi.mocked(commands.withdrawMark).mockReset();
 });
 
 afterEach(() => {
@@ -1258,5 +1294,347 @@ describe("centring on the trade under the pointer", () => {
         runId: "run-1",
       }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The example-trade marks (r5.s3.w3)
+// ---------------------------------------------------------------------------
+
+/** The candle click the screen registered with the adapter, so a case can fire one.
+ *  The adapter is mocked; this is the seam the screen's own arm → click → write path
+ *  runs through. */
+function fireCandleClick(openTime: string) {
+  const handler = h.adapter.onCandleClick.mock.calls.at(-1)?.[0] as
+    | ((openTime: string) => void)
+    | undefined;
+  expect(handler, "the screen never subscribed a candle click").toBeDefined();
+  handler?.(openTime);
+}
+
+/** Arm "Mark example" with a setup label, the way the trader does. */
+async function arm(setup = "support-rejection longs", side?: "Long" | "Short") {
+  if (side !== undefined) {
+    fireEvent.click(await screen.findByRole("button", { name: side }));
+  }
+  fireEvent.change(await screen.findByLabelText(/Setup label/i), {
+    target: { value: setup },
+  });
+  fireEvent.click(await screen.findByRole("button", { name: /Mark example/ }));
+}
+
+describe("the marks read", () => {
+  // These cases are about the marks, so the chart behind them is the FREE chart the
+  // standing mock does not answer: a case that opened `#/chart` while `chartData`
+  // answered with a run's layer would have its answer rejected by the drawn-answer gate,
+  // and the tab would draw no leg at all.
+  beforeEach(() => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+  });
+
+  it("reads the marks for the pair on screen, with no timeframe filter", async () => {
+    await open("#/chart");
+    await waitFor(() =>
+      expect(commands.listMarks).toHaveBeenCalledWith({ pair: "BTCUSDT" }),
+    );
+  });
+
+  it("draws the on-screen timeframe's marks and leaves the others off the chart", async () => {
+    vi.mocked(commands.listMarks).mockResolvedValue(
+      ok(
+        markList({
+          marks: [
+            mark({ markId: "m-4h", timeframe: "4h" }),
+            mark({ markId: "m-15m", timeframe: "15m", barTime: String(FIRST + TF_MS_15M) }),
+          ],
+        }),
+      ),
+    );
+    await open("#/chart");
+    await waitFor(() =>
+      expect(h.adapter.setMarks).toHaveBeenLastCalledWith([mark({ markId: "m-4h" })]),
+    );
+  });
+
+  it("says plainly how many marks live on another timeframe", async () => {
+    vi.mocked(commands.listMarks).mockResolvedValue(
+      ok(
+        markList({
+          marks: [
+            mark({ markId: "m-4h", timeframe: "4h" }),
+            mark({ markId: "m-15a", timeframe: "15m" }),
+            mark({ markId: "m-15b", timeframe: "15m" }),
+          ],
+        }),
+      ),
+    );
+    await open("#/chart");
+    await expect(screen.findByText("2 marks on 15m")).resolves.toBeTruthy();
+  });
+
+  it("says plainly how many marks the holdout hid", async () => {
+    vi.mocked(commands.listMarks).mockResolvedValue(
+      ok(
+        markList({
+          hiddenByHoldout: { holdoutStartMs: String(FIRST + 50 * DAY), count: 1 },
+        }),
+      ),
+    );
+    await open("#/chart");
+    await expect(
+      screen.findByText("1 mark hidden: inside the holdout"),
+    ).resolves.toBeTruthy();
+  });
+
+  it("says the marks are loading, then says there are none yet", async () => {
+    const pending = deferred<unknown>();
+    vi.mocked(commands.listMarks).mockReturnValue(pending.promise as never);
+    await open("#/chart");
+    await expect(screen.findByText("Loading example marks…")).resolves.toBeTruthy();
+
+    await act(async () => {
+      pending.resolve(ok(markList()));
+    });
+    await expect(
+      screen.findByText('No example marks yet — arm "Mark example", then click a candle.'),
+    ).resolves.toBeTruthy();
+  });
+
+  it("shows a failed marks read plainly, never as an empty list", async () => {
+    vi.mocked(commands.listMarks).mockResolvedValue(failure("the store is unreadable", "data"));
+    await open("#/chart");
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("the store is unreadable");
+    expect(screen.queryByText(/No example marks yet/)).toBeNull();
+  });
+});
+
+describe("marking a candle", () => {
+  // The free chart, for the same reason as the marks-read cases above.
+  beforeEach(() => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+  });
+
+  it("writes the mark on the clicked candle, naming the pair and timeframe on screen", async () => {
+    vi.mocked(commands.writeMark).mockResolvedValue(ok(mark()));
+    await open("#/chart");
+    await arm("breakout retest", "Long");
+    await act(async () => fireCandleClick(String(FIRST + TF_MS_4H)));
+
+    expect(commands.writeMark).toHaveBeenCalledWith({
+      pair: "BTCUSDT",
+      timeframe: "4h",
+      barTime: String(FIRST + TF_MS_4H),
+      side: "long",
+      setup: "breakout retest",
+      note: null,
+    });
+  });
+
+  it("sends no write at all while the control is disarmed", async () => {
+    await open("#/chart");
+    await screen.findByText('No example marks yet — arm "Mark example", then click a candle.');
+    await act(async () => fireCandleClick(String(FIRST)));
+    expect(commands.writeMark).not.toHaveBeenCalled();
+  });
+
+  it("refuses a blank setup label locally, naming the field and sending no write", async () => {
+    await open("#/chart");
+    fireEvent.click(await screen.findByRole("button", { name: /Mark example/ }));
+    await act(async () => fireCandleClick(String(FIRST)));
+    expect(commands.writeMark).not.toHaveBeenCalled();
+    await expect(
+      screen.findByText("Type a setup label before marking a candle."),
+    ).resolves.toBeTruthy();
+  });
+
+  it("shows the new mark in the table and on the chart without a reload", async () => {
+    const written = mark({ markId: "m-new", setup: "breakout retest" });
+    // The tab re-reads the list after a write (Approach 3), so the mock models the
+    // server's NEW state: the mark is there from the second call on. The trader never
+    // reloads anything.
+    vi.mocked(commands.listMarks)
+      .mockResolvedValueOnce(ok(markList()))
+      .mockResolvedValue(ok(markList({ marks: [written] })));
+    vi.mocked(commands.writeMark).mockResolvedValue(ok(written));
+    await open("#/chart");
+    await arm("breakout retest");
+    await act(async () => fireCandleClick(String(FIRST)));
+
+    await expect(screen.findByText("breakout retest")).resolves.toBeTruthy();
+    await waitFor(() =>
+      expect(h.adapter.setMarks).toHaveBeenLastCalledWith([written]),
+    );
+  });
+
+  it("shows a holdout refusal in plain words, with the date, and adds no mark", async () => {
+    // The bus folds the route's own `holdout` token onto `validation`
+    // (`tauri/error.rs::from_server_token` keeps the message and drops the token), so this
+    // is the refusal the screen actually receives. What identifies it is the tab's own
+    // knowledge of the fence plus the bar it sent: the fence is the write's first step
+    // (G2), so a bar at or after the known start is refused for the fence.
+    const holdoutMs = FIRST + 50 * DAY;
+    vi.mocked(commands.listMarks).mockResolvedValue(
+      ok(markList({ hiddenByHoldout: { holdoutStartMs: String(holdoutMs), count: 0 } })),
+    );
+    vi.mocked(commands.writeMark).mockResolvedValue(
+      failure(
+        "the holdout freeze refuses this run on BTCUSDT: `barTime` reaches into the holdout, which starts at 2025-02-20T00:00:00Z",
+        "validation",
+      ),
+    );
+    await open("#/chart");
+    await arm();
+    await act(async () => fireCandleClick(String(FIRST + 60 * DAY)));
+
+    const alert = await screen.findByRole("alert");
+    // `dateUtc` is the app's ONE date spelling and carries its UTC suffix, exactly as the
+    // holdout note above the table does; the sentence uses it, not a bare date.
+    expect(alert.textContent).toContain(
+      "This candle is inside the holdout from 2025-02-20 UTC; marks there are refused for every writer",
+    );
+    expect(screen.queryAllByRole("row")).toHaveLength(1);
+  });
+
+  it("shows the server's own words when the freeze opened after the tab's last read", async () => {
+    // The fence's start is a fact this tab learns from a read, and a freeze can open
+    // between that read and a write. Then the tab cannot name the date, and it must not
+    // invent one: the server's message — which names it itself — is what the trader reads.
+    vi.mocked(commands.listMarks).mockResolvedValue(ok(markList()));
+    vi.mocked(commands.writeMark).mockResolvedValue(
+      failure(
+        "the holdout freeze refuses this run on BTCUSDT: `barTime` reaches into the holdout, which starts at 2025-10-10T00:00:00Z",
+        "validation",
+      ),
+    );
+    await open("#/chart");
+    await arm();
+    await act(async () => fireCandleClick(String(FIRST + 60 * DAY)));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("starts at 2025-10-10T00:00:00Z");
+    expect(alert.textContent).not.toContain("This candle is inside the holdout from");
+  });
+
+  it("names the time, the pair and the timeframe when no candle opens there", async () => {
+    vi.mocked(commands.writeMark).mockResolvedValue(
+      failure("no BTCUSDT 4h candle opens at 1735776000000 ms in the HEAD snapshot"),
+    );
+    await open("#/chart");
+    await arm();
+    await act(async () => fireCandleClick(String(FIRST + 3 * TF_MS_4H)));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("no BTCUSDT 4h candle opens at 1735776000000 ms");
+  });
+});
+
+describe("the marks table", () => {
+  const TRADER_MARK = mark({
+    markId: "m-trader",
+    setup: "support-rejection longs",
+    note: "third touch",
+    writer: { kind: "trader", name: "Alice", selfReported: false },
+  });
+  const AGENT_MARK = mark({
+    markId: "m-agent",
+    timeframe: "4h",
+    barTime: String(FIRST + TF_MS_4H),
+    side: "short",
+    setup: "failed breakout",
+    writer: { kind: "agent", name: "claude-code", selfReported: true },
+  });
+
+  beforeEach(() => {
+    // The free chart: these cases are about the table, and the standing mock's run
+    // answer would be rejected by the drawn-answer gate for a free read.
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    vi.mocked(commands.listMarks).mockResolvedValue(
+      ok(markList({ marks: [TRADER_MARK, AGENT_MARK] })),
+    );
+  });
+
+  it("names a trader's writer by the app token's label, and an agent's as self-reported", async () => {
+    await open("#/chart");
+    await expect(screen.findByText("trader · Alice")).resolves.toBeTruthy();
+    await expect(
+      screen.findByText("agent · claude-code (self-reported)"),
+    ).resolves.toBeTruthy();
+  });
+
+  it("lists each mark's time, side, setup and note", async () => {
+    await open("#/chart");
+    const table = await screen.findByRole("table", { name: /Example marks/ });
+    const rows = within(table).getAllByRole("row");
+    // The header plus one row per mark.
+    expect(rows).toHaveLength(3);
+    expect(within(table).getByText("support-rejection longs")).toBeTruthy();
+    expect(within(table).getByText("third touch")).toBeTruthy();
+    expect(within(table).getByText("failed breakout")).toBeTruthy();
+  });
+
+  it("centres the chart on a mark whose row the trader clicks", async () => {
+    await open("#/chart");
+    await screen.findByText("support-rejection longs");
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^Mark 1, long,/ }),
+    );
+    expect(h.adapter.centerOn).toHaveBeenCalledWith(String(FIRST));
+  });
+
+  it("labels the table and the controls Reference — not an order", async () => {
+    await open("#/chart");
+    const table = await screen.findByRole("table", { name: /Example marks/ });
+    expect(table.textContent).toContain("Reference — not an order");
+    expect((await screen.findByRole("button", { name: /Mark example/ })).textContent)
+      .toContain("Reference — not an order");
+  });
+
+  it("withdraws a mark: the row and the layer both lose it", async () => {
+    // The re-read after the withdraw answers with the withdrawn mark gone, as the
+    // server's own list would (a withdrawn mark is hidden by the read).
+    vi.mocked(commands.listMarks)
+      .mockResolvedValueOnce(ok(markList({ marks: [TRADER_MARK, AGENT_MARK] })))
+      .mockResolvedValue(ok(markList({ marks: [TRADER_MARK] })));
+    vi.mocked(commands.withdrawMark).mockResolvedValue(ok(AGENT_MARK));
+    await open("#/chart");
+    await screen.findByText("failed breakout");
+    fireEvent.click(await screen.findByRole("button", { name: /Withdraw mark 2/ }));
+
+    await waitFor(() =>
+      expect(commands.withdrawMark).toHaveBeenCalledWith({ markId: "m-agent" }),
+    );
+    await waitFor(() => expect(screen.queryByText("failed breakout")).toBeNull());
+    await waitFor(() =>
+      expect(h.adapter.setMarks).toHaveBeenLastCalledWith([TRADER_MARK]),
+    );
+  });
+
+  it("shows a refused withdraw's reason", async () => {
+    vi.mocked(commands.withdrawMark).mockResolvedValue(
+      failure("no example mark with id m-agent exists", "not_found"),
+    );
+    await open("#/chart");
+    await screen.findByText("failed breakout");
+    fireEvent.click(await screen.findByRole("button", { name: /Withdraw mark 2/ }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("no example mark with id m-agent exists");
+    expect(screen.getByText("failed breakout")).toBeTruthy();
+  });
+
+  it("shows the marks and the run's trades together", async () => {
+    // This one DOES open a run, so the chart answers with that run's own layer.
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ trades: [trade({})] }) })),
+    );
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ trades: [tradeRow()] })),
+    );
+    await open("#/chart?run=run-1");
+    await expect(screen.findByText("support-rejection longs")).resolves.toBeTruthy();
+    await expect(screen.findByText("Trades in the run")).resolves.toBeTruthy();
+    await waitFor(() => expect(h.adapter.setMarks).toHaveBeenCalled());
+    expect(h.adapter.setTrades).toHaveBeenCalled();
   });
 });

@@ -37,6 +37,11 @@ export const PALETTE_TOKENS = {
   pivot: "--chart-pivot",
   /** The faint ghost on the bar the pivot peaked, `right` bars earlier (G3). */
   pivotGhost: "--chart-pivot-ghost",
+  /** The trader's example-trade mark (r5.s3.w3): a neutral text token. */
+  markTrader: "--chart-mark-trader",
+  /** An agent's example-trade mark (r5.s3.w3): the AI purple, so the two writers'
+   *  marks are told apart at a glance (G5). */
+  markAgent: "--chart-mark-agent",
 } as const;
 
 /** Every colour the chart draws with, resolved to a value the canvas accepts. */
@@ -63,5 +68,7 @@ export function chartPalette(root: Element): ChartPalette {
     serverLevel: read(PALETTE_TOKENS.serverLevel),
     pivot: read(PALETTE_TOKENS.pivot),
     pivotGhost: read(PALETTE_TOKENS.pivotGhost),
+    markTrader: read(PALETTE_TOKENS.markTrader),
+    markAgent: read(PALETTE_TOKENS.markAgent),
   };
 }

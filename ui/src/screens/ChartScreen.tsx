@@ -34,6 +34,7 @@ import type {
   BacktestRunDto,
   ChartDataDto,
   ChartTradeDto,
+  MarkDto,
   TradeRowDto,
 } from "../bindings";
 import type { ChartAdapter } from "../chart/adapter";
@@ -103,6 +104,110 @@ interface Notice {
   readonly bars: number;
 }
 
+/** The example-trade marks' read for the pair on screen (r5.s3.w3).
+ *
+ *  ONE read, filtered by pair only, and partitioned here: a timeframe-filtered read
+ *  could not also count the marks living on the other timeframes, which Approach 3
+ *  requires the tab to say plainly. */
+type MarksPhase =
+  | { readonly kind: "loading" }
+  | { readonly kind: "failed"; readonly message: string; readonly code: string }
+  | {
+      readonly kind: "ready";
+      readonly marks: readonly MarkDto[];
+      readonly hidden: { readonly holdoutStartMs: string; readonly count: number } | null;
+    };
+
+/** The mark controls' state. Disarmed, armed, submitting, refused (G6). */
+interface MarkForm {
+  readonly side: "long" | "short";
+  readonly setup: string;
+  readonly note: string;
+  readonly armed: boolean;
+  readonly submitting: boolean;
+}
+
+const DISARMED: MarkForm = {
+  side: "long",
+  setup: "",
+  note: "",
+  armed: false,
+  submitting: false,
+};
+
+/** Whether the instant `raw` is at or after `boundary`, both epoch-ms integer text.
+ *
+ *  `BigInt`, never `Number`: the screens are scanned by the no-float guard
+ *  (`format/no-float-money.test.ts`), and an epoch bound is not chart geometry, so it
+ *  does not get to hide behind that marker. The comparison is integer arithmetic on the
+ *  exact strings, the same way `format/time.ts` reads them. Unreadable text answers
+ *  `false`: the tab then says what the server said rather than claiming a fence it cannot
+ *  place. */
+function atOrAfterMs(raw: string, boundary: string): boolean {
+  try {
+    return BigInt(raw.trim()) >= BigInt(boundary.trim());
+  } catch {
+    return false;
+  }
+}
+
+/** What a refused write says, in plain words (G6, PDR-0011).
+ *
+ *  The server's message is ALWAYS what is shown when nothing better can be said: it is
+ *  prose, safe to show a trader, and it names the offending member.
+ *
+ *  Two refusals get the spec's own sentence instead, and both are decided from a fact the
+ *  tab holds rather than from the message's wording:
+ *
+ *  * **The holdout fence.** The bus folds the route's own `holdout` token onto
+ *    `Validation` (`tauri/error.rs::from_server_token`), so by the time a refusal reaches
+ *    this screen its code no longer says which refusal it was. What DOES decide it is the
+ *    tab's own knowledge of the fence plus the bar it sent: the fence is the write's FIRST
+ *    step after field parsing (G2), so a bar at or after a known holdout start is refused
+ *    for the fence and nothing else. When the freeze opened after this tab's last read the
+ *    start is unknown, and the server's message — which names the date itself — is shown.
+ *  * **A candle that does not exist.** `candle_not_found` survives the fold as
+ *    `Validation` too, and the tab cannot tell it from another validation, so it names the
+ *    time, the pair and the timeframe ONLY when the message's own code came through
+ *    unchanged. */
+function refusalText(
+  code: string,
+  message: string,
+  context: { readonly pair: string; readonly timeframe: string; readonly barTime: string },
+  holdoutStartMs: string | null,
+): string {
+  const fenceKnown =
+    holdoutStartMs !== null && atOrAfterMs(context.barTime, holdoutStartMs);
+  if (code === "holdout" || fenceKnown) {
+    if (holdoutStartMs !== null) {
+      return `This candle is inside the holdout from ${dateUtc(holdoutStartMs)}; marks there are refused for every writer`;
+    }
+  }
+  if (code === "candle_not_found") {
+    return `No candle opens at ${timeUtc(context.barTime)} on ${context.pair} ${context.timeframe} in the data the server holds.`;
+  }
+  return message;
+}
+
+/** A mark's writer, as the table shows it: the trader by its token's label, an agent by
+ *  its own name and marked as self-reported (G5, PDR-0015). */
+function writerText(writer: MarkDto["writer"]): string {
+  return `${writer.kind} · ${writer.name}${writer.selfReported ? " (self-reported)" : ""}`;
+}
+
+/** `1 mark on 15m` / `2 marks on 15m`, several timeframes joined. */
+function otherTimeframeNote(marks: readonly MarkDto[], drawn: string): string {
+  const counts = new Map<string, number>();
+  for (const mark of marks) {
+    if (mark.timeframe === drawn) continue;
+    counts.set(mark.timeframe, (counts.get(mark.timeframe) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([timeframe, count]) => `${count} ${count === 1 ? "mark" : "marks"} on ${timeframe}`)
+    .join(" · ");
+}
+
 /** The timeframe a leg names, or the primary's when the run recorded only one. */
 function timeframeOf(run: RunContext, leg: Leg): string {
   if (leg === "htf" && run.htfTimeframe !== null) return run.htfTimeframe;
@@ -170,6 +275,13 @@ export default function ChartScreen() {
   const [fragmentRun, setFragmentRun] = useState<string | null>(
     () => chartDeepLink(window.location.hash)?.run ?? null,
   );
+  // --- the example-trade marks (r5.s3.w3) -----------------------------------
+  const [marksPhase, setMarksPhase] = useState<MarksPhase>({ kind: "loading" });
+  const [form, setForm] = useState<MarkForm>(DISARMED);
+  /** The mark controls' refusal, and its own dismissing: a write's refusal and a
+   *  withdraw's share this one slot, because both are answers to the marks the tab is
+   *  showing and both are read in the same place. */
+  const [markRefusal, setMarkRefusal] = useState<string | null>(null);
   /** The identity this tab is DRAWING: the fragment's run, or null once a free
    *  pair/timeframe has been chosen. The fragment says where the tab ENTERED; an
    *  explicit choice made in the session wins over it, and both the run read's
@@ -227,6 +339,7 @@ export default function ChartScreen() {
       adapter.setCandles([]);
       adapter.setOverlays([]);
       adapter.setTrades([]);
+      adapter.setMarks([]);
     }
     drawnRef.current = false;
     drawnReadRef.current = null;
@@ -243,6 +356,40 @@ export default function ChartScreen() {
       adapterRef.current = null;
       drawnRef.current = false;
     };
+  }, []);
+
+  /** The mark controls' live state, as the click handler reads it. The handler is
+   *  subscribed ONCE and must see the state the trader is in NOW — a click landing
+   *  after an arm must write, and one landing after a disarm must not — so it reads
+   *  this ref rather than the closure that registered it. */
+  const markClickRef = useRef<{ form: MarkForm; pair: string; timeframe: string | null }>({
+    form: DISARMED,
+    pair: DEFAULT_PAIR,
+    timeframe: null,
+  });
+
+  /** The open freeze's holdout start as the drawn read saw it, for the holdout refusal's
+   *  sentence. Read through a ref because a write's continuation reads it after the render
+   *  that started the write, and `null` is a real answer (no freeze was open), never a
+   *  reason to invent a date. */
+  const liveHoldoutRef = useRef<string | null>(null);
+
+  // --- the candle click writes a mark (r5.s3.w3) ----------------------------
+  // Subscribed once, on the chart's own life. `arm` is what makes a click a write:
+  // disarmed, a click on the chart is just a click.
+  useEffect(() => {
+    const adapter = adapterRef.current;
+    if (adapter === null) return;
+    adapter.onCandleClick((openTime) => {
+      const live = markClickRef.current;
+      if (!live.form.armed || live.form.submitting || live.timeframe === null) return;
+      const setup = live.form.setup.trim();
+      if (setup === "") {
+        setMarkRefusal("Type a setup label before marking a candle.");
+        return;
+      }
+      void writeMarkAt(openTime, live);
+    });
   }, []);
 
   // --- what the fragment names (Q1: a run deep link opens the tab with that run) ---
@@ -314,6 +461,107 @@ export default function ChartScreen() {
       cancelled = true;
     };
   }, [fragmentRun]);
+
+  // --- the marks read (r5.s3.w3) --------------------------------------------
+  // ONE read for the pair on screen, partitioned below. Re-run whenever the pair
+  // changes, and after each write or withdraw (`marksSeq`).
+  const [marksSeq, setMarksSeq] = useState(0);
+  const markPair = run === null ? free.pair : run.pair;
+  useEffect(() => {
+    let cancelled = false;
+    setMarksPhase({ kind: "loading" });
+    void (async () => {
+      try {
+        const answer = await commands.listMarks({ pair: markPair });
+        if (cancelled) return;
+        if (answer.status !== "ok") {
+          setMarksPhase({
+            kind: "failed",
+            message: answer.error.message,
+            code: answer.error.code,
+          });
+          return;
+        }
+        setMarksPhase({
+          kind: "ready",
+          marks: answer.data.marks,
+          hidden: answer.data.hiddenByHoldout,
+        });
+      } catch (error) {
+        if (cancelled) return;
+        setMarksPhase({ kind: "failed", message: messageOf(error), code: "transport" });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [markPair, marksSeq]);
+
+  /** Write a mark on the clicked candle, through w1's `write_mark`. The pair, the
+   *  timeframe and the bar time are all the ones on screen: the mark is written against
+   *  the chart the trader is looking at, never against a remembered one. */
+  const writeMarkAt = async (
+    openTime: string,
+    live: { form: MarkForm; pair: string; timeframe: string | null },
+  ): Promise<void> => {
+    if (live.timeframe === null) return;
+    setMarkRefusal(null);
+    setForm((current) => ({ ...current, submitting: true }));
+    const note = live.form.note.trim();
+    try {
+      const answer = await commands.writeMark({
+        pair: live.pair,
+        timeframe: live.timeframe,
+        barTime: openTime,
+        side: live.form.side,
+        setup: live.form.setup.trim(),
+        note: note === "" ? null : note,
+      });
+      if (answer.status !== "ok") {
+        // A refused write writes nothing and says why (G2, G6). The control stays
+        // armed, so the trader can click another candle without arming again.
+        setMarkRefusal(
+          refusalText(
+            answer.error.code,
+            answer.error.message,
+            { pair: live.pair, timeframe: live.timeframe, barTime: openTime },
+            liveHoldoutRef.current,
+          ),
+        );
+        setForm((current) => ({ ...current, submitting: false }));
+        return;
+      }
+      // The written mark appears without a reload: the list is re-read, and the setup
+      // label is kept for the next mark while the note is cleared.
+      setForm((current) => ({ ...current, submitting: false, note: "" }));
+      setMarksSeq((seq) => seq + 1);
+    } catch (error) {
+      setMarkRefusal(messageOf(error));
+      setForm((current) => ({ ...current, submitting: false }));
+    }
+  };
+
+  /** Withdraw one mark, once. The row leaves the table and the layer together. */
+  const withdraw = async (mark: MarkDto): Promise<void> => {
+    setMarkRefusal(null);
+    try {
+      const answer = await commands.withdrawMark({ markId: mark.markId });
+      if (answer.status !== "ok") {
+        setMarkRefusal(answer.error.message);
+        return;
+      }
+      // The row leaves the table and the layer together, before the re-read answers:
+      // a withdrawn mark is not drawn for a moment either (PDR-0011).
+      setMarksPhase((current) =>
+        current.kind === "ready"
+          ? { ...current, marks: current.marks.filter((each) => each.markId !== mark.markId) }
+          : current,
+      );
+      setMarksSeq((seq) => seq + 1);
+    } catch (error) {
+      setMarkRefusal(messageOf(error));
+    }
+  };
 
   // --- the read itself ------------------------------------------------------
   useEffect(() => {
@@ -408,6 +656,25 @@ export default function ChartScreen() {
   // readers of both.
   const drawnTimeframe = dto?.timeframe ?? null;
   const timeframe = run === null ? free.timeframe : timeframeOf(run, leg);
+
+  // --- draw the marks (r5.s3.w3) --------------------------------------------
+  // The marks that belong on THIS series: the on-screen timeframe's own. A mark on
+  // another timeframe sits on one of that timeframe's candles, so drawing it here would
+  // place it on a bar it does not belong to.
+  const drawnMarks = marksPhase.kind === "ready" ? marksPhase.marks : [];
+  const marksOnLeg = drawnMarks.filter((mark) => mark.timeframe === drawnTimeframe);
+  useEffect(() => {
+    adapterRef.current?.setMarks(marksOnLeg);
+  }, [marksPhase, drawnTimeframe]);
+
+  // The form's live state, as the once-subscribed click handler reads it: the handler
+  // must see the state the trader is in NOW, not the state at subscription.
+  markClickRef.current = {
+    form,
+    pair: markPair,
+    timeframe: drawnTimeframe ?? timeframe,
+  };
+
   const selectFree = (pair: string, timeframe: string) => {
     freeRef.current = { pair, timeframe };
     setFree(freeRef.current);
@@ -477,6 +744,14 @@ export default function ChartScreen() {
   const fence = fenceStartMs(
     dto === null ? run?.holdoutStartMs ?? null : dto.holdout?.holdoutStartMs ?? null,
   );
+  // The holdout start a refused write's sentence names, read from the freshest word the
+  // tab holds: the marks read's own fence when a freeze was open at it, else the drawn
+  // chart's, else the run read's. `null` means no freeze was open — a real answer, and
+  // the refusal then shows the server's own message rather than an invented date.
+  const marksHidden = marksPhase.kind === "ready" ? marksPhase.hidden : null;
+  liveHoldoutRef.current =
+    marksHidden?.holdoutStartMs ??
+    (dto === null ? run?.holdoutStartMs ?? null : dto.holdout?.holdoutStartMs ?? null);
   const runTrades = (run?.trades ?? []).filter((trade) => beforeFence(trade, fence));
   const windowTrades =
     dto?.run == null ? null : dto.run.trades.filter((trade) => beforeFence(trade, fence));
@@ -583,6 +858,78 @@ export default function ChartScreen() {
         </span>
       </header>
 
+      {/* The example-trade marks' controls (r5.s3.w3). A mark is a REFERENCE trade,
+          never an order (PDR-0037), and the control says so. */}
+      <div className="cw-markbar">
+        <span className="cw-tool-lab">Mark example</span>
+        <div className="seg">
+          {(["long", "short"] as const).map((side) => (
+            <button
+              key={side}
+              type="button"
+              className={`seg-btn ${form.side === side ? "is-active" : ""}`}
+              onClick={() => setForm((current) => ({ ...current, side }))}
+            >
+              {side === "long" ? "Long" : "Short"}
+            </button>
+          ))}
+        </div>
+        <label className="cw-markfield">
+          Setup label
+          <input
+            type="text"
+            className="cw-markinput"
+            aria-label="Setup label"
+            maxLength={64}
+            value={form.setup}
+            onChange={(event) =>
+              setForm((current) => ({ ...current, setup: event.target.value }))
+            }
+          />
+        </label>
+        <label className="cw-markfield">
+          Note (optional)
+          <input
+            type="text"
+            className="cw-markinput"
+            aria-label="Note (optional)"
+            maxLength={280}
+            value={form.note}
+            onChange={(event) =>
+              setForm((current) => ({ ...current, note: event.target.value }))
+            }
+          />
+        </label>
+        {/* Never disabled on a blank label: a control that cannot be pressed cannot say
+            WHY it refused (G6). The label is checked where the write is decided, and
+            that check names the field. */}
+        <button
+          type="button"
+          className={`cw-markarm ${form.armed ? "is-on" : ""}`}
+          onClick={() => {
+            setMarkRefusal(null);
+            setForm((current) => ({ ...current, armed: !current.armed }));
+          }}
+        >
+          {form.armed ? "Mark example — armed" : "Mark example"} · Reference — not an order
+        </button>
+        {form.armed && !form.submitting && (
+          <span className="cw-markhint" role="status">
+            {`Click a ${drawnTimeframe ?? timeframe} candle to mark it.`}
+          </span>
+        )}
+        {form.submitting && (
+          <span className="cw-markhint" role="status">
+            Saving…
+          </span>
+        )}
+      </div>
+      {markRefusal !== null && (
+        <p className="cw-msg" role="alert">
+          {markRefusal}
+        </p>
+      )}
+
       <div className="cw-canvas" ref={containerRef} />
 
       {phase.kind === "loading" && (
@@ -626,6 +973,16 @@ export default function ChartScreen() {
         {undrawn !== null && (
           <p className="cw-note" role="note">
             {`The trade's entry is not drawn in this ${timeframe} window.`}
+          </p>
+        )}
+        {/* The marks on the OTHER timeframes are named here: they are stored and
+            readable, but this chart's leg cannot draw them (PDR-0011). */}
+        {marksPhase.kind === "ready" && drawnTimeframe !== null && (
+          <OtherTimeframeNote marks={marksPhase.marks} drawn={drawnTimeframe} />
+        )}
+        {marksPhase.kind === "ready" && marksPhase.hidden !== null && (
+          <p className="cw-note" role="note">
+            {`${marksPhase.hidden.count} ${marksPhase.hidden.count === 1 ? "mark" : "marks"} hidden: inside the holdout`}
           </p>
         )}
       </div>
@@ -701,6 +1058,84 @@ export default function ChartScreen() {
           <p className="cw-note" role="note">
             {`The drawn window holds ${windowTrades.length} of these trades.`}
           </p>
+        )}
+      </section>
+
+      {/* The example-trade marks' accessible copy (PDR-0011): every stored field, and a
+          withdraw per row. No mark is reachable only through the canvas. */}
+      <section className="cw-strip" aria-label="Example marks">
+        {marksPhase.kind === "loading" && (
+          <p className="cw-msg" role="status">
+            Loading example marks…
+          </p>
+        )}
+        {marksPhase.kind === "failed" && (
+          <p className="cw-msg" role="alert">
+            {marksPhase.message} ({marksPhase.code})
+          </p>
+        )}
+        {marksPhase.kind === "ready" && (
+          <>
+            <div className="cw-scroll">
+              <table className="cw-tbl cw-marks">
+                <caption>Example marks — Reference — not an order</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">#</th>
+                    <th scope="col">time</th>
+                    <th scope="col">side</th>
+                    <th scope="col">setup</th>
+                    <th scope="col">note</th>
+                    <th scope="col">writer</th>
+                    <th scope="col">withdraw</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {marksPhase.marks.map((mark, index) => (
+                    <tr
+                      key={mark.markId}
+                      data-side={mark.side}
+                      className={mark.writer.kind === "agent" ? "is-agent" : ""}
+                    >
+                      <th scope="row">
+                        <button
+                          type="button"
+                          className="cw-row-btn mono"
+                          aria-label={`Mark ${index + 1}, ${mark.side}, ${timeUtc(mark.barTime)}`}
+                          onClick={() => adapterRef.current?.centerOn(mark.barTime)}
+                        >
+                          {index + 1}
+                        </button>
+                      </th>
+                      <td className="mono">{timeUtc(mark.barTime)}</td>
+                      <td>{mark.side}</td>
+                      <td>{mark.setup}</td>
+                      <td>{mark.note ?? EM_DASH}</td>
+                      <td>{writerText(mark.writer)}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="cw-markwithdraw"
+                          aria-label={`Withdraw mark ${index + 1}`}
+                          onClick={() => void withdraw(mark)}
+                        >
+                          Withdraw
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {marksPhase.marks.length === 0 && (
+              <p className="cw-note" role="status">
+                No example marks yet — arm "Mark example", then click a candle.
+              </p>
+            )}
+            <p className="cw-note" role="note">
+              {`${marksPhase.marks.length} ${marksPhase.marks.length === 1 ? "mark" : "marks"} on ${markPair}${drawnTimeframe === null ? "" : `, ${marksOnLeg.length} on ${drawnTimeframe}`}.`}
+            </p>
+          </>
         )}
       </section>
 
@@ -789,6 +1224,26 @@ export default function ChartScreen() {
         </section>
       )}
     </section>
+  );
+}
+
+/** Says plainly how many marks live on a timeframe this chart is not drawing (r5.s3.w3).
+ *  Nothing when there are none: a note that says "0 marks elsewhere" is a line the
+ *  trader learns to skip past, and PDR-0011 asks for what IS there, not for a
+ *  placeholder. */
+function OtherTimeframeNote({
+  marks,
+  drawn,
+}: {
+  readonly marks: readonly MarkDto[];
+  readonly drawn: string;
+}) {
+  const note = otherTimeframeNote(marks, drawn);
+  if (note === "") return null;
+  return (
+    <p className="cw-note" role="note">
+      {note}
+    </p>
   );
 }
 

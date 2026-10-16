@@ -43,6 +43,7 @@ import type {
   ISeriesApi,
   ISeriesMarkersPluginApi,
   LineData,
+  MouseEventParams,
   SeriesMarker,
   SeriesMarkerPricePosition,
   Time,
@@ -50,7 +51,7 @@ import type {
   WhitespaceData,
 } from "lightweight-charts";
 
-import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
+import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "../bindings";
 import type { CandlePoint, ChartMarker, OverlayLayer } from "./layers";
 import {
   containingIndex,
@@ -71,6 +72,12 @@ export interface ChartAdapter {
   setOverlays(overlays: readonly ChartOverlayDto[]): void;
   /** Draw these trades' markers. */
   setTrades(trades: readonly ChartTradeDto[]): void;
+  /** Draw these example marks' markers (r5.s3.w3). */
+  setMarks(marks: readonly MarkDto[]): void;
+  /** Call `handler` with the open of the loaded candle a click landed on. A click
+   *  outside the loaded candles, or before any read has drawn a bar, calls nothing.
+   *  One handler: a second call replaces the first. */
+  onCandleClick(handler: (openTime: string) => void): void;
   /** Fit the whole loaded window into view. */
   fitAll(): void;
   /** Scroll so the bar nearest `timeMs` sits in the middle of the pane. */
@@ -149,10 +156,14 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
   let candlePoints: readonly CandlePoint[] = [];
   let overlayDtos: readonly ChartOverlayDto[] = [];
   let tradeDtos: readonly ChartTradeDto[] = [];
+  let markDtos: readonly MarkDto[] = [];
 
   let candleSeries: ISeriesApi<"Candlestick"> | null = null;
   let markerPlugin: ISeriesMarkersPluginApi<Time> | null = null;
   let layerSeries: ISeriesApi<"Line">[] = [];
+  /** The one click handler the screen subscribed, kept so `destroy` unsubscribes the
+   *  EXACT function it subscribed rather than every handler on the chart. */
+  let clickHandler: ((param: MouseEventParams<Time>) => void) | null = null;
 
   /** The candle series, created on the first candle draw. */
   const ensureCandles = (): ISeriesApi<"Candlestick"> => {
@@ -177,11 +188,25 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
   const drawMarkers = (): void => {
     if (markerPlugin === null) return;
     markerPlugin.setMarkers(
-      markersInWindow(toMarkers(overlayDtos, tradeDtos, palette), candlePoints).map(
-        toSeriesMarker,
-      ),
+      markersInWindow(
+        toMarkers(overlayDtos, tradeDtos, palette, markDtos),
+        candlePoints,
+      ).map(toSeriesMarker),
     );
   };
+
+  /** Whether `logical` names a loaded bar. The library resolves a click's position with
+   *  `Math.ceil` and no clamp, so a click in the pane past the last bar yields an index
+   *  one past it, and a click before the first yields a negative one; a position it
+   *  could not resolve at all is absent. Its `time` cannot carry this: it is already the
+   *  loaded open a time-scale point maps to, so a click right of the last candle comes
+   *  back carrying the LAST open (the r5.s2 retro §8 trap, on the write path). */
+  const loadedLogical = (logical: number | undefined): logical is number =>
+    candlePoints.length > 0 &&
+    logical !== undefined &&
+    Number.isFinite(logical) &&
+    logical >= 0 &&
+    logical <= candlePoints.length - 1;
 
   return {
     setCandles(next) {
@@ -222,6 +247,28 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       drawMarkers();
     },
 
+    setMarks(next) {
+      markDtos = [...next];
+      ensureCandles();
+      drawMarkers();
+    },
+
+    onCandleClick(handler) {
+      if (clickHandler !== null) chart.unsubscribeClick(clickHandler);
+      clickHandler = (param: MouseEventParams<Time>): void => {
+        // The CLICK POSITION is what decides, never the resolved time: `logical` is the
+        // raw place the click fell, so a click past the last loaded bar is told apart
+        // from a click on it, which its `time` alone cannot do.
+        if (!loadedLogical(param.logical as number | undefined)) return;
+        const raw = param.logical as number;
+        // The bar that CONTAINS the click — the same the library would draw a marker on,
+        // and never the next loaded bar its own lower-bound lookup would pick.
+        const index = containingIndex(candlePoints, candlePoints[Math.round(raw)].time);
+        handler(String(candlePoints[index].time * 1000));
+      };
+      chart.subscribeClick(clickHandler);
+    },
+
     fitAll() {
       chart.timeScale().fitContent();
     },
@@ -240,6 +287,12 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     },
 
     destroy() {
+      // Unsubscribe the exact handler this adapter put on, before the chart it belongs to
+      // is taken down. A handler left subscribed would fire against a destroyed chart.
+      if (clickHandler !== null) {
+        chart.unsubscribeClick(clickHandler);
+        clickHandler = null;
+      }
       chart.remove();
       candleSeries = null;
       markerPlugin = null;
@@ -248,6 +301,7 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       candlePoints = [];
       overlayDtos = [];
       tradeDtos = [];
+      markDtos = [];
     },
   };
 }
