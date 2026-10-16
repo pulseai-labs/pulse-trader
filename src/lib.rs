@@ -909,6 +909,23 @@ pub use crate::tauri::{
     chart_data_core,
 };
 
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks — the wire shapes and
+// the transport-free cores behind `POST /api/v1/marks*` and the `write_mark` /
+// `list_marks` / `withdraw_mark` bus commands (ADR-0020: additive only), the
+// value types and the refusal vocabulary the MCP tools share, and the ONE use
+// case that writes the table (SPINE G1).
+pub use crate::tauri::{
+    ListMarksRequest, MarkDto, MarkHoldoutDto, MarkListDto, MarkWriterDto, WithdrawMarkRequest,
+    WriteMarkRequest, list_marks_core, trader_writer, withdraw_mark_core, write_mark_core,
+};
+pub use adapters::db::SqliteExampleMarkRepo;
+pub use application::example_marks::{MarkHoldout, MarkList, MarkRequest, list_marks, write_mark};
+pub use application::holdout::guard_candle;
+pub use domain::{
+    ExampleMark, ExampleMarkDraft, ExampleMarkRepository, MarkError, MarkFilter, MarkNote,
+    MarkSetup, MarkSide, MarkWriter, MarkWriterKind, StoredMark,
+};
+
 // r4.s1.w5 (spec A2/A3, G7/C1/C4/C5): the certification step and its record.
 // The step is the ONE caller allowed to evaluate the holdout (grill Q4); its
 // store is the certification table's only writer. Surfaced for the MCP tool,

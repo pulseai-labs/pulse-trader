@@ -65,10 +65,15 @@ command `chart_data`, both straight through one transport-free core:
 - **`run` is `null` when no run is named**, else `{ runId, versionId, series, trades, overlays,
   notDrawn }`. `series` is `primary` or `htf` — each overlay is computed on the timeframe its
   rule was compiled for (grill Q2), and trades ride both. `trades` are the run's stored rows
-  whose entry or exit falls in the window **and which end before an open freeze's holdout
-  start**: a trade that reaches the fence is withheld whole, even when it entered before the
-  cut, because its exit price, exit reason and realized R were produced inside the withheld
-  period (r5.s2 close review; PDR-0007, Q5).
+  whose **entry or exit fill falls in the interval the returned candles occupy** — the resolved
+  bounds narrowed to the candles this read actually returns, not the requested window, so a
+  trade no drawn candle can hold is never listed. On an HTF leg that interval stops at the last
+  candle the run's **own last primary bar had closed**, and where the draw edge removes the
+  whole tail the interval is empty and no trade is drawn. Each listed trade also **ends before
+  an open freeze's holdout start**: a trade that reaches the fence is withheld whole, even when
+  it entered before the cut, because its exit price, exit reason and realized R were produced
+  inside the withheld period (r5.s2 close review; #423 repair in r5.s3.w1 — wording only;
+  PDR-0007, Q5).
 - **Overlays are keyed by the engine's own token labels** — `support:3-3-0.005-2-100`,
   `resistance:…`, `pivot_high:1-1`, `pivot_low:…`, `cdl:engulfing`, `ema:50` — the tokens MCP
   `export_indicators` accepts, produced by the token formatter beside its parser and proven by

@@ -764,6 +764,78 @@ pub trait CertificationRepository {
     ) -> impl Future<Output = Result<CertificationRecord, DataError>> + Send;
 }
 
+/// Example-trade marks' persistence port (r5.s3.w1, PDR-0037, ADR-0031) — the
+/// immutable `example_mark` rows a trader or an agent points at one candle, and
+/// the one-way `example_mark_withdrawal` row that takes a mark back.
+///
+/// The established repository style: `impl Future<Output = ...> + Send`, consumed
+/// generically, never `dyn`; the SQLite adapter
+/// (`adapters::db::example_mark_repo`) implements it over `pulse.db` behind
+/// `0021`'s immutability triggers.
+///
+/// **The one door is the USE CASE, not this port** (SPINE G1). `insert` is the
+/// method that writes a mark, and `application::example_marks::write_mark` is its
+/// only caller — the holdout fence runs there, before any candle is loaded (G2),
+/// which is why the fence is deliberately not re-implemented here: a second copy
+/// would be a second answer.
+///
+/// **A mark is create + read only.** There is no update and no delete: a withdraw
+/// appends to `example_mark_withdrawal`, and `0021`'s triggers refuse anything else.
+pub trait ExampleMarkRepository {
+    /// Persist one mark: the adapter mints the id and the injected-Clock
+    /// `created_at_ms`; the draft carries everything else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the store fails.
+    fn insert(
+        &self,
+        draft: &crate::domain::ExampleMarkDraft,
+    ) -> impl Future<Output = Result<crate::domain::ExampleMark, DataError>> + Send;
+
+    /// Fetch one mark by id with its withdrawal state (`Ok(None)` when no such
+    /// row) — the read the withdraw checks against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row or a store failure.
+    fn get(
+        &self,
+        mark_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::domain::StoredMark>, DataError>> + Send;
+
+    /// The marks matching `filter`, **not withdrawn**, in candle order
+    /// (`bar_open_ms` ascending) — the list's read.
+    ///
+    /// A withdrawn mark is absent by construction: the withdraw is one-way, and
+    /// a mark taken back is not a mark the reader may still act on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row or a store failure.
+    fn list(
+        &self,
+        filter: &crate::domain::MarkFilter,
+    ) -> impl Future<Output = Result<Vec<crate::domain::ExampleMark>, DataError>> + Send;
+
+    /// Withdraw one mark once, recording who took it back and when.
+    ///
+    /// The authority rule (Q3) is the USE CASE's — a trader may withdraw any
+    /// mark, an agent only its own — so this method is the append and nothing
+    /// more. `example_mark_withdrawal.mark_id` is the PRIMARY KEY: a second
+    /// withdraw cannot be stored even by a racing writer, which is why the
+    /// adapter needs no read-then-write lock of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the mark does not exist or the store fails.
+    fn withdraw(
+        &self,
+        mark_id: &str,
+        actor: &crate::domain::MarkWriter,
+    ) -> impl Future<Output = Result<(), DataError>> + Send;
+}
+
 /// `PulseTrader`'s paper-session persistence port (r3.s4.w2, ADR-0027) — the
 /// immutable `paper_session` rows, the append-only `paper_event` log, the
 /// recorded `paper_bar` candles, and the `fixture_snapshot` stamp. The

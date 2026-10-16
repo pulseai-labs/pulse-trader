@@ -108,7 +108,16 @@ impl BusErrorCode {
     pub fn from_server_token(token: &str) -> Option<Self> {
         Some(match token {
             "data" => Self::Data,
-            "validation" => Self::Validation,
+            // r5.s3.w1: the example-mark routes' own vocabulary (PDR-0037), folded
+            // onto the family each belongs to. Each is a correctable rejection —
+            // the caller can move the time, pick a candle that exists, or withdraw a
+            // mark it is allowed to — so they read as `Validation` and keep the
+            // server's message verbatim. Without this they would fall through to the
+            // synthetic `Internal`, and the app would tell a trader the fence had
+            // *broken*.
+            "validation" | "holdout" | "candle_not_found" | "already_withdrawn" | "not_writer" => {
+                Self::Validation
+            }
             "backtest" => Self::Backtest,
             "exchange" => Self::Exchange,
             "llm" => Self::Llm,

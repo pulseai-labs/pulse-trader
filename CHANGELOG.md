@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Example trades: marks on the chart, and the fence that keeps them out of the holdout
+  (r5.s3.w1, PDR-0037, ADR-0031).** A trader can now mark a candle as an **example trade** — a
+  reference trade, never an order — and an agent can write the same mark through `pulse mcp`,
+  each mark naming its writer. A mark holds the pair, the timeframe (`15m`, `4h` or `1d`), that
+  candle's **open time**, a side, a setup label such as "support-rejection longs", an optional
+  note and its writer; there is deliberately no stop, no target and no "what happened next",
+  because exits come from a rule's risk section. The app gets three app-scope routes —
+  `POST /api/v1/marks`, `POST /api/v1/marks/list`, `POST /api/v1/marks/withdraw` — and their bus
+  commands `write_mark`, `list_marks` and `withdraw_mark`; MCP gets the three tools of the same
+  names. **Every writer goes through one use case whose first check is the holdout fence**, so a
+  mark whose candle reaches an open freeze's holdout start is refused for the trader and for
+  every agent alike, and a time no candle opens at is refused for the holdout reason rather than
+  for the missing candle — the fence answers before anything is loaded, and a refused write
+  writes nothing. The trader's mark is named by the app token's **label** (never the token), an
+  agent's by the name that agent reported about itself and shown as self-reported. Marks are
+  immutable: a mark is never edited, a withdraw is one-way and the row stays stored, the trader
+  may withdraw any mark and an agent only its own. A list hides the marks a freeze opened later
+  now covers and says how many it hid, naming the holdout start. Two new tables (`example_mark`
+  and `example_mark_withdrawal`, migration `0021`) hold the records behind immutability triggers.
+  `docs/adr/0031-example-trade-marks.md` records the store, its writers, the fence and the
+  `explain_marks` contract w2 builds on; [`ADR-0030`](docs/adr/0030-chart-adapter-and-overlay-read.md)'s
+  description of which trades a chart read draws is corrected to the drawn-window rule the code
+  has had since r5.s2 (#423).
+
 - **The Chart tab: a backtest drawn on its candles (r5.s2.w2, PDR-0036, PDR-0004).** The Mac app
   gains a **Chart** tab — one full-width candle chart behind an adapter of our own in
   `ui/src/chart/`, the only place in the app that imports TradingView's Lightweight Charts

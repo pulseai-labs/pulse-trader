@@ -44,6 +44,10 @@ pub(crate) mod events;
 // A separate module so `commands.rs` stays the registration surface while the
 // projection logic lives next to its own unit tests.
 pub(crate) mod library;
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks' wire shapes and the
+// three transport-free cores behind `/api/v1/marks*` and the `write_mark` /
+// `list_marks` / `withdraw_mark` bus commands (ADR-0020: additive only).
+pub(crate) mod marks;
 // r3.s4.w5: the paper session surface's wire DTOs, its stream channel and the
 // sink trait the reader is generic over. A separate module so `commands.rs`
 // stays the registration surface while the shapes live beside their docs.
@@ -105,6 +109,11 @@ pub use chart::{
     ChartOverlayDto, ChartPatternEventDto, ChartPivotEventDto, ChartRunDto, ChartTradeDto,
     chart_data_core,
 };
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks' wire shapes and cores.
+pub use marks::{
+    ListMarksRequest, MarkDto, MarkHoldoutDto, MarkListDto, MarkWriterDto, WithdrawMarkRequest,
+    WriteMarkRequest, list_marks_core, trader_writer, withdraw_mark_core, write_mark_core,
+};
 
 /// Build the `tauri-specta` builder that owns the command registry.
 ///
@@ -153,6 +162,10 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::streak_card,
         // r5.s2.w1: the Chart tab's read (PDR-0036).
         commands::chart_data,
+        // r5.s3.w1: the example-trade marks (PDR-0037, ADR-0031).
+        commands::write_mark,
+        commands::list_marks,
+        commands::withdraw_mark,
     ])
 }
 

@@ -32,7 +32,7 @@
 //! guard is then inert.
 
 use crate::domain::{
-    CandleSeriesRepository, CandleWindow, DataError, HoldoutFreeze, Pair, PersistedRun,
+    CandleSeriesRepository, CandleWindow, DataError, HoldoutFreeze, Pair, PersistedRun, Timeframe,
 };
 
 /// A run or export refused because its window reaches into the frozen holdout.
@@ -199,6 +199,45 @@ pub fn guard_span(
     }
 }
 
+/// Guard ONE candle against the holdout — the single-candle half of the same
+/// decision, added for the example-trade marks (r5.s3.w1, PDR-0037 Q2/Q4, G2).
+///
+/// A mark names one candle, so the question is not "which window did the caller
+/// ask for" but "does this candle reach into the holdout": it is refused when its
+/// **close** lands after the holdout start, where the close is the candle's open
+/// time plus its timeframe's nominal duration ([`Timeframe::duration_ms`]) — no
+/// series is loaded to answer it, which is what lets the fence run before any
+/// candle lookup at all.
+///
+/// A candle closing EXACTLY at the holdout start is legal: the holdout is open at
+/// that instant and the bar never reaches past it, the same half-open reading
+/// [`guard_span`] gives an explicit `to`. An exact open time is deliberately not
+/// part of the test: a mark is refused for what its candle would have evaluated,
+/// and a bar that has not closed has evaluated nothing.
+///
+/// # Errors
+///
+/// Returns [`HoldoutRefusal`] naming the pair, the `bar_time` member and the
+/// holdout start when the candle reaches the fence.
+pub fn guard_candle(
+    freeze: Option<HoldoutFreeze>,
+    pair: &Pair,
+    timeframe: Timeframe,
+    open_ms: i64,
+) -> Result<(), HoldoutRefusal> {
+    let Some(freeze) = freeze else {
+        return Ok(());
+    };
+    if open_ms + timeframe.duration_ms() > freeze.holdout_start_ms {
+        return Err(HoldoutRefusal {
+            pair: pair.clone(),
+            field: "bar_time",
+            holdout_start_ms: freeze.holdout_start_ms,
+        });
+    }
+    Ok(())
+}
+
 /// Guard access to an already computed run's counted window.
 ///
 /// Uses the same explicit-span decision as execution; a persisted result cannot
@@ -286,8 +325,8 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{SpanDecision, WindowDecision, guard_backtest_window, guard_span};
-    use crate::domain::{CandleWindow, HoldoutFreeze, Pair};
+    use super::{SpanDecision, WindowDecision, guard_backtest_window, guard_candle, guard_span};
+    use crate::domain::{CandleWindow, HoldoutFreeze, Pair, Timeframe};
 
     const H: i64 = 1_751_328_000_000; // 2025-07-01T00:00:00Z
 
@@ -377,5 +416,37 @@ mod tests {
             guard_span(Some(freeze()), &pair, None, Some(H - 1), H + 1).unwrap(),
             SpanDecision::Pass
         );
+    }
+
+    /// r5.s3.w1: one candle against the fence, for all three mark timeframes. A
+    /// candle closing exactly at the holdout start is allowed; one that straddles
+    /// it and one that opens at or after it are both refused by name.
+    #[test]
+    fn a_single_candle_is_refused_only_when_it_reaches_the_holdout() {
+        let pair = Pair::new("BTCUSDT");
+        for timeframe in [Timeframe::M15, Timeframe::H4, Timeframe::D1] {
+            let duration = timeframe.duration_ms();
+
+            // Ends exactly at the holdout start: legal.
+            assert!(
+                guard_candle(Some(freeze()), &pair, timeframe, H - duration).is_ok(),
+                "{timeframe:?}: a candle closing exactly at the start is allowed"
+            );
+
+            // Straddles it: the close lands past the start.
+            let refusal = guard_candle(Some(freeze()), &pair, timeframe, H - duration / 2)
+                .expect_err("a straddling candle is refused");
+            assert_eq!(refusal.field, "bar_time");
+            assert_eq!(refusal.holdout_start_ms, H);
+            assert!(refusal.to_string().contains("BTCUSDT"), "{refusal}");
+            assert!(refusal.to_string().contains("2025-07-01"), "{refusal}");
+
+            // Opens at the start, and after it: refused.
+            assert!(guard_candle(Some(freeze()), &pair, timeframe, H).is_err());
+            assert!(guard_candle(Some(freeze()), &pair, timeframe, H + duration).is_err());
+        }
+
+        // No freeze open: the guard is inert, whatever the candle.
+        assert!(guard_candle(None, &pair, Timeframe::D1, H).is_ok());
     }
 }

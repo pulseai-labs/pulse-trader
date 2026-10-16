@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO example_mark_withdrawal (mark_id, withdrawn_at_ms, withdrawn_by_kind, withdrawn_by_name) VALUES (?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "2fefb83db07c52882a5eb4dc2184e625429d48edd9e0b623745d09b6da43000b"
+}

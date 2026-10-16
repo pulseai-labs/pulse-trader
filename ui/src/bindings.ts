@@ -355,6 +355,49 @@ export const commands = {
 	 *  [`chart_data_core`]: crate::tauri::chart::chart_data_core
 	 */
 	chartData: (request: ChartDataRequest) => typedError<ChartDataDto, BusError>(__TAURI_INVOKE("chart_data", { request })),
+	/**
+	 *  `write_mark` — mark ONE candle as an example trade: the pair, the timeframe,
+	 *  the candle's open time, a side, a setup label and an optional note
+	 *  (r5.s3.w1, PDR-0037). The writer is the app token's label, never a body
+	 *  member, and the mark is stored as `trader`. A mark whose candle reaches an
+	 *  open freeze's holdout start is refused; so is a time no candle opens at.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`] — `validation` for an unreadable field (the message
+	 *  names it), `validation` carrying the fence's own words for a holdout refusal
+	 *  or a missing candle.
+	 * 
+	 *  [`write_mark_core`]: crate::tauri::marks::write_mark_core
+	 */
+	writeMark: (request: WriteMarkRequest) => typedError<MarkDto, BusError>(__TAURI_INVOKE("write_mark", { request })),
+	/**
+	 *  `list_marks` — the example trades that still stand, narrowed by an optional
+	 *  pair, timeframe and setup label, in candle order (r5.s3.w1, PDR-0037). Marks
+	 *  an open freeze now covers are hidden and counted, never silently dropped.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`] — `validation` for an unreadable filter member, `data`
+	 *  when the store cannot be read.
+	 * 
+	 *  [`list_marks_core`]: crate::tauri::marks::list_marks_core
+	 */
+	listMarks: (request: ListMarksRequest) => typedError<MarkListDto, BusError>(__TAURI_INVOKE("list_marks", { request })),
+	/**
+	 *  `withdraw_mark` — take one example trade back, once (r5.s3.w1, PDR-0037). A
+	 *  trader may withdraw any mark; the mark's row stays stored and immutable, and
+	 *  the list stops showing it. A second withdraw is refused, and so is an unknown
+	 *  id.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`] — `not_found` for an unknown id, `validation` for an
+	 *  already-withdrawn mark or an agent reaching past its own.
+	 * 
+	 *  [`withdraw_mark_core`]: crate::tauri::marks::withdraw_mark_core
+	 */
+	withdrawMark: (request: WithdrawMarkRequest) => typedError<MarkDto, BusError>(__TAURI_INVOKE("withdraw_mark", { request })),
 };
 
 /* Types */
@@ -1485,6 +1528,83 @@ export type LibraryVersion = {
 	latestWalkForwardRunId: string | null,
 };
 
+/**
+ *  What the app asks `POST /api/v1/marks/list` for; every member narrows only
+ *  when it is given.
+ */
+export type ListMarksRequest = {
+	/**  Only this pair. */
+	pair?: string | null,
+	/**  Only this timeframe. */
+	timeframe?: string | null,
+	/**  Only this setup label. */
+	setup?: string | null,
+};
+
+/**
+ *  One example-trade mark, as the app reads it.
+ * 
+ *  Times cross as millisecond integer strings. There is deliberately no stop, no
+ *  target and no "what happened next": a mark is a reference trade, never an order
+ *  (PDR-0037 Q1).
+ */
+export type MarkDto = {
+	/**  The mark's id. */
+	markId: string,
+	/**  The pair the marked candle belongs to. */
+	pair: string,
+	/**  The `Binance` interval text (`15m` / `4h` / `1d`). */
+	timeframe: string,
+	/**  The marked candle's open time, epoch ms as an exact integer string. */
+	barTime: string,
+	/**  `long` or `short`. */
+	side: string,
+	/**  The setup label the writer gave it. */
+	setup: string,
+	/**  The writer's note, or `null`. */
+	note: string | null,
+	/**  Who wrote it. */
+	writer: MarkWriterDto,
+	/**  The HEAD snapshot the candle was found in when the mark was written. */
+	dataVersion: string,
+	/**  When the mark landed, epoch ms as an exact integer string. */
+	createdAt: string,
+};
+
+/**
+ *  What an open freeze hid from one list read (Q4, PDR-0007).
+ * 
+ *  The hidden marks are still stored — hiding is a read-side act — so the count is
+ *  the honest report of what the reader is not being shown.
+ */
+export type MarkHoldoutDto = {
+	/**  The open freeze's holdout start, epoch ms as an exact integer string. */
+	holdoutStartMs: string,
+	/**  How many marks this read hid because their candle reaches it. */
+	count: number,
+};
+
+/**  The list's answer: the marks a reader may act on, and what the fence hid. */
+export type MarkListDto = {
+	/**  The marks that stand, in candle order. */
+	marks: MarkDto[],
+	/**  The fence's count, or `null` while no freeze is open. */
+	hiddenByHoldout: MarkHoldoutDto | null,
+};
+
+/**  A mark's writer, as the frontend shows it. */
+export type MarkWriterDto = {
+	/**  `trader` (the app, named by its token's label) or `agent` (an MCP client). */
+	kind: string,
+	/**  The writer's name as stored: an app token's LABEL, or the agent's own name. */
+	name: string,
+	/**
+	 *  Whether the name is the writer's own claim about itself (PDR-0015) — true
+	 *  for an agent, false for the token-labelled trader.
+	 */
+	selfReported: boolean,
+};
+
 /**  The proposed change: one path, one value. */
 export type MutationDto = {
 	/**  The sweepable leaf's locator. */
@@ -2360,6 +2480,37 @@ export type WalkForwardVerdictDto = {
 	foldsRequired: number,
 	/**  The verdict over every fold's trades concatenated in fold order. */
 	pooled: FoldVerdictDto,
+};
+
+/**
+ *  What the app asks `POST /api/v1/marks/withdraw` to withdraw. The actor is NOT
+ *  here: it comes from the authenticated token (ADR-0026).
+ */
+export type WithdrawMarkRequest = {
+	/**  The mark to withdraw. */
+	markId: string,
+};
+
+/**
+ *  What the app asks `POST /api/v1/marks` to write. The writer is NOT here: it
+ *  comes from the authenticated token (ADR-0026).
+ */
+export type WriteMarkRequest = {
+	/**  The pair the marked candle belongs to (e.g. `BTCUSDT`). */
+	pair: string,
+	/**  The `Binance` interval text (`15m` / `4h` / `1d`). */
+	timeframe: string,
+	/**
+	 *  The marked candle's open time, epoch ms as an exact integer string. It
+	 *  must be a candle the HEAD snapshot actually holds.
+	 */
+	barTime: string,
+	/**  `long` or `short`. */
+	side: string,
+	/**  The setup label (1–64 characters). */
+	setup: string,
+	/**  The optional note (at most 280 characters). */
+	note?: string | null,
 };
 
 /* Tauri Specta runtime */

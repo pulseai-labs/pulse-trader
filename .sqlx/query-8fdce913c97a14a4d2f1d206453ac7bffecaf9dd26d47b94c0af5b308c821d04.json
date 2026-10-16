@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT withdrawn_at_ms FROM example_mark_withdrawal WHERE mark_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "withdrawn_at_ms",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8fdce913c97a14a4d2f1d206453ac7bffecaf9dd26d47b94c0af5b308c821d04"
+}

@@ -518,7 +518,11 @@ fn control_of(state: &Arc<ServerState>) -> Option<PaperControl> {
 }
 
 /// The caller's token label, as the auth middleware put it in the extensions.
-fn label_of(req: &Request) -> Option<AuthenticatedLabel> {
+///
+/// `pub(crate)` since r5.s3.w1: the example-mark routes in `super::routes` name
+/// their trader writer the same way, off the same extension, and there is no
+/// second place the label is read from.
+pub(crate) fn label_of(req: &Request) -> Option<AuthenticatedLabel> {
     req.extensions().get::<AuthenticatedLabel>().cloned()
 }
 
@@ -530,7 +534,16 @@ fn stop_actor(label: &AuthenticatedLabel) -> Option<StopActor> {
 }
 
 /// A `{code, message}` error body.
-fn api_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
+///
+/// `pub(crate)` since r5.s3.w1: the example-mark routes in `super::routes` answer
+/// their own refusals in this same shape — `holdout`, `candle_not_found`,
+/// `not_found`, `already_withdrawn`, `not_writer`, `validation` — and one shape
+/// with one reader is what keeps `client::route_error`'s mapping honest.
+pub(crate) fn api_error(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Response {
     (
         status,
         axum::Json(json!({ "code": code, "message": message.into() })),
@@ -539,7 +552,7 @@ fn api_error(status: StatusCode, code: &'static str, message: impl Into<String>)
 }
 
 /// The 500 every "cannot happen" seam answers with, named not guessed.
-fn internal(message: &str) -> Response {
+pub(crate) fn internal(message: &str) -> Response {
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
 }
 
