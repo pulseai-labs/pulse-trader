@@ -374,6 +374,11 @@ export default function ChartScreen() {
    *  reason to invent a date. */
   const liveHoldoutRef = useRef<string | null>(null);
 
+  /** Whether a mark write is in flight, set SYNCHRONOUSLY in the click handler and
+   *  cleared when the write settles. `form.submitting` cannot serve this: it is state,
+   *  so two clicks in one render pass both observe the old `false` and both write. */
+  const markInFlightRef = useRef<boolean>(false);
+
   // --- the candle click writes a mark (r5.s3.w3) ----------------------------
   // Subscribed once, on the chart's own life. `arm` is what makes a click a write:
   // disarmed, a click on the chart is just a click.
@@ -383,11 +388,18 @@ export default function ChartScreen() {
     adapter.onCandleClick((openTime) => {
       const live = markClickRef.current;
       if (!live.form.armed || live.form.submitting || live.timeframe === null) return;
+      // `live.form.submitting` is state, and state reaches the ref only after the next
+      // render — so two clicks in ONE render pass both read `false` on it. This ref is
+      // set SYNCHRONOUSLY, before the write starts, so the second click is refused
+      // here. A mark is immutable: a duplicate would stand until the trader withdrew
+      // it by hand.
+      if (markInFlightRef.current) return;
       const setup = live.form.setup.trim();
       if (setup === "") {
         setMarkRefusal("Type a setup label before marking a candle.");
         return;
       }
+      markInFlightRef.current = true;
       void writeMarkAt(openTime, live);
     });
   }, []);
@@ -538,6 +550,9 @@ export default function ChartScreen() {
     } catch (error) {
       setMarkRefusal(messageOf(error));
       setForm((current) => ({ ...current, submitting: false }));
+    } finally {
+      // The write settled, whatever it answered: the next click may write again.
+      markInFlightRef.current = false;
     }
   };
 

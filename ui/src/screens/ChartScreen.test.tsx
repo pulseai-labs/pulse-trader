@@ -1431,6 +1431,32 @@ describe("marking a candle", () => {
     });
   });
 
+  it("writes ONE mark when two clicks land in the same render pass", async () => {
+    // The write is left in flight, so the second click lands before the first settles.
+    // `form.submitting` reaches the click handler's ref only after a render, so both
+    // clicks observe the old `false` — the handler's own synchronous guard is what
+    // refuses the second one. A mark is immutable, so a duplicate would stand until
+    // the trader withdrew it by hand (CR3).
+    const pending = deferred<unknown>();
+    vi.mocked(commands.writeMark).mockReturnValue(pending.promise as never);
+    await open("#/chart");
+    await arm("breakout retest", "Long");
+    await act(async () => {
+      fireCandleClick(String(FIRST + TF_MS_4H));
+      fireCandleClick(String(FIRST + TF_MS_4H));
+    });
+
+    expect(commands.writeMark).toHaveBeenCalledTimes(1);
+
+    // Once the write settles, the next click writes again.
+    await act(async () => {
+      pending.resolve(ok(mark()));
+    });
+    vi.mocked(commands.writeMark).mockResolvedValue(ok(mark()));
+    await act(async () => fireCandleClick(String(FIRST + TF_MS_4H)));
+    expect(commands.writeMark).toHaveBeenCalledTimes(2);
+  });
+
   it("sends no write at all while the control is disarmed", async () => {
     await open("#/chart");
     await screen.findByText('No example marks yet — arm "Mark example", then click a candle.');
