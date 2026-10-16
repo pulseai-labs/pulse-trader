@@ -625,7 +625,7 @@ export default function ChartScreen() {
         )}
         {undrawn !== null && (
           <p className="cw-note" role="note">
-            {`The trade entering ${timeUtc(undrawn)} is not drawn on ${timeframe}: its ${timeframe} candle had not closed by the run's last ${run?.primaryTimeframe ?? timeframe} bar, so no window on this leg holds that bar.`}
+            {`The trade's entry is not drawn in this ${timeframe} window.`}
           </p>
         )}
       </div>

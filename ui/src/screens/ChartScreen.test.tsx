@@ -1126,7 +1126,7 @@ describe("centring on the trade under the pointer", () => {
     fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
 
     expect(commands.chartData).toHaveBeenCalledTimes(1);
-    await screen.findByText(/is not drawn on 4h/);
+    await screen.findByText("The trade's entry is not drawn in this 4h window.");
   });
 
   it("does not repeat the read for a trade the window it asked for cannot hold", async () => {
@@ -1169,10 +1169,47 @@ describe("centring on the trade under the pointer", () => {
     // not on the click after that either.
     fireEvent.click(row);
     expect(commands.chartData).toHaveBeenCalledTimes(1);
-    await screen.findByText(/is not drawn on 4h/);
+    await screen.findByText("The trade's entry is not drawn in this 4h window.");
 
     fireEvent.click(row);
     expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the window, not a cause, when the run starts inside the candle holding the entry", async () => {
+    // A fold whose own window starts INSIDE an H4 period: the candle that holds its first
+    // bars opened before that window, so the read never asks for it and the returned bars
+    // start at the NEXT H4 open. The bar is missing for a reason that has nothing to do
+    // with the run's end — the candle closed hours after the fold began — so the note must
+    // name the window and assert no cause at all.
+    const entry = FIRST + TF_MS_15M;
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          firstOpenTimeMs: String(entry),
+          lastCloseTimeMs: String(FIRST + 30 * DAY),
+          trades: [
+            tradeRow({ entryFillTime: String(entry), exitFillTime: String(entry + DAY) }),
+          ],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          candles: [candle(FIRST + TF_MS_4H), candle(FIRST + 2 * TF_MS_4H)],
+          run: runLayer({ trades: [] }),
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+
+    // The bar is named, no further read goes out, and no cause is claimed.
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    await screen.findByText("The trade's entry is not drawn in this 4h window.");
+    expect(screen.queryByText(/had not closed by the run's last/)).toBeNull();
   });
 
   it("still reads a window for an ordinary trade the drawn window does not hold", async () => {
