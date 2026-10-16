@@ -985,7 +985,7 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
         mfe: project_histogram(std::iter::empty()),
         mae: project_histogram(std::iter::empty()),
     };
-    let err = pulse::backtest_run_dto(&outcome, true)
+    let err = pulse::backtest_run_dto(&outcome, true, None)
         .expect_err("a count that does not fit the wire must refuse, never clamp");
     let BacktestAppError::SavedButReadBackFailed {
         run_id,
@@ -1020,7 +1020,7 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
         mae: project_histogram(std::iter::empty()),
     };
     assert!(
-        pulse::backtest_run_dto(&good, true).is_ok(),
+        pulse::backtest_run_dto(&good, true, None).is_ok(),
         "positive control: an uncorrupted outcome projects"
     );
 }

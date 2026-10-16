@@ -169,6 +169,7 @@ const SEEDED_RUN: BacktestRunDto = {
   usesHtf: true,
   firstOpenTimeMs: "1735689600000",
   lastCloseTimeMs: "1756684800000",
+  holdoutStartMs: null,
   startingEquity: "10000.00",
   takerFeeBps: "4.0000",
   slippageBps: "2.0000",

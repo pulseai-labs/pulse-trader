@@ -32,9 +32,10 @@ use std::path::{Path, PathBuf};
 
 use pulse::{
     BUS_COMMANDS, BacktestRunId, BacktestRunRepository, BusErrorCode, CreatedBy, DesktopState,
-    GetBacktestRunRequest, GetWalkForwardRunRequest, NewVersion, SqliteBacktestRunRepo, StrategyId,
-    StrategyRepository, Timeframe, VersionId, WalkForwardRunRequest, get_backtest_run_core,
-    get_walk_forward_run_core, run_walk_forward_version_core,
+    FakeClock, GetBacktestRunRequest, GetWalkForwardRunRequest, NewVersion, OpenFreezeRequest,
+    SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, StrategyId, StrategyRepository,
+    Timeframe, VersionId, WalkForwardRunRequest, get_backtest_run_core, get_walk_forward_run_core,
+    run_walk_forward_version_core,
 };
 use tempfile::TempDir;
 
@@ -321,6 +322,79 @@ async fn get_backtest_run_on_a_fold_id_returns_the_ordinary_run_dto() {
             "the fold counted only its window but warmed on the full snapshot"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 4. the app's run read names the open freeze's holdout boundary
+// ---------------------------------------------------------------------------
+
+/// The instant this suite opens its freeze at — inside the fixture's own range,
+/// so a run that reaches it is a run the fence must cover.
+const HOLDOUT_MS: i64 = 1_736_985_600_000;
+
+/// Open one freeze through the store, with the injected clock.
+async fn open_freeze(state: &DesktopState, holdout_start_ms: i64) {
+    SqliteCertificationFreezeRepo::with_deps(
+        state.db().pool().clone(),
+        FakeClock::at(1_760_000_000_000),
+    )
+    .open(&OpenFreezeRequest {
+        holdout_start_ms,
+        h: 12,
+        alpha: "0.0463".to_owned(),
+        holdout_test: "C1: z = z(1 - 0.05/H)".to_owned(),
+    })
+    .await
+    .expect("open the freeze");
+}
+
+/// Every NEW Chart trade surface reads `getBacktestRun` before (or beside) its
+/// chart read, so THAT read is where the tab learns where the fence is. It must
+/// carry the open freeze's boundary, so no Chart state can list a trade whose
+/// entry or exit reaches the holdout — and `null` while no freeze is open, so the
+/// field means "the fence", not "a number".
+///
+/// On the base commit the field does not exist: the JSON has no `holdoutStartMs`
+/// at all, so the frozen assertion reads `null` and fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_read_names_the_open_freezes_holdout_boundary() {
+    let env = env();
+    let version_id = seed_version(&env).await;
+    let state = env.cold_state().await;
+    let wf = run_walk_forward_version_core(&state, wf_request(&version_id))
+        .await
+        .expect("walk-forward succeeds");
+    let fold_id = wf.folds[0].backtest_run_id.clone();
+
+    let plain = serde_json::to_value(
+        get_backtest_run_core(
+            &state,
+            GetBacktestRunRequest {
+                run_id: fold_id.clone(),
+            },
+        )
+        .await
+        .expect("the fold reads while no freeze is open"),
+    )
+    .expect("the DTO serializes");
+    assert_eq!(
+        plain["holdoutStartMs"],
+        serde_json::Value::Null,
+        "no freeze is open, so the boundary is null"
+    );
+
+    open_freeze(&state, HOLDOUT_MS).await;
+    let frozen = serde_json::to_value(
+        get_backtest_run_core(&state, GetBacktestRunRequest { run_id: fold_id })
+            .await
+            .expect("the fold still reads while a freeze is open"),
+    )
+    .expect("the DTO serializes");
+    assert_eq!(
+        frozen["holdoutStartMs"],
+        serde_json::json!(HOLDOUT_MS.to_string()),
+        "the app's run read names the open freeze's holdout start"
+    );
 }
 
 // ---------------------------------------------------------------------------

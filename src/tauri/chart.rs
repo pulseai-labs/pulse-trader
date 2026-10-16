@@ -35,8 +35,9 @@ use crate::application::mcp_read::indicator_label;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestRunId, BacktestRunRepository, Candle, CandleSeries, CandleSeriesRepository,
-    CompiledValue, DataVersion, EvalContext, HoldoutFreeze, IndicatorSpec, Pair, Series,
-    StoredCandleSeries, StrategyRepository, SweepableValue, Timeframe, Trade, compile, validate,
+    CandleWindow, CompiledValue, DataVersion, EvalContext, HoldoutFreeze, IndicatorSpec, Pair,
+    Series, StoredCandleSeries, StrategyRepository, SweepableValue, Timeframe, Trade, compile,
+    validate,
 };
 use crate::tauri::backtest::{dec, direction_label, exit_reason_label, ms};
 
@@ -84,13 +85,19 @@ pub struct ChartCandleDto {
 }
 
 /// The note that an open freeze cut this read (PDR-0007 / ADR-0028): the holdout
-/// start and how many candles the cut removed **inside the returned window**.
+/// start and how many candles the cut removed **inside the resolved window**.
+///
+/// The resolved window is an explicit `fromMs`/`toMs`, else the run's own recorded
+/// window, else — for a read naming no run and no bounds — the whole pinned
+/// snapshot. It is NOT the capped slice a default pair read hands back: the count
+/// answers "how many of this window's bars did the fence withhold", which is why a
+/// read with no window of its own can report bars the returned slice never held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartHoldoutDto {
     /// The open freeze's holdout start, epoch ms as an exact integer string.
     pub holdout_start_ms: String,
-    /// How many candles the cut removed inside the window.
+    /// How many candles the cut removed inside the resolved window.
     pub bars_withheld: u32,
 }
 
@@ -187,7 +194,12 @@ pub struct ChartRunDto {
     pub version_id: String,
     /// `primary` / `htf` — the series the overlays were computed on (Q2).
     pub series: String,
-    /// Every stored trade whose entry or exit falls in the window.
+    /// Every stored trade whose entry or exit falls in the window and which ends
+    /// before an open freeze's holdout start (Q5).
+    ///
+    /// A trade that reaches the fence is withheld WHOLE, even when it entered
+    /// before the holdout start: its exit price, exit reason and realized R were
+    /// produced inside the withheld period, and the cut withholds those bars.
     pub trades: Vec<ChartTradeDto>,
     /// One overlay per drawn spec of the rule on this series.
     pub overlays: Vec<ChartOverlayDto>,
@@ -251,6 +263,12 @@ pub async fn chart_data_core(
     let span = run
         .as_ref()
         .map(|run| (run.primary_timeframe, run.primary_data_version.clone()));
+    // A windowed run consumed one slice of its pinned snapshot (a walk-forward fold,
+    // a windowed backtest, a freeze-clamped run), and that slice is the window a
+    // read with no bounds defaults to — the same `[first_open_time_ms,
+    // last_close_time_ms]` the run DTO reports, and the reason a small window inside
+    // an over-cap snapshot is a request this read can answer.
+    let window = run.as_ref().and_then(|run| run.window.clone());
 
     let read = {
         let store = store.clone();
@@ -262,6 +280,7 @@ pub async fn chart_data_core(
                 timeframe,
                 version.as_ref(),
                 span.as_ref().map(|(tf, version)| (*tf, version)),
+                window,
                 holdout,
                 (from_ms, to_ms),
                 bounded,
@@ -289,6 +308,7 @@ pub async fn chart_data_core(
             trades
                 .iter()
                 .filter(|trade| trade_in_window(trade, read.from, read.to))
+                .filter(|trade| trade_clears_holdout(trade, holdout))
                 .map(trade_dto)
                 .collect()
         }
@@ -329,6 +349,10 @@ struct ResolvedRun {
     primary_timeframe: Timeframe,
     /// The run's primary snapshot identity.
     primary_data_version: DataVersion,
+    /// The candle slice the run recorded (`inputs.window`), or `None` for a run
+    /// that consumed its whole pinned snapshot. Both legs are read back through
+    /// this same slice, so it is the window a read with no bounds defaults to.
+    window: Option<CandleWindow>,
     /// The rule's specs on the drawn series, in reference order.
     specs: Vec<IndicatorSpec>,
 }
@@ -390,6 +414,7 @@ async fn resolve_run(
         data_version,
         primary_timeframe: inputs.primary.timeframe,
         primary_data_version: inputs.primary.data_version.clone(),
+        window: inputs.window.clone(),
         specs,
     })
 }
@@ -462,6 +487,7 @@ fn read_window(
     timeframe: Timeframe,
     version: Option<&DataVersion>,
     span: Option<(Timeframe, &DataVersion)>,
+    window: Option<CandleWindow>,
     holdout: Option<HoldoutFreeze>,
     requested: (Option<i64>, Option<i64>),
     bounded: bool,
@@ -470,21 +496,30 @@ fn read_window(
     let mut series = load(store, pair, timeframe, version)?.series;
     let data_version = series.version.clone();
 
-    // The bounds: an explicit window; else the run's primary span (the run DTO's
-    // own definition of the run's range); else the series' own extent.
+    // The bounds: an explicit window; else the run's OWN recorded window; else the
+    // run's primary span (the run DTO's own definition of the run's range); else the
+    // series' own extent.
     let (from, to) = match requested {
         (Some(from), Some(to)) => (from, to),
         (from_ms, to_ms) => {
-            let (span_from, span_to) = match span {
-                Some((span_timeframe, span_version))
-                    if span_timeframe == timeframe && Some(span_version) == version =>
-                {
-                    span_of(&series)
-                }
-                Some((span_timeframe, span_version)) => {
-                    span_of(&load(store, pair, span_timeframe, Some(span_version))?.series)
-                }
-                None => span_of(&series),
+            let (span_from, span_to) = match window {
+                // A persisted window is half-open on the candles' `open_time`
+                // (`[from_ms, to_ms)`, `CandleWindow`'s own contract) while this
+                // read's `to` is inclusive: the window's last bar is the one
+                // opening at `to_ms - 1`. The bars this keeps are exactly the
+                // slice the run's read-back answers from, on both legs.
+                Some(window) => (window.from_ms, window.to_ms - 1),
+                None => match span {
+                    Some((span_timeframe, span_version))
+                        if span_timeframe == timeframe && Some(span_version) == version =>
+                    {
+                        span_of(&series)
+                    }
+                    Some((span_timeframe, span_version)) => {
+                        span_of(&load(store, pair, span_timeframe, Some(span_version))?.series)
+                    }
+                    None => span_of(&series),
+                },
             };
             (from_ms.unwrap_or(span_from), to_ms.unwrap_or(span_to))
         }
@@ -737,6 +772,19 @@ fn candle_dto(candle: &Candle) -> ChartCandleDto {
 /// filter: either end of a trade draws it.
 fn trade_in_window(trade: &Trade, from: i64, to: i64) -> bool {
     (from..=to).contains(&trade.entry_fill_time) || (from..=to).contains(&trade.exit_fill_time)
+}
+
+/// Whether a stored trade clears the open freeze (Q5): BOTH of its fills before
+/// the holdout start. A trade that entered before the fence and exited inside it
+/// carries an outcome produced in the withheld period — its exit price, its exit
+/// reason and its realized R — so the cut withholds it whole, exactly as it
+/// withholds the candles the position ran through. `None` (no freeze open, or the
+/// certification exemption) clears every trade.
+fn trade_clears_holdout(trade: &Trade, holdout: Option<HoldoutFreeze>) -> bool {
+    holdout.is_none_or(|freeze| {
+        trade.entry_fill_time < freeze.holdout_start_ms
+            && trade.exit_fill_time < freeze.holdout_start_ms
+    })
 }
 
 /// One stored trade as the chart marks it — the run's values, unchanged. A stored

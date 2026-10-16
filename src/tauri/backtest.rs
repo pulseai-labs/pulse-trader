@@ -50,7 +50,9 @@ use crate::application::backtest::{
 use crate::domain::backtest::{
     EquityCurve, ExitReason, Regime, RegimeBreakdown, RegimeCell, TradeSource,
 };
-use crate::domain::{BacktestInputs, BacktestRunId, Direction, FundingConfig, PersistedRun, Trade};
+use crate::domain::{
+    BacktestInputs, BacktestRunId, Direction, FundingConfig, HoldoutFreeze, PersistedRun, Trade,
+};
 
 use super::coach::SummaryDto;
 
@@ -220,6 +222,16 @@ pub struct BacktestRunDto {
     pub first_open_time_ms: String,
     /// Last candle `close_time` of the **reloaded** primary snapshot, epoch ms.
     pub last_close_time_ms: String,
+    /// The open freeze's holdout start, epoch ms as an exact integer string;
+    /// `null` while no freeze is open (r5.s2 close review).
+    ///
+    /// This read answers a persisted run with its stored values whatever the fence
+    /// holds — the freeze's own guard applies to RUNNING a backtest, not to reading
+    /// a saved result (r4.s1.w4). The boundary travels because the Chart tab fences
+    /// every trade row at the current holdout start (Q5), and the run read is its
+    /// first answer about a run: without this it could list a trade whose outcome
+    /// the freeze withholds.
+    pub holdout_start_ms: Option<String>,
     /// Starting equity, exact decimal string.
     pub starting_equity: String,
     /// Taker fee in basis points.
@@ -570,6 +582,7 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
 pub fn backtest_run_dto(
     outcome: &BacktestOutcome,
     uses_htf: bool,
+    holdout: Option<HoldoutFreeze>,
 ) -> Result<BacktestRunDto, BacktestAppError> {
     let run: &PersistedRun = &outcome.run;
     let summary = &run.summary;
@@ -613,6 +626,9 @@ pub fn backtest_run_dto(
             .candles
             .last()
             .map_or(0, |candle| candle.close_time)),
+        // The fence as THIS read saw it: the Chart tab's trade rows are fenced at
+        // this instant, so a run read with no freeze open says so with `null`.
+        holdout_start_ms: holdout.map(|freeze| ms(freeze.holdout_start_ms)),
         starting_equity: dec(run.starting_equity),
         taker_fee_bps: dec(inputs.taker_fee_bps),
         slippage_bps: dec(inputs.slippage_bps),

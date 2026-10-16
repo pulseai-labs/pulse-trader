@@ -436,6 +436,18 @@ export type BacktestRunDto = {
 	firstOpenTimeMs: string,
 	/**  Last candle `close_time` of the **reloaded** primary snapshot, epoch ms. */
 	lastCloseTimeMs: string,
+	/**
+	 *  The open freeze's holdout start, epoch ms as an exact integer string;
+	 *  `null` while no freeze is open (r5.s2 close review).
+	 * 
+	 *  This read answers a persisted run with its stored values whatever the fence
+	 *  holds — the freeze's own guard applies to RUNNING a backtest, not to reading
+	 *  a saved result (r4.s1.w4). The boundary travels because the Chart tab fences
+	 *  every trade row at the current holdout start (Q5), and the run read is its
+	 *  first answer about a run: without this it could list a trade whose outcome
+	 *  the freeze withholds.
+	 */
+	holdoutStartMs: string | null,
 	/**  Starting equity, exact decimal string. */
 	startingEquity: string,
 	/**  Taker fee in basis points. */
@@ -887,12 +899,18 @@ export type ChartDataRequest = {
 
 /**
  *  The note that an open freeze cut this read (PDR-0007 / ADR-0028): the holdout
- *  start and how many candles the cut removed **inside the returned window**.
+ *  start and how many candles the cut removed **inside the resolved window**.
+ * 
+ *  The resolved window is an explicit `fromMs`/`toMs`, else the run's own recorded
+ *  window, else — for a read naming no run and no bounds — the whole pinned
+ *  snapshot. It is NOT the capped slice a default pair read hands back: the count
+ *  answers "how many of this window's bars did the fence withhold", which is why a
+ *  read with no window of its own can report bars the returned slice never held.
  */
 export type ChartHoldoutDto = {
 	/**  The open freeze's holdout start, epoch ms as an exact integer string. */
 	holdoutStartMs: string,
-	/**  How many candles the cut removed inside the window. */
+	/**  How many candles the cut removed inside the resolved window. */
 	barsWithheld: number,
 };
 
@@ -958,7 +976,14 @@ export type ChartRunDto = {
 	versionId: string,
 	/**  `primary` / `htf` — the series the overlays were computed on (Q2). */
 	series: string,
-	/**  Every stored trade whose entry or exit falls in the window. */
+	/**
+	 *  Every stored trade whose entry or exit falls in the window and which ends
+	 *  before an open freeze's holdout start (Q5).
+	 * 
+	 *  A trade that reaches the fence is withheld WHOLE, even when it entered
+	 *  before the holdout start: its exit price, exit reason and realized R were
+	 *  produced inside the withheld period, and the cut withholds those bars.
+	 */
 	trades: ChartTradeDto[],
 	/**  One overlay per drawn spec of the rule on this series. */
 	overlays: ChartOverlayDto[],

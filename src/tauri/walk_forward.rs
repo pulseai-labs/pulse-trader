@@ -472,5 +472,10 @@ pub async fn get_backtest_run_core(
     // #219 rides the same rule for a persisted read: `uses_htf` is the run's own
     // version's compiled answer, never inferred from the recorded inputs.
     let uses_htf = run_uses_htf(&state.strategy_repo(), &outcome.run.strategy_version_id).await;
-    Ok(backtest_run_dto(&outcome, uses_htf)?)
+    // The open freeze reaches the DTO as METADATA only (r5.s2 close review): this
+    // read keeps answering a persisted run in full — the Lab's rows do not move —
+    // and the Chart tab is the surface that fences its trade rows at this instant.
+    // An unreadable freeze table is an error, never a silent `None`.
+    let holdout = state.open_holdout().await?;
+    Ok(backtest_run_dto(&outcome, uses_htf, holdout)?)
 }

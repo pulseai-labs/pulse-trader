@@ -1426,7 +1426,7 @@ pub async fn run_backtest_version_core(
     // refuses, and the refusal still names the run that exists. `uses_htf` comes
     // from the version's own DSL, not from the recorded inputs (#219).
     let uses_htf = run_uses_htf(&strategies, &version_id).await;
-    Ok(backtest_run_dto(&outcome, uses_htf)?)
+    Ok(backtest_run_dto(&outcome, uses_htf, holdout)?)
 }
 
 /// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).

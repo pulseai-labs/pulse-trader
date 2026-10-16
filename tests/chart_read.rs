@@ -17,13 +17,14 @@ use std::path::Path;
 
 use pulse::{
     BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, BusError, BusErrorCode,
-    Candle, CandlePatternName, CandleSeries, CandleSeriesRepository, CandleStore, ChartDataDto,
-    ChartDataRequest, ChartOverlayDto, CompiledValue, DataVersion, DesktopState, Direction,
-    EngineFingerprint, EquityCurve, EvalContext, ExitReason, FakeClock, Fill, FundingConfig,
-    IndicatorEngine, IndicatorSpec, NewVersion, OpenFreezeRequest, Pair, Regime, RegimeBreakdown,
-    Series, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
-    SqliteCertificationFreezeRepo, StrategyId, StrategyRepository, SummaryStats, SweepableValue,
-    Timeframe, Trade, TradeSource, VersionId, chart_data_core,
+    Candle, CandlePatternName, CandleSeries, CandleSeriesRepository, CandleStore, CandleWindow,
+    ChartDataDto, ChartDataRequest, ChartOverlayDto, CompiledValue, DataVersion, DesktopState,
+    Direction, EngineFingerprint, EquityCurve, EvalContext, ExitReason, FakeClock, Fill,
+    FundingConfig, GetBacktestRunRequest, IndicatorEngine, IndicatorSpec, NewVersion,
+    OpenFreezeRequest, Pair, Regime, RegimeBreakdown, Series, SkippedEntryCounts,
+    SnapshotSelection, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, StrategyId,
+    StrategyRepository, SummaryStats, SweepableValue, Timeframe, Trade, TradeSource, VersionId,
+    chart_data_core, get_backtest_run_core,
 };
 use rust_decimal::Decimal;
 use support::server::{ServerOptions, TestServer, spawn_server};
@@ -262,22 +263,43 @@ fn trade_at(entry_ms: i64, r: &str) -> Trade {
 /// snapshot identities so the read resolves exactly the data the run consumed.
 async fn seed_run(server: &TestServer, version: &VersionId, trades: Vec<Trade>) -> String {
     let store = store(&server.data_dir);
-    let inputs = BacktestInputs {
-        pair: pair(),
-        primary: SnapshotSelection {
+    seed_run_on(
+        server,
+        version,
+        SnapshotSelection {
             timeframe: Timeframe::M15,
             data_version: head(&store, Timeframe::M15),
         },
-        htf: Some(SnapshotSelection {
+        Some(SnapshotSelection {
             timeframe: Timeframe::H4,
             data_version: head(&store, Timeframe::H4),
         }),
+        None,
+        trades,
+    )
+    .await
+}
+
+/// The same, over snapshots and a window the caller chooses — the shape a windowed
+/// backtest or a walk-forward fold persists (`inputs.window`).
+async fn seed_run_on(
+    server: &TestServer,
+    version: &VersionId,
+    primary: SnapshotSelection,
+    htf: Option<SnapshotSelection>,
+    window: Option<CandleWindow>,
+    trades: Vec<Trade>,
+) -> String {
+    let inputs = BacktestInputs {
+        pair: pair(),
+        primary,
+        htf,
         d1: None,
         taker_fee_bps: Decimal::new(4, 0),
         slippage_bps: Decimal::new(1, 0),
         funding: FundingConfig::SnapshotRates,
         symbol_filters: None,
-        window: None,
+        window,
         lead_in_from_ms: None,
     };
     let net_pnl = trades.iter().map(|trade| trade.realized_pnl).sum();
@@ -490,6 +512,231 @@ async fn no_window_returns_the_latest_bars_of_the_head_snapshot() {
     assert_eq!(
         dto.candles.first().expect("bars").t,
         series.candles.first().expect("bars").open_time.to_string()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A windowed run's default window is the window it consumed
+// ---------------------------------------------------------------------------
+
+/// A run that recorded `inputs.window` — a windowed backtest or a walk-forward
+/// fold — must default to THAT window, not to the whole pinned snapshot: a small
+/// window inside an over-cap snapshot is a valid request, and its candles are the
+/// only ones the run consumed.
+///
+/// On the base commit the read defaults to the pinned snapshot's whole span, so
+/// this small window is refused with the cap (the false 422) — and the HTF leg
+/// answers with bars from outside the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_runs_default_window_is_the_window_it_consumed() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    // A synthetic snapshot longer than the cap, so only the RUN's window can
+    // answer: the whole-snapshot default would be refused.
+    let m15 = write_series(
+        &server.data_dir,
+        &pair(),
+        Timeframe::M15,
+        i64::from(pulse::CHART_BAR_CAP) + 100,
+    );
+    let h4 = write_series(&server.data_dir, &pair(), Timeframe::H4, 3_000);
+    let store = store(&server.data_dir);
+    let series = store
+        .load_version(&pair(), Timeframe::M15, &m15)
+        .expect("the synthetic M15 reads")
+        .series;
+    let held = u32::try_from(series.candles.len()).expect("a count");
+    assert!(
+        held > pulse::CHART_BAR_CAP,
+        "the snapshot must be over the cap for this test to bite"
+    );
+    let step = Timeframe::M15.duration_ms();
+    let window = CandleWindow::new(
+        series.candles[10_000].open_time,
+        series.candles[12_000].open_time,
+    )
+    .expect("a window");
+    let run_id = seed_run_on(
+        &server,
+        &version,
+        SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: m15.clone(),
+        },
+        Some(SnapshotSelection {
+            timeframe: Timeframe::H4,
+            data_version: h4.clone(),
+        }),
+        Some(window.clone()),
+        vec![],
+    )
+    .await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id.clone()),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the run's own window is under the cap, so it must answer");
+    let consumed: Vec<i64> = series
+        .candles
+        .iter()
+        .filter(|candle| candle.open_time >= window.from_ms && candle.open_time < window.to_ms)
+        .map(|candle| candle.open_time)
+        .collect();
+    assert_eq!(
+        dto.candles.len(),
+        consumed.len(),
+        "the default window holds exactly the bars the run consumed"
+    );
+    assert_eq!(dto.candles[0].t, consumed[0].to_string());
+    assert_eq!(
+        dto.candles[dto.candles.len() - 1].t,
+        consumed[consumed.len() - 1].to_string()
+    );
+
+    // The ends are the RUN DTO's own span — the same numbers the Lab shows for
+    // this run, and the reason the tab's own fit decision agrees with the read.
+    let run_dto = get_backtest_run_core(
+        &state,
+        GetBacktestRunRequest {
+            run_id: run_id.clone(),
+        },
+    )
+    .await
+    .expect("the run reads back");
+    assert_eq!(dto.candles[0].t, run_dto.first_open_time_ms);
+    assert_eq!(
+        dto.candles[dto.candles.len() - 1]
+            .t
+            .parse::<i64>()
+            .expect("a time")
+            + step
+            - 1,
+        run_dto.last_close_time_ms.parse::<i64>().expect("a time"),
+        "the defaulted window ends where the run's own span ends"
+    );
+
+    // The HTF leg defaults to the SAME run window: the H4 bars the run consumed,
+    // never bars from the rest of the snapshot.
+    let htf = store
+        .load_version(&pair(), Timeframe::H4, &h4)
+        .expect("the synthetic H4 reads")
+        .series;
+    let htf_consumed: Vec<i64> = htf
+        .candles
+        .iter()
+        .filter(|candle| candle.open_time >= window.from_ms && candle.open_time < window.to_ms)
+        .map(|candle| candle.open_time)
+        .collect();
+    assert!(
+        !htf_consumed.is_empty(),
+        "the window must hold H4 bars for this test to bite"
+    );
+    let htf_dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the HTF leg answers");
+    assert_eq!(
+        htf_dto.candles.len(),
+        htf_consumed.len(),
+        "the HTF leg defaults to the run's own window"
+    );
+    assert_eq!(htf_dto.candles[0].t, htf_consumed[0].to_string());
+    assert_eq!(
+        htf_dto.candles[htf_dto.candles.len() - 1].t,
+        htf_consumed[htf_consumed.len() - 1].to_string()
+    );
+}
+
+/// A windowed run's withheld count is the cut's count INSIDE THE RUN'S WINDOW —
+/// not inside the whole pinned snapshot. Fails on the base commit, where the
+/// defaulted window is the whole snapshot: 200 candles come back instead of the
+/// window's 100, and the count is 100 instead of 50.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_runs_withheld_count_counts_only_its_own_window() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let m15 = write_series(&server.data_dir, &pair(), Timeframe::M15, 300);
+    let store = store(&server.data_dir);
+    let series = store
+        .load_version(&pair(), Timeframe::M15, &m15)
+        .expect("the synthetic M15 reads")
+        .series;
+    let window = CandleWindow::new(series.candles[100].open_time, series.candles[250].open_time)
+        .expect("a window");
+    let holdout_start = series.candles[200].open_time;
+    open_freeze(&server, holdout_start).await;
+    let run_id = seed_run_on(
+        &server,
+        &version,
+        SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: m15,
+        },
+        None,
+        Some(window.clone()),
+        vec![],
+    )
+    .await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the run's own window reads");
+    let kept = series
+        .candles
+        .iter()
+        .filter(|candle| {
+            candle.open_time >= window.from_ms
+                && candle.open_time < window.to_ms
+                && candle.open_time < holdout_start
+        })
+        .count();
+    let withheld = series
+        .candles
+        .iter()
+        .filter(|candle| {
+            candle.open_time >= window.from_ms
+                && candle.open_time < window.to_ms
+                && candle.open_time >= holdout_start
+        })
+        .count();
+    assert!(
+        kept > 0 && withheld > 0,
+        "the window must straddle the holdout start to test anything"
+    );
+    assert_eq!(
+        dto.candles.len(),
+        kept,
+        "the default window is the run's, cut at the holdout"
+    );
+    assert_eq!(
+        dto.candles[0].t,
+        series.candles[100].open_time.to_string(),
+        "the window starts at the run's first consumed bar"
+    );
+    let holdout = dto.holdout.expect("the read says a freeze cut it");
+    assert_eq!(holdout.holdout_start_ms, holdout_start.to_string());
+    assert_eq!(
+        holdout.bars_withheld,
+        u32::try_from(withheld).expect("a count"),
+        "barsWithheld counts the cut's candles inside the RUN's window"
     );
 }
 
@@ -766,6 +1013,92 @@ async fn a_run_read_returns_the_runs_stored_trades() {
 /// The stored exit reason a chart trade carries.
 fn drawn_reason(trade: &pulse::ChartTradeDto) -> Option<&str> {
     trade.exit_reason.as_deref()
+}
+
+/// While a freeze is open, EVERY trade surface of the run layer is fenced: a
+/// trade whose entry OR exit is at or after the holdout start carries an outcome
+/// the cut withheld — its exit price, its reason and its realized R included — so
+/// the read must not return it at all.
+///
+/// On the base commit all five trades come back: the fence is applied to the
+/// candles only, and the withheld period's outcomes cross beside the note that
+/// says the bars were withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_freeze_withholds_every_trade_that_reaches_the_holdout() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let series = store
+        .load_version(&pair(), Timeframe::M15, &head(&store, Timeframe::M15))
+        .expect("the fixture reads")
+        .series;
+    let step = Timeframe::M15.duration_ms();
+    let holdout_start = series.candles[200].open_time;
+    // Every boundary in one case: wholly before, exiting exactly ON the boundary,
+    // entering exactly ON it, straddling it, and wholly after.
+    let before = trade_at(holdout_start - 8 * step, "2");
+    let exit_on = trade_at(holdout_start - step, "1");
+    let entry_on = trade_at(holdout_start, "1");
+    let straddling = trade_at(holdout_start - step / 2, "-1");
+    let after = trade_at(holdout_start + 4 * step, "2");
+    assert_eq!(
+        exit_on.exit_fill_time, holdout_start,
+        "the exit-at-boundary trade must exit exactly at the holdout start"
+    );
+    let run_id = seed_run(
+        &server,
+        &version,
+        vec![before.clone(), exit_on, entry_on, straddling, after],
+    )
+    .await;
+    open_freeze(&server, holdout_start).await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            from_ms: Some((holdout_start - 12 * step).to_string()),
+            to_ms: Some((holdout_start + 8 * step).to_string()),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the fenced window reads");
+    let run = dto.run.expect("the read carries the run layer");
+    assert_eq!(
+        run.trades.len(),
+        1,
+        "only the trade that ends before the holdout may cross"
+    );
+    assert_eq!(run.trades[0].entry_time, before.entry_fill_time.to_string());
+    assert_eq!(
+        run.trades[0].exit_time,
+        Some(before.exit_fill_time.to_string())
+    );
+    assert_eq!(
+        run.trades[0].realized_r,
+        before.realized_r.normalize().to_string()
+    );
+    assert!(
+        dto.holdout.is_some(),
+        "the read still says a freeze cut its candles"
+    );
+    // The fence is the point, not a truncation: nothing in the response carries a
+    // time at or after the holdout start.
+    for trade in &run.trades {
+        assert!(
+            trade.entry_time.parse::<i64>().expect("a time") < holdout_start
+                && trade
+                    .exit_time
+                    .as_deref()
+                    .expect("a closed trade")
+                    .parse::<i64>()
+                    .expect("a time")
+                    < holdout_start,
+            "no returned trade may carry a time at or after the holdout start"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

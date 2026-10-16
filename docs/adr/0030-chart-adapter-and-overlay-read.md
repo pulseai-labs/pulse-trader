@@ -56,12 +56,19 @@ command `chart_data`, both straight through one transport-free core:
   (specta refuses 64-bit integers). `dataVersion` names the snapshot the candles came from, so
   an agent can compare an overlay against `export_indicators` for the same data (G2).
 - **`holdout` is `null` while no freeze is open**, else the holdout start and the number of
-  candles the cut removed **inside the returned window**. Every chart read cuts at an open
-  freeze's holdout start BEFORE the engine steps (grill Q5), exactly as the agent exports do.
+  candles the cut removed **inside the resolved window** — an explicit `fromMs`/`toMs`, else the
+  run's own recorded window, else, for a read naming no run and no bounds, the whole pinned
+  snapshot. The count is NOT narrowed by the 20,000-bar slice such a read returns: it answers
+  "how many of this window's bars did the fence withhold" (r5.s2 close review). Every chart read
+  cuts at an open freeze's holdout start BEFORE the engine steps (grill Q5), exactly as the agent
+  exports do.
 - **`run` is `null` when no run is named**, else `{ runId, versionId, series, trades, overlays,
   notDrawn }`. `series` is `primary` or `htf` — each overlay is computed on the timeframe its
   rule was compiled for (grill Q2), and trades ride both. `trades` are the run's stored rows
-  whose entry or exit falls in the window, unchanged.
+  whose entry or exit falls in the window **and which end before an open freeze's holdout
+  start**: a trade that reaches the fence is withheld whole, even when it entered before the
+  cut, because its exit price, exit reason and realized R were produced inside the withheld
+  period (r5.s2 close review; PDR-0007, Q5).
 - **Overlays are keyed by the engine's own token labels** — `support:3-3-0.005-2-100`,
   `resistance:…`, `pivot_high:1-1`, `pivot_low:…`, `cdl:engulfing`, `ema:50` — the tokens MCP
   `export_indicators` accepts, produced by the token formatter beside its parser and proven by
