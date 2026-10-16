@@ -92,7 +92,10 @@ interface ChartRequest {
 type Phase =
   | { readonly kind: "loading"; readonly what: string }
   | { readonly kind: "failed"; readonly message: string; readonly code: string }
-  | { readonly kind: "ready"; readonly dto: ChartDataDto };
+  | { readonly kind: "ready"; readonly dto: ChartDataDto }
+  /** Nothing is drawn and nothing was asked for: the leg is over the cap and the tab
+   *  waits for a trade to pick. The notice beside it says exactly that. */
+  | { readonly kind: "idle" };
 
 /** A leg the trade is too fine to read whole until a trade is picked. */
 interface Notice {
@@ -297,6 +300,12 @@ export default function ChartScreen() {
     // will refuse, only to render the refusal, would be worse than saying so.
     if (request.plan.kind === "needs-trade") {
       setNotice({ timeframe: request.timeframe, bars: request.plan.bars });
+      // This leg asks for nothing but a trade, so only that waiting is true of it. A
+      // READY drawing of the previous leg stays drawn (D4), and the loading sentence of
+      // the read that opened the run stays too (CR6) — but a FAILED read belongs to the
+      // leg that asked for it. Left standing, the last leg's error would sit under this
+      // leg's notice and read as this leg's failure, though no read was ever sent.
+      setPhase((current) => (current.kind === "failed" ? { kind: "idle" } : current));
       return;
     }
     setNotice(null);

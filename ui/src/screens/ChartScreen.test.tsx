@@ -342,6 +342,30 @@ describe("the leg switch", () => {
     expect(h.adapter.setCandles).toHaveBeenCalledTimes(1);
   });
 
+  it("clears the failed leg's error when the leg the trader picks is only asking for a trade", async () => {
+    // The 4h leg's read fails. The trader then switches to the 15m leg, which is over
+    // the cap: no read for 15m is attempted at all, so the 4h read's error is not this
+    // leg's and must not stand under the 15m notice — the notice is the whole truth,
+    // and what it asks for (a trade of the run's own) is still there to pick.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ trades: [tradeRow()] })) as never,
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      failure("the chart read refused", "validation") as never,
+    );
+    await open("#/chart?run=run-1");
+    expect(await screen.findByRole("alert")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
+
+    expect(await screen.findByText(/Pick a trade to load 15m around it/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    // The run's own stored trades are still the selector the notice asks about.
+    const table = screen.getByRole("table", { name: "Trades in the run" });
+    expect(within(table).getAllByRole("button")).toHaveLength(1);
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
   it("reads a window around the selected trade once one is picked", async () => {
     await open("#/chart?run=run-1");
     await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
