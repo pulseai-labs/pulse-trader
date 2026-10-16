@@ -836,6 +836,75 @@ async fn a_rule_that_never_holds_reports_not_held_with_its_values() {
     assert!(report.held_by_every_mark.is_empty());
 }
 
+/// **Two marks on ONE 15m candle both explain, and both carry the same reading.**
+///
+/// A long and a short mark on the same bar name the SAME evaluation bar. The pass
+/// reads that bar once and must record its reading for BOTH marks: with a
+/// first-match lookup the second mark is falsely refused `no_evaluation_bar`, and
+/// `held_by_every_mark` is then computed over fewer marks than were selected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_marks_on_one_15m_candle_both_explain_and_share_one_reading() {
+    let world = world().await;
+    let bars = m15_bars(&world.store_dir);
+    let bar = bars[300];
+    let long = world.mark(Timeframe::M15, bar, MarkSide::Long).await;
+    let short = world.mark(Timeframe::M15, bar, MarkSide::Short).await;
+
+    let report = world
+        .explain(
+            MarkSelection::Ids(vec![long.id.clone(), short.id.clone()]),
+            PATTERN_RULE,
+            None,
+        )
+        .await
+        .expect("the case explains");
+
+    assert_eq!(
+        report.marks_explained, 2,
+        "both marks on the same bar explain: {:#?}",
+        report.refusals
+    );
+    assert!(
+        report.refusals.is_empty(),
+        "no mark is refused `no_evaluation_bar` by its sibling: {:#?}",
+        report.refusals
+    );
+    let explained_long = report
+        .marks
+        .iter()
+        .find(|mark| mark.mark.mark_id == long.id)
+        .expect("the long mark explains");
+    let explained_short = report
+        .marks
+        .iter()
+        .find(|mark| mark.mark.mark_id == short.id)
+        .expect("the short mark explains");
+
+    assert_eq!(
+        explained_long.evaluation_bar, explained_short.evaluation_bar,
+        "two marks on one candle name the same evaluation bar"
+    );
+    assert_eq!(
+        explained_long.conjuncts, explained_short.conjuncts,
+        "one bar, one reading: the conjuncts and their operands are identical"
+    );
+    assert_eq!(
+        explained_long.patterns, explained_short.patterns,
+        "and the mark's own candle is the same candle"
+    );
+    // The side still decides the verdict: one bar, two marks, two answers.
+    assert!(explained_long.side_matches, "a long mark under a long rule");
+    assert!(
+        !explained_short.side_matches,
+        "a short mark under a long rule"
+    );
+    // The reading is the real one: the rule's values are present at this bar.
+    assert!(
+        explained_long.conjuncts[0].operands[0].value.is_some(),
+        "the shared reading carries the operand values, not an empty fallback"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC-1 · the evaluation bar (Q5) and the fence (G4)
 // ---------------------------------------------------------------------------

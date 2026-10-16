@@ -804,6 +804,10 @@ struct PairPass {
 }
 
 /// What one evaluation bar's probe answered.
+///
+/// `Clone` because one bar's reading is inserted for EVERY mark that names it
+/// (several marks can share an evaluation bar).
+#[derive(Clone)]
 struct BarReading {
     /// One state per conjunct, flattened in the request's order. `not_warm` for
     /// every conjunct is the gate's cold answer, so the warm clause needs no
@@ -859,14 +863,24 @@ impl PairPass {
             htf.as_ref(),
             d1.as_ref(),
             |open_ms, probe| {
-                let Some((mark_id, _)) = wanted.iter().find(|(_, eval_ms)| *eval_ms == open_ms)
-                else {
+                // More than one mark can name the SAME evaluation bar: two marks on
+                // one 15m candle (a long and a short, or two writers), or a 4h mark
+                // and the 15m mark on the bar opening at the 4h close. The bar is
+                // read ONCE and its reading inserted for EVERY mark that names it —
+                // so no mark is refused `no_evaluation_bar` by a sibling, and
+                // `held_by_every_mark` is computed over every selected mark.
+                let sharing: Vec<String> = wanted
+                    .iter()
+                    .filter(|(_, eval_ms)| *eval_ms == open_ms)
+                    .map(|(mark_id, _)| mark_id.clone())
+                    .collect();
+                if sharing.is_empty() {
                     return;
-                };
-                bars.insert(
-                    mark_id.clone(),
-                    read_bar(probe, conjuncts, &wanted, &specs, open_ms),
-                );
+                }
+                let reading = read_bar(probe, conjuncts, &wanted, &specs, open_ms);
+                for mark_id in sharing {
+                    bars.insert(mark_id, reading.clone());
+                }
             },
         )?;
 
