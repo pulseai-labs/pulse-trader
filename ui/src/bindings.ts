@@ -977,8 +977,9 @@ export type ChartRunDto = {
 	/**  `primary` / `htf` — the series the overlays were computed on (Q2). */
 	series: string,
 	/**
-	 *  Every stored trade whose entry or exit falls in the window and which ends
-	 *  before an open freeze's holdout start (Q5).
+	 *  Every stored trade whose entry or exit falls in the DRAWN window — the interval
+	 *  the returned candles occupy — and which ends before an open freeze's holdout
+	 *  start (Q5).
 	 * 
 	 *  A trade that reaches the fence is withheld WHOLE, even when it entered
 	 *  before the holdout start: its exit price, exit reason and realized R were
