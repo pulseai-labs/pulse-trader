@@ -930,7 +930,11 @@ pub use application::example_marks::{MarkHoldout, MarkList, MarkRequest, list_ma
 // suite. It holds no evaluator of its own — it steps the SAME `EngineSession` a
 // backtest steps and reads each conjunct through that session's `EvalProbe`
 // (SPINE G3), over series cut at the holdout start before any step (G4).
-pub use application::holdout::guard_candle;
+// `HoldoutRefusal` is re-exported beside `guard_candle` because the public
+// `MarkError::Holdout` variant carries it: without this, a public error type
+// embeds a value whose module is private (the `private_interfaces` ring
+// inversion, R5).
+pub use application::holdout::{HoldoutRefusal, guard_candle};
 pub use application::mark_explain::{
     ConjunctReport, ExplainError, ExplainHoldout, ExplainReport, ExplainRequest, MarkExplanation,
     MarkJson, MarkRefusal, MarkSelection, MarkWriterJson, OperandReport, PatternReport,
