@@ -1053,9 +1053,10 @@ async fn a_mark_whose_evaluation_bar_opens_at_the_holdout_is_hidden_and_counted(
         rfc3339_ms(HOLDOUT_MS),
         "the holdout start crosses as RFC 3339 UTC ms, as `list_marks` renders it"
     );
-    assert!(
-        hidden.count >= 1,
-        "the mark whose evaluation bar opens at the holdout start is counted: {hidden:?}"
+    assert_eq!(
+        hidden.count, 1,
+        "EXACTLY the one requested mark whose evaluation bar opens at the holdout \
+         start is counted — not the whole store's hidden marks: {hidden:?}"
     );
     assert!(
         !report
@@ -1063,6 +1064,74 @@ async fn a_mark_whose_evaluation_bar_opens_at_the_holdout_is_hidden_and_counted(
             .iter()
             .any(|mark| mark.mark.mark_id == hidden_mark.id),
         "the hidden mark is never explained"
+    );
+}
+
+/// **A requested mark the fence hides is not a `NotFound`** (R2/CR1 b): the mark
+/// exists, it is simply hidden and counted. Answering "no example mark with id
+/// … exists" would be false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requested_mark_the_fence_hides_is_not_reported_as_missing() {
+    let world = world().await;
+    let bars = m15_bars(&world.store_dir);
+    let at_start = *bars
+        .iter()
+        .find(|bar| **bar == HOLDOUT_MS)
+        .expect("the fixture has a 15m bar at the holdout start");
+    let hidden_mark = world.mark(Timeframe::M15, at_start, MarkSide::Long).await;
+
+    let report = world
+        .explain(
+            MarkSelection::Ids(vec![hidden_mark.id.clone()]),
+            NEVER_RULE,
+            Some(HOLDOUT_MS),
+        )
+        .await
+        .expect("the mark exists, so the request is not refused");
+    assert_eq!(
+        report.marks_explained, 0,
+        "the mark is hidden, never explained"
+    );
+    assert_eq!(
+        report.hidden_by_holdout.expect("a freeze is open").count,
+        1,
+        "and it is the one hidden mark"
+    );
+}
+
+/// **`hidden` counts only the REQUESTED marks** (R2/CR1 a): a store-wide hidden
+/// mark the caller never named is not counted, and only the requested marks the
+/// fence rejects are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hidden_counts_only_the_requested_marks_the_fence_rejects() {
+    let world = world().await;
+    let bars = m15_bars(&world.store_dir);
+    let before = *bars
+        .iter()
+        .find(|bar| **bar < HOLDOUT_MS)
+        .expect("a bar before the holdout");
+    let at_start = *bars
+        .iter()
+        .find(|bar| **bar == HOLDOUT_MS)
+        .expect("the fixture has a 15m bar at the holdout start");
+    // Two hidden marks live in the store; the request names only one of them.
+    let named_hidden = world.mark(Timeframe::M15, at_start, MarkSide::Long).await;
+    let _unnamed_hidden = world.mark(Timeframe::M15, at_start, MarkSide::Short).await;
+    let shown = world.mark(Timeframe::M15, before, MarkSide::Long).await;
+
+    let report = world
+        .explain(
+            MarkSelection::Ids(vec![named_hidden.id.clone(), shown.id.clone()]),
+            NEVER_RULE,
+            Some(HOLDOUT_MS),
+        )
+        .await
+        .expect("the case explains");
+    assert_eq!(report.marks_explained, 1, "the shown mark explains");
+    assert_eq!(
+        report.hidden_by_holdout.expect("a freeze is open").count,
+        1,
+        "only the REQUESTED hidden mark is counted, never the store's others"
     );
 }
 

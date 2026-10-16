@@ -711,20 +711,51 @@ where
                     message: "markIds must name at least one mark".to_owned(),
                 });
             }
-            let listed =
-                crate::application::example_marks::list_marks(marks, freeze, MarkFilter::default())
-                    .await?;
-            let hidden = listed.hidden_by_holdout.map_or(0, |hidden| hidden.count);
-            // Resolved through the ONE list read, so a withdrawn mark is absent
-            // by construction (Q3) and a mark a freeze covers is hidden, never
-            // explained.
-            let found: Vec<ExampleMark> = ids
-                .iter()
-                .filter_map(|id| listed.marks.iter().find(|mark| &mark.id == id).cloned())
-                .collect();
-            if found.is_empty() {
+            // Resolved per id through the ONE read that answers "does this mark
+            // exist and is it withdrawn" — `ExampleMarkRepository::get`, which
+            // returns the row with its withdrawal state. The store-wide listing is
+            // NOT loaded: `hidden` must count only the REQUESTED marks the fence
+            // rejects, and an id that names no row must be the only `NotFound`.
+            let mut found: Vec<ExampleMark> = Vec::with_capacity(ids.len());
+            let mut hidden: u32 = 0;
+            let mut resolved: usize = 0;
+            let mut missing: Option<String> = None;
+            for id in ids {
+                let Some(stored) = marks.get(id).await? else {
+                    // Names nothing at all — the only id that earns `NotFound`.
+                    missing.get_or_insert_with(|| id.clone());
+                    continue;
+                };
+                resolved = resolved.saturating_add(1);
+                // A withdrawn mark is absent by construction, exactly as the list
+                // read makes it (Q3): the row still exists, so it is not `NotFound`,
+                // but it is never explained and never counted hidden.
+                if stored.is_withdrawn() {
+                    continue;
+                }
+                let mark = stored.mark;
+                // The fence, on the mark's OWN candle, as `list_marks` applies it:
+                // only a requested mark the fence rejects is counted.
+                if let Some(freeze) = freeze
+                    && crate::application::holdout::guard_candle(
+                        Some(freeze),
+                        &mark.pair,
+                        mark.timeframe,
+                        mark.bar_open_ms,
+                    )
+                    .is_err()
+                {
+                    hidden = hidden.saturating_add(1);
+                    continue;
+                }
+                found.push(mark);
+            }
+            // `NotFound` only when NO requested id resolved at all: a selection of
+            // marks the fence hid (or the writer withdrew) still names marks that
+            // exist, and answering "no such mark" for one of them would be false.
+            if resolved == 0 {
                 return Err(ExplainError::Mark(MarkError::NotFound {
-                    mark_id: ids.first().cloned().unwrap_or_default(),
+                    mark_id: missing.or_else(|| ids.first().cloned()).unwrap_or_default(),
                 }));
             }
             Ok((found, hidden))
