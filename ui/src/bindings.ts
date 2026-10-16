@@ -337,6 +337,24 @@ export const commands = {
 	 *  [`streak_card_core`]: crate::tauri::streak_card::streak_card_core
 	 */
 	streakCard: (request: StreakCardRequest) => typedError<StreakCardDto, BusError>(__TAURI_INVOKE("streak_card", { request })),
+	/**
+	 *  `chart_data` — what the Chart tab draws for a pair and timeframe: a window of
+	 *  candles (capped, cut at an open freeze's holdout start) and, when a backtest
+	 *  run is named, that run's trades and one overlay series per S/R, pivot,
+	 *  candle-pattern and EMA operand its version's rule uses on that series
+	 *  (r5.s2.w1, PDR-0036). Every overlay value is the engine's, read exactly as
+	 *  MCP `export_indicators` reads it.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`chart_data_core`]. An unknown run id is a
+	 *  `not_found` refusal; a pair or timeframe the run does not use is a
+	 *  `validation` refusal naming the field; a window over the bar cap is a
+	 *  `validation` refusal naming the cap and the count.
+	 * 
+	 *  [`chart_data_core`]: crate::tauri::chart::chart_data_core
+	 */
+	chartData: (request: ChartDataRequest) => typedError<ChartDataDto, BusError>(__TAURI_INVOKE("chart_data", { request })),
 };
 
 /* Types */
@@ -418,6 +436,18 @@ export type BacktestRunDto = {
 	firstOpenTimeMs: string,
 	/**  Last candle `close_time` of the **reloaded** primary snapshot, epoch ms. */
 	lastCloseTimeMs: string,
+	/**
+	 *  The open freeze's holdout start, epoch ms as an exact integer string;
+	 *  `null` while no freeze is open (r5.s2 close review).
+	 * 
+	 *  This read answers a persisted run with its stored values whatever the fence
+	 *  holds — the freeze's own guard applies to RUNNING a backtest, not to reading
+	 *  a saved result (r4.s1.w4). The boundary travels because the Chart tab fences
+	 *  every trade row at the current holdout start (Q5), and the run read is its
+	 *  first answer about a run: without this it could list a trade whose outcome
+	 *  the freeze withholds.
+	 */
+	holdoutStartMs: string | null,
 	/**  Starting equity, exact decimal string. */
 	startingEquity: string,
 	/**  Taker fee in basis points. */
@@ -807,6 +837,180 @@ export type CertificationSelectionDto = {
 	timeframe: string,
 	/**  The exact immutable snapshot identity (`ADR-0009`'s content hash). */
 	dataVersion: string,
+};
+
+/**  One candle, exactly as stored. */
+export type ChartCandleDto = {
+	/**  Bar open time, epoch ms as an exact integer string. */
+	t: string,
+	/**  Open price, exact decimal string. */
+	o: string,
+	/**  High price, exact decimal string. */
+	h: string,
+	/**  Low price, exact decimal string. */
+	l: string,
+	/**  Close price, exact decimal string. */
+	c: string,
+	/**  Traded base-asset volume, exact decimal string. */
+	v: string,
+};
+
+/**  The chart read's answer. */
+export type ChartDataDto = {
+	/**  The pair these candles belong to. */
+	pair: string,
+	/**  The `Binance` interval text. */
+	timeframe: string,
+	/**
+	 *  The snapshot identity the candles came from — what an agent passes as
+	 *  `data_version` to compare an overlay against `export_indicators` (G2).
+	 */
+	dataVersion: string,
+	/**  The window's candles, ascending. */
+	candles: ChartCandleDto[],
+	/**  The holdout cut, or `null` while no freeze is open. */
+	holdout: ChartHoldoutDto | null,
+	/**  The run layer, or `null` when the read named no run. */
+	run: ChartRunDto | null,
+};
+
+/**  What `chart_data` is asked for. */
+export type ChartDataRequest = {
+	/**  The pair to read (e.g. `BTCUSDT`). */
+	pair: string,
+	/**  The `Binance` interval text (`15m` / `4h` / `1d`). */
+	timeframe: string,
+	/**
+	 *  The window's start, epoch ms as an exact integer string. `null` uses the
+	 *  run's own start, or the data's when no run is named.
+	 */
+	fromMs: string | null,
+	/**
+	 *  The window's end, epoch ms as an exact integer string. `null` uses the
+	 *  run's own end, or the latest bar when no run is named.
+	 */
+	toMs: string | null,
+	/**
+	 *  The backtest run whose trades and overlays to draw. `null` reads candles
+	 *  only — the pair/timeframe case `r5.s3` marks trades on with no run.
+	 */
+	runId: string | null,
+};
+
+/**
+ *  The note that an open freeze cut this read (PDR-0007 / ADR-0028): the holdout
+ *  start and how many candles the cut removed **inside the resolved window**.
+ * 
+ *  The resolved window is an explicit `fromMs`/`toMs`, else the run's own recorded
+ *  window, else — for a read naming no run and no bounds — the whole pinned
+ *  snapshot. It is NOT the capped slice a default pair read hands back: the count
+ *  answers "how many of this window's bars did the fence withhold", which is why a
+ *  read with no window of its own can report bars the returned slice never held.
+ */
+export type ChartHoldoutDto = {
+	/**  The open freeze's holdout start, epoch ms as an exact integer string. */
+	holdoutStartMs: string,
+	/**  How many candles the cut removed inside the resolved window. */
+	barsWithheld: number,
+};
+
+/**
+ *  One overlay series, tagged on `kind` (Q4). The `label` is always the token
+ *  `export_indicators` accepts for the spec its values came from.
+ */
+export type ChartOverlayDto = 
+/**
+ *  An S/R level: one value per window bar, the level as it stood at that bar,
+ *  so the chart draws it stepped and never from a later bar (G3).
+ */
+{ kind: "level"; 
+/**  The engine's token for the level's spec. */
+label: string; 
+/**  One per window bar; `null` where the engine reads no value. */
+values: (string | null)[] } | 
+/**  An EMA line: one value per window bar, `null` while the engine warms up. */
+{ kind: "line"; 
+/**  The engine's token for the EMA's spec. */
+label: string; 
+/**  One per window bar; `null` while warming up. */
+values: (string | null)[] } | 
+/**  A pivot: one event per confirmation. */
+{ kind: "pivot"; 
+/**  The engine's token for the pivot's spec. */
+label: string; 
+/**  The window's confirmations, in bar order. */
+events: ChartPivotEventDto[] } | 
+/**  A named candle pattern: one event per bar whose value is non-zero. */
+{ kind: "pattern"; 
+/**  The engine's token for the pattern's spec. */
+label: string; 
+/**  The window's firings, in bar order. */
+events: ChartPatternEventDto[] };
+
+/**  One candle-pattern event: the bar it fired on and its signed value. */
+export type ChartPatternEventDto = {
+	/**  The bar the pattern fired on, epoch ms as an exact integer string. */
+	time: string,
+	/**  `100` / `-100` (full form) or `80` / `-80` (partial), exact decimal string. */
+	value: string,
+};
+
+/**
+ *  One pivot event: the confirmation bar, the peak `right` bars before it, and
+ *  the confirmed price.
+ */
+export type ChartPivotEventDto = {
+	/**  The bar where the engine's held pivot value changed — its confirmation. */
+	confirmTime: string,
+	/**  The peak bar, `right` bars before `confirm_time` (SPINE G3). */
+	peakTime: string,
+	/**  The confirmed pivot's price, exact decimal string. */
+	price: string,
+};
+
+/**  The run layer — `null` when the read named no run. */
+export type ChartRunDto = {
+	/**  The run the layer describes. */
+	runId: string,
+	/**  The immutable strategy version whose rule the overlays come from. */
+	versionId: string,
+	/**  `primary` / `htf` — the series the overlays were computed on (Q2). */
+	series: string,
+	/**
+	 *  Every stored trade whose entry or exit falls in the DRAWN window — the interval
+	 *  the returned candles occupy — and which ends before an open freeze's holdout
+	 *  start (Q5).
+	 * 
+	 *  A trade that reaches the fence is withheld WHOLE, even when it entered
+	 *  before the holdout start: its exit price, exit reason and realized R were
+	 *  produced inside the withheld period, and the cut withholds those bars.
+	 */
+	trades: ChartTradeDto[],
+	/**  One overlay per drawn spec of the rule on this series. */
+	overlays: ChartOverlayDto[],
+	/**
+	 *  The labels of the rule's other specs on this series — what the tab says it
+	 *  does not draw (Q4; PDR-0011).
+	 */
+	notDrawn: string[],
+};
+
+/**  One of the run's stored trades, as the chart marks it. */
+export type ChartTradeDto = {
+	/**  `long` / `short`. */
+	side: string,
+	/**  Entry fill time, epoch ms as an exact integer string. */
+	entryTime: string,
+	/**  Entry fill price, exact decimal string. */
+	entryPrice: string,
+	/**  Exit fill time, epoch ms as an exact integer string; `null` while open. */
+	exitTime: string | null,
+	/**  Exit fill price, exact decimal string; `null` while open. */
+	exitPrice: string | null,
+	/**  The stored exit reason (`stop_loss`, `take_profit`, …); `null` while open. */
+	exitReason: string | null,
+	/**  Realized R multiple, exact decimal string. */
+	realizedR: string,
 };
 
 /**

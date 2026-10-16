@@ -59,6 +59,9 @@ use super::backtest::{
     backtest_run_dto,
 };
 use super::certification::{CertificationRecordsDto, CertificationRecordsRequest};
+// r5.s2.w1: the Chart tab's read — a window of candles and, for a run, its trades
+// and its rule's overlays (PDR-0036).
+use super::chart::{ChartDataDto, ChartDataRequest};
 use super::coach::{
     CoachDecisionDto, CoachDecisionRequestDto, CoachSessionDto, CoachTurnRequestDto, summary_dto,
 };
@@ -152,6 +155,9 @@ pub const BUS_COMMANDS: &[&str] = &[
     "certification_records",
     // r5.s4.w1: the streak and drawdown card's read (PDR-0035 Q4).
     "streak_card",
+    // r5.s2.w1: the Chart tab's read — a window of candles and, for a run, its
+    // trades and its rule's overlays (PDR-0036).
+    "chart_data",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1420,7 +1426,7 @@ pub async fn run_backtest_version_core(
     // refuses, and the refusal still names the run that exists. `uses_htf` comes
     // from the version's own DSL, not from the recorded inputs (#219).
     let uses_htf = run_uses_htf(&strategies, &version_id).await;
-    Ok(backtest_run_dto(&outcome, uses_htf)?)
+    Ok(backtest_run_dto(&outcome, uses_htf, holdout)?)
 }
 
 /// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).
@@ -1805,6 +1811,30 @@ pub async fn streak_card(
     request: StreakCardRequest,
 ) -> Result<StreakCardDto, BusError> {
     state.post("/api/v1/streak-card", &request).await
+}
+
+/// `chart_data` — what the Chart tab draws for a pair and timeframe: a window of
+/// candles (capped, cut at an open freeze's holdout start) and, when a backtest
+/// run is named, that run's trades and one overlay series per S/R, pivot,
+/// candle-pattern and EMA operand its version's rule uses on that series
+/// (r5.s2.w1, PDR-0036). Every overlay value is the engine's, read exactly as
+/// MCP `export_indicators` reads it.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`chart_data_core`]. An unknown run id is a
+/// `not_found` refusal; a pair or timeframe the run does not use is a
+/// `validation` refusal naming the field; a window over the bar cap is a
+/// `validation` refusal naming the cap and the count.
+///
+/// [`chart_data_core`]: crate::tauri::chart::chart_data_core
+#[tauri::command]
+#[specta::specta]
+pub async fn chart_data(
+    state: tauri::State<'_, ClientState>,
+    request: ChartDataRequest,
+) -> Result<ChartDataDto, BusError> {
+    state.post("/api/v1/chart", &request).await
 }
 
 // ---------------------------------------------------------------------------

@@ -110,6 +110,7 @@ export type NavIconName =
   | "tree"
   | "chat"
   | "chart"
+  | "candle"
   | "play"
   | "book"
   | "graph"
@@ -149,6 +150,17 @@ export function NavIcon({ name }: { name: NavIconName }) {
         <svg {...ICON_SVG_PROPS} viewBox="0 0 16 16">
           <path d="M2 13 L2 3 M2 13 L14 13" />
           <path d="M4 11 L7 7 L9 9 L13 4" />
+        </svg>
+      );
+    case "candle":
+      // r5.s2.w2: the Chart tab's row, ported from the mock's own `candle` case
+      // (`docs/design/mock/app-shell.jsx`). The Backtest Lab keeps `chart`: the two
+      // are different destinations and one icon for both would read as one screen.
+      return (
+        <svg {...ICON_SVG_PROPS} viewBox="0 0 16 16">
+          <path d="M4.5 2 V14 M11.5 3 V13" />
+          <rect x="3" y="5" width="3" height="5" rx="0.5" />
+          <rect x="10" y="6" width="3" height="4" rx="0.5" fill="currentColor" />
         </svg>
       );
     case "play":
@@ -212,6 +224,9 @@ export const NAV_MAIN: readonly NavEntry[] = [
   { id: "library", label: "Strategy Library", icon: "tree" },
   { id: "designer", label: "Strategy Designer", icon: "chat" },
   { id: "backtest", label: "Backtest Lab", icon: "chart" },
+  // r5.s2.w2: the Chart tab, right after the Lab that opens it (the mock's own order).
+  // The row's "Soon" badge disappears by derivation once its ROUTES entry lands (G8).
+  { id: "chart", label: "Chart", icon: "candle" },
   { id: "deploy", label: "Deployment Dashboard", icon: "play" },
   { id: "journal", label: "Trade Journal", icon: "book" },
   { id: "analytics", label: "Analytics", icon: "graph", tier: "v3" },

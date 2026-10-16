@@ -169,6 +169,7 @@ const SEEDED_RUN: BacktestRunDto = {
   usesHtf: true,
   firstOpenTimeMs: "1735689600000",
   lastCloseTimeMs: "1756684800000",
+  holdoutStartMs: null,
   startingEquity: "10000.00",
   takerFeeBps: "4.0000",
   slippageBps: "2.0000",
@@ -3303,5 +3304,21 @@ describe("BacktestLabScreen (#269 — the certification deep link)", () => {
     });
     expect((screen.getByRole("combobox") as HTMLInputElement).value).toContain("ver-seco");
     expect(screen.queryByText(LINK_WF)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r5.s2.w2 — the run detail opens in the Chart tab
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (r5.s2.w2 — the run detail's Open in Chart link)", () => {
+  it("links the run's own id to the Chart tab's deep link", async () => {
+    // The Lab hands the run over by ID, the way the Library hands a walk-forward run
+    // to the Lab (#269): a fragment the Chart tab reads, never shared state. The tab
+    // then reads the run for its pair, both timeframes and its span.
+    const container = await renderRun(SEEDED_RUN);
+
+    const link = within(container).getByRole("link", { name: /open in chart/i });
+    expect(link.getAttribute("href")).toBe(`#/chart?run=${SEEDED_RUN.runId}`);
   });
 });

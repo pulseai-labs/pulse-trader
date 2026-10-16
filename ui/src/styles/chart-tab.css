@@ -1,0 +1,169 @@
+/* ============================================================
+   PulseTrader — Chart tab (r5.s2.w2)
+   The screen's own sheet, loaded after the shell sheets it builds on.
+
+   NAMING: `chart-tab.css`, never the mock's `chart.css`. `check-design-system.sh`
+   forbids porting a mock sheet by name, and this repo's precedent is the same one
+   `backtest.css` follows against the mock's `backtest-lab.css`.
+
+   THE PALETTE. The chart draws on a canvas, so the adapter needs colour VALUES and
+   reads these ten aliases off the element the chart is mounted in (`palette.ts`).
+   Every alias is an alias of a hue `tokens.css` already owns, and `--focus` is never
+   one of them: focus blue is the selection colour, not an indicator colour
+   (PDR-0031). The brief asks for no new colours, and these add none — they only name
+   which existing hue means what on a chart. Server-computed layers are dashed, which
+   the adapter sets, not this sheet.
+   ============================================================ */
+
+.cw {
+  /* the chart's palette — ten aliases, each `var()` of an existing hue */
+  --chart-bg: var(--bg-raised);
+  --chart-text: var(--text-2);
+  --chart-grid: var(--line-1);
+  --chart-bull: var(--bull-1);
+  --chart-bear: var(--bear-1);
+  --chart-open: var(--warn-1);
+  --chart-server-line: var(--text-2);
+  --chart-server-level: var(--text-3);
+  --chart-pivot: var(--text-2);
+  --chart-pivot-ghost: var(--text-4);
+
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-height: 0;
+}
+
+/* ---- toolbar ---- */
+.cw-tool {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+.cw-tool-lab {
+  font-size: var(--fs-11);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.cw-ctx {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+
+/* ---- the chart itself ---- */
+.cw-canvas {
+  flex: 1 1 auto;
+  min-height: 360px;
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-6);
+  background: var(--bg-raised);
+  /* The library's attribution logo sits in this box's bottom-left corner and must
+     never be covered (grill Q6). Nothing in this sheet overlays the canvas. */
+  overflow: hidden;
+}
+
+/* ---- the plain states and notes ---- */
+.cw-msg {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-6);
+  background: var(--bg-raised);
+  font-size: var(--fs-13);
+  color: var(--text-2);
+}
+.cw-msg[role="alert"] {
+  border-color: var(--bear-line);
+  background: var(--bear-bg);
+  color: var(--text-1);
+}
+.cw-notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.cw-note {
+  margin: 0;
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+.cw-note b {
+  color: var(--text-2);
+  font-weight: var(--fw-medium);
+}
+
+/* ---- the trade strip and the table copy ---- */
+.cw-strip,
+.cw-data {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 0;
+}
+.cw-scroll {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-6);
+}
+.cw-tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-13);
+}
+.cw-tbl caption {
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+.cw-tbl th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-overlay);
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-11);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.cw-tbl td {
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--line-1);
+  white-space: nowrap;
+  color: var(--text-2);
+}
+.cw-tbl tr.is-on td {
+  background: var(--bg-overlay);
+  color: var(--text-1);
+}
+.cw-tbl tr[data-side="long"] td:first-child {
+  color: var(--bull-1);
+}
+.cw-tbl tr[data-side="short"] td:first-child {
+  color: var(--bear-1);
+}
+.cw-row-btn {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  width: 100%;
+}
+.cw-row-btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.cw-data summary {
+  cursor: pointer;
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  padding: var(--sp-1) 0;
+}

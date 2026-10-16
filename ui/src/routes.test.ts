@@ -12,12 +12,13 @@ import {
   DEFAULT_NAV_ID,
   ROUTES,
   backtestDeepLink,
+  chartDeepLink,
   isNavBuilt,
   resolveNavId,
   resolveRoute,
 } from "./routes";
 
-const KNOWN_NAV_IDS = ["library", "designer", "backtest", "deploy", "journal", "analytics", "settings", "help"];
+const KNOWN_NAV_IDS = ["library", "designer", "backtest", "chart", "deploy", "journal", "analytics", "settings", "help"];
 
 describe("resolveNavId (fragment normalization)", () => {
   it("normalizes an empty fragment to the default nav", () => {
@@ -120,5 +121,28 @@ describe("backtestDeepLink (#269)", () => {
     expect(backtestDeepLink("#/backtest?wf=")).toBeNull();
     expect(backtestDeepLink("#/library?wf=wf-1")).toBeNull();
     expect(backtestDeepLink("")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r5.s2.w2 — the Chart tab's deep link (`#/chart?run=<id>`)
+// ---------------------------------------------------------------------------
+
+describe("chartDeepLink (r5.s2.w2)", () => {
+  it("reads the backtest run the Chart tab's fragment names", () => {
+    expect(chartDeepLink("#/chart?run=39486572")).toEqual({ run: "39486572" });
+  });
+
+  it("is null for every fragment that does not ask for one", () => {
+    expect(chartDeepLink("#/chart")).toBeNull();
+    expect(chartDeepLink("#/chart?run=")).toBeNull();
+    expect(chartDeepLink("#/backtest?run=run-1")).toBeNull();
+    expect(chartDeepLink("")).toBeNull();
+  });
+
+  it("resolves to the chart nav row with its query still attached", () => {
+    // The tab reads its own fragment; the shell reads only the nav id, and the
+    // query is not part of it (#269's rule, applied to the second deep link).
+    expect(resolveNavId("#/chart?run=39486572", KNOWN_NAV_IDS)).toBe("chart");
   });
 });
