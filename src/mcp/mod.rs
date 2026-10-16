@@ -154,7 +154,14 @@ impl ServerHandler for PulseMcp {
              certify_version (one call = one hypothesis — walk a version \
              forward under wf-v2 on the search span, judge its ONE holdout \
              backtest with the C1 test at the open freeze's budget H, and \
-             record it; the answer carries no holdout number). The \
+             record it; the answer carries no holdout number). Example-mark \
+             tools: write_mark, list_marks and withdraw_mark mark candles as \
+             reference trades, and explain_marks reports which of a candidate \
+             rule's conditions held at each mark's evaluation bar with the \
+             operand values and the 17 candle-pattern values at the marked \
+             candle — the truth the backtest's entry gate sees there, so an \
+             agent can propose a rule every example satisfies and then \
+             backtest it. The \
              pulse://dsl/schema resource carries the DSL grammar.",
         )
     }

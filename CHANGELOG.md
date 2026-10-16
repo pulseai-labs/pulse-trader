@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`explain_marks`: which of a rule's conditions held at each example trade's bar
+  (r5.s3.w2, PDR-0037 Q5, ADR-0031).** An agent driving Claude Code through `pulse mcp` can now
+  take the trader's example marks and a candidate rule and read, for every mark, **every conjunct of
+  `entry AND filters`** — with `held`, `not_held` or `not_warm`, the operand values behind each
+  answer, and the **17 candle-pattern values** at the marked candle — then propose a 3- or
+  four-condition rule every example satisfies, submit it and backtest it. The truth it reports is
+  **the truth the backtest's entry gate sees at that bar**: the tool reaches no evaluator of its own,
+  it builds the same `EngineSession` a run builds, steps it with the same feed loop, and reads each
+  conjunct through that session's read-only probe. A `15m` mark is explained at its own bar; a `4h`
+  or `1d` mark at the first `15m` bar opening at that candle's close. **No engine is stepped onto a
+  candle at or after an open freeze's holdout start**, and a mark whose evaluation bar opens there is
+  hidden and counted under `hidden_by_holdout`, never explained. The response also names
+  `held_by_every_mark` — the conjuncts no example rules out — and reports any mark it could not
+  explain under `refusals` with a typed reason rather than dropping it. The rule is an inline DSL
+  document (validated exactly as `submit_strategy_version` validates one, and never stored) or a
+  stored `version_id`. The backtest adapter gains an additive, read-only seam for it: `EvalProbe`,
+  `step_series` and `indicator_values_at`. **No backtest output changes** — the engine fingerprint's
+  value moves with the engine source set, and every golden, the `b8e91b89…` pin and the trade logs
+  stay exactly where they were.
+
 - **Example trades: marks on the chart, and the fence that keeps them out of the holdout
   (r5.s3.w1, PDR-0037, ADR-0031).** A trader can now mark a candle as an **example trade** — a
   reference trade, never an order — and an agent can write the same mark through `pulse mcp`,
