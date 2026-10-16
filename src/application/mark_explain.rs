@@ -715,7 +715,9 @@ where
             // exist and is it withdrawn" — `ExampleMarkRepository::get`, which
             // returns the row with its withdrawal state. The store-wide listing is
             // NOT loaded: `hidden` must count only the REQUESTED marks the fence
-            // rejects, and an id that names no row must be the only `NotFound`.
+            // rejects. An id that names no row is a refusal, even when sibling ids
+            // resolved, so `NotFound` is no longer reserved for the all-missing
+            // case.
             let mut found: Vec<ExampleMark> = Vec::with_capacity(ids.len());
             let mut hidden: u32 = 0;
             let mut resolved: usize = 0;

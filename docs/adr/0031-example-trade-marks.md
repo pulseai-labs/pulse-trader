@@ -125,13 +125,13 @@ telling a trader their mark had vanished.
   `guard_span` in `src/application/holdout.rs`; the freeze tables, `certify` and the holdout test are
   untouched.
 - **Determinism is held, though it is not a gated surface here.** The engine fingerprint's **value** does
-  move: this spine rewrites `src/adapters/backtest/session.rs` and `engine.rs`, both roots in
-  `build_support/engine_source_set.rs`'s `ENGINE_SOURCE_ROOTS`, and the fingerprint is persisted to
-  `backtest_run.engine_fingerprint`. Adding the read-only `EvalProbe` seam and correcting its warm clause
-  each change a hashed engine source file, so the fingerprint's value follows the engine source set. **No
-  backtest golden, pinned hash, fixture or trade log moves**: a mark is a stored reference trade, read by no
-  engine, and the engine's own results are unchanged. The `b8e91b89…` determinism pin is a run-content hash,
-  not the fingerprint, and it holds.
+  move: this spine rewrites `src/adapters/backtest/session.rs` and `engine.rs`, both under the
+  `src/adapters/backtest` root of `build_support/engine_source_set.rs`'s `ENGINE_SOURCE_ROOTS`, and the
+  fingerprint is persisted to `backtest_run.engine_fingerprint`. Adding the read-only `EvalProbe` seam and
+  correcting its warm clause each change a hashed engine source file, so the fingerprint's value follows the
+  engine source set. **No backtest golden, pinned hash, fixture or trade log moves**: a mark is a stored
+  reference trade, read by no engine, and the engine's own results are unchanged. The `b8e91b89…`
+  determinism pin is a run-content hash, not the fingerprint, and it holds.
 
 ## Sources
 
