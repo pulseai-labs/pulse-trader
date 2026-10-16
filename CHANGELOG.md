@@ -40,9 +40,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   explain under `refusals` with a typed reason rather than dropping it. The rule is an inline DSL
   document (validated exactly as `submit_strategy_version` validates one, and never stored) or a
   stored `version_id`. The backtest adapter gains an additive, read-only seam for it: `EvalProbe`,
-  `step_series` and `indicator_values_at`. **No backtest output changes** — the engine fingerprint's
-  value moves with the engine source set, and every golden, the `b8e91b89…` pin and the trade logs
-  stay exactly where they were.
+  `step_series` and `indicator_values_at`. **The engine fingerprint's value moves** — this spine rewrites
+  `src/adapters/backtest/session.rs`, a root in `build_support/engine_source_set.rs`'s `ENGINE_SOURCE_ROOTS`
+  source set — while no backtest output changes: every golden, the `b8e91b89…` pin and the trade logs stay
+  exactly where they were.
 
 - **Example trades: marks on the chart, and the fence that keeps them out of the holdout
   (r5.s3.w1, PDR-0037, ADR-0031).** A trader can now mark a candle as an **example trade** — a
