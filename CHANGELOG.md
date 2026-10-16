@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Example trades on the Chart tab: mark a candle, and read the marks back
+  (r5.s3.w3, PDR-0037, ADR-0031).** A trader can now arm **"Mark example"**, choose Long or Short,
+  type a setup label (kept for the next mark) and an optional note, and **click a candle** — the
+  mark is written through w1's `write_mark` and drawn on the bar it belongs to, in a plain square
+  below a long example and above a short one. **An agent's mark is drawn apart**, in the AI purple,
+  and the marks table names each writer: the trader by the app token's label, an agent by its own
+  name marked **(self-reported)** (PDR-0015). The table lists every stored field — UTC time, side,
+  setup, note, writer — carries a **Withdraw** per row, and centres the chart on a mark whose row is
+  clicked; it says plainly how many marks live on another timeframe and how many the holdout is
+  hiding. **A refused write says why** (holdout, no candle, invalid field) instead of failing
+  silently, and the control and the caption both read **"Reference — not an order"** (PDR-0037). The
+  adapter gains the click seam and the marks layer; a click resolves to the **containing** candle's
+  open and a click outside the loaded bars is ignored, so a mark can never land on a bar the trader
+  did not point at. No Rust, no route, no bus command and no binding changes: the UI is the whole of
+  this item.
+
 - **`explain_marks`: which of a rule's conditions held at each example trade's bar
   (r5.s3.w2, PDR-0037 Q5, ADR-0031).** An agent driving Claude Code through `pulse mcp` can now
   take the trader's example marks and a candidate rule and read, for every mark, **every conjunct of

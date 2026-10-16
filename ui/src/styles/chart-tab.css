@@ -16,7 +16,7 @@
    ============================================================ */
 
 .cw {
-  /* the chart's palette — ten aliases, each `var()` of an existing hue */
+  /* the chart's palette — twelve aliases, each `var()` of an existing hue */
   --chart-bg: var(--bg-raised);
   --chart-text: var(--text-2);
   --chart-grid: var(--line-1);
@@ -27,6 +27,11 @@
   --chart-server-level: var(--text-3);
   --chart-pivot: var(--text-2);
   --chart-pivot-ghost: var(--text-4);
+  /* The example-trade marks (r5.s3.w3). A trader's mark is a neutral text token;
+     an agent's is the AI purple (G5). Neither is `--focus`: focus blue is the
+     selection colour, not an indicator colour (PDR-0031). */
+  --chart-mark-trader: var(--text-1);
+  --chart-mark-agent: var(--ai-1);
 
   display: flex;
   flex-direction: column;
@@ -54,6 +59,83 @@
   gap: var(--sp-2);
   font-size: var(--fs-12);
   color: var(--text-2);
+}
+
+/* ---- the example-trade marks' controls (r5.s3.w3) ---- */
+.cw-markbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-6);
+  background: var(--bg-raised);
+}
+.cw-markfield {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-11);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.cw-markinput {
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-4);
+  background: var(--bg-overlay);
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  min-width: 180px;
+}
+.cw-markarm {
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-4);
+  background: var(--bg-overlay);
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  cursor: pointer;
+}
+.cw-markarm.is-on {
+  border-color: var(--text-2);
+  color: var(--text-1);
+}
+.cw-markarm:disabled {
+  color: var(--text-4);
+  cursor: default;
+}
+.cw-markarm:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.cw-markhint {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+.cw-markwithdraw {
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-4);
+  background: transparent;
+  color: var(--text-3);
+  font-size: var(--fs-12);
+  cursor: pointer;
+}
+.cw-markwithdraw:hover {
+  color: var(--text-1);
+}
+.cw-markwithdraw:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+/* An agent's mark is the AI purple, on the chart and in the table alike (G5). */
+.cw-marks tr.is-agent td:nth-child(2),
+.cw-marks tr.is-agent td:nth-child(5) {
+  color: var(--ai-1);
 }
 
 /* ---- the chart itself ---- */
