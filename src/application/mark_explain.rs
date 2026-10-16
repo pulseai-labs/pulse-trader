@@ -585,13 +585,6 @@ fn push_compiled<'a>(condition: &'a CompiledCondition, out: &mut Vec<&'a Compile
     }
 }
 
-/// The operand leaves to report for one conjunct.
-///
-/// A `Compare` reports its two sides' current values; a cross reports both sides
-/// on the current AND the prior bar; a `Rising`/`Falling` reports the value and
-/// its lagged twin (it compiles to exactly `Compare{value, Gt|Lt,
-/// lag(value, bars)}`, `compile.rs`), labelled with the existing `lag(...)`
-/// spelling. A nested `Or`/`Not` reports state only — the spec's rule.
 /// The validator's every field error as text — the SAME shape
 /// `submit_strategy_version` reports to an agent, so one rule refused by one
 /// validator reads the same on both surfaces.
@@ -648,6 +641,13 @@ fn operand_label(value: &ValueSource) -> String {
     }
 }
 
+/// The operand leaves to report for one conjunct.
+///
+/// A `Compare` reports its two sides' current values; a cross reports both sides
+/// on the current AND the prior bar; a `Rising`/`Falling` reports the value and
+/// its lagged twin (it compiles to exactly `Compare{value, Gt|Lt,
+/// lag(value, bars)}`, `compile.rs`), labelled with the existing `lag(...)`
+/// spelling. A nested `Or`/`Not` reports state only — the spec's rule.
 fn operand_pairs(
     dsl: &Condition,
     compiled: &CompiledCondition,
