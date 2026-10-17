@@ -20,8 +20,9 @@
 //! check, before any candle is loaded (G2); `list_marks` hides and counts the
 //! marks it covers; and `withdraw_mark` applies the same single-candle refusal
 //! AFTER its `not_found`, `already_withdrawn` and `not_writer` checks and before
-//! it withdraws anything, so an agent learns nothing about another writer's mark
-//! (#440, PDR-0039).
+//! it withdraws anything, so the fence's refusal never answers an agent about
+//! another writer's mark — a mark it did not write is answered `not_writer`, not
+//! the holdout refusal (#440, PDR-0039).
 //!
 //! **Wire shape.** camelCase; times cross as millisecond integer strings, counts
 //! as `u32` (specta refuses `i64`/`u64`). The refusal codes the routes answer with

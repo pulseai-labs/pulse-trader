@@ -81,8 +81,10 @@ evaluation bar opens at or after the holdout start, and steps no engine onto a c
 `withdraw_mark` applies the **same** `guard_candle` refusal a write gets, so a mark the fence covers cannot
 be withdrawn while the freeze is open; but it applies it **after** its `not_found`, `already_withdrawn` and
 `not_writer` checks and **before** it withdraws anything — the order is the decision, not an accident: an
-agent's refusal for another writer's fenced mark is `not_writer` alone, so the fence cannot become a way to
-learn where another writer's mark sits against the holdout. A fenced mark is not withdrawn, no DTO field of
+agent's refusal for a mark it did not write is `not_writer` and never the holdout refusal, so the fence
+cannot become a way to learn where another writer's mark sits against the holdout. (The `already_withdrawn`
+check precedes both, as it always has, so an agent can still tell that another writer's mark was withdrawn;
+that observable is pre-existing and carries nothing about the holdout.) A fenced mark is not withdrawn, no DTO field of
 it is returned, and the refusal that comes back is the write path's own — its text names the mark's pair
 and the holdout start, exactly as a refused write's does, and nothing else about the mark (#440, PDR-0039).
 

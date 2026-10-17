@@ -845,11 +845,12 @@ async fn an_agent_withdraws_its_own_mark_over_mcp_and_only_its_own() {
 
 /// #440 (PDR-0039): a withdraw reads the open freeze inside the call it serves,
 /// so a mark whose candle reaches the holdout start is refused with the SAME
-/// `holdout` refusal a write gets — and none of that mark's fields cross the wire.
+/// `holdout` refusal a write gets — and no DTO field of that mark crosses the wire.
 ///
 /// The order is part of the contract: `NotFound` → `AlreadyWithdrawn` →
 /// `NotWriter` → the fence → the withdraw. An agent that reaches for another
-/// writer's fenced mark therefore learns only `not_writer`.
+/// writer's un-withdrawn mark therefore gets `not_writer`, never the holdout
+/// refusal — the fence never says where a mark it may not touch sits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_app_withdraw_refuses_a_fenced_mark_for_the_holdout() {
     let server = spawn_server(ServerOptions::default()).await;
@@ -902,7 +903,7 @@ async fn the_app_withdraw_refuses_a_fenced_mark_for_the_holdout() {
     ] {
         assert!(
             body.get(field).is_none(),
-            "no field of a fenced mark crosses the wire, but `{field}` did: {body}"
+            "no DTO field of a fenced mark is in the refusal body, but `{field}` was: {body}"
         );
     }
 
@@ -940,9 +941,9 @@ async fn the_app_withdraw_refuses_a_fenced_mark_for_the_holdout() {
     );
     assert_eq!(body["markId"], clear);
 
-    // (e) An agent reaching for another writer's FENCED mark learns only
-    // `not_writer` — never the holdout, which would say something about a mark
-    // that is not its own.
+    // (e) An agent reaching for another writer's FENCED mark gets `not_writer` —
+    // never the holdout refusal, which would say something about a mark that is
+    // not its own. This is the test that pins the guard's PLACE in the order.
     let error = withdraw_mark_core(
         &state,
         MarkWriter {
@@ -1015,7 +1016,7 @@ async fn an_agent_withdraw_refuses_a_fenced_mark_for_the_holdout() {
     ] {
         assert!(
             refused.get(field).is_none(),
-            "no field of a fenced mark crosses: `{field}` did: {refused}"
+            "no DTO field of a fenced mark is in the refusal body: `{field}` was: {refused}"
         );
     }
 

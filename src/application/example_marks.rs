@@ -221,11 +221,14 @@ where
 /// a refused withdraw withdraws nothing and returns no DTO field of the mark.
 /// (The refusal's own text names the mark's pair and the holdout start, as a
 /// refused write's does; it carries nothing else about the mark.) Putting the
-/// guard after `NotWriter` is what keeps the refusal from
-/// saying anything about another writer's mark: an agent that reaches for a mark
-/// it did not write learns only that the mark is not its own, never where that
-/// mark sits against the holdout. A trader, who may withdraw any mark, gets the
-/// holdout refusal.
+/// guard after `NotWriter` is what keeps the FENCE's refusal out of another
+/// writer's hands: an agent that reaches for a mark it did not write is answered
+/// `NotWriter` and never the holdout refusal, so the fence can never tell it
+/// where that mark sits against the holdout. The `AlreadyWithdrawn` check runs
+/// before both, as it always has, so an agent can still learn that another
+/// writer's mark was withdrawn — a pre-existing observable that says nothing
+/// about the holdout and that this change does not alter. A trader, who may
+/// withdraw any mark the fence does not cover, gets the holdout refusal.
 ///
 /// # Errors
 ///
