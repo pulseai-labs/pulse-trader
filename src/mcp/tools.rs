@@ -1964,7 +1964,7 @@ impl PulseMcp {
     /// refuses a fenced mark for the holdout — after its `not_writer` check, so
     /// nothing is learned about another writer's mark.
     #[tool(
-        description = "Withdraw one example mark by id. A withdraw is ONE-WAY and the mark's row stays stored: the mark leaves every list, and a second withdraw is refused. This tool acts as the agent this session identified as, so it withdraws only marks that agent wrote — another writer's mark is refused, and the app's own trader is the surface that withdraws any mark. A mark whose candle reaches the open freeze's holdout start is REFUSED (the candle closes after the holdout begins) and nothing of that mark is returned; it stays hidden until the freeze closes."
+        description = "Withdraw one example mark by id. A withdraw is ONE-WAY and the mark's row stays stored: the mark leaves every list, and a second withdraw is refused. This tool acts as the agent this session identified as, so it withdraws only marks that agent wrote — another writer's mark is refused, and the app's own trader is the surface that withdraws any mark. A mark whose candle reaches the open freeze's holdout start is REFUSED (the candle closes after the holdout begins) and no field of that mark is returned, only the shared holdout refusal naming its pair and the holdout start; it stays hidden until the freeze closes."
     )]
     async fn withdraw_mark(
         &self,

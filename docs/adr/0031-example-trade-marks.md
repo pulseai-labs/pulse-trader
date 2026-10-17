@@ -54,8 +54,9 @@ holdout start where no candle exists is refused for the holdout reason, never fo
 
 **Marks are immutable, and a withdraw is one-way.** A mark is never edited. It can be withdrawn once; the
 row stays stored, and the withdrawal is a second row that records who took it back and when. The trader —
-the app — may withdraw any mark; an agent may withdraw only a mark it wrote (PDR-0037 Q3). The reads hide a
-withdrawn mark; nothing deletes one.
+the app — may withdraw any mark **the open freeze does not cover**; an agent may withdraw only a mark it
+wrote, and only one the freeze does not cover either (PDR-0037 Q3, PDR-0039). The reads hide a withdrawn
+mark; nothing deletes one.
 
 **One use case writes the table (G1).** `application::example_marks::write_mark` is the only code that
 inserts an `example_mark` row, and both writers reach it: the app's `POST /api/v1/marks`, and the
@@ -81,8 +82,9 @@ evaluation bar opens at or after the holdout start, and steps no engine onto a c
 be withdrawn while the freeze is open; but it applies it **after** its `not_found`, `already_withdrawn` and
 `not_writer` checks and **before** it withdraws anything — the order is the decision, not an accident: an
 agent's refusal for another writer's fenced mark is `not_writer` alone, so the fence cannot become a way to
-learn where another writer's mark sits against the holdout. A fenced mark is not withdrawn and none of its
-fields are returned (#440, PDR-0039).
+learn where another writer's mark sits against the holdout. A fenced mark is not withdrawn, no DTO field of
+it is returned, and the refusal that comes back is the write path's own — its text names the mark's pair
+and the holdout start, exactly as a refused write's does, and nothing else about the mark (#440, PDR-0039).
 
 **The writer is honest, and it is never a request member (G5, PDR-0015).** A trader mark is named by the app
 token's **label** — never the token, which is stored nowhere and logged nowhere. An agent mark is named by

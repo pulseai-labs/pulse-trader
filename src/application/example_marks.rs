@@ -217,9 +217,11 @@ where
 /// The order is `NotFound` → `AlreadyWithdrawn` → `NotWriter` → the holdout
 /// guard → the withdraw, and the guard's place is deliberate: a mark a freeze
 /// covers is a mark `list_marks` hides and counts and `explain_marks` refuses,
-/// so withdrawing one is refused with the SAME `holdout` refusal a write gets,
-/// and a refused withdraw withdraws nothing and returns none of the mark's
-/// fields. Putting the guard after `NotWriter` is what keeps the refusal from
+/// so withdrawing one is refused with the SAME `holdout` refusal a write gets:
+/// a refused withdraw withdraws nothing and returns no DTO field of the mark.
+/// (The refusal's own text names the mark's pair and the holdout start, as a
+/// refused write's does; it carries nothing else about the mark.) Putting the
+/// guard after `NotWriter` is what keeps the refusal from
 /// saying anything about another writer's mark: an agent that reaches for a mark
 /// it did not write learns only that the mark is not its own, never where that
 /// mark sits against the holdout. A trader, who may withdraw any mark, gets the

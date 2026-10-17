@@ -591,8 +591,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a write uses (`guard_candle` → the `holdout` refusal), and it applies that guard **after** its
   `not_found`, `already_withdrawn` and `not_writer` checks and **before** it withdraws anything —
   so an agent that reaches for another writer's fenced mark still learns only `not_writer`, never
-  anything about where that mark sits against the holdout. A fenced mark is not withdrawn and none
-  of its fields come back. **Known limit:** a mark inside an open holdout cannot be withdrawn until
+  anything about where that mark sits against the holdout. A fenced mark is not withdrawn, and no DTO
+  field of it comes back: the refusal is the write path's own `holdout` refusal, whose text names the
+  mark's pair and the holdout start and nothing else about the mark. **Known limit:** a mark inside an
+  open holdout cannot be withdrawn until
   the freeze closes; its row stays stored and the list keeps hiding and counting it, so nothing is
   lost. ADR-0031's fence paragraph now names **every** edge that exists — all four MCP mark tools
   and all three app mark cores — and says what each does with the freeze; no decision that ADR

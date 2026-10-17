@@ -294,7 +294,9 @@ pub async fn list_marks_core(
 /// The open freeze is read HERE, inside the call this core serves, and handed to
 /// the use case exactly as `write_mark_core` and `list_marks_core` hand it down
 /// (#440, PDR-0039): a mark whose candle reaches the holdout start is refused
-/// with the same `holdout` refusal a write gets, and none of its fields come back.
+/// with the same `holdout` refusal a write gets, and no DTO field of it comes
+/// back — the refusal's text names the mark's pair and the holdout start, exactly
+/// as a refused write's does.
 ///
 /// # Errors
 ///
