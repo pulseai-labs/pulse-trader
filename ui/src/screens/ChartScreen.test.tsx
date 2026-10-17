@@ -919,6 +919,56 @@ describe("the holdout fence over the tab's trades", () => {
     expect(within(table).getAllByRole("button")).toHaveLength(2);
     expect(within(table).getByText("2025-04-14 00:00 UTC")).toBeTruthy();
   });
+
+  it("says the holdout withheld the rows when the server sent none (#417)", async () => {
+    // The server now withholds every trade that reaches H, so a run whose EVERY
+    // trade is withheld arrives with `trades` empty and `withheldTradeCount`
+    // naming what was left out. Without that count the tab's own filter sees an
+    // empty list it cannot explain and prints "The run recorded no trades." — a
+    // sentence about a run that traded, and the exact wrong sentence PDR-0011
+    // forbids.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          primaryTimeframe: "15m",
+          htfTimeframe: null,
+          usesHtf: false,
+          holdoutStartMs: String(HOLDOUT),
+          withheldTradeCount: 2,
+          totalsWithheld: true,
+          trades: [],
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+
+    const table = await screen.findByRole("table", { name: "Trades in the run" });
+    expect(
+      within(table).getByText("This run's stored trades reach the holdout and are withheld."),
+    ).toBeTruthy();
+    expect(within(table).queryByText("The run recorded no trades.")).toBeNull();
+  });
+
+  it("still says the run recorded no trades when the server withheld nothing (#417)", async () => {
+    // The control: an empty run with no freeze is still an empty run.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          primaryTimeframe: "15m",
+          htfTimeframe: null,
+          usesHtf: false,
+          holdoutStartMs: null,
+          withheldTradeCount: 0,
+          totalsWithheld: false,
+          trades: [],
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+
+    const table = await screen.findByRole("table", { name: "Trades in the run" });
+    expect(within(table).getByText("The run recorded no trades.")).toBeTruthy();
+  });
 });
 
 // ---------------------------------------------------------------------------

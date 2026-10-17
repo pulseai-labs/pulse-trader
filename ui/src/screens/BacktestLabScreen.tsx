@@ -1996,12 +1996,16 @@ function TradeTable({ trades, runId, dto }: { trades: TradeRowDto[]; runId: stri
           count is short. The TOTALS sentence belongs to the totals block above
           (the ruling puts it "in place of the totals"); this is the row-level
           note, in the Chart tab's own shape for the same fact — "n marks hidden:
-          inside the holdout". */}
+          inside the holdout".
+          The count covers every row the fence rejected, INCLUDING a straddling
+          trade (entry before H, exit at or after it), so the wording is "reaching
+          the holdout" — the same phrase the Chart tab's own sentence uses — and
+          never "inside", which would name only the trades that OPEN there. */}
       {dto.withheldTradeCount > 0 && (
         <p className="bt-withheld-rows" role="note">
           {`${dto.withheldTradeCount} ${
             dto.withheldTradeCount === 1 ? "trade" : "trades"
-          } withheld: inside the holdout`}
+          } withheld: reaching the holdout`}
         </p>
       )}
       {/* r5.s2.w2: the tab that draws these trades on the run's own candles. The
@@ -2066,9 +2070,10 @@ function TradeTable({ trades, runId, dto }: { trades: TradeRowDto[]; runId: stri
 
 /** Every chart's in-DOM accessible twin carrying the same exact strings.
  *
- *  A withheld run (#417) has no series to twin: every outcome table below is
- *  empty or absent, and the section carries the same withheld sentence the KPI
- *  block does, so the accessible copy says what the graphic would have said. */
+ *  A withheld run (#417) has no series to twin: the four tables below render
+ *  their headers and no rows, and the withheld sentence lives in the KPI block
+ *  above, which is the one place the reading is explained. An empty twin is
+ *  therefore not a fabricated "no data" claim — the page has already said why. */
 function ChartTwins({ dto }: { dto: BacktestRunDto }) {
   const mfeColumns = useMemo(
     () => (dto.mfe === null ? [] : histogramColumns(dto.mfe)),

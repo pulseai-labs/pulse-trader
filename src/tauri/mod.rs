@@ -63,7 +63,8 @@ pub(crate) mod walk_forward;
 
 pub use backtest::{
     BacktestRunDto, BacktestRunRequest, CompareChildRunDto, CompareChildRunRequest, EquityPointDto,
-    HistogramBinDto, HistogramDto, RegimeCellDto, TradeRowDto, backtest_run_dto,
+    HistogramBinDto, HistogramDto, RegimeCellDto, TradeRowDto, backtest_run_dto, run_read_fence,
+    trade_clears_fence,
 };
 pub use coach::{
     AcceptFailureDto, AcceptedCoachDto, CoachActionDto, CoachCostDto, CoachDecisionDto,

@@ -18,23 +18,31 @@
 //!    STRADDLING trade and a trade INSIDE the holdout are not sent, server side.
 //! 2. **The run's stored totals are withheld** when the run's counted window
 //!    reaches H — the same window decision agent reads use
-//!    (`guard_persisted_run`), never a recomputation over the remaining trades.
+//!    (`guard_persisted_window`), never a recomputation over the remaining trades.
 //! 3. **The read says what it withheld** — the count, that the totals are
 //!    withheld, and H (on the existing `holdoutStartMs`).
 //! 4. **Nothing else moves**: a run wholly before H, and any run while no freeze
 //!    is open, read exactly as before.
+//! 5. **The fresh-run arm and the read agree at the FINAL-BAR boundary**
+//!    (`#417`'s fix round, the OMP review's blocking finding 1): a snapshot whose
+//!    last bar OPENS before H but CLOSES after it passes the window guard's
+//!    clamp decision, so the run reaches `SeriesEnd::SnapshotEnd` and its
+//!    end-of-data close fills at that bar's `close_time` — on or after H. The
+//!    fresh-run arm must not answer with that trade and the full totals while the
+//!    Lab's later read of the same run withholds both.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 
 use pulse::{
-    BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CandleSeriesRepository,
-    CandleStore, CandleWindow, CreatedBy, DesktopState, Direction, EngineFingerprint, EquityCurve,
-    ExitReason, FakeClock, Fill, FundingConfig, NewVersion, OpenFreezeRequest, Pair, Regime,
-    RegimeBreakdown, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
-    SqliteCertificationFreezeRepo, StrategyId, StrategyRepository, SummaryStats, Timeframe, Trade,
-    TradeSource, VersionId, get_backtest_run_core,
+    BacktestInputs, BacktestOutcome, BacktestResult, BacktestRunId, BacktestRunRepository,
+    CandleSeriesRepository, CandleStore, CandleWindow, CreatedBy, DesktopState, Direction,
+    EngineFingerprint, EquityCurve, ExitReason, FakeClock, Fill, FundingConfig, NewVersion,
+    OpenFreezeRequest, Pair, Regime, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
+    SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, StrategyId, StrategyRepository,
+    SummaryStats, Timeframe, Trade, TradeSource, VersionId, get_backtest_run_core,
+    project_histogram, run_read_fence,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -141,23 +149,30 @@ async fn seed_version(state: &DesktopState) -> VersionId {
 
 /// One closed long trade entering at `entry_ms` and exiting one M15 bar later,
 /// `r` R above a 90 000 entry with its stop 1 000 below (the `chart_read` shape).
+///
+/// **The SIGNAL times deliberately differ from the FILL times** (`#417`): an exit
+/// signals on the bar it is decided and fills at the NEXT bar's open, which is
+/// the engine's own rule. The fence is a fill-time rule, so a fence wrongly
+/// spelled on signal times would let the straddling trade through — with equal
+/// times these arms would pass either way and would pin nothing.
 fn trade_at(entry_ms: i64, r: &str) -> Trade {
     let entry = Decimal::new(90_000, 0);
     let stop = Decimal::new(89_000, 0);
     let r = r.parse::<Decimal>().expect("a decimal R");
     let exit = entry + r * (entry - stop);
     let qty = Decimal::ONE;
-    let exit_ms = entry_ms + Timeframe::M15.duration_ms();
+    let exit_signal_ms = entry_ms + Timeframe::M15.duration_ms();
+    let exit_fill_ms = exit_signal_ms + Timeframe::M15.duration_ms();
     let fees = Decimal::new(2, 2);
     Trade {
         direction: Direction::Long,
         qty,
         entry_price: entry,
         exit_price: exit,
-        entry_signal_time: entry_ms,
+        entry_signal_time: entry_ms - Timeframe::M15.duration_ms(),
         entry_fill_time: entry_ms,
-        exit_signal_time: exit_ms,
-        exit_fill_time: exit_ms,
+        exit_signal_time: exit_signal_ms,
+        exit_fill_time: exit_fill_ms,
         fills: vec![
             Fill {
                 price: entry,
@@ -168,7 +183,7 @@ fn trade_at(entry_ms: i64, r: &str) -> Trade {
             Fill {
                 price: exit,
                 qty,
-                time_ms: exit_ms,
+                time_ms: exit_fill_ms,
                 fee: Decimal::new(1, 2),
             },
         ],
@@ -360,14 +375,21 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
     let holdout_start = series[200].open_time;
 
     // (a) wholly before the fence, (b) straddling it, (c) inside the holdout.
-    // `trade_at` exits one bar after its entry, so (a) must clear H by a bar.
-    let before = trade_at(holdout_start - 2 * step, "2");
+    // `trade_at` fills its exit one bar after its own signal, so (a) clears H on
+    // its FILL time with two bars to spare — and its SIGNAL time is earlier still,
+    // which is what makes this arm pin the fill-time rule (a signal-time fence
+    // would pass (b) through).
+    let before = trade_at(holdout_start - 3 * step, "2");
     let straddling = trade_at(holdout_start - step / 2, "-1");
     let inside = trade_at(holdout_start + 2 * step, "2");
     assert_eq!(
         before.exit_fill_time,
         holdout_start - step,
-        "the pre-fence trade must exit before H"
+        "the pre-fence trade must FILL its exit before H"
+    );
+    assert!(
+        before.exit_signal_time < holdout_start,
+        "the pre-fence trade's signal is before H too"
     );
     assert!(
         straddling.entry_fill_time < holdout_start && straddling.exit_fill_time > holdout_start,
@@ -400,11 +422,11 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        dto.trades[0].entry_signal_time,
-        before.entry_signal_time.to_string()
+        dto.trades[0].entry_fill_time,
+        before.entry_fill_time.to_string()
     );
     assert_eq!(
-        dto.trades[0].exit_signal_time,
+        dto.trades[0].exit_fill_time,
         before.exit_fill_time.to_string()
     );
 
@@ -422,11 +444,11 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
             "a holdout trade's time `{time}` reached the app's run read"
         );
     }
-    // The fence is the point, not a truncation: every listed time is before H.
+    // The fence is the point, not a truncation: every listed FILL is before H.
     for trade in &dto.trades {
         assert!(
-            trade.entry_signal_time.parse::<i64>().expect("a time") < holdout_start
-                && trade.exit_signal_time.parse::<i64>().expect("a time") < holdout_start,
+            trade.entry_fill_time.parse::<i64>().expect("a time") < holdout_start
+                && trade.exit_fill_time.parse::<i64>().expect("a time") < holdout_start,
             "a listed trade reaches the holdout"
         );
     }
@@ -442,7 +464,133 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. the route edge carries the same fence
+// 2. the fresh-run arm and the read agree at the final-bar boundary
+// ---------------------------------------------------------------------------
+
+/// The blocking finding from this patch's own review (finding 1), pinned.
+///
+/// The window guard clamps only when a bar OPENS at or after H. When H lands
+/// strictly INSIDE the pinned snapshot's final bar, the run passes the guard, runs
+/// to `SeriesEnd::SnapshotEnd`, and any position open at the end is booked at that
+/// bar's `close_time` — which is at or after H. `run_read_fence` takes the window
+/// over `[first_open, last_close]` and the trade test over FILL times, so BOTH the
+/// fresh-run arm and the Lab's later read withhold that trade and the totals.
+///
+/// This arm builds the outcome in that exact shape and drives the one function
+/// both arms call, so a regression in either shows up here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_final_bar_boundary_is_withheld_by_the_same_decision_both_arms_call() {
+    let env = env();
+    let state = env.cold_state().await;
+    let version = seed_version(&state).await;
+    let series = m15_series(&env.store());
+    let last = series.last().expect("the fixture has candles");
+    // H strictly inside the final bar: after its open, before its close.
+    let holdout_start = last.open_time + 1;
+    assert!(
+        holdout_start > last.open_time && holdout_start < last.close_time,
+        "H must sit inside the final bar for this boundary to exist"
+    );
+
+    // The end-of-data close: a trade that opens before H and FILLS at the final
+    // bar's close, on or after H.
+    let mut final_bar_trade = trade_at(last.open_time - Timeframe::M15.duration_ms(), "1");
+    final_bar_trade.exit_fill_time = last.close_time;
+    final_bar_trade.exit_signal_time = last.close_time;
+    assert!(
+        final_bar_trade.entry_fill_time < holdout_start
+            && final_bar_trade.exit_fill_time >= holdout_start,
+        "the final-bar trade must enter before H and fill at or after it"
+    );
+
+    // The stored run, read back through the app's own read.
+    let run_id = seed_run(
+        &state,
+        &env.store(),
+        &version,
+        vec![final_bar_trade.clone()],
+    )
+    .await;
+    open_freeze_on(&state, holdout_start).await;
+    let read = read_run(&state, &run_id).await;
+
+    assert_eq!(
+        read.trades.len(),
+        0,
+        "the final-bar trade reaches H and must not be sent: {:?}",
+        read.trades
+    );
+    assert_withheld(&read, holdout_start, 1);
+
+    // The fresh-run arm's own decision, on the same outcome shape: the run the
+    // engine just produced has `window: None` over this snapshot, so the fence it
+    // takes must withhold here too.
+    let stored = SqliteBacktestRunRepo::new(state.db().pool().clone())
+        .get_run(&run_id)
+        .await
+        .expect("read the seeded run")
+        .expect("the seeded run exists");
+    let trades = SqliteBacktestRunRepo::new(state.db().pool().clone())
+        .get_trades(&run_id)
+        .await
+        .expect("read the seeded trades");
+    let inputs = stored
+        .inputs
+        .clone()
+        .expect("the seeded run carries inputs");
+    assert!(
+        inputs.window.is_none(),
+        "an unwindowed run is the shape whose end-of-data close reaches H"
+    );
+    let primary = env
+        .store()
+        .load_version(
+            &inputs.pair,
+            inputs.primary.timeframe,
+            &inputs.primary.data_version,
+        )
+        .expect("reload the primary snapshot")
+        .series;
+    let outcome = BacktestOutcome {
+        run: stored,
+        inputs,
+        trades,
+        primary,
+        htf: None,
+        d1: None,
+        fingerprint_warning: None,
+        mfe: project_histogram(std::iter::empty()),
+        mae: project_histogram(std::iter::empty()),
+    };
+    let freeze = pulse::HoldoutFreeze {
+        holdout_start_ms: holdout_start,
+    };
+    let fence =
+        run_read_fence(&outcome, Some(freeze)).expect("a freeze is open, so the fence exists");
+    assert!(
+        fence.withhold_totals,
+        "the fresh-run arm must withhold: its window reaches H through the final bar"
+    );
+    assert!(
+        !pulse::trade_clears_fence(&final_bar_trade, Some(fence)),
+        "the fresh-run arm must not send the final-bar trade"
+    );
+
+    // And the two arms agree, which is the whole point: the fresh-run projection
+    // and the stored read withhold the same things for the same run.
+    let fresh = pulse::backtest_run_dto(&outcome, true, Some(freeze), Some(fence))
+        .expect("the projection succeeds");
+    assert!(
+        fresh.totals_withheld && fresh.trades.is_empty(),
+        "the fresh-run DTO withholds the totals and the trade: {fresh:?}"
+    );
+    assert_eq!(fresh.withheld_trade_count, 1);
+    assert_eq!(read.withheld_trade_count, fresh.withheld_trade_count);
+    assert_eq!(read.totals_withheld, fresh.totals_withheld);
+}
+
+// ---------------------------------------------------------------------------
+// 3. the route edge carries the same fence
 // ---------------------------------------------------------------------------
 
 /// The HTTP edge is not a second implementation: `POST /api/v1/get-backtest-run`
@@ -461,7 +609,9 @@ async fn the_route_answers_the_same_withheld_read() {
     let step = Timeframe::M15.duration_ms();
     let holdout_start = series[200].open_time;
     let trades = vec![
-        trade_at(holdout_start - 2 * step, "2"),
+        // The exit FILLS a bar after it signals, so the safe trade needs three
+        // bars of clearance to end before H.
+        trade_at(holdout_start - 3 * step, "2"),
         trade_at(holdout_start + 2 * step, "2"),
     ];
     let run_id = seed_run(&state, &store, &version, trades).await;

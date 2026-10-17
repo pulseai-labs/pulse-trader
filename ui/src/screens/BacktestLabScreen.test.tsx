@@ -951,7 +951,7 @@ describe("BacktestLabScreen (#417 — a withheld run says so)", () => {
     expect(r.getAttribute("data-exact")).toBe(WITHHELD_RUN.trades[0].realizedR);
     // The row-level note names the withheld rows, in the Chart tab's own shape.
     const note = container.querySelector(".bt-withheld-rows") as HTMLElement;
-    expect(note.textContent).toBe("2 trades withheld: inside the holdout");
+    expect(note.textContent).toBe("2 trades withheld: reaching the holdout");
   });
 
   it("names the fence at the trade table rather than reading as a run with no trades", async () => {

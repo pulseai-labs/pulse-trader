@@ -599,9 +599,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   withheld: holdout from `<date UTC>`". Everything else is unchanged: a run wholly
   before the holdout and any run while no freeze is open read exactly as before, the
   stored run never changes, and the Library's spent certification records keep their
-  behavior. `run_backtest_version` shares the same projection, so a fresh run is
-  fenced by the same code; its own engine run is already clamped at the holdout
-  start, so it withholds nothing. Four other app reads that can carry holdout
+  behavior. `run_backtest_version` takes the SAME fence, decided in one place
+  (`run_read_fence`) from the outcome already in hand: the window guard clamps only
+  when a bar OPENS at the holdout start, so a snapshot whose last bar opens before it
+  but closes after it runs to the end of data — and that end-of-data close fills at
+  the last bar's close time, on or after the holdout start. Both arms therefore
+  withhold that final trade, and they cannot disagree. Four other app reads that can carry holdout
   outcomes are audited and deferred, each with its own issue: the walk-forward fold
   table and verdict (#445), `library_overview`'s version stats and run rows (#446),
   `compare_child_run`'s before/after cells and the coach accept's before-summary

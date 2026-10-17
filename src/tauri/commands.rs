@@ -56,7 +56,7 @@ use crate::domain::strategy::VersionId;
 
 use super::backtest::{
     BacktestRunDto, BacktestRunRequest, CompareChildRunDto, CompareChildRunRequest,
-    backtest_run_dto,
+    backtest_run_dto, run_read_fence,
 };
 use super::certification::{CertificationRecordsDto, CertificationRecordsRequest};
 // r5.s2.w1: the Chart tab's read — a window of candles and, for a run, its trades
@@ -1442,15 +1442,15 @@ pub async fn run_backtest_version_core(
     // refuses, and the refusal still names the run that exists. `uses_htf` comes
     // from the version's own DSL, not from the recorded inputs (#219).
     let uses_htf = run_uses_htf(&strategies, &version_id).await;
-    // No fence (#417, PDR-0038 option A): a run THIS call just executed cannot
-    // reach the holdout, so there is nothing for the fence to withhold —
-    // `fence: None` here is a fact about the run, not a shortcut. The guard above
-    // ran the run over `[snapshot_first_open, holdout_start)` (or over a snapshot
-    // that already ends before it), so every bar the engine stepped — and
-    // therefore every trade it recorded, including a position force-closed at the
-    // window edge — is before H. The Lab's later read of this run goes through
-    // `get_backtest_run_core`, which applies the fence on the stored row.
-    Ok(backtest_run_dto(&outcome, uses_htf, holdout, None)?)
+    // The SAME fence the Lab's later read of this run will apply (#417, PDR-0038
+    // option A). It is not always a no-op here: the window guard clamps only when
+    // a bar OPENS at or after H, so a snapshot whose last bar opens before H but
+    // CLOSES after it runs to `SeriesEnd::SnapshotEnd`, and that end-of-data close
+    // fills at the last bar's `close_time` — on or after H. `run_read_fence` reads
+    // the window and the fills the same way the stored read does, so this answer
+    // cannot differ from the one the Lab gets a moment later.
+    let fence = run_read_fence(&outcome, holdout);
+    Ok(backtest_run_dto(&outcome, uses_htf, holdout, fence)?)
 }
 
 /// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).

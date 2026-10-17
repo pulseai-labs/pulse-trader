@@ -51,7 +51,8 @@ use crate::domain::backtest::{
     EquityCurve, ExitReason, Regime, RegimeBreakdown, RegimeCell, TradeSource,
 };
 use crate::domain::{
-    BacktestInputs, BacktestRunId, Direction, FundingConfig, HoldoutFreeze, PersistedRun, Trade,
+    BacktestInputs, BacktestRunId, CandleWindow, Direction, FundingConfig, HoldoutFreeze,
+    PersistedRun, Trade,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,14 +126,16 @@ impl KeptTotals {
         if self.0 { value } else { None }
     }
 
-    /// A non-optional value that the DTO carries as `Option` (a histogram).
-    fn opt<T>(self, value: T) -> Option<T> {
-        if self.0 { Some(value) } else { None }
-    }
-
-    /// A series the DTO carries as a `Vec` (the equity curve, the regimes).
-    fn series<T>(self, value: Vec<T>) -> Vec<T> {
-        if self.0 { value } else { Vec::new() }
+    /// Whether the totals are kept.
+    ///
+    /// The guard for ANY series the DTO carries as a `Vec` or an `Option` — the
+    /// equity curve, the regimes, the two histograms. It is a precondition rather
+    /// than a wrapper because building such a series can FAIL (the regimes'
+    /// `u32` narrowing) or is merely wasted work when it is withheld; building one
+    /// and discarding it would narrow a withheld count, which [`Self::count`]
+    /// promises not to do.
+    fn is_kept(self) -> bool {
+        self.0
     }
 
     /// A stored count, narrowed to the wire's `u32` — and NOT narrowed at all
@@ -185,17 +188,72 @@ fn fenced_trades(
 /// rule, so the tab's second-guard filter and the server's cut can never
 /// disagree about a stored row.
 ///
-/// A stored [`Trade`] is closed by construction (`exit_fill_time` is not
-/// optional, and an open position is the run's own `open_position`, never a
-/// trade row), so `beforeFence`'s "or no exit" arm has no stored-row case to
-/// cover and this predicate is total. The DTO's own exit fields stay `Option`
-/// only because the wire shape allows an open trade.
+/// A stored [`Trade`] is closed by construction: `exit_fill_time` is a required
+/// field of this ring's own `TradeRowDto`, and an open position is the run's own
+/// `open_position`, never a trade row. `beforeFence`'s "or no exit" arm therefore
+/// has no stored-row case to cover and this predicate is total. (The `Option`
+/// exits belong to `ChartTradeDto` in `src/tauri/chart.rs`, whose wire shape does
+/// allow an open trade.)
+///
+/// The comparison is on FILL times, never signal times: the outcome a holdout
+/// bar produces is the fill that bar's price produced.
 #[must_use]
 pub fn trade_clears_fence(trade: &Trade, fence: Option<RunReadFence>) -> bool {
     fence.is_none_or(|fence| {
         trade.entry_fill_time < fence.holdout_start_ms
             && trade.exit_fill_time < fence.holdout_start_ms
     })
+}
+
+/// The fence ONE app run read applies, decided from provenance already in hand
+/// (`#417`, PDR-0038 option A) — the ONE place the run read and the fresh-run
+/// arm both ask the question.
+///
+/// The decision is the application ring's own ([`guard_persisted_window`], the
+/// read-side half of `guard_persisted_run`): the run's counted window is its
+/// RECORDED window when it has one, else the reloaded primary series' own
+/// `[first_open, last_close]`. Both come from the [`BacktestOutcome`] the caller
+/// already holds, so no second snapshot decode happens on an interactive read.
+///
+/// **Why the recorded window is not enough on its own.** A defaulted run is
+/// clamped only when a bar OPENs at or after H, so a snapshot whose last bar
+/// opens before H but CLOSES after it runs to `SeriesEnd::SnapshotEnd` — and an
+/// end-of-data close fills at that last bar's `close_time`, on or after H. The
+/// window test is therefore taken over the same `[first_open, last_close]` span
+/// the unwindowed guard uses, and the trade test below is taken over the FILL
+/// times, so the two agree about that final bar.
+///
+/// [`guard_persisted_window`]: crate::application::holdout::guard_persisted_window
+#[must_use]
+pub fn run_read_fence(
+    outcome: &BacktestOutcome,
+    holdout: Option<HoldoutFreeze>,
+) -> Option<RunReadFence> {
+    let freeze = holdout?;
+    let inputs = &outcome.inputs;
+    let window = match &inputs.window {
+        Some(window) => Some(window.clone()),
+        None => match (
+            outcome.primary.candles.first(),
+            outcome.primary.candles.last(),
+        ) {
+            (Some(first), Some(last)) => CandleWindow::new(first.open_time, last.close_time).ok(),
+            // An empty series counted nothing, so there is nothing to guard —
+            // the same answer `guard_persisted_run` gives it.
+            _ => None,
+        },
+    };
+    let window_clears = match window {
+        Some(window) => {
+            crate::application::holdout::guard_persisted_window(Some(freeze), &inputs.pair, &window)
+                .is_ok()
+        }
+        None => true,
+    };
+    Some(RunReadFence::from_window_decision(
+        freeze.holdout_start_ms,
+        window_clears,
+    ))
 }
 
 use super::coach::SummaryDto;
@@ -882,10 +940,30 @@ pub fn backtest_run_dto(
             run.skipped_entries.leverage_capped,
         )?,
 
-        equity: kept.series(equity_dto(&outcome.equity_curve())),
-        regimes: kept.series(regimes_dto(run_id, &run.regime_breakdown)?),
-        mfe: kept.opt(histogram_dto(&outcome.mfe)),
-        mae: kept.opt(histogram_dto(&outcome.mae)),
+        // A withheld read builds NO series at all: the regimes' `u32` narrowing
+        // can fail, and a withheld count must not be narrowed (`KeptTotals::count`).
+        // Building one and discarding it would break that promise, and the equity
+        // curve and histograms would be pure waste.
+        equity: if kept.is_kept() {
+            equity_dto(&outcome.equity_curve())
+        } else {
+            Vec::new()
+        },
+        regimes: if kept.is_kept() {
+            regimes_dto(run_id, &run.regime_breakdown)?
+        } else {
+            Vec::new()
+        },
+        mfe: if kept.is_kept() {
+            Some(histogram_dto(&outcome.mfe))
+        } else {
+            None
+        },
+        mae: if kept.is_kept() {
+            Some(histogram_dto(&outcome.mae))
+        } else {
+            None
+        },
         trades,
         walk_forward: walk_forward_dto(run),
     })
