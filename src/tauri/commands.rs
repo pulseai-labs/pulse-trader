@@ -1442,7 +1442,15 @@ pub async fn run_backtest_version_core(
     // refuses, and the refusal still names the run that exists. `uses_htf` comes
     // from the version's own DSL, not from the recorded inputs (#219).
     let uses_htf = run_uses_htf(&strategies, &version_id).await;
-    Ok(backtest_run_dto(&outcome, uses_htf, holdout)?)
+    // No fence (#417, PDR-0038 option A): a run THIS call just executed cannot
+    // reach the holdout, so there is nothing for the fence to withhold —
+    // `fence: None` here is a fact about the run, not a shortcut. The guard above
+    // ran the run over `[snapshot_first_open, holdout_start)` (or over a snapshot
+    // that already ends before it), so every bar the engine stepped — and
+    // therefore every trade it recorded, including a position force-closed at the
+    // window edge — is before H. The Lab's later read of this run goes through
+    // `get_backtest_run_core`, which applies the fence on the stored row.
+    Ok(backtest_run_dto(&outcome, uses_htf, holdout, None)?)
 }
 
 /// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).

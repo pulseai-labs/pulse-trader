@@ -54,6 +54,150 @@ use crate::domain::{
     BacktestInputs, BacktestRunId, Direction, FundingConfig, HoldoutFreeze, PersistedRun, Trade,
 };
 
+// ---------------------------------------------------------------------------
+// The holdout fence over one projected run (#417, PDR-0038 option A)
+// ---------------------------------------------------------------------------
+
+/// What one app run read leaves out while an open freeze's holdout start H is
+/// in force.
+///
+/// The DECISION is not made here — a caller resolves it through the same
+/// application-ring guard agent reads use ([`guard_persisted_window`], and its
+/// snapshot-loading wrapper `guard_persisted_run`) and hands the answer down.
+/// This type is only the answer's shape, so the projection has one spelling of
+/// the fence rather than one per caller.
+///
+/// [`guard_persisted_window`]: crate::application::holdout::guard_persisted_window
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunReadFence {
+    /// The open freeze's holdout start, epoch ms.
+    pub holdout_start_ms: i64,
+    /// Whether the run's COUNTED WINDOW reaches H — `true` withholds every
+    /// outcome aggregate and series. `false` leaves them exactly as stored: the
+    /// run never reached the holdout, so its totals disclose nothing about it.
+    pub withhold_totals: bool,
+}
+
+impl RunReadFence {
+    /// The fence this read applies under an open freeze, from the window
+    /// decision the application ring returned.
+    ///
+    /// `guard_persisted_run` answers `Ok(())` for a window that clears H and a
+    /// `HoldoutRefusal` for one that reaches it — so "refused" is exactly "the
+    /// counted window reaches H", which is the ruling's own test. A run with no
+    /// readable provenance (`MissingInputs`) cannot be PROVEN clear, so the
+    /// caller refuses it before reaching here.
+    #[must_use]
+    pub fn from_window_decision(holdout_start_ms: i64, window_clears_holdout: bool) -> Self {
+        Self {
+            holdout_start_ms,
+            withhold_totals: !window_clears_holdout,
+        }
+    }
+}
+
+/// A read's holdout decision as the accessors the outcome projection reads
+/// through (`#417`, PDR-0038 option A).
+///
+/// `true` means the totals were KEPT — no freeze is open, or the run's counted
+/// window ends before the holdout start. Every accessor then returns its input
+/// unchanged, which is what makes the unfenced read byte-identical to the one
+/// that predates `#417`. `false` means every outcome is withheld: `None`, or an
+/// empty series. It is never a recomputation over the trades that remain — the
+/// ruling rejected that by name, because the shown numbers would no longer match
+/// the stored run.
+#[derive(Debug, Clone, Copy)]
+pub struct KeptTotals(bool);
+
+impl KeptTotals {
+    /// An exact decimal-string field.
+    fn dec(self, value: Decimal) -> Option<String> {
+        if self.0 { Some(dec(value)) } else { None }
+    }
+
+    /// An already-optional exact decimal-string field.
+    fn dec_opt(self, value: Option<Decimal>) -> Option<String> {
+        if self.0 { dec_opt(value) } else { None }
+    }
+
+    /// An already-optional `f64` field.
+    fn ratio(self, value: Option<f64>) -> Option<f64> {
+        if self.0 { value } else { None }
+    }
+
+    /// A non-optional value that the DTO carries as `Option` (a histogram).
+    fn opt<T>(self, value: T) -> Option<T> {
+        if self.0 { Some(value) } else { None }
+    }
+
+    /// A series the DTO carries as a `Vec` (the equity curve, the regimes).
+    fn series<T>(self, value: Vec<T>) -> Vec<T> {
+        if self.0 { value } else { Vec::new() }
+    }
+
+    /// A stored count, narrowed to the wire's `u32` — and NOT narrowed at all
+    /// when withheld, because an absent value has nothing to fit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestAppError::SavedButReadBackFailed`] when a KEPT count
+    /// does not fit `u32`.
+    fn count(
+        self,
+        run_id: &BacktestRunId,
+        field: &str,
+        value: usize,
+    ) -> Result<Option<u32>, BacktestAppError> {
+        if self.0 {
+            count(run_id, field, value).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The run's trades as this read sends them, and how many the fence withheld
+/// (`#417`, PDR-0038 option A).
+///
+/// A trade that reaches the holdout start is dropped WHOLE — it is not in the
+/// answer at all, so no client can filter it back in. The count is the trades
+/// this read withheld, never a total the run does not have.
+fn fenced_trades(
+    outcome: &BacktestOutcome,
+    fence: Option<RunReadFence>,
+) -> (Vec<TradeRowDto>, u32) {
+    let mut rows = Vec::with_capacity(outcome.trades.len());
+    let mut withheld: u32 = 0;
+    for trade in &outcome.trades {
+        if trade_clears_fence(trade, fence) {
+            rows.push(trade_dto(trade));
+        } else {
+            withheld = withheld.saturating_add(1);
+        }
+    }
+    (rows, withheld)
+}
+
+/// Whether a stored trade CLEARS the fence: entry before H, and exit before H.
+///
+/// This is the Chart tab's `beforeFence` (`ui/src/chart/layers.ts`) and
+/// `src/tauri/chart.rs`'s `trade_clears_holdout`, spelled for the run read — ONE
+/// rule, so the tab's second-guard filter and the server's cut can never
+/// disagree about a stored row.
+///
+/// A stored [`Trade`] is closed by construction (`exit_fill_time` is not
+/// optional, and an open position is the run's own `open_position`, never a
+/// trade row), so `beforeFence`'s "or no exit" arm has no stored-row case to
+/// cover and this predicate is total. The DTO's own exit fields stay `Option`
+/// only because the wire shape allows an open trade.
+#[must_use]
+pub fn trade_clears_fence(trade: &Trade, fence: Option<RunReadFence>) -> bool {
+    fence.is_none_or(|fence| {
+        trade.entry_fill_time < fence.holdout_start_ms
+            && trade.exit_fill_time < fence.holdout_start_ms
+    })
+}
+
 use super::coach::SummaryDto;
 
 /// What the desktop asks for: one persisted strategy version.
@@ -225,13 +369,33 @@ pub struct BacktestRunDto {
     /// The open freeze's holdout start, epoch ms as an exact integer string;
     /// `null` while no freeze is open (r5.s2 close review).
     ///
-    /// This read answers a persisted run with its stored values whatever the fence
-    /// holds — the freeze's own guard applies to RUNNING a backtest, not to reading
-    /// a saved result (r4.s1.w4). The boundary travels because the Chart tab fences
-    /// every trade row at the current holdout start (Q5), and the run read is its
-    /// first answer about a run: without this it could list a trade whose outcome
-    /// the freeze withholds.
+    /// The boundary travels because the Chart tab fences every trade row at the
+    /// current holdout start (Q5), and the run read is its first answer about a
+    /// run — without it the tab could not tell where its fence is. `#417`
+    /// (PDR-0038 option A) moved the fence itself to this read: the DTO now also
+    /// carries `withheldTradeCount` and `totalsWithheld`, so the boundary is not
+    /// the only word about what the read left out.
     pub holdout_start_ms: Option<String>,
+    /// How many stored trades this read WITHHELD because they reach the open
+    /// freeze's holdout start (`#417`, PDR-0038 option A).
+    ///
+    /// A trade is withheld when the Chart tab's own rule does NOT hold for it —
+    /// entry at or after H, or an exit at or after H (`beforeFence`,
+    /// `ui/src/chart/layers.ts`; server-side, `trade_clears_holdout`). `0` while
+    /// no freeze is open, and `0` while a freeze is open and no trade reaches it.
+    /// This counts trades WITHHELD FROM `trades`, never trades the run lacks.
+    pub withheld_trade_count: u32,
+    /// Whether this read withheld the run's outcome totals (`#417`, PDR-0038
+    /// option A).
+    ///
+    /// `true` exactly when a freeze was open at this read AND the run's counted
+    /// window reaches the holdout start — the decision agent reads already make
+    /// (`guard_persisted_run`, `src/application/holdout.rs`). When it is `true`,
+    /// every outcome aggregate and series below is `null` or empty: the stored
+    /// numbers are withheld, NEVER recomputed over the trades that remain. When
+    /// it is `false` — no freeze open, or a run whose window ends before H —
+    /// every field below carries its stored value exactly as before.
+    pub totals_withheld: bool,
     /// Starting equity, exact decimal string.
     pub starting_equity: String,
     /// Taker fee in basis points.
@@ -264,63 +428,77 @@ pub struct BacktestRunDto {
     pub fingerprint_warning: Option<String>,
 
     // --- headline -------------------------------------------------------
-    /// Net P&L.
-    pub net_pnl: String,
-    /// Total taker fees.
-    pub fees_total: String,
-    /// Total signed funding.
-    pub funding_total: String,
-    /// Total adverse slippage.
-    pub slippage_total: String,
-    /// Mean P&L per trade.
-    pub expectancy: String,
-    /// Fraction of trades that won.
-    pub win_rate: String,
-    /// Gross profit over gross loss; `null` when there is no loss to divide by.
+    // Every field from here to `mae` is an OUTCOME: a number or series
+    // computed over the run's trades, and therefore a number the open freeze
+    // withholds when the run's counted window reaches the holdout start
+    // (`#417`, PDR-0038 option A). Each is `Option`/empty exactly so the fence
+    // has somewhere honest to put "withheld" — never a recomputation over the
+    // trades that remain, and never a plausible false zero.
+    /// Net P&L; `null` while the totals are withheld.
+    pub net_pnl: Option<String>,
+    /// Total taker fees; `null` while the totals are withheld.
+    pub fees_total: Option<String>,
+    /// Total signed funding; `null` while the totals are withheld.
+    pub funding_total: Option<String>,
+    /// Total adverse slippage; `null` while the totals are withheld.
+    pub slippage_total: Option<String>,
+    /// Mean P&L per trade; `null` while the totals are withheld.
+    pub expectancy: Option<String>,
+    /// Fraction of trades that won; `null` while the totals are withheld.
+    pub win_rate: Option<String>,
+    /// Gross profit over gross loss; `null` when there is no loss to divide by,
+    /// and `null` while the totals are withheld.
     pub profit_factor: Option<String>,
-    /// Sum of winning P&L.
-    pub gross_profit: String,
-    /// Sum of losing P&L.
-    pub gross_loss: String,
-    /// Mean winning trade.
-    pub avg_win: String,
-    /// Mean losing trade.
-    pub avg_loss: String,
-    /// Largest peak-to-trough equity drop.
-    pub max_drawdown: String,
-    /// Number of completed trades.
-    pub trade_count: u32,
-    /// How many won.
-    pub win_count: u32,
-    /// How many lost.
-    pub loss_count: u32,
-    /// Longest winning streak.
-    pub max_win_streak: u32,
-    /// Longest losing streak.
-    pub max_loss_streak: u32,
-    /// Sharpe ratio; `null` when undefined for this run.
+    /// Sum of winning P&L; `null` while the totals are withheld.
+    pub gross_profit: Option<String>,
+    /// Sum of losing P&L; `null` while the totals are withheld.
+    pub gross_loss: Option<String>,
+    /// Mean winning trade; `null` while the totals are withheld.
+    pub avg_win: Option<String>,
+    /// Mean losing trade; `null` while the totals are withheld.
+    pub avg_loss: Option<String>,
+    /// Largest peak-to-trough equity drop; `null` while the totals are withheld.
+    pub max_drawdown: Option<String>,
+    /// Number of completed trades; `null` while the totals are withheld.
+    pub trade_count: Option<u32>,
+    /// How many won; `null` while the totals are withheld.
+    pub win_count: Option<u32>,
+    /// How many lost; `null` while the totals are withheld.
+    pub loss_count: Option<u32>,
+    /// Longest winning streak; `null` while the totals are withheld.
+    pub max_win_streak: Option<u32>,
+    /// Longest losing streak; `null` while the totals are withheld.
+    pub max_loss_streak: Option<u32>,
+    /// Sharpe ratio; `null` when undefined for this run, and while the totals
+    /// are withheld.
     pub sharpe: Option<f64>,
-    /// Sortino ratio; `null` when undefined for this run.
+    /// Sortino ratio; `null` when undefined for this run, and while the totals
+    /// are withheld.
     pub sortino: Option<f64>,
 
     // --- skipped entries -------------------------------------------------
-    /// Entries skipped below the lot step.
-    pub skipped_sub_lot: u32,
-    /// Entries skipped below minimum notional.
-    pub skipped_sub_notional: u32,
-    /// Entries skipped by the leverage cap.
-    pub skipped_leverage_capped: u32,
+    /// Entries skipped below the lot step; `null` while the totals are withheld.
+    pub skipped_sub_lot: Option<u32>,
+    /// Entries skipped below minimum notional; `null` while the totals are withheld.
+    pub skipped_sub_notional: Option<u32>,
+    /// Entries skipped by the leverage cap; `null` while the totals are withheld.
+    pub skipped_leverage_capped: Option<u32>,
 
     // --- derived read projections ---------------------------------------
-    /// The equity curve, rebuilt from the persisted trades.
+    /// The equity curve, rebuilt from the persisted trades. EMPTY while the
+    /// totals are withheld — not a shorter curve, no curve.
     pub equity: Vec<EquityPointDto>,
-    /// The four regimes, always in this fixed order.
+    /// The four regimes, always in this fixed order. EMPTY while the totals
+    /// are withheld.
     pub regimes: Vec<RegimeCellDto>,
-    /// The pinned MFE histogram.
-    pub mfe: HistogramDto,
-    /// The pinned MAE histogram (magnitude).
-    pub mae: HistogramDto,
-    /// Every persisted trade, in `seq` order, with exact values.
+    /// The pinned MFE histogram; `null` while the totals are withheld.
+    pub mfe: Option<HistogramDto>,
+    /// The pinned MAE histogram (magnitude); `null` while the totals are withheld.
+    pub mae: Option<HistogramDto>,
+    /// Every persisted trade that CLEARS the open freeze, in `seq` order, with
+    /// exact values. A trade that reaches the holdout start is not in this list
+    /// at all (`#417`): it is withheld server-side, so no client can filter it
+    /// back in. `withheldTradeCount` says how many were left out.
     pub trades: Vec<TradeRowDto>,
 
     // --- walk-forward membership (r2.s3.w3, additive) ---------------------
@@ -566,11 +744,20 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
 
 /// Project a completed outcome onto the wire.
 ///
-/// Pure: it reads the outcome and nothing else. Every provenance and analytical
+/// Pure over its four inputs and nothing else. Every provenance and analytical
 /// value below traces to a persisted column or to the reloaded snapshot the
-/// persisted inputs name — except `uses_htf`, which no column carries and which
-/// the caller therefore passes in, read from the run's own strategy
-/// ([`run_uses_htf`](crate::application::backtest::run_uses_htf)).
+/// persisted inputs name — except two the caller passes in: `uses_htf`, which no
+/// column carries (read from the run's own strategy,
+/// [`run_uses_htf`](crate::application::backtest::run_uses_htf)), and `fence`,
+/// which the caller resolves through the application ring's own holdout decision
+/// because that decision needs the run's counted window (and, for an unwindowed
+/// run, its snapshot).
+///
+/// `fence` is `None` while no freeze is open, and then every field below is the
+/// stored value: the projection is byte-identical to the read that predates
+/// `#417`. With a fence in force a trade that reaches the holdout start is
+/// dropped from `trades` and counted in `withheldTradeCount`, and a run whose
+/// counted window reaches H has every outcome aggregate and series withheld.
 ///
 /// # Errors
 ///
@@ -578,19 +765,26 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
 /// [`ReadBackStage::Projection`] when a stored count or schema tag does not fit the
 /// wire's `u32`. The run is saved, so the error still names it — refusing is the
 /// point: a clamped count would render a plausible false number for a row that
-/// should not be reported at all.
+/// should not be reported at all. A withheld count is not narrowed at all: the
+/// value is absent, so nothing has to fit.
 pub fn backtest_run_dto(
     outcome: &BacktestOutcome,
     uses_htf: bool,
     holdout: Option<HoldoutFreeze>,
+    fence: Option<RunReadFence>,
 ) -> Result<BacktestRunDto, BacktestAppError> {
     let run: &PersistedRun = &outcome.run;
-    let summary = &run.summary;
     // Proven `Some` by the use case, which refuses a fresh read-back without inputs
     // — so the outcome carries them non-optionally and this projection is total.
     let inputs: &BacktestInputs = &outcome.inputs;
-    let breakdown = &run.regime_breakdown;
     let run_id = &run.id;
+    let summary = &run.summary;
+
+    // #417 (PDR-0038 option A): the fence's two halves. The totals read through
+    // `kept` and the rows through `trade_clears_fence`, so a withheld run has
+    // ONE reason to be empty rather than a dozen. See `KeptTotals`.
+    let kept = KeptTotals(!fence.is_some_and(|fence| fence.withhold_totals));
+    let (trades, withheld_trade_count) = fenced_trades(outcome, fence);
 
     Ok(BacktestRunDto {
         run_id: run.id.as_str().to_owned(),
@@ -629,6 +823,9 @@ pub fn backtest_run_dto(
         // The fence as THIS read saw it: the Chart tab's trade rows are fenced at
         // this instant, so a run read with no freeze open says so with `null`.
         holdout_start_ms: holdout.map(|freeze| ms(freeze.holdout_start_ms)),
+        // What this read left out, said plainly (#417 step 3).
+        withheld_trade_count,
+        totals_withheld: fence.is_some_and(|fence| fence.withhold_totals),
         starting_equity: dec(run.starting_equity),
         taker_fee_bps: dec(inputs.taker_fee_bps),
         slippage_bps: dec(inputs.slippage_bps),
@@ -653,43 +850,43 @@ pub fn backtest_run_dto(
         result_content_hash: run.result_content_hash.clone(),
         fingerprint_warning: outcome.fingerprint_warning.clone(),
 
-        net_pnl: dec(run.net_pnl),
-        fees_total: dec(run.fees_total),
-        funding_total: dec(run.funding_total),
-        slippage_total: dec(run.slippage_total),
-        expectancy: dec(summary.expectancy),
-        win_rate: dec(summary.win_rate),
-        profit_factor: dec_opt(summary.profit_factor),
-        gross_profit: dec(summary.gross_profit),
-        gross_loss: dec(summary.gross_loss),
-        avg_win: dec(summary.avg_win),
-        avg_loss: dec(summary.avg_loss),
-        max_drawdown: dec(summary.max_drawdown),
-        trade_count: count(run_id, "trade_count", summary.trade_count)?,
-        win_count: count(run_id, "win_count", summary.win_count)?,
-        loss_count: count(run_id, "loss_count", summary.loss_count)?,
-        max_win_streak: count(run_id, "max_win_streak", summary.max_win_streak)?,
-        max_loss_streak: count(run_id, "max_loss_streak", summary.max_loss_streak)?,
-        sharpe: summary.sharpe,
-        sortino: summary.sortino,
+        net_pnl: kept.dec(run.net_pnl),
+        fees_total: kept.dec(run.fees_total),
+        funding_total: kept.dec(run.funding_total),
+        slippage_total: kept.dec(run.slippage_total),
+        expectancy: kept.dec(summary.expectancy),
+        win_rate: kept.dec(summary.win_rate),
+        profit_factor: kept.dec_opt(summary.profit_factor),
+        gross_profit: kept.dec(summary.gross_profit),
+        gross_loss: kept.dec(summary.gross_loss),
+        avg_win: kept.dec(summary.avg_win),
+        avg_loss: kept.dec(summary.avg_loss),
+        max_drawdown: kept.dec(summary.max_drawdown),
+        trade_count: kept.count(run_id, "trade_count", summary.trade_count)?,
+        win_count: kept.count(run_id, "win_count", summary.win_count)?,
+        loss_count: kept.count(run_id, "loss_count", summary.loss_count)?,
+        max_win_streak: kept.count(run_id, "max_win_streak", summary.max_win_streak)?,
+        max_loss_streak: kept.count(run_id, "max_loss_streak", summary.max_loss_streak)?,
+        sharpe: kept.ratio(summary.sharpe),
+        sortino: kept.ratio(summary.sortino),
 
-        skipped_sub_lot: count(run_id, "skipped_sub_lot", run.skipped_entries.sub_lot)?,
-        skipped_sub_notional: count(
+        skipped_sub_lot: kept.count(run_id, "skipped_sub_lot", run.skipped_entries.sub_lot)?,
+        skipped_sub_notional: kept.count(
             run_id,
             "skipped_sub_notional",
             run.skipped_entries.sub_notional,
         )?,
-        skipped_leverage_capped: count(
+        skipped_leverage_capped: kept.count(
             run_id,
             "skipped_leverage_capped",
             run.skipped_entries.leverage_capped,
         )?,
 
-        equity: equity_dto(&outcome.equity_curve()),
-        regimes: regimes_dto(run_id, breakdown)?,
-        mfe: histogram_dto(&outcome.mfe),
-        mae: histogram_dto(&outcome.mae),
-        trades: outcome.trades.iter().map(trade_dto).collect(),
+        equity: kept.series(equity_dto(&outcome.equity_curve())),
+        regimes: kept.series(regimes_dto(run_id, &run.regime_breakdown)?),
+        mfe: kept.opt(histogram_dto(&outcome.mfe)),
+        mae: kept.opt(histogram_dto(&outcome.mae)),
+        trades,
         walk_forward: walk_forward_dto(run),
     })
 }

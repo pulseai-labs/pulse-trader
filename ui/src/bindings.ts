@@ -483,14 +483,38 @@ export type BacktestRunDto = {
 	 *  The open freeze's holdout start, epoch ms as an exact integer string;
 	 *  `null` while no freeze is open (r5.s2 close review).
 	 * 
-	 *  This read answers a persisted run with its stored values whatever the fence
-	 *  holds — the freeze's own guard applies to RUNNING a backtest, not to reading
-	 *  a saved result (r4.s1.w4). The boundary travels because the Chart tab fences
-	 *  every trade row at the current holdout start (Q5), and the run read is its
-	 *  first answer about a run: without this it could list a trade whose outcome
-	 *  the freeze withholds.
+	 *  The boundary travels because the Chart tab fences every trade row at the
+	 *  current holdout start (Q5), and the run read is its first answer about a
+	 *  run — without it the tab could not tell where its fence is. `#417`
+	 *  (PDR-0038 option A) moved the fence itself to this read: the DTO now also
+	 *  carries `withheldTradeCount` and `totalsWithheld`, so the boundary is not
+	 *  the only word about what the read left out.
 	 */
 	holdoutStartMs: string | null,
+	/**
+	 *  How many stored trades this read WITHHELD because they reach the open
+	 *  freeze's holdout start (`#417`, PDR-0038 option A).
+	 * 
+	 *  A trade is withheld when the Chart tab's own rule does NOT hold for it —
+	 *  entry at or after H, or an exit at or after H (`beforeFence`,
+	 *  `ui/src/chart/layers.ts`; server-side, `trade_clears_holdout`). `0` while
+	 *  no freeze is open, and `0` while a freeze is open and no trade reaches it.
+	 *  This counts trades WITHHELD FROM `trades`, never trades the run lacks.
+	 */
+	withheldTradeCount: number,
+	/**
+	 *  Whether this read withheld the run's outcome totals (`#417`, PDR-0038
+	 *  option A).
+	 * 
+	 *  `true` exactly when a freeze was open at this read AND the run's counted
+	 *  window reaches the holdout start — the decision agent reads already make
+	 *  (`guard_persisted_run`, `src/application/holdout.rs`). When it is `true`,
+	 *  every outcome aggregate and series below is `null` or empty: the stored
+	 *  numbers are withheld, NEVER recomputed over the trades that remain. When
+	 *  it is `false` — no freeze open, or a run whose window ends before H —
+	 *  every field below carries its stored value exactly as before.
+	 */
+	totalsWithheld: boolean,
 	/**  Starting equity, exact decimal string. */
 	startingEquity: string,
 	/**  Taker fee in basis points. */
@@ -525,59 +549,79 @@ export type BacktestRunDto = {
 	 *  must happen before the insert.
 	 */
 	fingerprintWarning: string | null,
-	/**  Net P&L. */
-	netPnl: string,
-	/**  Total taker fees. */
-	feesTotal: string,
-	/**  Total signed funding. */
-	fundingTotal: string,
-	/**  Total adverse slippage. */
-	slippageTotal: string,
-	/**  Mean P&L per trade. */
-	expectancy: string,
-	/**  Fraction of trades that won. */
-	winRate: string,
-	/**  Gross profit over gross loss; `null` when there is no loss to divide by. */
+	/**  Net P&L; `null` while the totals are withheld. */
+	netPnl: string | null,
+	/**  Total taker fees; `null` while the totals are withheld. */
+	feesTotal: string | null,
+	/**  Total signed funding; `null` while the totals are withheld. */
+	fundingTotal: string | null,
+	/**  Total adverse slippage; `null` while the totals are withheld. */
+	slippageTotal: string | null,
+	/**  Mean P&L per trade; `null` while the totals are withheld. */
+	expectancy: string | null,
+	/**  Fraction of trades that won; `null` while the totals are withheld. */
+	winRate: string | null,
+	/**
+	 *  Gross profit over gross loss; `null` when there is no loss to divide by,
+	 *  and `null` while the totals are withheld.
+	 */
 	profitFactor: string | null,
-	/**  Sum of winning P&L. */
-	grossProfit: string,
-	/**  Sum of losing P&L. */
-	grossLoss: string,
-	/**  Mean winning trade. */
-	avgWin: string,
-	/**  Mean losing trade. */
-	avgLoss: string,
-	/**  Largest peak-to-trough equity drop. */
-	maxDrawdown: string,
-	/**  Number of completed trades. */
-	tradeCount: number,
-	/**  How many won. */
-	winCount: number,
-	/**  How many lost. */
-	lossCount: number,
-	/**  Longest winning streak. */
-	maxWinStreak: number,
-	/**  Longest losing streak. */
-	maxLossStreak: number,
-	/**  Sharpe ratio; `null` when undefined for this run. */
+	/**  Sum of winning P&L; `null` while the totals are withheld. */
+	grossProfit: string | null,
+	/**  Sum of losing P&L; `null` while the totals are withheld. */
+	grossLoss: string | null,
+	/**  Mean winning trade; `null` while the totals are withheld. */
+	avgWin: string | null,
+	/**  Mean losing trade; `null` while the totals are withheld. */
+	avgLoss: string | null,
+	/**  Largest peak-to-trough equity drop; `null` while the totals are withheld. */
+	maxDrawdown: string | null,
+	/**  Number of completed trades; `null` while the totals are withheld. */
+	tradeCount: number | null,
+	/**  How many won; `null` while the totals are withheld. */
+	winCount: number | null,
+	/**  How many lost; `null` while the totals are withheld. */
+	lossCount: number | null,
+	/**  Longest winning streak; `null` while the totals are withheld. */
+	maxWinStreak: number | null,
+	/**  Longest losing streak; `null` while the totals are withheld. */
+	maxLossStreak: number | null,
+	/**
+	 *  Sharpe ratio; `null` when undefined for this run, and while the totals
+	 *  are withheld.
+	 */
 	sharpe: number | null,
-	/**  Sortino ratio; `null` when undefined for this run. */
+	/**
+	 *  Sortino ratio; `null` when undefined for this run, and while the totals
+	 *  are withheld.
+	 */
 	sortino: number | null,
-	/**  Entries skipped below the lot step. */
-	skippedSubLot: number,
-	/**  Entries skipped below minimum notional. */
-	skippedSubNotional: number,
-	/**  Entries skipped by the leverage cap. */
-	skippedLeverageCapped: number,
-	/**  The equity curve, rebuilt from the persisted trades. */
+	/**  Entries skipped below the lot step; `null` while the totals are withheld. */
+	skippedSubLot: number | null,
+	/**  Entries skipped below minimum notional; `null` while the totals are withheld. */
+	skippedSubNotional: number | null,
+	/**  Entries skipped by the leverage cap; `null` while the totals are withheld. */
+	skippedLeverageCapped: number | null,
+	/**
+	 *  The equity curve, rebuilt from the persisted trades. EMPTY while the
+	 *  totals are withheld — not a shorter curve, no curve.
+	 */
 	equity: EquityPointDto[],
-	/**  The four regimes, always in this fixed order. */
+	/**
+	 *  The four regimes, always in this fixed order. EMPTY while the totals
+	 *  are withheld.
+	 */
 	regimes: RegimeCellDto[],
-	/**  The pinned MFE histogram. */
-	mfe: HistogramDto,
-	/**  The pinned MAE histogram (magnitude). */
-	mae: HistogramDto,
-	/**  Every persisted trade, in `seq` order, with exact values. */
+	/**  The pinned MFE histogram; `null` while the totals are withheld. */
+	mfe: HistogramDto | null,
+	/**  The pinned MAE histogram (magnitude); `null` while the totals are withheld. */
+	mae: HistogramDto | null,
+	/**
+	 *  Every persisted trade that CLEARS the open freeze, in `seq` order, with
+	 *  exact values. A trade that reaches the holdout start is not in this list
+	 *  at all (`#417`): it is withheld server-side, so no client can filter it
+	 *  back in. `withheldTradeCount` says how many were left out.
+	 */
 	trades: TradeRowDto[],
 	/**
 	 *  Which `rolling-oos/v1` walk-forward run this run is a fold of — `null`

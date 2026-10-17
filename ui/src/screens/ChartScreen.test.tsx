@@ -34,7 +34,7 @@ vi.mock("../chart/adapter", () => ({
 }));
 
 vi.mock("@tauri-apps/api/app", () => ({
-  getVersion: vi.fn(() => Promise.resolve("0.1.5")),
+  getVersion: vi.fn(() => Promise.resolve("0.1.6")),
 }));
 
 const statusMock = vi.fn();
@@ -807,7 +807,7 @@ describe("Settings → About", () => {
     expect(link.getAttribute("rel")).toContain("noopener");
     expect(link.getAttribute("rel")).toContain("noreferrer");
     // The app's own version, read from the app — never a literal that goes stale.
-    expect(await screen.findByText("PulseTrader 0.1.5")).toBeTruthy();
+    expect(await screen.findByText("PulseTrader 0.1.6")).toBeTruthy();
   });
 });
 

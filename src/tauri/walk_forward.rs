@@ -26,6 +26,7 @@ use crate::application::backtest::{
     BacktestAppError, ReadBackFailure, ReadBackStage, read_back, resolve_default_request,
     run_uses_htf,
 };
+use crate::application::holdout::{PersistedRunGuardError, guard_persisted_run};
 use crate::application::walk_forward::{WalkForwardRequest, run_walk_forward};
 use crate::application::walk_forward_read::{load_fold_runs, rfc3339_ms};
 use crate::domain::backtest::FoldVerdict;
@@ -34,7 +35,7 @@ use crate::domain::{
     BacktestRunId, PersistedRun, WalkForwardRun, WalkForwardRunId, WalkForwardRunRepository,
 };
 
-use super::backtest::{BacktestRunDto, backtest_run_dto, dec};
+use super::backtest::{BacktestRunDto, RunReadFence, backtest_run_dto, dec};
 use super::commands::{DesktopState, OperationKey};
 use super::error::{BusError, BusErrorCode};
 
@@ -472,10 +473,38 @@ pub async fn get_backtest_run_core(
     // #219 rides the same rule for a persisted read: `uses_htf` is the run's own
     // version's compiled answer, never inferred from the recorded inputs.
     let uses_htf = run_uses_htf(&state.strategy_repo(), &outcome.run.strategy_version_id).await;
-    // The open freeze reaches the DTO as METADATA only (r5.s2 close review): this
-    // read keeps answering a persisted run in full — the Lab's rows do not move —
-    // and the Chart tab is the surface that fences its trade rows at this instant.
-    // An unreadable freeze table is an error, never a silent `None`.
+    // The open freeze reaches the DTO both as METADATA (its holdout start, r5.s2
+    // close review) and, since #417 (PDR-0038 option A), as a FENCE this read
+    // applies: `get_backtest_run_core` is the app's run read, so it is the surface
+    // that must not send a holdout trade or a holdout total. The decision is the
+    // application ring's own (`guard_persisted_run`) — the same one every agent
+    // read makes — never a second spelling of "does this run reach H".
+    //
+    // An unreadable freeze table is an error, never a silent `None`; a run whose
+    // provenance cannot be read is refused, never assumed clear of the holdout.
     let holdout = state.open_holdout().await?;
-    Ok(backtest_run_dto(&outcome, uses_htf, holdout)?)
+    let fence = match holdout {
+        None => None,
+        Some(freeze) => {
+            let window_clears =
+                match guard_persisted_run(state.candles(), holdout, &outcome.run).await {
+                    Ok(()) => true,
+                    Err(PersistedRunGuardError::Refused(_)) => false,
+                    Err(other) => {
+                        return Err(BusError::new(
+                            BusErrorCode::Data,
+                            format!(
+                                "the holdout guard could not decide run `{}`: {other}",
+                                outcome.run.id.as_str()
+                            ),
+                        ));
+                    }
+                };
+            Some(RunReadFence::from_window_decision(
+                freeze.holdout_start_ms,
+                window_clears,
+            ))
+        }
+    };
+    Ok(backtest_run_dto(&outcome, uses_htf, holdout, fence)?)
 }
