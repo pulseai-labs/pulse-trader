@@ -12,7 +12,8 @@
 //!   covered by a freeze that opened after they were written. What the fence
 //!   hides is counted, never silently dropped (Q4, PDR-0011).
 //! - [`withdraw_mark`] — the one-way door, with Q3's authority rule: a trader may
-//!   withdraw any mark, an agent only the mark it wrote.
+//!   withdraw any mark, an agent only the mark it wrote. The same fence applies,
+//!   but **after** the authority checks and not before (#440, PDR-0039).
 //!
 //! **The fence is passed in, and the edge reads it.** Every caller reads the open
 //! freeze once, inside the call it serves, and hands the guard
@@ -212,14 +213,34 @@ where
 /// appends to `example_mark_withdrawal` — so the list stops showing the mark
 /// while the audit keeps it (Q3).
 ///
+/// **The fence runs here too, and it runs LAST of the checks (#440, PDR-0039).**
+/// The order is `NotFound` → `AlreadyWithdrawn` → `NotWriter` → the holdout
+/// guard → the withdraw, and the guard's place is deliberate: a mark a freeze
+/// covers is a mark `list_marks` hides and counts and `explain_marks` refuses,
+/// so withdrawing one is refused with the SAME `holdout` refusal a write gets:
+/// a refused withdraw withdraws nothing and returns no DTO field of the mark.
+/// (The refusal's own text names the mark's pair and the holdout start, as a
+/// refused write's does; it carries nothing else about the mark.) Putting the
+/// guard after `NotWriter` is what keeps the FENCE's refusal out of another
+/// writer's hands: an agent that reaches for a mark it did not write is answered
+/// `NotWriter` and never the holdout refusal, so the fence can never tell it
+/// where that mark sits against the holdout. The `AlreadyWithdrawn` check runs
+/// before both, as it always has, so an agent can still learn that another
+/// writer's mark was withdrawn — a pre-existing observable that says nothing
+/// about the holdout and that this change does not alter. A trader, who may
+/// withdraw any mark the fence does not cover, gets the holdout refusal.
+///
 /// # Errors
 ///
 /// [`MarkError::NotFound`] for an id that names nothing;
 /// [`MarkError::AlreadyWithdrawn`] for a second withdraw; [`MarkError::NotWriter`]
-/// when an agent reaches for a mark that is not its own; [`MarkError::Field`] for
-/// an unusable actor; [`MarkError::Data`] on a store failure.
+/// when an agent reaches for a mark that is not its own; [`MarkError::Holdout`]
+/// when the mark's candle reaches an open freeze's holdout start;
+/// [`MarkError::Field`] for an unusable actor; [`MarkError::Data`] on a store
+/// failure.
 pub async fn withdraw_mark<R>(
     marks: &R,
+    freeze: Option<HoldoutFreeze>,
     actor: MarkWriter,
     mark_id: &str,
 ) -> Result<ExampleMark, MarkError>
@@ -249,6 +270,17 @@ where
             writer_name: stored.mark.writer.name.clone(),
         });
     }
+
+    // The fence, on the SAME single-candle decision a write uses (#440): a mark
+    // whose candle reaches the open holdout start is refused, and nothing is
+    // withdrawn. The mark is already in hand, so this answers without I/O.
+    guard_candle(
+        freeze,
+        &stored.mark.pair,
+        stored.mark.timeframe,
+        stored.mark.bar_open_ms,
+    )?;
+
     marks.withdraw(mark_id, &actor).await?;
     Ok(stored.mark)
 }

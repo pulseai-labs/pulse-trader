@@ -98,7 +98,13 @@ fn adjacent_bars_at_or_before(m15: &CandleSeries, at_ms: i64) -> (i64, i64) {
 
 /// Open one freeze through the store, with the injected clock.
 async fn open_freeze(server: &TestServer, holdout_start_ms: i64) {
-    SqliteCertificationFreezeRepo::with_deps(server.db.pool().clone(), FakeClock::at(OPENED_MS))
+    open_freeze_on(&server.db, holdout_start_ms).await;
+}
+
+/// Open one freeze against a bare db — the MCP world's own, when the case needs
+/// the freeze to open AFTER a mark has landed so that it covers it (#440).
+async fn open_freeze_on(db: &Db, holdout_start_ms: i64) {
+    SqliteCertificationFreezeRepo::with_deps(db.pool().clone(), FakeClock::at(OPENED_MS))
         .open(&OpenFreezeRequest {
             holdout_start_ms,
             h: 12,
@@ -199,6 +205,9 @@ const WATCHED: [&str; 8] = [
 struct Mcp {
     _tmp_db: TempDir,
     _tmp_store: TempDir,
+    /// The same db the spawned server opens — so a case can open a freeze AFTER
+    /// a mark has landed, the order `mcp_world`'s own argument cannot express.
+    db: Db,
     client: rmcp::service::RunningService<rmcp::RoleClient, ()>,
     store_dir: PathBuf,
 }
@@ -208,15 +217,7 @@ async fn mcp_world(holdout_start_ms: Option<i64>) -> Mcp {
     let tmp_db = TempDir::new().expect("tempdir");
     let (db_path, db) = support::mcp::migrated_db(&tmp_db).await;
     if let Some(holdout) = holdout_start_ms {
-        SqliteCertificationFreezeRepo::with_deps(db.pool().clone(), FakeClock::at(OPENED_MS))
-            .open(&OpenFreezeRequest {
-                holdout_start_ms: holdout,
-                h: 12,
-                alpha: "0.0463".to_owned(),
-                holdout_test: "C1: z = z(1 - 0.05/H)".to_owned(),
-            })
-            .await
-            .expect("open the freeze");
+        open_freeze_on(&db, holdout).await;
     }
     let tmp_store = TempDir::new().expect("tempdir");
     let store_dir = tmp_store.path().join("store");
@@ -228,6 +229,7 @@ async fn mcp_world(holdout_start_ms: Option<i64>) -> Mcp {
     Mcp {
         _tmp_db: tmp_db,
         _tmp_store: tmp_store,
+        db,
         client,
         store_dir,
     }
@@ -835,6 +837,207 @@ async fn an_agent_withdraws_its_own_mark_over_mcp_and_only_its_own() {
     )
     .await;
     assert_eq!(again["code"], "already_withdrawn", "{again}");
+}
+
+// ---------------------------------------------------------------------------
+// #440 (PDR-0039): the withdraw edge reads the open freeze
+// ---------------------------------------------------------------------------
+
+/// #440 (PDR-0039): a withdraw reads the open freeze inside the call it serves,
+/// so a mark whose candle reaches the holdout start is refused with the SAME
+/// `holdout` refusal a write gets — and no DTO field of that mark crosses the wire.
+///
+/// The order is part of the contract: `NotFound` → `AlreadyWithdrawn` →
+/// `NotWriter` → the fence → the withdraw. An agent that reaches for another
+/// writer's un-withdrawn mark therefore gets `not_writer`, never the holdout
+/// refusal — the fence never says where a mark it may not touch sits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_app_withdraw_refuses_a_fenced_mark_for_the_holdout() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let m15 = series(&server.data_dir, Timeframe::M15);
+    let (before, after) = adjacent_bars_at_or_before(&m15, HOLDOUT_MS);
+    let boundary = before + Timeframe::M15.duration_ms();
+
+    // Both marks land while NO freeze is open — the freeze that follows is what
+    // covers the second one.
+    let clear = app_write(&server, write_body("15m", before, "clear of the fence")).await;
+    let fenced = app_write(&server, write_body("15m", after, "reaches the fence")).await;
+
+    open_freeze(&server, boundary).await;
+
+    // (a) The app core: the fenced mark is refused for the holdout.
+    let state = server.desktop().await;
+    let error = withdraw_mark_core(
+        &state,
+        MarkWriter {
+            kind: MarkWriterKind::Trader,
+            name: APP_LABEL.to_owned(),
+        },
+        WithdrawMarkRequest {
+            mark_id: fenced.clone(),
+        },
+    )
+    .await
+    .expect_err("a fenced mark cannot be withdrawn");
+    assert_eq!(error.code(), "holdout", "{error}");
+
+    // ...and the same over the wire the app actually uses.
+    let (status, body) = post(
+        &server,
+        &server.app_token,
+        "/api/v1/marks/withdraw",
+        json!({ "markId": fenced }),
+    )
+    .await;
+    assert_eq!(status, 422, "a fenced withdraw is refused: {body}");
+    assert_eq!(body["code"], "holdout", "{body}");
+    for field in [
+        "markId",
+        "pair",
+        "timeframe",
+        "barTime",
+        "side",
+        "setup",
+        "note",
+        "writer",
+    ] {
+        assert!(
+            body.get(field).is_none(),
+            "no DTO field of a fenced mark is in the refusal body, but `{field}` was: {body}"
+        );
+    }
+
+    // Nothing was withdrawn: both rows stand, no withdrawal row was written, and
+    // the list still HIDES and COUNTS the fenced mark.
+    assert_eq!(
+        mark_rows(&server.db).await,
+        2,
+        "the fenced mark stays stored"
+    );
+    let withdrawals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM example_mark_withdrawal")
+        .fetch_one(server.db.pool())
+        .await
+        .expect("count the withdrawals");
+    assert_eq!(withdrawals, 0, "a refused withdraw withdraws nothing");
+    let (status, body) = post(&server, &server.app_token, "/api/v1/marks/list", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let marks = body["marks"].as_array().expect("a marks array");
+    assert_eq!(marks.len(), 1, "the fenced mark is hidden: {body}");
+    assert_eq!(marks[0]["markId"], clear);
+    assert_eq!(body["hiddenByHoldout"]["count"], 1, "{body}");
+
+    // (c) A candle closing EXACTLY at the holdout start never reaches it, so that
+    // mark is not fenced and its withdraw still goes through.
+    let (status, body) = post(
+        &server,
+        &server.app_token,
+        "/api/v1/marks/withdraw",
+        json!({ "markId": clear }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a mark clear of the fence still withdraws: {body}"
+    );
+    assert_eq!(body["markId"], clear);
+
+    // (e) An agent reaching for another writer's FENCED mark gets `not_writer` —
+    // never the holdout refusal, which would say something about a mark that is
+    // not its own. This is the test that pins the guard's PLACE in the order.
+    let error = withdraw_mark_core(
+        &state,
+        MarkWriter {
+            kind: MarkWriterKind::Agent,
+            name: "someone-else".to_owned(),
+        },
+        WithdrawMarkRequest {
+            mark_id: fenced.clone(),
+        },
+    )
+    .await
+    .expect_err("an agent may not withdraw another writer's mark");
+    assert_eq!(error.code(), "not_writer", "{error}");
+}
+
+/// (d) With no freeze open the fence is inert: the very bar that is refused
+/// above withdraws normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_freeze_open_a_late_mark_still_withdraws() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let m15 = series(&server.data_dir, Timeframe::M15);
+    let (_, after) = adjacent_bars_at_or_before(&m15, HOLDOUT_MS);
+
+    let id = app_write(&server, write_body("15m", after, "no freeze is open")).await;
+    let (status, body) = post(
+        &server,
+        &server.app_token,
+        "/api/v1/marks/withdraw",
+        json!({ "markId": id }),
+    )
+    .await;
+    assert_eq!(status, 200, "no freeze open, so the fence is inert: {body}");
+    assert_eq!(body["markId"], id);
+}
+
+/// #440 (PDR-0039): the same refusal on the MCP edge, over the real stdio
+/// transport — and the agent's own mark is the only one it could ever reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_withdraw_refuses_a_fenced_mark_for_the_holdout() {
+    let mcp = mcp_world(None).await;
+    let m15 = series(&mcp.store_dir, Timeframe::M15);
+    let (before, after) = adjacent_bars_at_or_before(&m15, HOLDOUT_MS);
+    let boundary = before + Timeframe::M15.duration_ms();
+
+    // Both marks land with no freeze open; the freeze then covers the second.
+    let clear = support::mcp::call(
+        &mcp.client,
+        "write_mark",
+        mcp_write_args("15m", before, "clear of the fence"),
+    )
+    .await;
+    let clear = clear["mark_id"].as_str().expect("an id").to_owned();
+    let fenced = support::mcp::call(
+        &mcp.client,
+        "write_mark",
+        mcp_write_args("15m", after, "reaches the fence"),
+    )
+    .await;
+    let fenced = fenced["mark_id"].as_str().expect("an id").to_owned();
+
+    open_freeze_on(&mcp.db, boundary).await;
+
+    // (b) The agent's own fenced mark: refused for the holdout, no field of it in
+    // the answer.
+    let refused =
+        support::mcp::call_err(&mcp.client, "withdraw_mark", json!({ "mark_id": fenced })).await;
+    assert_eq!(refused["code"], "holdout", "{refused}");
+    for field in [
+        "mark_id", "pair", "bar_time", "side", "setup", "note", "writer",
+    ] {
+        assert!(
+            refused.get(field).is_none(),
+            "no DTO field of a fenced mark is in the refusal body: `{field}` was: {refused}"
+        );
+    }
+
+    // It was not withdrawn: the list hides and counts it, and still shows the
+    // other one.
+    let listed = support::mcp::call(&mcp.client, "list_marks", json!({})).await;
+    let marks = listed["marks"].as_array().expect("a marks array");
+    assert_eq!(marks.len(), 1, "the fenced mark is hidden: {listed}");
+    assert_eq!(marks[0]["mark_id"], clear);
+    assert_eq!(
+        listed["hidden_by_holdout"]["count"], 1,
+        "the fenced mark is counted: {listed}"
+    );
+
+    // A mark clear of the fence still withdraws.
+    let withdrawn =
+        support::mcp::call(&mcp.client, "withdraw_mark", json!({ "mark_id": clear })).await;
+    assert_eq!(
+        withdrawn["mark_id"], clear,
+        "a mark clear of the fence still withdraws: {withdrawn}"
+    );
 }
 
 // ---------------------------------------------------------------------------

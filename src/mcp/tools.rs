@@ -1959,9 +1959,12 @@ impl PulseMcp {
 
     /// Withdraw one example trade: a mark is taken back once, and never deleted
     /// (r5.s3.w1, PDR-0037, Q3). An agent withdraws only the mark it wrote; the
-    /// app's trader (an app token) may withdraw any.
+    /// app's trader (an app token) may withdraw any. The holdout fence is read
+    /// HERE, in the same call, and handed to the use case (#440, PDR-0039), which
+    /// refuses a fenced mark for the holdout — after its `not_writer` check, so
+    /// nothing is learned about another writer's mark.
     #[tool(
-        description = "Withdraw one example mark by id. A withdraw is ONE-WAY and the mark's row stays stored: the mark leaves every list, and a second withdraw is refused. This tool acts as the agent this session identified as, so it withdraws only marks that agent wrote — another writer's mark is refused, and the app's own trader is the surface that withdraws any mark."
+        description = "Withdraw one example mark by id. A withdraw is ONE-WAY and the mark's row stays stored: the mark leaves every list, and a second withdraw is refused. This tool acts as the agent this session identified as, so it withdraws only marks that agent wrote — another writer's mark is refused, and the app's own trader is the surface that withdraws any mark. A mark whose candle reaches the open freeze's holdout start is REFUSED (the candle closes after the holdout begins) and no field of that mark is returned, only the shared holdout refusal naming its pair and the holdout start; it stays hidden until the freeze closes."
     )]
     async fn withdraw_mark(
         &self,
@@ -1971,8 +1974,21 @@ impl PulseMcp {
             kind: MarkWriterKind::Agent,
             name: self.identity_lock().name.clone(),
         };
+        // The open freeze, read once inside this call and handed to the use case: a
+        // read failure is a tool error, never a silent `None`.
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
         let marks = self.mark_repo();
-        match crate::application::example_marks::withdraw_mark(&marks, actor, &args.mark_id).await {
+        match crate::application::example_marks::withdraw_mark(
+            &marks,
+            holdout,
+            actor,
+            &args.mark_id,
+        )
+        .await
+        {
             Ok(mark) => Ok(CallToolResult::structured(mark_json(&mark))),
             Err(error) => Ok(mark_tool_error(&error)),
         }
