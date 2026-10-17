@@ -12,10 +12,16 @@
 //! the caller — and an agent mark by the identity the MCP session resolved. The
 //! DTO says which, and marks an agent's name as self-reported (PDR-0015).
 //!
-//! **The open freeze is read at the edge, in the same call.** Each core reads it
-//! once, immediately before the use case, and passes it in; the fence is then the
-//! use case's first check, before any candle is loaded (G2). No caller passes a
-//! hard-coded `None`.
+//! **The open freeze is read at the edge, in the same call.** All THREE cores
+//! read it once, immediately before the use case, and pass it in; no caller
+//! passes a hard-coded `None`, which would be a fence switched off rather than a
+//! fence passed, and a read failure is an error on every core. What the use case
+//! then does with it differs by call: `write_mark` applies the fence as its FIRST
+//! check, before any candle is loaded (G2); `list_marks` hides and counts the
+//! marks it covers; and `withdraw_mark` applies the same single-candle refusal
+//! AFTER its `not_found`, `already_withdrawn` and `not_writer` checks and before
+//! it withdraws anything, so an agent learns nothing about another writer's mark
+//! (#440, PDR-0039).
 //!
 //! **Wire shape.** camelCase; times cross as millisecond integer strings, counts
 //! as `u32` (specta refuses `i64`/`u64`). The refusal codes the routes answer with
@@ -285,18 +291,25 @@ pub async fn list_marks_core(
 
 /// `withdraw_mark`'s transport-free core, with the actor the edge resolved.
 ///
+/// The open freeze is read HERE, inside the call this core serves, and handed to
+/// the use case exactly as `write_mark_core` and `list_marks_core` hand it down
+/// (#440, PDR-0039): a mark whose candle reaches the holdout start is refused
+/// with the same `holdout` refusal a write gets, and none of its fields come back.
+///
 /// # Errors
 ///
 /// [`MarkError`], exactly as `application::example_marks::withdraw_mark` returns
-/// it.
+/// it; a freeze read failure is a [`MarkError::Data`], never a silent `None`.
 pub async fn withdraw_mark_core(
     state: &DesktopState,
     actor: MarkWriter,
     request: WithdrawMarkRequest,
 ) -> Result<MarkDto, MarkError> {
+    let freeze = edge_holdout(state).await?;
     let marks = state.example_mark_repo();
     let mark =
-        crate::application::example_marks::withdraw_mark(&marks, actor, &request.mark_id).await?;
+        crate::application::example_marks::withdraw_mark(&marks, freeze, actor, &request.mark_id)
+            .await?;
     Ok(mark_dto(&mark))
 }
 

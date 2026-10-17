@@ -578,6 +578,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A mark withdraw reads the open freeze and refuses a fenced mark (#440, PDR-0039).**
+  `withdraw_mark` — the application use case behind the app's `withdraw_mark_core` and the MCP
+  `withdraw_mark` tool — read no freeze at all, unlike the write, list and explain paths. An
+  id-based withdraw therefore answered the **full** mark (pair, bar time, side, setup, note,
+  writer) for a mark that `list_marks` was hiding and counting under `hidden_by_holdout` and that
+  `explain_marks` refused; and ADR-0031's fence paragraph and the `src/tauri/marks.rs` module doc
+  claimed every delivery edge read the freeze and that no edge passed a hard-coded `None`, which
+  was false for the withdraw edge. Both withdraw edges now read the open freeze **inside the call
+  they serve**, exactly as the write, list and explain edges do, and a freeze read failure is an
+  error on both rather than a silent `None`. The use case applies the **same** single-candle guard
+  a write uses (`guard_candle` → the `holdout` refusal), and it applies that guard **after** its
+  `not_found`, `already_withdrawn` and `not_writer` checks and **before** it withdraws anything —
+  so an agent that reaches for another writer's fenced mark still learns only `not_writer`, never
+  anything about where that mark sits against the holdout. A fenced mark is not withdrawn and none
+  of its fields come back. **Known limit:** a mark inside an open holdout cannot be withdrawn until
+  the freeze closes; its row stays stored and the list keeps hiding and counting it, so nothing is
+  lost. ADR-0031's fence paragraph now names **every** edge that exists — all four MCP mark tools
+  and all three app mark cores — and says what each does with the freeze; no decision that ADR
+  records changes. Write, list and explain behavior, every other refusal and the DTO shapes are
+  unchanged.
+
 - **The Lab's run view no longer shows trades or totals from an open freeze's
   holdout period (#417, PDR-0038 option A).** `get_backtest_run_core` — the app's
   read of a stored run, behind `POST /api/v1/get-backtest-run` and the `get_backtest_run`
