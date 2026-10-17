@@ -56,7 +56,7 @@ import BacktestLabScreen, { parseFoldCount } from "./BacktestLabScreen";
 import { clearBacktestSelection } from "./backtestSelection";
 import { ActiveOperationsProvider } from "../hooks/useActiveOperations";
 import { RouteContent } from "../App";
-import { decimal } from "../format/numbers";
+import { decimal, price, rMultiple } from "../format/numbers";
 import { timeUtc } from "../format/time";
 import { resolveRoute } from "../routes";
 
@@ -170,6 +170,11 @@ const SEEDED_RUN: BacktestRunDto = {
   firstOpenTimeMs: "1735689600000",
   lastCloseTimeMs: "1756684800000",
   holdoutStartMs: null,
+  // #417 (PDR-0038 option A): this fixture is the UNFENCED shape — no freeze
+  // was open at its read, so nothing was withheld and every total below is its
+  // stored value. `WITHHELD_RUN` below is the fenced shape.
+  withheldTradeCount: 0,
+  totalsWithheld: false,
   startingEquity: "10000.00",
   takerFeeBps: "4.0000",
   slippageBps: "2.0000",
@@ -290,6 +295,50 @@ const WARN_RUN: BacktestRunDto = {
   profitFactor: "0.681",
   sharpe: -0.42,
   sortino: -0.31,
+};
+
+/** The FENCED shape (#417, PDR-0038 option A): an open freeze's holdout start
+ *  cuts this run, so the server sent only the trades that cleared the fence and
+ *  withheld every outcome aggregate and series.
+ *
+ *  Every withheld field is `null` — NOT a number the screen could recompute —
+ *  so this fixture is also the proof that the screen renders the server's
+ *  decision rather than deriving its own. The counts are the shape the Rust
+ *  core produces: `Option<u32>` → `null`, `Vec` → `[]`. */
+const WITHHELD_RUN: BacktestRunDto = {
+  ...SEEDED_RUN,
+  runId: "run-fenced-0001",
+  holdoutStartMs: "1756684800000",
+  withheldTradeCount: 2,
+  totalsWithheld: true,
+  netPnl: null,
+  feesTotal: null,
+  fundingTotal: null,
+  slippageTotal: null,
+  expectancy: null,
+  winRate: null,
+  profitFactor: null,
+  grossProfit: null,
+  grossLoss: null,
+  avgWin: null,
+  avgLoss: null,
+  maxDrawdown: null,
+  tradeCount: null,
+  winCount: null,
+  lossCount: null,
+  maxWinStreak: null,
+  maxLossStreak: null,
+  sharpe: null,
+  sortino: null,
+  skippedSubLot: null,
+  skippedSubNotional: null,
+  skippedLeverageCapped: null,
+  equity: [],
+  regimes: [],
+  mfe: null,
+  mae: null,
+  // Only the pre-fence trades cross — the run's stored rows that clear the fence.
+  trades: [SEEDED_RUN.trades[0]],
 };
 
 const RUN_ERROR: BusError = {
@@ -750,9 +799,15 @@ describe("BacktestLabScreen (fresh result render)", () => {
   it("renders MFE and MAE as separate single-hue histograms with the pinned column order and labels", async () => {
     const container = await renderRun(SEEDED_RUN);
 
+    // #417: the histogram fields are `Option` on the wire, so an unfenced
+    // fixture must prove them present before the columns can be measured.
+    const mfe = SEEDED_RUN.mfe;
+    const mae = SEEDED_RUN.mae;
+    expect(mfe).not.toBeNull();
+    expect(mae).not.toBeNull();
     for (const [cls, hist] of [
-      [".bt-mfe", SEEDED_RUN.mfe],
-      [".bt-mae", SEEDED_RUN.mae],
+      [".bt-mfe", mfe!],
+      [".bt-mae", mae!],
     ] as const) {
       const chart = container.querySelector(cls);
       expect(chart).not.toBeNull();
@@ -845,6 +900,113 @@ describe("BacktestLabScreen (fresh result render)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #417 (PDR-0038 option A) — the withheld totals and the fenced rows
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (#417 — a withheld run says so)", () => {
+  it("shows one sentence in place of the totals, naming the count and the holdout date", async () => {
+    const container = await renderRun(WITHHELD_RUN);
+
+    // The ONE sentence, verbatim from the ruling's own example, with the date
+    // rendered the way the Chart tab renders it (`dateUtc` -> `YYYY-MM-DD`).
+    const notes = container.querySelectorAll(".bt-withheld");
+    expect(notes).toHaveLength(1);
+    expect((notes[0] as HTMLElement).textContent).toBe(
+      "2 trades and the run totals withheld: holdout from 2025-09-01 UTC",
+    );
+
+    // No total renders at all: not a zero, not an em dash grid, not a value the
+    // frontend derived. The KPI section holds the sentence and nothing else.
+    const tiles = container.querySelector(".bt-kpis") as HTMLElement;
+    expect(tiles.textContent).toContain("2 trades and the run totals withheld");
+    expect(tiles.querySelectorAll(".bt-kpi")).toHaveLength(0);
+    // The stored figures the fixture still carries nowhere appear.
+    for (const withheld of ["−84.13", "-84.125", "43.8%", "0.4375", "412.75"]) {
+      expect(tiles.textContent).not.toContain(withheld);
+    }
+  });
+
+  it("draws no equity curve, no regimes and no histograms for a withheld run", async () => {
+    const container = await renderRun(WITHHELD_RUN);
+
+    expect(container.querySelector(".bt-equity")).toBeNull();
+    expect(container.querySelector(".bt-histogram")).toBeNull();
+    // The twins carry the same emptiness — no table body stands in for a total.
+    expect(container.querySelector(".bt-twin-equity tbody")?.children.length ?? 0).toBe(0);
+    expect(container.querySelector(".bt-twin-regimes tbody")?.children.length ?? 0).toBe(0);
+  });
+
+  it("still lists the trades that cleared the fence, with their exact values", async () => {
+    const container = await renderRun(WITHHELD_RUN);
+
+    const rows = container.querySelectorAll(".bt-trades tbody tr");
+    expect(rows).toHaveLength(1);
+    // The row is the DTO's own stored trade, unaltered: the entry price and the
+    // realized R render as the A2 display text, with the DTO's exact string on
+    // the element (the `Figure` contract) — never a value the screen derived.
+    const row = rows[0] as HTMLElement;
+    const entry = within(row).getByText(price(WITHHELD_RUN.trades[0].entryPrice));
+    expect(entry.getAttribute("data-exact")).toBe(WITHHELD_RUN.trades[0].entryPrice);
+    const r = within(row).getByText(rMultiple(WITHHELD_RUN.trades[0].realizedR));
+    expect(r.getAttribute("data-exact")).toBe(WITHHELD_RUN.trades[0].realizedR);
+    // The row-level note names the withheld rows, in the Chart tab's own shape.
+    const note = container.querySelector(".bt-withheld-rows") as HTMLElement;
+    expect(note.textContent).toBe("2 trades withheld: reaching the holdout");
+  });
+
+  it("names the fence at the trade table rather than reading as a run with no trades", async () => {
+    // A fenced run whose EVERY trade is withheld: the empty table must say which
+    // empty it is (PDR-0011) — never "the run recorded no trades".
+    const container = await renderRun({ ...WITHHELD_RUN, trades: [] });
+    const table = container.querySelector(".bt-trades tbody") as HTMLElement;
+    expect(table.textContent).toContain("No trades in this run fall before the holdout.");
+    expect(table.textContent).not.toContain("The run recorded no trades.");
+  });
+
+  it("reads a run with no stored trades as a run that recorded none, even with the totals withheld", async () => {
+    // The opposite misattribution: `totalsWithheld` fires from the counted WINDOW
+    // alone, so a run whose window reaches H and which persisted NO trades still
+    // carries it. The count is 0, so no row was withheld and the table must say
+    // so — never name a holdout cause that did not occur (#417 fix round 4).
+    const container = await renderRun({
+      ...WITHHELD_RUN,
+      trades: [],
+      withheldTradeCount: 0,
+    });
+    expect(container.querySelector(".bt-withheld-rows")).toBeNull();
+    const table = container.querySelector(".bt-trades tbody") as HTMLElement;
+    expect(table.textContent).toContain("The run recorded no trades.");
+    expect(table.textContent).not.toContain("No trades in this run fall before the holdout.");
+  });
+
+  it("reads a withheld count as withheld rows even when the totals are not flagged", async () => {
+    const container = await renderRun({
+      ...SEEDED_RUN,
+      holdoutStartMs: "1756684800000",
+      withheldTradeCount: 2,
+      totalsWithheld: false,
+      trades: [],
+    });
+    const section = container.querySelector(".bt-trades-section") as HTMLElement;
+    expect(section.textContent).toContain("2 trades withheld: reaching the holdout");
+    const table = container.querySelector(".bt-trades tbody") as HTMLElement;
+    expect(table.textContent).toContain("No trades in this run fall before the holdout.");
+    expect(table.textContent).not.toContain("The run recorded no trades.");
+  });
+
+  it("renders the unfenced run exactly as before — no sentence, every total present", async () => {
+    // The control: `totalsWithheld: false` with no freeze open. This is the
+    // byte-for-byte path the ruling's step 4 protects.
+    const container = await renderRun(SEEDED_RUN);
+    expect(container.querySelector(".bt-withheld")).toBeNull();
+    const tiles = container.querySelector(".bt-kpis") as HTMLElement;
+    expect(tiles.querySelectorAll(".bt-kpi").length).toBeGreaterThan(0);
+    expect(within(tiles).getByText("−84.13 USDT").getAttribute("data-exact")).toBe("-84.125");
+    expect(container.querySelector(".bt-equity")).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Table twins, parity, focus, hit targets
 // ---------------------------------------------------------------------------
 
@@ -878,9 +1040,13 @@ describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
     }
 
     // Histogram twins: underflow + 12 bins + overflow with their counts.
+    const twinMfe = SEEDED_RUN.mfe;
+    const twinMae = SEEDED_RUN.mae;
+    expect(twinMfe).not.toBeNull();
+    expect(twinMae).not.toBeNull();
     for (const [cls, hist] of [
-      [".bt-twin-mfe", SEEDED_RUN.mfe],
-      [".bt-twin-mae", SEEDED_RUN.mae],
+      [".bt-twin-mfe", twinMfe!],
+      [".bt-twin-mae", twinMae!],
     ] as const) {
       const twin = container.querySelector(cls) as HTMLElement;
       expect(twin).not.toBeNull();

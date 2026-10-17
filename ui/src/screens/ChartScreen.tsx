@@ -74,9 +74,15 @@ interface RunContext {
    *  only fence the tab can know before its first chart answer — and a trade that
    *  reaches it carries a withheld-period outcome, so it is never listed. */
   readonly holdoutStartMs: string | null;
-  /** The run's stored trades. The run read is the tab's FIRST answer about the run and
-   *  it already carries every trade the run recorded, so a leg over the bar cap has rows
-   *  to pick from before any chart read happens (CR1). */
+  /** How many of the run's stored trades the SERVER withheld because they reach
+   *  the holdout start (#417). It is the only word that tells a run whose every
+   *  trade was withheld from a run that recorded none — the rows themselves
+   *  cannot, because they never arrive. */
+  readonly withheldTradeCount: number;
+  /** The run's stored trades that CLEAR the fence. The run read is the tab's FIRST
+   *  answer about the run and it already carries every trade the run recorded, so
+   *  a leg over the bar cap has rows to pick from before any chart read happens
+   *  (CR1). */
   readonly trades: readonly ChartTradeDto[];
 }
 
@@ -779,8 +785,16 @@ export default function ChartScreen() {
   })();
   /** Whether the FENCE emptied the list rather than the run having none: the empty
    *  state says which of the two it is (PDR-0011 — no state names a trade that is not
-   *  there, and no fence reads as "this run traded nothing"). */
-  const fencedOut = trades.length === 0 && (run?.trades.length ?? 0) > 0;
+   *  there, and no fence reads as "this run traded nothing").
+   *
+   *  The run read's own count is the authority (#417): the server now withholds a
+   *  trade that reaches the holdout, so a run whose EVERY trade is withheld comes
+   *  back with `trades` empty and `withheldTradeCount` naming how many it left out.
+   *  The local list alone cannot tell that from a run that traded nothing — the
+   *  client-side filter sees only what it was sent. */
+  const fencedOut =
+    trades.length === 0 &&
+    ((run?.withheldTradeCount ?? 0) > 0 || (run?.trades.length ?? 0) > 0);
   const overlays = dto?.run?.overlays ?? [];
   const events = overlays.flatMap((overlay) => {
     if (overlay.kind === "pivot") {
@@ -1294,6 +1308,7 @@ function readRun(dto: BacktestRunDto): RunContext {
     firstOpenTimeMs: dto.firstOpenTimeMs,
     lastCloseTimeMs: dto.lastCloseTimeMs,
     holdoutStartMs: dto.holdoutStartMs,
+    withheldTradeCount: dto.withheldTradeCount,
     trades: toChartTrades(dto.trades),
   };
 }

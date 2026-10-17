@@ -827,7 +827,8 @@ pub use crate::tauri::{
     LibraryVersion, RegimeCellDto, RunId, ShellInfo, StreamOutcome, TradeRowDto, VersionStats,
     backtest_run_dto, compare_child_run_core, compose_strategy_body, compose_strategy_core,
     demo_stream_core, dsl_summary, export_bindings, library_overview_core,
-    run_backtest_version_core, run_desktop, server_address, shell_info_core, summarize_dsl,
+    run_backtest_version_core, run_desktop, run_read_fence, server_address, shell_info_core,
+    summarize_dsl, trade_clears_fence,
 };
 // r3.s3.w5: the thin-client surface — `tests/client_proxy.rs` (AC-1) drives the
 // client against the in-process server, and the proxied command wrappers in

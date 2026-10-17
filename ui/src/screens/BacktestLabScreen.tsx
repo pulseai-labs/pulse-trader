@@ -1252,14 +1252,28 @@ export default function BacktestLabScreen() {
             onDecide={onDecide}
             onSelectChild={(id) => void onSelectChild(id)}
           />
-          <EquityChart
-            points={run.dto.equity}
-            startingEquity={run.dto.startingEquity}
-          />
-          <RegimeBars cells={run.dto.regimes} />
-          <Histogram title="MFE (R)" className="bt-mfe" hist={run.dto.mfe} />
-          <Histogram title="MAE (R)" className="bt-mae" hist={run.dto.mae} />
-          <TradeTable trades={run.dto.trades} runId={run.dto.runId} />
+          {/* #417 (PDR-0038 option A): a withheld run has no outcome series to
+              draw — the server sends empty `equity`/`regimes` and null
+              histograms rather than a curve over the trades that remain. Each
+              section below renders only when it has data, so the Lab shows the
+              withheld sentence (in KpiTiles) and the trades that cleared the
+              fence, and never an empty frame standing in for a total. */}
+          {!run.dto.totalsWithheld && (
+            <>
+              <EquityChart
+                points={run.dto.equity}
+                startingEquity={run.dto.startingEquity}
+              />
+              <RegimeBars cells={run.dto.regimes} />
+            </>
+          )}
+          {run.dto.mfe !== null && (
+            <Histogram title="MFE (R)" className="bt-mfe" hist={run.dto.mfe} />
+          )}
+          {run.dto.mae !== null && (
+            <Histogram title="MAE (R)" className="bt-mae" hist={run.dto.mae} />
+          )}
+          <TradeTable trades={run.dto.trades} runId={run.dto.runId} dto={run.dto} />
           <ChartTwins dto={run.dto} />
         </div>
       )}
@@ -1627,6 +1641,33 @@ function ProvenanceBand({ dto }: { dto: BacktestRunDto }) {
 }
 
 // ---------------------------------------------------------------------------
+// The withheld totals (r5-p1, #417, PDR-0038 option A)
+// ---------------------------------------------------------------------------
+
+/** The ONE sentence the Lab shows in place of the run's totals while an open
+ *  freeze's holdout start cuts them (#417 step 3).
+ *
+ *  Wording follows the Chart tab's own holdout notes ("Holdout from <date UTC>
+ *  — <n> bars withheld"): the date is the same `dateUtc` rendering, so one
+ *  freeze reads the same in both tabs. The server decided the fence and sent
+ *  every word of this — the count, the flag and the instant — so the screen
+ *  formats and never re-derives.
+ *
+ *  The count is the trades the READ withheld, never a total the screen computed:
+ *  a reader who adds the listed rows to it gets nothing, because the withheld
+ *  rows are not in the answer at all. */
+function WithheldTotals({ dto }: { dto: BacktestRunDto }) {
+  if (!dto.totalsWithheld) return null;
+  const count = dto.withheldTradeCount;
+  const noun = count === 1 ? "trade" : "trades";
+  return (
+    <p className="bt-withheld" role="note">
+      {`${count} ${noun} and the run totals withheld: holdout from ${dateUtc(dto.holdoutStartMs)}`}
+    </p>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // KPI tiles
 // ---------------------------------------------------------------------------
 
@@ -1640,6 +1681,17 @@ function Kpi({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 function KpiTiles({ dto }: { dto: BacktestRunDto }) {
+  // #417 (PDR-0038 option A): a withheld run has no totals to render, and the
+  // honest screen is the ONE sentence in their place — never a grid of em
+  // dashes a reader could mistake for a run that traded nothing. The decision
+  // is the server's (`totalsWithheld`); this screen only obeys it.
+  if (dto.totalsWithheld) {
+    return (
+      <section className="bt-section bt-kpis" aria-label="Headline metrics">
+        <WithheldTotals dto={dto} />
+      </section>
+    );
+  }
   return (
     <section className="bt-section bt-kpis" aria-label="Headline metrics">
       {/* Every figure is A2-formatted over the DTO's own text, with that exact
@@ -1658,11 +1710,11 @@ function KpiTiles({ dto }: { dto: BacktestRunDto }) {
       <Kpi label="Profit factor">
         <Figure exact={dto.profitFactor}>{decimal(dto.profitFactor, 2)}</Figure>
       </Kpi>
-      <Kpi label="Trades">{dto.tradeCount}</Kpi>
-      <Kpi label="Wins">{dto.winCount}</Kpi>
-      <Kpi label="Losses">{dto.lossCount}</Kpi>
-      <Kpi label="Max win streak">{dto.maxWinStreak}</Kpi>
-      <Kpi label="Max loss streak">{dto.maxLossStreak}</Kpi>
+      <Kpi label="Trades">{dto.tradeCount ?? EM_DASH}</Kpi>
+      <Kpi label="Wins">{dto.winCount ?? EM_DASH}</Kpi>
+      <Kpi label="Losses">{dto.lossCount ?? EM_DASH}</Kpi>
+      <Kpi label="Max win streak">{dto.maxWinStreak ?? EM_DASH}</Kpi>
+      <Kpi label="Max loss streak">{dto.maxLossStreak ?? EM_DASH}</Kpi>
       <Kpi label="Max drawdown">
         <Figure exact={dto.maxDrawdown}>{usdt(dto.maxDrawdown)}</Figure>
       </Kpi>
@@ -1672,9 +1724,9 @@ function KpiTiles({ dto }: { dto: BacktestRunDto }) {
       <Kpi label="Sortino">
         <Figure exact={asText(dto.sortino)}>{decimal(asText(dto.sortino), 2)}</Figure>
       </Kpi>
-      <Kpi label="Skipped sub-lot">{dto.skippedSubLot}</Kpi>
-      <Kpi label="Skipped sub-notional">{dto.skippedSubNotional}</Kpi>
-      <Kpi label="Skipped leverage-capped">{dto.skippedLeverageCapped}</Kpi>
+      <Kpi label="Skipped sub-lot">{dto.skippedSubLot ?? EM_DASH}</Kpi>
+      <Kpi label="Skipped sub-notional">{dto.skippedSubNotional ?? EM_DASH}</Kpi>
+      <Kpi label="Skipped leverage-capped">{dto.skippedLeverageCapped ?? EM_DASH}</Kpi>
       <Kpi label="Fees">
         <Figure exact={dto.feesTotal}>{usdt(dto.feesTotal)}</Figure>
       </Kpi>
@@ -1935,10 +1987,27 @@ const TRADE_FORMATTERS: Partial<
   maeR: rMultiple,
 };
 
-function TradeTable({ trades, runId }: { trades: TradeRowDto[]; runId: string }) {
+function TradeTable({ trades, runId, dto }: { trades: TradeRowDto[]; runId: string; dto: BacktestRunDto }) {
   return (
     <section className="bt-section bt-trades-section" aria-label="Trades">
       <h3 className="bt-h">Trades</h3>
+      {/* #417 step 3: the trades the fence left out are named HERE, at the table
+          that would have listed them, so a reader who counts rows is told why the
+          count is short. The TOTALS sentence belongs to the totals block above
+          (the ruling puts it "in place of the totals"); this is the row-level
+          note, in the Chart tab's own shape for the same fact — "n marks hidden:
+          inside the holdout".
+          The count covers every row the fence rejected, INCLUDING a straddling
+          trade (entry before H, exit at or after it), so the wording is "reaching
+          the holdout" — the same phrase the Chart tab's own sentence uses — and
+          never "inside", which would name only the trades that OPEN there. */}
+      {dto.withheldTradeCount > 0 && (
+        <p className="bt-withheld-rows" role="note">
+          {`${dto.withheldTradeCount} ${
+            dto.withheldTradeCount === 1 ? "trade" : "trades"
+          } withheld: reaching the holdout`}
+        </p>
+      )}
       {/* r5.s2.w2: the tab that draws these trades on the run's own candles. The
           handover is the fragment and the run id, never shared state (the #269
           deep-link pattern one screen over). */}
@@ -1977,6 +2046,21 @@ function TradeTable({ trades, runId }: { trades: TradeRowDto[]; runId: string })
                 })}
               </tr>
             ))}
+            {trades.length === 0 && (
+              <tr>
+                <td colSpan={TRADE_FIELDS.length}>
+                  {/* PDR-0011: the empty state says WHICH empty it is. The withheld
+                      COUNT is the proof rows existed and were withheld; the totals
+                      flag is not, because it fires from the counted WINDOW alone, so
+                      a run that stored no trades at all still has `totalsWithheld`
+                      true. Gating on the count alone is what the Chart tab does
+                      (`fencedOut`), so the same run reads the same in both tabs. #417. */}
+                  {dto.withheldTradeCount > 0
+                    ? "No trades in this run fall before the holdout."
+                    : "The run recorded no trades."}
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -1988,10 +2072,21 @@ function TradeTable({ trades, runId }: { trades: TradeRowDto[]; runId: string })
 // Table twins (no data reachable only through the graphic)
 // ---------------------------------------------------------------------------
 
-/** Every chart's in-DOM accessible twin carrying the same exact strings. */
+/** Every chart's in-DOM accessible twin carrying the same exact strings.
+ *
+ *  A withheld run (#417) has no series to twin: the four tables below render
+ *  their headers and no rows, and the withheld sentence lives in the KPI block
+ *  above, which is the one place the reading is explained. An empty twin is
+ *  therefore not a fabricated "no data" claim — the page has already said why. */
 function ChartTwins({ dto }: { dto: BacktestRunDto }) {
-  const mfeColumns = useMemo(() => histogramColumns(dto.mfe), [dto.mfe]);
-  const maeColumns = useMemo(() => histogramColumns(dto.mae), [dto.mae]);
+  const mfeColumns = useMemo(
+    () => (dto.mfe === null ? [] : histogramColumns(dto.mfe)),
+    [dto.mfe],
+  );
+  const maeColumns = useMemo(
+    () => (dto.mae === null ? [] : histogramColumns(dto.mae)),
+    [dto.mae],
+  );
 
   return (
     <section className="bt-twins" aria-label="Chart data tables">

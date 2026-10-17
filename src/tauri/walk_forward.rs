@@ -34,7 +34,7 @@ use crate::domain::{
     BacktestRunId, PersistedRun, WalkForwardRun, WalkForwardRunId, WalkForwardRunRepository,
 };
 
-use super::backtest::{BacktestRunDto, backtest_run_dto, dec};
+use super::backtest::{BacktestRunDto, backtest_run_dto, dec, run_read_fence};
 use super::commands::{DesktopState, OperationKey};
 use super::error::{BusError, BusErrorCode};
 
@@ -472,10 +472,16 @@ pub async fn get_backtest_run_core(
     // #219 rides the same rule for a persisted read: `uses_htf` is the run's own
     // version's compiled answer, never inferred from the recorded inputs.
     let uses_htf = run_uses_htf(&state.strategy_repo(), &outcome.run.strategy_version_id).await;
-    // The open freeze reaches the DTO as METADATA only (r5.s2 close review): this
-    // read keeps answering a persisted run in full — the Lab's rows do not move —
-    // and the Chart tab is the surface that fences its trade rows at this instant.
+    // The open freeze reaches the DTO both as METADATA (its holdout start, r5.s2
+    // close review) and, since #417 (PDR-0038 option A), as a FENCE this read
+    // applies: `get_backtest_run_core` is the app's run read, so it is the surface
+    // that must not send a holdout trade or a holdout total. `run_read_fence`
+    // makes the decision from the outcome already in hand — the same
+    // `guard_persisted_window` every agent read makes, and no second snapshot
+    // decode on an interactive read.
+    //
     // An unreadable freeze table is an error, never a silent `None`.
     let holdout = state.open_holdout().await?;
-    Ok(backtest_run_dto(&outcome, uses_htf, holdout)?)
+    let fence = run_read_fence(&outcome, holdout);
+    Ok(backtest_run_dto(&outcome, uses_htf, holdout, fence)?)
 }

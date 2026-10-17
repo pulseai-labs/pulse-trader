@@ -56,7 +56,7 @@ use crate::domain::strategy::VersionId;
 
 use super::backtest::{
     BacktestRunDto, BacktestRunRequest, CompareChildRunDto, CompareChildRunRequest,
-    backtest_run_dto,
+    backtest_run_dto, run_read_fence,
 };
 use super::certification::{CertificationRecordsDto, CertificationRecordsRequest};
 // r5.s2.w1: the Chart tab's read — a window of candles and, for a run, its trades
@@ -1442,7 +1442,28 @@ pub async fn run_backtest_version_core(
     // refuses, and the refusal still names the run that exists. `uses_htf` comes
     // from the version's own DSL, not from the recorded inputs (#219).
     let uses_htf = run_uses_htf(&strategies, &version_id).await;
-    Ok(backtest_run_dto(&outcome, uses_htf, holdout)?)
+    // The SAME fence the Lab's later read of this run will apply (#417, PDR-0038
+    // option A). It is not always a no-op here: the window guard clamps only when
+    // a bar OPENS at or after H, so a snapshot whose last bar opens before H but
+    // CLOSES after it runs to `SeriesEnd::SnapshotEnd`, and that end-of-data close
+    // fills at the last bar's `close_time` — on or after H. `run_read_fence` reads
+    // the window and the fills the same way the stored read does.
+    //
+    // The freeze is read AGAIN, after the run: the backtest latch and the freeze
+    // store are independent, so a freeze can open or close while a multi-second
+    // run is in flight. The pre-run value is what RUNS the backtest; this one is
+    // what may be SENT. Feeding the pre-run value in would let a freeze opened
+    // mid-run answer with the very trades and totals the Lab's next read of the
+    // same run withholds — and the leaky answer is the one the Lab sees first.
+    //
+    // A failure of THIS read returns the store's error although the run is already
+    // persisted, and that error names no run. Accepted rather than wrapped: the
+    // identical read succeeded a moment earlier, so the window is a store failure
+    // between two adjacent reads, and the run stays readable through
+    // `get_backtest_run_core`, which is where the Lab retries from.
+    let read_holdout = state.open_holdout().await?;
+    let fence = run_read_fence(&outcome, read_holdout);
+    Ok(backtest_run_dto(&outcome, uses_htf, read_holdout, fence)?)
 }
 
 /// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).

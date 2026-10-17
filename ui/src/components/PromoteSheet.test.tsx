@@ -59,6 +59,9 @@ const FOLD_RUN: BacktestRunDto = {
   firstOpenTimeMs: "1735689600000",
   lastCloseTimeMs: "1756684800000",
   holdoutStartMs: null,
+  // #417: no freeze was open at this fixture's read, so nothing was withheld.
+  withheldTradeCount: 0,
+  totalsWithheld: false,
   startingEquity: "10000.00",
   takerFeeBps: "4",
   slippageBps: "1",

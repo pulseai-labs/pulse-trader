@@ -182,12 +182,17 @@ async fn two_cold_runs_agree_on_every_field_except_identity_and_time() {
          run id and created_at"
     );
 
-    // The run is real, not an empty shell.
+    // The run is real, not an empty shell. No freeze is open in this suite, so
+    // #417's fence withholds nothing and every field is `Some` as before.
     assert!(
-        first.trade_count > 0 && !first.trades.is_empty(),
+        first.trade_count.is_some_and(|n| n > 0) && !first.trades.is_empty(),
         "the fixture run produced trades: {first:?}"
     );
-    assert_eq!(first.trades.len(), first.trade_count as usize);
+    assert_eq!(first.trades.len(), first.trade_count.unwrap() as usize);
+    assert!(
+        !first.totals_withheld,
+        "no freeze is open, so nothing is withheld"
+    );
 
     // The saved projections agree directly too, not just the DTO built from them.
     let db = env.db().await;
@@ -985,7 +990,7 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
         mfe: project_histogram(std::iter::empty()),
         mae: project_histogram(std::iter::empty()),
     };
-    let err = pulse::backtest_run_dto(&outcome, true, None)
+    let err = pulse::backtest_run_dto(&outcome, true, None, None)
         .expect_err("a count that does not fit the wire must refuse, never clamp");
     let BacktestAppError::SavedButReadBackFailed {
         run_id,
@@ -1020,7 +1025,7 @@ async fn a_stored_value_that_will_not_fit_the_wire_refuses_and_names_the_run() {
         mae: project_histogram(std::iter::empty()),
     };
     assert!(
-        pulse::backtest_run_dto(&good, true, None).is_ok(),
+        pulse::backtest_run_dto(&good, true, None, None).is_ok(),
         "positive control: an uncorrupted outcome projects"
     );
 }
@@ -1579,8 +1584,20 @@ async fn the_measured_fixture_produces_the_pinned_bins() {
         let total: u32 = h.bins.iter().map(|b| b.count).sum();
         assert_eq!(total, 6, "{label} counts every trade");
     };
-    expect(&dto.mfe, &[(0, 2), (4, 1), (6, 1), (8, 2)], "MFE");
-    expect(&dto.mae, &[(0, 1), (1, 1), (2, 1), (4, 3)], "MAE");
+    expect(
+        dto.mfe
+            .as_ref()
+            .expect("no freeze, so the MFE histogram is sent"),
+        &[(0, 2), (4, 1), (6, 1), (8, 2)],
+        "MFE",
+    );
+    expect(
+        dto.mae
+            .as_ref()
+            .expect("no freeze, so the MAE histogram is sent"),
+        &[(0, 1), (1, 1), (2, 1), (4, 3)],
+        "MAE",
+    );
 
     // The exact per-trade values live beside the projection, unrounded.
     assert!(
@@ -1637,7 +1654,11 @@ async fn the_response_reports_the_reloaded_snapshot_date_range_and_saved_values(
         .await
         .expect("read")
         .expect("exists");
-    assert_eq!(dto.net_pnl, saved.net_pnl.normalize().to_string());
+    assert_eq!(
+        dto.net_pnl,
+        Some(saved.net_pnl.normalize().to_string()),
+        "net_pnl is the persisted row's own decimal"
+    );
     assert_eq!(dto.result_content_hash, saved.result_content_hash);
     assert_eq!(dto.engine_fingerprint, saved.engine_fingerprint);
     assert_eq!(i64::from(dto.schema_version), saved.schema_version);

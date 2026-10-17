@@ -578,6 +578,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The Lab's run view no longer shows trades or totals from an open freeze's
+  holdout period (#417, PDR-0038 option A).** `get_backtest_run_core` — the app's
+  read of a stored run, behind `POST /api/v1/get-backtest-run` and the `get_backtest_run`
+  bus command — answered every stored trade and every stored total, passing the open
+  freeze's holdout start only as metadata; the Chart tab hid a trade that reaches the
+  boundary in the CLIENT, after the rows had arrived, and the Lab showed them. The
+  fence now runs on the server, on the Chart tab's own rule: a trade is listed only
+  when its entry and its exit are both before the holdout start, so a trade that
+  straddles the boundary and a trade inside the holdout are not sent at all. A run
+  that reaches the holdout start — its counted window through the SAME decision
+  agent reads already make (`guard_persisted_run`), or a row the trade fence
+  withheld, whose own outcome is inside the stored totals — has every outcome
+  aggregate and series withheld — net P&L, expectancy, win rate, profit factor, the
+  trade counts and streaks, drawdown, Sharpe and Sortino, fees, funding, slippage,
+  gross profit and loss, the averages, the skipped-entry counts, the equity curve,
+  the regime cells and both excursion histograms — never recomputed over the trades
+  that remain: the stored numbers are absent, not recalculated. The read says what it left out —
+  `withheldTradeCount`, `totalsWithheld` and the existing `holdoutStartMs` — and the
+  Lab renders one sentence in place of the totals: "`<n>` trades and the run totals
+  withheld: holdout from `<date UTC>`". Everything else is unchanged: a run wholly
+  before the holdout and any run while no freeze is open read exactly as before, the
+  stored run never changes, and the Library's spent certification records keep their
+  behavior. `run_backtest_version` takes the SAME fence, decided in one place
+  (`run_read_fence`) from the outcome already in hand: the window guard clamps only
+  when a bar OPENS at the holdout start, so a snapshot whose last bar opens before it
+  but closes after it runs to the end of data — and that end-of-data close fills at
+  the last bar's close time, on or after the holdout start. Both arms therefore
+  withhold that final trade, and they cannot disagree. Four other app reads that can carry holdout
+  outcomes are audited and deferred, each with its own issue: the walk-forward fold
+  table and verdict (#445), `library_overview`'s version stats and run rows (#446),
+  `compare_child_run`'s before/after cells and the coach accept's before-summary
+  (#447), and the streak-and-drawdown card (#448).
+
 - **A self-signed `just bundle` now says so, and the Keychain prompt on every new signed Mac build has a
   cause and a fix (#392).** Every new signed build asked for the login Keychain's password before it could
   read `PulseTrader/server_app_token`, and the answer did not persist — even for the same build. The cause

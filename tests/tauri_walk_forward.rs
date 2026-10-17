@@ -275,10 +275,35 @@ async fn get_backtest_run_on_a_fold_id_returns_the_ordinary_run_dto() {
         // The KPIs are the fold row's own summary values — the same numbers
         // the walk-forward table renders — AND the persisted row's, through
         // the same `backtest_run_dto` projection `run_backtest_version` uses.
-        assert_eq!(dto.expectancy, fold.expectancy, "fold expectancy agrees");
-        assert_eq!(dto.win_rate, fold.win_rate, "fold win rate agrees");
-        assert_eq!(dto.trade_count, fold.trades, "fold trade count agrees");
-        assert_eq!(dto.trade_count as usize, fold.n as usize, "`trades` is `n`");
+        // #417 (PDR-0038 option A): the outcome fields are `Option` so the
+        // holdout fence has somewhere to put "withheld" — this read ran with NO
+        // freeze open, so every one of them is `Some` and this arm is the
+        // unchanged path's own proof.
+        assert!(
+            !dto.totals_withheld,
+            "no freeze is open, so no total may be withheld"
+        );
+        assert_eq!(dto.withheld_trade_count, 0, "no freeze, no trade withheld");
+        assert_eq!(
+            dto.expectancy.as_deref(),
+            Some(fold.expectancy.as_str()),
+            "fold expectancy agrees"
+        );
+        assert_eq!(
+            dto.win_rate.as_deref(),
+            Some(fold.win_rate.as_str()),
+            "fold win rate agrees"
+        );
+        assert_eq!(
+            dto.trade_count,
+            Some(fold.trades),
+            "fold trade count agrees"
+        );
+        assert_eq!(
+            dto.trade_count.map(|n| n as usize),
+            Some(fold.n as usize),
+            "`trades` is `n`"
+        );
 
         let persisted = runs
             .get_run(&BacktestRunId::new(fold.backtest_run_id.clone()))
@@ -288,7 +313,7 @@ async fn get_backtest_run_on_a_fold_id_returns_the_ordinary_run_dto() {
         assert_eq!(dto.result_content_hash, persisted.result_content_hash);
         assert_eq!(
             dto.net_pnl,
-            persisted.net_pnl.normalize().to_string(),
+            Some(persisted.net_pnl.normalize().to_string()),
             "net_pnl is the persisted row's own decimal"
         );
 
