@@ -2049,12 +2049,13 @@ function TradeTable({ trades, runId, dto }: { trades: TradeRowDto[]; runId: stri
             {trades.length === 0 && (
               <tr>
                 <td colSpan={TRADE_FIELDS.length}>
-                  {/* PDR-0011: the empty state says WHICH empty it is. A fenced read
-                      must not read as "this run traded nothing" — and the withheld
-                      COUNT is the proof it withheld rows, not that none exist, so it
-                      gates this sentence beside the totals flag (the Chart tab ORs
-                      the same count into `fencedOut`). #417. */}
-                  {dto.totalsWithheld || dto.withheldTradeCount > 0
+                  {/* PDR-0011: the empty state says WHICH empty it is. The withheld
+                      COUNT is the proof rows existed and were withheld; the totals
+                      flag is not, because it fires from the counted WINDOW alone, so
+                      a run that stored no trades at all still has `totalsWithheld`
+                      true. Gating on the count alone is what the Chart tab does
+                      (`fencedOut`), so the same run reads the same in both tabs. #417. */}
+                  {dto.withheldTradeCount > 0
                     ? "No trades in this run fall before the holdout."
                     : "The run recorded no trades."}
                 </td>

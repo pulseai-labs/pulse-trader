@@ -387,7 +387,8 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
     // `trade_at` fills its exit one bar after its own signal, so at `H - 2 * step`
     // its exit SIGNALS one bar before H and FILLS exactly at H. A fence spelled on
     // signal times would clear (b) and list it; the fill-time rule withholds it.
-    // (a) clears H on its FILL time with four bars to spare.
+    // (a) clears H on its FILL time with ONE bar to spare; the bar it clears by
+    // four is its entry SIGNAL, which the fence does not read.
     let before = trade_at(holdout_start - 3 * step, "2");
     let straddling = trade_at(holdout_start - 2 * step, "-1");
     let inside = trade_at(holdout_start + 2 * step, "2");
@@ -449,12 +450,13 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
         before.exit_fill_time.to_string()
     );
 
-    // (b) and (c) are withheld WHOLE. The scan covers (c)'s times and, for (b),
-    // the times a lying answer would most readily leave in — but NOT all four of
-    // (b)'s: it sits one bar from (a), so three of its times ARE the listed row's
-    // own, and its exit fill is H itself, which the answer names legitimately as
-    // `holdoutStartMs`. The row-level assertions around this scan carry (b)'s
-    // proof: exactly one row is listed, it is (a), and every listed fill is < H.
+    // (b) and (c) are withheld WHOLE. This scan covers (c) ONLY: no time of (b)
+    // is scannable for, because (b) sits one bar from (a) so three of its times
+    // ARE the listed row's own, and its exit fill is H itself, which the answer
+    // names legitimately as `holdoutStartMs`. (b)'s proof is therefore solely the
+    // row-level assertions above and below this scan — do not trim them as
+    // redundant on the strength of this array: exactly one row is listed, it is
+    // (a), and every listed fill is < H.
     let withheld_times = [
         inside.entry_fill_time.to_string(),
         inside.exit_fill_time.to_string(),
@@ -701,6 +703,80 @@ async fn the_fresh_run_command_and_the_read_agree_under_one_open_freeze() {
     assert_eq!(
         read.holdout_start_ms, fresh.holdout_start_ms,
         "both answers name the same frozen holdout start"
+    );
+}
+
+/// An unprovable span WITHHOLDS where an empty series CLEARS — the fence's own
+/// failure direction, matching the agent guard's (`#417` fix round 4, the OMP
+/// review's finding 2).
+///
+/// An unwindowed run's span is `CandleWindow::new(first_open, last_close)`.
+/// `guard_persisted_run` REFUSES the read when that construction fails
+/// (`src/application/holdout.rs`), so mapping the failure onto the same arm as an
+/// EMPTY series — which the guard passes — would leave the app read more
+/// permissive than the guard it claims to share. A store can hold such a row:
+/// `CandleSeries::validate` checks `open_time` ordering only, and no in-repo
+/// writer stamps `close = open + step - 1` differently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unprovable_span_withholds_where_an_empty_series_clears() {
+    let env = env();
+    let state = env.cold_state().await;
+    let version = seed_version(&state).await;
+    let series = m15_series(&env.store());
+    let holdout_start = series[200].open_time;
+    // Zero trades: this arm is about the SPAN, not the rows.
+    let run_id = seed_run(&state, &env.store(), &version, vec![]).await;
+    let stored = SqliteBacktestRunRepo::new(state.db().pool().clone())
+        .get_run(&run_id)
+        .await
+        .expect("read the seeded run")
+        .expect("the seeded run exists");
+    let inputs = stored
+        .inputs
+        .clone()
+        .expect("the seeded run carries inputs");
+    let mut primary = env
+        .store()
+        .load_version(
+            &inputs.pair,
+            inputs.primary.timeframe,
+            &inputs.primary.data_version,
+        )
+        .expect("reload the primary snapshot")
+        .series;
+    // The span the fence must believe: the last candle closes at or before the
+    // first one opens, which `CandleWindow::new` refuses to construct.
+    let first_open = primary.candles.first().expect("candles").open_time;
+    primary.candles.last_mut().expect("candles").close_time = first_open;
+    let mut outcome = BacktestOutcome {
+        run: stored,
+        inputs,
+        trades: vec![],
+        primary,
+        htf: None,
+        d1: None,
+        fingerprint_warning: None,
+        mfe: project_histogram(std::iter::empty()),
+        mae: project_histogram(std::iter::empty()),
+    };
+    let freeze = pulse::HoldoutFreeze {
+        holdout_start_ms: holdout_start,
+    };
+
+    let fence =
+        run_read_fence(&outcome, Some(freeze)).expect("a freeze is open, so the fence exists");
+    assert!(
+        fence.withhold_totals,
+        "a span that will not construct is unprovable, so the fence must withhold — \
+         the guard this fence shares its decision with refuses the same run"
+    );
+
+    // The control, on the same run: an EMPTY series counted nothing, so it clears.
+    outcome.primary.candles = vec![];
+    let empty = run_read_fence(&outcome, Some(freeze)).expect("a freeze is open");
+    assert!(
+        !empty.withhold_totals,
+        "an empty series counted nothing, so there is nothing to guard"
     );
 }
 

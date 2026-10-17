@@ -963,6 +963,22 @@ describe("BacktestLabScreen (#417 — a withheld run says so)", () => {
     expect(table.textContent).not.toContain("The run recorded no trades.");
   });
 
+  it("reads a run with no stored trades as a run that recorded none, even with the totals withheld", async () => {
+    // The opposite misattribution: `totalsWithheld` fires from the counted WINDOW
+    // alone, so a run whose window reaches H and which persisted NO trades still
+    // carries it. The count is 0, so no row was withheld and the table must say
+    // so — never name a holdout cause that did not occur (#417 fix round 4).
+    const container = await renderRun({
+      ...WITHHELD_RUN,
+      trades: [],
+      withheldTradeCount: 0,
+    });
+    expect(container.querySelector(".bt-withheld-rows")).toBeNull();
+    const table = container.querySelector(".bt-trades tbody") as HTMLElement;
+    expect(table.textContent).toContain("The run recorded no trades.");
+    expect(table.textContent).not.toContain("No trades in this run fall before the holdout.");
+  });
+
   it("reads a withheld count as withheld rows even when the totals are not flagged", async () => {
     const container = await renderRun({
       ...SEEDED_RUN,

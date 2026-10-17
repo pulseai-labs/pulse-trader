@@ -234,6 +234,13 @@ pub fn run_read_fence(
 ) -> Option<RunReadFence> {
     let freeze = holdout?;
     let inputs = &outcome.inputs;
+    // An EMPTY primary series counted nothing, so there is nothing to guard — the
+    // same answer `guard_persisted_run` gives it (`holdout.rs`, the `else` on its
+    // first/last pair). A series that is NOT empty but whose span will not
+    // construct is a different case: the span is unprovable, and
+    // `guard_persisted_run` refuses it rather than clearing it. This fence does
+    // the same, so the two surfaces cannot disagree in either direction.
+    let empty_series = outcome.primary.candles.is_empty();
     let window = match &inputs.window {
         Some(window) => Some(window.clone()),
         None => match (
@@ -241,8 +248,6 @@ pub fn run_read_fence(
             outcome.primary.candles.last(),
         ) {
             (Some(first), Some(last)) => CandleWindow::new(first.open_time, last.close_time).ok(),
-            // An empty series counted nothing, so there is nothing to guard —
-            // the same answer `guard_persisted_run` gives it.
             _ => None,
         },
     };
@@ -251,7 +256,7 @@ pub fn run_read_fence(
             crate::application::holdout::guard_persisted_window(Some(freeze), &inputs.pair, &window)
                 .is_ok()
         }
-        None => true,
+        None => empty_series,
     };
     Some(RunReadFence::from_window_decision(
         freeze.holdout_start_ms,

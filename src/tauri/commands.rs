@@ -1455,6 +1455,12 @@ pub async fn run_backtest_version_core(
     // what may be SENT. Feeding the pre-run value in would let a freeze opened
     // mid-run answer with the very trades and totals the Lab's next read of the
     // same run withholds — and the leaky answer is the one the Lab sees first.
+    //
+    // A failure of THIS read returns the store's error although the run is already
+    // persisted, and that error names no run. Accepted rather than wrapped: the
+    // identical read succeeded a moment earlier, so the window is a store failure
+    // between two adjacent reads, and the run stays readable through
+    // `get_backtest_run_core`, which is where the Lab retries from.
     let read_holdout = state.open_holdout().await?;
     let fence = run_read_fence(&outcome, read_holdout);
     Ok(backtest_run_dto(&outcome, uses_htf, read_holdout, fence)?)
