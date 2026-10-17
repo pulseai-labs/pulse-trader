@@ -40,7 +40,7 @@ csv = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 hex = "0.4"
 # WI-1.1.1.04 (parquet persistence).
-polars = { version = "0.54", default-features = false, features = ["parquet"] }
+polars = { version = "0.55", default-features = false, features = ["parquet"] }
 directories = "6"
 serde_json = "1"
 # Shared by WI-02 (CHECKSUM verify) + WI-04 (data_version hash) — reconciled to one version at merge.
