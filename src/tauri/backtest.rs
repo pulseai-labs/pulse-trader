@@ -221,7 +221,10 @@ pub fn trade_clears_fence(trade: &Trade, fence: Option<RunReadFence>) -> bool {
 /// end-of-data close fills at that last bar's `close_time`, on or after H. The
 /// window test is therefore taken over the same `[first_open, last_close]` span
 /// the unwindowed guard uses, and the trade test below is taken over the FILL
-/// times, so the two agree about that final bar.
+/// times — so a fill at that last bar's close is withheld even where the window
+/// test passes at `to == H`. [`backtest_run_dto`] withholds the totals as soon as
+/// EITHER half fires, so this fence's two halves cannot make the DTO contradict
+/// itself about that final bar.
 ///
 /// [`guard_persisted_window`]: crate::application::holdout::guard_persisted_window
 #[must_use]
@@ -446,13 +449,25 @@ pub struct BacktestRunDto {
     /// Whether this read withheld the run's outcome totals (`#417`, PDR-0038
     /// option A).
     ///
-    /// `true` exactly when a freeze was open at this read AND the run's counted
-    /// window reaches the holdout start — the decision agent reads already make
-    /// (`guard_persisted_run`, `src/application/holdout.rs`). When it is `true`,
-    /// every outcome aggregate and series below is `null` or empty: the stored
-    /// numbers are withheld, NEVER recomputed over the trades that remain. When
-    /// it is `false` — no freeze open, or a run whose window ends before H —
-    /// every field below carries its stored value exactly as before.
+    /// `true` exactly when a freeze was open at this read AND the read withheld
+    /// something the totals carry: the run's counted window reaches the holdout
+    /// start — the decision agent reads already make (`guard_persisted_run`,
+    /// `src/application/holdout.rs`) — or the trade fence withheld at least one
+    /// trade.
+    ///
+    /// The second half keeps ONE document consistent at the one boundary the two
+    /// halves disagree. A counted window ending EXACTLY at H is legal for the
+    /// window test (`guard_span` refuses `to > H`, not `to == H`), while a trade
+    /// filling exactly at H is withheld — and that trade's own outcome is inside
+    /// the stored totals. Without this half the read would answer
+    /// `withheldTradeCount: 1` beside the withheld trade's P&L, and the Lab would
+    /// print "1 trade withheld" above the very totals that contain it.
+    ///
+    /// When it is `true`, every outcome aggregate and series below is `null` or
+    /// empty: the stored numbers are withheld, NEVER recomputed over the trades
+    /// that remain. When it is `false` — no freeze open, or a run that reaches H
+    /// in neither half — every field below carries its stored value exactly as
+    /// before.
     pub totals_withheld: bool,
     /// Starting equity, exact decimal string.
     pub starting_equity: String,
@@ -814,8 +829,9 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
 /// `fence` is `None` while no freeze is open, and then every field below is the
 /// stored value: the projection is byte-identical to the read that predates
 /// `#417`. With a fence in force a trade that reaches the holdout start is
-/// dropped from `trades` and counted in `withheldTradeCount`, and a run whose
-/// counted window reaches H has every outcome aggregate and series withheld.
+/// dropped from `trades` and counted in `withheldTradeCount`, and every outcome
+/// aggregate and series is withheld as soon as EITHER half of the fence fires:
+/// the run's counted window reaches H, or the trade fence withheld a trade.
 ///
 /// # Errors
 ///
@@ -842,8 +858,15 @@ pub fn backtest_run_dto(
     // #417 (PDR-0038 option A): the fence's two halves. The totals read through
     // `kept` and the rows through `trade_clears_fence`, so a withheld run has
     // ONE reason to be empty rather than a dozen. See `KeptTotals`.
-    let kept = KeptTotals(!fence.is_some_and(|fence| fence.withhold_totals));
     let (trades, withheld_trade_count) = fenced_trades(outcome, fence);
+    // The window half is a FLOOR, not the whole decision: a withheld trade's own
+    // outcome is inside the stored totals and series, so the totals cannot be kept
+    // beside a withheld trade — not even at `to == H`, where the window test
+    // passes (`guard_span` refuses `to > H`) while the trade fence withholds a
+    // fill that lands exactly on H.
+    let totals_withheld =
+        fence.is_some_and(|fence| fence.withhold_totals) || withheld_trade_count > 0;
+    let kept = KeptTotals(!totals_withheld);
 
     Ok(BacktestRunDto {
         run_id: run.id.as_str().to_owned(),
@@ -884,7 +907,7 @@ pub fn backtest_run_dto(
         holdout_start_ms: holdout.map(|freeze| ms(freeze.holdout_start_ms)),
         // What this read left out, said plainly (#417 step 3).
         withheld_trade_count,
-        totals_withheld: fence.is_some_and(|fence| fence.withhold_totals),
+        totals_withheld,
         starting_equity: dec(run.starting_equity),
         taker_fee_bps: dec(inputs.taker_fee_bps),
         slippage_bps: dec(inputs.slippage_bps),

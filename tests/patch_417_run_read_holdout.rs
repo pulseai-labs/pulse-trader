@@ -30,6 +30,12 @@
 //!    end-of-data close fills at that bar's `close_time` — on or after H. The
 //!    fresh-run arm must not answer with that trade and the full totals while the
 //!    Lab's later read of the same run withholds both.
+//! 6. **The fresh-run COMMAND is fenced, not just the projection it calls**
+//!    (`#417` fix round 3, the OMP review's finding 2): the DTO
+//!    `run_backtest_version_core` returns and `get_backtest_run_core`'s read of
+//!    that same run withhold the same trades and make the same totals decision.
+//!    Every other arm here drives `get_backtest_run_core`, so without this one a
+//!    regression to the command's own `run_read_fence` call ships green.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -42,7 +48,7 @@ use pulse::{
     OpenFreezeRequest, Pair, Regime, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
     SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, StrategyId, StrategyRepository,
     SummaryStats, Timeframe, Trade, TradeSource, VersionId, get_backtest_run_core,
-    project_histogram, run_read_fence,
+    project_histogram, run_backtest_version_core, run_read_fence,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -152,9 +158,11 @@ async fn seed_version(state: &DesktopState) -> VersionId {
 ///
 /// **The SIGNAL times deliberately differ from the FILL times** (`#417`): an exit
 /// signals on the bar it is decided and fills at the NEXT bar's open, which is
-/// the engine's own rule. The fence is a fill-time rule, so a fence wrongly
-/// spelled on signal times would let the straddling trade through — with equal
-/// times these arms would pass either way and would pin nothing.
+/// the engine's own rule, so a trade's exit SIGNAL is one bar before its exit
+/// FILL. The fence is a fill-time rule: the arm below places the straddling trade
+/// at `H - 2 * step` precisely so its exit SIGNALS before H (a signal-time fence
+/// would list it) and FILLS exactly at H (the fill-time rule withholds it). With
+/// equal times the two spellings would agree and the arm would pin neither.
 fn trade_at(entry_ms: i64, r: &str) -> Trade {
     let entry = Decimal::new(90_000, 0);
     let stop = Decimal::new(89_000, 0);
@@ -375,12 +383,13 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
     let holdout_start = series[200].open_time;
 
     // (a) wholly before the fence, (b) straddling it, (c) inside the holdout.
-    // `trade_at` fills its exit one bar after its own signal, so (a) clears H on
-    // its FILL time with two bars to spare — and its SIGNAL time is earlier still,
-    // which is what makes this arm pin the fill-time rule (a signal-time fence
-    // would pass (b) through).
+    // (b) is placed so the FILL-time spelling is the only one that withholds it:
+    // `trade_at` fills its exit one bar after its own signal, so at `H - 2 * step`
+    // its exit SIGNALS one bar before H and FILLS exactly at H. A fence spelled on
+    // signal times would clear (b) and list it; the fill-time rule withholds it.
+    // (a) clears H on its FILL time with four bars to spare.
     let before = trade_at(holdout_start - 3 * step, "2");
-    let straddling = trade_at(holdout_start - step / 2, "-1");
+    let straddling = trade_at(holdout_start - 2 * step, "-1");
     let inside = trade_at(holdout_start + 2 * step, "2");
     assert_eq!(
         before.exit_fill_time,
@@ -392,8 +401,18 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
         "the pre-fence trade's signal is before H too"
     );
     assert!(
-        straddling.entry_fill_time < holdout_start && straddling.exit_fill_time > holdout_start,
-        "the straddling trade must enter before H and exit after it"
+        straddling.entry_fill_time < holdout_start,
+        "the straddling trade must enter before H"
+    );
+    assert!(
+        straddling.exit_signal_time < holdout_start,
+        "the straddling trade's exit SIGNALS before H, so a fence spelled on \
+         signal times would wrongly list it"
+    );
+    assert_eq!(
+        straddling.exit_fill_time, holdout_start,
+        "the straddling trade's exit FILLS exactly at H — the half-open boundary \
+         the fill-time rule withholds and the signal-time rule clears"
     );
     assert!(
         inside.entry_fill_time > holdout_start,
@@ -430,10 +449,13 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
         before.exit_fill_time.to_string()
     );
 
-    // (b) and (c) are withheld WHOLE: no time they own appears anywhere.
+    // (b) and (c) are withheld WHOLE. The scan covers (c)'s times and, for (b),
+    // the times a lying answer would most readily leave in — but NOT all four of
+    // (b)'s: it sits one bar from (a), so three of its times ARE the listed row's
+    // own, and its exit fill is H itself, which the answer names legitimately as
+    // `holdoutStartMs`. The row-level assertions around this scan carry (b)'s
+    // proof: exactly one row is listed, it is (a), and every listed fill is < H.
     let withheld_times = [
-        straddling.entry_fill_time.to_string(),
-        straddling.exit_fill_time.to_string(),
         inside.entry_fill_time.to_string(),
         inside.exit_fill_time.to_string(),
     ];
@@ -476,8 +498,10 @@ async fn an_open_freeze_keeps_holdout_trades_out_of_the_apps_run_read() {
 /// over `[first_open, last_close]` and the trade test over FILL times, so BOTH the
 /// fresh-run arm and the Lab's later read withhold that trade and the totals.
 ///
-/// This arm builds the outcome in that exact shape and drives the one function
-/// both arms call, so a regression in either shows up here.
+/// This arm builds that exact shape by hand and drives `run_read_fence` and
+/// `backtest_run_dto` — the decision both arms call and the projection each then
+/// runs. It does NOT drive `run_backtest_version_core` itself; the arm below is
+/// what pins that command's own call, so a regression there cannot ship green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_final_bar_boundary_is_withheld_by_the_same_decision_both_arms_call() {
     let env = env();
@@ -587,6 +611,97 @@ async fn the_final_bar_boundary_is_withheld_by_the_same_decision_both_arms_call(
     assert_eq!(fresh.withheld_trade_count, 1);
     assert_eq!(read.withheld_trade_count, fresh.withheld_trade_count);
     assert_eq!(read.totals_withheld, fresh.totals_withheld);
+}
+
+/// The round's headline wiring, pinned at the COMMAND that carries it.
+///
+/// Every other arm in this suite drives `get_backtest_run_core`, so deleting
+/// `let fence = run_read_fence(&outcome, read_holdout);` from
+/// `run_backtest_version_core` (`src/tauri/commands.rs`) would leave them all
+/// green. This arm drives the command itself and compares its answer with the
+/// read the Lab makes of the same run a moment later.
+///
+/// **H is the snapshot's own LAST CLOSE**, the one freeze position that neither
+/// clamps nor refuses a defaulted run: `guard_span` clamps only when the snapshot
+/// ends PAST H, and refuses only `to > H`. So the engine runs the whole snapshot,
+/// and a position still open at the end is booked `EndOfData` at
+/// `last.close_time` — exactly H. That trade is what both arms must withhold, and
+/// it is what makes the comparison below non-vacuous: a command that passed
+/// `fence: None` would answer `withheldTradeCount: 0` and kept totals beside the
+/// read's `1` and withheld totals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fresh_run_command_and_the_read_agree_under_one_open_freeze() {
+    let env = env();
+    let state = env.cold_state().await;
+    let version = seed_version(&state).await;
+    let series = m15_series(&env.store());
+    let last = series.last().expect("the fixture has candles");
+    let holdout_start = last.close_time;
+    open_freeze_on(&state, holdout_start).await;
+
+    let fresh = run_backtest_version_core(
+        &state,
+        pulse::BacktestRunRequest {
+            version_id: version.as_str().to_owned(),
+        },
+    )
+    .await
+    .expect("the app backtest runs under the freeze");
+
+    assert_eq!(
+        fresh.holdout_start_ms.as_deref(),
+        Some(holdout_start.to_string().as_str()),
+        "the fresh-run answer names the open freeze's holdout start"
+    );
+    assert!(
+        fresh
+            .trades
+            .iter()
+            .all(|t| t.exit_fill_time.parse::<i64>().expect("a time") < holdout_start),
+        "the fresh-run arm may not send a trade that reaches H: {:?}",
+        fresh.trades
+    );
+
+    // The run that reaches H, so the comparison below cannot pass by being empty.
+    assert!(
+        fresh.withheld_trade_count > 0,
+        "this arm needs a run that reaches H — a position still open at the \
+         snapshot's own end, booked `EndOfData` at `last.close_time` (>={holdout_start}); \
+         listed rows: {:?}",
+        fresh.trades
+    );
+    // ONE decision, and the stricter half wins. This is the boundary the window
+    // test passes (`to == H` is legal for `guard_span`) while the trade fence
+    // withholds the fill that lands on H — so the window half alone would leave
+    // this answer carrying the withheld trade's own P&L and equity in full.
+    assert!(
+        fresh.totals_withheld,
+        "a withheld trade's outcome is inside the stored totals, so the totals \
+         cannot be kept beside it: {fresh:?}"
+    );
+    assert!(
+        fresh.net_pnl.is_none() && fresh.equity.is_empty(),
+        "the withheld trade's P&L and curve must not ship"
+    );
+
+    let read = read_run(&state, &BacktestRunId::new(&fresh.run_id)).await;
+    assert_eq!(
+        read.withheld_trade_count, fresh.withheld_trade_count,
+        "the fresh-run arm and the Lab's own read must withhold the same trades"
+    );
+    assert_eq!(
+        read.totals_withheld, fresh.totals_withheld,
+        "the fresh-run arm and the Lab's own read must make the same totals decision"
+    );
+    assert_eq!(
+        read.trades.len(),
+        fresh.trades.len(),
+        "the fresh-run arm and the Lab's own read must list the same trades"
+    );
+    assert_eq!(
+        read.holdout_start_ms, fresh.holdout_start_ms,
+        "both answers name the same frozen holdout start"
+    );
 }
 
 // ---------------------------------------------------------------------------

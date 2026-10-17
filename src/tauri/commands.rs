@@ -1447,10 +1447,17 @@ pub async fn run_backtest_version_core(
     // a bar OPENS at or after H, so a snapshot whose last bar opens before H but
     // CLOSES after it runs to `SeriesEnd::SnapshotEnd`, and that end-of-data close
     // fills at the last bar's `close_time` — on or after H. `run_read_fence` reads
-    // the window and the fills the same way the stored read does, so this answer
-    // cannot differ from the one the Lab gets a moment later.
-    let fence = run_read_fence(&outcome, holdout);
-    Ok(backtest_run_dto(&outcome, uses_htf, holdout, fence)?)
+    // the window and the fills the same way the stored read does.
+    //
+    // The freeze is read AGAIN, after the run: the backtest latch and the freeze
+    // store are independent, so a freeze can open or close while a multi-second
+    // run is in flight. The pre-run value is what RUNS the backtest; this one is
+    // what may be SENT. Feeding the pre-run value in would let a freeze opened
+    // mid-run answer with the very trades and totals the Lab's next read of the
+    // same run withholds — and the leaky answer is the one the Lab sees first.
+    let read_holdout = state.open_holdout().await?;
+    let fence = run_read_fence(&outcome, read_holdout);
+    Ok(backtest_run_dto(&outcome, uses_htf, read_holdout, fence)?)
 }
 
 /// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).

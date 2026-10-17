@@ -2050,8 +2050,11 @@ function TradeTable({ trades, runId, dto }: { trades: TradeRowDto[]; runId: stri
               <tr>
                 <td colSpan={TRADE_FIELDS.length}>
                   {/* PDR-0011: the empty state says WHICH empty it is. A fenced read
-                      must not read as "this run traded nothing". */}
-                  {dto.totalsWithheld
+                      must not read as "this run traded nothing" — and the withheld
+                      COUNT is the proof it withheld rows, not that none exist, so it
+                      gates this sentence beside the totals flag (the Chart tab ORs
+                      the same count into `fencedOut`). #417. */}
+                  {dto.totalsWithheld || dto.withheldTradeCount > 0
                     ? "No trades in this run fall before the holdout."
                     : "The run recorded no trades."}
                 </td>

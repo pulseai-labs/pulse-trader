@@ -587,13 +587,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fence now runs on the server, on the Chart tab's own rule: a trade is listed only
   when its entry and its exit are both before the holdout start, so a trade that
   straddles the boundary and a trade inside the holdout are not sent at all. A run
-  whose counted window reaches the holdout start has every outcome aggregate and
-  series withheld — net P&L, expectancy, win rate, profit factor, the trade counts
-  and streaks, drawdown, Sharpe and Sortino, fees, funding, slippage, gross profit
-  and loss, the averages, the skipped-entry counts, the equity curve, the regime
-  cells and both excursion histograms — through the SAME window decision agent reads
-  already make (`guard_persisted_run`), never recomputed over the trades that remain:
-  the stored numbers are absent, not recalculated. The read says what it left out —
+  that reaches the holdout start — its counted window through the SAME decision
+  agent reads already make (`guard_persisted_run`), or a row the trade fence
+  withheld, whose own outcome is inside the stored totals — has every outcome
+  aggregate and series withheld — net P&L, expectancy, win rate, profit factor, the
+  trade counts and streaks, drawdown, Sharpe and Sortino, fees, funding, slippage,
+  gross profit and loss, the averages, the skipped-entry counts, the equity curve,
+  the regime cells and both excursion histograms — never recomputed over the trades
+  that remain: the stored numbers are absent, not recalculated. The read says what it left out —
   `withheldTradeCount`, `totalsWithheld` and the existing `holdoutStartMs` — and the
   Lab renders one sentence in place of the totals: "`<n>` trades and the run totals
   withheld: holdout from `<date UTC>`". Everything else is unchanged: a run wholly

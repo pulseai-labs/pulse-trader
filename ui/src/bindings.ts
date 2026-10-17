@@ -506,13 +506,25 @@ export type BacktestRunDto = {
 	 *  Whether this read withheld the run's outcome totals (`#417`, PDR-0038
 	 *  option A).
 	 * 
-	 *  `true` exactly when a freeze was open at this read AND the run's counted
-	 *  window reaches the holdout start — the decision agent reads already make
-	 *  (`guard_persisted_run`, `src/application/holdout.rs`). When it is `true`,
-	 *  every outcome aggregate and series below is `null` or empty: the stored
-	 *  numbers are withheld, NEVER recomputed over the trades that remain. When
-	 *  it is `false` — no freeze open, or a run whose window ends before H —
-	 *  every field below carries its stored value exactly as before.
+	 *  `true` exactly when a freeze was open at this read AND the read withheld
+	 *  something the totals carry: the run's counted window reaches the holdout
+	 *  start — the decision agent reads already make (`guard_persisted_run`,
+	 *  `src/application/holdout.rs`) — or the trade fence withheld at least one
+	 *  trade.
+	 * 
+	 *  The second half keeps ONE document consistent at the one boundary the two
+	 *  halves disagree. A counted window ending EXACTLY at H is legal for the
+	 *  window test (`guard_span` refuses `to > H`, not `to == H`), while a trade
+	 *  filling exactly at H is withheld — and that trade's own outcome is inside
+	 *  the stored totals. Without this half the read would answer
+	 *  `withheldTradeCount: 1` beside the withheld trade's P&L, and the Lab would
+	 *  print "1 trade withheld" above the very totals that contain it.
+	 * 
+	 *  When it is `true`, every outcome aggregate and series below is `null` or
+	 *  empty: the stored numbers are withheld, NEVER recomputed over the trades
+	 *  that remain. When it is `false` — no freeze open, or a run that reaches H
+	 *  in neither half — every field below carries its stored value exactly as
+	 *  before.
 	 */
 	totalsWithheld: boolean,
 	/**  Starting equity, exact decimal string. */

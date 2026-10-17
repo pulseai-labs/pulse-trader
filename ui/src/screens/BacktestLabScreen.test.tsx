@@ -963,6 +963,21 @@ describe("BacktestLabScreen (#417 — a withheld run says so)", () => {
     expect(table.textContent).not.toContain("The run recorded no trades.");
   });
 
+  it("reads a withheld count as withheld rows even when the totals are not flagged", async () => {
+    const container = await renderRun({
+      ...SEEDED_RUN,
+      holdoutStartMs: "1756684800000",
+      withheldTradeCount: 2,
+      totalsWithheld: false,
+      trades: [],
+    });
+    const section = container.querySelector(".bt-trades-section") as HTMLElement;
+    expect(section.textContent).toContain("2 trades withheld: reaching the holdout");
+    const table = container.querySelector(".bt-trades tbody") as HTMLElement;
+    expect(table.textContent).toContain("No trades in this run fall before the holdout.");
+    expect(table.textContent).not.toContain("The run recorded no trades.");
+  });
+
   it("renders the unfenced run exactly as before — no sentence, every total present", async () => {
     // The control: `totalsWithheld: false` with no freeze open. This is the
     // byte-for-byte path the ruling's step 4 protects.
