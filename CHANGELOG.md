@@ -8,6 +8,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Example trades on the Chart tab: mark a candle, and read the marks back
+  (r5.s3.w3, PDR-0037, ADR-0031).** A trader can now arm **"Mark example"**, choose Long or Short,
+  type a setup label (kept for the next mark) and an optional note, and **click a candle** — the
+  mark is written through w1's `write_mark` and drawn on the bar it belongs to, in a plain square
+  below a long example and above a short one. **An agent's mark is drawn apart**, in the AI purple,
+  and the marks table names each writer: the trader by the app token's label, an agent by its own
+  name marked **(self-reported)** (PDR-0015). The table lists every stored field — UTC time, side,
+  setup, note, writer — carries a **Withdraw** per row, and centres the chart on a mark whose row is
+  clicked; it says plainly how many marks live on another timeframe and how many the holdout is
+  hiding. **A refused write says why** (holdout, no candle, invalid field) instead of failing
+  silently, and the control and the caption both read **"Reference — not an order"** (PDR-0037). The
+  adapter gains the click seam and the marks layer; a click resolves to the **containing** candle's
+  open and a click outside the loaded bars is ignored, so a mark can never land on a bar the trader
+  did not point at. No Rust, no route, no bus command and no binding changes: the UI is the whole of
+  this item.
+
+- **`explain_marks`: which of a rule's conditions held at each example trade's bar
+  (r5.s3.w2, PDR-0037 Q5, ADR-0031).** An agent driving Claude Code through `pulse mcp` can now
+  take the trader's example marks and a candidate rule and read, for every mark, **every conjunct of
+  `entry AND filters`** — with `held`, `not_held` or `not_warm`, the operand values behind each
+  answer, and the **17 candle-pattern values** at the marked candle — then propose a 3- or
+  four-condition rule every example satisfies, submit it and backtest it. The truth it reports is
+  **the truth the backtest's entry gate sees at that bar**: the tool reaches no evaluator of its own,
+  it builds the same `EngineSession` a run builds, steps it with the same feed loop, and reads each
+  conjunct through that session's read-only probe. A `15m` mark is explained at its own bar; a `4h`
+  or `1d` mark at the first `15m` bar opening at that candle's close. **No engine is stepped onto a
+  candle at or after an open freeze's holdout start**, and a mark whose evaluation bar opens there is
+  hidden and counted under `hidden_by_holdout`, never explained. The response also names
+  `held_by_every_mark` — the conjuncts no example rules out — and reports any mark it could not
+  explain under `refusals` with a typed reason rather than dropping it. The rule is an inline DSL
+  document (validated exactly as `submit_strategy_version` validates one, and never stored) or a
+  stored `version_id`. The backtest adapter gains an additive, read-only seam for it: `EvalProbe`,
+  `step_series` and `indicator_values_at`. **The engine fingerprint's value moves** — this spine rewrites
+  `src/adapters/backtest/session.rs`, under the `src/adapters/backtest` root of
+  `build_support/engine_source_set.rs`'s `ENGINE_SOURCE_ROOTS` — while no backtest output changes: every
+  golden, the `b8e91b89…` pin and the trade logs stay exactly where they were.
+
+- **Example trades: marks on the chart, and the fence that keeps them out of the holdout
+  (r5.s3.w1, PDR-0037, ADR-0031).** A trader can now mark a candle as an **example trade** — a
+  reference trade, never an order — and an agent can write the same mark through `pulse mcp`,
+  each mark naming its writer. A mark holds the pair, the timeframe (`15m`, `4h` or `1d`), that
+  candle's **open time**, a side, a setup label such as "support-rejection longs", an optional
+  note and its writer; there is deliberately no stop, no target and no "what happened next",
+  because exits come from a rule's risk section. The app gets three app-scope routes —
+  `POST /api/v1/marks`, `POST /api/v1/marks/list`, `POST /api/v1/marks/withdraw` — and their bus
+  commands `write_mark`, `list_marks` and `withdraw_mark`; MCP gets the three tools of the same
+  names. **Every writer goes through one use case whose first check is the holdout fence**, so a
+  mark whose candle reaches an open freeze's holdout start is refused for the trader and for
+  every agent alike, and a time no candle opens at is refused for the holdout reason rather than
+  for the missing candle — the fence answers before anything is loaded, and a refused write
+  writes nothing. The trader's mark is named by the app token's **label** (never the token), an
+  agent's by the name that agent reported about itself and shown as self-reported. Marks are
+  immutable: a mark is never edited, a withdraw is one-way and the row stays stored, the trader
+  may withdraw any mark and an agent only its own. A list hides the marks a freeze opened later
+  now covers and says how many it hid, naming the holdout start. Two new tables (`example_mark`
+  and `example_mark_withdrawal`, migration `0021`) hold the records behind immutability triggers.
+  `docs/adr/0031-example-trade-marks.md` records the store, its writers, the fence and the
+  `explain_marks` contract w2 builds on; [`ADR-0030`](docs/adr/0030-chart-adapter-and-overlay-read.md)'s
+  description of which trades a chart read draws is corrected to the drawn-window rule the code
+  has had since r5.s2 (#423).
+
 - **The Chart tab: a backtest drawn on its candles (r5.s2.w2, PDR-0036, PDR-0004).** The Mac app
   gains a **Chart** tab — one full-width candle chart behind an adapter of our own in
   `ui/src/chart/`, the only place in the app that imports TradingView's Lightweight Charts

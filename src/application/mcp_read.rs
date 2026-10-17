@@ -608,7 +608,11 @@ fn price_field_label(field: PriceField) -> &'static str {
 
 /// The 17 named candle patterns of schema 1.4.0 (r5.s1.w1) with their
 /// `cdl:` read-path names (r5.s1.w3), in catalog order.
-const CANDLE_PATTERNS: [(CandlePatternName, &str); 17] = [
+///
+/// `pub(crate)` since r5.s3.w2: `application::mark_explain` reads the same list
+/// for an explain's `patterns` block, so the spine keeps ONE hand-written copy
+/// of the 17 names here rather than growing a sixth ([KL] #413).
+pub(crate) const CANDLE_PATTERNS: [(CandlePatternName, &str); 17] = [
     (CandlePatternName::Doji, "doji"),
     (CandlePatternName::DragonflyDoji, "dragonfly_doji"),
     (CandlePatternName::GravestoneDoji, "gravestone_doji"),

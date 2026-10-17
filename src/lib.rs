@@ -559,7 +559,12 @@ pub use adapters::broker::BinanceAdapter;
 // build error, not a warning. 2.04 steps the detector over the run + aggregates
 // the breakdown onto `BacktestResult`; 2.05 renders it.
 pub use adapters::backtest::RegimeDetector;
-pub use adapters::backtest::{EngineSession, SessionTimeframes};
+// r5.s3.w2 (PDR-0037 Q5, SPINE G3/G4): the read-only seam `explain_marks`
+// reads a session through — `EvalProbe` asks a stepped session the entry gate's
+// own question, and `step_series` is the ONE feed loop a run and explain share,
+// so explain pairs HTF/D1 bars exactly as the backtest does. Additive: both are
+// read-only, and no backtest output changes with them in place.
+pub use adapters::backtest::{EngineSession, EvalProbe, SessionTimeframes, step_series};
 pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 
 // VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface
@@ -907,6 +912,37 @@ pub use crate::tauri::{
     CHART_BAR_CAP, ChartCandleDto, ChartDataDto, ChartDataRequest, ChartHoldoutDto,
     ChartOverlayDto, ChartPatternEventDto, ChartPivotEventDto, ChartRunDto, ChartTradeDto,
     chart_data_core,
+};
+
+// r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks — the wire shapes and
+// the transport-free cores behind `POST /api/v1/marks*` and the `write_mark` /
+// `list_marks` / `withdraw_mark` bus commands (ADR-0020: additive only), the
+// value types and the refusal vocabulary the MCP tools share, and the ONE use
+// case that writes the table (SPINE G1).
+pub use crate::tauri::{
+    ListMarksRequest, MarkDto, MarkHoldoutDto, MarkListDto, MarkWriterDto, WithdrawMarkRequest,
+    WriteMarkRequest, list_marks_core, trader_writer, withdraw_mark_core, write_mark_core,
+};
+pub use adapters::db::SqliteExampleMarkRepo;
+pub use application::example_marks::{MarkHoldout, MarkList, MarkRequest, list_marks, write_mark};
+// r5.s3.w2 (PDR-0037 Q5, ADR-0031): the `explain_marks` use case and its report
+// vocabulary, reached by the `explain_marks` MCP tool and by d107's contract
+// suite. It holds no evaluator of its own — it steps the SAME `EngineSession` a
+// backtest steps and reads each conjunct through that session's `EvalProbe`
+// (SPINE G3), over series cut at the holdout start before any step (G4).
+// `HoldoutRefusal` is re-exported beside `guard_candle` because the public
+// `MarkError::Holdout` variant carries it: without this, a public error type
+// embeds a value whose module is private (the `private_interfaces` ring
+// inversion, R5).
+pub use application::holdout::{HoldoutRefusal, guard_candle};
+pub use application::mark_explain::{
+    ConjunctReport, ExplainError, ExplainHoldout, ExplainReport, ExplainRequest, MarkExplanation,
+    MarkJson, MarkRefusal, MarkSelection, MarkWriterJson, OperandReport, PatternReport,
+    RuleRequest, explain_marks,
+};
+pub use domain::{
+    ExampleMark, ExampleMarkDraft, ExampleMarkRepository, MarkError, MarkFilter, MarkNote,
+    MarkSetup, MarkSide, MarkWriter, MarkWriterKind, StoredMark,
 };
 
 // r4.s1.w5 (spec A2/A3, G7/C1/C4/C5): the certification step and its record.

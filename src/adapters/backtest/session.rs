@@ -42,9 +42,10 @@ use crate::adapters::backtest::regime::RegimeDetector;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
-    BacktestError, BacktestResult, Candle, CompiledStrategy, Direction, ExitReason,
-    OpenPositionMark, OpenPositionStops, Pair, Regime, Series, SeriesEnd, SeriesRole,
-    SkippedEntryCounts, SymbolFilters, Timeframe, Trade,
+    BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledStrategy,
+    CompiledValue, Direction, EvalContext, ExitReason, IndicatorSpec, OpenPositionMark,
+    OpenPositionStops, Pair, Regime, Series, SeriesEnd, SeriesRole, SkippedEntryCounts,
+    SymbolFilters, Timeframe, Trade, align,
 };
 
 /// The cadences a session is declared over: the primary timeframe — whose
@@ -556,17 +557,73 @@ impl EngineSession {
         Ok(())
     }
 
+    /// The series-routed evaluation context over three engine references — the
+    /// ONE construction site, shared by `evaluate_blocks`'s three blocks and by
+    /// the read-only [`EngineSession::eval_probe`] the `explain_marks` use case
+    /// reads (r5.s3.w2).
+    ///
+    /// It takes the three engine refs rather than `&self` on purpose: the
+    /// returned context then borrows only those fields, so `evaluate_blocks`
+    /// can still assign `self.state` while holding it (the disjoint-field
+    /// borrow its signal-exit arm relies on).
+    #[must_use]
+    fn context_of<'a>(
+        engine: &'a IndicatorEngine,
+        htf: Option<&'a IndicatorEngine>,
+        d1: Option<&'a IndicatorEngine>,
+    ) -> DualSeriesContext<'a> {
+        DualSeriesContext {
+            primary: engine,
+            htf,
+            d1,
+        }
+    }
+
+    /// The entry gate's warm clause (r5.s3.w2) — everything the gate tests
+    /// EXCEPT the trading-state clauses (`counted`, no position, no pending
+    /// entry) and the predicate itself: the running bar count standing in for
+    /// `bar.index > 0`, the engine's own per-slot warm gate, the HTF/D1 engine
+    /// warm gates, and the paired-bar F3 clauses.
+    ///
+    /// ONE spelling: `evaluate_blocks` and [`EvalProbe::is_warm`] both call it,
+    /// so a change to the warm rule moves both at once.
+    #[must_use]
+    fn entry_gate_warm(&self) -> bool {
+        self.bars > 0
+            && self.engine.is_warm()
+            && self
+                .htf_engine
+                .as_ref()
+                .is_none_or(IndicatorEngine::is_warm)
+            && self.d1_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
+            && (self.htf_engine.is_none() || self.paired_htf.is_some())
+            && (self.d1_engine.is_none() || self.paired_d1.is_some())
+    }
+
+    /// A read-only view of the evaluation state `explain_marks` reads at a
+    /// mark's evaluation bar (r5.s3.w2, SPINE G3/G4).
+    ///
+    /// It borrows the stepped session. **No method steps an engine, mutates
+    /// state or writes anything** — the hook is additive and read-only, so
+    /// every backtest output is byte-identical with it in place.
+    #[must_use]
+    pub fn eval_probe(&self) -> EvalProbe<'_> {
+        EvalProbe { session: self }
+    }
+
     /// The post-step evaluation blocks of [`EngineSession::step`]: the signal
     /// exit, the time stop and the entry gate — the whole-run blocks verbatim,
     /// with the running bar count standing in for `bar.index` and the paired
     /// bars standing in for `bar.htf`/`bar.d1`.
     fn evaluate_blocks(&mut self, primary: &Candle, counted: bool) {
-        // The series-routed evaluation context over the stepped engines.
-        let ctx = DualSeriesContext {
-            primary: &self.engine,
-            htf: self.htf_engine.as_ref(),
-            d1: self.d1_engine.as_ref(),
-        };
+        // The series-routed evaluation context over the stepped engines. Built
+        // from the three engine fields, never `&self`, so `self.state` stays
+        // assignable below.
+        let ctx = Self::context_of(
+            &self.engine,
+            self.htf_engine.as_ref(),
+            self.d1_engine.as_ref(),
+        );
 
         if counted
             && self.state.position.is_some()
@@ -611,15 +668,7 @@ impl EngineSession {
         if counted
             && self.state.position.is_none()
             && self.state.pending_entry.is_none()
-            && self.bars > 0
-            && self.engine.is_warm()
-            && self
-                .htf_engine
-                .as_ref()
-                .is_none_or(IndicatorEngine::is_warm)
-            && self.d1_engine.as_ref().is_none_or(IndicatorEngine::is_warm)
-            && (self.htf_engine.is_none() || self.paired_htf.is_some())
-            && (self.d1_engine.is_none() || self.paired_d1.is_some())
+            && self.entry_gate_warm()
             && self.plan.strategy.entry().eval(&ctx)
         {
             let atr_at_signal_value = atr_at_signal(&self.plan, &ctx);
@@ -821,6 +870,167 @@ impl EngineSession {
             self.next_boundary += self.funding_interval_ms;
         }
     }
+}
+
+/// A read-only probe over a stepped [`EngineSession`] — the entry gate's own
+/// truth at the bar the session last stepped (r5.s3.w2, SPINE G3).
+///
+/// `explain_marks` asks this at a mark's evaluation bar: `is_warm` is the gate's
+/// warm clause **as the gate read it at the bar just stepped** (`EngineSession::
+/// entry_gate_warm`, corrected for the probe's one-bar lag — see [`EvalProbe::
+/// is_warm`]), `eval` is the predicate's own `eval` over the session's routing
+/// context, and `operand` reads a value leaf the same way. There is no second
+/// evaluator, so a condition explain reports as held is exactly what the
+/// backtest's entry gate sees at that bar.
+///
+/// The bias is deliberate and is the whole of G3: `is_warm` is a **superset** of
+/// the gate's trading-state clauses (the gate additionally requires `counted`, a
+/// flat position and no pending entry). A bar where the gate was blocked by a
+/// position still reports the conditions' own truth — which is what "which
+/// conditions held at this bar" means — while a bar the gate would refuse as
+/// cold reports `not_warm` and no operand values.
+pub struct EvalProbe<'a> {
+    session: &'a EngineSession,
+}
+
+impl EvalProbe<'_> {
+    /// Whether the entry gate's warm clause held at the last stepped bar.
+    ///
+    /// `step_series` calls the probe AFTER `step` returned, and `step` reads its
+    /// `bars > 0` clause inside `evaluate_blocks` BEFORE incrementing `bars`. The
+    /// bar just stepped is therefore index `bars - 1`, and the gate requires
+    /// `index > 0` — so the probe must ask `bars > 1`, not `bars > 0`, or index 0
+    /// looks warm to the probe while the gate saw it cold.
+    #[must_use]
+    pub fn is_warm(&self) -> bool {
+        self.session.bars > 1 && self.session.entry_gate_warm()
+    }
+
+    /// Evaluate ONE compiled condition against the session's routing context —
+    /// the same call the entry gate makes for its `entry ∧ filters` fold.
+    #[must_use]
+    pub fn eval(&self, condition: &CompiledCondition) -> bool {
+        condition.eval(&self.context())
+    }
+
+    /// A value leaf's value at the last stepped bar, or `None` where the engine
+    /// holds no value (warmup, or a level/pattern with no level at this bar).
+    /// `previous` reads the prior bar, the cross comparisons' other half.
+    #[must_use]
+    pub fn operand(&self, value: &CompiledValue, previous: bool) -> Option<Decimal> {
+        value.eval(&self.context(), previous)
+    }
+
+    /// The session's series-routed evaluation context, rebuilt per read.
+    #[must_use]
+    fn context(&self) -> DualSeriesContext<'_> {
+        EngineSession::context_of(
+            &self.session.engine,
+            self.session.htf_engine.as_ref(),
+            self.session.d1_engine.as_ref(),
+        )
+    }
+}
+
+/// Feed a whole aligned series through `session`, one closed primary bar at a
+/// time, with every higher-timeframe candle that closed at or before that bar's
+/// close (r5.s3.w2 — lifted verbatim from `run_backtest`'s loop body).
+///
+/// `on_bar` is called once per primary bar **after** `session.step` accepted it,
+/// with that bar's `open_time` and a read-only [`EvalProbe`] over the just-stepped
+/// session. `run_backtest` passes a no-op; `explain_marks` asks the probe at the
+/// bar it needs. One feed loop means explain pairs HTF/D1 bars exactly as a run
+/// does, and the probe is a shared reborrow of the session the loop already
+/// holds, so the closure cannot step it.
+///
+/// # Errors
+///
+/// Every refusal [`EngineSession::step`] raises for a malformed feed.
+pub fn step_series(
+    session: &mut EngineSession,
+    primary: &CandleSeries,
+    htf: Option<&CandleSeries>,
+    d1: Option<&CandleSeries>,
+    mut on_bar: impl FnMut(i64, &EvalProbe<'_>),
+) -> Result<(), BacktestError> {
+    // Index into `htf.candles` of the next HTF bar not yet drained (r2.s2
+    // round-1 fix F2). A cursor over the source series — not the aligned
+    // pairing — guarantees every closed HTF candle is handed exactly once,
+    // including the lead-in history `align` jumps past.
+    let mut htf_cursor = 0_usize;
+    let htf_candles: &[Candle] = htf.map_or(&[][..], |series| series.candles.as_slice());
+    // The D1 mirror of the HTF cursor (r3.s2.w4).
+    let mut d1_cursor = 0_usize;
+    let d1_candles: &[Candle] = d1.map_or(&[][..], |series| series.candles.as_slice());
+
+    for bar in align(primary, htf, d1) {
+        let mut closed_htf: Vec<Candle> = Vec::new();
+        while let Some(candle) = htf_candles.get(htf_cursor)
+            && candle.close_time <= bar.primary.close_time
+        {
+            closed_htf.push(candle.clone());
+            htf_cursor += 1;
+        }
+        let mut closed_d1: Vec<Candle> = Vec::new();
+        while let Some(candle) = d1_candles.get(d1_cursor)
+            && candle.close_time <= bar.primary.close_time
+        {
+            closed_d1.push(candle.clone());
+            d1_cursor += 1;
+        }
+        session.step(bar.primary, &closed_htf, &closed_d1)?;
+        // The probe borrows `*session` for the call only, so the loop keeps
+        // `&mut session` and the closure can read but never step.
+        on_bar(bar.primary.open_time, &session.eval_probe());
+    }
+    Ok(())
+}
+
+/// One bar's worth of [`indicator_values_at`]: the bar's open time and one
+/// value per requested spec, in the specs' order.
+pub type IndicatorValuesAtBar = (i64, Vec<Option<Decimal>>);
+
+/// The values of `specs` at each of `wanted` bar open times, read by stepping a
+/// fresh indicator engine over `candles` (r5.s3.w2).
+///
+/// The 17 candle-pattern values an `explain_marks` response carries come through
+/// here: the engine build and the per-bar read both live in the ADAPTER ring, so
+/// the application use case names no adapter type and `tests/tauri_backtest.rs`'s
+/// one-import scan for `crate::adapters::` in `src/application/` stays green.
+///
+/// Returns one `(open_time, values)` per wanted bar the series holds, in
+/// `candles` order; a spec without a value at that bar (its warmup) is `None`.
+///
+/// # Errors
+///
+/// `Err` when the engine cannot be built from `specs`.
+pub fn indicator_values_at(
+    specs: &[IndicatorSpec],
+    candles: &CandleSeries,
+    wanted: &[i64],
+) -> Result<Vec<IndicatorValuesAtBar>, String> {
+    let mut engine = IndicatorEngine::from_specs(specs).map_err(|error| error.to_string())?;
+    let mut found: Vec<IndicatorValuesAtBar> = Vec::new();
+    for candle in &candles.candles {
+        engine.step(candle);
+        if !wanted.contains(&candle.open_time) {
+            continue;
+        }
+        found.push((
+            candle.open_time,
+            specs
+                .iter()
+                .map(|spec| {
+                    engine.current(&CompiledValue::Indicator {
+                        series: Series::Primary,
+                        spec: spec.clone(),
+                        lag: 0,
+                    })
+                })
+                .collect(),
+        ));
+    }
+    Ok(found)
 }
 
 #[cfg(test)]

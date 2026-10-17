@@ -28,8 +28,10 @@ use serde_json::Value;
 use super::ServerState;
 use super::auth::Scope;
 use super::ops;
+use super::paper::{api_error, internal, label_of};
 use crate::tauri::certification::certification_records_core;
 use crate::tauri::streak_card::streak_card_core;
+use crate::tauri::trader_writer;
 use crate::tauri::walk_forward::{get_backtest_run_core, get_walk_forward_run_core};
 
 // ---------------------------------------------------------------------------
@@ -107,6 +109,19 @@ pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum:
         // for a run, its trades and its rule's overlays.
         .mount_post_json(state, "/api/v1/chart", |state, request| {
             Box::pin(plain_chart_data(state, request))
+        })
+        // r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks — write one,
+        // list them, withdraw one. All three are app-scope: the trader's own
+        // surface, named by its token's label. Agents reach the SAME use case
+        // through `/mcp` under an agent token, never through here.
+        .mount_post(state, "/api/v1/marks", |state, req| {
+            Box::pin(plain_write_mark(state, req))
+        })
+        .mount_post(state, "/api/v1/marks/list", |state, req| {
+            Box::pin(plain_list_marks(state, req))
+        })
+        .mount_post(state, "/api/v1/marks/withdraw", |state, req| {
+            Box::pin(plain_withdraw_mark(state, req))
         })
         .mount_post_json(
             state,
@@ -374,6 +389,73 @@ async fn plain_get_backtest_run(
         Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
         Err(err) => ops::bus_422(&err),
     }
+}
+
+/// `POST /api/v1/marks` — mark one candle as an example trade, as the TRADER.
+///
+/// The writer is the authenticated token's LABEL, taken off the request
+/// extensions and never off the body (ADR-0026, G5): a caller cannot say who it
+/// is. The body cannot carry a writer at all — `WriteMarkRequest` has no such
+/// member, and the type is deliberately not `deny_unknown_fields`, so an extra
+/// `writer` key is ignored rather than honoured.
+async fn plain_write_mark(state: Arc<ServerState>, req: Request) -> Response {
+    let Some(label) = label_of(&req) else {
+        return internal("the authenticated label is missing from the request");
+    };
+    let body: crate::tauri::WriteMarkRequest = match ops::parse_body(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    match crate::tauri::marks::write_mark_core(&state.desktop, trader_writer(&label.0), body).await
+    {
+        Ok(dto) => (StatusCode::CREATED, axum::Json(dto)).into_response(),
+        Err(error) => mark_error(&error),
+    }
+}
+
+/// `POST /api/v1/marks/list` — the example trades that still stand.
+async fn plain_list_marks(state: Arc<ServerState>, req: Request) -> Response {
+    let body: crate::tauri::ListMarksRequest = match ops::parse_body(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    match crate::tauri::marks::list_marks_core(&state.desktop, body).await {
+        Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
+        Err(error) => mark_error(&error),
+    }
+}
+
+/// `POST /api/v1/marks/withdraw` — take one example trade back, as the TRADER.
+async fn plain_withdraw_mark(state: Arc<ServerState>, req: Request) -> Response {
+    let Some(label) = label_of(&req) else {
+        return internal("the authenticated label is missing from the request");
+    };
+    let body: crate::tauri::WithdrawMarkRequest = match ops::parse_body(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    match crate::tauri::marks::withdraw_mark_core(&state.desktop, trader_writer(&label.0), body)
+        .await
+    {
+        Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
+        Err(error) => mark_error(&error),
+    }
+}
+
+/// The mark use case's typed refusal, as the route's own status.
+///
+/// `MarkError::code` is the ONE spelling of each refusal — `holdout`,
+/// `candle_not_found`, `not_found`, `already_withdrawn`, `not_writer`,
+/// `validation` — and it is the same string the MCP tools put in their error
+/// bodies (`client::route_error` folds the four correctable ones onto
+/// `Validation`, keeping this message verbatim). A store failure answers `data`,
+/// as every other route's does.
+fn mark_error(error: &crate::domain::MarkError) -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        error.code(),
+        error.to_string(),
+    )
 }
 
 /// `POST /api/v1/bus-selftest-failure` — ALWAYS a 422: the same real domain

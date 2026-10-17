@@ -33,8 +33,20 @@
 //    lower bound — the first loaded open at or after the time — so an exact interior time (a
 //    primary-timeframe fill on a higher-timeframe chart, an exit filing inside the last
 //    bar's period) would draw on the NEXT bar, not the one it happened in.
+//  * **The example-trade marks (r5.s3.w3).** A mark is drawn as a SQUARE — the one shape
+//    the library's marker union allows that no trade uses — below the bar for a long
+//    example and above it for a short one, in a neutral text token for the trader and in
+//    the AI purple for an agent (G5). It rides the same merged list and the same
+//    clip-and-place as everything else, so a mark on a bar this window does not hold
+//    draws nothing.
 
-import type { ChartCandleDto, ChartDataDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
+import type {
+  ChartCandleDto,
+  ChartDataDto,
+  ChartOverlayDto,
+  ChartTradeDto,
+  MarkDto,
+} from "../bindings";
 import { rMultiple } from "../format/numbers";
 import type { ChartPalette } from "./palette";
 
@@ -145,12 +157,16 @@ export function toOverlayLayers(
   return layers;
 }
 
-/** Every marker the window's overlays and trades draw, in ascending time — the order
- *  the library requires. */
+/** Every marker the window's overlays, trades and example marks draw, in ascending time
+ *  — the order the library requires.
+ *
+ *  `marks` is ADDITIVE and defaulted: a caller written before r5.s3.w3 reads the list it
+ *  always did, and a mark can never displace a trade's marker. */
 export function toMarkers(
   overlays: readonly ChartOverlayDto[],
   trades: readonly ChartTradeDto[],
   palette: ChartPalette,
+  marks: readonly MarkDto[] = [],
 ): ChartMarker[] {
   const markers: ChartMarker[] = [];
 
@@ -218,6 +234,18 @@ export function toMarkers(
         text: rMultiple(trade.realizedR),
       });
     }
+  }
+
+  for (const mark of marks) {
+    // The example-trade mark (r5.s3.w3): a square below a long example and above a
+    // short one, so it is never mistaken for a trade's entry (an arrow) or its exit
+    // (a circle). A trader's mark is neutral, an agent's is the AI purple (G5).
+    markers.push({
+      time: seconds(mark.barTime),
+      position: mark.side === "short" ? "aboveBar" : "belowBar",
+      shape: "square",
+      color: mark.writer.kind === "agent" ? palette.markAgent : palette.markTrader,
+    });
   }
 
   // Ascending time, stably: a marker's own layer order is preserved among equals.

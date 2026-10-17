@@ -19,7 +19,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
+import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "../bindings";
 import type { ChartMarker } from "./layers";
 import type { ChartPalette } from "./palette";
 import { buildLayers, markersInWindow, toCandles, toMarkers, toOverlayLayers } from "./layers";
@@ -36,7 +36,26 @@ const PALETTE: ChartPalette = {
   serverLevel: "level",
   pivot: "pivot",
   pivotGhost: "ghost",
+  markTrader: "mark-trader",
+  markAgent: "mark-agent",
 };
+
+/** One example-trade mark, as `listMarks` reads it (r5.s3.w1). Times are ms strings. */
+function mark(over: Partial<MarkDto> = {}): MarkDto {
+  return {
+    markId: "mark-1",
+    pair: "BTCUSDT",
+    timeframe: "4h",
+    barTime: "1735689600000",
+    side: "long",
+    setup: "support-rejection longs",
+    note: null,
+    writer: { kind: "trader", name: "Alice", selfReported: false },
+    dataVersion: "9a1dcf67cf4ea260",
+    createdAt: "1735693200000",
+    ...over,
+  };
+}
 
 /** Two 4h candles: 2025-01-01T00:00Z and 04:00Z. */
 function candles(): ChartCandleDto[] {
@@ -237,6 +256,86 @@ describe("toMarkers", () => {
     const times = toMarkers(overlays, trades, PALETTE).map((marker) => marker.time);
     expect(times).toEqual([...times].sort((a, b) => a - b));
     expect(times).toHaveLength(3);
+  });
+});
+
+describe("example marks as markers (r5.s3.w3)", () => {
+  it("draws a long mark below the bar and a short mark above it, in a square", () => {
+    // The square is the third shape the library's marker union allows, so a mark is
+    // distinguishable from a trade's entry (an arrow) and its exit (a circle).
+    expect(toMarkers([], [], PALETTE, [mark()])).toEqual([
+      {
+        time: 1735689600,
+        position: "belowBar",
+        shape: "square",
+        color: "mark-trader",
+      },
+    ]);
+    expect(toMarkers([], [], PALETTE, [mark({ side: "short" })])).toEqual([
+      {
+        time: 1735689600,
+        position: "aboveBar",
+        shape: "square",
+        color: "mark-trader",
+      },
+    ]);
+  });
+
+  it("draws an agent's mark in the AI colour and a trader's in the neutral one (G5)", () => {
+    const marks = [
+      mark({ markId: "m-trader" }),
+      mark({
+        markId: "m-agent",
+        writer: { kind: "agent", name: "claude-code", selfReported: true },
+      }),
+    ];
+    expect(toMarkers([], [], PALETTE, marks).map((entry) => entry.color)).toEqual([
+      "mark-trader",
+      "mark-agent",
+    ]);
+  });
+
+  it("merges the marks into the ONE list beside trades and overlays, ascending", () => {
+    const overlays: ChartOverlayDto[] = [
+      { kind: "pattern", label: "cdl:engulfing", events: [{ time: "1735747200000", value: "100" }] },
+    ];
+    const trades: ChartTradeDto[] = [
+      {
+        side: "long",
+        entryTime: "1735704000000",
+        entryPrice: "90000",
+        exitTime: "1735704000000",
+        exitPrice: "92000",
+        exitReason: "take_profit",
+        realizedR: "2",
+      },
+    ];
+    const merged = toMarkers(overlays, trades, PALETTE, [mark()]);
+    expect(merged.map((entry) => entry.time)).toEqual([1735689600, 1735704000, 1735704000, 1735747200]);
+    expect(merged.map((entry) => entry.shape)).toEqual([
+      "square",
+      "arrowUp",
+      "circle",
+      "circle",
+    ]);
+  });
+
+  it("clips a mark whose bar is not loaded, and places one inside a loaded bar on that bar", () => {
+    // A 15m mark inside the 00:00–04:00 4h bar, and one a bar past the window: the first
+    // draws on the bar that CONTAINS it (CR4), the second draws nowhere (CR2).
+    const loaded = toCandles(candles());
+    const inside = mark({ barTime: "1735693200000" });
+    const past = mark({ markId: "m-past", barTime: "1735718400000" });
+    expect(markersInWindow(toMarkers([], [], PALETTE, [inside]), loaded)).toEqual([
+      { time: 1735689600, position: "belowBar", shape: "square", color: "mark-trader" },
+    ]);
+    expect(markersInWindow(toMarkers([], [], PALETTE, [past]), loaded)).toEqual([]);
+  });
+
+  it("keeps the existing three-argument call working, with no marks drawn", () => {
+    // The parameter is additive and defaulted: every caller written before this item
+    // reads the same list it did before.
+    expect(toMarkers([], [], PALETTE)).toEqual([]);
   });
 });
 

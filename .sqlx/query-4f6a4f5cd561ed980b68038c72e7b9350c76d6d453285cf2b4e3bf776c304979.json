@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO example_mark (id, pair, timeframe, bar_open_ms, side, setup, note, writer_kind, writer_name, data_version, created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "4f6a4f5cd561ed980b68038c72e7b9350c76d6d453285cf2b4e3bf776c304979"
+}

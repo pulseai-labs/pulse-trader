@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT m.id, m.pair, m.timeframe, m.bar_open_ms, m.side, m.setup, m.note, m.writer_kind, m.writer_name, m.data_version, m.created_at_ms FROM example_mark m LEFT JOIN example_mark_withdrawal w ON w.mark_id = m.id WHERE (?1 IS NULL OR m.pair = ?1) AND (?2 IS NULL OR m.timeframe = ?2) AND (?3 IS NULL OR m.setup = ?3) AND w.mark_id IS NULL ORDER BY m.bar_open_ms ASC, m.id ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "pair",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "timeframe",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "bar_open_ms",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "side",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "setup",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "note",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "writer_kind",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "writer_name",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "data_version",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at_ms",
+        "ordinal": 10,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "665221b7dfef1afcfdfc27fd275d2f12c6998d4d34d73d9d7c83f4a78c7c677b"
+}

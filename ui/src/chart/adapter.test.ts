@@ -36,6 +36,8 @@ const h = vi.hoisted(() => {
     removeSeries: vi.fn(),
     applyOptions: vi.fn(),
     timeScale: vi.fn(() => timeScale),
+    subscribeClick: vi.fn(),
+    unsubscribeClick: vi.fn(),
     remove: vi.fn(),
   };
   const markersApi = { setMarkers: vi.fn() };
@@ -54,11 +56,11 @@ vi.mock("lightweight-charts", () => ({
 
 import { createChart, createSeriesMarkers } from "lightweight-charts";
 
-import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto } from "../bindings";
+import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "../bindings";
 import { createChartAdapter } from "./adapter";
 import { PALETTE_TOKENS } from "./palette";
 
-/** A container carrying the chart's ten aliases, as the loaded sheet leaves it. */
+/** A container carrying the chart's twelve aliases, as the loaded sheet leaves it. */
 function container(): HTMLElement {
   const el = document.createElement("div");
   el.style.setProperty(PALETTE_TOKENS.bull, "bull");
@@ -68,11 +70,37 @@ function container(): HTMLElement {
   el.style.setProperty(PALETTE_TOKENS.serverLevel, "level");
   el.style.setProperty(PALETTE_TOKENS.pivot, "pivot");
   el.style.setProperty(PALETTE_TOKENS.pivotGhost, "ghost");
+  el.style.setProperty(PALETTE_TOKENS.markTrader, "mark-trader");
+  el.style.setProperty(PALETTE_TOKENS.markAgent, "mark-agent");
   el.style.setProperty(PALETTE_TOKENS.background, "bg");
   el.style.setProperty(PALETTE_TOKENS.text, "text");
   el.style.setProperty(PALETTE_TOKENS.grid, "grid");
   document.body.append(el);
   return el;
+}
+
+/** One example-trade mark, as `listMarks` reads it (r5.s3.w1). */
+function mark(over: Partial<MarkDto> = {}): MarkDto {
+  return {
+    markId: "mark-1",
+    pair: "BTCUSDT",
+    timeframe: "4h",
+    barTime: "1735689600000",
+    side: "long",
+    setup: "support-rejection longs",
+    note: null,
+    writer: { kind: "trader", name: "Alice", selfReported: false },
+    dataVersion: "9a1dcf67cf4ea260",
+    createdAt: "1735693200000",
+    ...over,
+  };
+}
+
+/** The handler the adapter subscribed to the library's click delegate. */
+function clickHandler(): (param: { logical?: number; time?: number }) => void {
+  const call = h.chart.subscribeClick.mock.calls.at(-1);
+  expect(call, "the adapter never subscribed a click handler").toBeDefined();
+  return call?.[0] as (param: { logical?: number; time?: number }) => void;
 }
 
 /** The candle series the adapter created (the first `addSeries` call). */
@@ -121,6 +149,8 @@ beforeEach(() => {
   h.chart.addSeries.mockClear();
   h.chart.removeSeries.mockClear();
   h.chart.remove.mockClear();
+  h.chart.subscribeClick.mockClear();
+  h.chart.unsubscribeClick.mockClear();
   h.markersApi.setMarkers.mockClear();
   h.timeScale.fitContent.mockClear();
   h.timeScale.setVisibleLogicalRange.mockClear();
@@ -309,6 +339,36 @@ describe("createChartAdapter", () => {
     expect(h.chart.remove).toHaveBeenCalledTimes(1);
   });
 
+  it("draws the marks in the one markers list, beside the trades", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    adapter.setTrades([TRADE]);
+    adapter.setMarks([mark(), mark({ markId: "m-agent", barTime: "1735718400000" })]);
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { shape: string }[];
+    expect(last).toHaveLength(4);
+    // Ascending by time, stable among equals: the trade's entry (00:00) precedes the
+    // mark on the same bar (00:00), then the exit (04:00), then the mark on 08:00.
+    expect(last.map((entry) => entry.shape)).toEqual(["arrowUp", "square", "circle", "square"]);
+  });
+
+  it("replaces the marks on a second draw instead of stacking them", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setMarks([mark()]);
+    adapter.setMarks([mark({ markId: "m-2", barTime: "1735704000000" })]);
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
+    expect(last).toEqual([
+      { time: 1735704000, position: "belowBar", shape: "square", color: "mark-trader" },
+    ]);
+  });
+
+  it("reads a mark on a bar this window does not hold as no marker at all", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setMarks([mark({ barTime: "1735776000000" })]);
+    expect(h.markersApi.setMarkers).toHaveBeenLastCalledWith([]);
+  });
+
   it("centres on the last bar when the time asked for is past the window", () => {
     const adapter = createChartAdapter(container());
     adapter.setCandles(CANDLES);
@@ -330,5 +390,85 @@ describe("createChartAdapter", () => {
     createChartAdapter(container());
     expect(h.chart.addSeries).not.toHaveBeenCalled();
     expect(h.markersApi.setMarkers).not.toHaveBeenCalled();
+  });
+});
+
+describe("the candle click (r5.s3.w3)", () => {
+  it("subscribes the library's own click delegate", () => {
+    const adapter = createChartAdapter(container());
+    adapter.onCandleClick(() => {});
+    expect(h.chart.subscribeClick).toHaveBeenCalledTimes(1);
+    expect(typeof h.chart.subscribeClick.mock.calls[0][0]).toBe("function");
+  });
+
+  it("resolves a click inside a bar's period to that bar's open, not the next open", () => {
+    // THREE_BARS are 00:00, 04:00 and 08:00Z. A click inside the FIRST bar's period
+    // carries the raw position (logical 0) — the library's own lookup is a lower bound,
+    // so the instant alone would be read as the NEXT open (the r5.s2 retro §8 trap).
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(THREE_BARS);
+    const seen: string[] = [];
+    adapter.onCandleClick((openTime) => seen.push(openTime));
+    clickHandler()({ logical: 0, time: 1735689600 });
+    expect(seen).toEqual(["1735689600000"]);
+  });
+
+  it("resolves a click on the first and on the last loaded bar", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(THREE_BARS);
+    const seen: string[] = [];
+    adapter.onCandleClick((openTime) => seen.push(openTime));
+    clickHandler()({ logical: 0, time: 1735689600 });
+    clickHandler()({ logical: 2, time: 1735718400 });
+    expect(seen).toEqual(["1735689600000", "1735718400000"]);
+  });
+
+  it("IGNORES a click right of the last candle, where the library still hands a time (CR2)", () => {
+    // The case the position clip exists for: clicking in the empty pane past the last
+    // bar. The library clamps nothing away — `time` comes back as the LAST open, which
+    // alone would write a mark on the last candle — but `logical` is past the last
+    // loaded index, and that is what tells the two apart.
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(THREE_BARS);
+    const seen: string[] = [];
+    adapter.onCandleClick((openTime) => seen.push(openTime));
+    clickHandler()({ logical: 3, time: 1735718400 });
+    expect(seen).toEqual([]);
+  });
+
+  it("IGNORES a click before the first candle", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(THREE_BARS);
+    const seen: string[] = [];
+    adapter.onCandleClick((openTime) => seen.push(openTime));
+    clickHandler()({ logical: -1, time: 1735689600 });
+    clickHandler()({ logical: -40, time: 1735689600 });
+    expect(seen).toEqual([]);
+  });
+
+  it("IGNORES a click the library could place no position for", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(THREE_BARS);
+    const seen: string[] = [];
+    adapter.onCandleClick((openTime) => seen.push(openTime));
+    // Outside the data range the library hands back neither a position nor a time.
+    clickHandler()({});
+    expect(seen).toEqual([]);
+  });
+
+  it("IGNORES every click before a read has drawn any bar", () => {
+    const adapter = createChartAdapter(container());
+    const seen: string[] = [];
+    adapter.onCandleClick((openTime) => seen.push(openTime));
+    clickHandler()({ logical: 0, time: 1735689600 });
+    expect(seen).toEqual([]);
+  });
+
+  it("unsubscribes the exact handler it subscribed when it is destroyed", () => {
+    const adapter = createChartAdapter(container());
+    adapter.onCandleClick(() => {});
+    const subscribed = h.chart.subscribeClick.mock.calls[0][0];
+    adapter.destroy();
+    expect(h.chart.unsubscribeClick).toHaveBeenCalledWith(subscribed);
   });
 });
