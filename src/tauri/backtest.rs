@@ -825,6 +825,7 @@ fn trade_dto(trade: &Trade) -> TradeRowDto {
 /// point: a clamped count would render a plausible false number for a row that
 /// should not be reported at all. A withheld count is not narrowed at all: the
 /// value is absent, so nothing has to fit.
+#[allow(clippy::too_many_lines)] // one projection in one place: the DTO's field list IS the shape, and the fence's two halves read as one decision here
 pub fn backtest_run_dto(
     outcome: &BacktestOutcome,
     uses_htf: bool,
