@@ -154,13 +154,17 @@ export default function LibraryScreen() {
         setOverview(result.data);
         setError(null);
       } else {
+        applied.current = read;
         setError(result.error.message);
       }
     } catch {
       // A rejection here is the IPC call itself failing (no app handle under
       // a non-Tauri preview) — rendered as the honest error line, never as
       // fabricated content.
-      if (alive() && read > applied.current) setError("The library read failed.");
+      if (alive() && read > applied.current) {
+        applied.current = read;
+        setError("The library read failed.");
+      }
     }
   }, []);
 

@@ -838,6 +838,8 @@ function deferredOverview(): {
   promise: Promise<OverviewAnswer>;
   resolve: (answer: OverviewAnswer) => void;
 } {
+  // `Promise.withResolvers` is ES2024; this project's tsconfig lib is ES2022,
+  // so the executor form is the only one that typechecks here.
   let resolve!: (answer: OverviewAnswer) => void;
   const promise = new Promise<OverviewAnswer>((r) => {
     resolve = r;
@@ -934,6 +936,39 @@ describe("LibraryScreen (#324 — the open Library follows the server)", () => {
     // The stale answer must not undo the fresh one.
     expect(screen.getByText("2 strategies · 5 versions")).toBeTruthy();
     expect(screen.queryByText("2 strategies · 4 versions")).toBeNull();
+  });
+
+  it("a newer failed read stays in place when an older success lands afterwards", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+    await screen.findByText("Alpha Wave");
+
+    const older = deferredOverview();
+    const newer = deferredOverview();
+    overviewMock.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+
+    // Two focus refetches, the second past the hook's 1 s throttle.
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(5_000);
+    fireEvent(window, new Event("focus"));
+    nowSpy.mockReturnValue(9_000);
+    fireEvent(window, new Event("focus"));
+    nowSpy.mockRestore();
+    await act(async () => {});
+    expect(overviewMock.mock.calls.length).toBe(3);
+
+    // The NEWER answer is a failed read; the OLDER one is a success that lands
+    // afterwards. The failure must stand — an older payload may not clear it.
+    await act(async () => {
+      newer.resolve(busError("the store read failed"));
+    });
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.queryByText("Alpha Wave")).toBeNull();
+
+    await act(async () => {
+      older.resolve({ status: "ok", data: SEEDED });
+    });
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.queryByText("Alpha Wave")).toBeNull();
   });
 
   it("does not poll while the window is hidden; the visibility return refetches once", async () => {
