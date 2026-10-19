@@ -6,9 +6,11 @@
 //! writes no certification record and spends nothing. The freeze checks keep their precedence: no open
 //! freeze, a pre-freeze lineage root and a spent budget are refused before the gate ever reads a review.
 //!
-//! Every refusal here asserts three things: the exact [`pulse::PowerGateBlock`] that fired, that the
-//! freeze's budget count is unchanged, and that the rendered message carries no ASCII digit — G5's "its
-//! refusal names no number", checked mechanically rather than by inspection.
+//! Every **gate** refusal here asserts three things: the exact [`pulse::PowerGateBlock`] that fired, that
+//! the freeze's budget count is unchanged, and that the rendered message carries no ASCII digit — G5's "its
+//! refusal names no number", checked mechanically rather than by inspection. The two freeze-check refusals
+//! ([`the_freeze_checks_keep_precedence_over_the_gate`]) assert only which refusal wins: no open freeze, and
+//! a spent budget with the count left at `H`; the digit rule is the gate's.
 //!
 //! A synthetic review is built from a real one ([`draft_from`]) and inserted with a clock past 2100, so it
 //! is strictly the latest row for its `(version, pair, freeze)`: the gate reads it, not the real review

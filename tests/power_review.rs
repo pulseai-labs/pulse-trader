@@ -292,7 +292,9 @@ const EXPECTED_KEYS: [&str; 23] = [
 /// The outcome tokens the CLI's stdout may never carry, matched as WORDS: `holdout window:` is a required
 /// key and contains `win` as a substring, so a substring test is unsatisfiable by construction.
 fn outcome_tokens(text: &str) -> Vec<&'static str> {
-    const BANNED: [&str; 5] = ["mean", "bound", "pnl", "win", "realized"];
+    const BANNED: [&str; 7] = [
+        "mean", "bound", "pnl", "win", "realized", "return", "equity",
+    ];
     let words: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric())
         .map(str::to_lowercase)

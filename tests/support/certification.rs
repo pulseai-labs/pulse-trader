@@ -396,7 +396,9 @@ pub async fn walk_forward_under(
 
 /// A version with **no edge on this series**: it buys the rip (the reversion's
 /// own exit level) and leaves below its entry, so every trade that closes does
-/// so at a loss. The C1 test must refuse it; the record must still exist.
+/// so at a loss. Its search span fails, so its power review does not allow an
+/// attempt: every test that builds it refuses at the gate — no certification
+/// record is written and the freeze's count stays at zero.
 pub fn inverted_dsl() -> pulse::StrategyDsl {
     use pulse::{
         Comparator, Condition, Direction, ExitRule, PriceField, RiskParams, SchemaVersion, Series,
