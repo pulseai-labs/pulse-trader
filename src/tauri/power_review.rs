@@ -128,8 +128,9 @@ pub async fn power_reviews_core(
         .list_for_version(&VersionId::new(&request.version_id))
         .await?;
 
-    // The list is newest first (`created_at DESC, id DESC`), so the first record seen for a pair is that
-    // pair's latest under this freeze. A `HashSet` of pairs keeps the filter one pass.
+    // The list is newest first — insertion order (`rowid DESC`), never `created_at`, which can tie at one
+    // millisecond or step backwards — so the first record seen for a pair is that pair's latest under this
+    // freeze. A `HashSet` of pairs keeps the filter one pass.
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let reviews = records
         .iter()

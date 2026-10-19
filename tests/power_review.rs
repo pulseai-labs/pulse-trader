@@ -25,11 +25,12 @@ use std::process::Command;
 
 use pulse::{
     ASSUMED_EDGE_R, BacktestAppError, BinanceAdapter, CertificationRepository, CertifyRefusal,
-    FakeClock, MIN_HOLDOUT_TRADES, OpenFreezeRequest, POWER_BAR, PowerBlock, PowerReviewError,
-    PowerReviewOutcome, PowerReviewRecord, PowerReviewRepository, PowerReviewRequest,
-    SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
-    SqlitePowerReviewRepo, SqliteStrategyRepo, WalkForwardRunRepository, c1_z, holdout_test,
-    normal_cdf, pass_chance, review_power, sample_sigma, verdict,
+    FakeClock, MIN_HOLDOUT_TRADES, OpenFreezeRequest, POWER_BAR, Pair, PowerBlock,
+    PowerReviewDraft, PowerReviewError, PowerReviewOutcome, PowerReviewRecord,
+    PowerReviewRepository, PowerReviewRequest, SqliteBacktestRunRepo,
+    SqliteCertificationFreezeRepo, SqliteCertificationRepo, SqlitePowerReviewRepo,
+    SqliteStrategyRepo, WalkForwardRunRepository, c1_z, holdout_test, normal_cdf, pass_chance,
+    review_power, sample_sigma, verdict,
 };
 use rust_decimal::Decimal;
 use support::certification::{
@@ -398,6 +399,141 @@ async fn a_review_reports_the_count_only_and_writes_one_record() {
         record.pass_chance,
         record.allowed,
         record.reason
+    );
+}
+
+/// A review draft differing from `seed` only in the fields a test names, so every row satisfies `0022`'s
+/// CHECKs and points at the world's own search run.
+fn draft_like(
+    seed: &PowerReviewRecord,
+    pair: &Pair,
+    holdout_n: usize,
+    pass_chance: f64,
+    allowed: bool,
+    reason: Option<&str>,
+) -> PowerReviewDraft {
+    PowerReviewDraft {
+        version_id: seed.version_id.clone(),
+        freeze_id: seed.freeze_id.clone(),
+        pair: pair.clone(),
+        h: seed.h,
+        z: seed.z,
+        holdout_start_ms: seed.holdout_start_ms,
+        holdout_end_ms: seed.holdout_end_ms,
+        holdout_n,
+        holdout_inputs: seed.holdout_inputs.clone(),
+        search_walk_forward_run_id: seed.search_walk_forward_run_id.clone(),
+        search_pass: seed.search_pass,
+        search_n: seed.search_n,
+        sigma_r: seed.sigma_r.clone(),
+        assumed_edge_r: seed.assumed_edge_r.clone(),
+        bar: seed.bar.clone(),
+        min_holdout_trades: seed.min_holdout_trades,
+        pass_chance,
+        allowed,
+        reason: reason.map(str::to_owned),
+        engine_fingerprint: seed.engine_fingerprint.clone(),
+        called_by: "w1-ordering-test".to_owned(),
+    }
+}
+
+/// The repo's latest read resolves by **insertion order**, not by `created_at`: a same-millisecond tie and a
+/// backward clock step both resolve to the row inserted last. `id` is a random v4 UUID and `created_at`
+/// comes from the injected clock, so `created_at DESC, id DESC` could hand the certify gate a stale review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latest_for_resolves_by_insertion_order_on_a_tie_and_a_backward_clock() {
+    const TIE_MS: i64 = 1_900_000_000_000;
+    const LATER_MS: i64 = 1_850_000_000_000;
+    const EARLIER_MS: i64 = 1_800_000_000_000;
+
+    let world = world().await;
+    let seed = review(&world, Some(&world.freeze))
+        .await
+        .expect("the seed review runs")
+        .record;
+    let pool = world.db.pool().clone();
+
+    // (a) A same-millisecond tie: both rows carry ONE `created_at`, and the last inserted must win.
+    let tied = SqlitePowerReviewRepo::with_deps(pool.clone(), FakeClock::at(TIE_MS));
+    let first = tied
+        .insert(&draft_like(
+            &seed,
+            &world.pair,
+            11,
+            0.10,
+            false,
+            Some("too_few_holdout_trades"),
+        ))
+        .await
+        .unwrap();
+    let second = tied
+        .insert(&draft_like(&seed, &world.pair, 41, 0.60, true, None))
+        .await
+        .unwrap();
+    assert_eq!(first.created_at, second.created_at, "the tie is real");
+    assert_ne!(first.id, second.id, "the rows are distinct");
+    let latest = tied
+        .latest_for(&world.version, &world.pair, &world.freeze.id)
+        .await
+        .unwrap()
+        .expect("the tied rows read back");
+    assert_eq!(
+        latest.id, second.id,
+        "a same-millisecond tie resolves to the row inserted last"
+    );
+
+    // (b) A backward clock step: the later insert carries an EARLIER `created_at`, and must still win.
+    let sol = Pair::new("SOLUSDT");
+    let later = SqlitePowerReviewRepo::with_deps(pool.clone(), FakeClock::at(LATER_MS))
+        .insert(&draft_like(&seed, &sol, 50, 0.70, true, None))
+        .await
+        .unwrap();
+    let earlier = SqlitePowerReviewRepo::with_deps(pool.clone(), FakeClock::at(EARLIER_MS))
+        .insert(&draft_like(&seed, &sol, 42, 0.20, false, Some("below_bar")))
+        .await
+        .unwrap();
+    assert!(
+        earlier.created_at < later.created_at,
+        "the clock stepped backwards: {} then {}",
+        later.created_at,
+        earlier.created_at
+    );
+    let latest_sol = tied
+        .latest_for(&world.version, &sol, &world.freeze.id)
+        .await
+        .unwrap()
+        .expect("the backward-stepped rows read back");
+    assert_eq!(
+        latest_sol.id, earlier.id,
+        "a backward clock step still resolves to the row inserted last"
+    );
+
+    // Newest-first means reverse insertion order, across both cases.
+    let listed: Vec<String> = tied
+        .list_for_version(&world.version)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    let position = |id: &str| {
+        listed
+            .iter()
+            .position(|candidate| candidate == id)
+            .expect("every row is listed")
+    };
+    assert!(
+        position(&second.id) < position(&first.id),
+        "the tie's last insert leads the tie's first"
+    );
+    assert!(
+        position(&earlier.id) < position(&later.id),
+        "the backward step's last insert leads the earlier-clocked row"
+    );
+    assert_eq!(
+        position(&seed.id),
+        listed.len() - 1,
+        "the row written first is listed last"
     );
 }
 

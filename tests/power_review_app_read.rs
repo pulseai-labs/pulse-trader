@@ -24,8 +24,9 @@ use support::certification::{FREEZE_OPENED_MS, H};
 /// The holdout window the seeded freeze opens at (the certification-holdout helper's instant).
 const HOLDOUT_START_MS: i64 = 1_750_000_000_000;
 
-/// The three seeded reviews' write instants: B is strictly newest, A and C tie (so the pair filter, not
-/// the tie, decides the answer).
+/// The three seeded reviews' write instants. B is strictly newer than A and C ties A, so under the old
+/// `created_at DESC, id DESC` order the list led with B — the instants are what make the insertion order
+/// this test's subject rather than an accident of the seed sequence.
 const ROW_A_MS: i64 = 1_800_000_000_000;
 const ROW_B_MS: i64 = 1_800_000_060_000;
 const ROW_C_MS: i64 = 1_800_000_000_000;
@@ -171,8 +172,10 @@ fn request(seeded: &Seeded) -> serde_json::Value {
 // The read
 // ---------------------------------------------------------------------------
 
-/// The app answers the LATEST review per pair under the open freeze, newest first: B (BTCUSDT, the
-/// newer row) and C (SOLUSDT). A is the same pair as B and older, so it never appears.
+/// The app answers the LATEST review per pair under the open freeze, newest first. "Newest" is insertion
+/// order: the rows are seeded A (BTCUSDT), B (BTCUSDT), then C (SOLUSDT), so B is BTCUSDT's latest and C,
+/// written last of all, leads the list. A is the same pair as B and was inserted before it, so it never
+/// appears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_app_reads_the_latest_review_per_pair_under_the_open_freeze() {
     let seeded = seeded().await;
@@ -198,14 +201,80 @@ async fn the_app_reads_the_latest_review_per_pair_under_the_open_freeze() {
 
     let reviews = body["reviews"].as_array().expect("reviews is an array");
     assert_eq!(reviews.len(), 2, "one row per pair: {body}");
-    assert_eq!(reviews[0]["pair"], "BTCUSDT");
-    assert_eq!(reviews[0]["holdoutN"], 40);
-    assert_eq!(reviews[0]["passChance"], 0.5521);
-    assert_eq!(reviews[0]["allowed"], true);
-    assert_eq!(reviews[0]["reason"], serde_json::Value::Null);
-    assert_eq!(reviews[1]["pair"], "SOLUSDT");
-    assert_eq!(reviews[1]["holdoutN"], 12);
-    assert_eq!(reviews[1]["reason"], "too_few_holdout_trades");
+    assert_eq!(reviews[0]["pair"], "SOLUSDT");
+    assert_eq!(reviews[0]["holdoutN"], 12);
+    assert_eq!(reviews[0]["reason"], "too_few_holdout_trades");
+    assert_eq!(reviews[1]["pair"], "BTCUSDT");
+    assert_eq!(reviews[1]["holdoutN"], 40);
+    assert_eq!(reviews[1]["passChance"], 0.5521);
+    assert_eq!(reviews[1]["allowed"], true);
+    assert_eq!(reviews[1]["reason"], serde_json::Value::Null);
+}
+
+/// The panel's read resolves the latest review per pair by **insertion order**, not by `created_at`: a
+/// same-millisecond tie and a backward clock step both show the row inserted last. `id` is a random v4 UUID
+/// and `created_at` comes from the injected clock, so `created_at DESC, id DESC` could show the older row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_panel_resolves_a_tie_and_a_backward_clock_by_insertion_order() {
+    const TIE_MS: i64 = 1_900_000_000_000;
+    const LATER_MS: i64 = 1_850_000_000_000;
+    const EARLIER_MS: i64 = 1_800_000_000_000;
+    let seeded = seeded().await;
+    let pool = seeded.server.db.pool().clone();
+
+    // BTCUSDT: two rows at ONE millisecond — the last inserted must win.
+    let tied = SqlitePowerReviewRepo::with_deps(pool.clone(), FakeClock::at(TIE_MS));
+    tied.insert(&draft(
+        &seeded,
+        "BTCUSDT",
+        31,
+        0.4213,
+        false,
+        Some("below_bar"),
+    ))
+    .await
+    .expect("the tied review persists");
+    tied.insert(&draft(&seeded, "BTCUSDT", 40, 0.5521, true, None))
+        .await
+        .expect("the tied review persists");
+
+    // SOLUSDT: the later insert carries the EARLIER `created_at`, and must still win.
+    SqlitePowerReviewRepo::with_deps(pool.clone(), FakeClock::at(LATER_MS))
+        .insert(&draft(&seeded, "SOLUSDT", 50, 0.70, true, None))
+        .await
+        .expect("the later review persists");
+    SqlitePowerReviewRepo::with_deps(pool.clone(), FakeClock::at(EARLIER_MS))
+        .insert(&draft(
+            &seeded,
+            "SOLUSDT",
+            12,
+            0.10,
+            false,
+            Some("too_few_holdout_trades"),
+        ))
+        .await
+        .expect("the earlier-clocked review persists");
+
+    let (status, body) = post(&seeded, &seeded.server.app_token, request(&seeded)).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body:?}");
+    let reviews = body["reviews"].as_array().expect("reviews is an array");
+    assert_eq!(reviews.len(), 2, "one row per pair: {body}");
+    let by_pair = |pair: &str| {
+        reviews
+            .iter()
+            .find(|review| review["pair"] == pair)
+            .unwrap_or_else(|| panic!("{pair} is shown: {body}"))
+    };
+    assert_eq!(
+        by_pair("BTCUSDT")["holdoutN"],
+        40,
+        "a same-millisecond tie shows the row inserted last: {body}"
+    );
+    assert_eq!(
+        by_pair("SOLUSDT")["holdoutN"],
+        12,
+        "a backward clock step still shows the row inserted last: {body}"
+    );
 }
 
 /// G1: one review crosses the count, the chance, the bar and the decision — never an outcome. The key set

@@ -788,7 +788,9 @@ pub trait PowerReviewRepository {
     ) -> impl Future<Output = Result<PowerReviewRecord, DataError>> + Send;
 
     /// The newest review for one `(version, pair, freeze)`, or `None` — the read the certify gate (w2) and
-    /// the app's panel (w3) both make (`created_at DESC, id DESC LIMIT 1`).
+    /// the app's panel (w3) both make. Newest is **insertion order** (`rowid DESC LIMIT 1`), never
+    /// `created_at`: the clock can tie at one millisecond or step backwards and the ids are random v4
+    /// UUIDs, so neither can decide.
     ///
     /// # Errors
     ///
@@ -800,7 +802,7 @@ pub trait PowerReviewRepository {
         freeze_id: &str,
     ) -> impl Future<Output = Result<Option<PowerReviewRecord>, DataError>> + Send;
 
-    /// A version's reviews, newest first (`created_at DESC, id DESC`).
+    /// A version's reviews, newest first — insertion order (`rowid DESC`), never `created_at`.
     ///
     /// # Errors
     ///

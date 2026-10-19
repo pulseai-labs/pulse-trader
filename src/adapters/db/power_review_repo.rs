@@ -15,6 +15,11 @@
 //! exists once. Both lists are a handful of rows (one per review), so the id-then-fetch shape costs nothing
 //! measurable and cannot drift.
 //!
+//! **Insertion order decides, never `created_at`.** `latest_for` and `list_for_version` order by
+//! `rowid DESC`: the row id is a random v4 UUID and `created_at` comes from a clock that can tie at one
+//! millisecond or step backwards, so neither can say which review is newest. `rowid` is the table's
+//! insertion order, which is what "the newest review" means here — the row written last.
+//!
 //! NO `#[derive(Debug)]` on the repo struct: the `C: Clock` carries no `Debug` bound (mirror
 //! `SqliteCertificationRepo`).
 
@@ -223,7 +228,7 @@ impl<C: Clock + Send + Sync> crate::domain::PowerReviewRepository for SqlitePowe
         let id = sqlx::query_scalar!(
             r#"SELECT id AS "id!" FROM power_review
                WHERE version_id = ?1 AND pair = ?2 AND freeze_id = ?3
-               ORDER BY created_at DESC, id DESC LIMIT 1"#,
+               ORDER BY rowid DESC LIMIT 1"#,
             version_id_str,
             pair_str,
             freeze_id,
@@ -244,7 +249,7 @@ impl<C: Clock + Send + Sync> crate::domain::PowerReviewRepository for SqlitePowe
         let version_id_str = version_id.as_str();
         let ids = sqlx::query_scalar!(
             r#"SELECT id AS "id!" FROM power_review WHERE version_id = ?1
-               ORDER BY created_at DESC, id DESC"#,
+               ORDER BY rowid DESC"#,
             version_id_str,
         )
         .fetch_all(&self.pool)
