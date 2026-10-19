@@ -474,6 +474,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`certify_version` requires a qualifying power review (r5.s5.w2, PDR-0040, ADR-0032).** A certify call now
+  spends one of the open freeze's hypotheses only when the latest power review for that version, pair and freeze
+  allows an attempt **and** was taken on the data versions the call would pin now; otherwise it refuses with a
+  typed `NoQualifyingPowerReview` refusal, whose text **names no number** — no count, chance, bar or bound — and
+  **spends no hypothesis**, writing no certification record. The refusal is field-pathed to `power_review` over
+  MCP, and the tool's description no longer names an `H = 12` world: it says the gate exists and that a call
+  beyond the freeze's own budget `H` is refused. The freeze checks keep their precedence (no open freeze, a
+  pre-freeze lineage root, a spent budget), the search walk-forward a refused call ran stays persisted exactly as
+  before, and no engine file, golden, fingerprint or fixture moves.
+
 - **The desktop frontend builds and tests on Vite 8, and `just ui-deps` follows the lockfile
   (r4.s5.w5).** `vite` moved `^6.4.3` → `^8.3.4` (rolldown + lightningcss), `@vitejs/plugin-react`
   `^5.2.0` → `^6.1.2` (its Vite 8 major) and `vitest` `^5.0.0` → `^5.0.4` (its peer range accepts

@@ -150,6 +150,32 @@ impl CertificationDraft {
     }
 }
 
+/// Why the certify gate refused (r5.s5.w2, ADR-0032, G5). It never carries a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerGateBlock {
+    /// No power review exists for this version and pair under the open freeze.
+    NoReview,
+    /// The latest power review for this version and pair does not allow an attempt.
+    NotAllowed,
+    /// The latest power review was taken on other data versions than certify would pin now.
+    SnapshotMoved,
+}
+
+impl std::fmt::Display for PowerGateBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoReview => "this version and pair have no power review under the open freeze",
+            Self::NotAllowed => {
+                "the latest power review for this version and pair does not allow an attempt"
+            }
+            Self::SnapshotMoved => {
+                "the latest power review for this version and pair was taken on other data \
+                 versions than certify would pin now"
+            }
+        })
+    }
+}
+
 /// The certification step's typed refusals (C4, Q2) — every one names its
 /// reason, and every one means **nothing was written and no hypothesis was
 /// spent**. The step returns these before it runs anything; an engine or data
@@ -195,5 +221,17 @@ pub enum CertifyRefusal {
     HypothesisBudgetSpent {
         /// The freeze's budget `H`.
         h: u8,
+    },
+    /// No power review under the open freeze allows this attempt (r5.s5.w2, ADR-0032, G5): the gate fails
+    /// closed and its text names no number. The search walk-forward the call ran stays persisted, as for
+    /// every refusal after the search step; no hypothesis is spent.
+    #[error(
+        "no qualifying power review: {block} — run `pulse certify power` for this version and pair under \
+         the open freeze; a hypothesis is spent only when the latest review allows the attempt on the data \
+         versions certify would pin now — no hypothesis was spent"
+    )]
+    NoQualifyingPowerReview {
+        /// Which condition failed.
+        block: PowerGateBlock,
     },
 }
