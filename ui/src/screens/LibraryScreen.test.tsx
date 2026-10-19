@@ -8,7 +8,7 @@
 // "Fakes"). Reuses `src/test/setup.ts` (cleanup + matchMedia) — not
 // re-registered here.
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../bindings", () => ({
@@ -794,6 +794,175 @@ describe("LibraryScreen (C2 — refetch on focus, r2.s1.w4)", () => {
     await waitFor(() => {
       expect(overviewMock.mock.calls.length).toBeGreaterThan(callsOnMount);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #324 (d37) — the open Library follows the server
+// ---------------------------------------------------------------------------
+
+/** The app's poll cadence (`useServerStatus.ts`): the Library reads on it too. */
+const LIBRARY_POLL_MS = 15_000;
+
+/** The catalogue plus an agent-submitted child under v-alpha-3: d37's shape —
+ * `external_agent · claude-code` and a hypothesis subline. */
+function catalogWithAgentChild(): LibraryOverview {
+  return {
+    strategies: [
+      {
+        ...SEEDED.strategies[0],
+        versions: [
+          ...SEEDED.strategies[0].versions,
+          version(
+            "v-alpha-4",
+            "v-alpha-3",
+            null,
+            null,
+            "external_agent",
+            "claude-code",
+            "A wider stop cuts noise exits.",
+          ),
+        ],
+      },
+      SEEDED.strategies[1],
+    ],
+  };
+}
+
+/** An answer a test resolves by hand, for the out-of-order case. */
+type OverviewAnswer =
+  | { status: "ok"; data: LibraryOverview }
+  | { status: "error"; error: BusError };
+
+function deferredOverview(): {
+  promise: Promise<OverviewAnswer>;
+  resolve: (answer: OverviewAnswer) => void;
+} {
+  let resolve!: (answer: OverviewAnswer) => void;
+  const promise = new Promise<OverviewAnswer>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+describe("LibraryScreen (#324 — the open Library follows the server)", () => {
+  it("polls while open: an agent-submitted child appears under its expanded parent and both counts move, with no focus or navigation", async () => {
+    vi.useFakeTimers();
+    try {
+      overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+      const { container } = render(<App />);
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: /toggle alpha wave/i }));
+
+      const before = overviewMock.mock.calls.length;
+      overviewMock.mockResolvedValue({ status: "ok", data: catalogWithAgentChild() });
+      await act(async () => {
+        vi.advanceTimersByTime(LIBRARY_POLL_MS);
+      });
+
+      expect(overviewMock.mock.calls.length).toBeGreaterThan(before);
+      const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+      expect(within(tree).getByRole("button", { name: "Version v4" })).toBeTruthy();
+      expect(within(tree).getByText("external_agent · claude-code")).toBeTruthy();
+      expect(within(tree).getByText("A wider stop cuts noise exits.")).toBeTruthy();
+      const alphaCard = screen.getByText("Alpha Wave", { selector: ".scard-name" }).closest(".scard") as HTMLElement;
+      expect(within(alphaCard).getByText(/^4 versions/)).toBeTruthy();
+      expect(screen.getByText("2 strategies · 5 versions")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an unchanged poll leaves the expanded tree, the selection and the scroll alone", async () => {
+    vi.useFakeTimers();
+    try {
+      overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+      const { container } = render(<App />);
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: /toggle alpha wave/i }));
+      const v2 = screen.getByRole("button", { name: "Version v2" });
+      fireEvent.click(v2);
+      const scroller = container.querySelector("main.content") as HTMLElement;
+      scroller.scrollTop = 240;
+
+      const before = overviewMock.mock.calls.length;
+      await act(async () => {
+        vi.advanceTimersByTime(LIBRARY_POLL_MS);
+      });
+
+      // The poll DID read…
+      expect(overviewMock.mock.calls.length).toBeGreaterThan(before);
+      // …and the identical payload moved nothing: same nodes, same selection,
+      // same expansion, same scroll.
+      expect(screen.getByRole("button", { name: "Version v2" })).toBe(v2);
+      expect(v2.getAttribute("aria-pressed")).toBe("true");
+      const alphaCard = screen.getByText("Alpha Wave", { selector: ".scard-name" }).closest(".scard") as HTMLElement;
+      expect(alphaCard.classList.contains("is-expanded")).toBe(true);
+      expect(scroller.scrollTop).toBe(240);
+      expect(screen.getByText("2 strategies · 4 versions")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a slower earlier response cannot overwrite a newer one", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+    await screen.findByText("Alpha Wave");
+
+    const older = deferredOverview();
+    const newer = deferredOverview();
+    overviewMock.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+
+    // Two focus refetches, the second past the hook's 1 s throttle.
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(5_000);
+    fireEvent(window, new Event("focus"));
+    nowSpy.mockReturnValue(9_000);
+    fireEvent(window, new Event("focus"));
+    nowSpy.mockRestore();
+    await act(async () => {});
+    expect(overviewMock.mock.calls.length).toBe(3);
+
+    // The newer answer lands first, then the slower earlier one.
+    await act(async () => {
+      newer.resolve({ status: "ok", data: catalogWithAgentChild() });
+    });
+    expect(await screen.findByText("2 strategies · 5 versions")).toBeTruthy();
+    await act(async () => {
+      older.resolve({ status: "ok", data: SEEDED });
+    });
+    // The stale answer must not undo the fresh one.
+    expect(screen.getByText("2 strategies · 5 versions")).toBeTruthy();
+    expect(screen.queryByText("2 strategies · 4 versions")).toBeNull();
+  });
+
+  it("does not poll while the window is hidden; the visibility return refetches once", async () => {
+    vi.useFakeTimers();
+    try {
+      overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+      render(<App />);
+      await act(async () => {});
+      const callsOnMount = overviewMock.mock.calls.length;
+
+      Object.defineProperty(document, "visibilityState", {
+        value: "hidden",
+        configurable: true,
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(LIBRARY_POLL_MS);
+      });
+      expect(overviewMock.mock.calls.length).toBe(callsOnMount);
+
+      Object.defineProperty(document, "visibilityState", {
+        value: "visible",
+        configurable: true,
+      });
+      fireEvent(document, new Event("visibilitychange"));
+      await act(async () => {});
+      expect(overviewMock.mock.calls.length).toBe(callsOnMount + 1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

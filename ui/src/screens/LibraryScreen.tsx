@@ -20,7 +20,7 @@
 // it. The host is looked up in an effect, not during render, because it is
 // committed in the same tree this screen mounts in.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 
@@ -57,6 +57,12 @@ const NO_FOLDS: FoldMap = new Map();
 
 /** The details-track host `App.tsx` renders when the route declares the track. */
 const DETAILS_PANE_ID = "details-pane";
+
+/** The open Library's poll interval (#324, d37): the app's own 15 s cadence
+ * (`ui/src/hooks/useServerStatus.ts`), so a version the server holds appears
+ * within one poll interval — the Library is the one screen that polls its
+ * payload, a deliberate exception stated on `load` below. */
+const POLL_MS = 15_000;
 
 // Tree geometry (px) — proportions read from the design reference, authored
 // here rather than ported (`check-design-system.sh` forbids the port).
@@ -101,22 +107,50 @@ export default function LibraryScreen() {
   const [selected, setSelected] = useState<SelectionId | null>(null);
   const [paneHost, setPaneHost] = useState<HTMLElement | null>(null);
 
+  // #324 (d37): the ordering guard `useServerStatus` already uses (#389) —
+  // `issued` numbers every read, `applied` holds the highest read whose answer
+  // landed, so a slow EARLIER answer cannot overwrite a newer one.
+  // `appliedPayload` is the last payload put on screen: an identical poll
+  // response sets no overview, so nothing on screen moves.
+  const issued = useRef(0);
+  const applied = useRef(0);
+  const appliedPayload = useRef<string | null>(null);
+
   /**
-   * Read the library overview — the mount fetch AND the refetch-on-focus read
-   * (r2.s1.w4 C2), one code path.
+   * Read the library overview — the mount fetch, the refetch-on-focus read
+   * (r2.s1.w4 C2) and the open-Library poll (#324, d37), one code path.
    *
-   * `alive` is the caller's: the mount effect passes its own cleanup flag so a
+   * The poll is a DELIBERATE, Library-only exception to
+   * `useRefetchOnFocus.ts:9-11`'s "no polling" rule: d37 found that an
+   * agent-submitted version never reached an open, untouched Library, because
+   * nothing read again after mount. That hook and every other screen keep the
+   * rule unchanged; this screen alone polls its payload, because the trader is
+   * looking at it (#324, d37).
+   *
+   * `alive` is the caller's: each effect passes its own cleanup flag so a
    * response arriving after unmount sets no state. A refetch never clears the
    * selection — a version selected from the previous payload stays selected,
-   * and the details pane re-renders from the fresher object. A successful read
-   * also clears a stale error — a recovered backend must not leave the
-   * library hidden behind a dead read (F5).
+   * and the details pane re-renders from the fresher object.
+   *
+   * Answers are ordered: a read applies only when it is not older than the
+   * last answer already applied. An answer byte-identical to the last applied
+   * payload sets no overview at all — an unchanged poll moves nothing on
+   * screen — but it still clears a stale error, so a recovered backend never
+   * leaves the library hidden behind a dead read (F5).
    */
   const load = useCallback(async (alive: () => boolean = () => true): Promise<void> => {
+    const read = ++issued.current;
     try {
       const result = await commands.libraryOverview();
-      if (!alive()) return;
+      if (!alive() || read <= applied.current) return;
       if (result.status === "ok") {
+        applied.current = read;
+        const payload = JSON.stringify(result.data);
+        if (payload === appliedPayload.current) {
+          setError(null);
+          return;
+        }
+        appliedPayload.current = payload;
         setOverview(result.data);
         setError(null);
       } else {
@@ -126,7 +160,7 @@ export default function LibraryScreen() {
       // A rejection here is the IPC call itself failing (no app handle under
       // a non-Tauri preview) — rendered as the honest error line, never as
       // fabricated content.
-      if (alive()) setError("The library read failed.");
+      if (alive() && read > applied.current) setError("The library read failed.");
     }
   }, []);
 
@@ -135,6 +169,21 @@ export default function LibraryScreen() {
     void load(() => alive);
     return () => {
       alive = false;
+    };
+  }, [load]);
+
+  // #324 (d37): the Library's one poll. A hidden window does not poll — the
+  // focus / visibility refetch covers the return — so a backgrounded app
+  // reads nothing nobody is looking at.
+  useEffect(() => {
+    let alive = true;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      void load(() => alive);
+    }, POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
     };
   }, [load]);
 
