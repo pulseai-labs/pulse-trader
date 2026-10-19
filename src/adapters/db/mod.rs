@@ -112,7 +112,12 @@ pub use certification_freeze_repo::SqliteCertificationFreezeRepo;
 // one per hypothesis, written once and never mutated. `query!` macros for this
 // table are confined here (the `.sqlx` cache is keyed to this file).
 pub mod certification_repo;
+// r5.s5.w1 (PDR-0040, ADR-0032): the `power_review` store (the count-only read's immutable record).
+pub mod power_review_repo;
 pub use certification_repo::SqliteCertificationRepo;
+// r5.s5.w1 (PDR-0040, ADR-0032): the power-review store — the only writer of the immutable `power_review`
+// rows a count-only holdout read leaves behind.
+pub use power_review_repo::SqlitePowerReviewRepo;
 
 // r5.s3.w1 (PDR-0037, ADR-0031): the example-trade mark store — an immutable
 // `example_mark` row per reference trade plus its one-way `example_mark_withdrawal`.
@@ -185,7 +190,7 @@ const BUSY_TIMEOUT_SECS: u64 = 5;
 /// when it last expanded, so ADDING a file (here, `0009_external_agent_window_claim`)
 /// does not by itself invalidate the cached expansion. Editing this file is what
 /// forces the re-expansion, which is why a new migration always comes with a
-/// touch here (r5.s3.w1's `0021_example_marks` is the newest such touch).
+/// touch here (r5.s5.w1's `0022_power_review` is the newest such touch).
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Create `path` as a PRIVATE directory tree (0700 on unix) when it does not

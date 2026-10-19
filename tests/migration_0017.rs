@@ -223,7 +223,7 @@ async fn a_fresh_database_migrates_through_0017() {
     // The embedded max moved to 0021 (r5.s3.w1); the embedded set ends there.
     assert_eq!(
         applied_max(db.pool()).await,
-        21,
+        22,
         "the embedded set ends at the embedded max"
     );
 
@@ -266,7 +266,7 @@ async fn a_pre_0017_database_migrates_forward_keeping_every_row() {
     MIGRATOR.run(db.pool()).await.expect("0017 applies");
     // The embedded max moved to 0021 (r5.s3.w1) — the run carries the whole
     // set, not 0017 alone.
-    assert_eq!(applied_max(db.pool()).await, 21, "now at the embedded max");
+    assert_eq!(applied_max(db.pool()).await, 22, "now at the embedded max");
 
     assert_eq!(
         stored_d1(db.pool(), "run-legacy").await,
@@ -376,7 +376,7 @@ async fn the_down_restores_the_0016_shape() {
     MIGRATOR.run(db.pool()).await.expect("the up re-applies");
     assert_eq!(
         applied_max(db.pool()).await,
-        21,
+        22,
         "round trip closes at the embedded max"
     );
     assert_eq!(

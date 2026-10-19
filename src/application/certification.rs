@@ -46,8 +46,10 @@ use crate::application::backtest::{
     BacktestAppError, BacktestRequest, PreSaveStage, SnapshotPins, load_series,
     prepare_over_loaded_series, resolve_default_request,
 };
-use crate::application::walk_forward::{WalkForwardAppError, WalkForwardRequest, run_walk_forward};
-use crate::domain::backtest::{BacktestInputs, RunVerdict, VerdictRule, WalkForwardRun};
+use crate::application::walk_forward::{
+    WalkForwardAppError, WalkForwardOutcome, WalkForwardRequest, run_walk_forward,
+};
+use crate::domain::backtest::{BacktestInputs, RunVerdict, Trade, VerdictRule, WalkForwardRun};
 use crate::domain::certification::{
     CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
 };
@@ -167,98 +169,33 @@ where
     R: BacktestRunRepository + WalkForwardRunRepository,
     A: CertificationRepository,
 {
-    // 1. An open freeze, or nothing at all (C4): the holdout and the budget
-    //    both come from it.
-    let Some(freeze) = freeze else {
-        return Err(CertifyRefusal::NoOpenFreeze.into());
-    };
-
-    // 2. The version and its lineage root. Both reads happen before the budget
-    //    check because the root's creation instant is what C4 refuses on.
-    let version = strategies
-        .get_version(&request.version_id)
-        .await
-        .map_err(CertifyError::Store)?
-        .ok_or_else(|| CertifyError::VersionNotFound(request.version_id.clone()))?;
-    let root = lineage_root(strategies, &version).await?;
-    let root_created_at_ms = root.created_at.timestamp_millis();
-    if root_created_at_ms <= freeze.opened_at_ms {
-        return Err(CertifyRefusal::PreFreezeLineage {
-            version_id: version.id.clone(),
-            root_version_id: root.id.clone(),
-            root_created_at_ms,
-            freeze_opened_at_ms: freeze.opened_at_ms,
-        }
-        .into());
-    }
-
-    // 3. The budget: H hypotheses per freeze, counted from the records
-    //    themselves (Q2). This is the cheap refusal — the write transaction
-    //    re-derives the index and reads the freeze's own H under the write
-    //    lock, and THAT is the enforcement (close R1): two calls that overlap
-    //    here at `H - 1` cannot both write.
-    let used_before = certifications
-        .count_for_freeze(&freeze.id)
-        .await
-        .map_err(CertifyError::Store)?;
-    if used_before >= u32::from(freeze.h) {
-        return Err(CertifyRefusal::HypothesisBudgetSpent { h: freeze.h }.into());
-    }
-
-    // 4. The pair and timeframes, resolved exactly as the run tools resolve
-    //    them: the version's parent's latest run, then its own, then the app
-    //    defaults (BTCUSDT, M15 + H4, HEAD). The override then replaces the pair
-    //    and clears the inherited pins, through the ONE `apply_pair_override`
-    //    the MCP run tools import too (close R3).
-    let mut resolved = resolve_default_request(strategies, runs, &request.version_id, None)
-        .await
-        .map_err(CertifyError::Backtest)?;
-    apply_pair_override(
-        &mut resolved.pair,
-        &mut resolved.snapshots,
-        request.pair.as_ref(),
-    );
-
-    // 5. The search span, under wf-v2, with the freeze passed so the guard
-    //    clamps a defaulted `to` to the holdout start. Persisted as an ordinary
-    //    walk-forward run — the record's `search_walk_forward_run_id`.
-    let search = run_walk_forward(
+    // Steps 1–6 — the freeze checks, the version and its lineage root, the budget, the pair/timeframe
+    // resolution, the persisted `wf-v2` search walk-forward and the validated/compiled strategy — live in
+    // `prepare_attempt`, shared with `review_power` so the power review's count is taken through exactly
+    // this code (G2). The order, the refusals and the errors are unchanged.
+    let PreparedAttempt {
+        freeze,
+        version,
+        resolved,
+        search,
+        search_inputs,
+        validated,
+        compiled,
+    } = prepare_attempt(
         strategies,
         candles,
         exchange,
         runs,
-        &WalkForwardRequest {
-            version_id: request.version_id.clone(),
-            pair: resolved.pair.clone(),
-            primary_timeframe: resolved.primary_timeframe,
-            htf_timeframe: resolved.htf_timeframe,
-            config: resolved.config,
-            snapshots: resolved.snapshots.clone(),
-            // The guards own both bounds: `from` defaults to the first fully-warm
-            // bar, `to` to the snapshot's end — clamped to the holdout start
-            // while this freeze is open, which is what makes the search span the
-            // search span instead of a caller-supplied window.
-            from_ms: None,
-            to_ms: None,
-            k: None,
-            rule: Some(CERTIFY_RULE),
-        },
-        Some(freeze.holdout()),
+        certifications,
+        freeze,
+        &request.version_id,
+        request.pair.as_ref(),
     )
-    .await
-    .map_err(CertifyError::WalkForward)?;
+    .await?;
 
-    // The search run's provenance: every fold consumed the same pins, so the
-    // first fold's recorded inputs ARE the search side's data versions. A fold
-    // run that cannot be read (or records no inputs) is a failure, never a
-    // silently blank provenance.
-    let search_inputs = search_inputs(runs, &search.run).await?;
-
-    // 6. The ONE holdout backtest, unpersisted, outside the guard (Q4).
-    let validated = validate(&version.dsl).map_err(BacktestAppError::DslInvalid)?;
-    let compiled = compile(&validated)
-        .map_err(|e| CertifyError::Backtest(BacktestAppError::CompileFailed(e.to_string())))?;
-    let holdout_run = run_holdout(
+    // 6. The ONE holdout backtest, unpersisted, outside the guard (Q4). The C1 test is applied to its
+    //    realized-R series below; the power review stops at `trades.len()` and never reaches the test.
+    let holdout = holdout_trades(
         candles.clone(),
         exchange.clone(),
         validated,
@@ -269,15 +206,28 @@ where
         resolved.config,
         search_inputs.clone(),
         freeze.holdout_start_ms,
-        freeze.h,
     )
     .await?;
 
     // 7. The C1 test at the freeze's H, then the record — last, so every
-    //    failure above left the budget untouched.
+    //    failure above left the budget untouched. Each `HoldoutNumbers` field keeps
+    //    the expression this step used before the extraction.
+    let realized_rs: Vec<Decimal> = holdout
+        .trades
+        .iter()
+        .map(|trade| trade.realized_r)
+        .collect();
+    let verdict = holdout_test(&realized_rs, freeze.h);
+    let holdout_run = HoldoutNumbers {
+        realized_rs_len: realized_rs.len(),
+        mean_r: verdict.mean_r,
+        inputs: holdout.inputs,
+        end_ms: holdout.end_ms,
+        verdict,
+    };
     let draft = certification_draft(
         &version,
-        freeze,
+        &freeze,
         &resolved,
         &search.run,
         search_inputs,
@@ -462,7 +412,21 @@ struct HoldoutNumbers {
     end_ms: i64,
 }
 
-/// Run the ONE holdout backtest over `[holdout_start, the snapshot's end)`.
+/// What the holdout backtest produced: its trades, the window's exclusive end and the pinned inputs.
+///
+/// The trades travel as a value, and **the power review reads only their `len()`** — nothing else about the
+/// holdout's outcomes ever leaves the use case (G1).
+pub(crate) struct HoldoutTrades {
+    /// The holdout's trades (their `realized_r` is the C1 test's input for the certify call).
+    pub(crate) trades: Vec<Trade>,
+    /// The window's exclusive end — the primary snapshot's last candle's `close_time`.
+    pub(crate) end_ms: i64,
+    /// The data versions the holdout read pinned, per timeframe.
+    pub(crate) inputs: CertificationInputs,
+}
+
+/// Run the ONE holdout backtest over `[holdout_start, the snapshot's end)` — and stop there: the C1 test is
+/// the caller's (the certify step applies it; the power review counts the trades and nothing more).
 ///
 /// Q4's exemption, stated where it is made: this function passes `holdout:
 /// None` *by construction* — it loads the series with the search run's own
@@ -474,7 +438,7 @@ struct HoldoutNumbers {
 /// standalone backtest path does (filesystem I/O + `Parquet` decode + the CPU
 /// engine).
 #[allow(clippy::too_many_arguments)]
-async fn run_holdout<C, E>(
+pub(crate) async fn holdout_trades<C, E>(
     candles: C,
     exchange: E,
     validated: ValidatedDsl,
@@ -485,8 +449,7 @@ async fn run_holdout<C, E>(
     config: BacktestConfig,
     search_inputs: CertificationInputs,
     holdout_start_ms: i64,
-    h: u8,
-) -> Result<HoldoutNumbers, CertifyError>
+) -> Result<HoldoutTrades, CertifyError>
 where
     C: CandleSeriesRepository + Send + 'static,
     E: ExchangeAdapter + Send + 'static,
@@ -499,7 +462,7 @@ where
         htf: search_inputs.htf.as_ref().map(|s| s.data_version.clone()),
         d1: search_inputs.d1.as_ref().map(|s| s.data_version.clone()),
     };
-    tokio::task::spawn_blocking(move || -> Result<HoldoutNumbers, CertifyError> {
+    tokio::task::spawn_blocking(move || -> Result<HoldoutTrades, CertifyError> {
         let mut primary = load_series(
             &candles,
             &pair,
@@ -568,25 +531,155 @@ where
         )
         .map_err(CertifyError::Backtest)?;
 
-        // The C1 test sums the SAME realized-R series the rule's fold verdicts
-        // do (`FoldVerdict::from_rs`), and splits the family-wise alpha across
-        // the FREEZE's budget H — the budget the campaign actually runs under,
-        // read from the open record rather than assumed (Q2/ADR-0028).
-        let realized_rs: Vec<Decimal> = prepared
-            .result
-            .trades
-            .iter()
-            .map(|trade| trade.realized_r)
-            .collect();
-        let verdict = holdout_test(&realized_rs, h);
-        Ok(HoldoutNumbers {
-            realized_rs_len: realized_rs.len(),
-            mean_r: verdict.mean_r,
+        // The trades travel as a value; who may read what of them is the caller's decision, and
+        // `review_power` reads only their count (G1).
+        Ok(HoldoutTrades {
+            trades: prepared.result.trades,
             inputs: certification_inputs(&prepared.inputs),
             end_ms,
-            verdict,
         })
     })
     .await
     .map_err(|e| CertifyError::Internal(format!("the holdout backtest thread failed: {e}")))?
+}
+
+/// What the shared certify steps produced — everything the certify step and the power review need after the
+/// freeze checks, the resolution, the persisted search walk-forward and the compilation, and nothing that
+/// touches the holdout.
+pub(crate) struct PreparedAttempt {
+    /// The open freeze (cloned from the caller's borrowed value).
+    pub(crate) freeze: FreezeRecord,
+    /// The version under review.
+    pub(crate) version: StrategyVersion,
+    /// The resolved pair, timeframes and cost config, after the pair override.
+    pub(crate) resolved: BacktestRequest,
+    /// The persisted `wf-v2` search walk-forward.
+    pub(crate) search: WalkForwardOutcome,
+    /// The search span's recorded data versions (the first fold's).
+    pub(crate) search_inputs: CertificationInputs,
+    /// The validated DSL.
+    pub(crate) validated: ValidatedDsl,
+    /// The compiled strategy.
+    pub(crate) compiled: CompiledStrategy,
+}
+
+/// Steps 1–6 of the certification, extracted so the power review reaches the holdout window through exactly
+/// this code (G2, ADR-0032): the freeze checks, the version and its lineage root, the budget, the
+/// pair/timeframe resolution and pair override, the persisted `wf-v2` search walk-forward, the search span's
+/// recorded inputs, and `validate` + `compile`.
+///
+/// Every refusal writes nothing and spends nothing, exactly as before the extraction; a failure after the
+/// search step leaves the persisted search run behind, as an ordinary `run_walk_forward` call would.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_attempt<S, C, E, R, A>(
+    strategies: &S,
+    candles: &C,
+    exchange: &E,
+    runs: &R,
+    certifications: &A,
+    freeze: Option<&FreezeRecord>,
+    version_id: &VersionId,
+    pair: Option<&Pair>,
+) -> Result<PreparedAttempt, CertifyError>
+where
+    S: StrategyRepository,
+    C: CandleSeriesRepository + Clone + Send + 'static,
+    E: ExchangeAdapter + Clone + Send + 'static,
+    R: BacktestRunRepository + WalkForwardRunRepository,
+    A: CertificationRepository,
+{
+    // 1. An open freeze, or nothing at all (C4): the holdout and the budget
+    //    both come from it.
+    let Some(freeze) = freeze else {
+        return Err(CertifyRefusal::NoOpenFreeze.into());
+    };
+
+    // 2. The version and its lineage root. Both reads happen before the budget
+    //    check because the root's creation instant is what C4 refuses on.
+    let version = strategies
+        .get_version(version_id)
+        .await
+        .map_err(CertifyError::Store)?
+        .ok_or_else(|| CertifyError::VersionNotFound(version_id.clone()))?;
+    let root = lineage_root(strategies, &version).await?;
+    let root_created_at_ms = root.created_at.timestamp_millis();
+    if root_created_at_ms <= freeze.opened_at_ms {
+        return Err(CertifyRefusal::PreFreezeLineage {
+            version_id: version.id.clone(),
+            root_version_id: root.id.clone(),
+            root_created_at_ms,
+            freeze_opened_at_ms: freeze.opened_at_ms,
+        }
+        .into());
+    }
+
+    // 3. The budget: H hypotheses per freeze, counted from the records
+    //    themselves (Q2). The write transaction re-derives the index and reads
+    //    the freeze's own H under the write lock, which is the enforcement
+    //    (close R1) — this pre-check is the cheap named refusal.
+    let used_before = certifications
+        .count_for_freeze(&freeze.id)
+        .await
+        .map_err(CertifyError::Store)?;
+    if used_before >= u32::from(freeze.h) {
+        return Err(CertifyRefusal::HypothesisBudgetSpent { h: freeze.h }.into());
+    }
+
+    // 4. The pair and timeframes, resolved exactly as the run tools resolve
+    //    them, then the override through the ONE `apply_pair_override` the MCP
+    //    run tools import too (close R3).
+    let mut resolved = resolve_default_request(strategies, runs, version_id, None)
+        .await
+        .map_err(CertifyError::Backtest)?;
+    apply_pair_override(&mut resolved.pair, &mut resolved.snapshots, pair);
+
+    // 5. The search span, under wf-v2, with the freeze passed so the guard
+    //    clamps a defaulted `to` to the holdout start. Persisted as an ordinary
+    //    walk-forward run — the record's `search_walk_forward_run_id`.
+    let search = run_walk_forward(
+        strategies,
+        candles,
+        exchange,
+        runs,
+        &WalkForwardRequest {
+            version_id: version_id.clone(),
+            pair: resolved.pair.clone(),
+            primary_timeframe: resolved.primary_timeframe,
+            htf_timeframe: resolved.htf_timeframe,
+            config: resolved.config,
+            snapshots: resolved.snapshots.clone(),
+            // The guards own both bounds: `from` defaults to the first fully-warm
+            // bar, `to` to the snapshot's end — clamped to the holdout start
+            // while this freeze is open, which is what makes the search span the
+            // search span instead of a caller-supplied window.
+            from_ms: None,
+            to_ms: None,
+            k: None,
+            rule: Some(CERTIFY_RULE),
+        },
+        Some(freeze.holdout()),
+    )
+    .await
+    .map_err(CertifyError::WalkForward)?;
+
+    // The search run's provenance: every fold consumed the same pins, so the
+    // first fold's recorded inputs ARE the search side's data versions. A fold
+    // run that cannot be read (or records no inputs) is a failure, never a
+    // silently blank provenance.
+    let search_inputs = search_inputs(runs, &search.run).await?;
+
+    // 6. The strategy, validated and compiled — the holdout step's inputs.
+    let validated = validate(&version.dsl).map_err(BacktestAppError::DslInvalid)?;
+    let compiled = compile(&validated)
+        .map_err(|e| CertifyError::Backtest(BacktestAppError::CompileFailed(e.to_string())))?;
+
+    Ok(PreparedAttempt {
+        freeze: freeze.clone(),
+        version,
+        resolved,
+        search,
+        search_inputs,
+        validated,
+        compiled,
+    })
 }

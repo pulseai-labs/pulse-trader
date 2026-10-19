@@ -47,6 +47,7 @@ use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
 use crate::domain::llm_call::{AttributedCall, AttributedCallError, LlmCall, LlmCallId};
 use crate::domain::pair::Pair;
+use crate::domain::power_review::{PowerReviewDraft, PowerReviewRecord};
 use crate::domain::series::{CandleSeries, StoredCandleSeries};
 use crate::domain::sizing::SymbolFilters;
 use crate::domain::strategy::{
@@ -762,6 +763,52 @@ pub trait CertificationRepository {
         &self,
         draft: &CertificationDraft,
     ) -> impl Future<Output = Result<CertificationRecord, DataError>> + Send;
+}
+
+/// The power-review persistence port (r5.s5.w1, PDR-0040/ADR-0032) — the immutable `power_review` rows a
+/// count-only holdout read writes, one per read. The established repository style:
+/// `impl Future<Output = ...> + Send`, consumed generically, never `dyn`; the SQLite adapter
+/// (`adapters::db::power_review_repo`) implements it over `pulse.db` behind `0022`'s immutability triggers.
+///
+/// **Rows are create + read only.** A review is the audit record of a read — who looked at the holdout's
+/// trade count, on what candidate, under what freeze — so there is no update and no delete.
+///
+/// **The insert spends nothing and enforces nothing.** Unlike the certification budget, a review costs no
+/// hypothesis, so `insert` is a plain INSERT: no transaction, no budget check. The port exists so the CLI
+/// (this item) and the app's read (w3) share one store.
+pub trait PowerReviewRepository {
+    /// Persist one review and return the stored row (the store mints `id` and `created_at`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the version or freeze does not exist or the store fails.
+    fn insert(
+        &self,
+        draft: &PowerReviewDraft,
+    ) -> impl Future<Output = Result<PowerReviewRecord, DataError>> + Send;
+
+    /// The newest review for one `(version, pair, freeze)`, or `None` — the read the certify gate (w2) and
+    /// the app's panel (w3) both make (`created_at DESC, id DESC LIMIT 1`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row or a store failure.
+    fn latest_for(
+        &self,
+        version_id: &VersionId,
+        pair: &Pair,
+        freeze_id: &str,
+    ) -> impl Future<Output = Result<Option<PowerReviewRecord>, DataError>> + Send;
+
+    /// A version's reviews, newest first (`created_at DESC, id DESC`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a corrupt row or a store failure.
+    fn list_for_version(
+        &self,
+        version_id: &VersionId,
+    ) -> impl Future<Output = Result<Vec<PowerReviewRecord>, DataError>> + Send;
 }
 
 /// Example-trade marks' persistence port (r5.s3.w1, PDR-0037, ADR-0031) — the

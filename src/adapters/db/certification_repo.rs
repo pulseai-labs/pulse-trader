@@ -296,8 +296,8 @@ impl<C: Clock + Send + Sync> crate::domain::CertificationRepository for SqliteCe
     async fn insert(&self, draft: &CertificationDraft) -> Result<CertificationRecord, DataError> {
         let id = Uuid::new_v4().to_string();
         let created_at = self.now_rfc3339()?;
-        let search_inputs = encode_inputs("search_inputs", &draft.search_inputs)?;
-        let holdout_inputs = encode_inputs("holdout_inputs", &draft.holdout_inputs)?;
+        let search_inputs = encode_inputs("certification.search_inputs", &draft.search_inputs)?;
+        let holdout_inputs = encode_inputs("certification.holdout_inputs", &draft.holdout_inputs)?;
         let search_pass = i64::from(draft.search_pass);
         let holdout_passes = i64::from(draft.holdout_passes);
         let certified = i64::from(draft.certified());
@@ -444,8 +444,8 @@ fn certification_record(row: CertificationRow) -> Result<CertificationRecord, Da
         holdout_lower_bound: row.holdout_lower_bound,
         holdout_passes: row.holdout_passes != 0,
         certified: row.certified != 0,
-        search_inputs: decode_inputs("search_inputs", &row.search_inputs)?,
-        holdout_inputs: decode_inputs("holdout_inputs", &row.holdout_inputs)?,
+        search_inputs: decode_inputs("certification.search_inputs", &row.search_inputs)?,
+        holdout_inputs: decode_inputs("certification.holdout_inputs", &row.holdout_inputs)?,
         engine_fingerprint: row.engine_fingerprint,
         created_at: row.created_at,
         called_by: row.called_by,
@@ -477,15 +477,18 @@ struct CertificationRow {
     called_by: String,
 }
 
-/// Encode one side's selections for its JSON column (the `0006` precedent).
-fn encode_inputs(column: &str, inputs: &CertificationInputs) -> Result<String, DataError> {
-    serde_json::to_string(inputs)
-        .map_err(|e| DataError::Db(format!("encode certification.{column}: {e}")))
+/// Encode one side's selections for its JSON column (the `0006` precedent). `label` is the full column
+/// path (`"certification.search_inputs"`, `"power_review.holdout_inputs"`), so the error names the table too.
+pub(crate) fn encode_inputs(
+    label: &str,
+    inputs: &CertificationInputs,
+) -> Result<String, DataError> {
+    serde_json::to_string(inputs).map_err(|e| DataError::Db(format!("encode {label}: {e}")))
 }
 
 /// Decode one side's selections, fail-closed: a column that no longer parses is
-/// corruption, never a partially-recorded provenance.
-fn decode_inputs(column: &str, raw: &str) -> Result<CertificationInputs, DataError> {
-    serde_json::from_str(raw)
-        .map_err(|e| DataError::Db(format!("malformed certification.{column} `{raw}`: {e}")))
+/// corruption, never a partially-recorded provenance. One copy, shared by the certification and the power
+/// review stores.
+pub(crate) fn decode_inputs(label: &str, raw: &str) -> Result<CertificationInputs, DataError> {
+    serde_json::from_str(raw).map_err(|e| DataError::Db(format!("malformed {label} `{raw}`: {e}")))
 }

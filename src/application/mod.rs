@@ -123,3 +123,7 @@ pub(crate) mod walk_forward_read;
 // (the unpersisted holdout backtest), applies the C1 test at the open freeze's
 // H, and writes one immutable `certification` record whatever the outcome.
 pub(crate) mod certification;
+// r5.s5.w1 (PDR-0040, ADR-0032): the power review use case — the count-only holdout read and the record it
+// writes, reached from `pulse certify power` (w1) and the app's panel (w3). It composes the SAME
+// `prepare_attempt` + `holdout_trades` the certification step runs (G2).
+pub(crate) mod power_review;

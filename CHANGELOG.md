@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Power review before a certify attempt: the pass chance at the holdout's trade count
+  (r5.s5.w1, PDR-0040, ADR-0032).** Before a candidate spends one of the freeze's hypotheses, the operator can run
+  `pulse certify power --version <id> [--pair <PAIR>]` and see **how many trades the candidate makes in the open
+  freeze's holdout window** — the count only, nothing about how those trades went — and the chance the C1 holdout
+  test would pass a true `+0.25R` edge at that count, against the bar (`50%`, and at least 20 trades) fixed at plan
+  time. `z` is C1's own quantile, `Φ` is A&S 26.2.17, and σ is the candidate's own search-span sample σ; the count
+  is reached through the **same code path** a certify call runs, so the `n` a review reports is the `n` a
+  certification would test. **A review spends no hypothesis** and writes one immutable `power_review` row
+  (migration `0022`), naming who called it; a refused review writes nothing. The read is operator-only: the CLI
+  here, the app's app-scope panel in w3, and **never over MCP**. ADR-0032 names the formula, the constants, the
+  count-only rule and the gate w2 implements. No engine file, golden, fingerprint or freeze table moves.
+
 - **Example trades on the Chart tab: mark a candle, and read the marks back
   (r5.s3.w3, PDR-0037, ADR-0031).** A trader can now arm **"Mark example"**, choose Long or Short,
   type a setup label (kept for the next mark) and an optional note, and **click a candle** — the
