@@ -960,3 +960,16 @@ pub use domain::{
     CertificationDraft, CertificationInputs, CertificationRecord, CertificationRepository,
     CertifyRefusal,
 };
+
+// r5.s5.w1 (PDR-0040, ADR-0032): the power review — the count-only holdout read, its immutable record,
+// the pass-chance arithmetic and the CLI use case. Operator-only (the CLI here, w3's app route); never an
+// MCP surface. REQUIRED under `deny(warnings)` — a new public item unused outside its module is a
+// `dead_code` build error.
+pub use adapters::db::SqlitePowerReviewRepo;
+pub use application::power_review::{
+    PowerReviewError, PowerReviewOutcome, PowerReviewRequest, review_power,
+};
+pub use domain::{
+    ASSUMED_EDGE_R, MIN_HOLDOUT_TRADES, POWER_BAR, PowerBlock, PowerReviewDraft, PowerReviewRecord,
+    PowerReviewRepository, PowerVerdict, c1_z, normal_cdf, pass_chance, sample_sigma, verdict,
+};

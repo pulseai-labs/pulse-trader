@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!\" FROM power_review\n               WHERE version_id = ?1 AND pair = ?2 AND freeze_id = ?3\n               ORDER BY created_at DESC, id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "37943f648667034ec1973ae926718d600b19bcb65f7bbaf4ee7b90f8b884bdcd"
+}
