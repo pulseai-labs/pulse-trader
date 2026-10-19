@@ -59,6 +59,8 @@ use super::backtest::{
     backtest_run_dto, run_read_fence,
 };
 use super::certification::{CertificationRecordsDto, CertificationRecordsRequest};
+// r5.s5.w3: the Library's power-review read (PDR-0040, ADR-0032).
+use super::power_review::{PowerReviewsDto, PowerReviewsRequest};
 // r5.s2.w1: the Chart tab's read — a window of candles and, for a run, its trades
 // and its rule's overlays (PDR-0036).
 use super::chart::{ChartDataDto, ChartDataRequest};
@@ -85,7 +87,8 @@ use super::walk_forward::{
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
     Db, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
-    SqliteExampleMarkRepo, SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path, open_migrated,
+    SqliteExampleMarkRepo, SqliteLlmCallRepo, SqlitePowerReviewRepo, SqliteStrategyRepo,
+    default_db_path, open_migrated,
 };
 // r3.s3.w5: the thin-client state every proxied command speaks through.
 use crate::agent::ComposerEvent;
@@ -166,6 +169,8 @@ pub const BUS_COMMANDS: &[&str] = &[
     "write_mark",
     "list_marks",
     "withdraw_mark",
+    // r5.s5.w3: the Library's power-review read (PDR-0040).
+    "power_reviews",
 ];
 
 // ---------------------------------------------------------------------------
@@ -434,6 +439,14 @@ impl DesktopState {
     #[must_use]
     pub fn certification_repo(&self) -> SqliteCertificationRepo<SystemClock> {
         SqliteCertificationRepo::new(self.db.pool().clone())
+    }
+
+    /// The power-review store over the shared pool (r5.s5.w3, PDR-0040, ADR-0032)
+    /// — the app's latest-per-pair read under the open freeze. Same cheap-wrapper
+    /// pattern as [`DesktopState::strategy_repo`].
+    #[must_use]
+    pub fn power_review_repo(&self) -> SqlitePowerReviewRepo<SystemClock> {
+        SqlitePowerReviewRepo::new(self.db.pool().clone())
     }
 
     /// The example-trade mark store over the shared pool (r5.s3.w1, PDR-0037) —
@@ -1828,6 +1841,27 @@ pub async fn certification_records(
     request: CertificationRecordsRequest,
 ) -> Result<CertificationRecordsDto, BusError> {
     state.post("/api/v1/certification-records", &request).await
+}
+
+/// `power_reviews` — the latest power review per pair under the open freeze for
+/// one version: its holdout trade count, pass chance, the bar and whether a
+/// certify attempt is allowed (r5.s5.w3, PDR-0040, ADR-0032). No holdout
+/// outcome. App scope only; the `agent` surface has no power read (G6).
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`power_reviews_core`]. With no open freeze the
+/// answer names no freeze and carries an empty list; a version with no review
+/// under the open freeze answers an empty list.
+///
+/// [`power_reviews_core`]: crate::tauri::power_review::power_reviews_core
+#[tauri::command]
+#[specta::specta]
+pub async fn power_reviews(
+    state: tauri::State<'_, ClientState>,
+    request: PowerReviewsRequest,
+) -> Result<PowerReviewsDto, BusError> {
+    state.post("/api/v1/power-reviews", &request).await
 }
 
 /// `streak_card` — the losing streak and drawdown a normal bad run of one

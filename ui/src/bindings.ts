@@ -398,6 +398,21 @@ export const commands = {
 	 *  [`withdraw_mark_core`]: crate::tauri::marks::withdraw_mark_core
 	 */
 	withdrawMark: (request: WithdrawMarkRequest) => typedError<MarkDto, BusError>(__TAURI_INVOKE("withdraw_mark", { request })),
+	/**
+	 *  `power_reviews` — the latest power review per pair under the open freeze for
+	 *  one version: its holdout trade count, pass chance, the bar and whether a
+	 *  certify attempt is allowed (r5.s5.w3, PDR-0040, ADR-0032). No holdout
+	 *  outcome. App scope only; the `agent` surface has no power read (G6).
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`power_reviews_core`]. With no open freeze the
+	 *  answer names no freeze and carries an empty list; a version with no review
+	 *  under the open freeze answers an empty list.
+	 * 
+	 *  [`power_reviews_core`]: crate::tauri::power_review::power_reviews_core
+	 */
+	powerReviews: (request: PowerReviewsRequest) => typedError<PowerReviewsDto, BusError>(__TAURI_INVOKE("power_reviews", { request })),
 };
 
 /* Types */
@@ -2051,6 +2066,55 @@ export type PaperTrades = {
 	 *  (#344).
 	 */
 	entries: PaperEntry[],
+};
+
+/**
+ *  One power review as the Library shows it: the count, the pass chance, the bar and the decision — no
+ *  holdout outcome (G1).
+ */
+export type PowerReviewDto = {
+	/**  The record's id. */
+	id: string,
+	/**  The version the review is about. */
+	versionId: string,
+	/**  The freeze the review ran under. */
+	freezeId: string,
+	/**  The pair the count was taken on. */
+	pair: string,
+	/**  The freeze's hypothesis budget `H` (which fixes `z`). */
+	h: number,
+	/**  The holdout's trade count — the one thing this read reports about the holdout. */
+	holdoutN: number,
+	/**  The chance C1 would pass a true `+0.25R` edge at this count. */
+	passChance: number | null,
+	/**  The bar the chance was judged against, as stored (`"0.50"`). */
+	bar: string,
+	/**  The trade-count floor the decision applied, as stored. */
+	minHoldoutTrades: number,
+	/**  Whether a certify attempt is allowed. */
+	allowed: boolean,
+	/**  The first failing reason's stored spelling, or `None` when allowed. */
+	reason: string | null,
+	/**  When the review was written, RFC 3339 ms. */
+	createdAt: string,
+	/**  The calling client's label. */
+	calledBy: string,
+};
+
+/**  What `power_reviews` answers: the latest review per pair under the open freeze, newest first. */
+export type PowerReviewsDto = {
+	/**  The version the reviews belong to. */
+	versionId: string,
+	/**  The freeze currently open, or `None` when none is. */
+	openFreezeId: string | null,
+	/**  One row per pair, newest first; empty when the open freeze has no review for this version. */
+	reviews: PowerReviewDto[],
+};
+
+/**  What `power_reviews` is asked for: one strategy version. */
+export type PowerReviewsRequest = {
+	/**  The version whose power reviews to read. */
+	versionId: string,
 };
 
 /**  The typed override half of a promote — `OverrideRequest` on the wire. */
