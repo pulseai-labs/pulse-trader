@@ -19,8 +19,9 @@ takes its operator-only surface from [ADR-0012](0012-agents-via-mcp-tools.md). I
 The r5 campaign certifies **at most `H = 2` hypotheses** under freeze `30f98b21` (PDR-0026; ADR-0028), and each
 attempt spends one of them on data no search run may ever see again. ADR-0028 chose the C1 test — the one-sided
 lower confidence bound of the holdout expectancy strictly above zero, at a family-wise 5% split
-`z = z(1 − 0.05/H)` — and **measured its power**: on the harness null, 312 of 1000 seeds pass at 100 holdout
-trades and H = 12, 455 at 150, 486 at 160, 628 at 200, 734 at 250; at H = 6, 395 / 557 / 592 / 716 / 817. The
+`z = z(1 − 0.05/H)` — and **measured its power** at that reference edge: with a true `+0.25R` edge, 312 of 1000
+seeds pass at 100 holdout trades and H = 12, 455 at 150, 486 at 160, 628 at 200, 734 at 250; at H = 6,
+395 / 557 / 592 / 716 / 817 (under the harness null C1 rejects at the family-wise alpha, by construction). The
 power table is the fact this ADR turns into a decision procedure: **a candidate whose holdout yields few trades
 cannot pass C1 at any edge, and spending one of `H = 2` hypotheses on it is a certain waste.**
 
@@ -69,8 +70,10 @@ its `n` **through the same code certify runs**: the freeze checks, the pair/time
 series load — extracted into one shared function (`prepare_attempt` + `holdout_trades` in
 `src/application/certification.rs`) that both callers use. The review uses `trades.len()`, the window end and the
 recorded inputs; it never calls `holdout_test` on the holdout's trades and computes nothing else from them. The
-new table, DTO, CLI print-out and every error carry the **count only** — no R, mean, bound, P&L, win rate, trade
-time or verdict (SPINE G1). **`certify_version`'s outcome, refusals and record are unchanged by the
+new table, DTO, CLI print-out and every error carry **no holdout outcome** — never a holdout's R, mean, bound,
+P&L, win rate, trade time or verdict (SPINE G1). The bar's own arithmetic — `z`, the search-span σ, `search_n`,
+`search_pass` and `pass_chance` — belongs to the search span and the pre-committed bar, never the holdout, and
+is recorded. **`certify_version`'s outcome, refusals and record are unchanged by the
 extraction** (G2).
 
 **A review spends nothing and writes one immutable row; a refused review writes nothing (G3).** The read runs
@@ -100,8 +103,8 @@ changed by this ADR, and no golden, pinned hash, paper-replay digest or certifie
 
 ## Consequences
 
-- **One new table, one new migration.** `0022_power_review` adds `power_review` (23 columns, four CHECK-held
-  laws, the two immutability triggers, and an index on `(version_id, pair, freeze_id, created_at)` for the read
+- **One new table, one new migration.** `0022_power_review` adds `power_review` (23 columns, twelve CHECK
+  constraints, the two immutability triggers, and an index on `(version_id, pair, freeze_id, created_at)` for the read
   the gate and the app both make). The embedded max moves 21 → 22. The down file restores the exact 0021 shape.
 - **The touch surface** joins the bones registry at the r5.s5 close: `src/domain/power_review.rs`,
   `src/application/power_review.rs`, `src/adapters/db/power_review_repo.rs`, `migrations/0022_power_review.*`.
@@ -112,7 +115,8 @@ changed by this ADR, and no golden, pinned hash, paper-replay digest or certifie
 - **Revisit when** a later freeze opens, `H` changes, or a candidate's trade rate makes the 50% bar reachable —
   any of the three makes this ADR's arithmetic the wrong arithmetic.
 - **`H` and the fence are unchanged.** The review reads the freeze's `holdout_start_ms` and `h`; it does not open,
-  close or alter anything about a freeze, and a refusal leaves the store exactly as it was.
+  close or alter anything about a freeze, and a refusal writes no review row — though the search span's
+  walk-forward is already persisted by the time the holdout read runs, exactly as after a certification error.
 
 ## Sources
 
