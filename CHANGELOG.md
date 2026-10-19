@@ -6,19 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-
-- **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount
-  and on a window focus / visibility return, so an agent-submitted child version never reached an untouched,
-  focused Library — the r5 close watched two submissions stay invisible for 5.5 and 10.5 minutes until
-  Lab → Library remounted the screen (d37). The Library now polls `library_overview` every 15 s while it is
-  open (the app's own cadence), skips the tick while the window is hidden, and applies only a read no newer
-  answer has superseded, so a slower earlier response cannot undo a fresher one. An unchanged payload sets no
-  state: an idle poll moves nothing on screen — the expanded tree, the selection and the scroll stay exactly
-  as they are. The poll is a deliberate, Library-only exception to `useRefetchOnFocus`'s "no polling" rule
-  (that hook and every other screen are unchanged). No server, route, payload, migration, engine or golden
-  change.
-
 ### Added
 
 - **The Library shows the power review (r5.s5.w3, PDR-0040, ADR-0032).** The details pane of a selected version now
@@ -623,6 +610,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Preserved unmerged as [PR #123](https://github.com/pulseai-labs/pulse-trader/pull/123).
 
 ### Fixed
+
+- **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount
+  and on a window focus / visibility return, so an agent-submitted child version never reached an untouched,
+  focused Library — the r5 close watched two submissions stay invisible for 5.5 and 10.5 minutes until
+  Lab → Library remounted the screen (d37). The Library now polls `library_overview` every 15 s while it is
+  open (the app's own cadence), skips the tick while the window is hidden, and applies only a read no newer
+  answer has superseded, so a slower earlier response cannot undo a fresher one. An unchanged payload sets no
+  state: an idle poll moves nothing on screen — the expanded tree, the selection and the scroll stay exactly
+  as they are. The poll is a deliberate, Library-only exception to `useRefetchOnFocus`'s "no polling" rule
+  (that hook and every other screen are unchanged). No server, route, payload, migration, engine or golden
+  change.
 
 - **A mark withdraw reads the open freeze and refuses a fenced mark (#440, PDR-0039).**
   `withdraw_mark` — the application use case behind the app's `withdraw_mark_core` and the MCP
