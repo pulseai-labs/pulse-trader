@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO power_review (id, version_id, freeze_id, pair, h, z, holdout_start_ms, holdout_end_ms, holdout_n, holdout_inputs, search_walk_forward_run_id, search_pass, search_n, sigma_r, assumed_edge_r, bar, min_holdout_trades, pass_chance, allowed, reason, engine_fingerprint, called_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 23
+    },
+    "nullable": []
+  },
+  "hash": "93d7e6cabe814b6b97e0a195a36c31410102f11a421ce654943d1335bcf74ee9"
+}

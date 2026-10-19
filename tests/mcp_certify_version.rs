@@ -24,8 +24,8 @@ use std::path::Path;
 use pulse::{CertificationRepository, FakeClock, OpenFreezeRequest, SqliteCertificationFreezeRepo};
 use serde_json::{Value, json};
 use support::certification::{
-    FREEZE_OPENED_MS, H, certifications, seed_search_run, seeded_draft, walk_forward_run_count,
-    world, world_with_clocks,
+    FREEZE_OPENED_MS, H, certifications, power_review, seed_search_run, seeded_draft,
+    walk_forward_run_count, world, world_with_clocks,
 };
 use support::mcp::{call, call_err, spawn_client};
 use support::server::{ServerOptions, spawn_server};
@@ -111,6 +111,9 @@ fn revoke_token(label: &str, db_path: &Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certify_version_answers_without_any_holdout_number() {
     let world = world().await;
+    power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let client = spawn_client(&world.db_path, &world.data_dir()).await;
     let result = call(
         &client,
@@ -298,6 +301,9 @@ async fn certify_version_refuses_a_pre_freeze_lineage_root() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certify_version_records_the_calling_label() {
     let world = world().await;
+    power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let client = spawn_client(&world.db_path, &world.data_dir()).await;
     let _ = call(
         &client,

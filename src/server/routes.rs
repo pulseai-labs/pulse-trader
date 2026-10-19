@@ -30,6 +30,7 @@ use super::auth::Scope;
 use super::ops;
 use super::paper::{api_error, internal, label_of};
 use crate::tauri::certification::certification_records_core;
+use crate::tauri::power_review::power_reviews_core;
 use crate::tauri::streak_card::streak_card_core;
 use crate::tauri::trader_writer;
 use crate::tauri::walk_forward::{get_backtest_run_core, get_walk_forward_run_core};
@@ -100,6 +101,11 @@ pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum:
         // r4.s1.w5 (spec A4/C5): the app's full certification-record read.
         .mount_post_json(state, "/api/v1/certification-records", |state, request| {
             Box::pin(plain_certification_records(state, request))
+        })
+        // r5.s5.w3 (PDR-0040, ADR-0032): the Library's power-review read — count,
+        // pass chance, bar, allowed; no outcome.
+        .mount_post_json(state, "/api/v1/power-reviews", |state, request| {
+            Box::pin(plain_power_reviews(state, request))
         })
         // r5.s4.w1 (PDR-0035 Q4): the streak and drawdown card's read.
         .mount_post_json(state, "/api/v1/streak-card", |state, request| {
@@ -345,6 +351,20 @@ async fn plain_certification_records(
     request: crate::tauri::CertificationRecordsRequest,
 ) -> Response {
     match certification_records_core(&state.desktop, request).await {
+        Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
+        Err(err) => ops::bus_422(&err),
+    }
+}
+
+/// `POST /api/v1/power-reviews` — the latest power review per pair under the open
+/// freeze, straight through the core (r5.s5.w3, PDR-0040, ADR-0032). Mounted
+/// `Scope::App`: an `agent` token is a 403 `scope_refused` with an audit row,
+/// exactly like every other route on this table.
+async fn plain_power_reviews(
+    state: Arc<ServerState>,
+    request: crate::tauri::PowerReviewsRequest,
+) -> Response {
+    match power_reviews_core(&state.desktop, request).await {
         Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
         Err(err) => ops::bus_422(&err),
     }

@@ -54,6 +54,9 @@ async fn promote_version(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promotion_reads_certification_promotes_through_the_record() {
     let world = world().await;
+    support::certification::power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let outcome = support::certification::certify(&world, Some(&world.freeze))
         .await
         .expect("the planted edge certifies");
@@ -286,6 +289,9 @@ async fn promotion_reads_certification_keeps_the_override_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certified_record_promotes_after_a_later_failed_wf_v1_pointer() {
     let world = world().await;
+    support::certification::power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let outcome = support::certification::certify(&world, Some(&world.freeze))
         .await
         .unwrap();

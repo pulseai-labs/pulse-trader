@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The Library shows the power review (r5.s5.w3, PDR-0040, ADR-0032).** The details pane of a selected version now
+  carries a **Power review** section: for each pair, the latest review under the open freeze, with its **holdout
+  trade count**, its **pass chance** against the **50% bar** fixed at plan time, and whether a certify attempt is
+  **allowed** — and, when it is not, why (`the search span fails`, `fewer than 20 holdout trades`, `pass chance
+  below the bar`). **No holdout outcome is shown**: the section states that outcomes are not shown before the
+  attempt, and the wire shape carries no `z`, window, pinned inputs, search-span fields, σ, assumed edge or
+  fingerprint (SPINE G1). The read is one new app-scope route, `POST /api/v1/power-reviews`, behind the one new
+  `power_reviews` bus command — an agent token gets a 403 `scope_refused`, and there is **no power read over
+  MCP** (G6). With no open freeze the pane says so; a freeze with no review for this version says `None yet.`
+  No engine file, golden, fingerprint, migration or freeze table moves.
+
+- **Power review before a certify attempt: the pass chance at the holdout's trade count
+  (r5.s5.w1, PDR-0040, ADR-0032).** Before a candidate spends one of the freeze's hypotheses, the operator can run
+  `pulse certify power --version <id> [--pair <PAIR>]` and see **how many trades the candidate makes in the open
+  freeze's holdout window** — the count only, nothing about how those trades went — and the chance the C1 holdout
+  test would pass a true `+0.25R` edge at that count, against the bar (`50%`, and at least 20 trades) fixed at plan
+  time. `z` is C1's own quantile, `Φ` is A&S 26.2.17, and σ is the candidate's own search-span sample σ; the count
+  is reached through the **same code path** a certify call runs, so the `n` a review reports is the `n` a
+  certification would test. **A review spends no hypothesis** and writes one immutable `power_review` row
+  (migration `0022`), naming who called it; a refused review writes nothing. The read is operator-only: the CLI
+  here, the app's app-scope panel in w3, and **never over MCP**. ADR-0032 names the formula, the constants, the
+  count-only rule and the gate w2 implements. No engine file, golden, fingerprint or freeze table moves.
+
 - **Example trades on the Chart tab: mark a candle, and read the marks back
   (r5.s3.w3, PDR-0037, ADR-0031).** A trader can now arm **"Mark example"**, choose Long or Short,
   type a setup label (kept for the next mark) and an optional note, and **click a candle** — the
@@ -461,6 +484,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   known limit "a failed unit raises no push alert".
 
 ### Changed
+
+- **`certify_version` requires a qualifying power review (r5.s5.w2, PDR-0040, ADR-0032).** A certify call now
+  spends one of the open freeze's hypotheses only when the latest power review for that version, pair and freeze
+  allows an attempt **and** was taken on the data versions the call would pin now; otherwise it refuses with a
+  typed `NoQualifyingPowerReview` refusal, whose text **names no number** — no count, chance, bar or bound — and
+  **spends no hypothesis**, writing no certification record. The refusal is field-pathed to `power_review` over
+  MCP, and the tool's description no longer names an `H = 12` world: it says the gate exists and that a call
+  beyond the freeze's own budget `H` is refused. The freeze checks keep their precedence (no open freeze, a
+  pre-freeze lineage root, a spent budget), the search walk-forward a refused call ran stays persisted exactly as
+  before, and no engine file, golden, fingerprint or fixture moves.
 
 - **The desktop frontend builds and tests on Vite 8, and `just ui-deps` follows the lockfile
   (r4.s5.w5).** `vite` moved `^6.4.3` → `^8.3.4` (rolldown + lightningcss), `@vitejs/plugin-react`

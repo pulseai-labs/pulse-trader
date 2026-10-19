@@ -16,7 +16,12 @@ mod candle;
 // typed refusals. Pure + zero-I/O; the SQLite store is
 // `adapters::db::certification_repo`.
 pub(crate) mod certification;
+// r5.s5.w1 (PDR-0040, ADR-0032): the power review's value types and maths — the immutable `power_review`
+// row, its draft, the pass-chance formula, C1's own quantile and the verdict. Pure + zero-I/O; the SQLite
+// store is `adapters::db::power_review_repo`. Deliberately outside `src/domain/backtest/`, so the engine
+// fingerprint does not move (SPINE G7).
 mod clock;
+pub(crate) mod power_review;
 // r1.s2.w2 (ADR-0021): the coaching session domain — never-silence outcomes, the
 // typed failure taxonomy, and the disposition state machine. Pure + zero-I/O; the
 // `CoachingRepository` port lives in `port` beside the other ports.
@@ -150,7 +155,14 @@ pub use freeze::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeReques
 // error under `deny(warnings)`. (The step's error enum lives in
 // `application::certification`, close R2: it carries application-ring errors.)
 pub use certification::{
-    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
+    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal, PowerGateBlock,
+};
+// r5.s5.w1 (PDR-0040, ADR-0032): the power review's surface — the record and its draft, the pass-chance
+// arithmetic, C1's own quantile and the verdict. Re-exported so `lib.rs` can curate the crate surface — an
+// un-re-exported public domain item is a `dead_code` BUILD error under `deny(warnings)`.
+pub use power_review::{
+    ASSUMED_EDGE_R, MIN_HOLDOUT_TRADES, POWER_BAR, PowerBlock, PowerReviewDraft, PowerReviewRecord,
+    PowerVerdict, c1_z, normal_cdf, pass_chance, sample_sigma, verdict,
 };
 // r5.s3.w1 (PDR-0037, ADR-0031): the example-trade mark's surface — the stored
 // row, its draft, the read shape, the filter and the refusal vocabulary.
@@ -242,7 +254,7 @@ pub use port::{
     BacktestRunRepository, CandleSeriesRepository, CertificationRepository, ClosedBarSource,
     CoachAcceptanceRepository, CoachingRepository, ExampleMarkRepository, ExchangeAdapter,
     FixtureSnapshotStore, LlmCallRepository, LlmProvider, MarketDataSource, PaperSessionRepository,
-    StrategyRepository, WalkForwardRunRepository,
+    PowerReviewRepository, StrategyRepository, WalkForwardRunRepository,
 };
 // r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
 // live in `port` like every other port and are re-exported `pub(crate)` rather than

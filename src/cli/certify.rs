@@ -24,8 +24,16 @@ use chrono::{Datelike as _, SecondsFormat, TimeZone, Utc};
 use clap::Subcommand;
 use rust_decimal::Decimal;
 
-use crate::adapters::db::SqliteCertificationFreezeRepo;
-use crate::domain::{FreezeRecord, OpenFreezeRequest};
+use crate::adapters::db::{
+    SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
+    SqlitePowerReviewRepo, SqliteStrategyRepo,
+};
+use crate::adapters::store::CandleStore;
+use crate::application::power_review::{PowerReviewRequest, review_power};
+use crate::domain::strategy::VersionId;
+use crate::domain::{
+    ExchangeAdapter as _, FreezeRecord, OpenFreezeRequest, Pair, PowerReviewRecord,
+};
 
 /// `pulse certify {freeze,close-freeze,status}` — the freeze lifecycle.
 #[derive(Debug, Subcommand)]
@@ -59,6 +67,23 @@ pub enum CertifyAction {
         /// Path to `pulse.db`. Defaults to the platform data path.
         #[arg(long)]
         db: Option<PathBuf>,
+    },
+    /// Review a candidate's power before it spends a hypothesis (r5.s5.w1, ADR-0032): the holdout trade
+    /// count it would test, the chance C1 passes a true +0.25R edge at that count, and whether the bar
+    /// allows an attempt. The count only — no holdout outcome is read, printed or stored.
+    Power {
+        /// The strategy version to review.
+        #[arg(long)]
+        version: String,
+        /// The pair to count on; defaults to the version's lineage pair.
+        #[arg(long)]
+        pair: Option<String>,
+        /// Path to `pulse.db`. Defaults to the platform data path.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// The candle-snapshot directory. Defaults to the platform data dir.
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
 }
 
@@ -130,6 +155,50 @@ pub(crate) async fn run_certify(args: &CertifyArgs) -> anyhow::Result<()> {
                 None => println!("no open freeze"),
             }
         }
+        CertifyAction::Power {
+            version,
+            pair,
+            db,
+            store,
+        } => {
+            // The pair, validated at this untrusted boundary exactly as the MCP edge validates it: the
+            // symbol's shape, then the run's own exchange adapter's pin table. An unpinned symbol refuses
+            // here, before anything runs.
+            let pair = pair.as_deref().map(Pair::parse).transpose()?;
+            let exchange = crate::adapters::broker::BinanceAdapter::new();
+            if let Some(pair) = pair.as_ref() {
+                exchange
+                    .symbol_filters(pair)
+                    .map_err(|e| anyhow::anyhow!("refused: {e}"))?;
+            }
+            let db_handle = super::open_db(db.as_deref()).await?;
+            let store = match store {
+                Some(dir) => CandleStore::with_base_dir(dir.clone()),
+                None => CandleStore::with_default_base_dir()
+                    .map_err(|e| anyhow::anyhow!("resolve candle-store dir: {e}"))?,
+            };
+            let freeze = SqliteCertificationFreezeRepo::new(db_handle.pool().clone())
+                .open_freeze()
+                .await
+                .map_err(|e| anyhow::anyhow!("certify power failed: {e}"))?;
+            let outcome = review_power(
+                &SqliteStrategyRepo::new(db_handle.pool().clone()),
+                &store,
+                &exchange,
+                &SqliteBacktestRunRepo::new(db_handle.pool().clone()),
+                &SqliteCertificationRepo::new(db_handle.pool().clone()),
+                &SqlitePowerReviewRepo::new(db_handle.pool().clone()),
+                freeze.as_ref(),
+                &PowerReviewRequest {
+                    version_id: VersionId::new(version.clone()),
+                    pair,
+                    called_by: "cli".to_owned(),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("refused: {e}"))?;
+            print_power_review(&outcome.record);
+        }
     }
     Ok(())
 }
@@ -176,4 +245,38 @@ fn rfc3339(ms: i64) -> String {
         ),
         None => format!("{ms} ms"),
     }
+}
+
+/// Print one power review (Approach 7): the holdout's **count**, the candidate's search-span σ and the bar's
+/// arithmetic — and the fixed line saying what is deliberately not shown. No outcome of the holdout's trades
+/// is printed, and none is stored (G1).
+fn print_power_review(record: &PowerReviewRecord) {
+    println!("power review id: {}", record.id);
+    println!("version: {}", record.version_id.as_str());
+    println!("pair: {}", record.pair.as_str());
+    println!("freeze id: {}", record.freeze_id);
+    println!("h: {}", record.h);
+    println!("z: {:.6}", record.z);
+    println!(
+        "holdout window: {} .. {}",
+        rfc3339(record.holdout_start_ms),
+        rfc3339(record.holdout_end_ms)
+    );
+    println!("holdout trades: {}", record.holdout_n);
+    println!("search trades: {}", record.search_n);
+    println!("search sigma (R): {}", record.sigma_r);
+    println!("assumed edge (R): {}", record.assumed_edge_r);
+    println!("pass chance: {:.1}%", record.pass_chance * 100.0);
+    let bar_pct = record.bar.parse::<f64>().map_or(0.0, |bar| bar * 100.0);
+    println!("bar: {bar_pct:.1}%");
+    println!("min holdout trades: {}", record.min_holdout_trades);
+    println!(
+        "search span passes: {}",
+        if record.search_pass { "yes" } else { "no" }
+    );
+    match &record.reason {
+        Some(reason) => println!("attempt allowed: no — {reason}"),
+        None => println!("attempt allowed: yes"),
+    }
+    println!("holdout outcomes: not shown");
 }

@@ -899,6 +899,11 @@ pub use crate::tauri::{
     CertificationSelectionDto, certification_records_core,
 };
 
+// r5.s5.w3 (PDR-0040, ADR-0032): the Library's power-review read — the wire shapes and the
+// transport-free core behind `POST /api/v1/power-reviews` and the `power_reviews` bus command
+// (ADR-0020: additive only). Count only (G1), app scope only (G6).
+pub use crate::tauri::{PowerReviewDto, PowerReviewsDto, PowerReviewsRequest, power_reviews_core};
+
 // r5.s4.w1 (PDR-0035): the streak and drawdown card's read contract — the wire
 // shapes and the transport-free core behind `POST /api/v1/streak-card` and the
 // `streak_card` bus command (ADR-0020: additive only).
@@ -958,5 +963,18 @@ pub use application::certification::{
 };
 pub use domain::{
     CertificationDraft, CertificationInputs, CertificationRecord, CertificationRepository,
-    CertifyRefusal,
+    CertifyRefusal, PowerGateBlock,
+};
+
+// r5.s5.w1 (PDR-0040, ADR-0032): the power review — the count-only holdout read, its immutable record,
+// the pass-chance arithmetic and the CLI use case. Operator-only (the CLI here, w3's app route); never an
+// MCP surface. REQUIRED under `deny(warnings)` — a new public item unused outside its module is a
+// `dead_code` build error.
+pub use adapters::db::SqlitePowerReviewRepo;
+pub use application::power_review::{
+    PowerReviewError, PowerReviewOutcome, PowerReviewRequest, review_power,
+};
+pub use domain::{
+    ASSUMED_EDGE_R, MIN_HOLDOUT_TRADES, POWER_BAR, PowerBlock, PowerReviewDraft, PowerReviewRecord,
+    PowerReviewRepository, PowerVerdict, c1_z, normal_cdf, pass_chance, sample_sigma, verdict,
 };

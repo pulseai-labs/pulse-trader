@@ -33,6 +33,9 @@ pub(crate) mod chart;
 // r4.s1.w5 (spec A4/C5): the certification-record read — the app's full view of
 // a version's records, one plain route and one bus command (ADR-0020: additive).
 pub(crate) mod certification;
+// r5.s5.w3 (PDR-0040, ADR-0032): the Library's power-review read — the count, the pass chance, the bar
+// and the decision, behind one app-scope route and the `power_reviews` bus command (ADR-0020: additive).
+pub(crate) mod power_review;
 // r1.s4.w3: the coach rail's wire contract (DTOs + the named recoveries) and the
 // two command cores. A separate module so `commands.rs` stays the registration
 // surface while the projection logic lives beside its own unit tests.
@@ -100,6 +103,8 @@ pub use certification::{
     CertificationRecordDto, CertificationRecordsDto, CertificationRecordsRequest,
     CertificationSelectionDto, certification_records_core,
 };
+// r5.s5.w3 (PDR-0040, ADR-0032): the Library's power-review read's wire shapes and core.
+pub use power_review::{PowerReviewDto, PowerReviewsDto, PowerReviewsRequest, power_reviews_core};
 // r5.s4.w1 (PDR-0035): the streak and drawdown card's wire shapes and core.
 pub use streak_card::{
     DecimalPercentilesDto, StreakCardDto, StreakCardRequest, StreakPercentilesDto, streak_card_core,
@@ -167,6 +172,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::write_mark,
         commands::list_marks,
         commands::withdraw_mark,
+        // r5.s5.w3: the Library's power-review read (PDR-0040).
+        commands::power_reviews,
     ])
 }
 
