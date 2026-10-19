@@ -899,6 +899,11 @@ pub use crate::tauri::{
     CertificationSelectionDto, certification_records_core,
 };
 
+// r5.s5.w3 (PDR-0040, ADR-0032): the Library's power-review read — the wire shapes and the
+// transport-free core behind `POST /api/v1/power-reviews` and the `power_reviews` bus command
+// (ADR-0020: additive only). Count only (G1), app scope only (G6).
+pub use crate::tauri::{PowerReviewDto, PowerReviewsDto, PowerReviewsRequest, power_reviews_core};
+
 // r5.s4.w1 (PDR-0035): the streak and drawdown card's read contract — the wire
 // shapes and the transport-free core behind `POST /api/v1/streak-card` and the
 // `streak_card` bus command (ADR-0020: additive only).

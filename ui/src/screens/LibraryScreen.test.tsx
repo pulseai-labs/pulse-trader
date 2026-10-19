@@ -33,6 +33,10 @@ vi.mock("../bindings", () => ({
     certificationRecords: vi
       .fn()
       .mockResolvedValue({ status: "ok", data: { versionId: "", records: [] } }),
+    // r5.s5.w3: the pane's power-review read; no open freeze by default.
+    powerReviews: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: { versionId: "", openFreezeId: null, reviews: [] } }),
     // r4.s5.w3 (#330): the details pane reads the version's latest walk-forward
     // once to learn which of its recent runs are folds. Defaults to a
     // not-found-shaped refusal, so a fixture that carries a pointer but no
@@ -58,6 +62,7 @@ import type {
   LibraryOverview,
   LibraryRunSummary,
   LibraryVersion,
+  PowerReviewDto,
   VersionStats,
   WalkForwardRunDto,
 } from "../bindings";
@@ -70,6 +75,8 @@ const KNOWN_NAV_IDS = ["library", "designer", "backtest", "deploy", "journal", "
 
 const overviewMock = vi.mocked(commands.libraryOverview);
 const certificationRecordsMock = vi.mocked(commands.certificationRecords);
+// r5.s5.w3: the pane's power-review read.
+const powerReviewsMock = vi.mocked(commands.powerReviews);
 const walkForwardRunMock = vi.mocked(commands.getWalkForwardRun);
 
 /** The figure helper (r4.s5.w1): the A2 display text plus the ring's own exact
@@ -188,6 +195,13 @@ const SEEDED: LibraryOverview = {
 
 beforeEach(() => {
   overviewMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
+  // r5.s5.w3: the power-review read answers "no open freeze" unless a case says
+  // otherwise — the module mock's own default, restored here so one case's
+  // resolved value cannot leak into the next.
+  powerReviewsMock.mockResolvedValue({
+    status: "ok",
+    data: { versionId: "", openFreezeId: null, reviews: [] },
+  });
   // r4.s5.w3 (#330): the fold reads are cached by walk-forward id for the
   // session; each case starts from an empty cache so its call assertions hold.
   clearWalkForwardFoldReads();
@@ -663,6 +677,91 @@ describe("LibraryScreen (r4.s1.w5 — the certification records)", () => {
     const inPane = within(pane);
     expect(await inPane.findByText("Certification records")).toBeTruthy();
     expect(await inPane.findByText("None yet.")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r5.s5.w3 — the power review before the one certify attempt
+// ---------------------------------------------------------------------------
+
+/** One power review, in the generated DTO's shape (r5.s5.w3). */
+function powerReview(allowed: boolean): PowerReviewDto {
+  return {
+    id: "pr-1",
+    versionId: "v-alpha-2",
+    freezeId: "f-1",
+    pair: "BTCUSDT",
+    h: 2,
+    holdoutN: 31,
+    passChance: 0.4213,
+    bar: "0.50",
+    minHoldoutTrades: 20,
+    allowed,
+    reason: allowed ? null : "below_bar",
+    createdAt: "2026-11-30T09:00:00.000Z",
+    calledBy: "cli",
+  };
+}
+
+describe("LibraryScreen (r5.s5.w3 — the power review)", () => {
+  /** Select v2 of "Alpha Wave" and return the pane's Power review section. */
+  async function openPowerReview(): Promise<HTMLElement> {
+    const { container } = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v2"));
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const inPane = within(pane);
+    return (await inPane.findByText("Power review")).closest("section") as HTMLElement;
+  }
+
+  it("shows the count, the pass chance, the bar and why an attempt is not allowed", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    powerReviewsMock.mockResolvedValue({
+      status: "ok",
+      data: { versionId: "v-alpha-2", openFreezeId: "f-1", reviews: [powerReview(false)] },
+    });
+
+    const section = await openPowerReview();
+    const inSection = within(section);
+    expect(inSection.getByText("BTCUSDT")).toBeTruthy();
+    expect(inSection.getByText("31t")).toBeTruthy();
+    expect(inSection.getByText("pass 42.1%")).toBeTruthy();
+    expect(inSection.getByText("bar 50.0%")).toBeTruthy();
+    expect(inSection.getByText("attempt not allowed — pass chance below the bar")).toBeTruthy();
+    expect(inSection.getByText("Holdout outcomes are not shown before the attempt.")).toBeTruthy();
+    expect(powerReviewsMock).toHaveBeenCalledWith({ versionId: "v-alpha-2" });
+    // G1: nothing about how the holdout trades went reaches the pane.
+    expect(section.textContent ?? "").not.toMatch(/mean|bound|pnl|win/i);
+  });
+
+  it("says an attempt is allowed", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    powerReviewsMock.mockResolvedValue({
+      status: "ok",
+      data: { versionId: "v-alpha-2", openFreezeId: "f-1", reviews: [powerReview(true)] },
+    });
+
+    const section = await openPowerReview();
+    expect(within(section).getByText("attempt allowed")).toBeTruthy();
+  });
+
+  it("says no freeze is open", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+
+    const section = await openPowerReview();
+    expect(await within(section).findByText("No freeze is open.")).toBeTruthy();
+  });
+
+  it("says 'None yet.' when the open freeze has no review", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    powerReviewsMock.mockResolvedValue({
+      status: "ok",
+      data: { versionId: "v-alpha-2", openFreezeId: "f-1", reviews: [] },
+    });
+
+    const section = await openPowerReview();
+    expect(await within(section).findByText("None yet.")).toBeTruthy();
   });
 });
 

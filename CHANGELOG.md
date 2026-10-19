@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The Library shows the power review (r5.s5.w3, PDR-0040, ADR-0032).** The details pane of a selected version now
+  carries a **Power review** section: for each pair, the latest review under the open freeze, with its **holdout
+  trade count**, its **pass chance** against the **50% bar** fixed at plan time, and whether a certify attempt is
+  **allowed** — and, when it is not, why (`the search span fails`, `fewer than 20 holdout trades`, `pass chance
+  below the bar`). **No holdout outcome is shown**: the section states that outcomes are not shown before the
+  attempt, and the wire shape carries no `z`, window, pinned inputs, search-span fields, σ, assumed edge or
+  fingerprint (SPINE G1). The read is one new app-scope route, `POST /api/v1/power-reviews`, behind the one new
+  `power_reviews` bus command — an agent token gets a 403 `scope_refused`, and there is **no power read over
+  MCP** (G6). With no open freeze the pane says so; a freeze with no review for this version says `None yet.`
+  No engine file, golden, fingerprint, migration or freeze table moves.
+
 - **Power review before a certify attempt: the pass chance at the holdout's trade count
   (r5.s5.w1, PDR-0040, ADR-0032).** Before a candidate spends one of the freeze's hypotheses, the operator can run
   `pulse certify power --version <id> [--pair <PAIR>]` and see **how many trades the candidate makes in the open

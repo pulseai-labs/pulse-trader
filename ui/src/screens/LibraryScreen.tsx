@@ -30,6 +30,7 @@ import type {
   LibraryOverview,
   LibraryStrategy,
   LibraryVersion,
+  PowerReviewDto,
   VersionStats,
 } from "../bindings";
 import { CertBadge } from "../components/CertBadge";
@@ -670,6 +671,100 @@ function CertificationRecords({ versionId }: { versionId: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// The power review (r5.s5.w3, PDR-0040, ADR-0032)
+// ---------------------------------------------------------------------------
+
+/** What the pane has from the `power_reviews` read. */
+type PowerReviewRows =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "loaded"; openFreezeId: string | null; reviews: readonly PowerReviewDto[] };
+
+/**
+ * Why an attempt is not allowed, in the words the pane uses. The three tokens
+ * are the stored spellings `PowerBlock::as_str` owns (`search_span_fails`,
+ * `too_few_holdout_trades`, `below_bar`); anything else — including a `null`
+ * reason on a review that does not allow — is the em dash rather than an
+ * invented sentence.
+ */
+function allowedText(review: PowerReviewDto): string {
+  if (review.allowed) return "attempt allowed";
+  switch (review.reason) {
+    case "search_span_fails":
+      return "attempt not allowed — the search span fails";
+    case "too_few_holdout_trades":
+      return `attempt not allowed — fewer than ${review.minHoldoutTrades} holdout trades`;
+    case "below_bar":
+      return "attempt not allowed — pass chance below the bar";
+    default:
+      return EM_DASH;
+  }
+}
+
+/**
+ * The latest power review per pair under the open freeze, read on selection:
+ * each pair's holdout trade count, its pass chance against the bar fixed at
+ * plan time, and whether a certify attempt is allowed. The count is the only
+ * thing this pane learns about the holdout (G1); no outcome, window or σ is
+ * shown, and the fence is stated on the pane itself.
+ */
+function PowerReviews({ versionId }: { versionId: string }) {
+  const [rows, setRows] = useState<PowerReviewRows>({ kind: "loading" });
+
+  useEffect(() => {
+    let alive = true;
+    setRows({ kind: "loading" });
+    void commands
+      .powerReviews({ versionId })
+      .then((result) => {
+        if (!alive) return;
+        setRows(
+          result.status === "ok"
+            ? {
+                kind: "loaded",
+                openFreezeId: result.data.openFreezeId,
+                reviews: result.data.reviews,
+              }
+            : { kind: "error", message: result.error.message },
+        );
+      })
+      .catch(() => {
+        if (alive) {
+          setRows({
+            kind: "error",
+            message: "The power review could not be read.",
+          });
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [versionId]);
+
+  if (rows.kind === "loading") return <div className="bt-none dim">Reading…</div>;
+  if (rows.kind === "error") return <div className="bt-none dim">{rows.message}</div>;
+  if (rows.openFreezeId === null) return <div className="bt-none dim">No freeze is open.</div>;
+  if (rows.reviews.length === 0) return <div className="bt-none dim">None yet.</div>;
+  return (
+    <>
+      <div className="bt-list">
+        {rows.reviews.map((review) => (
+          <div key={review.id} className="cert-rec">
+            <span className="mono">{review.pair}</span>
+            <span className="mono">{`${review.holdoutN}t`}</span>
+            <span className="mono">{`pass ${percentFromFraction(String(review.passChance))}`}</span>
+            <span className="mono dim">{`bar ${percentFromFraction(review.bar)}`}</span>
+            <span className="bt-spacer" />
+            <span className="mono">{allowedText(review)}</span>
+          </div>
+        ))}
+      </div>
+      <div className="bt-none dim">Holdout outcomes are not shown before the attempt.</div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Details pane (portaled into the shell's third track)
 // ---------------------------------------------------------------------------
 
@@ -760,6 +855,15 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
             </button>
           )}
         </div>
+      </section>
+
+      {/* r5.s5.w3 (PDR-0040, ADR-0032): the power review — before the one
+          certify attempt, each pair's holdout trade count and pass chance
+          against the bar fixed at plan time, read through the app-scope
+          `power_reviews` route. No holdout outcome is shown here. */}
+      <section className="d-section">
+        <h4 className="dsl-h">Power review</h4>
+        <PowerReviews versionId={version.id} />
       </section>
 
       {/* r4.s1.w5 (spec A4/C5): the FULL certification record — the holdout's
