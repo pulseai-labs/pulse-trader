@@ -199,6 +199,22 @@ fn verdict_refuses_in_priority_order() {
     );
 }
 
+/// The bar test fails **closed**: a NaN or any other non-finite chance is not allowed, and it refuses with
+/// the existing `below_bar` reason rather than letting the NaN through as allowed with no reason.
+#[test]
+fn a_nan_pass_chance_is_not_allowed() {
+    for chance in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            verdict(true, MIN_HOLDOUT_TRADES, chance),
+            pulse::PowerVerdict {
+                allowed: false,
+                reason: Some(PowerBlock::BelowBar)
+            },
+            "a non-finite chance ({chance}) must refuse with below_bar"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The use case's world
 // ---------------------------------------------------------------------------

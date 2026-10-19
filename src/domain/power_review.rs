@@ -127,14 +127,15 @@ pub struct PowerVerdict {
 }
 
 /// The verdict, in its fixed order: the search span first (no candidate at all), then the trade-count floor,
-/// then the bar. A chance exactly at [`POWER_BAR`] is allowed — the comparison is a strict below.
+/// then the bar. A chance exactly at [`POWER_BAR`] is allowed — the comparison is a strict below. The bar
+/// test fails **closed**: a NaN or non-finite chance is not allowed, and refuses with [`PowerBlock::BelowBar`].
 #[must_use]
 pub fn verdict(search_pass: bool, holdout_n: usize, pass_chance: f64) -> PowerVerdict {
     let reason = if !search_pass {
         Some(PowerBlock::SearchSpanFails)
     } else if holdout_n < MIN_HOLDOUT_TRADES {
         Some(PowerBlock::TooFewHoldoutTrades)
-    } else if pass_chance < POWER_BAR {
+    } else if !pass_chance.is_finite() || pass_chance < POWER_BAR {
         Some(PowerBlock::BelowBar)
     } else {
         None
