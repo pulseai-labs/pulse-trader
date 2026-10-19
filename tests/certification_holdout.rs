@@ -7,7 +7,8 @@
 //!
 //! - a planted-edge version certifies (search passes under `wf-v2`, the C1
 //!   holdout test passes), and its record names its pair and its data versions;
-//! - a version with no edge is recorded `certified = false` and still counts;
+//! - a version whose power review does not allow an attempt is refused before
+//!   the holdout and spends nothing (r5.s5.w2, G5);
 //! - the 13th call is refused by name and writes nothing;
 //! - two inserts that overlap on the last budget slot write ONE record and
 //!   refuse the other inside the write transaction (close R1);
@@ -28,8 +29,9 @@ use pulse::{
 };
 use support::certification::{
     BARS, FREEZE_OPENED_MS, H, Probe, SEED, World, certifications, certify, certify_with_pair,
-    inverted_dsl, probe_draft, runs, seed_search_run, seeded_draft, walk_forward_run_count,
-    walk_forward_under, world, world_with, world_with_clocks, write_pair_series,
+    inverted_dsl, power_review, power_review_with_pair, probe_draft, runs, seed_search_run,
+    seeded_draft, walk_forward_run_count, walk_forward_under, world, world_with, world_with_clocks,
+    write_pair_series,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +80,9 @@ async fn certification_refuses_without_an_open_freeze() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certification_of_a_planted_edge_names_its_pair_and_data_versions() {
     let world = world().await;
+    power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let outcome = certify(&world, Some(&world.freeze))
         .await
         .expect("the planted edge certifies");
@@ -209,32 +214,39 @@ fn assert_record_names_provenance(world: &World, record: &pulse::CertificationRe
     );
 }
 
-/// (b) A version with no edge is recorded `certified = false` and still counts:
-/// a failed attempt is a hypothesis spent (Q2).
+/// (b) A version whose power review does not allow an attempt is refused before the holdout and spends
+/// nothing (r5.s5.w2, G5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn certification_records_a_non_certifying_version_and_counts_it() {
+async fn certification_refuses_a_version_whose_power_review_does_not_allow_it() {
     let world = world_with(inverted_dsl()).await;
-    let outcome = certify(&world, Some(&world.freeze))
+    let review = power_review(&world, Some(&world.freeze))
         .await
-        .expect("the step records whatever the outcome");
-    assert!(
-        !outcome.record.holdout_passes,
-        "the anti-edge version cannot pass the C1 test: n={}, mean={}, bound={}",
-        outcome.record.holdout_n, outcome.record.holdout_mean_r, outcome.record.holdout_lower_bound
-    );
-    assert!(!outcome.record.certified);
+        .expect("the review runs");
+    assert!(!review.record.allowed);
     assert_eq!(
-        outcome.hypotheses_used, 1,
-        "an uncertified attempt still counts"
+        review.record.reason.as_deref(),
+        Some("search_span_fails"),
+        "the review's own reason is the search span's verdict"
     );
-    assert_eq!(outcome.hypotheses_left, u32::from(H) - 1);
+    let error = certify(&world, Some(&world.freeze))
+        .await
+        .expect_err("a non-allowing review refuses the attempt");
+    assert!(
+        matches!(
+            error,
+            pulse::CertifyError::Refused(CertifyRefusal::NoQualifyingPowerReview {
+                block: pulse::PowerGateBlock::NotAllowed
+            })
+        ),
+        "the gate refuses naming the review: {error}"
+    );
     assert_eq!(
         certifications(&world)
             .count_for_freeze(&world.freeze.id)
             .await
             .unwrap(),
-        1,
-        "the failed hypothesis is recorded"
+        0,
+        "a refused attempt spends no hypothesis"
     );
 }
 
@@ -248,6 +260,9 @@ async fn certification_records_a_non_certifying_version_and_counts_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_app_reads_the_full_record_and_the_route_is_app_scope() {
     let world = world().await;
+    power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let outcome = certify(&world, Some(&world.freeze))
         .await
         .expect("the planted edge certifies");
@@ -410,6 +425,9 @@ async fn certification_on_a_second_pair_names_that_pair_and_its_data_version() {
     let sol = Pair::new("SOLUSDT");
     let (sol_m15_version, _sol_h4_version) =
         write_pair_series(&world.store, &sol, SEED ^ 0x5010, BARS);
+    power_review_with_pair(&world, Some(&world.freeze), Some(sol.clone()))
+        .await
+        .expect("the SOLUSDT review allows an attempt");
 
     let outcome = certify_with_pair(&world, Some(&world.freeze), Some(sol.clone()))
         .await
@@ -613,6 +631,9 @@ async fn certification_refuses_a_pre_freeze_lineage_root() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certification_records_are_immutable() {
     let world = world().await;
+    power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let outcome = certify(&world, Some(&world.freeze))
         .await
         .expect("the planted edge certifies");
@@ -676,6 +697,9 @@ async fn certified_flag_does_not_follow_a_wf_v2_search_pass() {
 
     // The same version reads `true` once the record exists — the flag follows
     // the record, and the record names the run the step just made.
+    power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     let outcome = certify(&world, Some(&world.freeze))
         .await
         .expect("the planted edge certifies");
@@ -692,15 +716,26 @@ async fn certified_flag_does_not_follow_a_wf_v2_search_pass() {
     );
 }
 
-/// The flag is not set by an UNCERTIFIED record either: a version whose
-/// hypothesis was recorded `certified = false` stays uncertified.
+/// The flag is not set by a refused attempt: a version the gate refuses stays uncertified (r5.s5.w2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn certified_flag_stays_unset_for_a_failed_record() {
+async fn a_version_refused_by_the_gate_stays_uncertified() {
     let world = world_with(inverted_dsl()).await;
-    let outcome = certify(&world, Some(&world.freeze))
+    let review = power_review(&world, Some(&world.freeze))
         .await
-        .expect("the step records whatever the outcome");
-    assert!(!outcome.record.certified);
+        .expect("the review runs");
+    assert!(!review.record.allowed);
+    let error = certify(&world, Some(&world.freeze))
+        .await
+        .expect_err("a non-allowing review refuses the attempt");
+    assert!(
+        matches!(
+            error,
+            pulse::CertifyError::Refused(CertifyRefusal::NoQualifyingPowerReview {
+                block: pulse::PowerGateBlock::NotAllowed
+            })
+        ),
+        "the gate refuses naming the review: {error}"
+    );
     let version = SqliteStrategyRepo::new(world.db.pool().clone())
         .get_version(&world.version)
         .await
@@ -708,7 +743,7 @@ async fn certified_flag_stays_unset_for_a_failed_record() {
         .expect("the version exists");
     assert!(
         !version.certified,
-        "an uncertified record does not certify the version"
+        "a refused attempt does not certify the version"
     );
     assert!(
         version.latest_walk_forward_run_id.is_some(),
@@ -739,6 +774,9 @@ async fn certification_refuses_a_root_on_the_freeze_opening_millisecond() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certification_refuses_a_freeze_closed_after_the_caller_read() {
     let world = world().await;
+    power_review(&world, Some(&world.freeze))
+        .await
+        .expect("the fixture's review allows an attempt");
     // The caller already read world.freeze. Close before its eventual insert.
     SqliteCertificationFreezeRepo::with_deps(
         world.db.pool().clone(),

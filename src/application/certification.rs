@@ -14,20 +14,22 @@
 //! 5. walk forward under **`wf-v2`** on the search span, the freeze passed so
 //!    the window is the guard's clamped default `[first warm bar,
 //!    holdout_start)`. That walk-forward persists as an ordinary run;
-//! 6. run **one** backtest over `[holdout_start, the snapshot's end)`. This is
+//! 6. no power review under the open freeze for this version and pair allows the
+//!    attempt on the data versions this call pins →
+//!    [`CertifyRefusal::NoQualifyingPowerReview`] (r5.s5.w2, ADR-0032, G5);
+//! 7. run **one** backtest over `[holdout_start, the snapshot's end)`. This is
 //!    the holdout guard's only run-time exemption (grill Q4): the load below
 //!    names its window explicitly and never consults a freeze, so no guard
 //!    decision is skipped — the window IS the decision. The run is **never
 //!    persisted**: no run read may ever surface holdout trades to an agent, so
 //!    its numbers live only in the certification record;
-//! 7. `holdout_test(holdout realized_r, freeze.h)` and ONE immutable record
+//! 8. `holdout_test(holdout realized_r, freeze.h)` and ONE immutable record
 //!    with the next `hypothesis_index`. A failed or uncertified attempt still
 //!    counts and is still recorded.
 //!
-//! An error writes no certification record and spends no hypothesis. Once
-//! step 5 persists the search walk-forward, a later failure leaves that run
-//! and the version's `latest_walk_forward_run_id` pointing to it, exactly as
-//! an ordinary `run_walk_forward` call would.
+//! An error writes no certification record and spends no hypothesis. Once step 5 persists the search
+//! walk-forward, a later failure leaves that run and the version's `latest_walk_forward_run_id` pointing to
+//! it, exactly as an ordinary `run_walk_forward` call would — the gate's refusal included.
 //!
 //! The step composes the existing use cases rather than re-implementing them:
 //! [`run_walk_forward`] for the search span and the shared
@@ -51,14 +53,15 @@ use crate::application::walk_forward::{
 };
 use crate::domain::backtest::{BacktestInputs, RunVerdict, Trade, VerdictRule, WalkForwardRun};
 use crate::domain::certification::{
-    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
+    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal, PowerGateBlock,
 };
 use crate::domain::dsl::CompiledStrategy;
 use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestRunRepository, CandleSeriesRepository, CandleWindow, CertificationRepository,
-    DataError, ExchangeAdapter, FreezeRecord, Pair, SnapshotSelection, StrategyRepository,
-    Timeframe, ValidatedDsl, WalkForwardRunRepository, compile, holdout_test, validate,
+    DataError, ExchangeAdapter, FreezeRecord, Pair, PowerReviewRepository, SnapshotSelection,
+    StrategyRepository, Timeframe, ValidatedDsl, WalkForwardRunRepository, compile, holdout_test,
+    validate,
 };
 
 /// The longest `parent_version_id` chain this walk will follow before calling
@@ -150,15 +153,17 @@ pub struct CertifyOutcome {
 ///
 /// # Errors
 ///
-/// [`CertifyError::Refused`] for the three named refusals (nothing written,
+/// [`CertifyError::Refused`] for the four named refusals (nothing written,
 /// nothing counted), [`CertifyError::VersionNotFound`] for an absent version,
 /// and the composed use cases' errors — see [`CertifyError`].
-pub async fn certify_version<S, C, E, R, A>(
+#[allow(clippy::too_many_arguments)]
+pub async fn certify_version<S, C, E, R, A, P>(
     strategies: &S,
     candles: &C,
     exchange: &E,
     runs: &R,
     certifications: &A,
+    reviews: &P,
     freeze: Option<&FreezeRecord>,
     request: &CertifyRequest,
 ) -> Result<CertifyOutcome, CertifyError>
@@ -168,8 +173,9 @@ where
     E: ExchangeAdapter + Clone + Send + 'static,
     R: BacktestRunRepository + WalkForwardRunRepository,
     A: CertificationRepository,
+    P: PowerReviewRepository,
 {
-    // Steps 1–6 — the freeze checks, the version and its lineage root, the budget, the pair/timeframe
+    // Steps 1–5 — the freeze checks, the version and its lineage root, the budget, the pair/timeframe
     // resolution, the persisted `wf-v2` search walk-forward and the validated/compiled strategy — live in
     // `prepare_attempt`, shared with `review_power` so the power review's count is taken through exactly
     // this code (G2). The order, the refusals and the errors are unchanged.
@@ -193,7 +199,20 @@ where
     )
     .await?;
 
-    // 6. The ONE holdout backtest, unpersisted, outside the guard (Q4). The C1 test is applied to its
+    // The gate (r5.s5.w2, ADR-0032, G5): no qualifying power review under the open freeze for this version,
+    // pair and the data versions this call pins — no attempt. It sits after the search walk-forward (its
+    // pins come from it) and before the holdout, so a refused call leaves that persisted search run behind,
+    // exactly as every refusal after the search step does today, and spends no hypothesis.
+    require_qualifying_review(
+        reviews,
+        &version.id,
+        &resolved.pair,
+        &freeze.id,
+        &search_inputs,
+    )
+    .await?;
+
+    // 7. The ONE holdout backtest, unpersisted, outside the guard (Q4). The C1 test is applied to its
     //    realized-R series below; the power review stops at `trades.len()` and never reaches the test.
     let holdout = holdout_trades(
         candles.clone(),
@@ -209,7 +228,7 @@ where
     )
     .await?;
 
-    // 7. The C1 test at the freeze's H, then the record — last, so every
+    // 8. The C1 test at the freeze's H, then the record — last, so every
     //    failure above left the budget untouched. Each `HoldoutNumbers` field keeps
     //    the expression this step used before the extraction.
     let realized_rs: Vec<Decimal> = holdout
@@ -259,6 +278,29 @@ fn certification_write_error(error: DataError) -> CertifyError {
             CertifyRefusal::HypothesisBudgetSpent { h }.into()
         }
         other => CertifyError::Store(other),
+    }
+}
+
+/// The certify gate (r5.s5.w2, ADR-0032, G5): certify spends nothing unless the latest power review for
+/// `(version, pair, open freeze)` allows an attempt and was taken on the data versions this call pins.
+async fn require_qualifying_review<P: PowerReviewRepository>(
+    reviews: &P,
+    version_id: &VersionId,
+    pair: &Pair,
+    freeze_id: &str,
+    search_inputs: &CertificationInputs,
+) -> Result<(), CertifyError> {
+    let block = match reviews.latest_for(version_id, pair, freeze_id).await? {
+        None => Some(PowerGateBlock::NoReview),
+        Some(review) if !review.allowed => Some(PowerGateBlock::NotAllowed),
+        Some(review) if review.holdout_inputs != *search_inputs => {
+            Some(PowerGateBlock::SnapshotMoved)
+        }
+        Some(_) => None,
+    };
+    match block {
+        Some(block) => Err(CertifyRefusal::NoQualifyingPowerReview { block }.into()),
+        None => Ok(()),
     }
 }
 
@@ -563,7 +605,7 @@ pub(crate) struct PreparedAttempt {
     pub(crate) compiled: CompiledStrategy,
 }
 
-/// Steps 1–6 of the certification, extracted so the power review reaches the holdout window through exactly
+/// Steps 1–5 of the certification, extracted so the power review reaches the holdout window through exactly
 /// this code (G2, ADR-0032): the freeze checks, the version and its lineage root, the budget, the
 /// pair/timeframe resolution and pair override, the persisted `wf-v2` search walk-forward, the search span's
 /// recorded inputs, and `validate` + `compile`.

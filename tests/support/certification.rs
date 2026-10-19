@@ -321,11 +321,44 @@ pub async fn certify_with_pair(
         &pulse::BinanceAdapter::new(),
         &SqliteBacktestRunRepo::new(world.db.pool().clone()),
         &SqliteCertificationRepo::new(world.db.pool().clone()),
+        &pulse::SqlitePowerReviewRepo::new(world.db.pool().clone()),
         freeze,
         &CertifyRequest {
             version_id: world.version.clone(),
             pair,
             called_by: "w5-test-agent".to_owned(),
+        },
+    )
+    .await
+}
+
+/// One power review over the world, exactly as the CLI arm makes it (r5.s5.w2): the record the certify
+/// gate reads.
+pub async fn power_review(
+    world: &World,
+    freeze: Option<&pulse::FreezeRecord>,
+) -> Result<pulse::PowerReviewOutcome, pulse::PowerReviewError> {
+    power_review_with_pair(world, freeze, None).await
+}
+
+/// [`power_review`] with an optional (already-validated) pair override.
+pub async fn power_review_with_pair(
+    world: &World,
+    freeze: Option<&pulse::FreezeRecord>,
+    pair: Option<Pair>,
+) -> Result<pulse::PowerReviewOutcome, pulse::PowerReviewError> {
+    pulse::review_power(
+        &SqliteStrategyRepo::new(world.db.pool().clone()),
+        &world.store,
+        &pulse::BinanceAdapter::new(),
+        &SqliteBacktestRunRepo::new(world.db.pool().clone()),
+        &SqliteCertificationRepo::new(world.db.pool().clone()),
+        &pulse::SqlitePowerReviewRepo::new(world.db.pool().clone()),
+        freeze,
+        &pulse::PowerReviewRequest {
+            version_id: world.version.clone(),
+            pair,
+            called_by: "w2-test-operator".to_owned(),
         },
     )
     .await

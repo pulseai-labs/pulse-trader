@@ -155,7 +155,7 @@ pub use freeze::{FreezeRecord, FreezeStoreError, HoldoutFreeze, OpenFreezeReques
 // error under `deny(warnings)`. (The step's error enum lives in
 // `application::certification`, close R2: it carries application-ring errors.)
 pub use certification::{
-    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal,
+    CertificationDraft, CertificationInputs, CertificationRecord, CertifyRefusal, PowerGateBlock,
 };
 // r5.s5.w1 (PDR-0040, ADR-0032): the power review's surface — the record and its draft, the pass-chance
 // arithmetic, C1's own quantile and the verdict. Re-exported so `lib.rs` can curate the crate surface — an

@@ -36,7 +36,7 @@ use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
     RunReadFailure, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, SqliteCertificationRepo,
-    SqliteStrategyRepo,
+    SqlitePowerReviewRepo, SqliteStrategyRepo,
 };
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::application::backtest::{
@@ -721,6 +721,9 @@ fn certify_error_result(err: &CertifyError) -> CallToolResult {
         }
         CertifyError::Refused(CertifyRefusal::HypothesisBudgetSpent { .. }) => {
             field_error("hypotheses", err)
+        }
+        CertifyError::Refused(CertifyRefusal::NoQualifyingPowerReview { .. }) => {
+            field_error("power_review", err)
         }
         CertifyError::VersionNotFound(_) => field_error("version_id", err),
         CertifyError::WalkForward(error) => walk_forward_error_result(error),
@@ -1586,15 +1589,16 @@ impl PulseMcp {
     /// While a freeze is open, this walks the version forward under `wf-v2`
     /// over the search span — the guard clamps the span's end to the holdout
     /// start — runs ONE backtest over the holdout, and applies the C1 holdout
-    /// test at the freeze's hypothesis budget H. The record it writes is
-    /// immutable and every call counts, certified or not; the (H+1)th call is
+    /// test at the freeze's hypothesis budget H. It first requires a qualifying power review under the open
+    /// freeze (r5.s5.w2, ADR-0032): without one it refuses, names no number and spends nothing. The record it
+    /// writes is immutable and every call that passes the gate counts, certified or not; the (H+1)th call is
     /// refused by name. The answer carries the certification's id, its
     /// pass/fail, the search-span verdict, whether the holdout passed, and the
     /// hypotheses used and left — **never a holdout number** (grill Q5: no
     /// holdout n, mean, bound, z, end or trade list); the app's own read shows
     /// the full record.
     #[tool(
-        description = "Certify one strategy version against the frozen holdout: ONE call is ONE hypothesis. Requires an open freeze (`pulse certify freeze`) and a version whose lineage root was created after it. Walks the version forward under wf-v2 over the search span, runs one backtest over the holdout, and applies the C1 holdout test at the freeze's budget H; the call is recorded whether or not it certifies, and the 13th call under H = 12 is refused. Answers certification_id, certified, the search-span verdict (pass, folds holding/required, pooled bound), holdout_passed, hypotheses_used and hypotheses_left — the holdout's own numbers (n, mean, bound, z, end, trades) are never returned here. Optional pair (e.g. SOLUSDT) overrides the inherited pair."
+        description = "Certify one strategy version against the frozen holdout: ONE call is ONE hypothesis. Requires an open freeze (`pulse certify freeze`) and a version whose lineage root was created after it. Walks the version forward under wf-v2 over the search span, runs one backtest over the holdout, and applies the C1 holdout test at the freeze's budget H; It also requires a power review under the open freeze for this version and pair (run by the operator with `pulse certify power`) that allows the attempt and was taken on the data versions this call pins; without one the call is refused with field power_review, names no number and spends no hypothesis. A call that passes this gate is recorded whether or not it certifies, and a call beyond the freeze's budget H is refused. Answers certification_id, certified, the search-span verdict (pass, folds holding/required, pooled bound), holdout_passed, hypotheses_used and hypotheses_left — the holdout's own numbers (n, mean, bound, z, end, trades) are never returned here. Optional pair (e.g. SOLUSDT) overrides the inherited pair."
     )]
     #[allow(clippy::too_many_lines)]
     async fn certify_version(
@@ -1622,12 +1626,14 @@ impl PulseMcp {
         let strategies = SqliteStrategyRepo::new(self.state.db.pool().clone());
         let runs = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
         let certifications = SqliteCertificationRepo::new(self.state.db.pool().clone());
+        let reviews = SqlitePowerReviewRepo::new(self.state.db.pool().clone());
         let outcome = match certify_version(
             &strategies,
             &self.state.candles,
             &self.state.exchange,
             &runs,
             &certifications,
+            &reviews,
             freeze.as_ref(),
             &CertifyRequest {
                 version_id: VersionId::new(args.version_id),

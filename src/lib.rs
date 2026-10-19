@@ -958,7 +958,7 @@ pub use application::certification::{
 };
 pub use domain::{
     CertificationDraft, CertificationInputs, CertificationRecord, CertificationRepository,
-    CertifyRefusal,
+    CertifyRefusal, PowerGateBlock,
 };
 
 // r5.s5.w1 (PDR-0040, ADR-0032): the power review — the count-only holdout read, its immutable record,
