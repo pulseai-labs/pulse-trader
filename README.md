@@ -110,37 +110,7 @@ is the point. A negative result is a result, and the gate was not moved to avoid
 
 ## Screens
 
-The macOS app is Tauri 2 + React over the same engine. The five slots below are reserved for
-screenshots from the app's QA library and fixture data; the files land in
-`docs/assets/readme/screens/`. Until they do, the slots render empty.
-
-<table>
-<tr>
-<td width="50%" valign="top">
-  <img src="docs/assets/readme/screens/backtest-lab.png" alt="Backtest Lab: headline metrics, regime breakdown and the trade log of one persisted run">
-  <br><em><b>Backtest Lab.</b> One persisted run: expectancy in R, regime breakdown, and every trade with its fees, funding and slippage.</em>
-</td>
-<td width="50%" valign="top">
-  <img src="docs/assets/readme/screens/chart.png" alt="Chart tab: a backtest drawn on its candles with entry and exit markers and indicator overlays">
-  <br><em><b>Chart.</b> A backtest drawn on its candles — entries and exits, S/R levels, pivots and candle patterns. An open freeze's holdout stays withheld.</em>
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-  <img src="docs/assets/readme/screens/library.png" alt="Library: the version tree with hypotheses, provenance and certification state">
-  <br><em><b>Library.</b> The version tree. Each node carries its hypothesis, its provenance and its certification state — a search-span pass alone is not a certificate.</em>
-</td>
-<td width="50%" valign="top">
-  <img src="docs/assets/readme/screens/designer.png" alt="Designer: the agent composing a strategy through visible tool calls">
-  <br><em><b>Designer.</b> The agent composes a strategy through validated builder tools. The DSL it writes is the document the engine runs.</em>
-</td>
-</tr>
-</table>
-
-<img src="docs/assets/readme/screens/deployment.png" width="880" alt="Deployment: paper sessions with running P&amp;L, orders, fills and the marked open position">
-
-**Deployment.** Paper sessions: promotion, the per-bar running P&L, orders, fills and the marked open
-position. Paper only — no live orders.
+Screenshots of the Backtest Lab, Chart, Library, Designer and Deployment screens are coming.
 
 ## Drive it from Claude Code
 
@@ -202,7 +172,12 @@ shell, so the build needs Tauri 2's platform prerequisites. The desktop bundle a
 22.22.2 or newer on an accepted LTS line (`^22.22.2 || ^24.15.0 || >=26`, from `package.json`'s
 `engines`).
 
+`cargo build --release` does not run Tauri's `beforeBuildCommand`, and `build.rs` refuses a
+placeholder frontend in a release profile. Build the frontend first:
+
 ```sh
+npm ci
+npm run build
 cargo build --release
 ```
 
