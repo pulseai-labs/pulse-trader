@@ -48,8 +48,8 @@ Claude Code can drive the loop directly.
 ## Honest by construction
 
 Most backtest loops converge on the answer they were shown. Tune long enough and something always
-looks good. PulseTrader makes that outcome cost something. The r4 and r5 campaign runs used the gate
-below.
+looks good. PulseTrader makes that outcome cost something. The gate below has applied since r4 shipped
+it.
 
 ### The search span is not the holdout
 
@@ -99,7 +99,7 @@ power bar and the assumed edge are constants in the code, not flags.
 
 ### No strategy has certified on real data yet
 
-r4 and r5 both closed on written negative results; r5's is in this repository
+r5 closed on a written negative result, which is in this repository
 ([`docs/certification/r5-attempt-2026-10-19.md`](docs/certification/r5-attempt-2026-10-19.md)). That
 is the point. A negative result is a result, and the gate was not moved to avoid it.
 
