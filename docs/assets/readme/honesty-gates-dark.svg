@@ -1,59 +1,60 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 590" width="880" height="590" role="img" aria-label="The search span is walked forward under wf-v2; a fenced holdout, a fixed hypothesis budget and a power review gate one certification record that is immutable whatever the outcome.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 644" width="880" height="644" role="img" aria-label="The search span is walked forward under wf-v2; a fenced holdout, a fixed hypothesis budget and a power review gate one certification record that is immutable whatever the outcome.">
 <title>PulseTrader honesty gates</title>
 <defs>
 <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6e7681"/></marker>
 <marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#4493f8"/></marker>
 <marker id="arO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3fb950"/></marker>
 </defs>
-<rect width="880" height="590" fill="#0d1117"/>
+<rect width="880" height="644" fill="#0d1117"/>
 <text x="28" y="38" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#e6edf3" text-anchor="start" opacity="1.0">Honest by construction</text>
 <text x="28" y="61" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">The search span and the holdout are separated before any candidate exists, and the gate is fixed before a result is seen.</text>
-<rect x="24" y="84" width="320" height="62" rx="10" fill="#161b22" stroke="#6e7681" stroke-width="1.4"/>
-<text x="184.0" y="104.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Search span</text>
-<text x="184.0" y="122.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">every bar before the freeze's holdout start</text>
-<text x="184.0" y="134.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">persisted wf-v2 runs</text>
-<rect x="24" y="156" width="320" height="62" rx="10" fill="#0c2d4a" stroke="#4493f8" stroke-width="1.4"/>
-<text x="184.0" y="176.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">wf-v2 on K folds</text>
-<text x="184.0" y="194.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">fold holds: n ≥ 20 and mean R &gt; 0</text>
-<text x="184.0" y="206.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">run passes: ≥ ⌈2K/3⌉ folds and pooled bound &gt; 0</text>
-<rect x="24" y="228" width="320" height="62" rx="10" fill="#0c2d4a" stroke="#4493f8" stroke-width="1.4"/>
-<text x="184.0" y="256.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Candidate</text>
-<text x="184.0" y="274.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">a search-span pass is not a certificate</text>
-<rect x="24" y="332" width="320" height="62" rx="10" fill="#2b2100" stroke="#d29922" stroke-width="1.4"/>
-<text x="184.0" y="352.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Holdout backtest</text>
-<text x="184.0" y="370.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">one run, never persisted</text>
-<text x="184.0" y="382.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">no holdout trades are readable</text>
-<rect x="24" y="406" width="320" height="62" rx="10" fill="#2b2100" stroke="#d29922" stroke-width="1.4"/>
-<text x="184.0" y="426.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">C1 test</text>
-<text x="184.0" y="444.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">z = z(1 − 0.05/H); pass when the lower bound &gt; 0</text>
-<text x="184.0" y="456.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">at least two holdout trades</text>
-<rect x="24" y="480" width="320" height="62" rx="10" fill="#12261a" stroke="#3fb950" stroke-width="1.4"/>
-<text x="184.0" y="500.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Certification row</text>
-<text x="184.0" y="518.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">immutable, written whatever the outcome</text>
-<text x="184.0" y="530.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">certified = search pass AND holdout pass</text>
-<line x1="184.0" y1="148" x2="184.0" y2="152" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
-<line x1="184.0" y1="220" x2="184.0" y2="224" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
-<line x1="184.0" y1="292" x2="184.0" y2="328" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
-<line x1="24" y1="320" x2="344" y2="320" stroke="#f85149" stroke-width="2" stroke-dasharray="6 5"/>
-<text x="184.0" y="314" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#f85149" text-anchor="middle" opacity="1.0">holdout fence — never reused</text>
-<line x1="320" y1="292" x2="320" y2="328" stroke="#f85149" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#ar)"/>
-<text x="396" y="76" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#8d96a0" text-anchor="start" opacity="1.0">Fixed before any candidate is seen</text>
-<rect x="396" y="88" width="460" height="92" rx="10" fill="#161b22" stroke="#6e7681" stroke-width="1.4"/>
-<text x="626.0" y="123.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Freeze</text>
-<text x="626.0" y="141.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">one open at a time; terms fixed by trigger</text>
-<text x="626.0" y="153.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">a new holdout starts after the last close</text>
-<rect x="396" y="200" width="460" height="92" rx="10" fill="#231a3a" stroke="#a371f7" stroke-width="1.4"/>
-<text x="626.0" y="235.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Hypothesis budget H</text>
-<text x="626.0" y="253.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">1 to 12, set at the freeze</text>
-<text x="626.0" y="265.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">lower-only: never raised, never moved after a result</text>
-<rect x="396" y="312" width="460" height="92" rx="10" fill="#231a3a" stroke="#a371f7" stroke-width="1.4"/>
-<text x="626.0" y="347.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Power review</text>
-<text x="626.0" y="365.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">holdout trade count and pass chance at +0.25R</text>
-<text x="626.0" y="377.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">an attempt needs ≥ 50% and ≥ 20 holdout trades</text>
-<rect x="396" y="430" width="460" height="106" rx="10" fill="#161b22" stroke="#6e7681" stroke-width="1.4"/>
-<text x="412" y="456" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="start" opacity="1.0">The gate is never loosened after a result</text>
-<text x="412" y="478" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A rule's constants are the rule: change one and it is</text>
-<text x="412" y="495" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">a new rule name, never an edit to a stored verdict.</text>
-<text x="412" y="516" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A freeze's terms never change; certification rows are immutable.</text>
-<text x="28" y="570" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A refused or errored certify call spends no hypothesis and writes no certification row.</text>
+<rect x="24" y="84" width="320" height="68" rx="10" fill="#161b22" stroke="#6e7681" stroke-width="1.4"/>
+<text x="184.0" y="107.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Search span</text>
+<text x="184.0" y="125.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">every bar before the freeze's holdout start</text>
+<text x="184.0" y="137.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">persisted wf-v2 runs</text>
+<rect x="24" y="170" width="320" height="68" rx="10" fill="#0c2d4a" stroke="#4493f8" stroke-width="1.4"/>
+<text x="184.0" y="193.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">wf-v2 on K folds</text>
+<text x="184.0" y="211.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">fold holds: n ≥ 20 and mean R &gt; 0</text>
+<text x="184.0" y="223.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">run passes: ≥ ⌈2K/3⌉ folds and pooled bound &gt; 0</text>
+<rect x="24" y="256" width="320" height="68" rx="10" fill="#0c2d4a" stroke="#4493f8" stroke-width="1.4"/>
+<text x="184.0" y="287.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Candidate</text>
+<text x="184.0" y="305.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">a search-span pass is not a certificate</text>
+<rect x="24" y="360" width="320" height="68" rx="10" fill="#2b2100" stroke="#d29922" stroke-width="1.4"/>
+<text x="184.0" y="383.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Holdout backtest</text>
+<text x="184.0" y="401.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">one run, never persisted</text>
+<text x="184.0" y="413.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">no holdout trades are readable</text>
+<rect x="24" y="446" width="320" height="68" rx="10" fill="#2b2100" stroke="#d29922" stroke-width="1.4"/>
+<text x="184.0" y="469.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">C1 test</text>
+<text x="184.0" y="487.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">z = z(1 − 0.05/H); pass when the lower bound &gt; 0</text>
+<text x="184.0" y="499.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">at least two holdout trades</text>
+<rect x="24" y="532" width="320" height="68" rx="10" fill="#12261a" stroke="#3fb950" stroke-width="1.4"/>
+<text x="184.0" y="555.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Certification row</text>
+<text x="184.0" y="573.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">immutable, written whatever the outcome</text>
+<text x="184.0" y="585.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">certified = search pass AND holdout pass</text>
+<line x1="184" y1="154" x2="184" y2="166" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
+<line x1="184" y1="240" x2="184" y2="252" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
+<line x1="320" y1="326" x2="320" y2="356" stroke="#f85149" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#ar)"/>
+<line x1="24" y1="352" x2="344" y2="352" stroke="#f85149" stroke-width="2" stroke-dasharray="6 5"/>
+<text x="184" y="344" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#f85149" text-anchor="middle" opacity="1.0">holdout fence — never reused</text>
+<line x1="184" y1="430" x2="184" y2="442" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
+<line x1="184" y1="516" x2="184" y2="528" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="396" y="84" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#8d96a0" text-anchor="start" opacity="1.0">Fixed before any candidate is seen</text>
+<rect x="396" y="96" width="460" height="92" rx="10" fill="#161b22" stroke="#6e7681" stroke-width="1.4"/>
+<text x="626.0" y="131.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Freeze</text>
+<text x="626.0" y="149.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">one open at a time; terms fixed by trigger</text>
+<text x="626.0" y="161.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">a new holdout starts after the last close</text>
+<rect x="396" y="208" width="460" height="92" rx="10" fill="#231a3a" stroke="#a371f7" stroke-width="1.4"/>
+<text x="626.0" y="243.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Hypothesis budget H</text>
+<text x="626.0" y="261.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">1 to 12, set at the freeze</text>
+<text x="626.0" y="273.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">lower-only: never raised, never moved after a result</text>
+<rect x="396" y="320" width="460" height="92" rx="10" fill="#231a3a" stroke="#a371f7" stroke-width="1.4"/>
+<text x="626.0" y="355.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Power review</text>
+<text x="626.0" y="373.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">holdout trade count and pass chance at +0.25R</text>
+<text x="626.0" y="385.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">an attempt needs ≥ 50% and ≥ 20 holdout trades</text>
+<rect x="396" y="442" width="460" height="106" rx="10" fill="#161b22" stroke="#6e7681" stroke-width="1.4"/>
+<text x="412" y="468" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="start" opacity="1.0">The gate is never loosened after a result</text>
+<text x="412" y="490" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A rule's constants are the rule: change one and it is</text>
+<text x="412" y="507" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">a new rule name, never an edit to a stored verdict.</text>
+<text x="412" y="528" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A freeze's terms never change; certification rows are immutable.</text>
+<text x="28" y="626" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A refused or errored certify call spends no hypothesis and writes no certification row.</text>
 </svg>

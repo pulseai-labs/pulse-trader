@@ -32,8 +32,7 @@
 <text x="758.0" y="247.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">stdio ↔ /mcp relay</text>
 <text x="758.0" y="259.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">agent token, file 0600</text>
 <line x1="228" y1="148" x2="320" y2="186" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
-<text x="266" y="156" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="500" fill="#59636e" text-anchor="middle" opacity="1.0">HTTP</text>
-<text x="266" y="170" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">app token</text>
+<text x="272" y="210" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="500" fill="#59636e" text-anchor="middle" opacity="1.0">HTTP · app token</text>
 <line x1="230" y1="340" x2="318" y2="352" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#ar)"/>
 <text x="274" y="336" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">local ops</text>
 <line x1="660" y1="238" x2="560" y2="238" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
