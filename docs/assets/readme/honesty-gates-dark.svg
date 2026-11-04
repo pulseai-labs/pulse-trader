@@ -22,7 +22,7 @@
 <rect x="24" y="332" width="320" height="62" rx="10" fill="#2b2100" stroke="#d29922" stroke-width="1.4"/>
 <text x="184.0" y="352.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Holdout backtest</text>
 <text x="184.0" y="370.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">one run, never persisted</text>
-<text x="184.0" y="382.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">no holdout outcome is returned</text>
+<text x="184.0" y="382.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">no holdout trades are readable</text>
 <rect x="24" y="406" width="320" height="62" rx="10" fill="#2b2100" stroke="#d29922" stroke-width="1.4"/>
 <text x="184.0" y="426.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">C1 test</text>
 <text x="184.0" y="444.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="middle" opacity="1.0">z = z(1 − 0.05/H); pass when the lower bound &gt; 0</text>
@@ -36,7 +36,7 @@
 <line x1="184.0" y1="292" x2="184.0" y2="328" stroke="#6e7681" stroke-width="1.6" marker-end="url(#ar)"/>
 <line x1="24" y1="320" x2="344" y2="320" stroke="#f85149" stroke-width="2" stroke-dasharray="6 5"/>
 <text x="184.0" y="314" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#f85149" text-anchor="middle" opacity="1.0">holdout fence — never reused</text>
-<line x1="184.0" y1="292" x2="184.0" y2="328" stroke="#f85149" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#ar)"/>
+<line x1="320" y1="292" x2="320" y2="328" stroke="#f85149" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#ar)"/>
 <text x="396" y="76" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#8d96a0" text-anchor="start" opacity="1.0">Fixed before any candidate is seen</text>
 <rect x="396" y="88" width="460" height="92" rx="10" fill="#161b22" stroke="#6e7681" stroke-width="1.4"/>
 <text x="626.0" y="123.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="middle" opacity="1.0">Freeze</text>
@@ -54,6 +54,6 @@
 <text x="412" y="456" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#e6edf3" text-anchor="start" opacity="1.0">The gate is never loosened after a result</text>
 <text x="412" y="478" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A rule's constants are the rule: change one and it is</text>
 <text x="412" y="495" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">a new rule name, never an edit to a stored verdict.</text>
-<text x="412" y="516" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">Every freeze and certification row is immutable.</text>
+<text x="412" y="516" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A freeze's terms never change; certification rows are immutable.</text>
 <text x="28" y="570" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#8d96a0" text-anchor="start" opacity="1.0">A refused or errored certify call spends no hypothesis and writes no certification row.</text>
 </svg>

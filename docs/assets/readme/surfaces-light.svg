@@ -23,7 +23,7 @@
 <text x="440.0" y="239.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">scope: app or agent</text>
 <rect x="324" y="330" width="232" height="58" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
 <text x="440.0" y="356.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">SQLite + Parquet</text>
-<text x="440.0" y="374.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">one host, one writer</text>
+<text x="440.0" y="374.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">on the server host</text>
 <rect x="660" y="52" width="196" height="92" rx="10" fill="#fbefff" stroke="#8250df" stroke-width="1.4"/>
 <text x="758.0" y="95.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Claude Code</text>
 <text x="758.0" y="113.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">MCP client</text>
