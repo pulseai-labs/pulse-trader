@@ -17,9 +17,9 @@ agent. You describe a target in plain words. The agent writes it in a small stra
 engine backtests it on real Binance USDT-M futures candles with fees, funding and slippage. A coach
 proposes one change per loop.
 
-Nothing counts as a result until walk-forward and a fenced holdout agree — and both gates are fixed
-before you see the answer. The same engine is an MCP server, so Claude Code can drive the loop
-directly.
+A strategy under the real-data campaign gate counts only when walk-forward and a fenced holdout
+agree — and both gates are fixed before you see the answer. The same engine is an MCP server, so
+Claude Code can drive the loop directly.
 
 [What it does](#what-it-does) · [Honest by construction](#honest-by-construction) · [Screens](#screens) · [Claude Code](#drive-it-from-claude-code) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Status](#status-and-roadmap)
 
@@ -47,15 +47,16 @@ directly.
 ## Honest by construction
 
 Most backtest loops converge on the answer they were shown. Tune long enough and something always
-looks good. PulseTrader makes that outcome cost something.
+looks good. PulseTrader makes that outcome cost something. The r4 and r5 campaign runs used the gate
+below.
 
 ### The search span is not the holdout
 
 A certification freeze fixes a holdout start before any candidate exists. Everything before that
 line is the search span; everything after it is the holdout. While the freeze is open, one guard
-sits in front of every run, walk-forward, export, chart read and example mark. A window that reaches
-the holdout is refused by name. A defaulted end is clamped to the holdout start. A spent holdout is
-never reused: a new freeze's holdout must start after the last close.
+sits in front of every persisted run, walk-forward, export, chart read and example mark. A window
+that reaches the holdout is refused by name. A defaulted end is clamped to the holdout start. A spent
+holdout is never reused: a new freeze's holdout must start after the last close.
 
 ### The search span must survive `wf-v2`
 
@@ -64,6 +65,9 @@ never reused: a new freeze's holdout must start after the last close.
 - A fold holds when it has at least 20 trades and a positive mean expectancy in R.
 - A run passes when at least ⌈2K/3⌉ folds hold and the pooled one-sided 95% lower bound over every
   out-of-sample trade is above zero.
+
+The older `wf-v1` rule is retained for the synthetic certify fixture and older lineages; it is not
+the campaign's gate.
 
 ### The holdout is a separate test
 
@@ -157,7 +161,7 @@ example trades on candles and ask `explain_marks` which conjuncts of a candidate
 mark. The DSL schema is served as the `pulse://dsl/schema` resource.
 
 It cannot promote, stop or sweep a paper session, run a shadow check, read a power review, or
-administer freezes or tokens. The holdout fence applies to every run, export, chart read and mark.
+administer freezes or tokens. The holdout fence applies to every persisted run, export, chart read and mark.
 
 A local configuration — the whole app and CLI in one binary:
 
@@ -185,7 +189,7 @@ tool calls to the server's `/mcp`.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/agent-loop-dark.svg">
-  <img src="docs/assets/readme/agent-loop-light.svg" width="880" alt="Claude Code speaks MCP to pulse mcp; the twenty tools call the same application use cases the app uses, against one SQLite database and one Parquet store, with the holdout fence on every run, export and mark.">
+  <img src="docs/assets/readme/agent-loop-light.svg" width="880" alt="Claude Code speaks MCP to pulse mcp; the twenty tools call the same application use cases the app uses, against one SQLite database and one Parquet store, with the holdout fence on every persisted run, export and mark.">
 </picture>
 
 ## Quickstart
