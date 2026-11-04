@@ -2,29 +2,27 @@
 <title>PulseTrader architecture</title>
 <defs>
 <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8c959f"/></marker>
-<marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#0969da"/></marker>
-<marker id="arO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1a7f37"/></marker>
 </defs>
 <rect width="880" height="570" fill="#ffffff"/>
 <text x="28" y="38" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#1f2328" text-anchor="start" opacity="1.0">Architecture</text>
 <text x="28" y="61" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">One Rust binary decides its surface from argv: no arguments opens the app, any argument runs the CLI.</text>
 <text x="20" y="100" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">SURFACES</text>
-<rect x="116" y="74" width="150" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
-<text x="191.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse CLI</text>
-<text x="191.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">fetch · backtest · certify</text>
-<rect x="282" y="74" width="170" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
-<text x="367.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Mac app</text>
-<text x="367.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">Tauri 2 · React 19</text>
-<rect x="468" y="74" width="172" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
-<text x="554.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse serve</text>
-<text x="554.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">axum · /api/v1 · /mcp</text>
-<rect x="656" y="74" width="200" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
-<text x="756.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse mcp</text>
-<text x="756.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">stdio · HTTP relay</text>
+<rect x="116" y="74" width="180" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="206.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse CLI</text>
+<text x="206.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">fetch-data · backtest · certify</text>
+<rect x="312" y="74" width="170" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="397.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Mac app</text>
+<text x="397.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">Tauri 2 · React 19</text>
+<rect x="498" y="74" width="172" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="584.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse serve</text>
+<text x="584.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">axum · /api/v1 · /mcp</text>
+<rect x="686" y="74" width="170" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="771.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse mcp</text>
+<text x="771.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">stdio · HTTP relay</text>
 <text x="20" y="196" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">USE CASES</text>
 <rect x="116" y="160" width="740" height="62" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
 <text x="486.0" y="188.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">src/application</text>
-<text x="486.0" y="206.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">compose · coach · backtest · walk-forward · certification · power review · paper · marks</text>
+<text x="486.0" y="206.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">coach · backtest · walk-forward · certification · power review · paper · marks</text>
 <line x1="486" y1="138" x2="486" y2="156" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
 <text x="20" y="284" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">CORE</text>
 <rect x="116" y="248" width="396" height="72" rx="10" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
@@ -58,7 +56,7 @@
 <text x="455.0" y="481.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">content-addressed by data_version</text>
 <rect x="608" y="438" width="110" height="64" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
 <text x="663.0" y="463.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">exports/</text>
-<text x="663.0" y="481.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">CSV</text>
+<text x="663.0" y="481.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">CSV · Parquet</text>
 <rect x="730" y="438" width="126" height="64" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
 <text x="793.0" y="463.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Keychain</text>
 <text x="793.0" y="481.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">credentials</text>

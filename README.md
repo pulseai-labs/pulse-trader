@@ -198,8 +198,9 @@ tool calls to the server's `/mcp`.
 ## Quickstart
 
 The CLI needs Rust 1.98, which `rust-toolchain.toml` pins. The one binary also contains the desktop
-shell, so the build needs Tauri 2's platform prerequisites. The desktop bundle also needs Node 22.22
-or newer.
+shell, so the build needs Tauri 2's platform prerequisites. The desktop bundle also needs Node
+22.22.2 or newer on an accepted LTS line (`^22.22.2 || ^24.15.0 || >=26`, from `package.json`'s
+`engines`).
 
 ```sh
 cargo build --release
@@ -245,7 +246,7 @@ CLI. Four surfaces — CLI, Mac app, headless server, MCP server — sit over on
 | Layer | Where | What |
 |---|---|---|
 | Domain | `src/domain` | Types, ports, the DSL and the verdict rules. Pure — no I/O. |
-| Use cases | `src/application` | Compose and coach, backtest, walk-forward, certification, power review, paper, marks. |
+| Use cases | `src/application` | Coach, backtest, walk-forward, certification, power review, paper, marks. |
 | Engine | `src/adapters/backtest` | The deterministic backtest engine and the `engine_fingerprint`. |
 | Adapters | `src/adapters/{binance,broker,db,store,indicators,llm,secrets}` | Exchange data and filters, SQLite, Parquet, indicators, the LLM transport, the Keychain. |
 | Surfaces | `src/cli`, `src/tauri`, `src/server`, `src/mcp`; `ui/` | CLI, desktop command bus, HTTP server, MCP server; the React frontend. |
