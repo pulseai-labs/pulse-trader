@@ -97,7 +97,7 @@ name, never an edit to a stored verdict. A freeze's holdout start, H and test ca
 opens — the only permitted update is its first close — and every certification row is immutable. The
 power bar and the assumed edge are constants in the code, not flags.
 
-### No strategy has certified yet
+### No strategy has certified on real data yet
 
 r4 and r5 both closed on written negative results; r5's is in this repository
 ([`docs/certification/r5-attempt-2026-10-19.md`](docs/certification/r5-attempt-2026-10-19.md)). That
