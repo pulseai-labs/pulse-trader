@@ -6,20 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.1.9] - 2026-11-05
-
-### Security
-
-- **Security: dependency updates for RUSTSEC-2026-0381, -0382, -0383, -0386, -0391, -0398,
-  -0403, -0410 (cargo-deny).** Lockfile-only bumps (`cargo update`; no `Cargo.toml`
-  requirement changed and no advisory ignored): `rustls-webpki` 0.103.15 → 0.103.16,
-  `tokio` 1.52.3 → 1.54.1, `webpki-root-certs` 1.0.8 → 1.0.11, `webpki-roots` 1.0.7 →
-  1.0.11, `zstd` 0.13.3 → 0.13.4, `zstd-safe` 7.2.4 → 7.4.0, `zstd-sys` 2.0.16+zstd.1.5.7 →
-  2.1.2+zstd.1.5.7. `cargo deny check` (advisories, bans, licenses, sources) is green
-  again. No golden, paper replay digest, Parquet content hash or engine source-set hash
-  moves; the engine fingerprint moves only because it hashes `Cargo.lock` (expected, as in
-  the `zip` 9 bump).
-
 ### Added
 
 - **The Library shows the power review (r5.s5.w3, PDR-0040, ADR-0032).** The details pane of a selected version now
@@ -925,6 +911,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   [#259](https://github.com/pulseai-labs/pulse-trader/issues/259).
 
 ### Security
+
+- **Security: dependency updates for RUSTSEC-2026-0381, -0382, -0383, -0386, -0391, -0398,
+  -0403, -0410 (cargo-deny, 0.1.9).** Lockfile-only bumps (`cargo update`; no `Cargo.toml`
+  requirement changed and no advisory ignored): `rustls-webpki` 0.103.15 → 0.103.16,
+  `tokio` 1.52.3 → 1.54.1, `webpki-root-certs` 1.0.8 → 1.0.11, `webpki-roots` 1.0.7 →
+  1.0.11, `zstd` 0.13.3 → 0.13.4, `zstd-safe` 7.2.4 → 7.4.0, `zstd-sys` 2.0.16+zstd.1.5.7 →
+  2.1.2+zstd.1.5.7. `cargo deny check` (advisories, bans, licenses, sources) is green
+  again. No golden, paper replay digest, Parquet content hash or engine source-set hash
+  moves; the engine fingerprint moves only because it hashes `Cargo.lock` (expected, as in
+  the `zip` 9 bump).
 
 - **Yanked dependency replaces: `zip` 8.6.0 → 9.0.3 (#418).** Every `zip` 8.x release is
   yanked on crates.io, so the required `cargo deny check advisories` lane failed on `main` and
