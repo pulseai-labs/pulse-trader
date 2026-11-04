@@ -28,7 +28,8 @@ Claude Code can drive the loop directly.
 1. **You describe a target.** In the app's Designer, or with `pulse compose "<target>"`: pair,
    direction, setup, stop, target — plain words.
 2. **The agent writes the strategy.** The composer drives six validated builder tools and emits a
-   DSL document (schema 1.4.0). Only the document is stored; the engine never reads prose.
+   DSL document (schema 1.4.0). The strategy is stored as that document; the engine never reads
+   prose.
 3. **The Rust engine backtests it.** Deterministic, on real Binance USDT-M candles fetched by
    `pulse fetch-data`. Every trade carries its fee (4 bp taker by default), its slippage (1 bp) and
    its funding. The run stores an `engine_fingerprint`; same inputs, same bytes.
@@ -155,13 +156,15 @@ tools and no more.
 | Example marks | `write_mark`, `list_marks`, `withdraw_mark`, `explain_marks` |
 
 An agent can read the version tree and any run, walk-forward or paper session; submit a variant with
-a hypothesis; backtest it; walk it forward; and certify it — one call, one hypothesis. It can export
-trades, candles or indicator columns as CSV; candles can also be a Parquet byte copy. It can mark
-example trades on candles and ask `explain_marks` which conjuncts of a candidate rule held at each
-mark. The DSL schema is served as the `pulse://dsl/schema` resource.
+a hypothesis; backtest it; walk it forward; and certify it — one call, one hypothesis, and only when
+a qualifying power review allows the attempt. It can export trades, candles or indicator columns as
+CSV; candles can also be a Parquet byte copy. It can mark example trades on candles and ask
+`explain_marks` which conjuncts of a candidate rule held at each mark. The DSL schema is served as
+the `pulse://dsl/schema` resource.
 
 It cannot promote, stop or sweep a paper session, run a shadow check, read a power review, or
-administer freezes or tokens. The holdout fence applies to every persisted run, export, chart read and mark.
+administer freezes or tokens. The holdout fence applies to every persisted run, export, chart read
+and mark.
 
 A local configuration — the whole app and CLI in one binary:
 
@@ -194,8 +197,9 @@ tool calls to the server's `/mcp`.
 
 ## Quickstart
 
-The CLI needs Rust 1.98, which `rust-toolchain.toml` pins. The desktop app also needs Node 22.22 or
-newer.
+The CLI needs Rust 1.98, which `rust-toolchain.toml` pins. The one binary also contains the desktop
+shell, so the build needs Tauri 2's platform prerequisites. The desktop bundle also needs Node 22.22
+or newer.
 
 ```sh
 cargo build --release
