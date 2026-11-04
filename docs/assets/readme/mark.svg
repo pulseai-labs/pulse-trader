@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="PulseTrader mark: a pulse line inside a rounded tile">
+<title>PulseTrader mark</title>
+<rect width="96" height="96" rx="22" fill="#1f6feb"/>
+<path d="M14 52 L30 52 L38 32 L50 70 L58 44 L66 52 L82 52" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M20 24 H76" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-dasharray="1 7" opacity="0.85"/>
+</svg>
