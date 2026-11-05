@@ -110,7 +110,33 @@ is the point. A negative result is a result, and the gate was not moved to avoid
 
 ## Screens
 
-Screenshots of the Backtest Lab, Chart, Library, Designer and Deployment screens are coming.
+These are screenshots of the macOS app connected to a running `pulse serve`, with real data.
+
+<table>
+  <tr>
+    <td>
+      <img src="docs/assets/readme/screens/library.png" width="430" alt="The Library with the strategy C51 D1-Downtrend RSI Rally-Fade Short expanded to its version tree of eight external_agent versions, v3 selected, its DSL summary and UNCERTIFIED certification state in the right panel.">
+      <br><sub><b>Library</b> — every version an agent submits, with its hypothesis</sub>
+    </td>
+    <td>
+      <img src="docs/assets/readme/screens/backtest-lab.png" width="430" alt="The Backtest Lab with one completed run's metric tiles, the Ask the coach button and the equity curve.">
+      <br><sub><b>Backtest Lab</b> — a completed run's metrics and equity curve</sub>
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <img src="docs/assets/readme/screens/chart.png" width="430" alt="The Chart with BTCUSDT 15m candles, the pair and timeframe pickers, the Mark example bar and a line stating the holdout start; no run is open, so no trades are drawn.">
+      <br><sub><b>Chart</b> — BTCUSDT 15m, the example-mark bar and the holdout start</sub>
+    </td>
+    <td>
+      <img src="docs/assets/readme/screens/deployment.png" width="430" alt="The Deployment Dashboard with two active paper sessions on BTCUSDT 15m and 4h, running on the server.">
+      <br><sub><b>Deployment</b> — two paper sessions running on the server</sub>
+    </td>
+  </tr>
+</table>
+
+The Strategy Designer is the natural-language composer: you describe a target in plain words, it
+builds the strategy with its six validated builder tools and saves it as a new version.
 
 ## Drive it from Claude Code
 
