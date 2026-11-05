@@ -74,8 +74,8 @@ the campaign's gate.
 
 The C1 test judges one holdout run with the lower confidence bound at a family-wise 5% split over
 the hypothesis budget: `z = z(1 − 0.05/H)`. It passes only when there are at least two trades and
-that bound is strictly above zero. A certification row requires both the search pass and the holdout
-pass, and it is written whatever the outcome.
+that bound is strictly above zero. A version is certified only when both passes hold; every
+completed attempt writes an immutable certification row, pass or fail.
 
 ### The budget is spent once per call
 
@@ -246,8 +246,7 @@ x86_64, arm64 and arm64-darwin, then compares the three hashes byte for byte.
   <img src="docs/assets/readme/surfaces-light.svg" width="880" alt="The Mac app talks HTTP to pulse serve with an app token from the Keychain; Claude Code talks MCP to pulse mcp, which relays to the server's /mcp with an agent token; the server owns SQLite, Parquet and the paper runtime on one host.">
 </picture>
 
-Layer detail is in [ARCHITECTURE.md](ARCHITECTURE.md); the decisions behind it are in
-[`docs/adr/`](docs/adr/).
+The decisions behind this design are in [`docs/adr/`](docs/adr/).
 
 ## Status and roadmap
 
