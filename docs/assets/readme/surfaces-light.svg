@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 436" width="880" height="436" role="img" aria-label="The Mac app talks HTTP to pulse serve with an app token from the Keychain; Claude Code talks MCP to pulse mcp, which relays to the server's /mcp with an agent token; the server owns SQLite, Parquet and the paper runtime on one host.">
+<title>PulseTrader surfaces</title>
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8c959f"/></marker>
+</defs>
+<rect width="880" height="436" fill="#ffffff"/>
+<text x="28" y="38" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#1f2328" text-anchor="start" opacity="1.0">Surfaces</text>
+<text x="28" y="61" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">The always-on server owns the data; the app and the agent are clients with different scopes.</text>
+<rect x="28" y="96" width="200" height="104" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+<text x="128.0" y="137.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Mac app</text>
+<text x="128.0" y="155.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">Tauri 2 + React</text>
+<text x="128.0" y="167.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">app token in the Keychain</text>
+<rect x="28" y="268" width="200" height="104" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="128.0" y="309.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse CLI</text>
+<text x="128.0" y="327.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">local administration</text>
+<text x="128.0" y="339.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">fetch-data · backtest · certify</text>
+<rect x="324" y="150" width="232" height="124" rx="10" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+<text x="440.0" y="194.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse serve</text>
+<text x="440.0" y="212.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">axum · /api/v1 · /mcp</text>
+<text x="440.0" y="224.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">paper runtime</text>
+<text x="440.0" y="239.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">scope: app or agent</text>
+<rect x="324" y="330" width="232" height="58" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="440.0" y="356.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">SQLite + Parquet</text>
+<text x="440.0" y="374.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">on the server host</text>
+<rect x="660" y="52" width="196" height="92" rx="10" fill="#fbefff" stroke="#8250df" stroke-width="1.4"/>
+<text x="758.0" y="95.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Claude Code</text>
+<text x="758.0" y="113.25" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">MCP client</text>
+<rect x="660" y="190" width="196" height="100" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+<text x="758.0" y="229.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse mcp</text>
+<text x="758.0" y="247.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">stdio ↔ /mcp relay</text>
+<text x="758.0" y="259.75" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">agent token, file 0600</text>
+<line x1="228" y1="148" x2="320" y2="186" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="272" y="210" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="500" fill="#59636e" text-anchor="middle" opacity="1.0">HTTP · app token</text>
+<line x1="230" y1="340" x2="318" y2="352" stroke="#8c959f" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#ar)"/>
+<text x="274" y="336" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">local ops</text>
+<line x1="660" y1="238" x2="560" y2="238" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="610" y="230" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="500" fill="#59636e" text-anchor="middle" opacity="1.0">HTTP /mcp</text>
+<line x1="758" y1="144" x2="758" y2="186" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="766" y="172" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">stdio</text>
+<line x1="440" y1="274" x2="440" y2="326" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="452" y="306" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">owns</text>
+<text x="28" y="416" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">A local pulse mcp --local opens the local database and needs no server. The relay serves the same tool set over HTTP.</text>
+</svg>

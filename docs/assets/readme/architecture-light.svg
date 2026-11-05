@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 570" width="880" height="570" role="img" aria-label="One Rust binary: a CLI, a Tauri 2 desktop app, a headless server and an MCP server over a hexagonal core of domain ports, application use cases and adapters, storing SQLite, Parquet and the macOS Keychain.">
+<title>PulseTrader architecture</title>
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8c959f"/></marker>
+</defs>
+<rect width="880" height="570" fill="#ffffff"/>
+<text x="28" y="38" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#1f2328" text-anchor="start" opacity="1.0">Architecture</text>
+<text x="28" y="61" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">One Rust binary decides its surface from argv: no arguments opens the app, any argument runs the CLI.</text>
+<text x="20" y="100" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">SURFACES</text>
+<rect x="116" y="74" width="180" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="206.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse CLI</text>
+<text x="206.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">fetch-data · backtest · certify</text>
+<rect x="312" y="74" width="170" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="397.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Mac app</text>
+<text x="397.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">Tauri 2 · React 19</text>
+<rect x="498" y="74" width="172" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="584.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse serve</text>
+<text x="584.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">axum · /api/v1 · /mcp</text>
+<rect x="686" y="74" width="170" height="62" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="771.0" y="102.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse mcp</text>
+<text x="771.0" y="120.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">stdio · HTTP relay</text>
+<text x="20" y="196" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">USE CASES</text>
+<rect x="116" y="160" width="740" height="62" rx="10" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+<text x="486.0" y="188.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">src/application</text>
+<text x="486.0" y="206.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">coach · backtest · walk-forward · certification · power review · paper · marks</text>
+<line x1="486" y1="138" x2="486" y2="156" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="20" y="284" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">CORE</text>
+<rect x="116" y="248" width="396" height="72" rx="10" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+<text x="314.0" y="273.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">src/domain</text>
+<text x="314.0" y="291.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">types · ports · DSL 1.4.0 · verdict rules</text>
+<text x="314.0" y="303.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">pure types and rules · no I/O</text>
+<rect x="528" y="248" width="328" height="72" rx="10" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+<text x="692.0" y="273.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">deterministic engine</text>
+<text x="692.0" y="291.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">src/adapters/backtest</text>
+<text x="692.0" y="303.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">engine_fingerprint on every run</text>
+<line x1="486" y1="224" x2="486" y2="244" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="20" y="380" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">ADAPTERS</text>
+<rect x="116" y="344" width="138" height="60" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="185.0" y="378.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Binance · broker</text>
+<rect x="266" y="344" width="138" height="60" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="335.0" y="378.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">SQLite · sqlx</text>
+<rect x="416" y="344" width="138" height="60" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="485.0" y="378.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Parquet · Polars</text>
+<rect x="566" y="344" width="138" height="60" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="635.0" y="378.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">LLM · indicators</text>
+<rect x="716" y="344" width="138" height="60" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="785.0" y="378.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Keychain · secrets</text>
+<line x1="486" y1="322" x2="486" y2="340" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="20" y="470" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.5" font-weight="700" fill="#59636e" text-anchor="start" opacity="1.0">STORAGE</text>
+<rect x="116" y="438" width="186" height="64" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="209.0" y="456.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">pulse.db</text>
+<text x="209.0" y="474.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">SQLite WAL</text>
+<text x="209.0" y="486.0" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">migrations 0001–0022</text>
+<rect x="314" y="438" width="282" height="64" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="455.0" y="463.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">candles/&lt;PAIR&gt;/&lt;TF&gt;/*.parquet</text>
+<text x="455.0" y="481.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">content-addressed by data_version</text>
+<rect x="608" y="438" width="110" height="64" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="663.0" y="463.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">exports/</text>
+<text x="663.0" y="481.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">CSV · Parquet</text>
+<rect x="730" y="438" width="126" height="64" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.4"/>
+<text x="793.0" y="463.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1f2328" text-anchor="middle" opacity="1.0">Keychain</text>
+<text x="793.0" y="481.5" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle" opacity="1.0">credentials</text>
+<line x1="486" y1="406" x2="486" y2="434" stroke="#8c959f" stroke-width="1.6" marker-end="url(#ar)"/>
+<text x="28" y="536" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">Dependency direction points inward. The same binary is the app, the CLI, the server and the MCP server.</text>
+<text x="28" y="554" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="start" opacity="1.0">ARCHITECTURE.md has the layer detail; docs/adr/ records why each decision was made.</text>
+</svg>
