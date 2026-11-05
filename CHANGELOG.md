@@ -912,6 +912,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Security: dependency updates for GHSA-m665-v7pm-7grj (`zip`) and five `undici` advisories
+  (0.1.10).** `zip` 9.0.3 → 9.3.0 (`cargo update -p zip`; `Cargo.toml` keeps `zip = "9"` with
+  the deflate-only feature set, `typed-path` follows 0.12.3 → 0.13.0, and
+  `build_support/lockfile-guard.txt` moves its `zip` line in the same visible act) clears
+  GHSA-m665-v7pm-7grj. `undici` 8.11.2 → 8.12.3 in `package-lock.json` (`npm update undici`;
+  development-only, reached through `jsdom` 30.0.1, and no `package.json` change) clears
+  GHSA-xjj6-f33q-929c, GHSA-2m5v-pch6-74hx, GHSA-qrxm-fqhp-jwvm, GHSA-4w7w-5xrc-9h26 and
+  GHSA-9fm3-97px-rjf6. `glib` stays at 0.18.5, so GHSA-wrw7-89jp-8q8g (fixed in 0.20.0) remains:
+  every `gtk` 0.18.x in the tree — `tauri` 2.11.5, `muda`, `tao` and `wry` all require
+  `gtk = "0.18"` — requires `glib ^0.18`, while the only newer GTK3 bindings (`gtk` 0.19)
+  require `glib ^0.22`, so 0.20 needs a tauri/gtk move that does not exist. `cargo deny check`
+  (advisories, bans, licenses, sources) is green. No golden, paper replay digest, Parquet
+  content hash or engine source-set hash moves; the engine fingerprint moves only because it
+  hashes `Cargo.lock` (expected).
+
 - **Security: dependency updates for RUSTSEC-2026-0381, -0382, -0383, -0386, -0391, -0398,
   -0403, -0410 (cargo-deny, 0.1.9).** Lockfile-only bumps (`cargo update`; no `Cargo.toml`
   requirement changed and no advisory ignored): `rustls-webpki` 0.103.15 → 0.103.16,
