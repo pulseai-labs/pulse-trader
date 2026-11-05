@@ -7,7 +7,7 @@ Point your client at the bundle binary — **not** a separate server package.
 ## Claude Code
 
 ```sh
-claude mcp add pulse -- /Applications/PulseTrader.app/Contents/MacOS/pulse mcp --agent-name claude-code
+claude mcp add pulse -- /Applications/PulseTrader.app/Contents/MacOS/pulse mcp --local --agent-name claude-code
 ```
 
 The equivalent `.mcp.json` entry:
@@ -17,16 +17,34 @@ The equivalent `.mcp.json` entry:
   "mcpServers": {
     "pulse": {
       "command": "/Applications/PulseTrader.app/Contents/MacOS/pulse",
-      "args": ["mcp", "--agent-name", "claude-code"]
+      "args": ["mcp", "--local", "--agent-name", "claude-code"]
     }
   }
 }
 ```
 
+## Modes
+
+`pulse mcp` has three modes (`src/cli/mcp.rs`):
+
+- **`--local`** — the mode the configuration above pins: serve MCP over
+  stdio against the **local** database. `--db`, `--data-dir` and
+  `--agent-name` all apply.
+- **bare `pulse mcp`** — the thin relay: stdin's JSON-RPC frames ride HTTP
+  to the always-on server's `/mcp` route with an **agent token**. The
+  connection comes from the `mcp-connection.toml` file `login` writes; no
+  login and no `--local` is a non-zero exit with the reason on stderr.
+- **`pulse mcp login --server <url>`** — verify a token against the server
+  (handshake + one MCP `initialize` probe) and write that connection file.
+  The token is read **from stdin only** — never an argument, never a flag.
+
+In relay mode the database the tools read and write is the **server's**;
+`--db` and `--data-dir` do not apply.
+
 ## One database, no overrides
 
-The documented configuration passes **no `--db` and no `--data-dir`**. That is
-deliberate: with no overrides the server opens the same
+In `--local` mode the documented configuration passes **no `--db` and no
+`--data-dir`**. That is deliberate: with no overrides the server opens the
 `~/Library/Application Support/PulseTrader/pulse.db` and the same candle store
 the Finder-launched app uses — so a version the agent submits appears in the
 app's Library on next focus. The app cannot be redirected to a different data
@@ -45,10 +63,10 @@ a stale snapshot. Keep the client pointed at the bundle you actually run, and
 re-run `claude mcp add` after reinstalling the app.
 
 **Dev override (development only, not the documented config):** against a
-fresh build, `target/debug/pulse mcp --agent-name claude-code` serves the same
-tools from the working tree. It shares the release schema only while the tree
-is at or ahead of the installed app's migrations; treat it as a rehearsal
-config, never the demo config.
+fresh build, `target/debug/pulse mcp --local --agent-name claude-code`
+serves the same tools from the working tree. It shares the release schema
+only while the tree is at or ahead of the installed app's migrations; treat
+it as a rehearsal config, never the demo config.
 
 ## Agent identity
 
@@ -77,20 +95,54 @@ path of every file they write.
 
 ## Tools
 
-Nine tools — seven reads, two writes. All calls are synchronous; write tools
-commit before they return.
+Twenty tools — nine library/run/paper reads, three exports, two writes,
+two walk-forward/certification tools, four example-mark tools. All calls
+are synchronous; write tools commit before they return.
 
-| Tool | Arguments | Returns |
-|---|---|---|
-| `list_strategies` | `{ include_archived?: bool }` | `{ strategies: [...] }` — strategy/version tree, parent-first |
-| `get_version` | `{ version_id }` | migrated DSL document, verbatim original, hash, provenance |
-| `list_runs` | `{ version_id }` | `{ runs: [...] }` — runs against the version, headline stats + input provenance |
-| `get_run` | `{ run_id }` | summary stats, regime breakdown, skipped entries, MFE/MAE, persisted inputs, `open_position` (the window-edge mark, or `null`) |
-| `export_trades` | `{ run_id }` | absolute CSV path, row count, column names |
-| `export_candles` | `{ pair, timeframe, data_version?, format? }` | absolute path under exports dir, row count, resolved `data_version` |
-| `export_indicators` | `{ pair, timeframe, data_version?, indicators }` | absolute CSV path (`open_time` + one column per spec) |
-| `submit_strategy_version` | `{ parent_version_id? \| strategy_name?, dsl, hypothesis }` — exactly one of the first two | `{ version_id, strategy_id, version_hash, created_by: "external_agent", agent_name, submission_id, created_at }` |
-| `run_backtest` | `{ version_id, from?, to? }` — `from`/`to` are RFC 3339 UTC (`"2025-03-01T00:00:00Z"`), both or neither | `{ run_id, version_id, run }` — `run.inputs.window` carries `{from_ms, to_ms}` |
+**Library, runs and paper reads**
+
+| Tool | What it does |
+|---|---|
+| `list_strategies` | List strategies with their version trees in parent-first order; `include_archived` opts in |
+| `get_version` | Fetch one version by id — migrated DSL document, verbatim original, hash, provenance |
+| `list_runs` | List the runs recorded against a version — headline stats plus persisted input provenance |
+| `get_run` | Fetch one run — summary stats, regime breakdown, skipped entries, MFE/MAE, persisted inputs, integrity fields |
+| `get_walk_forward_run` | Fetch one walk-forward run by id — the same detail shape `run_walk_forward` returns, one row per fold |
+| `list_paper_sessions` | List paper sessions with status, graduation, engine epochs, closed-trade count, out-of-sample comparison |
+| `get_paper_session` | Fetch one paper session by id — status, graduation, epochs, open position, recorded verdicts, comparison |
+| `get_paper_trades` | Fetch one session's closed trades with their realized R-multiples, plus its open position |
+| `get_paper_comparison` | Fetch one session's out-of-sample comparison — live mean R against the certifying walk-forward's fold-expectancy range |
+
+**Exports**
+
+| Tool | What it does |
+|---|---|
+| `export_trades` | Export a run's full trade log as CSV under the server exports dir — absolute path, row count, column names |
+| `export_candles` | Export a candle snapshot — CSV rows, or a byte copy of the Parquet file when `format=parquet`; `data_version` omitted selects HEAD |
+| `export_indicators` | Export per-candle indicator values (e.g. `rsi:14`, `ema:50`) as CSV — `open_time` plus one column per spec, blank while the engine warms |
+
+**Writes**
+
+| Tool | What it does |
+|---|---|
+| `submit_strategy_version` | Submit a DSL variant with a hypothesis — `parent_version_id` clones, `strategy_name` roots a new strategy (exactly one); persisted as `external_agent` plus its submission row |
+| `run_backtest` | Run a backtest of one version — optional `from`/`to` window (RFC 3339, both or neither), optional `pair` override, effective window echoed; holdout-guarded |
+
+**Walk-forward and certification**
+
+| Tool | What it does |
+|---|---|
+| `run_walk_forward` | Walk a version forward — `rolling-oos/v1` cuts the counted span into K folds (2..=12, default 6), judged under `wf-v1` (default) or `wf-v2`; each fold is an ordinary persisted run |
+| `certify_version` | Certify a version against the frozen holdout — one call is one hypothesis; requires an open freeze and a qualifying power review; recorded whether or not it certifies |
+
+**Example marks**
+
+| Tool | What it does |
+|---|---|
+| `write_mark` | Mark one candle as an example trade — a reference trade, never an order; a candle reaching the open freeze's holdout start is refused |
+| `list_marks` | List the chart's example marks in candle order, narrowed by pair/timeframe/setup; withdrawn marks absent, holdout-hidden marks reported under `hidden_by_holdout` |
+| `withdraw_mark` | Withdraw one mark by id — one-way, the row stays stored, the mark leaves every list; only the withdrawing agent's own marks |
+| `explain_marks` | Explain, per marked trade, which conjuncts of a candidate rule held at the entry bar, with the operand values and the 17 candle-pattern values |
 
 Field-level rejections come back as `{ "field", "message" }` tool errors —
 correctable, nothing persisted. A structural failure (busy database, missing

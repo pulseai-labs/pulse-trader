@@ -917,7 +917,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the deflate-only feature set, `typed-path` follows 0.12.3 → 0.13.0, and
   `build_support/lockfile-guard.txt` moves its `zip` line in the same visible act) clears
   GHSA-m665-v7pm-7grj. `undici` 8.11.2 → 8.12.3 in `package-lock.json` (`npm update undici`;
-  development-only, reached through `jsdom` 30.0.1, and no `package.json` change) clears
+  development-only, reached through `jsdom` 30.0.1, and no `package.json` dependency change) clears
   GHSA-xjj6-f33q-929c, GHSA-2m5v-pch6-74hx, GHSA-qrxm-fqhp-jwvm, GHSA-4w7w-5xrc-9h26 and
   GHSA-9fm3-97px-rjf6. `glib` stays at 0.18.5, so GHSA-wrw7-89jp-8q8g (fixed in 0.20.0) remains:
   every `gtk` 0.18.x in the tree — `tauri` 2.11.5, `muda`, `tao` and `wry` all require

@@ -1,19 +1,25 @@
-//! The fifteen tools of `pulse mcp` (r2.s1.w2, w3; r2.s3.w5; r3.s4.w4).
+//! The twenty tools of `pulse mcp` (r2.s1.w2, w3; r2.s3.w5; r3.s4.w4;
+//! r4.s1.w5; r5.s3), grouped as the README groups them:
 //!
-//! Eleven read tools: `w2`'s five repository queries and two candle-store
-//! readers, `r3.s4.w4`'s four paper-session reads (`list_paper_sessions`,
-//! `get_paper_session`, `get_paper_trades`, `get_paper_comparison` — all
-//! through the shared `application::paper_read` projection, so a tool and a
-//! route answer from the same code), with exports landing under the
-//! per-process exports dir. Two write tools (`w3`): `submit_strategy_version`
-//! persists an agent-authored DSL variant through the application submit use
-//! case, and `run_backtest` runs a version through the shared application flow
-//! with an optional `[from, to)` candle window. Two walk-forward tools
-//! (r2.s3.w5): `run_walk_forward` walks a version over `rolling-oos/v1` folds
-//! through the same shared flow and `get_walk_forward_run` reads one persisted
-//! run back — both answer the ONE `WalkForwardRunDetail` shape, and every fold
-//! is an ordinary `backtest_run` row the unchanged `list_runs`/`get_run`
-//! surfaces resolve.
+//! - Nine library/run/paper reads: the repository and run queries
+//!   (`list_strategies`, `get_version`, `list_runs`, `get_run`,
+//!   `get_walk_forward_run`) and r3.s4.w4's four paper-session reads
+//!   (`list_paper_sessions`, `get_paper_session`, `get_paper_trades`,
+//!   `get_paper_comparison` — all through the shared
+//!   `application::paper_read` projection, so a tool and a route answer
+//!   from the same code).
+//! - Three exports (`export_trades`, `export_candles`,
+//!   `export_indicators`) landing under the per-process exports dir.
+//! - Two write tools (`w3`): `submit_strategy_version` persists an
+//!   agent-authored DSL variant through the application submit use case,
+//!   and `run_backtest` runs a version through the shared application flow
+//!   with an optional `[from, to)` candle window.
+//! - Two walk-forward/certification tools: `run_walk_forward` (r2.s3.w5)
+//!   walks a version over `rolling-oos/v1` folds through the same shared
+//!   flow, and `certify_version` (r4.s1.w5) spends one hypothesis of an
+//!   open freeze on one C1-judged attempt.
+//! - Four example-mark tools (r5.s3): `write_mark`, `list_marks`,
+//!   `withdraw_mark` and `explain_marks`.
 //!
 //! No tool can promote a session, stop one, sweep-stop every session or run a
 //! shadow check (A3, least privilege): the surface is read-only by

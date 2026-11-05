@@ -10,11 +10,17 @@
 ```
 pulse-trader/
 ├── src/
-│   ├── domain/        # Pure domain — types, ports, no external deps
+│   ├── domain/        # Pure domain — types, ports, value crates only
 │   ├── adapters/      # Binance, SQLite, Parquet, indicator implementations
-│   ├── agent/         # Agent orchestration (PulseHive-backed)
-│   ├── cli/           # CLI surface (proof-of-concept entry point)
-│   └── tauri/         # Tauri command-bus stubs (scaffolded; shares this Rust core)
+│   ├── application/   # Use cases shared by every surface, over the domain ports
+│   ├── agent/         # Composer and coach model halves, builder tools (PulseHive-backed)
+│   ├── cli/           # CLI surface — every `pulse` subcommand
+│   ├── server/        # `pulse serve` — the axum server: /api/v1 routes, /mcp, the paper runtime
+│   ├── client/        # Thin HTTP client the desktop bus and the `mcp` relay speak through
+│   ├── mcp/           # `pulse mcp` — the MCP tools, resources, exports, and the HTTP relay
+│   ├── tauri/         # The desktop command bus and its typed event channel (Tauri 2)
+│   └── entry.rs       # argv dispatch — no arguments opens the app, any argument runs the CLI
+├── ui/                # The desktop shell's React frontend
 ├── docs/adr/          # Architecture Decision Records
 ├── migrations/        # sqlx migration files for the SQLite schema
 ├── tests/             # Integration tests
@@ -41,12 +47,13 @@ define every external concern:
 | `StrategyRepository` | Persist and load `Strategy` / `StrategyVersion` |
 | `CandleSeriesRepository` | Load the `HEAD` or an exact `data_version` candle snapshot; commit a new one |
 | `MarketDataSource` | Abstraction over bulk, REST, and WebSocket data |
-| `EventBus` | In-process event dispatch |
 | `Clock` | Mockable wall time |
 | `Indicator` | Streaming indicator computation |
 
-The domain module has zero external crate dependencies (no sqlx, no reqwest,
-no Polars). All computation inside `domain/` is deterministic by construction.
+The domain module depends only on value crates — `rust_decimal`, `serde`,
+`serde_json`, `chrono`, `thiserror`, `sha2` — and on no I/O crates (no
+sqlx, no reqwest, no Polars). All computation inside `domain/` is
+deterministic by construction.
 
 ### `adapters/` — concrete implementations
 
@@ -60,25 +67,41 @@ no Polars). All computation inside `domain/` is deterministic by construction.
 ### `agent/` — agent orchestration
 
 Wraps PulseHive (the author-owned in-Rust multi-agent SDK) to run the
-Composer and Coach agent roles entirely in-process. No Python layer; no
-sidecar process.
+model-facing halves in-process: the Composer loop with its six validated
+builder tools (`agent/composer.rs`, `agent/tools.rs`) and the coach's
+prompt-and-parse half (`agent/coach.rs`). The coach turn sequence itself —
+one call, one validated mutation, one durable session — lives in
+`application/coach.rs` (ADR-0021). No Python layer; no sidecar process.
 
 ### `cli/` — command-line surface
 
-The `pulse` binary entry point. Parses arguments via `clap`, wires up
-adapters, and drives the compose → backtest → coach loop.
+The `pulse` binary's argument surface. Its `clap` subcommands: data
+(`fetch-data`, `indicators`, `import`, `backup`, `backup-verify`,
+`restore`, `fixture`), strategies and runs (`strategy`, `backtest`,
+`runs`), the agent loop (`compose`, `coach`, `llm-check`), the server and
+its administration (`serve`, `mcp`, `token`, `certify`, `watch`), plus one
+hidden diagnostic (`keychain-probe`). Each subcommand is a composition
+root wiring adapters around the application use cases.
 
-### `tauri/` — desktop shell stubs
+### `tauri/` — the desktop command bus
 
-Stub module for the Tauri command bus. The `tauri/` layer is scaffolded here
-and shares the same Rust core; the CLI and the Tauri shell differ only at this
-outermost layer.
+The implemented Tauri command bus: `commands.rs` (the one append-only
+registration list, `BUS_COMMANDS`) plus the per-screen read contracts
+`library.rs`, `backtest.rs`, `chart.rs`, `coach.rs`, `paper.rs`,
+`certification.rs`, `power_review.rs`, `marks.rs`, `walk_forward.rs` and
+`streak_card.rs`, with `events.rs` (the typed event channel) and `error.rs`.
+Since ADR-0026 ([`0026-client-server-split.md`](docs/adr/0026-client-server-split.md))
+the shell is a thin HTTP client of `pulse serve`: the app manages a
+`ClientState` (`src/tauri/mod.rs`), and the bus's commands hold
+`tauri::State<'_, ClientState>` and reach the server through `src/client/`.
 
 ---
 
 ## Storage tiers
 
-Four storage tiers; no server processes, no Postgres, no Redis.
+Four storage tiers, no Postgres, no Redis — and one long-running server
+process: `pulse serve` is an always-on axum server that owns the database,
+the candle store and the paper runtime (`src/server/mod.rs`).
 
 ### 1. SQLite (WAL) — entity store and event log
 
@@ -176,8 +199,11 @@ mechanisms enforce it:
 
 3. **`engine_fingerprint`.** Every `BacktestRun` record stores a hash of
    (crate versions + Rust toolchain + DSL schema version + target architecture
-   triple). A CI test asserts that running the same strategy 100× on both
-   Apple Silicon and x86\_64 produces byte-identical results.
+   triple). CI proves it cross-arch: the `determinism (x86_64)`,
+   `determinism (arm64)` and `determinism (arm64-darwin)` jobs each run the
+   same strategy 100× sequentially and 100× in parallel in a release build
+   and emit one canonical content hash; the `determinism cross-arch compare`
+   job then byte-compares the three (`.github/workflows/ci.yml`).
 
 Key dependency pins that protect reproducibility:
 - `ta = "=0.5.0"` — indicator library; an upgrade can shift low-decimal outputs.
@@ -187,13 +213,36 @@ Key dependency pins that protect reproducibility:
 
 ## Architecture Decision Records
 
-All load-bearing architectural decisions are recorded in `docs/adr/`:
+All load-bearing architectural decisions are recorded in
+[`docs/adr/`](docs/adr/) — every file there, addenda included:
 
-| ADR | Subject |
+| ADR | Title |
 |---|---|
-| [0001](docs/adr/0001-record-architecture-decisions.md) | Why and how ADRs are used in this project |
-| [0009](docs/adr/0009-data-version-content-hash-scheme.md) | Content-hash scheme for candle-snapshot `data_version` ids |
-| [0010](docs/adr/0010-strategyversion-identity-immutability-provenance-storage.md) | `StrategyVersion` identity, immutability, and provenance storage |
-
-ADRs 0002–0008 are recorded as Proposed in ADR-0001 (decision queue); full
-write-ups will be added as each decision becomes implementation-load-bearing.
+| [0001](docs/adr/0001-record-architecture-decisions.md) | Record architecture decisions |
+| [0009](docs/adr/0009-data-version-content-hash-scheme.md) | `data_version` content-hash scheme for candle snapshots |
+| [0010](docs/adr/0010-strategyversion-identity-immutability-provenance-storage.md) | StrategyVersion identity, immutability & provenance storage |
+| [0011](docs/adr/0011-pulsehive-dual-license-commercial-self-grant.md) | PulseHive dual-license & commercial self-grant for PulseTrader linkage |
+| [0012](docs/adr/0012-thin-llmprovider-port-over-pulsehive.md) | Thin PulseTrader-owned LlmProvider port over PulseHive |
+| [0013](docs/adr/0013-extend-thin-llmprovider-port-with-tools-over-hivemind.md) | Extend the thin LlmProvider port with tool-calling over PulseHive HiveMind |
+| [0014](docs/adr/0014-posture-source-available-with-private-data-overlay.md) | Posture: source-available canonical with a private data-overlay moat |
+| [0015](docs/adr/0015-system-shape-modular-monolith-hexagonal-one-artifact.md) | System shape: modular monolith, hexagonal, one shippable artifact, zero sidecars |
+| [0016](docs/adr/0016-trust-boundaries-keychain-secrets-redact-before-persist.md) | Trust boundaries: secrets never committed, redact-before-persist, no order-placing path in v1 |
+| [0017](docs/adr/0017-failure-visibility-mixed-error-preservation-at-the-cli-edge.md) | Failure visibility: mixed error preservation at the CLI edge; structured tracing deferred |
+| [0018](docs/adr/0018-evolution-forward-only-migrations-immutable-snapshots.md) | Evolution: forward-only migrations on the startup path, immutable content-addressed snapshots, immutable StrategyVersion |
+| [0019](docs/adr/0019-stack-rust-core-embedded-sqlite-and-parquet.md) | Stack: Rust core with embedded SQLite (WAL) and Parquet storage |
+| [0020](docs/adr/0020-desktop-shell-tauri-react.md) | Desktop shell: Tauri v2 + React in WKWebView, one argv-dispatching binary |
+| [0021](docs/adr/0021-coach-agent-one-mutation-framework.md) | Coach agent and the one-mutation framework |
+| [0022](docs/adr/0022-toolchain-bump-1-98.md) | Toolchain bump: Rust 1.92.0 → 1.98.0 |
+| [0023](docs/adr/0023-retain-ollama-cloud-bump-default-model-to-glm-5-3-flash.md) | Retain Ollama Cloud; bump the default model to `glm-5.3-flash` |
+| [0024](docs/adr/0024-dsl-schema-evolution-and-indicator-seam.md) | DSL schema evolution and the indicator seam |
+| [0024 (addendum)](docs/adr/0024-addendum-structure-indicators-1-3-0.md) | Addendum — Structure indicators under schema 1.3.0 |
+| [0024 (addendum)](docs/adr/0024-addendum-candle-patterns-1-4-0.md) | Addendum — Named candlestick patterns under schema 1.4.0 |
+| [0025](docs/adr/0025-walk-forward-run-kind-and-certification-seam.md) | Walk-forward as a run kind and the certification seam |
+| [0026](docs/adr/0026-client-server-split.md) | The client/server split |
+| [0027](docs/adr/0027-paper-session-event-log.md) | The paper session: a row plus an append-only event log, graduated two ways |
+| [0027 (addendum)](docs/adr/0027-addendum-paper-pnl-read-model.md) | Addendum — The paper P&L read model |
+| [0028](docs/adr/0028-wf-v2-holdout-and-hypothesis-budget.md) | `wf-v2`, the C1 holdout test, and the hypothesis budget |
+| [0029](docs/adr/0029-prod-on-mac-mini-qa-on-draco-desk.md) | Prod on the Mac Mini under launchd |
+| [0030](docs/adr/0030-chart-adapter-and-overlay-read.md) | The chart adapter boundary and the overlay read contract |
+| [0031](docs/adr/0031-example-trade-marks.md) | Example-trade marks: the store, its writers, the holdout fence and the explain contract |
+| [0032](docs/adr/0032-certify-power-review.md) | Certify power review: the pass-chance bar, the count-only holdout read and the certify gate |
