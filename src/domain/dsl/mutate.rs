@@ -520,6 +520,11 @@ fn visit_indicator_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> C
         IndicatorSpec::Lowest { period, .. } => {
             f(&format!("{base}.lowest.period"), LeafMut::Period(period))?;
         }
+        // r6.s1.w1 (schema 1.5.0): the simple moving average — the period is
+        // the sweepable leaf, like `Ema`; `source` is a field tag.
+        IndicatorSpec::Sma { period, .. } => {
+            f(&format!("{base}.sma.period"), LeafMut::Period(period))?;
+        }
         // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
         // indicators (r4.s6.w3): twelve variants, two helpers. Listed here BY
         // NAME — never matched with a wildcard — so a new variant still breaks

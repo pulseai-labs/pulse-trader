@@ -1,8 +1,9 @@
 //! r4.s6.w1 — the structure-indicator acceptance suite (demo line d78).
 //!
 //! Schema **1.3.0** ships twelve structure and pattern indicator variants: the
-//! (r5.s1.w1 moved `CURRENT` on to 1.4.0, additively: these twelve variants are
-//! untouched, and this suite's migration case now lands on 1.4.0.)
+//! (r5.s1.w1 moved `CURRENT` on to 1.4.0 and r6.s1.w1 to 1.5.0, additively:
+//! these twelve variants are untouched, and this suite's migration case now
+//! lands on 1.5.0.)
 //! swing pivots `PivotHigh`/`PivotLow`, the levels `Resistance`/`Support`, the
 //! four candle-anatomy values `Body`/`UpperWick`/`LowerWick`/`Range` (all four
 //! groups pinned here), and the four pattern variants
@@ -948,7 +949,7 @@ fn a_resistance_on_the_htf_series_compiles_and_steps_on_the_closed_h4_bar() {
 }
 
 // ---------------------------------------------------------------------------
-// (h) Migration — a 1.2.0 document loads and re-serializes as CURRENT (1.4.0)
+// (h) Migration — a 1.2.0 document loads and re-serializes as CURRENT (1.5.0)
 // ---------------------------------------------------------------------------
 
 /// A canonical 1.2.0 document (every defaulted field written explicitly, the
@@ -985,7 +986,7 @@ fn a_1_2_0_document_loads_and_reserializes_as_current_unchanged_otherwise() {
     );
     assert!(
         loaded.migrated,
-        "the 1.2.0 → 1.3.0 identity step was applied (and on to 1.4.0)"
+        "the 1.2.0 → 1.3.0 identity step was applied (and on to 1.5.0)"
     );
     assert_eq!(
         loaded.dsl_original, DOC_1_2_0,
@@ -998,15 +999,15 @@ fn a_1_2_0_document_loads_and_reserializes_as_current_unchanged_otherwise() {
     );
     assert_eq!(
         loaded.dsl.schema_version.to_string(),
-        "1.4.0",
-        "CURRENT is 1.4.0"
+        "1.5.0",
+        "CURRENT is 1.5.0"
     );
 
     // Re-serialized, the document differs from the input ONLY in its version.
     let reserialized = serde_json::to_value(&loaded.dsl).expect("re-serializes");
     let mut expected: serde_json::Value =
         serde_json::from_str(DOC_1_2_0).expect("the fixture is valid JSON");
-    expected["schema_version"] = serde_json::json!("1.4.0");
+    expected["schema_version"] = serde_json::json!("1.5.0");
     assert_eq!(
         reserialized, expected,
         "the identity step changes nothing but the schema_version string"

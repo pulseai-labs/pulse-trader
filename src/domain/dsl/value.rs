@@ -358,6 +358,22 @@ pub enum IndicatorSpec {
         /// Which pattern to evaluate.
         pattern: CandlePatternName,
     },
+    /// Simple Moving Average: the arithmetic mean of `source` over the last
+    /// `period` bars including the current one (schema 1.5.0, r6.s1.w1).
+    /// Warm-up: the first value lands on candle index `period − 1`.
+    Sma {
+        /// Lookback period.
+        period: SweepableValue<u32>,
+        /// Which price field to average; absent ⇒ `close`. Writes always emit
+        /// it.
+        #[serde(default = "default_sma_source")]
+        source: PriceField,
+    },
+}
+
+/// `#[serde(default = …)]` target for [`IndicatorSpec::Sma`]'s `source`.
+fn default_sma_source() -> PriceField {
+    PriceField::Close
 }
 
 /// `#[serde(default = …)]` target for [`IndicatorSpec::Highest`]'s `source`
@@ -372,12 +388,15 @@ fn default_lowest_source() -> PriceField {
 }
 
 /// The operation of a [`ValueSource::Arith`] node (r3.s2.w3, schema 1.2.0 —
-/// Q2). Serializes `snake_case` (`"add"`/`"sub"`/`"mul"`/`"div"`).
+/// Q2). Serializes `snake_case`
+/// (`"add"`/`"sub"`/`"mul"`/`"div"`/`"max"`/`"min"`).
 ///
-/// All four operations evaluate on `Decimal` only, through the `checked_*`
-/// arithmetic: any overflow gives no value, and `Div` by an exactly-zero
-/// operand gives no value (Q2: "division by zero, or any operand without a
-/// value, gives no value").
+/// All six operations evaluate on `Decimal` only. The four arithmetic ones go
+/// through the `checked_*` arithmetic: any overflow gives no value, and `Div`
+/// by an exactly-zero operand gives no value (Q2: "division by zero, or any
+/// operand without a value, gives no value"). `Max` and `Min` (schema 1.5.0,
+/// r6.s1.w1) pick the larger or smaller operand and cannot overflow; they give
+/// no value only when an operand has none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ArithOp {
@@ -389,6 +408,36 @@ pub enum ArithOp {
     Mul,
     /// Pointwise ratio; a zero divisor gives no value.
     Div,
+    /// Pointwise maximum of the two operands (schema 1.5.0, r6.s1.w1).
+    Max,
+    /// Pointwise minimum of the two operands (schema 1.5.0, r6.s1.w1).
+    Min,
+}
+
+/// How an [`ArithOp`] is spelled in trader-facing text (render, refusal
+/// messages, mark explanations): the four arithmetic operations read infix,
+/// `(a + b)`; `Max` and `Min` read as calls, `max(a,b)` (schema 1.5.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArithSpelling {
+    /// Between the operands, inside parentheses: `(a + b)`.
+    Infix(&'static str),
+    /// A function name over both operands: `max(a,b)`.
+    Call(&'static str),
+}
+
+impl ArithOp {
+    /// The one spelling every text surface shares, so the match over the six
+    /// operations lives here and a new operation breaks it first.
+    pub(crate) const fn spelling(self) -> ArithSpelling {
+        match self {
+            Self::Add => ArithSpelling::Infix("+"),
+            Self::Sub => ArithSpelling::Infix("-"),
+            Self::Mul => ArithSpelling::Infix("*"),
+            Self::Div => ArithSpelling::Infix("/"),
+            Self::Max => ArithSpelling::Call("max"),
+            Self::Min => ArithSpelling::Call("min"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +452,8 @@ impl proptest::arbitrary::Arbitrary for ArithOp {
             Just(Self::Sub),
             Just(Self::Mul),
             Just(Self::Div),
+            Just(Self::Max),
+            Just(Self::Min),
         ]
         .boxed()
     }

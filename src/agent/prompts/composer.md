@@ -12,7 +12,7 @@ expected_inputs: >
 expected_outputs: >
   A sequence of builder-tool calls (one visible step each) that compose and
   finalize a schema-valid strategy; never raw DSL JSON.
-dsl_schema_version: "1.4.0"
+dsl_schema_version: "1.5.0"
 ---
 
 # Composer system prompt
@@ -62,7 +62,7 @@ Both take `{ "left": <operand>, "op": <comparator>, "right": <operand> }`.
 
 **Every operand — left AND right — MUST include a `source`.** Pick one shape:
 
-- `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx"|"atr", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number>, "output": "line"|"signal"|"histogram" }` (the optional `output` picks which MACD series the operand reads; omit it for the line) — or for the rolling extremes: `{ "source": "indicator", "indicator": "highest"|"lowest", "period": <number> }` (the highest value / lowest value of the last `period` **prior** bars, excluding the current one; add `"price_field": "high"` for `highest` and `"price_field": "low"` for `lowest` unless the trader names another field)
+- `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx"|"atr", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number>, "output": "line"|"signal"|"histogram" }` (the optional `output` picks which MACD series the operand reads; omit it for the line) — or for the rolling extremes: `{ "source": "indicator", "indicator": "highest"|"lowest", "period": <number> }` (the highest value / lowest value of the last `period` **prior** bars, excluding the current one; add `"price_field": "high"` for `highest` and `"price_field": "low"` for `lowest` unless the trader names another field) — or for the simple moving average: `{ "source": "indicator", "indicator": "sma", "period": <number> }` (the mean of the last `period` bars **including the current one**; it averages the close unless you add `"price_field": "open"|"high"|"low"|"volume"`; the first value lands on bar `period`)
 
 - **The schema-1.3.0 structure and pattern indicators** (the swing structure a
   breakout is built from; each is still an `indicator` operand, so any of them
@@ -78,7 +78,7 @@ Both take `{ "left": <operand>, "op": <comparator>, "right": <operand> }`.
 
 - `{ "source": "price", "price_field": "open"|"high"|"low"|"close"|"volume" }`
 - `{ "source": "constant", "value": "<decimal string>" }`  ← a bare threshold like 30 is a **constant**: `{ "source": "constant", "value": "30" }`
-- `{ "source": "arith", "op": "add"|"sub"|"mul"|"div", "lhs": <operand>, "rhs": <operand> }` — a pointwise arithmetic combination of two operands, e.g. `atr(14) / close`: `{ "source": "arith", "op": "div", "lhs": { "source": "indicator", "indicator": "atr", "period": 14 }, "rhs": { "source": "price", "price_field": "close" } }`
+- `{ "source": "arith", "op": "add"|"sub"|"mul"|"div"|"max"|"min", "lhs": <operand>, "rhs": <operand> }` — a pointwise arithmetic combination of two operands (`max`/`min` pick the larger/smaller one, e.g. the top of a ribbon of EMAs is nested `max`es), e.g. `atr(14) / close`: `{ "source": "arith", "op": "div", "lhs": { "source": "indicator", "indicator": "atr", "period": 14 }, "rhs": { "source": "price", "price_field": "close" } }`
 - `{ "source": "lag", "of": <operand>, "bars": <number> }` — the operand's value `bars` closed bars back **on the operand's own series**, e.g. yesterday's close: `{ "source": "lag", "of": { "source": "price", "price_field": "close" }, "bars": 1 }`. A lag may not sit under another lag — raise `bars` instead.
 
 An **indicator or price** operand may also carry `"timeframe": "h4"` or

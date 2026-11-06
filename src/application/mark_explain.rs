@@ -50,6 +50,7 @@ use crate::adapters::backtest::{
     BacktestConfig, EngineSession, EvalProbe, SessionTimeframes, indicator_values_at, step_series,
 };
 use crate::application::mcp_read::CANDLE_PATTERNS;
+use crate::domain::dsl::ArithSpelling;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     CandleSeries, CandleSeriesRepository, CompiledCondition, CompiledStrategy, CompiledValue,
@@ -626,17 +627,15 @@ fn operand_label(value: &ValueSource) -> String {
         ValueSource::Indicator { series, spec } => {
             format!("{}{}", series_prefix(*series), indicator_label(spec))
         }
-        ValueSource::Arith { op, lhs, rhs } => format!(
-            "({} {} {})",
-            operand_label(lhs),
-            match op {
-                crate::domain::ArithOp::Add => "+",
-                crate::domain::ArithOp::Sub => "-",
-                crate::domain::ArithOp::Mul => "*",
-                crate::domain::ArithOp::Div => "/",
-            },
-            operand_label(rhs)
-        ),
+        ValueSource::Arith { op, lhs, rhs } => match op.spelling() {
+            ArithSpelling::Infix(symbol) => {
+                format!("({} {symbol} {})", operand_label(lhs), operand_label(rhs))
+            }
+            // Schema 1.5.0: `max(a,b)` / `min(a,b)`.
+            ArithSpelling::Call(name) => {
+                format!("{name}({},{})", operand_label(lhs), operand_label(rhs))
+            }
+        },
         ValueSource::Lag { value, bars } => format!("lag({}, {bars})", operand_label(value)),
     }
 }

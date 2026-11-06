@@ -58,10 +58,10 @@ pub struct SchemaVersion {
 }
 
 impl SchemaVersion {
-    /// The schema version this build of the DSL writes (`1.4.0`).
+    /// The schema version this build of the DSL writes (`1.5.0`).
     pub const CURRENT: SchemaVersion = SchemaVersion {
         major: 1,
-        minor: 4,
+        minor: 5,
         patch: 0,
     };
 }
@@ -117,11 +117,11 @@ impl TryFrom<String> for SchemaVersion {
 // `"MAJOR.MINOR.PATCH"` string — not the three-field struct layout, which is
 // what the derived impl would describe (and what no document ever contains).
 // The string is pinned to the loader's ACCEPTED set: `Migrator::v1()` registers
-// `1.0.0 → 1.1.0 → 1.2.0 → 1.3.0 → 1.4.0`, so the loadable spellings are every
+// `1.0.0 → 1.1.0 → 1.2.0 → 1.3.0 → 1.4.0 → 1.5.0`, so the loadable spellings are every
 // `from` in that chain (migrated forward) and `CURRENT`. A bare `type: string`
 // would tell a validating agent that `"garbage"` or `"2.0.0"` is legal — both
 // are rejected at submission. When the registry gains another `from` version,
-// widen this enum again (r5.s1.w1 widened it for the 1.3.0 → 1.4.0 step).
+// widen this enum again (r6.s1.w1 widened it for the 1.4.0 → 1.5.0 step).
 impl schemars::JsonSchema for SchemaVersion {
     fn inline_schema() -> bool {
         true
@@ -134,7 +134,7 @@ impl schemars::JsonSchema for SchemaVersion {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "enum": ["1.0.0", "1.1.0", "1.2.0", "1.3.0", DSL_SCHEMA_VERSION],
+            "enum": ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", DSL_SCHEMA_VERSION],
         })
     }
 }
@@ -161,20 +161,20 @@ mod tests {
     }
 
     /// AC-7: `CURRENT` serializes to a `"MAJOR.MINOR.PATCH"` string and
-    /// round-trips; deserializing `"1.4.0"` equals `CURRENT`.
+    /// round-trips; deserializing `"1.5.0"` equals `CURRENT`.
     #[test]
     fn schema_version_current_serializes_semver() {
         let json = serde_json::to_string(&SchemaVersion::CURRENT).expect("serialize CURRENT");
         // A bare JSON string, not an object.
-        assert_eq!(json, "\"1.4.0\"");
+        assert_eq!(json, "\"1.5.0\"");
 
         let back: SchemaVersion = serde_json::from_str(&json).expect("deserialize CURRENT");
         assert_eq!(back, SchemaVersion::CURRENT);
 
-        // Deserializing the literal "1.4.0" yields CURRENT; the four earlier
+        // Deserializing the literal "1.5.0" yields CURRENT; the five earlier
         // versions still parse (registered `from`s, not CURRENT).
         let from_literal: SchemaVersion =
-            serde_json::from_str("\"1.4.0\"").expect("deserialize \"1.4.0\"");
+            serde_json::from_str("\"1.5.0\"").expect("deserialize \"1.5.0\"");
         assert_eq!(from_literal, SchemaVersion::CURRENT);
         let old_literal: SchemaVersion =
             serde_json::from_str("\"1.0.0\"").expect("deserialize \"1.0.0\"");
@@ -188,6 +188,9 @@ mod tests {
         let newest_literal: SchemaVersion =
             serde_json::from_str("\"1.3.0\"").expect("deserialize \"1.3.0\"");
         assert_ne!(newest_literal, SchemaVersion::CURRENT);
+        let latest_literal: SchemaVersion =
+            serde_json::from_str("\"1.4.0\"").expect("deserialize \"1.4.0\"");
+        assert_ne!(latest_literal, SchemaVersion::CURRENT);
     }
 
     #[test]
@@ -229,7 +232,14 @@ mod tests {
         let json = serde_json::to_value(&schema).expect("schema serializes");
         assert_eq!(
             json["enum"],
-            serde_json::json!(["1.0.0", "1.1.0", "1.2.0", "1.3.0", DSL_SCHEMA_VERSION])
+            serde_json::json!([
+                "1.0.0",
+                "1.1.0",
+                "1.2.0",
+                "1.3.0",
+                "1.4.0",
+                DSL_SCHEMA_VERSION
+            ])
         );
         assert_eq!(json["type"], "string");
     }

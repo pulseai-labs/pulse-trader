@@ -17,6 +17,13 @@ path = "src/lib.rs"
 name = "pulse"
 path = "src/main.rs"
 
+# r6.s1.w1: the SOLUSDT fixture generator lives beside the fixture it writes
+# (`tests/fixtures/`, which cargo does not auto-discover). Its one test is
+# `#[ignore]`d: run it once by hand, never in the suite.
+[[test]]
+name = "gen_solusdt_cipher_store"
+path = "tests/fixtures/gen_solusdt_cipher_store.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
