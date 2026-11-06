@@ -152,6 +152,7 @@ fn always_in_dsl() -> StrategyDsl {
             risk_per_trade_pct: SweepableValue::Fixed(dec(1, 2)),
             max_leverage: SweepableValue::Fixed(dec(3, 0)),
         },
+        setup: None,
     }
 }
 

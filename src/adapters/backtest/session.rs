@@ -142,7 +142,8 @@ impl EngineSession {
     ///
     /// [`BacktestError::InvalidConfig`], [`BacktestError::FundingIntervalUnknown`],
     /// [`BacktestError::NoStopLoss`], [`BacktestError::ImpossibleTakeProfit`],
-    /// [`BacktestError::EngineInit`].
+    /// [`BacktestError::UnsupportedExit`] (a `StructureStop` or a setup, until
+    /// r6.s2.w4 and r6.s2.w2), [`BacktestError::EngineInit`].
     pub fn new(
         compiled: &CompiledStrategy,
         pair: &Pair,
@@ -156,6 +157,14 @@ impl EngineSession {
             .funding_interval_ms(pair)
             .map_err(|_| BacktestError::FundingIntervalUnknown { pair: pair.clone() })?;
         let plan = ExitPlan::from_strategy(compiled)?;
+        // r6.s2.w1 (ADR-0033): the setup state machine arrives in r6.s2.w2. Until
+        // then a strategy with a setup is refused by name, not run as its entry
+        // gate alone; r6.s2.w2 removes this refusal.
+        if compiled.setup().is_some() {
+            return Err(BacktestError::UnsupportedExit(
+                "setup: this engine build does not run setups yet (r6.s2.w2)".to_owned(),
+            ));
+        }
         let engine = IndicatorEngine::new(compiled)
             .map_err(|err| BacktestError::EngineInit(err.to_string()))?;
         // The higher-timeframe engine is built only when the strategy carries
@@ -1155,8 +1164,8 @@ impl EngineSession {
 mod tests {
     use super::*;
     use crate::domain::{
-        Comparator, Condition, ExitRule, PriceField, RiskParams, SchemaVersion, StrategyDsl,
-        SweepableValue, ValueSource, compile, validate,
+        Comparator, Condition, ExitRule, PriceField, RiskParams, SchemaVersion, Setup, SetupSide,
+        StrategyDsl, SweepableValue, ValueSource, compile, validate,
     };
 
     fn dec(s: &str) -> Decimal {
@@ -1189,6 +1198,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
                 max_leverage: SweepableValue::Fixed(dec("3")),
             },
+            setup: None,
         };
         let compiled_strategy =
             compile(&validate(&dsl).expect("probe dsl validates")).expect("probe dsl compiles");
@@ -1209,6 +1219,71 @@ mod tests {
             None,
         )
         .expect("probe session constructs")
+    }
+
+    /// r6.s2.w1 (ADR-0033): a strategy with a setup is refused by name until the
+    /// state machine lands (r6.s2.w2) — never run as its entry gate alone.
+    #[test]
+    fn setup_refused_until_w2() {
+        let condition = || Condition::Compare {
+            lhs: ValueSource::Price {
+                series: Series::Primary,
+                field: PriceField::Close,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant { value: dec("0") },
+        };
+        let dsl = StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "setup refusal".to_owned(),
+            direction: Direction::Long,
+            entry: condition(),
+            filters: vec![],
+            exits: vec![ExitRule::StopLoss {
+                distance_pct: SweepableValue::Fixed(dec("0.05")),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
+                max_leverage: SweepableValue::Fixed(dec("3")),
+            },
+            setup: Some(Box::new(Setup {
+                expiry_bars: SweepableValue::Fixed(8),
+                long: Some(SetupSide {
+                    arm: condition(),
+                    dip: condition(),
+                    trigger: condition(),
+                    stop_anchor: None,
+                }),
+                short: None,
+            })),
+        };
+        let compiled_strategy =
+            compile(&validate(&dsl).expect("dsl validates")).expect("dsl compiles");
+        let outcome = EngineSession::new(
+            &compiled_strategy,
+            &Pair::new("BTCUSDT"),
+            SessionTimeframes {
+                primary: Timeframe::M15,
+                htf: Some(Timeframe::H4),
+                d1: None,
+            },
+            BacktestConfig {
+                starting_equity: dec("10000"),
+                taker_fee_bps: dec("0"),
+                slippage_bps: dec("0"),
+            },
+            SymbolFilters::unconstrained(),
+            None,
+        );
+        let Err(err) = outcome else {
+            panic!("a setup is refused until r6.s2.w2");
+        };
+        assert_eq!(
+            err,
+            BacktestError::UnsupportedExit(
+                "setup: this engine build does not run setups yet (r6.s2.w2)".to_owned()
+            )
+        );
     }
 
     fn probe_bar(i: i64) -> Candle {
@@ -1309,6 +1384,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
                 max_leverage: SweepableValue::Fixed(dec("3")),
             },
+            setup: None,
         };
         let compiled_strategy =
             compile(&validate(&dsl).expect("probe dsl validates")).expect("probe dsl compiles");

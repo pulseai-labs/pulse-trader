@@ -190,6 +190,7 @@ fn compiled(direction: Direction, exits: Vec<ExitRule>) -> CompiledStrategy {
             risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
             max_leverage: SweepableValue::Fixed(Decimal::from(3)),
         },
+        setup: None,
     };
     compile(&validate(&dsl).unwrap()).unwrap()
 }

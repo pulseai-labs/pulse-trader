@@ -128,6 +128,7 @@ pub fn fixture_strategy_dsl() -> StrategyDsl {
             risk_per_trade_pct: SweepableValue::Fixed(risk_per_trade_pct),
             max_leverage: SweepableValue::Fixed(max_leverage),
         },
+        setup: None,
     }
 }
 

@@ -34,6 +34,7 @@ use thiserror::Error;
 
 use super::condition::{Comparator, Condition};
 use super::exit::ExitRule;
+use super::risk::Direction;
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
 use super::value::{ArithSpelling, IndicatorSpec, PriceField, ValueSource};
@@ -82,6 +83,9 @@ pub enum ValidationCode {
     /// instead), or a `Lag`/`Rising`/`Falling` over a value whose leaves sit on
     /// both series (an `h4:` lag would be ambiguous).
     InvalidExpression,
+    /// A setup's shape is wrong: no side, a direction that does not match its
+    /// sides, or a structure stop without a setup (r6.s2.w1, ADR-0033).
+    InvalidSetup,
 }
 
 /// A single field-level, correctable validation error.
@@ -183,6 +187,9 @@ pub fn validate(dsl: &StrategyDsl) -> Result<ValidatedDsl, ValidationErrors> {
 
     // Rules 1/3/4/5/6 over the exits.
     check_exits(&dsl.exits, &mut errors);
+
+    // Rules S1–S7 over the setup and its exits (r6.s2.w1, ADR-0033).
+    check_setup(dsl, &mut errors);
 
     // Rule 6 over the risk params.
     check_risk(&dsl.risk, &mut errors);
@@ -1364,27 +1371,129 @@ fn check_exits(exits: &[ExitRule], errors: &mut Vec<FieldError>) {
                     errors,
                 );
             }
+            ExitRule::StructureStop { .. } => {
+                // The structure stop shares StopLoss's exclusive family (rule 5)
+                // and satisfies rule 3's stop requirement (ADR-0033). Its own
+                // range and sweep rules (S6, S7) live in `check_setup`.
+                has_stop = true;
+                count_stop += 1;
+            }
         }
     }
 
-    // Rule 3: TakeProfit requires a stop (StopLoss or AtrStop) in the same
-    // strategy.
+    // Rule 3: TakeProfit requires a stop (StopLoss, AtrStop or StructureStop)
+    // in the same strategy.
     if has_take_profit && !has_stop {
         errors.push(FieldError {
             path: "exits".to_owned(),
             code: ValidationCode::TakeProfitWithoutStop,
-            message: "a TakeProfit exit requires a StopLoss or AtrStop in the same strategy (R is \
-                      undefined without a stop)"
+            message: "a TakeProfit exit requires a StopLoss, AtrStop or StructureStop in the same \
+                      strategy (R is undefined without a stop)"
                 .to_owned(),
         });
     }
 
-    // Rule 5: no duplicate exclusive exits (StopLoss and AtrStop are ONE
-    // exclusive family; multiple SignalExit allowed).
-    push_dup(count_stop, "stop (StopLoss or AtrStop)", errors);
+    // Rule 5: no duplicate exclusive exits (StopLoss, AtrStop and StructureStop
+    // are ONE exclusive family; multiple SignalExit allowed).
+    push_dup(
+        count_stop,
+        "stop (StopLoss, AtrStop or StructureStop)",
+        errors,
+    );
     push_dup(count_take_profit, "TakeProfit", errors);
     push_dup(count_trailing, "TrailingStop", errors);
     push_dup(count_time, "TimeStop", errors);
+}
+
+/// Rules S1–S7 (r6.s2.w1, ADR-0033): a setup's shape, its two numeric fields, the
+/// `StructureStop` that needs it, and every side condition.
+fn check_setup(dsl: &StrategyDsl, errors: &mut Vec<FieldError>) {
+    // S4: a StructureStop needs a setup. S6/S7: its buffer.
+    for (i, exit) in dsl.exits.iter().enumerate() {
+        let ExitRule::StructureStop { buffer_pct } = exit else {
+            continue;
+        };
+        let base = format!("exits[{i}]");
+        if dsl.setup.is_none() {
+            errors.push(FieldError {
+                path: base.clone(),
+                code: ValidationCode::InvalidSetup,
+                message: "a StructureStop exit requires a setup".to_owned(),
+            });
+        }
+        let path = format!("{base}.buffer_pct");
+        match buffer_pct {
+            SweepableValue::Sweep { .. } => push_sweep(&path, errors),
+            SweepableValue::Fixed(d) => {
+                if *d < Decimal::ZERO || *d > Decimal::new(5, 2) {
+                    errors.push(FieldError {
+                        path,
+                        code: ValidationCode::FieldRange,
+                        message: "structure-stop buffer_pct must be between 0 and 0.05".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    let Some(setup) = &dsl.setup else {
+        return;
+    };
+
+    // S1: at least one side. S2/S3: the direction follows the sides.
+    match (&setup.long, &setup.short) {
+        (None, None) => errors.push(FieldError {
+            path: "setup".to_owned(),
+            code: ValidationCode::InvalidSetup,
+            message: "a setup must declare a long side, a short side, or both".to_owned(),
+        }),
+        (Some(_), None) if dsl.direction != Direction::Long => errors.push(FieldError {
+            path: "direction".to_owned(),
+            code: ValidationCode::InvalidSetup,
+            message: "a one-sided setup's direction must be its side (long)".to_owned(),
+        }),
+        (None, Some(_)) if dsl.direction != Direction::Short => errors.push(FieldError {
+            path: "direction".to_owned(),
+            code: ValidationCode::InvalidSetup,
+            message: "a one-sided setup's direction must be its side (short)".to_owned(),
+        }),
+        (Some(_), Some(_)) if dsl.direction != Direction::Long => errors.push(FieldError {
+            path: "direction".to_owned(),
+            code: ValidationCode::InvalidSetup,
+            message: "a two-sided setup's direction must be long; each trade takes the side \
+                      that triggered"
+                .to_owned(),
+        }),
+        _ => {}
+    }
+
+    // S5/S7: expiry_bars in 1..=2000, no sweep.
+    match &setup.expiry_bars {
+        SweepableValue::Sweep { .. } => push_sweep("setup.expiry_bars", errors),
+        SweepableValue::Fixed(n) => {
+            if !(1..=2000).contains(n) {
+                errors.push(FieldError {
+                    path: "setup.expiry_bars".to_owned(),
+                    code: ValidationCode::FieldRange,
+                    message: "setup expiry_bars must be between 1 and 2000".to_owned(),
+                });
+            }
+        }
+    }
+
+    // Every side condition goes through the ordinary condition rules.
+    for (name, side) in [("long", &setup.long), ("short", &setup.short)] {
+        let Some(side) = side else {
+            continue;
+        };
+        let base = format!("setup.{name}");
+        check_condition(&side.arm, &format!("{base}.arm"), errors, true);
+        check_condition(&side.dip, &format!("{base}.dip"), errors, true);
+        check_condition(&side.trigger, &format!("{base}.trigger"), errors, true);
+        if let Some(anchor) = &side.stop_anchor {
+            check_condition(anchor, &format!("{base}.stop_anchor"), errors, true);
+        }
+    }
 }
 
 /// Push a [`ValidationCode::DuplicateExit`] when an exclusive exit kind appears
@@ -1579,6 +1688,12 @@ fn walk_unknown_fields(
                         format!("{path}.{key}")
                     };
                     walk_unknown_fields(raw_child, cur_child, &child_path, errors);
+                } else if raw_child.is_null() {
+                    // r6.s2.w1 (ADR-0033 decision 1): a `null` the parsed value
+                    // omits reads as absent. The served schema admits `null` for
+                    // the `Option` fields (`setup`, `long`, `short`,
+                    // `stop_anchor`); a null means absent either way, so even a
+                    // null-valued typo key is not an unknown field.
                 } else {
                     let child_path = if path.is_empty() {
                         key.clone()
@@ -1662,6 +1777,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
                 max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
             },
+            setup: None,
         }
     }
 
@@ -2603,6 +2719,352 @@ mod tests {
                 .any(|e| e.code == ValidationCode::UnknownField && e.path == "entry.lhs.typo"),
             "the unknown-field walk must reach inside the Arith, got {:?}",
             err.errors()
+        );
+    }
+
+    // ---- r6.s2.w1 (ADR-0033): the setup rules S1–S7 ------------------------
+
+    use crate::domain::dsl::setup::{Setup, SetupSide};
+    use crate::domain::dsl::value::PriceField as SetupPriceField;
+
+    fn setup_condition(level: i64) -> Condition {
+        Condition::Compare {
+            lhs: ValueSource::Price {
+                series: Series::Htf,
+                field: SetupPriceField::Close,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::new(level, 0),
+            },
+        }
+    }
+
+    fn setup_side() -> SetupSide {
+        SetupSide {
+            arm: setup_condition(1),
+            dip: setup_condition(2),
+            trigger: setup_condition(3),
+            stop_anchor: Some(setup_condition(4)),
+        }
+    }
+
+    fn structure_stop(buffer: Decimal) -> ExitRule {
+        ExitRule::StructureStop {
+            buffer_pct: SweepableValue::Fixed(buffer),
+        }
+    }
+
+    /// A valid long-only setup strategy with a structure stop.
+    fn setup_base() -> StrategyDsl {
+        let mut dsl = valid_base();
+        dsl.exits = vec![structure_stop(Decimal::new(5, 4))];
+        dsl.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: Some(setup_side()),
+            short: None,
+        }));
+        dsl
+    }
+
+    fn setup_errors(dsl: &StrategyDsl) -> Vec<FieldError> {
+        validate(dsl).expect_err("must be refused").into_errors()
+    }
+
+    fn setup_error_at(errors: &[FieldError], path: &str) -> FieldError {
+        let hits: Vec<_> = errors.iter().filter(|e| e.path == path).collect();
+        assert_eq!(hits.len(), 1, "one error at {path}: {errors:?}");
+        hits[0].clone()
+    }
+
+    #[test]
+    fn setup_valid_one_sided_and_two_sided_validate() {
+        validate(&setup_base()).expect("a long-only setup validates");
+
+        let mut two = setup_base();
+        two.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: Some(setup_side()),
+            short: Some(setup_side()),
+        }));
+        validate(&two).expect("a two-sided setup validates");
+
+        let mut short = setup_base();
+        short.direction = Direction::Short;
+        short.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: None,
+            short: Some(setup_side()),
+        }));
+        validate(&short).expect("a short-only setup validates");
+    }
+
+    #[test]
+    fn setup_s1_no_side_is_invalid() {
+        let mut dsl = setup_base();
+        dsl.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: None,
+            short: None,
+        }));
+        let e = setup_error_at(&setup_errors(&dsl), "setup");
+        assert_eq!(e.code, ValidationCode::InvalidSetup);
+        assert_eq!(
+            e.message,
+            "a setup must declare a long side, a short side, or both"
+        );
+    }
+
+    #[test]
+    fn setup_s2_s3_direction_follows_the_sides() {
+        let mut dsl = setup_base();
+        dsl.direction = Direction::Short;
+        let e = setup_error_at(&setup_errors(&dsl), "direction");
+        assert_eq!(e.code, ValidationCode::InvalidSetup);
+        assert_eq!(
+            e.message,
+            "a one-sided setup's direction must be its side (long)"
+        );
+
+        let mut dsl = setup_base();
+        dsl.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: None,
+            short: Some(setup_side()),
+        }));
+        let e = setup_error_at(&setup_errors(&dsl), "direction");
+        assert_eq!(
+            e.message,
+            "a one-sided setup's direction must be its side (short)"
+        );
+
+        let mut dsl = setup_base();
+        dsl.direction = Direction::Short;
+        dsl.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: Some(setup_side()),
+            short: Some(setup_side()),
+        }));
+        let e = setup_error_at(&setup_errors(&dsl), "direction");
+        assert_eq!(e.code, ValidationCode::InvalidSetup);
+        assert_eq!(
+            e.message,
+            "a two-sided setup's direction must be long; each trade takes the side that triggered"
+        );
+    }
+
+    #[test]
+    fn setup_s4_structure_stop_needs_a_setup() {
+        let mut dsl = setup_base();
+        dsl.setup = None;
+        let e = setup_error_at(&setup_errors(&dsl), "exits[0]");
+        assert_eq!(e.code, ValidationCode::InvalidSetup);
+        assert_eq!(e.message, "a StructureStop exit requires a setup");
+    }
+
+    #[test]
+    fn setup_s5_expiry_bounds() {
+        for bad in [0u32, 2001] {
+            let mut dsl = setup_base();
+            dsl.setup.as_mut().unwrap().expiry_bars = SweepableValue::Fixed(bad);
+            let e = setup_error_at(&setup_errors(&dsl), "setup.expiry_bars");
+            assert_eq!(e.code, ValidationCode::FieldRange);
+            assert_eq!(e.message, "setup expiry_bars must be between 1 and 2000");
+        }
+        for good in [1u32, 2000] {
+            let mut dsl = setup_base();
+            dsl.setup.as_mut().unwrap().expiry_bars = SweepableValue::Fixed(good);
+            validate(&dsl).expect("the bound is valid");
+        }
+    }
+
+    #[test]
+    fn setup_s6_buffer_bounds() {
+        for bad in [Decimal::new(-1, 4), Decimal::new(501, 4)] {
+            let mut dsl = setup_base();
+            dsl.exits = vec![structure_stop(bad)];
+            let e = setup_error_at(&setup_errors(&dsl), "exits[0].buffer_pct");
+            assert_eq!(e.code, ValidationCode::FieldRange);
+            assert_eq!(
+                e.message,
+                "structure-stop buffer_pct must be between 0 and 0.05"
+            );
+        }
+        for good in [Decimal::ZERO, Decimal::new(5, 2)] {
+            let mut dsl = setup_base();
+            dsl.exits = vec![structure_stop(good)];
+            validate(&dsl).expect("the bound is valid");
+        }
+    }
+
+    #[test]
+    fn setup_s7_sweeps_are_refused() {
+        let mut dsl = setup_base();
+        dsl.setup.as_mut().unwrap().expiry_bars = SweepableValue::Sweep {
+            start: 4,
+            end: 8,
+            step: 2,
+        };
+        let e = setup_error_at(&setup_errors(&dsl), "setup.expiry_bars");
+        assert_eq!(e.code, ValidationCode::SweepUnsupported);
+
+        let mut dsl = setup_base();
+        dsl.exits = vec![ExitRule::StructureStop {
+            buffer_pct: SweepableValue::Sweep {
+                start: Decimal::ZERO,
+                end: Decimal::new(1, 2),
+                step: Decimal::new(5, 3),
+            },
+        }];
+        let e = setup_error_at(&setup_errors(&dsl), "exits[0].buffer_pct");
+        assert_eq!(e.code, ValidationCode::SweepUnsupported);
+    }
+
+    #[test]
+    fn setup_side_conditions_are_checked_at_their_paths() {
+        let mut dsl = setup_base();
+        let side = dsl.setup.as_mut().unwrap().long.as_mut().unwrap();
+        side.arm = Condition::And { conditions: vec![] };
+        side.dip = Condition::And { conditions: vec![] };
+        side.trigger = Condition::Or { conditions: vec![] };
+        side.stop_anchor = Some(Condition::Or { conditions: vec![] });
+        let errors = setup_errors(&dsl);
+        for path in [
+            "setup.long.arm.and",
+            "setup.long.dip.and",
+            "setup.long.trigger.or",
+            "setup.long.stop_anchor.or",
+        ] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.path == path && e.code == ValidationCode::EmptyConjunction),
+                "{path}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_short_side_conditions_are_checked_at_their_paths() {
+        let mut dsl = setup_base();
+        dsl.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: Some(setup_side()),
+            short: Some(SetupSide {
+                arm: Condition::And { conditions: vec![] },
+                dip: setup_condition(2),
+                trigger: setup_condition(3),
+                stop_anchor: None,
+            }),
+        }));
+        let e = setup_error_at(&setup_errors(&dsl), "setup.short.arm.and");
+        assert_eq!(e.code, ValidationCode::EmptyConjunction);
+    }
+
+    #[test]
+    fn setup_structure_stop_joins_the_stop_family() {
+        // A TakeProfit rests on a StructureStop.
+        let mut dsl = setup_base();
+        dsl.exits.push(ExitRule::TakeProfit {
+            target_r: SweepableValue::Fixed(Decimal::new(3, 0)),
+        });
+        validate(&dsl).expect("a take profit rests on a structure stop");
+
+        // A TakeProfit alone names all three stops.
+        let mut dsl = setup_base();
+        dsl.exits = vec![ExitRule::TakeProfit {
+            target_r: SweepableValue::Fixed(Decimal::new(3, 0)),
+        }];
+        let e = setup_error_at(&setup_errors(&dsl), "exits");
+        assert_eq!(e.code, ValidationCode::TakeProfitWithoutStop);
+        assert_eq!(
+            e.message,
+            "a TakeProfit exit requires a StopLoss, AtrStop or StructureStop in the same strategy (R is undefined without a stop)"
+        );
+
+        // A StructureStop and a StopLoss are one exclusive family.
+        let mut dsl = setup_base();
+        dsl.exits.push(ExitRule::StopLoss {
+            distance_pct: SweepableValue::Fixed(Decimal::new(5, 2)),
+        });
+        let e = setup_error_at(&setup_errors(&dsl), "exits");
+        assert_eq!(e.code, ValidationCode::DuplicateExit);
+        assert_eq!(
+            e.message,
+            "at most one stop (StopLoss, AtrStop or StructureStop) exit is allowed; found 2"
+        );
+    }
+
+    /// The write-path walk reads a `null` the parsed value omits as absent.
+    fn setup_unknown_field_paths(raw: &serde_json::Value) -> Vec<String> {
+        let parsed: StrategyDsl =
+            serde_json::from_value(raw.clone()).expect("the raw document parses");
+        match check_unknown_fields(raw, &parsed) {
+            Ok(()) => Vec::new(),
+            Err(errors) => errors.errors().iter().map(|e| e.path.clone()).collect(),
+        }
+    }
+
+    fn setup_raw() -> serde_json::Value {
+        let mut dsl = setup_base();
+        dsl.setup = Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(16),
+            long: Some(setup_side()),
+            short: Some(setup_side()),
+        }));
+        dsl.direction = Direction::Long;
+        serde_json::to_value(&dsl).expect("serializes")
+    }
+
+    #[test]
+    fn setup_unknown_field_null_setup_is_absent() {
+        let mut raw = serde_json::to_value(valid_base()).unwrap();
+        raw["setup"] = serde_json::Value::Null;
+        assert_eq!(setup_unknown_field_paths(&raw), Vec::<String>::new());
+    }
+
+    #[test]
+    fn setup_unknown_field_null_long_is_absent() {
+        let mut raw = setup_raw();
+        raw["setup"]["long"] = serde_json::Value::Null;
+        assert_eq!(setup_unknown_field_paths(&raw), Vec::<String>::new());
+    }
+
+    #[test]
+    fn setup_unknown_field_null_short_is_absent() {
+        let mut raw = setup_raw();
+        raw["setup"]["short"] = serde_json::Value::Null;
+        assert_eq!(setup_unknown_field_paths(&raw), Vec::<String>::new());
+    }
+
+    #[test]
+    fn setup_unknown_field_null_stop_anchor_is_absent() {
+        let mut raw = setup_raw();
+        raw["setup"]["long"]["stop_anchor"] = serde_json::Value::Null;
+        assert_eq!(setup_unknown_field_paths(&raw), Vec::<String>::new());
+    }
+
+    #[test]
+    fn setup_unknown_field_null_typo_key_reads_as_absent() {
+        let mut raw = setup_raw();
+        raw["setup"]["shrt"] = serde_json::Value::Null;
+        assert_eq!(setup_unknown_field_paths(&raw), Vec::<String>::new());
+    }
+
+    #[test]
+    fn setup_unknown_field_non_null_typo_key_is_still_refused() {
+        let mut raw = setup_raw();
+        raw["setup"]["shrt"] = serde_json::json!({"arm": 1});
+        assert_eq!(
+            setup_unknown_field_paths(&raw),
+            vec!["setup.shrt".to_owned()]
+        );
+
+        let mut raw = setup_raw();
+        raw["setup"]["long"]["trigr"] = serde_json::json!(5);
+        assert_eq!(
+            setup_unknown_field_paths(&raw),
+            vec!["setup.long.trigr".to_owned()]
         );
     }
 }
