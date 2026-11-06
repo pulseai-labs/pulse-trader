@@ -63,6 +63,9 @@ pub use sweepable::SweepableValue;
 pub use validate::{
     FieldError, ValidatedDsl, ValidationCode, ValidationErrors, check_unknown_fields, validate,
 };
+// r6.s1.w1: how an `ArithOp` reads in text (crate-internal: render, validate and
+// the mark explanation share it).
+pub(crate) use value::ArithSpelling;
 pub use value::{
     ArithOp, CandlePatternName, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
 };

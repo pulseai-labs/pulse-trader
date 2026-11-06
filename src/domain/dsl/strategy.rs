@@ -289,6 +289,15 @@ mod prop_tests {
             (arb_sweepable_u32(), arb_price_field())
                 .prop_map(|(period, source)| IndicatorSpec::Highest { period, source })
                 .boxed(),
+            // r6.s1.w1 (schema 1.5.0): the simple moving average — any period,
+            // any source field.
+            (arb_sweepable_u32(), arb_price_field())
+                .prop_map(|(period, source)| IndicatorSpec::Sma { period, source })
+                .boxed(),
+            // r6.s1.w2 (schema 1.5.0): WaveTrend — any channel, any average.
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(channel, average)| IndicatorSpec::WaveTrend { channel, average })
+                .boxed(),
             (arb_sweepable_u32(), arb_price_field())
                 .prop_map(|(period, source)| IndicatorSpec::Lowest { period, source })
                 .boxed(),

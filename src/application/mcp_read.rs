@@ -75,6 +75,7 @@ pub fn parse_indicator_specs(raw: &[String]) -> anyhow::Result<Vec<IndicatorColu
     Ok(columns)
 }
 
+#[allow(clippy::too_many_lines)] // one dispatch: every token kind routes to its parser here
 fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
     // The four candle-anatomy kinds take no parameters and are written bare —
     // no `:` at all (r4.s6.w1).
@@ -165,6 +166,19 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
         return parse_rolling_extreme(token, &kind, rest);
     }
 
+    // r6.s1.w1 (schema 1.5.0): the simple moving average carries one period and
+    // the same optional price-field selector — `sma:<period>[:<source>]`, the
+    // source defaulting to close.
+    if kind == "sma" {
+        return parse_sma(token, rest);
+    }
+
+    // r6.s1.w2 (schema 1.5.0): WaveTrend's first line carries two lengths —
+    // `wavetrend:<channel>:<average>`, the only two-parameter colon kind.
+    if kind == "wavetrend" {
+        return parse_wavetrend(token, rest);
+    }
+
     // r4.s6.w1: the structure indicators. The pivot variants carry the
     // `left`/`right` span; the level variants add `tolerance_pct` (a decimal
     // FRACTION — `0.003` is 0.3%), `min_touches` and `lookback`.
@@ -195,7 +209,7 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
             "invalid --indicator {token:?}: MACD needs fast/slow/signal and is not supported by <kind>:<period>"
         ),
         _ => anyhow::bail!(
-            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, adx, atr, highest, or lowest)"
+            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, adx, atr, sma, wavetrend, highest, or lowest)"
         ),
     };
     Ok(IndicatorColumn {
@@ -204,9 +218,15 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
     })
 }
 
-/// Parse the `highest:<period>[:<field>]` / `lowest:<period>[:<field>]`
-/// forms (schema 1.2.0, r3.s2 — Q1).
-fn parse_rolling_extreme(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+/// Split `<period>[:<field>]` into the period, the field when one was written,
+/// and the label suffix (`":<field>"`, empty when no field was written) — the
+/// shared grammar of `highest:`, `lowest:` and `sma:` (`kind` names the token
+/// in the errors).
+fn parse_period_and_field(
+    token: &str,
+    kind: &str,
+    rest: &str,
+) -> anyhow::Result<(u32, Option<PriceField>, String)> {
     let parts: Vec<&str> = rest.split(':').collect();
     let (period_str, field, field_label) = match parts.as_slice() {
         [period] => (period, None, String::new()),
@@ -228,6 +248,13 @@ fn parse_rolling_extreme(token: &str, kind: &str, rest: &str) -> anyhow::Result<
         _ => anyhow::bail!("invalid --indicator {token:?}: {kind} expects <period>[:<field>]"),
     };
     let period = parse_period(token, period_str)?;
+    Ok((period, field, field_label))
+}
+
+/// Parse the `highest:<period>[:<field>]` / `lowest:<period>[:<field>]`
+/// forms (schema 1.2.0, r3.s2 — Q1).
+fn parse_rolling_extreme(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    let (period, field, field_label) = parse_period_and_field(token, kind, rest)?;
     let fixed = SweepableValue::Fixed(period);
     let default_source = if kind == "highest" {
         PriceField::High
@@ -248,6 +275,38 @@ fn parse_rolling_extreme(token: &str, kind: &str, rest: &str) -> anyhow::Result<
     Ok(IndicatorColumn {
         label: format!("{kind}:{period}{field_label}"),
         spec,
+    })
+}
+
+/// Parse the `sma:<period>[:<field>]` form (schema 1.5.0, r6.s1.w1). The field
+/// defaults to close; an explicit write shows in the label, the `highest:`
+/// precedent.
+fn parse_sma(token: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    let (period, field, field_label) = parse_period_and_field(token, "sma", rest)?;
+    Ok(IndicatorColumn {
+        label: format!("sma:{period}{field_label}"),
+        spec: IndicatorSpec::Sma {
+            period: SweepableValue::Fixed(period),
+            source: field.unwrap_or(PriceField::Close),
+        },
+    })
+}
+
+/// Parse the `wavetrend:<channel>:<average>` form (schema 1.5.0, r6.s1.w2):
+/// both lengths are required, each >= 1.
+fn parse_wavetrend(token: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    let parts: Vec<&str> = rest.split(':').collect();
+    let [channel, average] = parts[..] else {
+        anyhow::bail!("invalid --indicator {token:?}: wavetrend expects <channel>:<average>");
+    };
+    let channel = parse_period(token, channel)?;
+    let average = parse_period(token, average)?;
+    Ok(IndicatorColumn {
+        label: format!("wavetrend:{channel}:{average}"),
+        spec: IndicatorSpec::WaveTrend {
+            channel: SweepableValue::Fixed(channel),
+            average: SweepableValue::Fixed(average),
+        },
     })
 }
 
@@ -428,7 +487,7 @@ fn parse_trendline(token: &str, kind: &str, rest: &str) -> anyhow::Result<Indica
 ///
 /// Spelled exactly as the parser's own labels: the case-normalized kind, a
 /// `normalize()`d decimal tolerance, the fixed `cdl:<snake_case>` name, and the
-/// `highest`/`lowest` field elided when it is that kind's default (an explicit
+/// `highest`/`lowest`/`sma` field elided when it is that kind's default (an explicit
 /// write always shows, the macd-output precedent). A [`SweepableValue::Sweep`]
 /// has no token in this grammar — validation rejects every sweep before a
 /// compiled rule can carry one — so a swept leaf renders as its bounds
@@ -445,6 +504,18 @@ pub fn indicator_label(spec: &IndicatorSpec) -> String {
         }
         IndicatorSpec::Lowest { period, source } => {
             rolling_label("lowest", period, *source, PriceField::Low)
+        }
+        IndicatorSpec::Sma { period, source } => {
+            rolling_label("sma", period, *source, PriceField::Close)
+        }
+        // r6.s1.w2 (schema 1.5.0): `wavetrend:<channel>:<average>`, the exact
+        // inverse of `parse_wavetrend`.
+        IndicatorSpec::WaveTrend { channel, average } => {
+            format!(
+                "wavetrend:{}:{}",
+                period_label(channel),
+                period_label(average)
+            )
         }
         IndicatorSpec::Macd {
             fast,
@@ -541,8 +612,9 @@ fn decimal_label(value: &SweepableValue<Decimal>) -> String {
     }
 }
 
-/// The `highest:` / `lowest:` token — the field elided when it is that kind's
-/// default, exactly as [`parse_rolling_extreme`] builds its label.
+/// The `highest:` / `lowest:` / `sma:` token — the field elided when it is that
+/// kind's default, exactly as [`parse_rolling_extreme`] and [`parse_sma`] build
+/// their labels.
 fn rolling_label(
     kind: &str,
     period: &SweepableValue<u32>,
@@ -971,7 +1043,8 @@ mod tests {
             | IndicatorSpec::Adx { period }
             | IndicatorSpec::Atr { period }
             | IndicatorSpec::Highest { period, .. }
-            | IndicatorSpec::Lowest { period, .. } => match period {
+            | IndicatorSpec::Lowest { period, .. }
+            | IndicatorSpec::Sma { period, .. } => match period {
                 SweepableValue::Fixed(period) => *period,
                 SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
             },
@@ -1000,6 +1073,12 @@ mod tests {
             IndicatorSpec::Macd { .. } => {
                 panic!("MACD is not part of kind:period parsing")
             }
+            IndicatorSpec::WaveTrend { channel, .. } => match channel {
+                // r6.s1.w2: WaveTrend carries two lengths; the channel is the
+                // stand-in this helper reads (the `wavetrend` tests read both).
+                SweepableValue::Fixed(channel) => *channel,
+                SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
+            },
             IndicatorSpec::Body
             | IndicatorSpec::UpperWick
             | IndicatorSpec::LowerWick
@@ -1240,6 +1319,63 @@ mod tests {
         }
     }
 
+    /// r6.s1.w2 (schema 1.5.0): `wavetrend:<channel>:<average>` parses to the
+    /// `WaveTrend` spec with both lengths, and the label is the token.
+    #[test]
+    fn parses_the_wavetrend_token_with_both_lengths() {
+        let one = parse_indicator_specs(&["wavetrend:9:12".to_owned()]).expect("parses");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].label, "wavetrend:9:12");
+        assert_eq!(
+            one[0].spec,
+            IndicatorSpec::WaveTrend {
+                channel: SweepableValue::Fixed(9),
+                average: SweepableValue::Fixed(12),
+            }
+        );
+        // The kind is case-insensitive and the lengths are trimmed, like every
+        // other kind; the label is canonical, so the two spellings dedup.
+        let dup =
+            parse_indicator_specs(&["WaveTrend: 9 : 12".to_owned(), "wavetrend:9:12".to_owned()])
+                .expect("parses");
+        assert_eq!(dup.len(), 1, "one column for both spellings");
+        assert_eq!(dup[0].label, "wavetrend:9:12");
+    }
+
+    /// r6.s1.w2: a malformed `wavetrend` token is refused with the grammar,
+    /// and the unknown-kind refusal lists the kind.
+    #[test]
+    fn rejects_malformed_wavetrend_tokens() {
+        for bad in [
+            "wavetrend:9",
+            "wavetrend:9:12:3",
+            "wavetrend:9-12",
+            "wavetrend:0:12",
+            "wavetrend:9:0",
+            "wavetrend:x:12",
+            "wavetrend:9:",
+        ] {
+            let err = parse_indicator_specs(&[bad.to_owned()])
+                .expect_err(&format!("{bad} must be refused"))
+                .to_string();
+            assert!(
+                err.contains(bad),
+                "{bad}: the refusal names the token: {err}"
+            );
+        }
+        let err = parse_indicator_specs(&["wavetrend:9".to_owned()])
+            .expect_err("one length is refused")
+            .to_string();
+        assert!(
+            err.contains("<channel>:<average>"),
+            "the refusal states the grammar: {err}"
+        );
+        let err = parse_indicator_specs(&["nope:9".to_owned()])
+            .expect_err("unknown kind")
+            .to_string();
+        assert!(err.contains("wavetrend"), "the kind list names it: {err}");
+    }
+
     /// r5.s2.w1 (SPINE G2/AC-1): every spec a compiled rule can carry has a
     /// label the token parser accepts, and `parse(label(spec)) == spec` — so the
     /// chart read's overlays are always addressable through `export_indicators`.
@@ -1280,6 +1416,22 @@ mod tests {
             IndicatorSpec::Lowest {
                 period: fixed(20),
                 source: PriceField::Volume,
+            },
+            IndicatorSpec::Sma {
+                period: fixed(50),
+                source: PriceField::Close,
+            },
+            IndicatorSpec::Sma {
+                period: fixed(50),
+                source: PriceField::High,
+            },
+            IndicatorSpec::WaveTrend {
+                channel: fixed(9),
+                average: fixed(12),
+            },
+            IndicatorSpec::WaveTrend {
+                channel: fixed(3),
+                average: fixed(1),
             },
             IndicatorSpec::Macd {
                 fast: fixed(12),

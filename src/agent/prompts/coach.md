@@ -36,9 +36,10 @@ call ends the turn, and any other number makes the whole turn a recorded failure
 
 Three families of numeric leaf, and nothing else:
 
-- **indicator periods** and bar counts — an RSI, EMA, ADX or ATR period
-  (`…indicator.atr.period`), MACD's `fast`, `slow` or `signal`, a time stop's
-  `max_bars`;
+- **indicator periods** and bar counts — an RSI, EMA, SMA, ADX or ATR period
+  (`…indicator.atr.period`), WaveTrend's `channel` or `average`
+  (`…indicator.wavetrend.channel`), MACD's `fast`, `slow` or `signal`, a time
+  stop's `max_bars`;
 - **exit parameters** — a stop's `distance_pct`, a take-profit's `target_r`, a
   trailing stop's `trail_pct`, an ATR stop's `period` and `multiple` (an ATR
   multiple, e.g. `exits[0].multiple`);

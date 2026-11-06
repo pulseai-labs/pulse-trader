@@ -22,7 +22,9 @@ use super::exit::ExitRule;
 use super::risk::{Direction, RiskParams};
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
-use super::value::{CandlePatternName, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource};
+use super::value::{
+    ArithSpelling, CandlePatternName, IndicatorSpec, MacdOutput, PriceField, Series, ValueSource,
+};
 
 /// A [`StrategyDsl`] rendered to summary lines — the fields both wire DTOs
 /// carry (`DslSummary` wraps `entry` in a one-element `Vec`; the compact card
@@ -81,6 +83,16 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
             )
         }
         IndicatorSpec::Atr { period } => format!("atr({})", u32_leaf(period)),
+        // The simple moving average (schema 1.5.0, r6.s1.w1): the period, then
+        // the price field it averages — `sma(50,close)`.
+        IndicatorSpec::Sma { period, source } => {
+            format!("sma({},{})", u32_leaf(period), field_word(*source))
+        }
+        // WaveTrend's first line (schema 1.5.0, r6.s1.w2): the channel length,
+        // then the average length — `wavetrend(9,12)`.
+        IndicatorSpec::WaveTrend { channel, average } => {
+            format!("wavetrend({},{})", u32_leaf(channel), u32_leaf(average))
+        }
         // The rolling extremes name the prior-N convention: the word `prior`
         // is MANDATORY — it is the convention's name (Q1), e.g.
         // `highest(high, 20 prior)`.
@@ -279,17 +291,20 @@ pub fn value_with_prefix(source: &ValueSource, htf_prefix: &str) -> String {
         // `(atr(14) / close)`. The children render through the prefixed
         // variant, so a nested expression parenthesizes at each level
         // deterministically.
-        ValueSource::Arith { op, lhs, rhs } => format!(
-            "({} {} {})",
-            value_with_prefix(lhs, htf_prefix),
-            match op {
-                crate::domain::dsl::value::ArithOp::Add => "+",
-                crate::domain::dsl::value::ArithOp::Sub => "-",
-                crate::domain::dsl::value::ArithOp::Mul => "*",
-                crate::domain::dsl::value::ArithOp::Div => "/",
-            },
-            value_with_prefix(rhs, htf_prefix)
-        ),
+        // `max(a,b)` / `min(a,b)` (schema 1.5.0) read as calls, with no space
+        // after the comma — the file's `sma(50,close)` convention.
+        ValueSource::Arith { op, lhs, rhs } => match op.spelling() {
+            ArithSpelling::Infix(symbol) => format!(
+                "({} {symbol} {})",
+                value_with_prefix(lhs, htf_prefix),
+                value_with_prefix(rhs, htf_prefix)
+            ),
+            ArithSpelling::Call(name) => format!(
+                "{name}({},{})",
+                value_with_prefix(lhs, htf_prefix),
+                value_with_prefix(rhs, htf_prefix)
+            ),
+        },
         // `lag(close, 5)`; the series tag belongs to the lagged operand
         // (own-series rule), so it renders inside: `lag(h4:ema(20), 1)`.
         ValueSource::Lag { value: inner, bars } => {

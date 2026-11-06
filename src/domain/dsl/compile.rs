@@ -148,8 +148,8 @@ impl CompiledValue {
     /// Evaluate this value — a leaf read or an `Arith` tree — against `ctx`.
     ///
     /// The Q2 no-value semantics: an `Arith` over any operand without a value
-    /// gives no value, `Div` by an exactly-zero operand gives no value, and a
-    /// `checked_*` overflow gives no value. `previous` evaluates the same tree
+    /// gives no value (`Max` and `Min` included), `Div` by an exactly-zero
+    /// operand gives no value, and a `checked_*` overflow gives no value. `previous` evaluates the same tree
     /// on the previous values, so crosses over expressions work.
     #[must_use]
     pub fn eval(&self, ctx: &dyn EvalContext, previous: bool) -> Option<Decimal> {
@@ -163,6 +163,10 @@ impl CompiledValue {
                     ArithOp::Mul => l.checked_mul(r),
                     ArithOp::Div if r.is_zero() => None,
                     ArithOp::Div => l.checked_div(r),
+                    // Schema 1.5.0 (r6.s1.w1): both operands have a value here
+                    // (the `?`s above), so the pick cannot fail.
+                    ArithOp::Max => Some(l.max(r)),
+                    ArithOp::Min => Some(l.min(r)),
                 }
             }
             leaf => {
@@ -1452,6 +1456,155 @@ mod tests {
                 );
             }
             other => panic!("an Arith document value compiles to an Arith tree, was {other:?}"),
+        }
+    }
+
+    // ---- r6.s1.w1: `max` / `min` arithmetic ---------------------------------
+
+    /// A `max`/`min` node over two operands.
+    fn arith_node(op: TestArithOp, lhs: CompiledValue, rhs: CompiledValue) -> CompiledValue {
+        CompiledValue::Arith {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn arith_const(text: &str) -> CompiledValue {
+        CompiledValue::Const(text.parse().expect("a decimal literal"))
+    }
+
+    fn arith_ema(period: u32) -> CompiledValue {
+        CompiledValue::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Ema {
+                period: SweepableValue::Fixed(period),
+            },
+            lag: 0,
+        }
+    }
+
+    /// `max` takes the larger operand and `min` the smaller, whichever side it
+    /// is on, for negatives and for equal operands.
+    #[test]
+    fn arith_max_and_min_pick_the_larger_and_smaller_operand() {
+        let ctx = FakeCtx::empty();
+        for (l, r, larger, smaller) in [
+            ("3", "5", "5", "3"),
+            ("5", "3", "5", "3"),
+            ("-3", "-5", "-3", "-5"),
+            ("-2", "4", "4", "-2"),
+            ("2.5", "2.5", "2.5", "2.5"),
+            ("0", "-0.00000001", "0", "-0.00000001"),
+        ] {
+            let max = arith_node(TestArithOp::Max, arith_const(l), arith_const(r));
+            let min = arith_node(TestArithOp::Min, arith_const(l), arith_const(r));
+            assert_eq!(
+                max.eval(&ctx, false),
+                Some(larger.parse().unwrap()),
+                "max({l}, {r})"
+            );
+            assert_eq!(
+                min.eval(&ctx, false),
+                Some(smaller.parse().unwrap()),
+                "min({l}, {r})"
+            );
+        }
+    }
+
+    /// An operand without a value gives no value, on either side and for both
+    /// operations — never the other operand's value.
+    #[test]
+    fn arith_max_and_min_give_no_value_when_an_operand_has_none() {
+        // EMA(5) has a value; EMA(11) is still warming up (absent from the ctx).
+        let ctx = FakeCtx::empty().with_current(&arith_ema(5), "10".parse().unwrap());
+        for op in [TestArithOp::Max, TestArithOp::Min] {
+            let warm_left = arith_node(op, arith_ema(5), arith_ema(11));
+            let warm_right = arith_node(op, arith_ema(11), arith_ema(5));
+            let neither = arith_node(op, arith_ema(11), arith_ema(11));
+            assert_eq!(
+                warm_left.eval(&ctx, false),
+                None,
+                "{op:?}: rhs has no value"
+            );
+            assert_eq!(
+                warm_right.eval(&ctx, false),
+                None,
+                "{op:?}: lhs has no value"
+            );
+            assert_eq!(
+                neither.eval(&ctx, false),
+                None,
+                "{op:?}: neither has a value"
+            );
+        }
+    }
+
+    /// `previous = true` evaluates the same tree on the previous values, so a
+    /// cross over a `max` works.
+    #[test]
+    fn arith_max_and_min_evaluate_on_the_previous_values_too() {
+        let a = arith_ema(5);
+        let b = arith_ema(11);
+        let ctx = FakeCtx::empty()
+            .with_current(&a, "10".parse().unwrap())
+            .with_current(&b, "20".parse().unwrap())
+            .with_previous(&a, "30".parse().unwrap())
+            .with_previous(&b, "25".parse().unwrap());
+        let max = arith_node(TestArithOp::Max, a.clone(), b.clone());
+        let min = arith_node(TestArithOp::Min, a, b);
+        assert_eq!(max.eval(&ctx, false), Some("20".parse().unwrap()));
+        assert_eq!(max.eval(&ctx, true), Some("30".parse().unwrap()));
+        assert_eq!(min.eval(&ctx, false), Some("10".parse().unwrap()));
+        assert_eq!(min.eval(&ctx, true), Some("25".parse().unwrap()));
+    }
+
+    /// The Cipher ribbon's band top is the depth-3 tree of `max` nodes over
+    /// eight EMAs; it equals the largest EMA, and it has no value while any
+    /// one EMA still has none.
+    #[test]
+    fn arith_max_nests_to_the_ribbon_band_top() {
+        let periods = [5u32, 11, 15, 18, 21, 24, 28, 34];
+        let m = |a: CompiledValue, b: CompiledValue| arith_node(TestArithOp::Max, a, b);
+        let e = |i: usize| arith_ema(periods[i]);
+        let band_top = m(
+            m(m(e(0), e(1)), m(e(2), e(3))),
+            m(m(e(4), e(5)), m(e(6), e(7))),
+        );
+
+        let values = ["101", "104.5", "99", "103", "107.25", "100", "106", "98"];
+        let mut ctx = FakeCtx::empty();
+        for (i, v) in values.iter().enumerate() {
+            ctx = ctx.with_current(&e(i), v.parse().unwrap());
+        }
+        assert_eq!(band_top.eval(&ctx, false), Some("107.25".parse().unwrap()));
+
+        // Drop one EMA: the whole band top has no value.
+        let mut partial = FakeCtx::empty();
+        for (i, v) in values.iter().enumerate().take(7) {
+            partial = partial.with_current(&e(i), v.parse().unwrap());
+        }
+        assert_eq!(band_top.eval(&partial, false), None);
+    }
+
+    /// `max`/`min` compile from the document type to the same node, with the
+    /// operation kept.
+    #[test]
+    fn arith_max_and_min_compile_from_the_document_value() {
+        for op in [TestArithOp::Max, TestArithOp::Min] {
+            let value = ValueSource::Arith {
+                op,
+                lhs: Box::new(ValueSource::Constant {
+                    value: Decimal::new(1, 0),
+                }),
+                rhs: Box::new(ValueSource::Constant {
+                    value: Decimal::new(2, 0),
+                }),
+            };
+            match super::compile_value(&value) {
+                CompiledValue::Arith { op: got, .. } => assert_eq!(got, op),
+                other => panic!("an Arith document value compiles to an Arith node, was {other:?}"),
+            }
         }
     }
 

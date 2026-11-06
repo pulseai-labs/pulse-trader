@@ -96,6 +96,15 @@ const SCAN_TARGETS: &[&str] = &[
     // candle ring, no `convert` seam, scanned like every other indicator surface
     // so a future banned call here is not a false-green hole.
     "src/adapters/indicators/candle_patterns.rs",
+    // r6.s1.w1: the SMA adapter — pure `Decimal` (a running sum over a window,
+    // one scale-8 half-even division), no `convert` seam, scanned like every
+    // other indicator surface so a future banned call here is not a false-green
+    // hole.
+    "src/adapters/indicators/sma.rs",
+    // r6.s1.w2: the WaveTrend adapter — three chained ta-rs EMAs behind the
+    // `convert` seam (hlc3 in, WT1 out at scale 8 half-even), scanned like
+    // `ema.rs` so a future banned f64 call here is not a false-green hole.
+    "src/adapters/indicators/wavetrend.rs",
     "src/domain/backtest/regime.rs",
     "src/adapters/backtest/regime.rs",
     "src/adapters/backtest/engine.rs",

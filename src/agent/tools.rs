@@ -477,6 +477,12 @@ mod mapping {
         slow: Option<u32>,
         #[serde(default)]
         signal: Option<u32>,
+        // `wavetrend` only (schema 1.5.0, r6.s1.w2): the channel length (n1)
+        // and the average length (n2); both are required for that kind.
+        #[serde(default)]
+        channel: Option<u32>,
+        #[serde(default)]
+        average: Option<u32>,
         // MACD-only output selector (schema 1.2.0, r3.s2 — b2): `"line"`,
         // `"signal"` or `"histogram"`; absent → the historical line.
         #[serde(default)]
@@ -497,7 +503,7 @@ mod mapping {
         // DSL type.
         #[serde(default)]
         timeframe: Option<String>,
-        // `arith` only (r3.s2.w5): the pointwise operation, `add|sub|mul|div`.
+        // `arith` only (r3.s2.w5): the pointwise operation, `add|sub|mul|div|max|min`.
         #[serde(default)]
         op: Option<String>,
         // `arith` only: the left/right side of the pointwise operation. Boxed
@@ -789,15 +795,17 @@ mod mapping {
             Some("sub") => Ok(ArithOp::Sub),
             Some("mul") => Ok(ArithOp::Mul),
             Some("div") => Ok(ArithOp::Div),
+            Some("max") => Ok(ArithOp::Max),
+            Some("min") => Ok(ArithOp::Min),
             Some(other) => Err(field_error(
                 format!("{path}.op"),
                 ValidationCode::FieldRange,
-                format!("unknown arith op {other:?}; expected add|sub|mul|div"),
+                format!("unknown arith op {other:?}; expected add|sub|mul|div|max|min"),
             )),
             None => Err(field_error(
                 format!("{path}.op"),
                 ValidationCode::FieldRange,
-                "an arith operand requires `op` (add|sub|mul|div)",
+                "an arith operand requires `op` (add|sub|mul|div|max|min)",
             )),
         }
     }
@@ -846,6 +854,7 @@ mod mapping {
     /// `SweepableValue::Fixed`; v1 constructs only `Fixed`). Period range (`> 0`)
     /// and the MACD `fast < slow` rule are enforced by the whole-document
     /// `validate()` at finalize — not reimplemented here.
+    #[allow(clippy::too_many_lines)] // one arm per indicator name: the name → variant table IS the function
     fn indicator_spec(operand: &Operand, path: &str) -> Result<IndicatorSpec, FieldError> {
         let indicator = operand.indicator.as_deref().ok_or_else(|| {
             field_error(
@@ -882,6 +891,19 @@ mod mapping {
             "lowest" => Ok(IndicatorSpec::Lowest {
                 period: fixed_period(operand, path)?,
                 source: price_field_or(operand.price_field.as_deref(), PriceField::Low, path)?,
+            }),
+            // The simple moving average (schema 1.5.0, r6.s1.w1): the field it
+            // averages comes from the operand's existing `price_field` (absent
+            // ⇒ close). `Operand.source` stays the operand-kind discriminator.
+            "sma" => Ok(IndicatorSpec::Sma {
+                period: fixed_period(operand, path)?,
+                source: price_field_or(operand.price_field.as_deref(), PriceField::Close, path)?,
+            }),
+            // WaveTrend's first line (schema 1.5.0, r6.s1.w2): two required
+            // lengths, `channel` (n1) and `average` (n2).
+            "wavetrend" => Ok(IndicatorSpec::WaveTrend {
+                channel: fixed_u32(operand.channel, &format!("{path}.channel"))?,
+                average: fixed_u32(operand.average, &format!("{path}.average"))?,
             }),
             // The structure indicators (r4.s6.w1): the pivot variants take
             // `left`/`right`, the level variants the same span plus
@@ -1123,6 +1145,7 @@ fn operand_schema() -> Value {
 
 /// One unroll level of the operand schema: the full property set, with
 /// `lhs` / `rhs` / `of` set to `nested`.
+#[allow(clippy::too_many_lines)] // one JSON property table: every operand field is one entry
 fn operand_schema_level(nested: &Value) -> Value {
     json!({
         "type": "object",
@@ -1134,7 +1157,7 @@ fn operand_schema_level(nested: &Value) -> Value {
             "indicator": {
                 "type": "string",
                 "enum": [
-                    "rsi", "ema", "adx", "macd", "atr", "highest", "lowest",
+                    "rsi", "ema", "adx", "macd", "atr", "sma", "wavetrend", "highest", "lowest",
                     "pivot_high", "pivot_low", "resistance", "support",
                     "double_top_neckline", "double_bottom_neckline",
                     "trendline_lows", "trendline_highs",
@@ -1162,6 +1185,16 @@ fn operand_schema_level(nested: &Value) -> Value {
             "fast": { "type": "integer", "minimum": 1 },
             "slow": { "type": "integer", "minimum": 1 },
             "signal": { "type": "integer", "minimum": 1 },
+            "channel": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "wavetrend only (required): the channel length n1, e.g. 9"
+            },
+            "average": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "wavetrend only (required): the average length n2, e.g. 12"
+            },
             "output": {
                 "type": "string",
                 "enum": ["line", "signal", "histogram"],
@@ -1170,13 +1203,13 @@ fn operand_schema_level(nested: &Value) -> Value {
             "price_field": {
                 "type": "string",
                 "enum": ["open", "high", "low", "close", "volume"],
-                "description": "highest/lowest default to high/low respectively; a price operand requires it"
+                "description": "highest/lowest default to high/low respectively and sma to close; a price operand requires it"
             },
             "value": { "type": "string", "description": "a decimal as a string, e.g. \"30\" (constant only)" },
             "op": {
                 "type": "string",
-                "enum": ["add", "sub", "mul", "div"],
-                "description": "arith only: the pointwise operation"
+                "enum": ["add", "sub", "mul", "div", "max", "min"],
+                "description": "arith only: the pointwise operation; max/min pick the larger/smaller of the two operands"
             },
             "lhs": nested,
             "rhs": nested,
@@ -1738,6 +1771,253 @@ mod tests {
                 "right": { "source": "constant", "value": "0" }
             }),
         ));
+    }
+
+    /// r6.s1.w1 (schema 1.5.0): `sma` (a `period`, the price field from
+    /// `price_field`, absent ⇒ close) and the `max`/`min` arith operations
+    /// compose through the tool surface into the typed document.
+    #[test]
+    fn sma_and_max_min_compose_through_the_tool_surface() {
+        use crate::domain::{
+            ArithOp, Condition, IndicatorSpec, PriceField, Series, SweepableValue, ValueSource,
+        };
+
+        let mut builder = StrategyBuilder::new();
+        assert_ok(create_strategy(
+            &mut builder,
+            json!({ "name": "close above the higher SMA", "direction": "long" }),
+        ));
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": {
+                    "source": "arith", "op": "max",
+                    "lhs": { "source": "indicator", "indicator": "sma", "period": 50 },
+                    "rhs": {
+                        "source": "indicator", "indicator": "sma", "period": 20,
+                        "price_field": "high"
+                    }
+                }
+            }),
+        ));
+        assert_ok(add_filter(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": {
+                    "source": "arith", "op": "min",
+                    "lhs": { "source": "indicator", "indicator": "ema", "period": 5 },
+                    "rhs": { "source": "indicator", "indicator": "ema", "period": 11 }
+                }
+            }),
+        ));
+        assert_ok(set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05" }),
+        ));
+        assert_ok(set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        ));
+        let validated = builder.finalize().expect("the strategy must validate");
+        let sma = |period: u32, source: PriceField| ValueSource::Indicator {
+            series: Series::Primary,
+            spec: IndicatorSpec::Sma {
+                period: SweepableValue::Fixed(period),
+                source,
+            },
+        };
+        let Condition::Compare { rhs, .. } = &validated.dsl().entry else {
+            panic!("the entry is a comparison");
+        };
+        assert_eq!(
+            *rhs,
+            ValueSource::Arith {
+                op: ArithOp::Max,
+                lhs: Box::new(sma(50, PriceField::Close)),
+                rhs: Box::new(sma(20, PriceField::High)),
+            },
+            "an absent price_field reads as close; `max` maps to ArithOp::Max"
+        );
+        let Condition::Compare { rhs, .. } = &validated.dsl().filters[0] else {
+            panic!("the filter is a comparison");
+        };
+        assert!(
+            matches!(
+                rhs,
+                ValueSource::Arith {
+                    op: ArithOp::Min,
+                    ..
+                }
+            ),
+            "`min` maps to ArithOp::Min, got {rhs:?}"
+        );
+    }
+
+    /// r6.s1.w1: a bad price field on an SMA is a correctable error pathed at
+    /// it, and an unknown arith op now lists `max|min`.
+    #[test]
+    fn sma_and_max_min_refusals_are_correctable() {
+        let mut builder = StrategyBuilder::new();
+        match add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "indicator", "indicator": "sma", "period": 5,
+                          "price_field": "midpoint" },
+                "op": "gt",
+                "right": { "source": "constant", "value": "1" }
+            }),
+        ) {
+            ToolOutcome::Err { errors } => assert!(
+                errors.iter().any(|e| e.path.starts_with("left")),
+                "pathed at the left operand: {errors:?}"
+            ),
+            ToolOutcome::Ok { .. } => panic!("an unknown price_field must be a correctable Err"),
+        }
+        match add_entry_signal(
+            &mut builder,
+            json!({
+                "left": {
+                    "source": "arith", "op": "avg",
+                    "lhs": { "source": "price", "price_field": "close" },
+                    "rhs": { "source": "price", "price_field": "open" }
+                },
+                "op": "gt",
+                "right": { "source": "constant", "value": "1" }
+            }),
+        ) {
+            ToolOutcome::Err { errors } => assert!(
+                errors
+                    .iter()
+                    .any(|e| e.message.contains("add|sub|mul|div|max|min")),
+                "the refusal lists max|min: {errors:?}"
+            ),
+            ToolOutcome::Ok { .. } => panic!("an unknown arith op must be a correctable Err"),
+        }
+    }
+
+    /// r6.s1.w2 (schema 1.5.0): `wavetrend` takes a `channel` and an `average`
+    /// and composes through the tool surface into the typed document, on the
+    /// primary and on the higher-timeframe series.
+    #[test]
+    fn wavetrend_composes_through_the_tool_surface() {
+        use crate::domain::{Condition, IndicatorSpec, Series, SweepableValue, ValueSource};
+
+        let mut builder = StrategyBuilder::new();
+        assert_ok(create_strategy(
+            &mut builder,
+            json!({ "name": "pullback under way", "direction": "long" }),
+        ));
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": {
+                    "source": "indicator", "indicator": "wavetrend",
+                    "channel": 9, "average": 12, "timeframe": "h4"
+                },
+                "op": "lt",
+                "right": { "source": "constant", "value": "0" }
+            }),
+        ));
+        assert_ok(add_filter(
+            &mut builder,
+            json!({
+                "left": {
+                    "source": "indicator", "indicator": "wavetrend",
+                    "channel": 10, "average": 21
+                },
+                "op": "gt",
+                "right": { "source": "constant", "value": "-60" }
+            }),
+        ));
+        assert_ok(set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05" }),
+        ));
+        assert_ok(set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        ));
+        let validated = builder.finalize().expect("the strategy must validate");
+        let Condition::Compare { lhs, .. } = &validated.dsl().entry else {
+            panic!("the entry is a comparison");
+        };
+        assert_eq!(
+            *lhs,
+            ValueSource::Indicator {
+                series: Series::Htf,
+                spec: IndicatorSpec::WaveTrend {
+                    channel: SweepableValue::Fixed(9),
+                    average: SweepableValue::Fixed(12),
+                },
+            },
+            "channel and average map to the variant's two lengths"
+        );
+        let Condition::Compare { lhs, .. } = &validated.dsl().filters[0] else {
+            panic!("the filter is a comparison");
+        };
+        assert!(
+            matches!(
+                lhs,
+                ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec: IndicatorSpec::WaveTrend { .. },
+                }
+            ),
+            "an absent timeframe is the primary series, got {lhs:?}"
+        );
+    }
+
+    /// r6.s1.w2: both `WaveTrend` lengths are required, and a missing one is a
+    /// correctable error pathed at that field; the advertised `indicator` enum
+    /// and the operand properties list the new kind.
+    #[test]
+    fn wavetrend_requires_both_lengths_and_is_advertised() {
+        let mut builder = StrategyBuilder::new();
+        for (operand, missing) in [
+            (
+                json!({ "source": "indicator", "indicator": "wavetrend", "average": 12 }),
+                "left.channel",
+            ),
+            (
+                json!({ "source": "indicator", "indicator": "wavetrend", "channel": 9 }),
+                "left.average",
+            ),
+        ] {
+            match add_entry_signal(
+                &mut builder,
+                json!({
+                    "left": operand,
+                    "op": "lt",
+                    "right": { "source": "constant", "value": "0" }
+                }),
+            ) {
+                ToolOutcome::Err { errors } => assert!(
+                    errors.iter().any(|e| e.path == missing),
+                    "pathed at {missing}: {errors:?}"
+                ),
+                ToolOutcome::Ok { .. } => panic!("a missing length must be a correctable Err"),
+            }
+        }
+
+        let schema = super::operand_schema_level(&json!({}));
+        let kinds = schema["properties"]["indicator"]["enum"]
+            .as_array()
+            .expect("the indicator enum");
+        assert!(
+            kinds.iter().any(|k| k == "wavetrend"),
+            "the indicator enum lists wavetrend: {kinds:?}"
+        );
+        for field in ["channel", "average"] {
+            assert_eq!(
+                schema["properties"][field]["minimum"],
+                json!(1),
+                "the operand schema advertises `{field}` as a positive integer"
+            );
+        }
     }
 
     /// AC-12: calling `set_risk_params` (and the other setters) BEFORE

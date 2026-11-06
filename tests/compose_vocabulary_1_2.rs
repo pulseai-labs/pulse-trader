@@ -512,8 +512,8 @@ async fn d47_journey_composes_arithmetic_slopes_and_d1_with_no_substitution() {
     // migrator into the same typed document (already-current, no migration).
     assert_eq!(
         version.dsl_schema_version.to_string(),
-        "1.4.0",
-        "the persisted version is stamped schema 1.4.0"
+        "1.5.0",
+        "the persisted version is stamped schema 1.5.0"
     );
     assert_eq!(version.dsl.schema_version, SchemaVersion::CURRENT);
     let loaded = Migrator::v1()
@@ -1223,7 +1223,9 @@ async fn advertised_tool_definitions_carry_the_expanded_vocabulary_without_refs(
             let indicators = props["indicator"]["enum"]
                 .as_array()
                 .expect("indicator enum is an array");
-            for kind in ["rsi", "ema", "adx", "macd", "atr", "highest", "lowest"] {
+            for kind in [
+                "rsi", "ema", "adx", "macd", "atr", "sma", "highest", "lowest",
+            ] {
                 assert!(
                     indicators.iter().any(|v| v == kind),
                     "{signal_tool}.{side} advertises {kind} in the indicator enum"
@@ -1236,7 +1238,7 @@ async fn advertised_tool_definitions_carry_the_expanded_vocabulary_without_refs(
             );
             assert_eq!(
                 props["op"]["enum"],
-                json!(["add", "sub", "mul", "div"]),
+                json!(["add", "sub", "mul", "div", "max", "min"]),
                 "{signal_tool}.{side} advertises the arith op enum"
             );
             assert!(
