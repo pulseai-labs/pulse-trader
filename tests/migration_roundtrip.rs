@@ -11,8 +11,9 @@
 //! `llm_call.key_source` provenance column, r1.s1.w2) and `0008` (the coach
 //! lifecycle rebuild of the two coaching tables, r1.s4.w4), `0009` (the
 //! external-agent provenance + run-window contract, r2.s1.w1) and `0010` (the
-//! window-edge open-position mark, r2.s1 G1); the embedded max is therefore 23 (r5.s5.w1 `0022` — the
-//! power review, ADR-0032; r6.s2.w3 `0023` — the setup trace on `trade`, ADR-0033)
+//! window-edge open-position mark, r2.s1 G1); the embedded max is therefore 24 (r5.s5.w1 `0022` — the
+//! power review, ADR-0032; r6.s2.w3 `0023` — the setup trace on `trade`, ADR-0033; r6.s2.w4 `0024` —
+//! the structure-stop skip count on `backtest_run`, ADR-0033)
 //! (r2.s2.w2 `0011`, r2.s3.w2 `0012`, r2.s3.w3 `0013`, r2.s3.w4 `0014`, and
 //! r3.s3.w1 `0016` — the client-token tables; `0015` is reserved for r3.s1;
 //! r3.s2.w4 `0017` — `backtest_run.d1_data_version`, the recorded daily snapshot;
@@ -111,8 +112,8 @@ async fn migrate_up_then_undo_is_reversible() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        23,
-        "migrated to embedded max (23)"
+        24,
+        "migrated to embedded max (24)"
     );
     assert!(
         object_present(db.pool(), "table", "strategy").await,
@@ -140,7 +141,7 @@ async fn migrate_up_then_undo_is_reversible() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         index_present(db.pool()).await,
         "after re-run, 0002 index back"
@@ -172,7 +173,7 @@ async fn backup_written_before_migrate() {
     match outcome {
         pulse::MigrationOutcome::Migrated { from, to, backup } => {
             assert_eq!(from, 1, "from == the pre-migration version");
-            assert_eq!(to, 23, "to == the embedded max");
+            assert_eq!(to, 24, "to == the embedded max");
             assert!(backup.exists(), "backup file exists: {}", backup.display());
             let name = backup.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
@@ -187,7 +188,7 @@ async fn backup_written_before_migrate() {
 
     // The migration completed to the embedded max.
     let db = Db::with_path(&path).await.expect("reopen migrated db");
-    assert_eq!(applied_max(db.pool()).await, 23, "schema now at 0023");
+    assert_eq!(applied_max(db.pool()).await, 24, "schema now at 0024");
     assert!(
         index_present(db.pool()).await,
         "0002 index present post-migrate"
@@ -218,8 +219,8 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        23,
-        "migrated to embedded max (23)"
+        24,
+        "migrated to embedded max (24)"
     );
     assert!(
         schema_0003_present(db.pool()).await,
@@ -256,7 +257,7 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         schema_0003_present(db.pool()).await,
         "after re-run, 0003 backtest_run + trade tables and both indexes back"
@@ -288,8 +289,8 @@ async fn migration_0004_llm_call_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        23,
-        "migrated to embedded max (23)"
+        24,
+        "migrated to embedded max (24)"
     );
     assert!(
         schema_0004_present(db.pool()).await,
@@ -322,7 +323,7 @@ async fn migration_0004_llm_call_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         schema_0004_present(db.pool()).await,
         "after re-run, 0004 llm_call table + triggers + index back"
@@ -420,7 +421,7 @@ async fn migration_0011_trade_stop_price_roundtrip() {
         .expect("migrate to embedded max");
 
     // (a) At the embedded max the column exists.
-    assert_eq!(applied_max(db.pool()).await, 23, "embedded max is 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "embedded max is 24");
     assert!(
         stop_price_column_present(db.pool()).await,
         "trade.stop_price exists after up"
@@ -443,7 +444,7 @@ async fn migration_0011_trade_stop_price_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         stop_price_column_present(db.pool()).await,
         "after re-run, trade.stop_price is back"
@@ -551,7 +552,7 @@ async fn migration_0019_certification_freeze_roundtrip() {
         .expect("migrate to embedded max");
 
     // (a) At the embedded max the table is present.
-    assert_eq!(applied_max(db.pool()).await, 23, "embedded max is 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "embedded max is 24");
     assert!(
         object_present(db.pool(), "table", "certification_freeze").await,
         "certification_freeze exists after up"
@@ -572,7 +573,7 @@ async fn migration_0019_certification_freeze_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         object_present(db.pool(), "table", "certification_freeze").await,
         "after re-run, certification_freeze is back"
@@ -648,7 +649,7 @@ async fn migration_0020_certification_roundtrip() {
         .expect("migrate to embedded max");
 
     // (a) At the embedded max the table and its two laws are present.
-    assert_eq!(applied_max(db.pool()).await, 23, "embedded max is 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "embedded max is 24");
     assert!(
         object_present(db.pool(), "table", "certification").await,
         "certification exists after up"
@@ -677,7 +678,7 @@ async fn migration_0020_certification_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         object_present(db.pool(), "table", "certification").await,
         "after re-run, certification is back"
@@ -784,7 +785,7 @@ async fn migration_0021_example_marks_roundtrip() {
         .expect("migrate to embedded max");
 
     // (a) At the embedded max both tables and their four laws are present.
-    assert_eq!(applied_max(db.pool()).await, 23, "embedded max is 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "embedded max is 24");
     assert!(
         object_present(db.pool(), "table", "example_mark").await,
         "example_mark exists after up"
@@ -820,12 +821,12 @@ async fn migration_0021_example_marks_roundtrip() {
         "after undo to 20, both mark tables are gone"
     );
 
-    // (c) Re-running brings 0021 back (reversible round): 20 → 23.
+    // (c) Re-running brings 0021 back (reversible round): 20 → 24.
     MIGRATOR
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         object_present(db.pool(), "table", "example_mark").await,
         "after re-run, example_mark is back"
@@ -865,11 +866,11 @@ async fn migration_0021_down_refuses_a_mark_row() {
         "the refusal names the migration and the state: {err}"
     );
     // The refused down is transactional PER MIGRATION: sqlx reverts each migration in its own transaction,
-    // so the (empty) downs of `0023` and `0022` committed first and `0021`'s then refused — the schema stands at 21, not 23.
+    // so the (empty) downs of `0024`, `0023` and `0022` committed first and `0021`'s then refused — the schema stands at 21, not 24.
     assert_eq!(
         applied_max(db.pool()).await,
         21,
-        "0023's and 0022's empty downs applied; the refused 0021 down left the schema at 0021"
+        "0024's, 0023's and 0022's empty downs applied; the refused 0021 down left the schema at 0021"
     );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM example_mark")
         .fetch_one(db.pool())
@@ -925,7 +926,7 @@ async fn migration_0022_power_review_roundtrip() {
         .run(db.pool())
         .await
         .expect("migrate to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "embedded max is 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "embedded max is 24");
     assert!(
         object_present(db.pool(), "table", "power_review").await,
         "power_review exists after up"
@@ -954,7 +955,7 @@ async fn migration_0022_power_review_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     assert!(
         object_present(db.pool(), "table", "power_review").await,
         "after re-run, power_review is back"
@@ -1000,7 +1001,7 @@ async fn migration_0022_down_refuses_a_power_review_row() {
     assert_eq!(
         applied_max(db.pool()).await,
         22,
-        "0023's empty down applied; the refused 0022 down left the schema at 0022"
+        "0024's and 0023's empty downs applied; the refused 0022 down left the schema at 0022"
     );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM power_review")
         .fetch_one(db.pool())
@@ -1041,7 +1042,7 @@ async fn migration_0023_trade_setup_trace_roundtrip() {
         .run(db.pool())
         .await
         .expect("migrate to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "embedded max is 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "embedded max is 24");
     for column in TRACE_COLUMNS {
         assert!(
             trade_column_present(db.pool(), column).await,
@@ -1066,7 +1067,7 @@ async fn migration_0023_trade_setup_trace_roundtrip() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 23, "after re-run, max == 23");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
     for column in TRACE_COLUMNS {
         assert!(
             trade_column_present(db.pool(), column).await,
@@ -1113,7 +1114,7 @@ async fn migration_0023_down_refuses_a_setup_trace() {
     assert_eq!(
         applied_max(db.pool()).await,
         23,
-        "the refused down left the schema at the embedded max"
+        "0024's empty down applied; the refused 0023 down left the schema at 0023"
     );
     for column in TRACE_COLUMNS {
         assert!(
@@ -1121,4 +1122,116 @@ async fn migration_0023_down_refuses_a_setup_trace() {
             "the refused down left trade.{column} in place"
         );
     }
+}
+
+// ---- r6.s2.w4: the 0024 backtest_run skipped_stop_beyond_fill column ---------
+
+/// Whether `backtest_run` has the column `skipped_stop_beyond_fill` (a `PRAGMA table_info` probe).
+async fn skip_column_present(pool: &SqlitePool) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('backtest_run') \
+         WHERE name = 'skipped_stop_beyond_fill'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    n == 1
+}
+
+/// r6.s2.w4 / AC-2: `0024` adds the nullable `skipped_stop_beyond_fill` column to `backtest_run`.
+/// Undoing it over NULL-only history (every row written before it) is lossless and restores the
+/// exact 0023 shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0024_run_skip_count_roundtrip() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+    assert_eq!(applied_max(db.pool()).await, 24, "embedded max is 24");
+    assert!(
+        skip_column_present(db.pool()).await,
+        "backtest_run.skipped_stop_beyond_fill exists after up"
+    );
+
+    // A run without a count (the pre-0024 shape: the column holds NULL) survives the down.
+    seed_run_with_trade(db.pool(), None, "hash").await;
+    undo_to(db.pool(), 23)
+        .await
+        .expect("a NULL-count history downgrades losslessly");
+    assert_eq!(applied_max(db.pool()).await, 23, "after undo, max == 23");
+    assert!(
+        !skip_column_present(db.pool()).await,
+        "after undo to 23, the column is gone"
+    );
+
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("re-run to embedded max");
+    assert_eq!(applied_max(db.pool()).await, 24, "after re-run, max == 24");
+    assert!(
+        skip_column_present(db.pool()).await,
+        "after re-run, the column is back"
+    );
+}
+
+/// r6.s2.w4: the `0024` down REFUSES over a run holding a non-zero count — 0023 has no column for
+/// it, and the run's stored hash would no longer re-derive (ADR-0018). A zero count downgrades.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0024_down_refuses_a_skip_count() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+    seed_run_with_trade(db.pool(), None, "hash").await;
+    let insert_run = |id: &'static str, count: i64| {
+        sqlx::query(
+            "INSERT INTO backtest_run \
+             (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+              engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+              funding_total, slippage_total, expectancy, trade_count, wins, losses, \
+              breakeven, max_win_streak, max_loss_streak, skipped_sub_lot, \
+              skipped_sub_notional, skipped_leverage_capped, skipped_stop_beyond_fill, \
+              pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+              funding_config) \
+             VALUES (?1, 'ver-1', 1, '2026-06-30T00:00:00.000Z', 'fp', 'tgt', \
+                     'hash', '10000', '0', '0', '0', '0', '0', 0, 0, 0, 0, 0, 0, 0, 0, 0, ?2, \
+                     'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
+        )
+        .bind(id)
+        .bind(count)
+    };
+    insert_run("run-zero", 0)
+        .execute(db.pool())
+        .await
+        .expect("seed a run with a zero count");
+    insert_run("run-skipped", 1)
+        .execute(db.pool())
+        .await
+        .expect("seed a run with a count of 1");
+
+    let err = undo_to(db.pool(), 23)
+        .await
+        .expect_err("a non-zero count must refuse the 0024 down");
+    assert!(
+        err.to_string().contains("0024") && err.to_string().contains("refus"),
+        "the refusal names the migration and the state: {err}"
+    );
+    assert_eq!(
+        applied_max(db.pool()).await,
+        24,
+        "the refused down left the schema at the embedded max"
+    );
+    assert!(
+        skip_column_present(db.pool()).await,
+        "the refused down left the column in place"
+    );
 }

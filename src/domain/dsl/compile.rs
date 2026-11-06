@@ -454,6 +454,16 @@ impl CompiledStrategy {
         &self.entry
     }
 
+    /// A copy with the setup removed (r6.s2.w4). Test-only: `validate` refuses a
+    /// `StructureStop` without a setup (rule S4), so this is the one way to reach
+    /// the engine's own defence against that shape.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn without_setup(mut self) -> Self {
+        self.setup = None;
+        self
+    }
+
     /// The compiled exit rules.
     #[must_use]
     pub fn exits(&self) -> &[CompiledExit] {

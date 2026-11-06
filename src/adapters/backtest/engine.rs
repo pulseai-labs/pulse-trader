@@ -443,13 +443,13 @@ pub(super) fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -
             },
             lag: 0,
         }),
-        StopRule::Pct(_) => None,
+        StopRule::Pct(_) | StopRule::Structure { .. } => None,
     }
 }
 
-/// How a position's stop is derived (r2.s2.w2): either the fixed-fraction
-/// `StopLoss` distance or the `AtrStop`'s `multiple × ATR(period)` frozen at
-/// the signal bar.
+/// How a position's stop is derived (r2.s2.w2): the fixed-fraction `StopLoss`
+/// distance, the `AtrStop`'s `multiple × ATR(period)` frozen at the signal bar,
+/// or the setup's structure level (r6.s2.w4).
 #[derive(Debug, Clone, Copy)]
 pub(super) enum StopRule {
     /// `entry × (1 ∓ distance_pct)` — the stop distance in price units is
@@ -462,6 +462,12 @@ pub(super) enum StopRule {
         period: u32,
         /// The ATR multiple.
         multiple: Decimal,
+    },
+    /// The setup's stop-window extreme pushed out by `buffer_pct`, ADR-0033
+    /// decision 6. The extreme comes from the fired setup side (`SetupFire.extreme`).
+    Structure {
+        /// The fraction the stop sits beyond the window's extreme.
+        buffer_pct: Decimal,
     },
 }
 
@@ -569,18 +575,6 @@ pub(super) struct ExitPlan {
 
 impl ExitPlan {
     pub(super) fn from_strategy(compiled: &CompiledStrategy) -> Result<Self, BacktestError> {
-        // r6.s2.w1 (ADR-0033): the structure stop's level comes from a setup's
-        // stop window, which the engine does not track yet. Refuse it by name
-        // before any other plan check; r6.s2.w4 removes this refusal.
-        if compiled
-            .exits()
-            .iter()
-            .any(|exit| matches!(exit, CompiledExit::StructureStop { .. }))
-        {
-            return Err(BacktestError::UnsupportedExit(
-                "StructureStop (r6.s2.w4)".to_owned(),
-            ));
-        }
         let trail_pct = compiled.exits().iter().find_map(|exit| match exit {
             CompiledExit::TrailingStop { trail_pct } => Some(*trail_pct),
             _ => None,
@@ -600,6 +594,15 @@ impl ExitPlan {
         let stop = family_stop
             .or_else(|| trail_pct.map(StopRule::Pct))
             .ok_or(BacktestError::NoStopLoss)?;
+        // r6.s2.w4 (ADR-0033 decision 6): the structure stop's level is the
+        // fired setup side's stop-window extreme. Without a setup there is no
+        // window; validation rule S4 refuses that strategy, and this is the
+        // engine's defence.
+        if matches!(stop, StopRule::Structure { .. }) && compiled.setup().is_none() {
+            return Err(BacktestError::UnsupportedExit(
+                "StructureStop without a setup".to_owned(),
+            ));
+        }
         let trail_only = family_stop.is_none();
         let take_profit_target_r = take_profit_target(compiled.exits());
         // The short-TP impossibility check is plan-time only for the
@@ -962,7 +965,34 @@ pub(super) fn prepare_pending_fill(
             };
             atr_stop_price(entry_price, atr, multiple, direction)
         }
+        // The stop-window extreme of the fired setup side, pushed out by the
+        // buffer (r6.s2.w4, ADR-0033 decision 6). A pending entry with no
+        // setup cannot reach here (`from_strategy` refuses the plan), so skip
+        // rather than invent a stop.
+        StopRule::Structure { buffer_pct } => {
+            let Some(fire) = pending.setup else {
+                return Ok(PreparedFill::Consume { skipped: None });
+            };
+            match pending.direction {
+                Direction::Long => fire.extreme * (Decimal::ONE - buffer_pct),
+                Direction::Short => fire.extreme * (Decimal::ONE + buffer_pct),
+            }
+        }
     };
+    // A structure stop the fill price has already reached is a skipped entry,
+    // not a failed run: the next bar opened at or past the level (r6.s2.w4).
+    // This runs BEFORE the geometry guard below, which stays unchanged and
+    // still fails the whole run for every other shape.
+    if matches!(plan.stop, StopRule::Structure { .. })
+        && match direction {
+            Direction::Long => stop >= entry_price,
+            Direction::Short => stop <= entry_price,
+        }
+    {
+        return Ok(PreparedFill::Consume {
+            skipped: Some(SkipReason::StopBeyondFill),
+        });
+    }
     // r2.s2 round-3 fix: the F4 geometry guard hoisted out of the `Atr` arm — it
     // must reject a zero stop DISTANCE too, not only a non-positive price. A
     // flat series (`high == low == prev_close` on every bar) drives the frozen
@@ -1017,7 +1047,9 @@ pub(super) fn prepare_pending_fill(
                 target,
                 direction,
             )),
-            StopRule::Atr { .. } => atr_take_profit_price(entry_price, stop, target, direction),
+            StopRule::Atr { .. } | StopRule::Structure { .. } => {
+                atr_take_profit_price(entry_price, stop, target, direction)
+            }
         })
         .transpose()?;
     Ok(PreparedFill::Open(PreparedEntry {
@@ -1584,6 +1616,9 @@ fn stop_rule(exits: &[CompiledExit]) -> Option<StopRule> {
             period: *period,
             multiple: *multiple,
         }),
+        CompiledExit::StructureStop { buffer_pct } => Some(StopRule::Structure {
+            buffer_pct: *buffer_pct,
+        }),
         _ => None,
     })
 }
@@ -1648,8 +1683,9 @@ fn reject_impossible_short_tp(
     Ok(())
 }
 
-/// ATR-stop take-profit: `entry ± target_r × |entry − stop|` — the same 1R
-/// distance a fixed-fraction stop uses, measured against the frozen ATR stop.
+/// Take-profit for every absolute stop (the ATR stop and the structure stop):
+/// `entry ± target_r × |entry − stop|` — the same 1R distance a fixed-fraction
+/// stop uses, measured against the stop frozen at the fill.
 /// The short variant can resolve to a non-positive price (the plan-time
 /// `reject_impossible_short_tp` cannot see the ATR distance), so the typed
 /// check lives here at fill time (r2.s2.w2).
@@ -2235,9 +2271,10 @@ mod tests {
         assert_eq!(err, BacktestError::NoStopLoss);
     }
 
-    /// r6.s2.w1 (ADR-0033): a `StructureStop` is refused by name until its level
-    /// is built (r6.s2.w4) — before any stop-family check, so it is never read
-    /// as a missing stop.
+    /// r6.s2.w4 (ADR-0033): a `StructureStop` needs the setup whose stop window
+    /// gives it a level. Validation rule S4 refuses the document; this is the
+    /// engine's own defence, so the plan is refused by name and never read as a
+    /// missing stop. (The name is w1's, kept; w1 refused every `StructureStop`.)
     #[test]
     fn structure_stop_refused_until_w4() {
         let setup_side = || SetupSide {
@@ -2265,10 +2302,15 @@ mod tests {
                 short: None,
             })),
         };
-        let strategy = compile(&validate(&dsl).unwrap()).unwrap();
+        let with_setup = compile(&validate(&dsl).unwrap()).unwrap();
+        ExitPlan::from_strategy(&with_setup).expect("a structure stop with a setup plans");
+
+        // Rule S4 refuses a `StructureStop` document without a setup, so the strategy is
+        // compiled with its setup and then stripped.
+        let without_setup = with_setup.without_setup();
         assert_eq!(
-            ExitPlan::from_strategy(&strategy).unwrap_err(),
-            BacktestError::UnsupportedExit("StructureStop (r6.s2.w4)".to_owned())
+            ExitPlan::from_strategy(&without_setup).unwrap_err(),
+            BacktestError::UnsupportedExit("StructureStop without a setup".to_owned())
         );
     }
 

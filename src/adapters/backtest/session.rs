@@ -147,7 +147,7 @@ impl EngineSession {
     ///
     /// [`BacktestError::InvalidConfig`], [`BacktestError::FundingIntervalUnknown`],
     /// [`BacktestError::NoStopLoss`], [`BacktestError::ImpossibleTakeProfit`],
-    /// [`BacktestError::UnsupportedExit`] (a `StructureStop` until r6.s2.w4),
+    /// [`BacktestError::UnsupportedExit`] (a `StructureStop` without a setup),
     /// [`BacktestError::EngineInit`].
     pub fn new(
         compiled: &CompiledStrategy,

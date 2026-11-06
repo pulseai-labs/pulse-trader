@@ -190,6 +190,13 @@ impl BacktestResult {
         feed_usize(hasher, result.skipped_entries.sub_lot);
         feed_usize(hasher, result.skipped_entries.sub_notional);
         feed_usize(hasher, result.skipped_entries.leverage_capped);
+        // r6.s2.w4 (ADR-0033): the structure-stop skip count feeds the hash
+        // CONDITIONALLY — zero writes nothing, so every run without such a skip
+        // re-derives the byte stream it hashed under before the count existed.
+        if result.skipped_entries.stop_beyond_fill > 0 {
+            hasher.update([0x42]);
+            feed_usize(hasher, result.skipped_entries.stop_beyond_fill);
+        }
         // r2.s1 G1(b): the window-edge open-position mark is run output, so a
         // `Some` mark feeds into the hash — a tampered `open_position` column
         // then fails the #39 re-derive-on-read guard. The feed is CONDITIONAL:
