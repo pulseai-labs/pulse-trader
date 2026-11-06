@@ -47,17 +47,18 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::adapters::backtest::{
-    BacktestConfig, EngineSession, EvalProbe, SessionTimeframes, indicator_values_at, step_series,
+    BacktestConfig, EngineSession, EvalProbe, SessionTimeframes, SetupEvent, SetupFire, SetupPhase,
+    SideState, indicator_values_at, step_series,
 };
 use crate::application::mcp_read::CANDLE_PATTERNS;
 use crate::domain::dsl::ArithSpelling;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    CandleSeries, CandleSeriesRepository, CompiledCondition, CompiledStrategy, CompiledValue,
-    Condition, DataError, Direction, ExampleMark, ExampleMarkRepository, ExchangeAdapter,
-    HoldoutFreeze, IndicatorSpec, MarkError, MarkFilter, MarkSide, Migrator, Pair, Series,
-    StrategyDsl, StrategyRepository, SymbolFilters, Timeframe, ValueSource, check_unknown_fields,
-    compile, validate,
+    CandleSeries, CandleSeriesRepository, CompiledCondition, CompiledSetupSide, CompiledStrategy,
+    CompiledValue, Condition, DataError, Direction, ExampleMark, ExampleMarkRepository,
+    ExchangeAdapter, HoldoutFreeze, IndicatorSpec, MarkError, MarkFilter, MarkSide, Migrator, Pair,
+    Series, SetupSide, StrategyDsl, StrategyRepository, SymbolFilters, Timeframe, ValueSource,
+    check_unknown_fields, compile, validate,
 };
 
 /// How many conjuncts one explanation carries, at most — a bound on the
@@ -128,6 +129,48 @@ pub struct ConjunctReport {
     /// The operand values behind the answer. Empty while `not_warm`, because a
     /// partial history would report numbers the gate never saw.
     pub operands: Vec<OperandReport>,
+}
+
+/// One setup side at the evaluation bar (r6.s2.w5, ADR-0033): where it stands, what
+/// happened on this bar, its open setup's times, its last fire, and its conditions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetupReport {
+    /// `long` or `short`: the mark's side.
+    pub side: &'static str,
+    /// After this bar: `idle`, `armed` or `dipped`.
+    pub phase: SetupPhase,
+    /// What happened on this bar: `armed`, `dipped`, `triggered`, `expired`, or null.
+    pub event: Option<SetupEvent>,
+    /// The open setup's arm, dip and anchor bars' close times (RFC 3339 UTC ms, the
+    /// `rfc3339_ms` spelling); null when idle or not yet reached.
+    pub armed_at: Option<String>,
+    /// The open setup's dip bar close time; null when idle or not yet dipped.
+    pub dipped_at: Option<String>,
+    /// The open setup's stop-anchor bar close time; null when idle or not yet anchored.
+    pub anchored_at: Option<String>,
+    /// The side's most recent fire at or before this bar.
+    pub last_trigger: Option<TriggerReport>,
+    /// The side's conditions at this bar: each of `arm`, `dip`, `trigger` and
+    /// `stop_anchor` flattened by its top-level `And`, exactly as `entry ∧ filters` is
+    /// flattened, with `source` `setup.<side>.arm` (…`.dip`, `.trigger`, `.stop_anchor`)
+    /// and `index` counting from 0 across the list.
+    pub conditions: Vec<ConjunctReport>,
+}
+
+/// A setup side's fire: the times of the setup that led to it and the stop window's
+/// extreme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TriggerReport {
+    /// The arm bar's close time.
+    pub armed_at: String,
+    /// The dip bar's close time.
+    pub dipped_at: String,
+    /// The stop-anchor bar's close time, when one was found.
+    pub anchored_at: Option<String>,
+    /// The trigger bar's close time.
+    pub triggered_at: String,
+    /// The stop window's extreme at the fire, an exact decimal string.
+    pub stop_extreme: String,
 }
 
 /// One candle-pattern value at the mark's own candle.
@@ -231,11 +274,17 @@ pub struct MarkExplanation {
     /// spelling w1's `mark_json` uses. The mark's own bar for a `15m` mark, else
     /// the first `15m` bar opening at its candle's close.
     pub evaluation_bar: String,
-    /// Whether the rule's direction allows this mark's side.
+    /// Whether the rule's direction allows this mark's side. For a rule with a setup:
+    /// whether the setup declares the mark's side.
     pub side_matches: bool,
     /// Every conjunct of `entry ∧ filters`, in declared order.
     pub conjuncts: Vec<ConjunctReport>,
-    /// Every conjunct held AND the side matching — the mark's own verdict.
+    /// The mark's side of the rule's setup at the evaluation bar; absent when the rule
+    /// has no setup or no side for the mark's side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupReport>,
+    /// Every conjunct held AND the side matching — the mark's own verdict. For a rule
+    /// with a setup: the mark's side is declared and fired on the evaluation bar.
     pub all_held: bool,
     /// The 17 candle-pattern values at the mark's own candle and timeframe.
     pub patterns: Vec<PatternReport>,
@@ -361,6 +410,8 @@ where
 
     // 2. The conjuncts, flattened on both sides in the same order.
     let conjuncts = flatten(&dsl, &compiled)?;
+    // The setup's side conditions, flattened the same way (r6.s2.w5).
+    let setup_plan = flatten_setup(&dsl, &compiled)?;
 
     // 3. The marks, gathered through the port (withdrawn marks absent, a
     //    freeze's covered marks hidden and counted).
@@ -404,6 +455,7 @@ where
             exchange,
             freeze,
             &conjuncts,
+            setup_plan.as_ref(),
             &pair_marks,
             &evaluation,
         )?;
@@ -411,7 +463,7 @@ where
             let Some(eval_ms) = evaluation.get(&mark.id).copied() else {
                 continue;
             };
-            match pass.explain(mark, eval_ms, &conjuncts, direction) {
+            match pass.explain(mark, eval_ms, &conjuncts, setup_plan.as_ref(), direction) {
                 Ok(explanation) => explained.push(explanation),
                 Err(reason) => refusals.push(MarkRefusal {
                     mark_id: mark.id.clone(),
@@ -584,6 +636,126 @@ fn push_compiled<'a>(condition: &'a CompiledCondition, out: &mut Vec<&'a Compile
         }
         other => out.push(other),
     }
+}
+
+/// One setup side's conditions, flattened and paired like [`Conjunct`]s.
+struct SideConjuncts {
+    /// `long` or `short`.
+    side: &'static str,
+    /// `arm`, `dip`, `trigger` and `stop_anchor` conditions in that order, each
+    /// flattened by its top-level `And`, with `source` `setup.<side>.<part>`.
+    conjuncts: Vec<Conjunct>,
+}
+
+/// The conditions of the sides a rule's setup declares (r6.s2.w5, ADR-0033).
+struct SetupPlan {
+    long: Option<SideConjuncts>,
+    short: Option<SideConjuncts>,
+}
+
+impl SetupPlan {
+    /// The conditions of the mark's side, when the setup declares it.
+    fn side(&self, side: MarkSide) -> Option<&SideConjuncts> {
+        match side {
+            MarkSide::Long => self.long.as_ref(),
+            MarkSide::Short => self.short.as_ref(),
+        }
+    }
+}
+
+/// Flatten each declared setup side. `None` for a rule with no setup.
+fn flatten_setup(
+    dsl: &StrategyDsl,
+    compiled: &CompiledStrategy,
+) -> Result<Option<SetupPlan>, ExplainError> {
+    let (Some(dsl_setup), Some(compiled_setup)) = (dsl.setup.as_ref(), compiled.setup()) else {
+        return Ok(None);
+    };
+    Ok(Some(SetupPlan {
+        long: dsl_setup
+            .long
+            .as_ref()
+            .zip(compiled_setup.long.as_ref())
+            .map(|(side, compiled_side)| flatten_side("long", side, compiled_side))
+            .transpose()?,
+        short: dsl_setup
+            .short
+            .as_ref()
+            .zip(compiled_setup.short.as_ref())
+            .map(|(side, compiled_side)| flatten_side("short", side, compiled_side))
+            .transpose()?,
+    }))
+}
+
+/// The `source` of one side condition: `setup.<side>.<part>`.
+fn side_source(side: &str, part: &str) -> &'static str {
+    match (side, part) {
+        ("long", "arm") => "setup.long.arm",
+        ("long", "dip") => "setup.long.dip",
+        ("long", "trigger") => "setup.long.trigger",
+        ("long", _) => "setup.long.stop_anchor",
+        (_, "arm") => "setup.short.arm",
+        (_, "dip") => "setup.short.dip",
+        (_, "trigger") => "setup.short.trigger",
+        (_, _) => "setup.short.stop_anchor",
+    }
+}
+
+/// One side's conditions (`arm`, `dip`, `trigger`, then `stop_anchor` when declared),
+/// flattened on the DSL and the compiled side alike.
+fn flatten_side(
+    side: &'static str,
+    dsl: &SetupSide,
+    compiled: &CompiledSetupSide,
+) -> Result<SideConjuncts, ExplainError> {
+    let mut parts: Vec<(&'static str, &Condition, &CompiledCondition)> = vec![
+        (side_source(side, "arm"), &dsl.arm, &compiled.arm),
+        (side_source(side, "dip"), &dsl.dip, &compiled.dip),
+        (
+            side_source(side, "trigger"),
+            &dsl.trigger,
+            &compiled.trigger,
+        ),
+    ];
+    if let Some((anchor, compiled_anchor)) =
+        dsl.stop_anchor.as_ref().zip(compiled.stop_anchor.as_ref())
+    {
+        parts.push((side_source(side, "stop_anchor"), anchor, compiled_anchor));
+    }
+
+    let mut conjuncts: Vec<Conjunct> = Vec::new();
+    for (source, condition, compiled_condition) in parts {
+        let mut dsl_parts: Vec<(&'static str, &Condition)> = Vec::new();
+        push_dsl(condition, source, &mut dsl_parts);
+        let mut compiled_parts: Vec<&CompiledCondition> = Vec::new();
+        push_compiled(compiled_condition, &mut compiled_parts);
+        if dsl_parts.len() != compiled_parts.len() {
+            // Unreachable while `compile` maps `And` shape-preservingly.
+            return Err(ExplainError::Rule(format!(
+                "the {source} condition's {} DSL conjuncts do not pair with its {} compiled ones",
+                dsl_parts.len(),
+                compiled_parts.len()
+            )));
+        }
+        for ((source, part), compiled_part) in dsl_parts.into_iter().zip(compiled_parts) {
+            conjuncts.push(Conjunct {
+                source,
+                dsl: serde_json::to_value(part).unwrap_or(serde_json::Value::Null),
+                operands: operand_pairs(part, compiled_part),
+                compiled: compiled_part.clone(),
+            });
+        }
+    }
+    if conjuncts.len() > MAX_CONJUNCTS {
+        return Err(ExplainError::Field {
+            path: "dsl",
+            message: format!(
+                "a setup side may carry at most {MAX_CONJUNCTS} conditions, got {}",
+                conjuncts.len()
+            ),
+        });
+    }
+    Ok(SideConjuncts { side, conjuncts })
 }
 
 /// The validator's every field error as text — the SAME shape
@@ -860,6 +1032,26 @@ struct BarReading {
     states: Vec<&'static str>,
     /// One operand list per conjunct, flattened in the request's order.
     operands: Vec<Vec<OperandReport>>,
+    /// The setup's sides at this bar; `None` for a rule with no setup.
+    setup: Option<SetupReading>,
+}
+
+/// What one bar's probe answered for the setup's declared sides (r6.s2.w5).
+#[derive(Clone)]
+struct SetupReading {
+    long: Option<SideReading>,
+    short: Option<SideReading>,
+}
+
+/// One side's state and condition readings at a bar.
+#[derive(Clone)]
+struct SideReading {
+    /// The side's state after the bar.
+    state: SideState,
+    /// One state per side condition, in the plan's order.
+    states: Vec<&'static str>,
+    /// One operand list per side condition, in the plan's order.
+    operands: Vec<Vec<OperandReport>>,
 }
 
 impl PairPass {
@@ -871,6 +1063,7 @@ impl PairPass {
         exchange: &X,
         freeze: Option<HoldoutFreeze>,
         conjuncts: &[Conjunct],
+        setup: Option<&SetupPlan>,
         marks: &[ExampleMark],
         evaluation: &BTreeMap<String, i64>,
     ) -> Result<Self, ExplainError>
@@ -922,7 +1115,8 @@ impl PairPass {
                 if sharing.is_empty() {
                     return;
                 }
-                let reading = read_bar(probe, conjuncts, &wanted, &specs, open_ms);
+                let mut reading = read_bar(probe, conjuncts, &wanted, &specs, open_ms);
+                reading.setup = setup.and_then(|plan| read_setup(probe, plan));
                 for mark_id in sharing {
                     bars.insert(mark_id, reading.clone());
                 }
@@ -981,6 +1175,7 @@ impl PairPass {
         mark: &ExampleMark,
         evaluation_bar_ms: i64,
         conjuncts: &[Conjunct],
+        setup: Option<&SetupPlan>,
         direction: Direction,
     ) -> Result<MarkExplanation, &'static str> {
         let Some(reading) = self.bars.get(&mark.id) else {
@@ -1004,16 +1199,34 @@ impl PairPass {
             })
             .collect::<Vec<_>>();
 
-        let side_matches = matches!(
-            (direction, mark.side),
-            (Direction::Long, MarkSide::Long) | (Direction::Short, MarkSide::Short)
-        );
-        let all_held = side_matches && reports.iter().all(|report| report.state == "held");
+        // A rule with a setup is stateful: its sides, not its direction, say which
+        // marks it takes, and a mark's verdict is a fire on its own bar.
+        let (side_matches, all_held, setup_report) = if let Some(plan) = setup {
+            let side = plan.side(mark.side);
+            let side_reading = reading.setup.as_ref().and_then(|setup| match mark.side {
+                MarkSide::Long => setup.long.as_ref(),
+                MarkSide::Short => setup.short.as_ref(),
+            });
+            let report = side
+                .zip(side_reading)
+                .map(|(side, read)| setup_report(side, read));
+            let fired =
+                side_reading.is_some_and(|read| read.state.event == Some(SetupEvent::Triggered));
+            (side.is_some(), side.is_some() && fired, report)
+        } else {
+            let side_matches = matches!(
+                (direction, mark.side),
+                (Direction::Long, MarkSide::Long) | (Direction::Short, MarkSide::Short)
+            );
+            let all_held = side_matches && reports.iter().all(|report| report.state == "held");
+            (side_matches, all_held, None)
+        };
         Ok(MarkExplanation {
             mark: MarkJson::of(mark),
             evaluation_bar: rfc3339_ms(evaluation_bar_ms),
             side_matches,
             conjuncts: reports,
+            setup: setup_report,
             all_held,
             patterns,
         })
@@ -1081,7 +1294,117 @@ fn read_bar(
             slice
         })
         .collect();
-    BarReading { states, operands }
+    BarReading {
+        states,
+        operands,
+        setup: None,
+    }
+}
+
+/// Read each declared setup side at the last stepped bar: the side's state and each
+/// of its conditions, with the same probe calls the entry conjuncts use.
+fn read_setup(probe: &EvalProbe<'_>, plan: &SetupPlan) -> Option<SetupReading> {
+    let view = probe.setup_view()?;
+    let warm = probe.is_warm();
+    let read = |side: Option<&SideConjuncts>, state: Option<SideState>| {
+        side.zip(state)
+            .map(|(side, state)| read_side(probe, side, state, warm))
+    };
+    Some(SetupReading {
+        long: read(plan.long.as_ref(), view.long),
+        short: read(plan.short.as_ref(), view.short),
+    })
+}
+
+/// One side's reading. Conditions read `not_warm`, with no operands, while the
+/// entry gate is cold (a partial history would report numbers the gate never saw).
+fn read_side(
+    probe: &EvalProbe<'_>,
+    side: &SideConjuncts,
+    state: SideState,
+    warm: bool,
+) -> SideReading {
+    let value = |value: &CompiledValue, previous: bool| {
+        probe
+            .operand(value, previous)
+            .map(|d| d.normalize().to_string())
+    };
+    let states = side
+        .conjuncts
+        .iter()
+        .map(|conjunct| {
+            if !warm {
+                "not_warm"
+            } else if probe.eval(&conjunct.compiled) {
+                "held"
+            } else {
+                "not_held"
+            }
+        })
+        .collect();
+    let operands = side
+        .conjuncts
+        .iter()
+        .map(|conjunct| {
+            if !warm {
+                return Vec::new();
+            }
+            conjunct
+                .operands
+                .iter()
+                .map(|(label, compiled, previous)| OperandReport {
+                    label: label.clone(),
+                    value: value(compiled, false),
+                    previous: previous.then(|| value(compiled, true)),
+                })
+                .collect()
+        })
+        .collect();
+    SideReading {
+        state,
+        states,
+        operands,
+    }
+}
+
+/// One side's `SetupReport` from its reading.
+fn setup_report(side: &SideConjuncts, read: &SideReading) -> SetupReport {
+    let state = &read.state;
+    // The open setup's times: only while a setup is live. After a fire or a lapse the
+    // side is idle and the fire lives in `last_trigger`.
+    let open = state.phase != SetupPhase::Idle;
+    SetupReport {
+        side: side.side,
+        phase: state.phase,
+        event: state.event,
+        armed_at: open.then(|| rfc3339_ms(state.arm_time)),
+        dipped_at: state.dip_time.filter(|_| open).map(rfc3339_ms),
+        anchored_at: state.anchor_time.filter(|_| open).map(rfc3339_ms),
+        last_trigger: state.last_trigger.as_ref().map(trigger_report),
+        conditions: side
+            .conjuncts
+            .iter()
+            .enumerate()
+            .map(|(index, conjunct)| ConjunctReport {
+                index,
+                source: conjunct.source,
+                condition: conjunct.dsl.clone(),
+                state: read.states.get(index).copied().unwrap_or("not_warm"),
+                operands: read.operands.get(index).cloned().unwrap_or_default(),
+            })
+            .collect(),
+    }
+}
+
+/// A fire as the report spells it.
+fn trigger_report(fire: &SetupFire) -> TriggerReport {
+    TriggerReport {
+        armed_at: rfc3339_ms(fire.arm_time),
+        dipped_at: rfc3339_ms(fire.dip_time),
+        anchored_at: fire.anchor_time.map(rfc3339_ms),
+        triggered_at: rfc3339_ms(fire.trigger_time),
+        stop_extreme: fire.extreme.normalize().to_string(),
+    }
 }
 
 /// Build a session and step the whole cut series once, calling `on_bar` at each
