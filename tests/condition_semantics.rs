@@ -147,6 +147,7 @@ fn dsl_with_entry(entry: Condition) -> StrategyDsl {
             risk_per_trade_pct: fixed(1, 2),
             max_leverage: fixed(3, 0),
         },
+        setup: None,
     }
 }
 

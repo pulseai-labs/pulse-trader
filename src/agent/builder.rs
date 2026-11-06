@@ -136,6 +136,7 @@ impl StrategyBuilder {
             filters: self.filters.clone(),
             exits: self.exits.clone(),
             risk,
+            setup: None,
         };
         // Reuse the existing whole-document validator verbatim (VS-1.1.2); its
         // guaranteed-non-empty error collection maps to the correctable Vec.

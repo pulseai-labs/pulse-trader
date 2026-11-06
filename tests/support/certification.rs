@@ -437,6 +437,7 @@ pub fn inverted_dsl() -> pulse::StrategyDsl {
             risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
             max_leverage: SweepableValue::Fixed(Decimal::from(3)),
         },
+        setup: None,
     }
 }
 

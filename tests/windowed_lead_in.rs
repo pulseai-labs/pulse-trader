@@ -90,6 +90,7 @@ fn ema50_dsl() -> StrategyDsl {
             risk_per_trade_pct: fixed(1, 2),
             max_leverage: fixed(3, 0),
         },
+        setup: None,
     }
 }
 
@@ -140,6 +141,7 @@ fn always_entry_dsl() -> StrategyDsl {
             risk_per_trade_pct: fixed(1, 2),
             max_leverage: fixed(3, 0),
         },
+        setup: None,
     }
 }
 

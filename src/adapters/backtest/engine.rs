@@ -568,6 +568,18 @@ pub(super) struct ExitPlan {
 
 impl ExitPlan {
     pub(super) fn from_strategy(compiled: &CompiledStrategy) -> Result<Self, BacktestError> {
+        // r6.s2.w1 (ADR-0033): the structure stop's level comes from a setup's
+        // stop window, which the engine does not track yet. Refuse it by name
+        // before any other plan check; r6.s2.w4 removes this refusal.
+        if compiled
+            .exits()
+            .iter()
+            .any(|exit| matches!(exit, CompiledExit::StructureStop { .. }))
+        {
+            return Err(BacktestError::UnsupportedExit(
+                "StructureStop (r6.s2.w4)".to_owned(),
+            ));
+        }
         let trail_pct = compiled.exits().iter().find_map(|exit| match exit {
             CompiledExit::TrailingStop { trail_pct } => Some(*trail_pct),
             _ => None,
@@ -1624,14 +1636,14 @@ fn atr_take_profit_price(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        BacktestConfig, FundingGapWindow, OpenPosition, build_funding_index,
+        BacktestConfig, ExitPlan, FundingGapWindow, OpenPosition, build_funding_index,
         first_fully_warm_bar_ms, funding_between, funding_gaps, run_backtest, update_excursion,
     };
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
-        Series, SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource,
-        compile, realized_pnl, validate,
+        Series, SeriesEnd, Setup, SetupSide, StrategyDsl, SweepableValue, SymbolFilters, Timeframe,
+        ValueSource, compile, realized_pnl, validate,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -1778,6 +1790,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(rate(1, 2)),
                 max_leverage: SweepableValue::Fixed(d(3)),
             },
+            setup: None,
         };
         compile(&validate(&dsl).unwrap()).unwrap()
     }
@@ -2178,6 +2191,43 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
+    }
+
+    /// r6.s2.w1 (ADR-0033): a `StructureStop` is refused by name until its level
+    /// is built (r6.s2.w4) — before any stop-family check, so it is never read
+    /// as a missing stop.
+    #[test]
+    fn structure_stop_refused_until_w4() {
+        let setup_side = || SetupSide {
+            arm: price_entry(),
+            dip: price_entry(),
+            trigger: price_entry(),
+            stop_anchor: None,
+        };
+        let dsl = StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "structure stop refusal".to_owned(),
+            direction: Direction::Long,
+            entry: price_entry(),
+            filters: vec![],
+            exits: vec![ExitRule::StructureStop {
+                buffer_pct: SweepableValue::Fixed(rate(5, 4)),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(rate(1, 2)),
+                max_leverage: SweepableValue::Fixed(d(3)),
+            },
+            setup: Some(Box::new(Setup {
+                expiry_bars: SweepableValue::Fixed(8),
+                long: Some(setup_side()),
+                short: None,
+            })),
+        };
+        let strategy = compile(&validate(&dsl).unwrap()).unwrap();
+        assert_eq!(
+            ExitPlan::from_strategy(&strategy).unwrap_err(),
+            BacktestError::UnsupportedExit("StructureStop (r6.s2.w4)".to_owned())
+        );
     }
 
     #[test]

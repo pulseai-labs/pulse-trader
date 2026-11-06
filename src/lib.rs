@@ -129,7 +129,8 @@ pub use domain::{
 // `deny(warnings)` + `pub(crate) mod domain` (an un-re-exported public domain
 // type is a `dead_code` build error, not a warning).
 pub use domain::{
-    Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl,
+    Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, Setup, SetupSide,
+    StrategyDsl,
 };
 
 // r2.s2.w4 (b10, ADR-0024): the one ring-owned DSL display formatter —
@@ -167,8 +168,9 @@ pub use domain::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Mi
 // Re-exported on the same curated-surface pattern — REQUIRED under
 // `deny(warnings)` + `pub(crate) mod domain`.
 pub use domain::{
-    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledSetup, CompiledSetupSide,
+    CompiledStrategy, CompiledValue, EvalContext, atr_stop_price, compile, stop_price,
+    take_profit_price,
 };
 
 // r1.s2.w1 (ADR-0021): the one-mutation framework. `apply(&StrategyDsl,

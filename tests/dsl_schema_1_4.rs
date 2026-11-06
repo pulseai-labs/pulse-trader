@@ -7,7 +7,7 @@
 //!
 //! 1. **The served schema names the current version and its pattern values.**
 //!    The `pulse://dsl/schema` document carries the current `schema_version`
-//!    (1.5.0 since r6.s1.w1, which moved it on additively; the test names keep
+//!    (1.6.0 since r6.s2.w1, which moved it on additively; the test names keep
 //!    their 1.4.0 spelling), the served version enum lists the loadable
 //!    spellings, and the
 //!    `CandlePattern` variant's `pattern` enum lists the 17 names.
@@ -62,7 +62,7 @@ const PATTERNS: [CandlePatternName; 17] = [
 // ---------------------------------------------------------------------------
 
 /// The served schema (the `StrategyDsl` JSON Schema the `pulse://dsl/schema`
-/// resource carries) names the current version (1.5.0) and lists the 17 pattern
+/// resource carries) names the current version (1.6.0) and lists the 17 pattern
 /// names on the `CandlePattern` spec.
 #[test]
 fn the_served_dsl_schema_names_1_4_0_and_the_pattern_values() {
@@ -73,7 +73,7 @@ fn the_served_dsl_schema_names_1_4_0_and_the_pattern_values() {
             .expect("the version enum")
             .last()
             .and_then(|v| v.as_str()),
-        Some("1.5.0"),
+        Some("1.6.0"),
         "the served schema names the version this engine writes"
     );
 
@@ -128,7 +128,9 @@ fn the_served_version_enum_is_the_loadable_set() {
         serde_json::to_value(schemars::schema_for!(StrategyDsl)).expect("schema serializes");
     assert_eq!(
         schema["properties"]["schema_version"]["enum"],
-        serde_json::json!(["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]),
+        serde_json::json!([
+            "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"
+        ]),
         "the served enum lists every loadable spelling and nothing else"
     );
 }
@@ -244,14 +246,14 @@ fn a_1_3_0_document_migrates_by_identity() {
     );
     assert_eq!(
         loaded.dsl.schema_version.to_string(),
-        "1.5.0",
-        "CURRENT is 1.5.0"
+        "1.6.0",
+        "CURRENT is 1.6.0"
     );
 
     let reserialized = serde_json::to_value(&loaded.dsl).expect("re-serializes");
     let mut expected: serde_json::Value =
         serde_json::from_str(DOC_1_3_0).expect("the fixture is valid JSON");
-    expected["schema_version"] = serde_json::json!("1.5.0");
+    expected["schema_version"] = serde_json::json!("1.6.0");
     assert_eq!(
         reserialized, expected,
         "the identity step changes nothing but the schema_version string"
@@ -259,29 +261,29 @@ fn a_1_3_0_document_migrates_by_identity() {
 }
 
 /// The whole registered chain is identity, end to end: a 1.0.0 document reaches
-/// the current version (1.5.0) with its meaning intact (the same compiled
+/// the current version (1.6.0) with its meaning intact (the same compiled
 /// strategy, hash-for-hash).
 #[test]
 fn the_whole_chain_migrates_identity_to_1_4_0() {
     let doc = DOC_1_3_0.replace("\"1.3.0\"", "\"1.0.0\"");
     let loaded = Migrator::v1().load(&doc).expect("a 1.0.0 document loads");
     assert_eq!(loaded.from.to_string(), "1.0.0");
-    assert_eq!(loaded.dsl.schema_version.to_string(), "1.5.0");
+    assert_eq!(loaded.dsl.schema_version.to_string(), "1.6.0");
     compile(&validate(&loaded.dsl).expect("validates")).expect("compiles");
 }
 
 /// A future minor is still refused with the message naming the new pair.
 #[test]
 fn a_future_minor_is_refused() {
-    let doc = DOC_1_3_0.replace("\"1.3.0\"", "\"1.6.0\"");
+    let doc = DOC_1_3_0.replace("\"1.3.0\"", "\"1.7.0\"");
     let err = Migrator::v1()
         .load(&doc)
         .expect_err("a future version must refuse");
     let pulse::LoadError::FutureVersion { found, current } = err else {
         panic!("expected FutureVersion, got {err:?}");
     };
-    assert_eq!(found.to_string(), "1.6.0");
-    assert_eq!(current.to_string(), "1.5.0");
+    assert_eq!(found.to_string(), "1.7.0");
+    assert_eq!(current.to_string(), "1.6.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +331,7 @@ fn candle_pattern_strategy() -> StrategyDsl {
             risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
             max_leverage: SweepableValue::Fixed(Decimal::from(3)),
         },
+        setup: None,
     }
 }
 

@@ -409,6 +409,7 @@ fn the_pattern_works_on_the_htf_operand() {
             risk_per_trade_pct: SweepableValue::Fixed(Decimal::from_str("0.01").unwrap()),
             max_leverage: SweepableValue::Fixed(Decimal::from(3)),
         },
+        setup: None,
     };
     let strategy =
         compile(&validate(&dsl).expect("the strategy validates")).expect("the strategy compiles");
@@ -556,6 +557,7 @@ fn a_rule_reads_the_pattern_through_compare() {
             risk_per_trade_pct: SweepableValue::Fixed(Decimal::from_str("0.01").unwrap()),
             max_leverage: SweepableValue::Fixed(Decimal::from(3)),
         },
+        setup: None,
     };
     let strategy = compile(&validate(&dsl).expect("validates")).expect("compiles");
     let mut engine = IndicatorEngine::new(&strategy).expect("engine builds");

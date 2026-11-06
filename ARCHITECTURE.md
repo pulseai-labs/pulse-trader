@@ -247,3 +247,4 @@ All load-bearing architectural decisions are recorded in
 | [0030](docs/adr/0030-chart-adapter-and-overlay-read.md) | The chart adapter boundary and the overlay read contract |
 | [0031](docs/adr/0031-example-trade-marks.md) | Example-trade marks: the store, its writers, the holdout fence and the explain contract |
 | [0032](docs/adr/0032-certify-power-review.md) | Certify power review: the pass-chance bar, the count-only holdout read and the certify gate |
+| [0033](docs/adr/0033-stateful-setups.md) | Stateful setups: arm, dip, trigger and expiry in the strategy grammar and the engine |

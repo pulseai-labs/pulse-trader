@@ -177,7 +177,7 @@ pub use example_mark::{
 pub use dsl::{
     ArithOp, CandlePatternName, Comparator, Condition, DSL_SCHEMA_VERSION, Direction, ExitRule,
     IndicatorSpec, MacdOutput, PriceField, RiskParams, SchemaVersion, SchemaVersionParseError,
-    Series, StrategyDsl, SweepableValue, ValueSource,
+    Series, Setup, SetupSide, StrategyDsl, SweepableValue, ValueSource,
 };
 pub use indicator::Indicator;
 // VS-1.1.2 work-2.03: the semantic-validation surface (FR-3 correctable rejection).
@@ -211,8 +211,9 @@ pub use ids::IdSource;
 // `Compiled*` types + `EvalContext` seam + pure exit-geometry helpers are its
 // surface.
 pub use dsl::{
-    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledSetup, CompiledSetupSide,
+    CompiledStrategy, CompiledValue, EvalContext, atr_stop_price, compile, stop_price,
+    take_profit_price,
 };
 pub use error::{DataError, ValidationError};
 // VS-1.2.3 work-3.01: the build-time engine identity (FR-7 / NFR-2). Re-exported

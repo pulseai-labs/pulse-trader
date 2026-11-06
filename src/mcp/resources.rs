@@ -104,15 +104,21 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "rising_falling",
         "`rising`/`falling` mean the value is strictly greater/less than its own value `bars` bars ago on the same series (`bars` in 1..=500, default 1); over a value containing a lag, or mixing both series, they are refused",
     ),
+    // r6.s2.w1 (schema 1.6.0, ADR-0033): the stateful setup.
+    (
+        "setups",
+        "**Setups (1.6.0).** `setup` makes the rule stateful. Each side (`long`, `short`) arms when its `arm` holds on a 15m bar where a new higher-timeframe bar closed; a new arm restarts the side. After the arm bar, the first bar where `dip` holds is the dip; after the dip bar, the first bar where `trigger` holds and `entry` and every filter hold fires the side, which enters at the next bar's open. A side with no trigger by `expiry_bars` bars after its arm lapses. `StructureStop` places the stop at the side's lowest low (long) or highest high (short) from the first bar after the arm where `stop_anchor` holds (or from the bar after the arm) up to the trigger bar, pushed out by `buffer_pct`. Both sides share one position. Write each side in full; nothing is mirrored. Omit `setup`, `long`, `short` or `stop_anchor` when absent (`null` is read as absent). A one-sided setup's `direction` is its side; a two-sided setup's is `long`.",
+    ),
     // r3.s2.w1: schema 1.2.0 — the served version set and its forward rule.
     // r4.s6.w1: moved to 1.3.0 (the structure indicator variants); the served
     // set grows by 1.2.0. r5.s1.w1: moved to 1.4.0 (the named candlestick
     // pattern variant); the served set grows by 1.3.0. r6.s1.w1: moved to 1.5.0
     // (the `Sma` indicator and `max`/`min` arithmetic); the served set grows by
-    // 1.4.0.
+    // 1.4.0. r6.s2.w1: moved to 1.6.0 (`setup` and the `StructureStop` exit); the
+    // served set grows by 1.5.0.
     (
         "schema_version",
-        "this engine writes and serves schema 1.5.0 and also loads 1.0.0, 1.1.0, 1.2.0, 1.3.0 and 1.4.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.5.0",
+        "this engine writes and serves schema 1.6.0 and also loads 1.0.0, 1.1.0, 1.2.0, 1.3.0, 1.4.0 and 1.5.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.6.0",
     ),
 ];
 
@@ -161,7 +167,7 @@ mod tests {
         }
         // F6: `schema_version` publishes the ACCEPTED values, not an
         // unconstrained string — `Migrator::v1()` loads `1.0.0`, `1.1.0`,
-        // `1.2.0`, `1.3.0` and `1.4.0` (identity-migrated) and `CURRENT`, so the schema a
+        // `1.2.0`, `1.3.0`, `1.4.0` and `1.5.0` (identity-migrated) and `CURRENT`, so the schema a
         // validating agent reads must pin exactly that enum.
         assert_eq!(
             properties["schema_version"]["enum"],
@@ -171,6 +177,7 @@ mod tests {
                 "1.2.0",
                 "1.3.0",
                 "1.4.0",
+                "1.5.0",
                 DSL_SCHEMA_VERSION
             ]),
             "schema_version property must publish the accepted enum"
@@ -204,6 +211,22 @@ mod tests {
             d1,
             "a `d1` operand is evaluated on the last closed daily (1d) bar, never on the forming one; the daily snapshot needs no argument — it resolves automatically for the pair a strategy is run on, and a missing one is refused by name: fetch it with `pulse fetch-data <PAIR> --tf D1`; the `timeframe` argument still selects only `primary` or `htf`, and `1d` is refused there because the daily series is the fixed `d1` slot"
         );
+        // r6.s2.w1 (schema 1.6.0): the setups paragraph states the arm edge, the
+        // dip and trigger order, the expiry and the structure stop.
+        let setups = conventions
+            .get("setups")
+            .and_then(serde_json::Value::as_str)
+            .expect("conventions.setups is a string");
+        for needle in [
+            "**Setups (1.6.0).**",
+            "a new higher-timeframe bar closed",
+            "lapses",
+            "`StructureStop` places the stop",
+            "Both sides share one position.",
+            "(`null` is read as absent)",
+        ] {
+            assert!(setups.contains(needle), "{needle:?} missing: {setups}");
+        }
         // r6.s1.w2 (schema 1.5.0): the WaveTrend convention states the formula,
         // the warm-up index and the zero-`d` rule.
         let wavetrend = conventions
