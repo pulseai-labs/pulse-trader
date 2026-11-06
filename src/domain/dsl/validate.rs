@@ -36,7 +36,7 @@ use super::condition::{Comparator, Condition};
 use super::exit::ExitRule;
 use super::strategy::StrategyDsl;
 use super::sweepable::SweepableValue;
-use super::value::{IndicatorSpec, PriceField, ValueSource};
+use super::value::{ArithSpelling, IndicatorSpec, PriceField, ValueSource};
 use crate::domain::DSL_SCHEMA_VERSION;
 
 /// A machine-actionable classification of a single semantic violation.
@@ -617,17 +617,18 @@ fn describe(v: &ValueSource) -> String {
         ValueSource::Constant { value } => format!("the constant {value}"),
         ValueSource::Price { field, .. } => field_name(*field).to_owned(),
         ValueSource::Indicator { spec, .. } => format!("the {} value", spec_name(spec)),
-        ValueSource::Arith { op, lhs, rhs } => format!(
-            "the expression ({} {} {})",
-            describe(lhs),
-            match op {
-                crate::domain::dsl::value::ArithOp::Add => "+",
-                crate::domain::dsl::value::ArithOp::Sub => "-",
-                crate::domain::dsl::value::ArithOp::Mul => "*",
-                crate::domain::dsl::value::ArithOp::Div => "/",
-            },
-            describe(rhs)
-        ),
+        ValueSource::Arith { op, lhs, rhs } => match op.spelling() {
+            ArithSpelling::Infix(symbol) => {
+                format!(
+                    "the expression ({} {symbol} {})",
+                    describe(lhs),
+                    describe(rhs)
+                )
+            }
+            ArithSpelling::Call(name) => {
+                format!("the expression {name}({},{})", describe(lhs), describe(rhs))
+            }
+        },
         ValueSource::Lag { value, bars } => {
             format!("lag({}, {bars})", describe(value))
         }
@@ -655,6 +656,7 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Atr { period } => format!("ATR({})", period_value(period)),
         IndicatorSpec::Highest { period, .. } => format!("Highest({})", period_value(period)),
         IndicatorSpec::Lowest { period, .. } => format!("Lowest({})", period_value(period)),
+        IndicatorSpec::Sma { period, .. } => format!("sma({})", period_value(period)),
         IndicatorSpec::PivotHigh { left, right } => {
             format!("PivotHigh({}/{})", period_value(left), period_value(right))
         }
@@ -930,6 +932,12 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
                 "Lowest period",
                 errors,
             );
+        }
+        // The simple moving average (schema 1.5.0, r6.s1.w1): the period is the
+        // window size and must be > 0. `source` is any `PriceField` and carries
+        // no rule (the rolling extremes' precedent above).
+        IndicatorSpec::Sma { period, .. } => {
+            check_u32_positive(period, &format!("{path}.sma.period"), "SMA period", errors);
         }
         // The structure indicators (schema 1.3.0, r4.s6.w1), the pattern
         // indicators (r4.s6.w3) and the named candle patterns (schema 1.4.0,

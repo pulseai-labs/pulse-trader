@@ -194,9 +194,14 @@ fn example_pattern(dsl: &StrategyDsl) -> (CandlePatternName, Series) {
     );
 }
 
-/// The example is a valid document at schema 1.4.0 whose entry is the lagged
+/// The example is a valid document — authored at schema 1.4.0, identity-
+/// migrated to `CURRENT` (1.5.0) on load — whose entry is the lagged
 /// support-touch form (the trap) and whose filters are the close-back-above and
 /// the named bullish pattern.
+///
+/// The example file itself stays at 1.4.0 on purpose (r6.s1.w1): rewriting it
+/// would put its frozen golden at risk for no gain, and a 1.4.0 document must
+/// keep loading by identity — which this assertion proves.
 #[test]
 fn example_parses_validates_and_carries_the_support_touch_form() {
     let dsl = load_example();
@@ -207,8 +212,8 @@ fn example_parses_validates_and_carries_the_support_touch_form() {
     );
     assert_eq!(
         dsl.schema_version.to_string(),
-        "1.4.0",
-        "the example is authored at schema 1.4.0"
+        "1.5.0",
+        "the example is identity-migrated from 1.4.0 to CURRENT"
     );
 
     // Entry: htf:low <= lag(htf:support{…}, 1) × (1 + k) — the level the

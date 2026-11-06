@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DSL schema 1.5.0: `Sma` indicator, `max`/`min` arithmetic (r6.s1.w1).** The first Cipher building blocks.
+  A strategy can now write a **simple moving average** of any price field — `IndicatorSpec::Sma { period, source }`,
+  serialized `{"indicator":"Sma","period":50,"source":"Close"}`, the source defaulting to close — the mean of the
+  last `period` bars **including the current one**, in exact `Decimal` rounded to 8 places half-even, its first value
+  on candle index `period − 1`. And two operands can be combined with **`max` or `min`** (`ArithOp::Max`,
+  `ArithOp::Min`, rendered `max(a,b)` / `min(a,b)`), so the Cipher ribbon's band top — the highest of eight EMAs of
+  close — is one depth-3 operand whose value explain can show. `sma:<period>[:<source>]` is a new
+  `pulse indicators` / `export_indicators` token, the composer's tool schema lists `sma` and the two new `op` values,
+  and the MCP schema resource says so. Parity: the engine's SMA(50, close) on the committed SOLUSDT 4h fixture agrees
+  with TradingView's readings in STR-0003's ledger to within 0.01 at both design-example bars. The fixture is a new
+  committed store, `tests/fixtures/solusdt-cipher-store/` (Binance USDT-M SOLUSDT 15m and 4h, 2026-06-01 up to
+  2026-10-08, ending before the holdout), written by `tests/fixtures/gen_solusdt_cipher_store.rs`. The
+  `1.4.0 → 1.5.0` migration is identity (only the version string is rewritten), so every pre-1.5.0 document keeps its
+  meaning and its frozen `result_content_hash`; `WaveTrend` (r6.s1.w2) joins under the same 1.5.0. See the ADR-0024
+  addendum `docs/adr/0024-addendum-cipher-indicators-1-5-0.md`.
+
 - **The Library shows the power review (r5.s5.w3, PDR-0040, ADR-0032).** The details pane of a selected version now
   carries a **Power review** section: for each pair, the latest review under the open freeze, with its **holdout
   trade count**, its **pass chance** against the **50% bar** fixed at plan time, and whether a certify attempt is

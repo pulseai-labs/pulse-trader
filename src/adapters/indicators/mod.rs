@@ -18,6 +18,8 @@ pub mod macd;
 pub mod patterns;
 pub mod rolling;
 pub mod rsi;
+// r6.s1.w1 (schema 1.5.0): the simple moving average of one price field.
+pub mod sma;
 pub mod structure;
 pub mod wilder;
 
