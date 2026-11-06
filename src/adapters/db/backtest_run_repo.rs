@@ -586,6 +586,7 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                  skipped_sub_lot         AS "skipped_sub_lot?: i64",
                  skipped_sub_notional    AS "skipped_sub_notional?: i64",
                  skipped_leverage_capped AS "skipped_leverage_capped?: i64",
+                 skipped_stop_beyond_fill AS "skipped_stop_beyond_fill?: i64",
                  pair                    AS "pair?: String",
                  primary_timeframe       AS "primary_timeframe?: String",
                  primary_data_version    AS "primary_data_version?: String",
@@ -642,6 +643,13 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
             sub_lot: usize_from("skipped_sub_lot", r.skipped_sub_lot)?,
             sub_notional: usize_from("skipped_sub_notional", r.skipped_sub_notional)?,
             leverage_capped: usize_from("skipped_leverage_capped", r.skipped_leverage_capped)?,
+            // r6.s2.w4 / migration 0024: every pre-0024 row holds NULL here, which
+            // reads as no skips. `usize_from` still refuses a negative or oversized
+            // value; only the NULL is mapped, so a corrupt count is not hidden.
+            stop_beyond_fill: usize_from(
+                "skipped_stop_beyond_fill",
+                Some(r.skipped_stop_beyond_fill.unwrap_or(0)),
+            )?,
         };
         // r2.s1 G1(b): the window-edge mark parses BEFORE the hash rebuild — the
         // feed covers it when present, so a tampered column fails the #39 guard
@@ -1368,7 +1376,7 @@ pub(crate) async fn insert_run_row(
     // the hash feed on read — D4b proves this).
     let regime_breakdown_json = serde_json::to_string(&result.regime_breakdown)
         .map_err(|e| DataError::Db(e.to_string()))?;
-    let (skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) =
+    let (skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, skipped_stop_beyond_fill) =
         skipped_entry_i64s(result)?;
 
     // r1.s3.w2 (#110) — the eight INPUT provenance columns. Timeframes and the
@@ -1464,11 +1472,12 @@ pub(crate) async fn insert_run_row(
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
           d1_data_version, taker_fee_bps, slippage_bps, funding_config, window_from_ms, \
           window_to_ms, window_lead_in_from_ms, open_position, walk_forward_run_id, \
-          fold_index, lot_step, min_qty, min_notional, max_leverage) \
+          fold_index, lot_step, min_qty, min_notional, max_leverage, \
+          skipped_stop_beyond_fill) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
                  ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
-                 ?47, ?48, ?49, ?50, ?51)",
+                 ?47, ?48, ?49, ?50, ?51, ?52)",
         run_id,
         version_id_str,
         schema_version,
@@ -1520,6 +1529,7 @@ pub(crate) async fn insert_run_row(
         min_qty_text,
         min_notional_text,
         max_leverage_text,
+        skipped_stop_beyond_fill,
     )
     .execute(&mut **tx)
     .await
@@ -1527,17 +1537,19 @@ pub(crate) async fn insert_run_row(
     Ok(())
 }
 
-/// The three `skipped_entries` count columns as `i64` (extracted from
+/// The four `skipped_entries` count columns as `i64` (extracted from
 /// `insert_run_row` for #204 — the `0013` membership columns push it past its
-/// r2.s3.w2 count otherwise; r2.s3.w3).
-fn skipped_entry_i64s(result: &BacktestResult) -> Result<(i64, i64, i64), DataError> {
+/// r2.s3.w2 count otherwise; r2.s3.w3; r6.s2.w4 adds `0024`'s fourth).
+fn skipped_entry_i64s(result: &BacktestResult) -> Result<(i64, i64, i64, i64), DataError> {
     let sub_lot = i64::try_from(result.skipped_entries.sub_lot)
         .map_err(|e| DataError::Db(format!("skipped_sub_lot overflows i64: {e}")))?;
     let sub_notional = i64::try_from(result.skipped_entries.sub_notional)
         .map_err(|e| DataError::Db(format!("skipped_sub_notional overflows i64: {e}")))?;
     let leverage_capped = i64::try_from(result.skipped_entries.leverage_capped)
         .map_err(|e| DataError::Db(format!("skipped_leverage_capped overflows i64: {e}")))?;
-    Ok((sub_lot, sub_notional, leverage_capped))
+    let stop_beyond_fill = i64::try_from(result.skipped_entries.stop_beyond_fill)
+        .map_err(|e| DataError::Db(format!("skipped_stop_beyond_fill overflows i64: {e}")))?;
+    Ok((sub_lot, sub_notional, leverage_capped, stop_beyond_fill))
 }
 
 /// Insert every `trade` row for `run_id`, in `seq` order (0-based chronological),
@@ -2532,6 +2544,63 @@ mod tests {
                 "must reject the unsupported schema_version; got: {msg}"
             ),
             other => panic!("expected DataError::Db unsupported-schema, got {other:?}"),
+        }
+    }
+
+    // ---- r6.s2.w4 / migration 0024: skipped_stop_beyond_fill ------------------
+
+    /// Raw-INSERT a minimal v1 run row (no trades) with the given `skipped_stop_beyond_fill`.
+    async fn seed_run_with_skip_column(pool: &SqlitePool, id: &str, value: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO backtest_run \
+             (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+              engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+              funding_total, slippage_total, trade_count, wins, losses, breakeven, \
+              max_win_streak, max_loss_streak, win_rate, expectancy, gross_profit, \
+              gross_loss, avg_win, avg_loss, max_drawdown, regime_breakdown, \
+              skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+              skipped_stop_beyond_fill, \
+              pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+              funding_config) \
+             VALUES (?1, 'ver-1', 1, '2026-06-30T00:00:00.000Z', 'fp', 'tgt', \
+                     'hash', '10000', '0', '0', '0', '0', 0, 0, 0, 0, 0, 0, '0', '0', '0', '0', \
+                     '0', '0', '0', ?2, 0, 0, 0, ?3, \
+                     'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
+        )
+        .bind(id)
+        .bind(serde_json::to_string(&RegimeBreakdown::default()).unwrap())
+        .bind(value)
+        .execute(pool)
+        .await
+        .expect("seed a run row");
+    }
+
+    /// A NULL count (every pre-0024 row) is mapped to 0 before the count is read, so it is not
+    /// refused as a corrupt row; a negative count is still refused, naming the column.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_run_maps_a_null_skip_count_to_zero_and_refuses_a_negative_one() {
+        let (repo, pool, _tmp) = repo_at(1_700_000_000_000).await;
+
+        seed_run_with_skip_column(&pool, "run-null", None).await;
+        let run = repo.get_run(&BacktestRunId::new("run-null")).await;
+        // The placeholder hash does not re-derive, so the read ends at the tamper guard —
+        // AFTER the count was read. A NULL-count refusal would name the column instead.
+        match run {
+            Err(crate::domain::DataError::Db(msg)) => assert!(
+                msg.contains("result_content_hash mismatch"),
+                "a NULL count passes the count read; got: {msg}"
+            ),
+            other => panic!("expected the hash guard to end the read, got {other:?}"),
+        }
+
+        seed_run_with_skip_column(&pool, "run-negative", Some(-1)).await;
+        let run = repo.get_run(&BacktestRunId::new("run-negative")).await;
+        match run {
+            Err(crate::domain::DataError::Db(msg)) => assert!(
+                msg.contains("skipped_stop_beyond_fill"),
+                "a negative count is refused, naming the column; got: {msg}"
+            ),
+            other => panic!("expected a corrupt-count refusal, got {other:?}"),
         }
     }
 

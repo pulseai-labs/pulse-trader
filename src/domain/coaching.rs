@@ -1045,6 +1045,11 @@ impl CoachContext {
             "sub_lot: {} · sub_notional: {} · leverage_capped: {}",
             k.sub_lot, k.sub_notional, k.leverage_capped
         );
+        // r6.s2.w4: the structure-stop skip count shows only when non-zero, so every
+        // earlier prompt stays byte-identical.
+        if k.stop_beyond_fill > 0 {
+            let _ = writeln!(out, "stop_beyond_fill: {}", k.stop_beyond_fill);
+        }
         let _ = writeln!(
             out,
             "\n## Strategy DSL (the document your mutation addresses)"
