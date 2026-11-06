@@ -147,8 +147,8 @@ impl EngineSession {
     ///
     /// [`BacktestError::InvalidConfig`], [`BacktestError::FundingIntervalUnknown`],
     /// [`BacktestError::NoStopLoss`], [`BacktestError::ImpossibleTakeProfit`],
-    /// [`BacktestError::UnsupportedExit`] (a `StructureStop` until r6.s2.w4, or a
-    /// two-sided setup until r6.s2.w3), [`BacktestError::EngineInit`].
+    /// [`BacktestError::UnsupportedExit`] (a `StructureStop` until r6.s2.w4),
+    /// [`BacktestError::EngineInit`].
     pub fn new(
         compiled: &CompiledStrategy,
         pair: &Pair,
@@ -162,16 +162,6 @@ impl EngineSession {
             .funding_interval_ms(pair)
             .map_err(|_| BacktestError::FundingIntervalUnknown { pair: pair.clone() })?;
         let plan = ExitPlan::from_strategy(compiled)?;
-        // r6.s2.w2 (ADR-0033): the engine runs one-sided setups. Two sides on one
-        // position slot arrive in r6.s2.w3, which removes this refusal.
-        if compiled
-            .setup()
-            .is_some_and(|setup| setup.long.is_some() && setup.short.is_some())
-        {
-            return Err(BacktestError::UnsupportedExit(
-                "two-sided setup (r6.s2.w3)".to_owned(),
-            ));
-        }
         let engine = IndicatorEngine::new(compiled)
             .map_err(|err| BacktestError::EngineInit(err.to_string()))?;
         // The higher-timeframe engine is built only when the strategy carries
@@ -251,7 +241,6 @@ impl EngineSession {
             let prepared = prepare_pending_fill(
                 &self.state,
                 primary,
-                self.direction,
                 &self.plan,
                 &self.config,
                 &self.filters,
@@ -555,14 +544,7 @@ impl EngineSession {
         // one determined by already-closed bars (the detector is stepped
         // after the engines, mirroring `engine.step`) — captured in `step`
         // before any mutation, the same read with unchanged semantics.
-        commit_pending_fill(
-            &mut self.state,
-            prepared,
-            primary,
-            self.direction,
-            &self.plan,
-            regime,
-        );
+        commit_pending_fill(&mut self.state, prepared, primary, &self.plan, regime);
         if let Some(position) = self.state.position.as_mut() {
             // Fold this bar (the just-opened entry bar, or any held bar
             // including the full exit bar) into the running MFE/MAE before
@@ -729,6 +711,7 @@ impl EngineSession {
                     primary,
                     counted,
                     &ctx,
+                    fire.direction,
                     Some(fire),
                 );
             }
@@ -738,7 +721,15 @@ impl EngineSession {
             && self.entry_gate_warm()
             && self.plan.strategy.entry().eval(&ctx)
         {
-            Self::queue_entry(&mut self.state, &self.plan, primary, counted, &ctx, None);
+            Self::queue_entry(
+                &mut self.state,
+                &self.plan,
+                primary,
+                counted,
+                &ctx,
+                self.direction,
+                None,
+            );
         }
     }
 
@@ -754,6 +745,7 @@ impl EngineSession {
         primary: &Candle,
         counted: bool,
         ctx: &DualSeriesContext<'_>,
+        direction: Direction,
         setup: Option<SetupFire>,
     ) {
         if counted && state.position.is_none() && state.pending_entry.is_none() {
@@ -763,6 +755,7 @@ impl EngineSession {
                     signal_time: primary.close_time,
                     atr_at_signal: atr_at_signal_value,
                     setup,
+                    direction,
                 });
             }
         }
@@ -1265,8 +1258,8 @@ impl EngineSession {
 mod tests {
     use super::*;
     use crate::domain::{
-        Comparator, Condition, ExitRule, PriceField, RiskParams, SchemaVersion, Setup, SetupSide,
-        StrategyDsl, SweepableValue, ValueSource, compile, validate,
+        Comparator, Condition, ExitRule, PriceField, RiskParams, SchemaVersion, StrategyDsl,
+        SweepableValue, ValueSource, compile, validate,
     };
 
     fn dec(s: &str) -> Decimal {
@@ -1320,81 +1313,6 @@ mod tests {
             None,
         )
         .expect("probe session constructs")
-    }
-
-    /// r6.s2.w2 (ADR-0033): a one-sided setup runs; a two-sided setup is refused
-    /// by name until r6.s2.w3 — never run as one side alone.
-    #[test]
-    fn setup_refused() {
-        let condition = || Condition::Compare {
-            lhs: ValueSource::Price {
-                series: Series::Primary,
-                field: PriceField::Close,
-            },
-            op: Comparator::Gt,
-            rhs: ValueSource::Constant { value: dec("0") },
-        };
-        let dsl_with = |short: Option<SetupSide>| StrategyDsl {
-            schema_version: SchemaVersion::CURRENT,
-            name: "setup refusal".to_owned(),
-            direction: Direction::Long,
-            entry: condition(),
-            filters: vec![],
-            exits: vec![ExitRule::StopLoss {
-                distance_pct: SweepableValue::Fixed(dec("0.05")),
-            }],
-            risk: RiskParams {
-                risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
-                max_leverage: SweepableValue::Fixed(dec("3")),
-            },
-            setup: Some(Box::new(Setup {
-                expiry_bars: SweepableValue::Fixed(8),
-                long: Some(SetupSide {
-                    arm: condition(),
-                    dip: condition(),
-                    trigger: condition(),
-                    stop_anchor: None,
-                }),
-                short,
-            })),
-        };
-        let open = |dsl: &StrategyDsl| {
-            let compiled_strategy =
-                compile(&validate(dsl).expect("dsl validates")).expect("dsl compiles");
-            EngineSession::new(
-                &compiled_strategy,
-                &Pair::new("BTCUSDT"),
-                SessionTimeframes {
-                    primary: Timeframe::M15,
-                    htf: Some(Timeframe::H4),
-                    d1: None,
-                },
-                BacktestConfig {
-                    starting_equity: dec("10000"),
-                    taker_fee_bps: dec("0"),
-                    slippage_bps: dec("0"),
-                },
-                SymbolFilters::unconstrained(),
-                None,
-            )
-        };
-        assert!(
-            open(&dsl_with(None)).is_ok(),
-            "a one-sided setup is accepted"
-        );
-        let two_sided = dsl_with(Some(SetupSide {
-            arm: condition(),
-            dip: condition(),
-            trigger: condition(),
-            stop_anchor: None,
-        }));
-        let Err(err) = open(&two_sided) else {
-            panic!("a two-sided setup is refused until r6.s2.w3");
-        };
-        assert_eq!(
-            err,
-            BacktestError::UnsupportedExit("two-sided setup (r6.s2.w3)".to_owned())
-        );
     }
 
     /// A plain (no-setup) session with a fixed-percent stop and an always-true
@@ -1486,6 +1404,7 @@ mod tests {
             &bar,
             true,
             &ctx,
+            fire.direction,
             Some(fire),
         );
     }

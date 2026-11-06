@@ -27,15 +27,14 @@
 //! - `repeat_runs_and_stepping_agree` — determinism, and the fold equals the step.
 //! - `short_side_alone` — the short side mirrors the long side.
 //! - `trace_feeds_the_hash` — the trace is covered by `result_content_hash`.
-//! - `two_sided_is_refused_until_w3` — two sides on one slot wait for w3.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pulse::{
-    BacktestConfig, BacktestError, BacktestResult, Candle, CandleSeries, Comparator,
-    CompiledStrategy, Condition, DataVersion, Direction, EngineSession, ExitReason, ExitRule, Pair,
-    PriceField, RiskParams, SchemaVersion, Series, SeriesEnd, SessionTimeframes, SetupEvent,
-    SetupPhase, SetupSide, SetupTrace, SetupView, StrategyDsl, SweepableValue, SymbolFilters,
-    Timeframe, ValueSource, compile, run_backtest, step_series, validate,
+    BacktestConfig, BacktestResult, Candle, CandleSeries, Comparator, CompiledStrategy, Condition,
+    DataVersion, Direction, EngineSession, ExitReason, ExitRule, Pair, PriceField, RiskParams,
+    SchemaVersion, Series, SeriesEnd, SessionTimeframes, SetupEvent, SetupPhase, SetupSide,
+    SetupTrace, SetupView, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource,
+    compile, run_backtest, step_series, validate,
 };
 use rust_decimal::Decimal;
 
@@ -519,31 +518,4 @@ fn trace_feeds_the_hash() {
         changed.result_content_hash(),
         "the dip time is covered by the result hash"
     );
-}
-
-#[test]
-fn two_sided_is_refused_until_w3() {
-    let compiled = strategy(
-        Direction::Long,
-        "2",
-        96,
-        Some(long_side()),
-        Some(short_side()),
-    );
-    let outcome = EngineSession::new(
-        &compiled,
-        &Pair::new("BTCUSDT"),
-        SessionTimeframes {
-            primary: Timeframe::M15,
-            htf: Some(Timeframe::H4),
-            d1: None,
-        },
-        zero_slippage(),
-        SymbolFilters::unconstrained(),
-        None,
-    );
-    let Err(BacktestError::UnsupportedExit(text)) = outcome else {
-        panic!("a two-sided setup is refused until r6.s2.w3");
-    };
-    assert!(text.contains("two-sided"), "{text}");
 }

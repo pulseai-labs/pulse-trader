@@ -606,12 +606,14 @@ impl ExitPlan {
         // fixed-fraction stop (its distance is known before any bar). For an
         // `AtrStop` the distance is `multiple × ATR` — unknowable until the
         // signal bar — so the same typed check moves to the fill (r2.s2.w2).
+        //
+        // r6.s2.w3: the check covers EACH side the strategy can trade — the
+        // declared sides of its setup, else its one `direction` — so a
+        // two-sided strategy is refused when its short side cannot take profit.
         if let StopRule::Pct(stop_distance_pct) = stop {
-            reject_impossible_short_tp(
-                compiled.direction(),
-                take_profit_target_r,
-                stop_distance_pct,
-            )?;
+            for direction in tradable_directions(compiled) {
+                reject_impossible_short_tp(direction, take_profit_target_r, stop_distance_pct)?;
+            }
         }
         Ok(Self {
             strategy: compiled.clone(),
@@ -726,6 +728,10 @@ pub(super) struct PendingEntry {
     /// The setup side that fired this entry (r6.s2.w2, ADR-0033); `None` for
     /// a strategy with no setup.
     pub(super) setup: Option<SetupFire>,
+    /// The side this entry opens (r6.s2.w3, ADR-0033 decision 4): the fired
+    /// setup side's direction, else the strategy's own. The fill reads it, so a
+    /// two-sided setup opens a long or a short on the one position slot.
+    pub(super) direction: Direction,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -903,6 +909,8 @@ pub(super) struct PreparedEntry {
     signal_time: i64,
     /// The pending entry's setup trace, copied to the position at the commit.
     setup: Option<SetupTrace>,
+    /// The pending entry's direction, which the position opens with.
+    direction: Direction,
 }
 
 /// The commit instruction [`prepare_pending_fill`] produced.
@@ -922,7 +930,6 @@ pub(super) enum PreparedFill {
 pub(super) fn prepare_pending_fill(
     state: &LoopState,
     candle: &Candle,
-    direction: Direction,
     plan: &ExitPlan,
     config: &BacktestConfig,
     filters: &SymbolFilters,
@@ -930,6 +937,7 @@ pub(super) fn prepare_pending_fill(
     let Some(pending) = state.pending_entry else {
         return Ok(PreparedFill::Idle);
     };
+    let direction = pending.direction;
     if state.position.is_some() {
         return Ok(PreparedFill::Consume { skipped: None });
     }
@@ -1025,6 +1033,7 @@ pub(super) fn prepare_pending_fill(
             dip_time: fire.dip_time,
             anchor_time: fire.anchor_time,
         }),
+        direction,
     }))
 }
 
@@ -1036,7 +1045,6 @@ pub(super) fn commit_pending_fill(
     state: &mut LoopState,
     prepared: PreparedFill,
     candle: &Candle,
-    direction: Direction,
     plan: &ExitPlan,
     regime: Regime,
 ) {
@@ -1051,7 +1059,7 @@ pub(super) fn commit_pending_fill(
         PreparedFill::Open(entry) => {
             state.pending_entry = None;
             state.position = Some(OpenPosition {
-                direction,
+                direction: entry.direction,
                 qty: entry.qty,
                 entry_price: entry.entry_price,
                 initial_stop: entry.stop,
@@ -1596,6 +1604,21 @@ fn signal_exit_indices(exits: &[CompiledExit]) -> Vec<usize> {
             _ => None,
         })
         .collect()
+}
+
+/// The directions a strategy can open (r6.s2.w3): the declared sides of its
+/// setup, long first, or its one `direction` without a setup.
+fn tradable_directions(compiled: &CompiledStrategy) -> Vec<Direction> {
+    match compiled.setup() {
+        Some(setup) => [
+            setup.long.as_ref().map(|_| Direction::Long),
+            setup.short.as_ref().map(|_| Direction::Short),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        None => vec![compiled.direction()],
+    }
 }
 
 /// Reject a short take-profit whose geometry resolves to a non-positive price.
