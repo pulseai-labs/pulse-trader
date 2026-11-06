@@ -54,8 +54,8 @@ use crate::adapters::clock::SystemClock;
 use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, CandleWindow, EquityCurve, ExitReason, Fill,
     FundingConfig, LatestReadableRun, OpenPositionMark, PersistedRun, Regime, RegimeBreakdown,
-    RunSummary, SnapshotSelection, SummaryStats, Trade, TradeSource, WalkForwardMembership,
-    WalkForwardRunId,
+    RunSummary, SetupTrace, SnapshotSelection, SummaryStats, Trade, TradeSource,
+    WalkForwardMembership, WalkForwardRunId,
 };
 use crate::domain::sizing::{SkippedEntryCounts, SymbolFilters};
 use crate::domain::strategy::VersionId;
@@ -764,6 +764,7 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
     }
 
     /// [`BacktestRunRepository::get_trades`] with the failure class preserved.
+    #[allow(clippy::too_many_lines)] // one column list and one fail-closed mapping per column
     async fn get_trades_classified(
         &self,
         id: &BacktestRunId,
@@ -808,7 +809,10 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                  source            AS "source?: String",
                  regime            AS "regime?: String",
                  fills             AS "fills?: String",
-                 stop_price        AS "stop_price?: String"
+                 stop_price        AS "stop_price?: String",
+                 setup_arm_time    AS "setup_arm_time?: i64",
+                 setup_dip_time    AS "setup_dip_time?: i64",
+                 setup_anchor_time AS "setup_anchor_time?: i64"
                FROM trade WHERE backtest_run_id = ?1 ORDER BY seq"#,
             id_str,
         )
@@ -873,8 +877,8 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                     .stop_price
                     .map(|s| parse_decimal("trade.stop_price", &s))
                     .transpose()?,
-                // Persisting the setup trace is r6.s2.w3's; a stored run reads back without one.
-                setup: None,
+                // Migration 0023: NULL columns (every pre-0023 row) read back as `None`.
+                setup: setup_trace_of(r.setup_arm_time, r.setup_dip_time, r.setup_anchor_time)?,
             });
         }
         Ok(out)
@@ -1216,6 +1220,36 @@ fn usize_from(column: &str, value: Option<i64>) -> Result<usize, DataError> {
 
 /// Require a non-NULL column value, fail-closed on NULL (D5 — a trade column that
 /// must be present but is NULL is a corrupt row, never silently defaulted).
+/// Rebuild a trade's setup trace from its three `0023` columns. A trace has an arm
+/// and a dip time or neither: both NULL (every pre-0023 row, every trade of a
+/// strategy without a setup) is `None`, both present is `Some`, and exactly one
+/// present is a corrupt row naming the NULL column. The anchor time is optional
+/// on its own, and with no trace it is ignored.
+fn setup_trace_of(
+    arm_time: Option<i64>,
+    dip_time: Option<i64>,
+    anchor_time: Option<i64>,
+) -> Result<Option<SetupTrace>, DataError> {
+    match (arm_time, dip_time) {
+        (None, None) => Ok(None),
+        (Some(arm_time), Some(dip_time)) => Ok(Some(SetupTrace {
+            arm_time,
+            dip_time,
+            anchor_time,
+        })),
+        (None, Some(_)) => Err(trace_half_missing("trade.setup_arm_time")),
+        (Some(_), None) => Err(trace_half_missing("trade.setup_dip_time")),
+    }
+}
+
+/// The corrupt-row error for a setup trace with only one of its arm and dip
+/// times stored (migration 0023): `column` is the NULL one.
+fn trace_half_missing(column: &str) -> DataError {
+    DataError::Db(format!(
+        "NULL in required column `{column}` (corrupt row): the other half of the setup trace is stored"
+    ))
+}
+
 fn require_col<T>(column: &str, value: Option<T>) -> Result<T, DataError> {
     value.ok_or_else(|| DataError::Db(format!("NULL in required column `{column}` (corrupt row)")))
 }
@@ -1549,15 +1583,20 @@ pub(crate) async fn insert_trade_rows(
         // r2.s2.w2 / migration 0011: the recorded per-trade stop. `None` binds
         // NULL — the only value a pre-0011-shaped row can carry.
         let stop_price = trade.stop_price.map(decimal_text);
+        // r6.s2.w3 / migration 0023: the setup trace. No trace binds three NULLs.
+        let setup_arm_time = trade.setup.map(|trace| trace.arm_time);
+        let setup_dip_time = trade.setup.map(|trace| trace.dip_time);
+        let setup_anchor_time = trade.setup.and_then(|trace| trace.anchor_time);
 
         sqlx::query!(
             "INSERT INTO trade \
              (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, \
               entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, \
               fees_total, funding_total, slippage_total, realized_pnl, realized_r, \
-              mfe_r, mae_r, exit_reason, source, regime, fills, stop_price) \
+              mfe_r, mae_r, exit_reason, source, regime, fills, stop_price, \
+              setup_arm_time, setup_dip_time, setup_anchor_time) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             trade_id,
             run_id,
             seq_i64,
@@ -1581,6 +1620,9 @@ pub(crate) async fn insert_trade_rows(
             regime,
             fills_json,
             stop_price,
+            setup_arm_time,
+            setup_dip_time,
+            setup_anchor_time,
         )
         .execute(&mut **tx)
         .await
@@ -2296,6 +2338,42 @@ mod tests {
     }
 
     // ---- AC-14: get_trades fails closed on a corrupt trade row (D5 / C9) ------
+
+    /// Migration 0023: the three columns map to a trace, to `None`, or to a corrupt-row
+    /// error that names the NULL column of a half-written pair.
+    #[test]
+    fn setup_trace_of_maps_the_three_columns() {
+        use super::setup_trace_of;
+        use crate::domain::backtest::SetupTrace;
+
+        assert_eq!(setup_trace_of(None, None, None).unwrap(), None);
+        assert_eq!(
+            setup_trace_of(Some(10), Some(20), None).unwrap(),
+            Some(SetupTrace {
+                arm_time: 10,
+                dip_time: 20,
+                anchor_time: None,
+            })
+        );
+        assert_eq!(
+            setup_trace_of(Some(10), Some(20), Some(15)).unwrap(),
+            Some(SetupTrace {
+                arm_time: 10,
+                dip_time: 20,
+                anchor_time: Some(15),
+            })
+        );
+        let missing_dip = setup_trace_of(Some(10), None, None).unwrap_err();
+        assert!(
+            missing_dip.to_string().contains("trade.setup_dip_time"),
+            "{missing_dip}"
+        );
+        let missing_arm = setup_trace_of(None, Some(20), Some(15)).unwrap_err();
+        assert!(
+            missing_arm.to_string().contains("trade.setup_arm_time"),
+            "{missing_arm}"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_trades_fails_closed_on_corrupt_row() {
