@@ -88,6 +88,11 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Sma { period, source } => {
             format!("sma({},{})", u32_leaf(period), field_word(*source))
         }
+        // WaveTrend's first line (schema 1.5.0, r6.s1.w2): the channel length,
+        // then the average length — `wavetrend(9,12)`.
+        IndicatorSpec::WaveTrend { channel, average } => {
+            format!("wavetrend({},{})", u32_leaf(channel), u32_leaf(average))
+        }
         // The rolling extremes name the prior-N convention: the word `prior`
         // is MANDATORY — it is the convention's name (Q1), e.g.
         // `highest(high, 20 prior)`.

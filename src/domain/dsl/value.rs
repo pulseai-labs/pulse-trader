@@ -369,6 +369,16 @@ pub enum IndicatorSpec {
         #[serde(default = "default_sma_source")]
         source: PriceField,
     },
+    /// `WaveTrend`'s first line, WT1, over hlc3 (schema 1.5.0, r6.s1.w2).
+    /// esa = EMA(hlc3, channel); d = EMA(|hlc3 − esa|, channel);
+    /// ci = (hlc3 − esa) / (0.015 · d); WT1 = EMA(ci, average).
+    /// Warm-up: the first value lands on candle index `2·channel + average − 3`.
+    WaveTrend {
+        /// The channel length (n1).
+        channel: SweepableValue<u32>,
+        /// The average length (n2).
+        average: SweepableValue<u32>,
+    },
 }
 
 /// `#[serde(default = …)]` target for [`IndicatorSpec::Sma`]'s `source`.

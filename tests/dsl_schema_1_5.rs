@@ -495,3 +495,91 @@ fn the_band_top_equals_the_largest_of_the_eight_emas_on_real_candles() {
     }
     assert!(compared > 500, "the check ran on real bars ({compared})");
 }
+
+// ---------------------------------------------------------------------------
+// 6. `WaveTrend` (r6.s1.w2) — joins under the same 1.5.0
+// ---------------------------------------------------------------------------
+
+fn wavetrend(channel: u32, average: u32) -> IndicatorSpec {
+    IndicatorSpec::WaveTrend {
+        channel: SweepableValue::Fixed(channel),
+        average: SweepableValue::Fixed(average),
+    }
+}
+
+/// `WaveTrend` is an additive variant under the same 1.5.0: the served version
+/// enum is unchanged, the wire shape is exact, and both lengths are required.
+#[test]
+fn the_wavetrend_wire_shape_is_exact_and_both_lengths_are_required() {
+    let spec = wavetrend(9, 12);
+    let json = serde_json::to_string(&spec).expect("serialize");
+    assert_eq!(
+        json,
+        r#"{"indicator":"WaveTrend","channel":9,"average":12}"#
+    );
+    let back: IndicatorSpec = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, spec);
+
+    for partial in [
+        r#"{"indicator":"WaveTrend","channel":9}"#,
+        r#"{"indicator":"WaveTrend","average":12}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<IndicatorSpec>(partial).is_err(),
+            "{partial}: no length has a default"
+        );
+    }
+
+    let schema = serde_json::to_value(schemars::schema_for!(StrategyDsl)).expect("serializes");
+    assert_eq!(
+        schema["properties"]["schema_version"]["enum"],
+        serde_json::json!(["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]),
+        "WaveTrend adds no schema version"
+    );
+}
+
+/// A 1.5.0 strategy with `WaveTrend` on both series validates, renders,
+/// compiles and survives a serialize → load round trip.
+#[test]
+fn a_wavetrend_strategy_validates_renders_compiles_and_round_trips() {
+    let htf = ValueSource::Indicator {
+        series: Series::Htf,
+        spec: wavetrend(9, 12),
+    };
+    let dsl = strategy_with_entry(
+        "pullback under way",
+        Condition::Compare {
+            lhs: htf,
+            op: Comparator::Lt,
+            rhs: constant("0"),
+        },
+    );
+    let validated = validate(&dsl).expect("the strategy validates");
+    compile(&validated).expect("the strategy compiles");
+
+    assert_eq!(render::indicator(&wavetrend(9, 12)), "wavetrend(9,12)");
+    assert_eq!(render::strategy(&dsl).entry, "h4:wavetrend(9,12) < 0");
+
+    let json = serde_json::to_string(&dsl).expect("serializes");
+    let loaded = Migrator::v1().load(&json).expect("loads");
+    assert!(!loaded.migrated, "a CURRENT document needs no migration");
+    assert_eq!(loaded.dsl, dsl, "the round trip is value-equal");
+}
+
+/// A zero length is refused with a path naming that leaf, one error per zero.
+#[test]
+fn a_zero_wavetrend_length_is_refused_by_validation() {
+    for (channel, average, leaf) in [(0, 12, "wavetrend.channel"), (9, 0, "wavetrend.average")] {
+        let dsl = strategy_with_entry(
+            "wavetrend zero",
+            Condition::Compare {
+                lhs: indicator(wavetrend(channel, average)),
+                op: Comparator::Lt,
+                rhs: constant("0"),
+            },
+        );
+        let errors = validate(&dsl).expect_err("a zero length must be refused");
+        let text = format!("{errors:?}");
+        assert!(text.contains(leaf), "the error names {leaf}: {text}");
+    }
+}

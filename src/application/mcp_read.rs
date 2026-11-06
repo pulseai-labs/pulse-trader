@@ -173,6 +173,12 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
         return parse_sma(token, rest);
     }
 
+    // r6.s1.w2 (schema 1.5.0): WaveTrend's first line carries two lengths —
+    // `wavetrend:<channel>:<average>`, the only two-parameter colon kind.
+    if kind == "wavetrend" {
+        return parse_wavetrend(token, rest);
+    }
+
     // r4.s6.w1: the structure indicators. The pivot variants carry the
     // `left`/`right` span; the level variants add `tolerance_pct` (a decimal
     // FRACTION — `0.003` is 0.3%), `min_touches` and `lookback`.
@@ -203,7 +209,7 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
             "invalid --indicator {token:?}: MACD needs fast/slow/signal and is not supported by <kind>:<period>"
         ),
         _ => anyhow::bail!(
-            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, adx, atr, sma, highest, or lowest)"
+            "invalid --indicator {token:?}: unknown kind {kind:?} (expected rsi, ema, adx, atr, sma, wavetrend, highest, or lowest)"
         ),
     };
     Ok(IndicatorColumn {
@@ -282,6 +288,24 @@ fn parse_sma(token: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
         spec: IndicatorSpec::Sma {
             period: SweepableValue::Fixed(period),
             source: field.unwrap_or(PriceField::Close),
+        },
+    })
+}
+
+/// Parse the `wavetrend:<channel>:<average>` form (schema 1.5.0, r6.s1.w2):
+/// both lengths are required, each >= 1.
+fn parse_wavetrend(token: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
+    let parts: Vec<&str> = rest.split(':').collect();
+    let [channel, average] = parts[..] else {
+        anyhow::bail!("invalid --indicator {token:?}: wavetrend expects <channel>:<average>");
+    };
+    let channel = parse_period(token, channel)?;
+    let average = parse_period(token, average)?;
+    Ok(IndicatorColumn {
+        label: format!("wavetrend:{channel}:{average}"),
+        spec: IndicatorSpec::WaveTrend {
+            channel: SweepableValue::Fixed(channel),
+            average: SweepableValue::Fixed(average),
         },
     })
 }
@@ -483,6 +507,15 @@ pub fn indicator_label(spec: &IndicatorSpec) -> String {
         }
         IndicatorSpec::Sma { period, source } => {
             rolling_label("sma", period, *source, PriceField::Close)
+        }
+        // r6.s1.w2 (schema 1.5.0): `wavetrend:<channel>:<average>`, the exact
+        // inverse of `parse_wavetrend`.
+        IndicatorSpec::WaveTrend { channel, average } => {
+            format!(
+                "wavetrend:{}:{}",
+                period_label(channel),
+                period_label(average)
+            )
         }
         IndicatorSpec::Macd {
             fast,
@@ -1040,6 +1073,12 @@ mod tests {
             IndicatorSpec::Macd { .. } => {
                 panic!("MACD is not part of kind:period parsing")
             }
+            IndicatorSpec::WaveTrend { channel, .. } => match channel {
+                // r6.s1.w2: WaveTrend carries two lengths; the channel is the
+                // stand-in this helper reads (the `wavetrend` tests read both).
+                SweepableValue::Fixed(channel) => *channel,
+                SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
+            },
             IndicatorSpec::Body
             | IndicatorSpec::UpperWick
             | IndicatorSpec::LowerWick
@@ -1280,6 +1319,63 @@ mod tests {
         }
     }
 
+    /// r6.s1.w2 (schema 1.5.0): `wavetrend:<channel>:<average>` parses to the
+    /// `WaveTrend` spec with both lengths, and the label is the token.
+    #[test]
+    fn parses_the_wavetrend_token_with_both_lengths() {
+        let one = parse_indicator_specs(&["wavetrend:9:12".to_owned()]).expect("parses");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].label, "wavetrend:9:12");
+        assert_eq!(
+            one[0].spec,
+            IndicatorSpec::WaveTrend {
+                channel: SweepableValue::Fixed(9),
+                average: SweepableValue::Fixed(12),
+            }
+        );
+        // The kind is case-insensitive and the lengths are trimmed, like every
+        // other kind; the label is canonical, so the two spellings dedup.
+        let dup =
+            parse_indicator_specs(&["WaveTrend: 9 : 12".to_owned(), "wavetrend:9:12".to_owned()])
+                .expect("parses");
+        assert_eq!(dup.len(), 1, "one column for both spellings");
+        assert_eq!(dup[0].label, "wavetrend:9:12");
+    }
+
+    /// r6.s1.w2: a malformed `wavetrend` token is refused with the grammar,
+    /// and the unknown-kind refusal lists the kind.
+    #[test]
+    fn rejects_malformed_wavetrend_tokens() {
+        for bad in [
+            "wavetrend:9",
+            "wavetrend:9:12:3",
+            "wavetrend:9-12",
+            "wavetrend:0:12",
+            "wavetrend:9:0",
+            "wavetrend:x:12",
+            "wavetrend:9:",
+        ] {
+            let err = parse_indicator_specs(&[bad.to_owned()])
+                .expect_err(&format!("{bad} must be refused"))
+                .to_string();
+            assert!(
+                err.contains(bad),
+                "{bad}: the refusal names the token: {err}"
+            );
+        }
+        let err = parse_indicator_specs(&["wavetrend:9".to_owned()])
+            .expect_err("one length is refused")
+            .to_string();
+        assert!(
+            err.contains("<channel>:<average>"),
+            "the refusal states the grammar: {err}"
+        );
+        let err = parse_indicator_specs(&["nope:9".to_owned()])
+            .expect_err("unknown kind")
+            .to_string();
+        assert!(err.contains("wavetrend"), "the kind list names it: {err}");
+    }
+
     /// r5.s2.w1 (SPINE G2/AC-1): every spec a compiled rule can carry has a
     /// label the token parser accepts, and `parse(label(spec)) == spec` — so the
     /// chart read's overlays are always addressable through `export_indicators`.
@@ -1328,6 +1424,14 @@ mod tests {
             IndicatorSpec::Sma {
                 period: fixed(50),
                 source: PriceField::High,
+            },
+            IndicatorSpec::WaveTrend {
+                channel: fixed(9),
+                average: fixed(12),
+            },
+            IndicatorSpec::WaveTrend {
+                channel: fixed(3),
+                average: fixed(1),
             },
             IndicatorSpec::Macd {
                 fast: fixed(12),

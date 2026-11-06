@@ -53,7 +53,7 @@ narrows the strategy into something they did not request.
 
 Every tool takes **flat primitive** arguments. Two value rules:
 
-- **Integers are JSON numbers** — an indicator `period`/`fast`/`slow`/`signal` is a number like `14`, never a string (`"14"`).
+- **Integers are JSON numbers** — an indicator `period`/`fast`/`slow`/`signal`/`channel`/`average` is a number like `14`, never a string (`"14"`).
 - **Decimals are JSON strings** — every price / percent / ratio is a decimal *string* like `"30"`, `"0.05"`, `"2.0"`, never a bare number.
 
 ### Operands (`add_entry_signal` and `add_filter`)
@@ -62,7 +62,7 @@ Both take `{ "left": <operand>, "op": <comparator>, "right": <operand> }`.
 
 **Every operand — left AND right — MUST include a `source`.** Pick one shape:
 
-- `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx"|"atr", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number>, "output": "line"|"signal"|"histogram" }` (the optional `output` picks which MACD series the operand reads; omit it for the line) — or for the rolling extremes: `{ "source": "indicator", "indicator": "highest"|"lowest", "period": <number> }` (the highest value / lowest value of the last `period` **prior** bars, excluding the current one; add `"price_field": "high"` for `highest` and `"price_field": "low"` for `lowest` unless the trader names another field) — or for the simple moving average: `{ "source": "indicator", "indicator": "sma", "period": <number> }` (the mean of the last `period` bars **including the current one**; it averages the close unless you add `"price_field": "open"|"high"|"low"|"volume"`; the first value lands on bar `period`)
+- `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx"|"atr", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number>, "output": "line"|"signal"|"histogram" }` (the optional `output` picks which MACD series the operand reads; omit it for the line) — or for the rolling extremes: `{ "source": "indicator", "indicator": "highest"|"lowest", "period": <number> }` (the highest value / lowest value of the last `period` **prior** bars, excluding the current one; add `"price_field": "high"` for `highest` and `"price_field": "low"` for `lowest` unless the trader names another field) — or for the simple moving average: `{ "source": "indicator", "indicator": "sma", "period": <number> }` (the mean of the last `period` bars **including the current one**; it averages the close unless you add `"price_field": "open"|"high"|"low"|"volume"`; the first value lands on bar `period`) — or for WaveTrend's first line, WT1: `{ "source": "indicator", "indicator": "wavetrend", "channel": <number>, "average": <number> }` (an oscillator over the bar's hlc3 = (high + low + close) / 3, centred on 0, so "the pullback is under way" is `wavetrend` below `0`; **both** `channel` and `average` are required, and a trader who names no lengths means `9` and `12`; the first value lands on bar `2·channel + average − 2`, and a bar whose smoothed deviation is exactly zero, as on a perfectly flat stretch, has no value)
 
 - **The schema-1.3.0 structure and pattern indicators** (the swing structure a
   breakout is built from; each is still an `indicator` operand, so any of them

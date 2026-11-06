@@ -101,6 +101,10 @@ const SCAN_TARGETS: &[&str] = &[
     // other indicator surface so a future banned call here is not a false-green
     // hole.
     "src/adapters/indicators/sma.rs",
+    // r6.s1.w2: the WaveTrend adapter — three chained ta-rs EMAs behind the
+    // `convert` seam (hlc3 in, WT1 out at scale 8 half-even), scanned like
+    // `ema.rs` so a future banned f64 call here is not a false-green hole.
+    "src/adapters/indicators/wavetrend.rs",
     "src/domain/backtest/regime.rs",
     "src/adapters/backtest/regime.rs",
     "src/adapters/backtest/engine.rs",

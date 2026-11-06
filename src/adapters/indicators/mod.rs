@@ -21,6 +21,8 @@ pub mod rsi;
 // r6.s1.w1 (schema 1.5.0): the simple moving average of one price field.
 pub mod sma;
 pub mod structure;
+// r6.s1.w2 (schema 1.5.0): WaveTrend's first line, WT1, over hlc3.
+pub mod wavetrend;
 pub mod wilder;
 
 #[cfg(test)]
