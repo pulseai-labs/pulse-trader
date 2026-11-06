@@ -61,6 +61,11 @@ const CONVENTIONS: &[(&str, &str)] = &[
         "sma",
         "`Sma{period, source}` is the arithmetic mean of `source` over the last `period` bars INCLUDING the current one, rounded to 8 decimal places half-even (rendered `sma(50,close)`); `source` is any price field and defaults to `close`; the first value lands on candle index `period` − 1, and it works on any series (`h4:sma(50,close)` is the mean of the last 50 closed H4 bars)",
     ),
+    // r6.s1.w2 (schema 1.5.0): WaveTrend's first line.
+    (
+        "wavetrend",
+        "`WaveTrend{channel, average}` is WaveTrend's first line, WT1, over hlc3 = (high + low + close) / 3 (rendered `wavetrend(9,12)`): esa = EMA(hlc3, channel), d = EMA(|hlc3 − esa|, channel), ci = (hlc3 − esa) / (0.015 · d), WT1 = EMA(ci, average), each EMA with α = 2 / (n + 1) seeded with its first input; the value is rounded to 8 decimal places half-even; the first value lands on candle index 2·channel + average − 3; a bar whose d is exactly 0 has no value; it works on any series (`h4:wavetrend(9,12)`) and matches TradingView's WT1 only after a long warm-up, because TradingView seeds its EMAs with an SMA",
+    ),
     // r4.s6.w1/w3 (schema 1.3.0), published by r4.s6.w4: the structure and
     // pattern vocabulary — including the zone-break form the never-true
     // same-bar comparison would violate.
@@ -199,5 +204,23 @@ mod tests {
             d1,
             "a `d1` operand is evaluated on the last closed daily (1d) bar, never on the forming one; the daily snapshot needs no argument — it resolves automatically for the pair a strategy is run on, and a missing one is refused by name: fetch it with `pulse fetch-data <PAIR> --tf D1`; the `timeframe` argument still selects only `primary` or `htf`, and `1d` is refused there because the daily series is the fixed `d1` slot"
         );
+        // r6.s1.w2 (schema 1.5.0): the WaveTrend convention states the formula,
+        // the warm-up index and the zero-`d` rule.
+        let wavetrend = conventions
+            .get("wavetrend")
+            .and_then(serde_json::Value::as_str)
+            .expect("conventions.wavetrend is a string");
+        for needle in [
+            "hlc3",
+            "0.015",
+            "2·channel + average − 3",
+            "d is exactly 0",
+            "wavetrend(9,12)",
+        ] {
+            assert!(
+                wavetrend.contains(needle),
+                "{needle:?} missing: {wavetrend}"
+            );
+        }
     }
 }

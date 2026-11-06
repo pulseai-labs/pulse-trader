@@ -24,6 +24,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   meaning and its frozen `result_content_hash`; `WaveTrend` (r6.s1.w2) joins under the same 1.5.0. See the ADR-0024
   addendum `docs/adr/0024-addendum-cipher-indicators-1-5-0.md`.
 
+- **WaveTrend WT1 indicator (r6.s1.w2).** A strategy can now read WaveTrend's first line as an operand on either
+  series: `IndicatorSpec::WaveTrend { channel, average }`, serialized
+  `{"indicator":"WaveTrend","channel":9,"average":12}` under the same schema 1.5.0 (no version bump).
+  It is the oscillator Cipher v1 reads as "the pullback is under way" (WT1 below 0): over the hlc3,
+  `esa = EMA(hlc3, channel)`, `d = EMA(|hlc3 − esa|, channel)`, `ci = (hlc3 − esa) / (0.015 · d)`,
+  `WT1 = EMA(ci, average)`, rounded to 8 places half-even, its first value on candle index
+  `2·channel + average − 3`; a bar whose `d` is exactly zero has no value. `wavetrend:<channel>:<average>` is a new
+  `pulse indicators` / `export_indicators` token, the composer's tool schema takes `"indicator": "wavetrend"` with
+  `channel` and `average`, and the MCP schema resource says so. Parity: the engine's WT1(9, 12) on the committed
+  SOLUSDT 4h fixture agrees with TradingView's readings in STR-0003's ledger to within 0.05 at all eight ledger
+  bars, after warm-up (TradingView seeds with an SMA; the difference has decayed by then). See the ADR-0024
+  addendum `docs/adr/0024-addendum-cipher-indicators-1-5-0.md`.
+
 - **The Library shows the power review (r5.s5.w3, PDR-0040, ADR-0032).** The details pane of a selected version now
   carries a **Power review** section: for each pair, the latest review under the open freeze, with its **holdout
   trade count**, its **pass chance** against the **50% bar** fixed at plan time, and whether a certify attempt is

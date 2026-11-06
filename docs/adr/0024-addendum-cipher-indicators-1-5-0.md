@@ -85,6 +85,51 @@ another indicator — a different shape, not a new field here); exponential
 weighting, offsets or smoothing options on the SMA (additive, out of scope); or
 any non-additive grammar change, exactly as the parent decision lists them.
 
+## WaveTrend (`r6.s1.w2`)
+
+`r6.s1.w2` adds the third block under the same 1.5.0: `IndicatorSpec::WaveTrend`,
+WaveTrend's first line, WT1, over hlc3. No version step, no new migration: the
+variant is an unused tag in every existing document.
+
+| Addition | Shape | Value at bar t |
+|---|---|---|
+| `IndicatorSpec::WaveTrend` | `{ channel: SweepableValue<u32>, average: SweepableValue<u32> }`, both required, no defaults | `ap = (high + low + close) / 3`; `esa = EMA(ap, channel)`; `d = EMA(|ap − esa|, channel)`; `ci = (ap − esa) / (0.015 · d)`; `WT1 = EMA(ci, average)`, rounded to 8 decimal places half-even. |
+
+The wire form is `{"indicator":"WaveTrend","channel":9,"average":12}`; it renders
+`wavetrend(9,12)`; the `export_indicators` token is `wavetrend:<channel>:<average>`
+(the label is the exact inverse of the parser); the composer's tool schema takes
+`"indicator": "wavetrend"` with `channel` and `average`, both required.
+
+**The arithmetic.** Each EMA is the ta-rs `ExponentialMovingAverage` the `Ema`
+adapter wraps: `α = 2 / (n + 1)`, seeded with its first input. Floats stay behind
+the `convert` seam: the hlc3 is formed in `Decimal` and crosses once, and WT1
+crosses back once at scale 8 half-even. The three EMAs are chained: `d` is fed
+from the bar `esa` is warm (`channel` values fed), and WT1 from the bar `d` is
+warm. The first value therefore lands on candle index
+`(channel − 1) + (channel − 1) + (average − 1) = 2·channel + average − 3`.
+
+**A bar with `d = 0` has no value.** Then `ci` is undefined. The bar returns no
+value and does **not** feed the third EMA, so `esa` and `d` advance and WT1 does
+not; later bars continue from the same state and nothing desyncs. `d` is exactly
+zero only while every bar since `esa` warmed has equalled `esa`: a constant
+series, or `channel = 1` (where `esa` is the input itself, so WaveTrend with
+`channel = 1` never has a value). `is_ready` follows the `Indicator` port: true
+iff the next call returns a value, on the assumption that the next bar's `d` is
+not exactly zero.
+
+**Parity, and its limit.** `tests/wavetrend_parity.rs` runs `WaveTrend{9, 12}`
+over every SOLUSDT 4h bar of the committed fixture store, from the first, and
+holds the engine's WT1 at STR-0003's eight ledger bars to within 0.05 of
+TradingView's two-decimal reading. TradingView seeds its EMAs with an SMA and the
+engine with the first input; the difference decays geometrically, so the claim is
+parity **after warm-up**, and every ledger bar is more than 400 4h bars past it
+(PDR-0003's clean room: the formula above is the whole definition, and no
+third-party implementation was read). A shorter series, or a bar close to the
+first, will not match TradingView to that tolerance.
+
+**Touch surface** is the same list as the SMA's, plus the determinism guard's scan
+target `src/adapters/indicators/wavetrend.rs`; not `src/domain/backtest/**`.
+
 ## Consequences
 
 A strategy can now write a simple moving average of any price field and combine
@@ -97,7 +142,7 @@ existing document names cannot change a number, and the `1.4.0 → 1.5.0` step
 rewrites only the version string.
 
 The cost of the next building block stays inside ADR-0024's seam list. The SMA
-needed one enum variant and its arms in each explicit `IndicatorSpec` match (the
+and WaveTrend each needed one enum variant and its arms in each explicit `IndicatorSpec` match (the
 engine factory, validation, render, mutation, the MCP token parser and label, the
 composer tool schema and the proptest generators); none of those matches has a
 wildcard, so the compiler listed every site. A block that does not fit that list

@@ -657,6 +657,13 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::Highest { period, .. } => format!("Highest({})", period_value(period)),
         IndicatorSpec::Lowest { period, .. } => format!("Lowest({})", period_value(period)),
         IndicatorSpec::Sma { period, .. } => format!("sma({})", period_value(period)),
+        IndicatorSpec::WaveTrend { channel, average } => {
+            format!(
+                "wavetrend({}/{})",
+                period_value(channel),
+                period_value(average)
+            )
+        }
         IndicatorSpec::PivotHigh { left, right } => {
             format!("PivotHigh({}/{})", period_value(left), period_value(right))
         }
@@ -938,6 +945,22 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
         // no rule (the rolling extremes' precedent above).
         IndicatorSpec::Sma { period, .. } => {
             check_u32_positive(period, &format!("{path}.sma.period"), "SMA period", errors);
+        }
+        // WaveTrend (schema 1.5.0, r6.s1.w2): both lengths are EMA windows and
+        // must be > 0.
+        IndicatorSpec::WaveTrend { channel, average } => {
+            check_u32_positive(
+                channel,
+                &format!("{path}.wavetrend.channel"),
+                "WaveTrend channel",
+                errors,
+            );
+            check_u32_positive(
+                average,
+                &format!("{path}.wavetrend.average"),
+                "WaveTrend average",
+                errors,
+            );
         }
         // The structure indicators (schema 1.3.0, r4.s6.w1), the pattern
         // indicators (r4.s6.w3) and the named candle patterns (schema 1.4.0,

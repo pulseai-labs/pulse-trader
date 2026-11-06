@@ -477,6 +477,12 @@ mod mapping {
         slow: Option<u32>,
         #[serde(default)]
         signal: Option<u32>,
+        // `wavetrend` only (schema 1.5.0, r6.s1.w2): the channel length (n1)
+        // and the average length (n2); both are required for that kind.
+        #[serde(default)]
+        channel: Option<u32>,
+        #[serde(default)]
+        average: Option<u32>,
         // MACD-only output selector (schema 1.2.0, r3.s2 — b2): `"line"`,
         // `"signal"` or `"histogram"`; absent → the historical line.
         #[serde(default)]
@@ -893,6 +899,12 @@ mod mapping {
                 period: fixed_period(operand, path)?,
                 source: price_field_or(operand.price_field.as_deref(), PriceField::Close, path)?,
             }),
+            // WaveTrend's first line (schema 1.5.0, r6.s1.w2): two required
+            // lengths, `channel` (n1) and `average` (n2).
+            "wavetrend" => Ok(IndicatorSpec::WaveTrend {
+                channel: fixed_u32(operand.channel, &format!("{path}.channel"))?,
+                average: fixed_u32(operand.average, &format!("{path}.average"))?,
+            }),
             // The structure indicators (r4.s6.w1): the pivot variants take
             // `left`/`right`, the level variants the same span plus
             // `tolerance_pct` (a decimal fraction — `0.003` = 0.3%),
@@ -1133,6 +1145,7 @@ fn operand_schema() -> Value {
 
 /// One unroll level of the operand schema: the full property set, with
 /// `lhs` / `rhs` / `of` set to `nested`.
+#[allow(clippy::too_many_lines)] // one JSON property table: every operand field is one entry
 fn operand_schema_level(nested: &Value) -> Value {
     json!({
         "type": "object",
@@ -1144,7 +1157,7 @@ fn operand_schema_level(nested: &Value) -> Value {
             "indicator": {
                 "type": "string",
                 "enum": [
-                    "rsi", "ema", "adx", "macd", "atr", "sma", "highest", "lowest",
+                    "rsi", "ema", "adx", "macd", "atr", "sma", "wavetrend", "highest", "lowest",
                     "pivot_high", "pivot_low", "resistance", "support",
                     "double_top_neckline", "double_bottom_neckline",
                     "trendline_lows", "trendline_highs",
@@ -1172,6 +1185,16 @@ fn operand_schema_level(nested: &Value) -> Value {
             "fast": { "type": "integer", "minimum": 1 },
             "slow": { "type": "integer", "minimum": 1 },
             "signal": { "type": "integer", "minimum": 1 },
+            "channel": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "wavetrend only (required): the channel length n1, e.g. 9"
+            },
+            "average": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "wavetrend only (required): the average length n2, e.g. 12"
+            },
             "output": {
                 "type": "string",
                 "enum": ["line", "signal", "histogram"],
@@ -1873,6 +1896,127 @@ mod tests {
                 "the refusal lists max|min: {errors:?}"
             ),
             ToolOutcome::Ok { .. } => panic!("an unknown arith op must be a correctable Err"),
+        }
+    }
+
+    /// r6.s1.w2 (schema 1.5.0): `wavetrend` takes a `channel` and an `average`
+    /// and composes through the tool surface into the typed document, on the
+    /// primary and on the higher-timeframe series.
+    #[test]
+    fn wavetrend_composes_through_the_tool_surface() {
+        use crate::domain::{Condition, IndicatorSpec, Series, SweepableValue, ValueSource};
+
+        let mut builder = StrategyBuilder::new();
+        assert_ok(create_strategy(
+            &mut builder,
+            json!({ "name": "pullback under way", "direction": "long" }),
+        ));
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": {
+                    "source": "indicator", "indicator": "wavetrend",
+                    "channel": 9, "average": 12, "timeframe": "h4"
+                },
+                "op": "lt",
+                "right": { "source": "constant", "value": "0" }
+            }),
+        ));
+        assert_ok(add_filter(
+            &mut builder,
+            json!({
+                "left": {
+                    "source": "indicator", "indicator": "wavetrend",
+                    "channel": 10, "average": 21
+                },
+                "op": "gt",
+                "right": { "source": "constant", "value": "-60" }
+            }),
+        ));
+        assert_ok(set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05" }),
+        ));
+        assert_ok(set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        ));
+        let validated = builder.finalize().expect("the strategy must validate");
+        let Condition::Compare { lhs, .. } = &validated.dsl().entry else {
+            panic!("the entry is a comparison");
+        };
+        assert_eq!(
+            *lhs,
+            ValueSource::Indicator {
+                series: Series::Htf,
+                spec: IndicatorSpec::WaveTrend {
+                    channel: SweepableValue::Fixed(9),
+                    average: SweepableValue::Fixed(12),
+                },
+            },
+            "channel and average map to the variant's two lengths"
+        );
+        let Condition::Compare { lhs, .. } = &validated.dsl().filters[0] else {
+            panic!("the filter is a comparison");
+        };
+        assert!(
+            matches!(
+                lhs,
+                ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec: IndicatorSpec::WaveTrend { .. },
+                }
+            ),
+            "an absent timeframe is the primary series, got {lhs:?}"
+        );
+    }
+
+    /// r6.s1.w2: both `WaveTrend` lengths are required, and a missing one is a
+    /// correctable error pathed at that field; the advertised `indicator` enum
+    /// and the operand properties list the new kind.
+    #[test]
+    fn wavetrend_requires_both_lengths_and_is_advertised() {
+        let mut builder = StrategyBuilder::new();
+        for (operand, missing) in [
+            (
+                json!({ "source": "indicator", "indicator": "wavetrend", "average": 12 }),
+                "left.channel",
+            ),
+            (
+                json!({ "source": "indicator", "indicator": "wavetrend", "channel": 9 }),
+                "left.average",
+            ),
+        ] {
+            match add_entry_signal(
+                &mut builder,
+                json!({
+                    "left": operand,
+                    "op": "lt",
+                    "right": { "source": "constant", "value": "0" }
+                }),
+            ) {
+                ToolOutcome::Err { errors } => assert!(
+                    errors.iter().any(|e| e.path == missing),
+                    "pathed at {missing}: {errors:?}"
+                ),
+                ToolOutcome::Ok { .. } => panic!("a missing length must be a correctable Err"),
+            }
+        }
+
+        let schema = super::operand_schema_level(&json!({}));
+        let kinds = schema["properties"]["indicator"]["enum"]
+            .as_array()
+            .expect("the indicator enum");
+        assert!(
+            kinds.iter().any(|k| k == "wavetrend"),
+            "the indicator enum lists wavetrend: {kinds:?}"
+        );
+        for field in ["channel", "average"] {
+            assert_eq!(
+                schema["properties"][field]["minimum"],
+                json!(1),
+                "the operand schema advertises `{field}` as a positive integer"
+            );
         }
     }
 
