@@ -125,6 +125,7 @@ pub fn seeded_trade() -> Trade {
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
         stop_price: Some(Decimal::new(89_450, 0)),
+        setup: None,
     }
 }
 
@@ -295,6 +296,7 @@ pub fn seeded_trade_at_r(idx: i64, r: Decimal) -> Trade {
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
         stop_price: Some(stop),
+        setup: None,
     }
 }
 

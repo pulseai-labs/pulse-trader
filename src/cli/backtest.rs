@@ -717,6 +717,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(Decimal::new(28_500, 0)),
+            setup: None,
         }
     }
 

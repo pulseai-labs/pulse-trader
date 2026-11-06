@@ -1890,6 +1890,7 @@ fn prepared_backtest() -> PreparedBacktest {
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
         stop_price: Some(Decimal::new(28_500, 0)),
+        setup: None,
     }];
     let starting_equity = Decimal::new(10_000, 0);
     let net_pnl: Decimal = trades.iter().map(|t| t.realized_pnl).sum();
