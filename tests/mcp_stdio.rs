@@ -734,3 +734,68 @@ async fn unknown_identifiers_refuse_instead_of_returning_empty() {
 
     client.cancel().await.expect("cancel session");
 }
+
+/// r6.s1.w3 (AC-4): the Cipher composition example round-trips over MCP. The
+/// example's rule submits through `submit_strategy_version` as a new strategy,
+/// reads back through `get_version` at schema 1.5.0, and `pulse://dsl/schema`
+/// lists `Sma`, `WaveTrend` and the `max` / `min` arithmetic operations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cipher_example_round_trips_over_mcp() {
+    let tmp_db = TempDir::new().unwrap();
+    let (db_path, _db) = migrated_db(&tmp_db).await;
+    let tmp_store = TempDir::new().unwrap();
+    let store_dir = tmp_store.path().join("store");
+    copy_tree(&manifest(FIXTURE_STORE), &store_dir);
+    let client = spawn_client(&db_path, &store_dir).await;
+
+    // The schema resource lists the four new spellings.
+    let read = client
+        .read_resource(ReadResourceRequestParams::new("pulse://dsl/schema"))
+        .await
+        .expect("resources/read pulse://dsl/schema");
+    let ResourceContents::TextResourceContents { text, .. } = &read.contents[0] else {
+        panic!(
+            "dsl_schema must be text contents, got {:?}",
+            read.contents[0]
+        );
+    };
+    let doc: Value = serde_json::from_str(text).expect("dsl_schema body parses as JSON");
+    let schema = doc["json_schema"].to_string();
+    for spelling in ["\"Sma\"", "\"WaveTrend\"", "\"max\"", "\"min\""] {
+        assert!(
+            schema.contains(spelling),
+            "pulse://dsl/schema does not list {spelling}"
+        );
+    }
+
+    // The example submits as a new strategy through the agent write tool.
+    let example: Value = serde_json::from_str(
+        &std::fs::read_to_string(manifest("examples/strategies/cipher-building-blocks.json"))
+            .expect("read the Cipher example"),
+    )
+    .expect("the Cipher example is JSON");
+    let submitted = call(
+        &client,
+        "submit_strategy_version",
+        json!({
+            "strategy_name": "Cipher building blocks",
+            "dsl": example,
+            "hypothesis": "r6.s1.w3: the Cipher building blocks compose into one valid rule",
+        }),
+    )
+    .await;
+    let version_id = submitted["version_id"]
+        .as_str()
+        .expect("version_id reported")
+        .to_owned();
+    assert_eq!(submitted["created_by"], "external_agent");
+
+    // It reads back at 1.5.0 with the rule intact.
+    let version = call(&client, "get_version", json!({"version_id": version_id})).await;
+    assert_eq!(version["dsl_schema_version"], "1.5.0");
+    assert_eq!(version["dsl"]["name"], example["name"]);
+    assert_eq!(version["dsl"]["entry"], example["entry"]);
+    assert_eq!(version["dsl"]["filters"], example["filters"]);
+
+    client.cancel().await.expect("cancel session");
+}
