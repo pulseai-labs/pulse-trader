@@ -948,7 +948,7 @@ pub use application::holdout::{HoldoutRefusal, guard_candle};
 pub use application::mark_explain::{
     ConjunctReport, ExplainError, ExplainHoldout, ExplainReport, ExplainRequest, MarkExplanation,
     MarkJson, MarkRefusal, MarkSelection, MarkWriterJson, OperandReport, PatternReport,
-    RuleRequest, explain_marks,
+    RuleRequest, SetupReport, TriggerReport, explain_marks,
 };
 pub use domain::{
     ExampleMark, ExampleMarkDraft, ExampleMarkRepository, MarkError, MarkFilter, MarkNote,
