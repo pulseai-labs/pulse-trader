@@ -7,9 +7,14 @@ mod engine;
 // `domain::backtest::regime`.
 mod regime;
 pub mod session;
+// r6.s2.w2 (ADR-0033): the one-sided setup state machine.
+mod setup;
 
 pub use engine::{
     BacktestConfig, FundingGapWindow, first_fully_warm_bar_ms, funding_gaps, run_backtest,
 };
 pub use regime::RegimeDetector;
-pub use session::{EngineSession, EvalProbe, SessionTimeframes, indicator_values_at, step_series};
+pub use session::{
+    EngineSession, EvalProbe, SessionTimeframes, SetupView, indicator_values_at, step_series,
+};
+pub use setup::{SetupEvent, SetupFire, SetupPhase, SideState};

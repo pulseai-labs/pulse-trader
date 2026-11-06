@@ -519,9 +519,9 @@ pub use cli::watch::{
 // type is a `dead_code` build error, not a warning. Kept additive (work-1.02's
 // MTF feed extends the same `backtest` tree at the R1→R2 merge).
 pub use domain::{
-    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, Side, Trade,
-    TradeSource, apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
-    taker_fee,
+    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, SetupTrace, Side,
+    Trade, TradeSource, apply_slippage, funding_payment, realized_pnl, realized_r,
+    resolve_intra_bar_exit, taker_fee,
 };
 
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
@@ -567,6 +567,8 @@ pub use adapters::backtest::RegimeDetector;
 // so explain pairs HTF/D1 bars exactly as the backtest does. Additive: both are
 // read-only, and no backtest output changes with them in place.
 pub use adapters::backtest::{EngineSession, EvalProbe, SessionTimeframes, step_series};
+// r6.s2.w2 (ADR-0033): the setup state `EvalProbe::setup_view` reads, per side.
+pub use adapters::backtest::{SetupEvent, SetupFire, SetupPhase, SetupView, SideState};
 pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 
 // VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface

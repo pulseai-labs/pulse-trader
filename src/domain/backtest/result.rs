@@ -258,6 +258,21 @@ fn feed_trade(hasher: &mut Sha256, trade: &Trade) {
     if let Some(stop_price) = trade.stop_price {
         feed_decimal(hasher, stop_price);
     }
+    // r6.s2.w2 (ADR-0033): the setup trace feeds the hash CONDITIONALLY too —
+    // `None` writes nothing, so every run of a strategy without a setup
+    // re-derives the byte stream it hashed under before the field existed.
+    if let Some(trace) = trade.setup {
+        hasher.update([0x53]);
+        hasher.update(trace.arm_time.to_be_bytes());
+        hasher.update(trace.dip_time.to_be_bytes());
+        match trace.anchor_time {
+            Some(anchor) => {
+                hasher.update([1]);
+                hasher.update(anchor.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
 }
 
 /// Feed one [`RegimeCell`] (`{ trade_count: usize, net_pnl: Decimal }`).
@@ -396,6 +411,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(Decimal::new(28_500, 0)),
+            setup: None,
         };
         let mut regime_breakdown = RegimeBreakdown::new();
         regime_breakdown.record(Regime::TrendingUp, trade.realized_pnl);

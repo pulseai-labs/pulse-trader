@@ -154,6 +154,7 @@ fn marker_trade() -> Trade {
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
         stop_price: None,
+        setup: None,
     }
 }
 

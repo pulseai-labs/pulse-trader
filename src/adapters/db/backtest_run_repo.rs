@@ -873,6 +873,8 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                     .stop_price
                     .map(|s| parse_decimal("trade.stop_price", &s))
                     .transpose()?,
+                // Persisting the setup trace is r6.s2.w3's; a stored run reads back without one.
+                setup: None,
             });
         }
         Ok(out)
@@ -1709,6 +1711,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(d(28_500, 0)),
+            setup: None,
         }
     }
 
@@ -1791,6 +1794,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingDown,
             stop_price: Some(Decimal::from_str_exact("19500.00").unwrap()),
+            setup: None,
         };
         // Trade B — single fill, regime Ranging, positive.
         let trade_b = Trade {
@@ -1819,6 +1823,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::Ranging,
             stop_price: Some(d(110, 0)),
+            setup: None,
         };
         // Trade C — regime Unknown (opened while warming), break-even.
         let trade_c = Trade {
@@ -1847,6 +1852,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::Unknown,
             stop_price: Some(d(45, 0)),
+            setup: None,
         };
         // Trade D — regime TrendingUp, positive (so all four variants appear).
         let trade_d = Trade {
@@ -1875,6 +1881,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(Decimal::from_str_exact("6.66666667").unwrap()),
+            setup: None,
         };
         let trades = vec![trade_a, trade_b, trade_c, trade_d];
         // All four regime cells populated.

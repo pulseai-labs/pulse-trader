@@ -167,6 +167,22 @@ pub struct Trade {
     /// stream it hashed under (the r2.s1 G1(b) precedent).
     #[serde(default)]
     pub stop_price: Option<Decimal>,
+
+    /// The setup that produced this trade; `None` for a strategy with no setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupTrace>,
+}
+
+/// The setup that produced a trade (ADR-0033). The trigger time is the trade's
+/// `entry_signal_time`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupTrace {
+    /// The close time of the arm bar, epoch ms.
+    pub arm_time: i64,
+    /// The close time of the dip bar, epoch ms.
+    pub dip_time: i64,
+    /// The close time of the stop-anchor bar, epoch ms, when one was found.
+    pub anchor_time: Option<i64>,
 }
 
 #[cfg(test)]
@@ -211,6 +227,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(Decimal::new(99, 0)),
+            setup: None,
         }
     }
 

@@ -3,13 +3,14 @@
 use rust_decimal::Decimal;
 
 use super::session::{EngineSession, SessionTimeframes, step_series};
+use super::setup::SetupFire;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledExit, CompiledStrategy,
     CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve, EvalContext, ExitReason,
     Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, OpenPositionStops, Regime,
-    RegimeBreakdown, Series, SeriesEnd, SeriesRole, Side, SizingOutcome, SkipReason,
+    RegimeBreakdown, Series, SeriesEnd, SeriesRole, SetupTrace, Side, SizingOutcome, SkipReason,
     SkippedEntryCounts, SummaryStats, SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource,
     ValidationError, align, apply_slippage, atr_stop_price, compute_position_size, funding_payment,
     realized_pnl, realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
@@ -722,6 +723,9 @@ pub(super) struct PendingEntry {
     /// it into the absolute stop without recomputing (the ATR may have moved
     /// between signal and fill bars).
     pub(super) atr_at_signal: Option<Decimal>,
+    /// The setup side that fired this entry (r6.s2.w2, ADR-0033); `None` for
+    /// a strategy with no setup.
+    pub(super) setup: Option<SetupFire>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -771,6 +775,9 @@ pub(super) struct OpenPosition {
     /// The market regime in effect at the entry-fill bar (FR-6), carried to the
     /// `Trade` at close so `RegimeBreakdown` can aggregate it.
     regime: Regime,
+    /// The setup trace carried to the `Trade` at close (r6.s2.w2, ADR-0033);
+    /// `None` for a strategy with no setup.
+    setup: Option<SetupTrace>,
 }
 
 impl OpenPosition {
@@ -823,6 +830,7 @@ impl OpenPosition {
             mfe_r: Decimal::ZERO,
             mae_r: Decimal::ZERO,
             regime,
+            setup: None,
         }
     }
 
@@ -893,6 +901,8 @@ pub(super) struct PreparedEntry {
     stop: Decimal,
     take_profit_price: Option<Decimal>,
     signal_time: i64,
+    /// The pending entry's setup trace, copied to the position at the commit.
+    setup: Option<SetupTrace>,
 }
 
 /// The commit instruction [`prepare_pending_fill`] produced.
@@ -1010,6 +1020,11 @@ pub(super) fn prepare_pending_fill(
         stop,
         take_profit_price,
         signal_time: pending.signal_time,
+        setup: pending.setup.map(|fire| SetupTrace {
+            arm_time: fire.arm_time,
+            dip_time: fire.dip_time,
+            anchor_time: fire.anchor_time,
+        }),
     }))
 }
 
@@ -1053,6 +1068,7 @@ pub(super) fn commit_pending_fill(
                 mfe_r: Decimal::ZERO,
                 mae_r: Decimal::ZERO,
                 regime,
+                setup: entry.setup,
             });
         }
     }
@@ -1354,6 +1370,8 @@ fn close_position(
         // trailing stop moved the effective level (`exit_price` shows where
         // the trail was).
         stop_price: Some(position.initial_stop),
+        // The setup that produced the entry (ADR-0033); `None` without a setup.
+        setup: position.setup,
     });
     Ok(())
 }
@@ -2084,6 +2102,7 @@ mod tests {
             mfe_r: Decimal::ZERO,
             mae_r: Decimal::ZERO,
             regime: Regime::Unknown,
+            setup: None,
         }
     }
 
@@ -2778,6 +2797,7 @@ mod tests {
                 mfe_r: Decimal::ZERO,
                 mae_r: Decimal::ZERO,
                 regime: Regime::Unknown,
+                setup: None,
             };
             for (lo_off, span, up_off) in &bars {
                 // Build a coherent OHLC bar around the entry price: low <= open,

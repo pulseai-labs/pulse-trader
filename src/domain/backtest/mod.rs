@@ -64,7 +64,7 @@ pub use streak_card::{
     ClosedTrade, DecimalPercentiles, FIXED_EQUITY_USDT, HORIZON_TRADES, MIN_CLOSED_TRADES, PATHS,
     PERCENTILES, STREAK_CARD_SEED, StreakCard, StreakPercentiles, streak_card,
 };
-pub use trade::{ExitReason, Fill, Trade, TradeSource};
+pub use trade::{ExitReason, Fill, SetupTrace, Trade, TradeSource};
 pub use walk_forward::{
     FoldScheme, FoldVerdict, K_DEFAULT, K_MAX, K_MIN, N_MIN, RunVerdict, VerdictRule,
     WalkForwardError, WalkForwardFold, WalkForwardFoldDraft, WalkForwardMembership, WalkForwardRun,

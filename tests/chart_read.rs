@@ -256,6 +256,7 @@ fn trade_at(entry_ms: i64, r: &str) -> Trade {
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
         stop_price: Some(stop),
+        setup: None,
     }
 }
 

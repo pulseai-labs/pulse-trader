@@ -420,6 +420,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::Unknown,
             stop_price: None,
+            setup: None,
         }
     }
 
