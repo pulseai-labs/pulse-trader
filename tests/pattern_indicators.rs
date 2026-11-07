@@ -582,6 +582,7 @@ fn long_dsl(entry: Condition) -> StrategyDsl {
             risk_per_trade_pct: fixed_dec("0.01"),
             max_leverage: fixed_dec("3"),
         },
+        setup: None,
     }
 }
 

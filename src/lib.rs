@@ -129,7 +129,8 @@ pub use domain::{
 // `deny(warnings)` + `pub(crate) mod domain` (an un-re-exported public domain
 // type is a `dead_code` build error, not a warning).
 pub use domain::{
-    Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl,
+    Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, Setup, SetupSide,
+    StrategyDsl,
 };
 
 // r2.s2.w4 (b10, ADR-0024): the one ring-owned DSL display formatter —
@@ -167,8 +168,9 @@ pub use domain::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Mi
 // Re-exported on the same curated-surface pattern — REQUIRED under
 // `deny(warnings)` + `pub(crate) mod domain`.
 pub use domain::{
-    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledSetup, CompiledSetupSide,
+    CompiledStrategy, CompiledValue, EvalContext, atr_stop_price, compile, stop_price,
+    take_profit_price,
 };
 
 // r1.s2.w1 (ADR-0021): the one-mutation framework. `apply(&StrategyDsl,
@@ -517,9 +519,9 @@ pub use cli::watch::{
 // type is a `dead_code` build error, not a warning. Kept additive (work-1.02's
 // MTF feed extends the same `backtest` tree at the R1→R2 merge).
 pub use domain::{
-    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, Side, Trade,
-    TradeSource, apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
-    taker_fee,
+    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, SetupTrace, Side,
+    Trade, TradeSource, apply_slippage, funding_payment, realized_pnl, realized_r,
+    resolve_intra_bar_exit, taker_fee,
 };
 
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
@@ -565,6 +567,8 @@ pub use adapters::backtest::RegimeDetector;
 // so explain pairs HTF/D1 bars exactly as the backtest does. Additive: both are
 // read-only, and no backtest output changes with them in place.
 pub use adapters::backtest::{EngineSession, EvalProbe, SessionTimeframes, step_series};
+// r6.s2.w2 (ADR-0033): the setup state `EvalProbe::setup_view` reads, per side.
+pub use adapters::backtest::{SetupEvent, SetupFire, SetupPhase, SetupView, SideState};
 pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 
 // VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface
@@ -944,7 +948,7 @@ pub use application::holdout::{HoldoutRefusal, guard_candle};
 pub use application::mark_explain::{
     ConjunctReport, ExplainError, ExplainHoldout, ExplainReport, ExplainRequest, MarkExplanation,
     MarkJson, MarkRefusal, MarkSelection, MarkWriterJson, OperandReport, PatternReport,
-    RuleRequest, explain_marks,
+    RuleRequest, SetupReport, TriggerReport, explain_marks,
 };
 pub use domain::{
     ExampleMark, ExampleMarkDraft, ExampleMarkRepository, MarkError, MarkFilter, MarkNote,

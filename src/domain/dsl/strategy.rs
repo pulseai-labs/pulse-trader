@@ -32,6 +32,7 @@ use super::condition::Condition;
 use super::exit::ExitRule;
 use super::risk::{Direction, RiskParams};
 use super::schema_version::SchemaVersion;
+use super::setup::Setup;
 
 /// A complete, self-contained strategy document.
 ///
@@ -57,6 +58,12 @@ pub struct StrategyDsl {
     pub exits: Vec<ExitRule>,
     /// The risk / sizing inputs.
     pub risk: RiskParams,
+    /// The stateful setup (schema 1.6.0, ADR-0033), or none. With a setup, `entry` and
+    /// every `filter` are a gate both sides share, checked on the trigger bar.
+    /// Boxed: a setup holds up to eight conditions inline, and the document rides
+    /// through large async futures (`clippy::large_futures`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<Box<Setup>>,
 }
 
 #[cfg(test)]
@@ -107,6 +114,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
                 max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
             },
+            setup: None,
         }
     }
 
@@ -652,6 +660,7 @@ mod prop_tests {
                     filters,
                     exits,
                     risk,
+                    setup: None,
                 },
             )
     }

@@ -56,11 +56,14 @@
 //! distance_pct`), and the take-profit is an R-multiple of that distance. See
 //! [`stop_price`] and [`take_profit_price`].
 
+use std::fmt::Write as _;
+
 use rust_decimal::Decimal;
 
 use super::condition::{Comparator, Condition};
 use super::exit::ExitRule;
 use super::risk::{Direction, RiskParams};
+use super::setup::Setup;
 use super::sweepable::SweepableValue;
 use super::validate::ValidatedDsl;
 use super::value::{ArithOp, IndicatorSpec, PriceField, Series, ValueSource};
@@ -356,6 +359,57 @@ pub enum CompiledExit {
         /// ATR multiple.
         multiple: Decimal,
     },
+    /// A structure stop (schema 1.6.0, ADR-0033): the side's extreme over its stop
+    /// window, pushed out by `buffer_pct` of itself. The engine places the level
+    /// in r6.s2.w4.
+    StructureStop {
+        /// The buffer as a decimal fraction of the extreme (`0.0005` = 0.05%).
+        buffer_pct: Decimal,
+    },
+}
+
+/// A compiled side (ADR-0033).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledSetupSide {
+    /// Evaluated on a primary bar where a higher-timeframe bar closed.
+    pub arm: CompiledCondition,
+    /// The pullback.
+    pub dip: CompiledCondition,
+    /// Fires the side, together with the shared entry gate.
+    pub trigger: CompiledCondition,
+    /// Starts the structure stop's window, when present.
+    pub stop_anchor: Option<CompiledCondition>,
+}
+
+/// A compiled setup (ADR-0033).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledSetup {
+    /// Primary bars after the arm bar within which the trigger must close.
+    pub expiry_bars: u32,
+    /// The long side, when declared.
+    pub long: Option<CompiledSetupSide>,
+    /// The short side, when declared.
+    pub short: Option<CompiledSetupSide>,
+}
+
+impl CompiledSetup {
+    /// Every compiled side condition: long then short, each as arm, dip,
+    /// trigger, stop anchor.
+    fn conditions(&self) -> impl Iterator<Item = &CompiledCondition> {
+        [self.long.as_ref(), self.short.as_ref()]
+            .into_iter()
+            .flatten()
+            .flat_map(|side| {
+                [
+                    Some(&side.arm),
+                    Some(&side.dip),
+                    Some(&side.trigger),
+                    side.stop_anchor.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+            })
+    }
 }
 
 /// The compiled risk / sizing inputs — carried for the backtester; no sizing
@@ -382,6 +436,9 @@ pub struct CompiledStrategy {
     required_indicators: Vec<IndicatorSpec>,
     required_htf_indicators: Vec<IndicatorSpec>,
     required_d1_indicators: Vec<IndicatorSpec>,
+    /// Boxed: a setup holds up to eight compiled conditions inline, and the
+    /// compiled strategy rides through large async futures (r6.s2.w1).
+    setup: Option<Box<CompiledSetup>>,
 }
 
 impl CompiledStrategy {
@@ -397,6 +454,16 @@ impl CompiledStrategy {
         &self.entry
     }
 
+    /// A copy with the setup removed (r6.s2.w4). Test-only: `validate` refuses a
+    /// `StructureStop` without a setup (rule S4), so this is the one way to reach
+    /// the engine's own defence against that shape.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn without_setup(mut self) -> Self {
+        self.setup = None;
+        self
+    }
+
     /// The compiled exit rules.
     #[must_use]
     pub fn exits(&self) -> &[CompiledExit] {
@@ -407,6 +474,12 @@ impl CompiledStrategy {
     #[must_use]
     pub fn risk(&self) -> &CompiledRisk {
         &self.risk
+    }
+
+    /// The compiled setup (schema 1.6.0, ADR-0033), when the strategy has one.
+    #[must_use]
+    pub fn setup(&self) -> Option<&CompiledSetup> {
+        self.setup.as_deref()
     }
 
     /// The de-duplicated **primary-series** indicators this strategy references
@@ -435,10 +508,11 @@ impl CompiledStrategy {
 
     /// Whether any operand is tagged `series: "htf"` (schema 1.1.0) — computed
     /// by walking the compiled tree rather than a stored flag, so it cannot
-    /// drift from the actual leaves.
+    /// drift from the actual leaves. A setup always needs the higher timeframe
+    /// (r6.s2.w1, ADR-0033): a side arms only on a higher-timeframe close.
     #[must_use]
     pub fn needs_htf(&self) -> bool {
-        self.has_series(Series::Htf)
+        self.setup.is_some() || self.has_series(Series::Htf)
     }
 
     /// Whether any operand is tagged `series: "d1"` (r3.s2.w4) — the same
@@ -450,7 +524,8 @@ impl CompiledStrategy {
 
     /// The one series-parameterised walk both [`Self::needs_htf`] and
     /// [`Self::needs_d1`] delegate to (r3.s2.w4): `true` when any leaf of the
-    /// effective entry or a signal exit carries the given series tag.
+    /// effective entry, a signal exit or a setup side condition carries the
+    /// given series tag.
     fn has_series(&self, series: Series) -> bool {
         fn value_carries(value: &CompiledValue, series: Series) -> bool {
             match value {
@@ -482,16 +557,34 @@ impl CompiledStrategy {
             || self.exits.iter().any(|exit| {
                 matches!(exit, CompiledExit::SignalExit { condition } if cond_carries(condition, series))
             })
+            || self
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.conditions().any(|c| cond_carries(c, series)))
     }
 
     /// A human-readable rendering of the evaluator tree, for demo-2's "inspect
     /// the compiled evaluator tree" step. Backed by `Debug` of the entry tree.
     #[must_use]
     pub fn describe(&self) -> String {
-        format!(
+        let mut text = format!(
             "CompiledStrategy {{ direction: {:?}, entry: {:?}, exits: {:?}, required_indicators: {:?} }}",
             self.direction, self.entry, self.exits, self.required_indicators
-        )
+        );
+        if let Some(setup) = &self.setup {
+            let sides = match (&setup.long, &setup.short) {
+                (Some(_), Some(_)) => "long + short",
+                (Some(_), None) => "long",
+                (None, Some(_)) => "short",
+                (None, None) => "none",
+            };
+            let _ = write!(
+                text,
+                "\nsetup: expiry {} bars, sides {sides}",
+                setup.expiry_bars
+            );
+        }
+        text
     }
 
     /// The deepest lag each indicator slot on `series` must serve, plus the
@@ -558,6 +651,11 @@ impl CompiledStrategy {
         walk_condition(&self.entry, series, &mut lags);
         for exit in &self.exits {
             if let CompiledExit::SignalExit { condition } = exit {
+                walk_condition(condition, series, &mut lags);
+            }
+        }
+        if let Some(setup) = &self.setup {
+            for condition in setup.conditions() {
                 walk_condition(condition, series, &mut lags);
             }
         }
@@ -854,7 +952,34 @@ fn compile_exit(rule: &ExitRule) -> Result<CompiledExit, CompileError> {
             })?;
             Ok(CompiledExit::AtrStop { period, multiple })
         }
+        ExitRule::StructureStop { buffer_pct } => {
+            let buffer_pct = *fixed(buffer_pct).ok_or_else(|| CompileError::UnexpectedSweep {
+                field: "exit.StructureStop.buffer_pct".to_owned(),
+            })?;
+            Ok(CompiledExit::StructureStop { buffer_pct })
+        }
     }
+}
+
+/// Compile a [`Setup`] (ADR-0033): every side condition through
+/// `compile_condition`, `expiry_bars` resolved like the other fixed leaves.
+fn compile_setup(setup: &Setup) -> Result<CompiledSetup, CompileError> {
+    let expiry_bars = *fixed(&setup.expiry_bars).ok_or_else(|| CompileError::UnexpectedSweep {
+        field: "setup.expiry_bars".to_owned(),
+    })?;
+    let side = |side: &Option<super::setup::SetupSide>| {
+        side.as_ref().map(|side| CompiledSetupSide {
+            arm: compile_condition(&side.arm),
+            dip: compile_condition(&side.dip),
+            trigger: compile_condition(&side.trigger),
+            stop_anchor: side.stop_anchor.as_ref().map(compile_condition),
+        })
+    };
+    Ok(CompiledSetup {
+        expiry_bars,
+        long: side(&setup.long),
+        short: side(&setup.short),
+    })
 }
 
 /// Compile the [`RiskParams`] into a [`CompiledRisk`] (extract `Fixed` payloads).
@@ -953,6 +1078,30 @@ pub fn compile(validated: &ValidatedDsl) -> Result<CompiledStrategy, CompileErro
         }
     }
 
+    // Every side condition's indicators too, so the engines build their slots
+    // (r6.s2.w1, ADR-0033).
+    let setup = dsl
+        .setup
+        .as_ref()
+        .map(|setup| compile_setup(setup))
+        .transpose()?
+        .map(Box::new);
+    if let Some(setup) = &dsl.setup {
+        for side in [&setup.long, &setup.short].into_iter().flatten() {
+            for condition in [&side.arm, &side.dip, &side.trigger]
+                .into_iter()
+                .chain(side.stop_anchor.as_ref())
+            {
+                collect_indicators(
+                    condition,
+                    &mut required_indicators,
+                    &mut required_htf_indicators,
+                    &mut required_d1_indicators,
+                );
+            }
+        }
+    }
+
     Ok(CompiledStrategy {
         direction: dsl.direction,
         entry,
@@ -961,6 +1110,7 @@ pub fn compile(validated: &ValidatedDsl) -> Result<CompiledStrategy, CompileErro
         required_indicators,
         required_htf_indicators,
         required_d1_indicators,
+        setup,
     })
 }
 
@@ -1015,6 +1165,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
                 max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
             },
+            setup: None,
         };
         validate(&dsl).expect("rsi_oversold fixture must validate")
     }
@@ -1151,6 +1302,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
                 max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
             },
+            setup: None,
         };
         let validated = validate(&dsl).expect("fixture must validate");
         let compiled = compile(&validated).expect("must compile");
@@ -1690,6 +1842,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
                 max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
             },
+            setup: None,
         };
         let compiled = compile(&validate(&dsl).expect("validates")).expect("compiles");
         let (slot_lags, price_lag) = compiled.series_lags(Series::Primary);
@@ -1723,5 +1876,154 @@ mod tests {
             .expect("an Atr(14) slot exists");
         assert_eq!(slot_lags[atr_slot], 0, "the AtrStop's ATR stays at lag 0");
         assert_eq!(price_lag, 0, "no Price leaf carries a lag here");
+    }
+
+    // ---- r6.s2.w1 (ADR-0033): a setup compiles -----------------------------
+
+    use crate::domain::dsl::setup::{Setup, SetupSide};
+
+    fn setup_cond(series: Series, indicator: Option<IndicatorSpec>, level: i64) -> Condition {
+        Condition::Compare {
+            lhs: match indicator {
+                Some(spec) => ValueSource::Indicator { series, spec },
+                None => ValueSource::Price {
+                    series,
+                    field: PriceField::Close,
+                },
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::new(level, 0),
+            },
+        }
+    }
+
+    fn sma_spec(period: u32) -> IndicatorSpec {
+        IndicatorSpec::Sma {
+            period: SweepableValue::Fixed(period),
+            source: PriceField::Close,
+        }
+    }
+
+    /// A two-sided setup: the long dip reads `Sma(50)`, the short dip reads
+    /// `Sma(20)`, the short trigger reads a `d1` close.
+    fn setup_strategy() -> StrategyDsl {
+        StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "compile setup".to_owned(),
+            direction: Direction::Long,
+            entry: setup_cond(Series::Primary, None, 0),
+            filters: vec![],
+            exits: vec![
+                ExitRule::StructureStop {
+                    buffer_pct: SweepableValue::Fixed(Decimal::new(5, 4)),
+                },
+                ExitRule::TakeProfit {
+                    target_r: SweepableValue::Fixed(Decimal::new(3, 0)),
+                },
+            ],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
+            },
+            setup: Some(Box::new(Setup {
+                expiry_bars: SweepableValue::Fixed(96),
+                long: Some(SetupSide {
+                    arm: setup_cond(Series::Primary, None, 1),
+                    dip: setup_cond(Series::Primary, Some(sma_spec(50)), 2),
+                    trigger: setup_cond(Series::Primary, None, 3),
+                    stop_anchor: Some(setup_cond(Series::Primary, None, 4)),
+                }),
+                short: Some(SetupSide {
+                    arm: setup_cond(Series::Primary, None, 5),
+                    dip: setup_cond(Series::Primary, Some(sma_spec(20)), 6),
+                    trigger: setup_cond(Series::D1, None, 7),
+                    stop_anchor: None,
+                }),
+            })),
+        }
+    }
+
+    #[test]
+    fn setup_compiles_a_two_sided_document() {
+        let compiled = compile(&validate(&setup_strategy()).unwrap()).unwrap();
+        let setup = compiled.setup().expect("the setup compiles");
+        assert_eq!(setup.expiry_bars, 96);
+        let long = setup.long.as_ref().expect("long side");
+        assert!(long.stop_anchor.is_some());
+        let short = setup.short.as_ref().expect("short side");
+        assert!(short.stop_anchor.is_none());
+        assert_eq!(
+            compiled.exits()[0],
+            CompiledExit::StructureStop {
+                buffer_pct: Decimal::new(5, 4)
+            }
+        );
+        // The shared entry gate stays `entry ∧ filters`.
+        assert_eq!(
+            compiled.entry(),
+            &compile(&validate(&setup_strategy()).unwrap())
+                .unwrap()
+                .entry()
+                .clone()
+        );
+    }
+
+    #[test]
+    fn setup_registers_every_side_indicator_and_needs_htf() {
+        let compiled = compile(&validate(&setup_strategy()).unwrap()).unwrap();
+        assert!(compiled.needs_htf(), "a setup always needs the HTF");
+        assert!(compiled.required_indicators().contains(&sma_spec(50)));
+        assert!(compiled.required_indicators().contains(&sma_spec(20)));
+        // The `d1` operand inside a side is seen by the series walk.
+        assert!(compiled.needs_d1());
+    }
+
+    #[test]
+    fn setup_describe_appends_one_line() {
+        let compiled = compile(&validate(&setup_strategy()).unwrap()).unwrap();
+        let text = compiled.describe();
+        assert!(
+            text.ends_with("\nsetup: expiry 96 bars, sides long + short"),
+            "{text}"
+        );
+
+        let mut one = setup_strategy();
+        one.setup.as_mut().unwrap().short = None;
+        let text = compile(&validate(&one).unwrap()).unwrap().describe();
+        assert!(
+            text.ends_with("\nsetup: expiry 96 bars, sides long"),
+            "{text}"
+        );
+
+        let plain = compile(&rsi_oversold()).unwrap().describe();
+        assert!(!plain.contains("setup:"), "{plain}");
+    }
+
+    #[test]
+    fn setup_slot_lags_cover_the_side_conditions() {
+        let mut dsl = setup_strategy();
+        // A lagged SMA(50) in the long dip: the slot must keep its history.
+        dsl.setup.as_mut().unwrap().long.as_mut().unwrap().dip = Condition::Compare {
+            lhs: ValueSource::Lag {
+                value: Box::new(ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec: sma_spec(50),
+                }),
+                bars: 3,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::new(2, 0),
+            },
+        };
+        let compiled = compile(&validate(&dsl).unwrap()).unwrap();
+        let (slot_lags, _) = compiled.series_lags(Series::Primary);
+        let slot = compiled
+            .required_indicators()
+            .iter()
+            .position(|s| *s == sma_spec(50))
+            .expect("an Sma(50) slot exists");
+        assert_eq!(slot_lags[slot], 3);
     }
 }

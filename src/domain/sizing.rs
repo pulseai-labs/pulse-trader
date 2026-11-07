@@ -139,6 +139,10 @@ pub enum SkipReason {
     /// size to `0` — the effective cap left no notional room for any position at
     /// all (distinct from a positive size that merely floors below one lot).
     LeverageCapZero,
+    /// A structure-stop entry whose levels cannot be placed at the fill: the next bar opened
+    /// at or past the stop level, or a short's `TakeProfit` resolves to a non-positive
+    /// price. The entry is skipped, not filled (ADR-0033).
+    StopBeyondFill,
 }
 
 /// The outcome of [`compute_position_size`] (C4).
@@ -243,6 +247,18 @@ pub struct SkippedEntryCounts {
     /// Entries skipped because the leverage cap floored the qty to `0`
     /// ([`SkipReason::LeverageCapZero`]).
     pub leverage_capped: usize,
+    /// Entries skipped because the fill price had already reached the structure stop, or a
+    /// short's target price resolved non-positive ([`SkipReason::StopBeyondFill`], ADR-0033). A zero count is never serialized, so every
+    /// result that predates the field serializes byte-identically.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stop_beyond_fill: usize,
+}
+
+/// `skip_serializing_if` for a count: serialize the field only when it is non-zero.
+// serde's `skip_serializing_if` calls the predicate with a reference, whatever the type.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl SkippedEntryCounts {
@@ -259,6 +275,7 @@ impl SkippedEntryCounts {
             SkipReason::SubLot => &mut self.sub_lot,
             SkipReason::SubNotional => &mut self.sub_notional,
             SkipReason::LeverageCapZero => &mut self.leverage_capped,
+            SkipReason::StopBeyondFill => &mut self.stop_beyond_fill,
         };
         *cell = cell.saturating_add(1);
     }
@@ -269,6 +286,7 @@ impl SkippedEntryCounts {
         self.sub_lot
             .saturating_add(self.sub_notional)
             .saturating_add(self.leverage_capped)
+            .saturating_add(self.stop_beyond_fill)
     }
 }
 
@@ -576,6 +594,47 @@ mod tests {
         let back: SkippedEntryCounts =
             serde_json::from_str(&json).expect("deserialize SkippedEntryCounts");
         assert_eq!(counts, back);
+    }
+
+    /// r6.s2.w4 (ADR-0033): a structure stop the fill had already reached is its own
+    /// reason, and its count is part of the total.
+    #[test]
+    fn skipped_entry_counts_record_stop_beyond_fill() {
+        let mut counts = SkippedEntryCounts::new();
+        counts.record(SkipReason::StopBeyondFill);
+        assert_eq!(counts.stop_beyond_fill, 1);
+        assert_eq!(counts.sub_lot, 0);
+        assert_eq!(counts.sub_notional, 0);
+        assert_eq!(counts.leverage_capped, 0);
+        assert_eq!(counts.total(), 1);
+    }
+
+    /// A zero `stop_beyond_fill` never appears in a serialized tally, so every serialization
+    /// that predates the field stays byte-identical; a non-zero count does appear, and both
+    /// read back (a missing key reads as zero).
+    #[test]
+    fn stop_beyond_fill_serializes_only_when_non_zero() {
+        let mut counts = SkippedEntryCounts::new();
+        let json = serde_json::to_string(&counts).expect("serialize a zero tally");
+        assert!(
+            !json.contains("stop_beyond_fill"),
+            "a zero count has no key: {json}"
+        );
+        assert_eq!(
+            json,
+            r#"{"sub_lot":0,"sub_notional":0,"leverage_capped":0}"#
+        );
+        let back: SkippedEntryCounts = serde_json::from_str(&json).expect("read a pre-field tally");
+        assert_eq!(back, counts);
+
+        counts.record(SkipReason::StopBeyondFill);
+        let json = serde_json::to_string(&counts).expect("serialize a non-zero tally");
+        assert!(
+            json.contains(r#""stop_beyond_fill":1"#),
+            "a count of 1 has its key: {json}"
+        );
+        let back: SkippedEntryCounts = serde_json::from_str(&json).expect("read it back");
+        assert_eq!(back, counts);
     }
 }
 

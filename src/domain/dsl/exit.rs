@@ -69,6 +69,13 @@ pub enum ExitRule {
         /// ATR multiple — a plain multiplier in `(0, 10]` (bounded in 2.03).
         multiple: SweepableValue<Decimal>,
     },
+    /// A structure stop (schema 1.6.0, ADR-0033): the side's extreme over its stop window
+    /// (lowest low for a long, highest high for a short), pushed out by `buffer_pct` of
+    /// itself. Valid only with a `setup`. Shares the `StopLoss` exclusive family and defines 1R.
+    StructureStop {
+        /// The buffer as a decimal fraction of the extreme (`0.0005` = 0.05%). Bounds [0, 0.05].
+        buffer_pct: SweepableValue<Decimal>,
+    },
 }
 
 #[cfg(test)]

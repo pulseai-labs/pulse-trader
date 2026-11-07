@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DSL schema 1.6.0: `setup` (arm, dip, trigger, expiry; long and short sides) and the `StructureStop` exit
+  (r6.s2.w1).** A strategy can now be written as a stateful **setup**: a long side, a short side or both, each with an
+  `arm` condition (checked when a 4H bar closes), a `dip`, a `trigger` and an optional `stop_anchor`, plus an
+  `expiry_bars` limit. A new `StructureStop { buffer_pct }` exit takes its level from the setup. The grammar
+  validates (rules S1–S7, `InvalidSetup`), renders (`setup` lines), compiles, mutates and appears in the MCP schema
+  resource. The write path now reads a `null` `setup`, `long`, `short` or `stop_anchor` as absent. The engine does not
+  run a setup yet: it refuses one with a typed `UnsupportedExit` error until r6.s2.w2. The `1.5.0 → 1.6.0` migration is
+  identity, so every earlier document keeps its meaning and its `result_content_hash`. See ADR-0033
+  (`docs/adr/0033-stateful-setups.md`).
+
 - **DSL schema 1.5.0: `Sma` indicator, `max`/`min` arithmetic (r6.s1.w1).** The first Cipher building blocks.
   A strategy can now write a **simple moving average** of any price field — `IndicatorSpec::Sma { period, source }`,
   serialized `{"indicator":"Sma","period":50,"source":"Close"}`, the source defaulting to close — the mean of the

@@ -377,7 +377,7 @@ impl LeafMut<'_> {
 type Visit<'f> = &'f mut dyn FnMut(&str, LeafMut<'_>) -> ControlFlow<()>;
 
 /// Walk every sweepable numeric leaf of a strategy, in `validate.rs` order:
-/// `entry`, each `filters[i]`, each `exits[i]`, then `risk`.
+/// `entry`, each `filters[i]`, each `exits[i]`, the `setup`, then `risk`.
 fn visit_leaves(dsl: &mut StrategyDsl, f: Visit<'_>) -> ControlFlow<()> {
     visit_condition(&mut dsl.entry, "entry", f)?;
 
@@ -409,6 +409,31 @@ fn visit_leaves(dsl: &mut StrategyDsl, f: Visit<'_>) -> ControlFlow<()> {
             ExitRule::AtrStop { period, multiple } => {
                 f(&format!("{base}.period"), LeafMut::Period(period))?;
                 f(&format!("{base}.multiple"), LeafMut::Threshold(multiple))?;
+            }
+            // r6.s2.w1 (schema 1.6.0): the structure stop's buffer is a threshold.
+            ExitRule::StructureStop { buffer_pct } => {
+                f(
+                    &format!("{base}.buffer_pct"),
+                    LeafMut::Threshold(buffer_pct),
+                )?;
+            }
+        }
+    }
+
+    // r6.s2.w1 (schema 1.6.0): the setup — expiry, then each side's conditions
+    // in `validate.rs` order (long then short; arm, dip, trigger, stop_anchor).
+    if let Some(setup) = dsl.setup.as_mut() {
+        f("setup.expiry_bars", LeafMut::Period(&mut setup.expiry_bars))?;
+        for (name, side) in [("long", &mut setup.long), ("short", &mut setup.short)] {
+            let Some(side) = side else {
+                continue;
+            };
+            let base = format!("setup.{name}");
+            visit_condition(&mut side.arm, &format!("{base}.arm"), f)?;
+            visit_condition(&mut side.dip, &format!("{base}.dip"), f)?;
+            visit_condition(&mut side.trigger, &format!("{base}.trigger"), f)?;
+            if let Some(anchor) = side.stop_anchor.as_mut() {
+                visit_condition(anchor, &format!("{base}.stop_anchor"), f)?;
             }
         }
     }
@@ -707,4 +732,156 @@ fn visit_pattern_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> Con
         ),
     }
     ControlFlow::Continue(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{Mutation, ParamValue, apply, sweepable_paths};
+    use crate::domain::dsl::condition::{Comparator, Condition};
+    use crate::domain::dsl::exit::ExitRule;
+    use crate::domain::dsl::risk::{Direction, RiskParams};
+    use crate::domain::dsl::schema_version::SchemaVersion;
+    use crate::domain::dsl::setup::{Setup, SetupSide};
+    use crate::domain::dsl::strategy::StrategyDsl;
+    use crate::domain::dsl::sweepable::SweepableValue;
+    use crate::domain::dsl::value::{IndicatorSpec, PriceField, Series, ValueSource};
+    use rust_decimal::Decimal;
+
+    fn price(field: PriceField) -> ValueSource {
+        ValueSource::Price {
+            series: Series::Primary,
+            field,
+        }
+    }
+
+    fn sma_below_close(period: u32) -> Condition {
+        Condition::Compare {
+            lhs: ValueSource::Indicator {
+                series: Series::Primary,
+                spec: IndicatorSpec::Sma {
+                    period: SweepableValue::Fixed(period),
+                    source: PriceField::Close,
+                },
+            },
+            op: Comparator::Lt,
+            rhs: price(PriceField::Close),
+        }
+    }
+
+    fn close_above_open() -> Condition {
+        Condition::Compare {
+            lhs: price(PriceField::Close),
+            op: Comparator::Gt,
+            rhs: price(PriceField::Open),
+        }
+    }
+
+    /// A long-only setup whose dip reads `Sma(50)`, with a structure stop.
+    fn setup_dsl() -> StrategyDsl {
+        StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "mutate setup".to_owned(),
+            direction: Direction::Long,
+            entry: close_above_open(),
+            filters: vec![],
+            exits: vec![ExitRule::StructureStop {
+                buffer_pct: SweepableValue::Fixed(Decimal::new(5, 4)),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
+            },
+            setup: Some(Box::new(Setup {
+                expiry_bars: SweepableValue::Fixed(16),
+                long: Some(SetupSide {
+                    arm: Condition::Compare {
+                        lhs: ValueSource::Price {
+                            series: Series::Htf,
+                            field: PriceField::Close,
+                        },
+                        op: Comparator::Gt,
+                        rhs: ValueSource::Constant {
+                            value: Decimal::new(1, 0),
+                        },
+                    },
+                    dip: sma_below_close(50),
+                    trigger: close_above_open(),
+                    stop_anchor: Some(sma_below_close(20)),
+                }),
+                short: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn setup_leaves_are_listed_in_validate_order() {
+        let paths = sweepable_paths(&setup_dsl());
+        let at = |p: &str| {
+            paths
+                .iter()
+                .position(|x| x == p)
+                .unwrap_or_else(|| panic!("{p} is addressable: {paths:?}"))
+        };
+        assert!(at("exits[0].buffer_pct") < at("setup.expiry_bars"));
+        assert!(at("setup.expiry_bars") < at("setup.long.dip.lhs.indicator.sma.period"));
+        assert!(
+            at("setup.long.dip.lhs.indicator.sma.period")
+                < at("setup.long.stop_anchor.lhs.indicator.sma.period")
+        );
+        assert!(at("setup.long.stop_anchor.lhs.indicator.sma.period") < at("risk.max_leverage"));
+    }
+
+    #[test]
+    fn setup_a_mutation_reaches_the_dip_indicator_period() {
+        let candidate = apply(
+            &setup_dsl(),
+            &Mutation::SetParam {
+                path: "setup.long.dip.lhs.indicator.sma.period".to_owned(),
+                new_value: ParamValue::Period { value: 30 },
+            },
+        )
+        .expect("the dip's SMA period is mutable");
+        let dip = &candidate
+            .dsl()
+            .setup
+            .as_ref()
+            .and_then(|s| s.long.as_ref())
+            .expect("the long side survives")
+            .dip;
+        assert_eq!(dip, &sma_below_close(30));
+    }
+
+    #[test]
+    fn setup_expiry_and_buffer_are_mutable() {
+        let expiry = apply(
+            &setup_dsl(),
+            &Mutation::SetParam {
+                path: "setup.expiry_bars".to_owned(),
+                new_value: ParamValue::Period { value: 24 },
+            },
+        )
+        .expect("expiry_bars is a period leaf");
+        assert_eq!(
+            expiry.dsl().setup.as_ref().map(|s| s.expiry_bars.clone()),
+            Some(SweepableValue::Fixed(24))
+        );
+
+        let buffer = apply(
+            &setup_dsl(),
+            &Mutation::SetParam {
+                path: "exits[0].buffer_pct".to_owned(),
+                new_value: ParamValue::Threshold {
+                    value: Decimal::new(1, 3),
+                },
+            },
+        )
+        .expect("buffer_pct is a threshold leaf");
+        assert_eq!(
+            buffer.dsl().exits[0],
+            ExitRule::StructureStop {
+                buffer_pct: SweepableValue::Fixed(Decimal::new(1, 3)),
+            }
+        );
+    }
 }

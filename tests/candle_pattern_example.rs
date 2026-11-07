@@ -195,7 +195,7 @@ fn example_pattern(dsl: &StrategyDsl) -> (CandlePatternName, Series) {
 }
 
 /// The example is a valid document — authored at schema 1.4.0, identity-
-/// migrated to `CURRENT` (1.5.0) on load — whose entry is the lagged
+/// migrated to `CURRENT` (1.6.0) on load — whose entry is the lagged
 /// support-touch form (the trap) and whose filters are the close-back-above and
 /// the named bullish pattern.
 ///
@@ -212,7 +212,7 @@ fn example_parses_validates_and_carries_the_support_touch_form() {
     );
     assert_eq!(
         dsl.schema_version.to_string(),
-        "1.5.0",
+        "1.6.0",
         "the example is identity-migrated from 1.4.0 to CURRENT"
     );
 

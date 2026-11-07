@@ -38,6 +38,7 @@ mod mutate;
 pub mod render;
 mod risk;
 mod schema_version;
+mod setup;
 mod strategy;
 mod sweepable;
 mod validate;
@@ -45,8 +46,9 @@ mod value;
 
 // VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3).
 pub use compile::{
-    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
-    EvalContext, atr_stop_price, compile, stop_price, take_profit_price,
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledSetup, CompiledSetupSide,
+    CompiledStrategy, CompiledValue, EvalContext, atr_stop_price, compile, stop_price,
+    take_profit_price,
 };
 pub use condition::{Comparator, Condition};
 pub use exit::ExitRule;
@@ -58,6 +60,8 @@ pub use mutate::{
 };
 pub use risk::{Direction, RiskParams};
 pub use schema_version::{DSL_SCHEMA_VERSION, SchemaVersion, SchemaVersionParseError};
+// r6.s2.w1 (ADR-0033): the stateful-setup grammar, schema 1.6.0.
+pub use setup::{Setup, SetupSide};
 pub use strategy::StrategyDsl;
 pub use sweepable::SweepableValue;
 pub use validate::{

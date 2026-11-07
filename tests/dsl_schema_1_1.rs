@@ -76,6 +76,7 @@ fn dsl_with(entry: Condition, exits: Vec<ExitRule>) -> StrategyDsl {
             risk_per_trade_pct: SweepableValue::Fixed(dec(1, 2)),
             max_leverage: SweepableValue::Fixed(dec(3, 0)),
         },
+        setup: None,
     }
 }
 
@@ -230,7 +231,7 @@ fn inline_1_0_0_document_migrates_and_deserializes_equal() {
 
 #[test]
 fn future_versions_still_reject() {
-    for future in ["1.6.0", "2.0.0"] {
+    for future in ["1.7.0", "2.0.0"] {
         let mut doc: Value = serde_json::from_str(INLINE_1_0_0).unwrap();
         doc["schema_version"] = json!(future);
         let err = Migrator::v1()

@@ -714,6 +714,7 @@ mod tests {
             filters,
             exits: vec![stop_exit()],
             risk: risk(),
+            setup: None,
         };
         compile(&validate(&dsl).expect("fixture validates")).expect("fixture compiles")
     }

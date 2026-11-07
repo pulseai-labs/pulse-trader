@@ -3,13 +3,14 @@
 use rust_decimal::Decimal;
 
 use super::session::{EngineSession, SessionTimeframes, step_series};
+use super::setup::SetupFire;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledExit, CompiledStrategy,
     CompiledValue, DataError, Direction, EngineFingerprint, EquityCurve, EvalContext, ExitReason,
     Fill, IndicatorSpec, IntraBarExit, OpenPositionMark, OpenPositionStops, Regime,
-    RegimeBreakdown, Series, SeriesEnd, SeriesRole, Side, SizingOutcome, SkipReason,
+    RegimeBreakdown, Series, SeriesEnd, SeriesRole, SetupTrace, Side, SizingOutcome, SkipReason,
     SkippedEntryCounts, SummaryStats, SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource,
     ValidationError, align, apply_slippage, atr_stop_price, compute_position_size, funding_payment,
     realized_pnl, realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
@@ -442,13 +443,13 @@ pub(super) fn atr_at_signal(exit_plan: &ExitPlan, ctx: &DualSeriesContext<'_>) -
             },
             lag: 0,
         }),
-        StopRule::Pct(_) => None,
+        StopRule::Pct(_) | StopRule::Structure { .. } => None,
     }
 }
 
-/// How a position's stop is derived (r2.s2.w2): either the fixed-fraction
-/// `StopLoss` distance or the `AtrStop`'s `multiple × ATR(period)` frozen at
-/// the signal bar.
+/// How a position's stop is derived (r2.s2.w2): the fixed-fraction `StopLoss`
+/// distance, the `AtrStop`'s `multiple × ATR(period)` frozen at the signal bar,
+/// or the setup's structure level (r6.s2.w4).
 #[derive(Debug, Clone, Copy)]
 pub(super) enum StopRule {
     /// `entry × (1 ∓ distance_pct)` — the stop distance in price units is
@@ -461,6 +462,12 @@ pub(super) enum StopRule {
         period: u32,
         /// The ATR multiple.
         multiple: Decimal,
+    },
+    /// The setup's stop-window extreme pushed out by `buffer_pct`, ADR-0033
+    /// decision 6. The extreme comes from the fired setup side (`SetupFire.extreme`).
+    Structure {
+        /// The fraction the stop sits beyond the window's extreme.
+        buffer_pct: Decimal,
     },
 }
 
@@ -587,18 +594,29 @@ impl ExitPlan {
         let stop = family_stop
             .or_else(|| trail_pct.map(StopRule::Pct))
             .ok_or(BacktestError::NoStopLoss)?;
+        // r6.s2.w4 (ADR-0033 decision 6): the structure stop's level is the
+        // fired setup side's stop-window extreme. Without a setup there is no
+        // window; validation rule S4 refuses that strategy, and this is the
+        // engine's defence.
+        if matches!(stop, StopRule::Structure { .. }) && compiled.setup().is_none() {
+            return Err(BacktestError::UnsupportedExit(
+                "StructureStop without a setup".to_owned(),
+            ));
+        }
         let trail_only = family_stop.is_none();
         let take_profit_target_r = take_profit_target(compiled.exits());
         // The short-TP impossibility check is plan-time only for the
         // fixed-fraction stop (its distance is known before any bar). For an
         // `AtrStop` the distance is `multiple × ATR` — unknowable until the
         // signal bar — so the same typed check moves to the fill (r2.s2.w2).
+        //
+        // r6.s2.w3: the check covers EACH side the strategy can trade — the
+        // declared sides of its setup, else its one `direction` — so a
+        // two-sided strategy is refused when its short side cannot take profit.
         if let StopRule::Pct(stop_distance_pct) = stop {
-            reject_impossible_short_tp(
-                compiled.direction(),
-                take_profit_target_r,
-                stop_distance_pct,
-            )?;
+            for direction in tradable_directions(compiled) {
+                reject_impossible_short_tp(direction, take_profit_target_r, stop_distance_pct)?;
+            }
         }
         Ok(Self {
             strategy: compiled.clone(),
@@ -710,6 +728,13 @@ pub(super) struct PendingEntry {
     /// it into the absolute stop without recomputing (the ATR may have moved
     /// between signal and fill bars).
     pub(super) atr_at_signal: Option<Decimal>,
+    /// The setup side that fired this entry (r6.s2.w2, ADR-0033); `None` for
+    /// a strategy with no setup.
+    pub(super) setup: Option<SetupFire>,
+    /// The side this entry opens (r6.s2.w3, ADR-0033 decision 4): the fired
+    /// setup side's direction, else the strategy's own. The fill reads it, so a
+    /// two-sided setup opens a long or a short on the one position slot.
+    pub(super) direction: Direction,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -759,6 +784,9 @@ pub(super) struct OpenPosition {
     /// The market regime in effect at the entry-fill bar (FR-6), carried to the
     /// `Trade` at close so `RegimeBreakdown` can aggregate it.
     regime: Regime,
+    /// The setup trace carried to the `Trade` at close (r6.s2.w2, ADR-0033);
+    /// `None` for a strategy with no setup.
+    setup: Option<SetupTrace>,
 }
 
 impl OpenPosition {
@@ -811,6 +839,7 @@ impl OpenPosition {
             mfe_r: Decimal::ZERO,
             mae_r: Decimal::ZERO,
             regime,
+            setup: None,
         }
     }
 
@@ -881,6 +910,10 @@ pub(super) struct PreparedEntry {
     stop: Decimal,
     take_profit_price: Option<Decimal>,
     signal_time: i64,
+    /// The pending entry's setup trace, copied to the position at the commit.
+    setup: Option<SetupTrace>,
+    /// The pending entry's direction, which the position opens with.
+    direction: Direction,
 }
 
 /// The commit instruction [`prepare_pending_fill`] produced.
@@ -900,7 +933,6 @@ pub(super) enum PreparedFill {
 pub(super) fn prepare_pending_fill(
     state: &LoopState,
     candle: &Candle,
-    direction: Direction,
     plan: &ExitPlan,
     config: &BacktestConfig,
     filters: &SymbolFilters,
@@ -908,6 +940,7 @@ pub(super) fn prepare_pending_fill(
     let Some(pending) = state.pending_entry else {
         return Ok(PreparedFill::Idle);
     };
+    let direction = pending.direction;
     if state.position.is_some() {
         return Ok(PreparedFill::Consume { skipped: None });
     }
@@ -932,7 +965,34 @@ pub(super) fn prepare_pending_fill(
             };
             atr_stop_price(entry_price, atr, multiple, direction)
         }
+        // The stop-window extreme of the fired setup side, pushed out by the
+        // buffer (r6.s2.w4, ADR-0033 decision 6). A pending entry with no
+        // setup cannot reach here (`from_strategy` refuses the plan), so skip
+        // rather than invent a stop.
+        StopRule::Structure { buffer_pct } => {
+            let Some(fire) = pending.setup else {
+                return Ok(PreparedFill::Consume { skipped: None });
+            };
+            match pending.direction {
+                Direction::Long => fire.extreme * (Decimal::ONE - buffer_pct),
+                Direction::Short => fire.extreme * (Decimal::ONE + buffer_pct),
+            }
+        }
     };
+    // A structure stop the fill price has already reached is a skipped entry,
+    // not a failed run: the next bar opened at or past the level (r6.s2.w4).
+    // This runs BEFORE the geometry guard below, which stays unchanged and
+    // still fails the whole run for every other shape.
+    if matches!(plan.stop, StopRule::Structure { .. })
+        && match direction {
+            Direction::Long => stop >= entry_price,
+            Direction::Short => stop <= entry_price,
+        }
+    {
+        return Ok(PreparedFill::Consume {
+            skipped: Some(SkipReason::StopBeyondFill),
+        });
+    }
     // r2.s2 round-3 fix: the F4 geometry guard hoisted out of the `Atr` arm — it
     // must reject a zero stop DISTANCE too, not only a non-positive price. A
     // flat series (`high == low == prev_close` on every bar) drives the frozen
@@ -978,18 +1038,31 @@ pub(super) fn prepare_pending_fill(
     // kinds (r2.s2.w2): fixed-fraction keeps its closed form, `AtrStop` takes
     // `entry ± target_r × |entry − stop|` — with the short-TP impossibility
     // check moved here from plan time, where the ATR distance was unknowable.
-    let take_profit_price = plan
-        .take_profit_target_r
-        .map(|target| match plan.stop {
-            StopRule::Pct(distance_pct) => Ok(take_profit_price(
-                entry_price,
-                distance_pct,
-                target,
-                direction,
-            )),
-            StopRule::Atr { .. } => atr_take_profit_price(entry_price, stop, target, direction),
-        })
-        .transpose()?;
+    let take_profit_price = match plan.take_profit_target_r {
+        None => None,
+        Some(target) => Some(match plan.stop {
+            StopRule::Pct(distance_pct) => {
+                take_profit_price(entry_price, distance_pct, target, direction)
+            }
+            StopRule::Atr { .. } => atr_take_profit_price(entry_price, stop, target, direction)?,
+            // A short whose window high sits so far above the fill that the
+            // target resolves to a non-positive price is a skipped entry, not
+            // a failed run: the structure is a market fact, not a broken
+            // strategy (ADR-0033 decision 6). It shares the skip cell of the
+            // stop-beyond-fill case: the entry's levels cannot be placed.
+            StopRule::Structure { .. } => {
+                match atr_take_profit_price(entry_price, stop, target, direction) {
+                    Ok(price) => price,
+                    Err(BacktestError::ImpossibleTakeProfit(_)) => {
+                        return Ok(PreparedFill::Consume {
+                            skipped: Some(SkipReason::StopBeyondFill),
+                        });
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }),
+    };
     Ok(PreparedFill::Open(PreparedEntry {
         qty,
         entry_price,
@@ -998,6 +1071,12 @@ pub(super) fn prepare_pending_fill(
         stop,
         take_profit_price,
         signal_time: pending.signal_time,
+        setup: pending.setup.map(|fire| SetupTrace {
+            arm_time: fire.arm_time,
+            dip_time: fire.dip_time,
+            anchor_time: fire.anchor_time,
+        }),
+        direction,
     }))
 }
 
@@ -1009,7 +1088,6 @@ pub(super) fn commit_pending_fill(
     state: &mut LoopState,
     prepared: PreparedFill,
     candle: &Candle,
-    direction: Direction,
     plan: &ExitPlan,
     regime: Regime,
 ) {
@@ -1024,7 +1102,7 @@ pub(super) fn commit_pending_fill(
         PreparedFill::Open(entry) => {
             state.pending_entry = None;
             state.position = Some(OpenPosition {
-                direction,
+                direction: entry.direction,
                 qty: entry.qty,
                 entry_price: entry.entry_price,
                 initial_stop: entry.stop,
@@ -1041,6 +1119,7 @@ pub(super) fn commit_pending_fill(
                 mfe_r: Decimal::ZERO,
                 mae_r: Decimal::ZERO,
                 regime,
+                setup: entry.setup,
             });
         }
     }
@@ -1342,6 +1421,8 @@ fn close_position(
         // trailing stop moved the effective level (`exit_price` shows where
         // the trail was).
         stop_price: Some(position.initial_stop),
+        // The setup that produced the entry (ADR-0033); `None` without a setup.
+        setup: position.setup,
     });
     Ok(())
 }
@@ -1546,6 +1627,9 @@ fn stop_rule(exits: &[CompiledExit]) -> Option<StopRule> {
             period: *period,
             multiple: *multiple,
         }),
+        CompiledExit::StructureStop { buffer_pct } => Some(StopRule::Structure {
+            buffer_pct: *buffer_pct,
+        }),
         _ => None,
     })
 }
@@ -1566,6 +1650,21 @@ fn signal_exit_indices(exits: &[CompiledExit]) -> Vec<usize> {
             _ => None,
         })
         .collect()
+}
+
+/// The directions a strategy can open (r6.s2.w3): the declared sides of its
+/// setup, long first, or its one `direction` without a setup.
+fn tradable_directions(compiled: &CompiledStrategy) -> Vec<Direction> {
+    match compiled.setup() {
+        Some(setup) => [
+            setup.long.as_ref().map(|_| Direction::Long),
+            setup.short.as_ref().map(|_| Direction::Short),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        None => vec![compiled.direction()],
+    }
 }
 
 /// Reject a short take-profit whose geometry resolves to a non-positive price.
@@ -1595,8 +1694,9 @@ fn reject_impossible_short_tp(
     Ok(())
 }
 
-/// ATR-stop take-profit: `entry ± target_r × |entry − stop|` — the same 1R
-/// distance a fixed-fraction stop uses, measured against the frozen ATR stop.
+/// Take-profit for every absolute stop (the ATR stop and the structure stop):
+/// `entry ± target_r × |entry − stop|` — the same 1R distance a fixed-fraction
+/// stop uses, measured against the stop frozen at the fill.
 /// The short variant can resolve to a non-positive price (the plan-time
 /// `reject_impossible_short_tp` cannot see the ATR distance), so the typed
 /// check lives here at fill time (r2.s2.w2).
@@ -1613,7 +1713,7 @@ fn atr_take_profit_price(
     };
     if tp <= Decimal::ZERO {
         return Err(BacktestError::ImpossibleTakeProfit(format!(
-            "short take-profit at {target_r}R × ATR stop distance {distance} \
+            "short take-profit at {target_r}R × stop distance {distance} \
              resolves to a non-positive price"
         )));
     }
@@ -1624,14 +1724,14 @@ fn atr_take_profit_price(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        BacktestConfig, FundingGapWindow, OpenPosition, build_funding_index,
+        BacktestConfig, ExitPlan, FundingGapWindow, OpenPosition, build_funding_index,
         first_fully_warm_bar_ms, funding_between, funding_gaps, run_backtest, update_excursion,
     };
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
-        Series, SeriesEnd, StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource,
-        compile, realized_pnl, validate,
+        Series, SeriesEnd, Setup, SetupSide, StrategyDsl, SweepableValue, SymbolFilters, Timeframe,
+        ValueSource, compile, realized_pnl, validate,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -1778,6 +1878,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(rate(1, 2)),
                 max_leverage: SweepableValue::Fixed(d(3)),
             },
+            setup: None,
         };
         compile(&validate(&dsl).unwrap()).unwrap()
     }
@@ -2071,6 +2172,7 @@ mod tests {
             mfe_r: Decimal::ZERO,
             mae_r: Decimal::ZERO,
             regime: Regime::Unknown,
+            setup: None,
         }
     }
 
@@ -2178,6 +2280,49 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
+    }
+
+    /// r6.s2.w4 (ADR-0033): a `StructureStop` needs the setup whose stop window
+    /// gives it a level. Validation rule S4 refuses the document; this is the
+    /// engine's own defence, so the plan is refused by name and never read as a
+    /// missing stop. (The name is w1's, kept; w1 refused every `StructureStop`.)
+    #[test]
+    fn structure_stop_refused_until_w4() {
+        let setup_side = || SetupSide {
+            arm: price_entry(),
+            dip: price_entry(),
+            trigger: price_entry(),
+            stop_anchor: None,
+        };
+        let dsl = StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "structure stop refusal".to_owned(),
+            direction: Direction::Long,
+            entry: price_entry(),
+            filters: vec![],
+            exits: vec![ExitRule::StructureStop {
+                buffer_pct: SweepableValue::Fixed(rate(5, 4)),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(rate(1, 2)),
+                max_leverage: SweepableValue::Fixed(d(3)),
+            },
+            setup: Some(Box::new(Setup {
+                expiry_bars: SweepableValue::Fixed(8),
+                long: Some(setup_side()),
+                short: None,
+            })),
+        };
+        let with_setup = compile(&validate(&dsl).unwrap()).unwrap();
+        ExitPlan::from_strategy(&with_setup).expect("a structure stop with a setup plans");
+
+        // Rule S4 refuses a `StructureStop` document without a setup, so the strategy is
+        // compiled with its setup and then stripped.
+        let without_setup = with_setup.without_setup();
+        assert_eq!(
+            ExitPlan::from_strategy(&without_setup).unwrap_err(),
+            BacktestError::UnsupportedExit("StructureStop without a setup".to_owned())
+        );
     }
 
     #[test]
@@ -2728,6 +2873,7 @@ mod tests {
                 mfe_r: Decimal::ZERO,
                 mae_r: Decimal::ZERO,
                 regime: Regime::Unknown,
+                setup: None,
             };
             for (lo_off, span, up_off) in &bars {
                 // Build a coherent OHLC bar around the entry price: low <= open,

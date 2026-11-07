@@ -409,7 +409,7 @@ async fn support_rejection_journey_composes_the_worked_example_with_no_substitut
         "the journey composes the checked-in example exactly"
     );
     assert_eq!(version.dsl.schema_version, SchemaVersion::CURRENT);
-    assert_eq!(version.dsl_schema_version.to_string(), "1.5.0");
+    assert_eq!(version.dsl_schema_version.to_string(), "1.6.0");
 
     // The rendered lines speak the trap's form and the pattern in trader words.
     let rendered = render::strategy(&version.dsl);

@@ -54,6 +54,7 @@ fn trade(entry_fill_time: i64, exit_fill_time: i64) -> Trade {
         source: TradeSource::Backtest,
         regime: Regime::TrendingUp,
         stop_price: Some(Decimal::new(99, 0)),
+        setup: None,
     }
 }
 

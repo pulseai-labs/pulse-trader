@@ -100,6 +100,7 @@ fn journey_dsl() -> StrategyDsl {
             risk_per_trade_pct: fixed_dec(1, 2),
             max_leverage: fixed_dec(3, 0),
         },
+        setup: None,
     }
 }
 
@@ -445,6 +446,7 @@ fn the_seeded_journey_document_renders_its_expected_lines() {
             filters: vec!["h4:close > h4:ema(200)".to_owned()],
             exits: vec!["atr(14)×2".to_owned(), "take profit 2R".to_owned()],
             risk: vec!["risk 1% per trade".to_owned(), "max leverage 3x".to_owned()],
+            setup: vec![],
         }
     );
 }

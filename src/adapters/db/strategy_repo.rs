@@ -1238,6 +1238,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
                 max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
             },
+            setup: None,
         }
     }
 

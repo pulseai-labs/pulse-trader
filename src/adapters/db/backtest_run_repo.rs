@@ -54,8 +54,8 @@ use crate::adapters::clock::SystemClock;
 use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, CandleWindow, EquityCurve, ExitReason, Fill,
     FundingConfig, LatestReadableRun, OpenPositionMark, PersistedRun, Regime, RegimeBreakdown,
-    RunSummary, SnapshotSelection, SummaryStats, Trade, TradeSource, WalkForwardMembership,
-    WalkForwardRunId,
+    RunSummary, SetupTrace, SnapshotSelection, SummaryStats, Trade, TradeSource,
+    WalkForwardMembership, WalkForwardRunId,
 };
 use crate::domain::sizing::{SkippedEntryCounts, SymbolFilters};
 use crate::domain::strategy::VersionId;
@@ -586,6 +586,7 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                  skipped_sub_lot         AS "skipped_sub_lot?: i64",
                  skipped_sub_notional    AS "skipped_sub_notional?: i64",
                  skipped_leverage_capped AS "skipped_leverage_capped?: i64",
+                 skipped_stop_beyond_fill AS "skipped_stop_beyond_fill?: i64",
                  pair                    AS "pair?: String",
                  primary_timeframe       AS "primary_timeframe?: String",
                  primary_data_version    AS "primary_data_version?: String",
@@ -642,6 +643,13 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
             sub_lot: usize_from("skipped_sub_lot", r.skipped_sub_lot)?,
             sub_notional: usize_from("skipped_sub_notional", r.skipped_sub_notional)?,
             leverage_capped: usize_from("skipped_leverage_capped", r.skipped_leverage_capped)?,
+            // r6.s2.w4 / migration 0024: every pre-0024 row holds NULL here, which
+            // reads as no skips. `usize_from` still refuses a negative or oversized
+            // value; only the NULL is mapped, so a corrupt count is not hidden.
+            stop_beyond_fill: usize_from(
+                "skipped_stop_beyond_fill",
+                Some(r.skipped_stop_beyond_fill.unwrap_or(0)),
+            )?,
         };
         // r2.s1 G1(b): the window-edge mark parses BEFORE the hash rebuild — the
         // feed covers it when present, so a tampered column fails the #39 guard
@@ -764,6 +772,7 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
     }
 
     /// [`BacktestRunRepository::get_trades`] with the failure class preserved.
+    #[allow(clippy::too_many_lines)] // one column list and one fail-closed mapping per column
     async fn get_trades_classified(
         &self,
         id: &BacktestRunId,
@@ -808,7 +817,10 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                  source            AS "source?: String",
                  regime            AS "regime?: String",
                  fills             AS "fills?: String",
-                 stop_price        AS "stop_price?: String"
+                 stop_price        AS "stop_price?: String",
+                 setup_arm_time    AS "setup_arm_time?: i64",
+                 setup_dip_time    AS "setup_dip_time?: i64",
+                 setup_anchor_time AS "setup_anchor_time?: i64"
                FROM trade WHERE backtest_run_id = ?1 ORDER BY seq"#,
             id_str,
         )
@@ -873,6 +885,8 @@ impl<C: Clock + Send + Sync> SqliteBacktestRunRepo<C> {
                     .stop_price
                     .map(|s| parse_decimal("trade.stop_price", &s))
                     .transpose()?,
+                // Migration 0023: NULL columns (every pre-0023 row) read back as `None`.
+                setup: setup_trace_of(r.setup_arm_time, r.setup_dip_time, r.setup_anchor_time)?,
             });
         }
         Ok(out)
@@ -1214,6 +1228,36 @@ fn usize_from(column: &str, value: Option<i64>) -> Result<usize, DataError> {
 
 /// Require a non-NULL column value, fail-closed on NULL (D5 — a trade column that
 /// must be present but is NULL is a corrupt row, never silently defaulted).
+/// Rebuild a trade's setup trace from its three `0023` columns. A trace has an arm
+/// and a dip time or neither: both NULL (every pre-0023 row, every trade of a
+/// strategy without a setup) is `None`, both present is `Some`, and exactly one
+/// present is a corrupt row naming the NULL column. The anchor time is optional
+/// on its own, and with no trace it is ignored.
+fn setup_trace_of(
+    arm_time: Option<i64>,
+    dip_time: Option<i64>,
+    anchor_time: Option<i64>,
+) -> Result<Option<SetupTrace>, DataError> {
+    match (arm_time, dip_time) {
+        (None, None) => Ok(None),
+        (Some(arm_time), Some(dip_time)) => Ok(Some(SetupTrace {
+            arm_time,
+            dip_time,
+            anchor_time,
+        })),
+        (None, Some(_)) => Err(trace_half_missing("trade.setup_arm_time")),
+        (Some(_), None) => Err(trace_half_missing("trade.setup_dip_time")),
+    }
+}
+
+/// The corrupt-row error for a setup trace with only one of its arm and dip
+/// times stored (migration 0023): `column` is the NULL one.
+fn trace_half_missing(column: &str) -> DataError {
+    DataError::Db(format!(
+        "NULL in required column `{column}` (corrupt row): the other half of the setup trace is stored"
+    ))
+}
+
 fn require_col<T>(column: &str, value: Option<T>) -> Result<T, DataError> {
     value.ok_or_else(|| DataError::Db(format!("NULL in required column `{column}` (corrupt row)")))
 }
@@ -1332,7 +1376,7 @@ pub(crate) async fn insert_run_row(
     // the hash feed on read — D4b proves this).
     let regime_breakdown_json = serde_json::to_string(&result.regime_breakdown)
         .map_err(|e| DataError::Db(e.to_string()))?;
-    let (skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) =
+    let (skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, skipped_stop_beyond_fill) =
         skipped_entry_i64s(result)?;
 
     // r1.s3.w2 (#110) — the eight INPUT provenance columns. Timeframes and the
@@ -1428,11 +1472,12 @@ pub(crate) async fn insert_run_row(
           pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
           d1_data_version, taker_fee_bps, slippage_bps, funding_config, window_from_ms, \
           window_to_ms, window_lead_in_from_ms, open_position, walk_forward_run_id, \
-          fold_index, lot_step, min_qty, min_notional, max_leverage) \
+          fold_index, lot_step, min_qty, min_notional, max_leverage, \
+          skipped_stop_beyond_fill) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
                  ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, \
-                 ?47, ?48, ?49, ?50, ?51)",
+                 ?47, ?48, ?49, ?50, ?51, ?52)",
         run_id,
         version_id_str,
         schema_version,
@@ -1484,6 +1529,7 @@ pub(crate) async fn insert_run_row(
         min_qty_text,
         min_notional_text,
         max_leverage_text,
+        skipped_stop_beyond_fill,
     )
     .execute(&mut **tx)
     .await
@@ -1491,17 +1537,19 @@ pub(crate) async fn insert_run_row(
     Ok(())
 }
 
-/// The three `skipped_entries` count columns as `i64` (extracted from
+/// The four `skipped_entries` count columns as `i64` (extracted from
 /// `insert_run_row` for #204 — the `0013` membership columns push it past its
-/// r2.s3.w2 count otherwise; r2.s3.w3).
-fn skipped_entry_i64s(result: &BacktestResult) -> Result<(i64, i64, i64), DataError> {
+/// r2.s3.w2 count otherwise; r2.s3.w3; r6.s2.w4 adds `0024`'s fourth).
+fn skipped_entry_i64s(result: &BacktestResult) -> Result<(i64, i64, i64, i64), DataError> {
     let sub_lot = i64::try_from(result.skipped_entries.sub_lot)
         .map_err(|e| DataError::Db(format!("skipped_sub_lot overflows i64: {e}")))?;
     let sub_notional = i64::try_from(result.skipped_entries.sub_notional)
         .map_err(|e| DataError::Db(format!("skipped_sub_notional overflows i64: {e}")))?;
     let leverage_capped = i64::try_from(result.skipped_entries.leverage_capped)
         .map_err(|e| DataError::Db(format!("skipped_leverage_capped overflows i64: {e}")))?;
-    Ok((sub_lot, sub_notional, leverage_capped))
+    let stop_beyond_fill = i64::try_from(result.skipped_entries.stop_beyond_fill)
+        .map_err(|e| DataError::Db(format!("skipped_stop_beyond_fill overflows i64: {e}")))?;
+    Ok((sub_lot, sub_notional, leverage_capped, stop_beyond_fill))
 }
 
 /// Insert every `trade` row for `run_id`, in `seq` order (0-based chronological),
@@ -1547,15 +1595,20 @@ pub(crate) async fn insert_trade_rows(
         // r2.s2.w2 / migration 0011: the recorded per-trade stop. `None` binds
         // NULL — the only value a pre-0011-shaped row can carry.
         let stop_price = trade.stop_price.map(decimal_text);
+        // r6.s2.w3 / migration 0023: the setup trace. No trace binds three NULLs.
+        let setup_arm_time = trade.setup.map(|trace| trace.arm_time);
+        let setup_dip_time = trade.setup.map(|trace| trace.dip_time);
+        let setup_anchor_time = trade.setup.and_then(|trace| trace.anchor_time);
 
         sqlx::query!(
             "INSERT INTO trade \
              (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, \
               entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, \
               fees_total, funding_total, slippage_total, realized_pnl, realized_r, \
-              mfe_r, mae_r, exit_reason, source, regime, fills, stop_price) \
+              mfe_r, mae_r, exit_reason, source, regime, fills, stop_price, \
+              setup_arm_time, setup_dip_time, setup_anchor_time) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             trade_id,
             run_id,
             seq_i64,
@@ -1579,6 +1632,9 @@ pub(crate) async fn insert_trade_rows(
             regime,
             fills_json,
             stop_price,
+            setup_arm_time,
+            setup_dip_time,
+            setup_anchor_time,
         )
         .execute(&mut **tx)
         .await
@@ -1709,6 +1765,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(d(28_500, 0)),
+            setup: None,
         }
     }
 
@@ -1791,6 +1848,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingDown,
             stop_price: Some(Decimal::from_str_exact("19500.00").unwrap()),
+            setup: None,
         };
         // Trade B — single fill, regime Ranging, positive.
         let trade_b = Trade {
@@ -1819,6 +1877,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::Ranging,
             stop_price: Some(d(110, 0)),
+            setup: None,
         };
         // Trade C — regime Unknown (opened while warming), break-even.
         let trade_c = Trade {
@@ -1847,6 +1906,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::Unknown,
             stop_price: Some(d(45, 0)),
+            setup: None,
         };
         // Trade D — regime TrendingUp, positive (so all four variants appear).
         let trade_d = Trade {
@@ -1875,6 +1935,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(Decimal::from_str_exact("6.66666667").unwrap()),
+            setup: None,
         };
         let trades = vec![trade_a, trade_b, trade_c, trade_d];
         // All four regime cells populated.
@@ -2290,6 +2351,42 @@ mod tests {
 
     // ---- AC-14: get_trades fails closed on a corrupt trade row (D5 / C9) ------
 
+    /// Migration 0023: the three columns map to a trace, to `None`, or to a corrupt-row
+    /// error that names the NULL column of a half-written pair.
+    #[test]
+    fn setup_trace_of_maps_the_three_columns() {
+        use super::setup_trace_of;
+        use crate::domain::backtest::SetupTrace;
+
+        assert_eq!(setup_trace_of(None, None, None).unwrap(), None);
+        assert_eq!(
+            setup_trace_of(Some(10), Some(20), None).unwrap(),
+            Some(SetupTrace {
+                arm_time: 10,
+                dip_time: 20,
+                anchor_time: None,
+            })
+        );
+        assert_eq!(
+            setup_trace_of(Some(10), Some(20), Some(15)).unwrap(),
+            Some(SetupTrace {
+                arm_time: 10,
+                dip_time: 20,
+                anchor_time: Some(15),
+            })
+        );
+        let missing_dip = setup_trace_of(Some(10), None, None).unwrap_err();
+        assert!(
+            missing_dip.to_string().contains("trade.setup_dip_time"),
+            "{missing_dip}"
+        );
+        let missing_arm = setup_trace_of(None, Some(20), Some(15)).unwrap_err();
+        assert!(
+            missing_arm.to_string().contains("trade.setup_arm_time"),
+            "{missing_arm}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_trades_fails_closed_on_corrupt_row() {
         let (repo, pool, _tmp) = repo_at(1_700_000_000_000).await;
@@ -2447,6 +2544,63 @@ mod tests {
                 "must reject the unsupported schema_version; got: {msg}"
             ),
             other => panic!("expected DataError::Db unsupported-schema, got {other:?}"),
+        }
+    }
+
+    // ---- r6.s2.w4 / migration 0024: skipped_stop_beyond_fill ------------------
+
+    /// Raw-INSERT a minimal v1 run row (no trades) with the given `skipped_stop_beyond_fill`.
+    async fn seed_run_with_skip_column(pool: &SqlitePool, id: &str, value: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO backtest_run \
+             (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+              engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+              funding_total, slippage_total, trade_count, wins, losses, breakeven, \
+              max_win_streak, max_loss_streak, win_rate, expectancy, gross_profit, \
+              gross_loss, avg_win, avg_loss, max_drawdown, regime_breakdown, \
+              skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+              skipped_stop_beyond_fill, \
+              pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+              funding_config) \
+             VALUES (?1, 'ver-1', 1, '2026-06-30T00:00:00.000Z', 'fp', 'tgt', \
+                     'hash', '10000', '0', '0', '0', '0', 0, 0, 0, 0, 0, 0, '0', '0', '0', '0', \
+                     '0', '0', '0', ?2, 0, 0, 0, ?3, \
+                     'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
+        )
+        .bind(id)
+        .bind(serde_json::to_string(&RegimeBreakdown::default()).unwrap())
+        .bind(value)
+        .execute(pool)
+        .await
+        .expect("seed a run row");
+    }
+
+    /// A NULL count (every pre-0024 row) is mapped to 0 before the count is read, so it is not
+    /// refused as a corrupt row; a negative count is still refused, naming the column.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_run_maps_a_null_skip_count_to_zero_and_refuses_a_negative_one() {
+        let (repo, pool, _tmp) = repo_at(1_700_000_000_000).await;
+
+        seed_run_with_skip_column(&pool, "run-null", None).await;
+        let run = repo.get_run(&BacktestRunId::new("run-null")).await;
+        // The placeholder hash does not re-derive, so the read ends at the tamper guard —
+        // AFTER the count was read. A NULL-count refusal would name the column instead.
+        match run {
+            Err(crate::domain::DataError::Db(msg)) => assert!(
+                msg.contains("result_content_hash mismatch"),
+                "a NULL count passes the count read; got: {msg}"
+            ),
+            other => panic!("expected the hash guard to end the read, got {other:?}"),
+        }
+
+        seed_run_with_skip_column(&pool, "run-negative", Some(-1)).await;
+        let run = repo.get_run(&BacktestRunId::new("run-negative")).await;
+        match run {
+            Err(crate::domain::DataError::Db(msg)) => assert!(
+                msg.contains("skipped_stop_beyond_fill"),
+                "a negative count is refused, naming the column; got: {msg}"
+            ),
+            other => panic!("expected a corrupt-count refusal, got {other:?}"),
         }
     }
 

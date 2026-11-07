@@ -1,0 +1,960 @@
+{
+  "schema_version": "1.6.0",
+  "name": "Cipher Pullback Engulf v1 (STR-0003)",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": {
+      "type": "Price",
+      "series": "primary",
+      "field": "Close"
+    },
+    "op": "Gt",
+    "rhs": {
+      "type": "Constant",
+      "value": "0"
+    }
+  },
+  "filters": [],
+  "exits": [
+    {
+      "type": "StructureStop",
+      "buffer_pct": "0.0005"
+    },
+    {
+      "type": "TakeProfit",
+      "target_r": "3"
+    }
+  ],
+  "risk": {
+    "risk_per_trade_pct": "0.01",
+    "max_leverage": "3"
+  },
+  "setup": {
+    "expiry_bars": 96,
+    "long": {
+      "arm": {
+        "type": "And",
+        "conditions": [
+          {
+            "type": "Compare",
+            "lhs": {
+              "type": "Price",
+              "series": "htf",
+              "field": "Close"
+            },
+            "op": "Gt",
+            "rhs": {
+              "type": "Indicator",
+              "series": "htf",
+              "spec": {
+                "indicator": "Sma",
+                "period": 50,
+                "source": "Close"
+              }
+            }
+          },
+          {
+            "type": "Or",
+            "conditions": [
+              {
+                "type": "Compare",
+                "lhs": {
+                  "type": "Lag",
+                  "value": {
+                    "type": "Indicator",
+                    "series": "htf",
+                    "spec": {
+                      "indicator": "WaveTrend",
+                      "channel": 9,
+                      "average": 12
+                    }
+                  },
+                  "bars": 1
+                },
+                "op": "Lt",
+                "rhs": {
+                  "type": "Constant",
+                  "value": "0"
+                }
+              },
+              {
+                "type": "Compare",
+                "lhs": {
+                  "type": "Lag",
+                  "value": {
+                    "type": "Indicator",
+                    "series": "htf",
+                    "spec": {
+                      "indicator": "WaveTrend",
+                      "channel": 9,
+                      "average": 12
+                    }
+                  },
+                  "bars": 2
+                },
+                "op": "Lt",
+                "rhs": {
+                  "type": "Constant",
+                  "value": "0"
+                }
+              },
+              {
+                "type": "Compare",
+                "lhs": {
+                  "type": "Lag",
+                  "value": {
+                    "type": "Indicator",
+                    "series": "htf",
+                    "spec": {
+                      "indicator": "WaveTrend",
+                      "channel": 9,
+                      "average": 12
+                    }
+                  },
+                  "bars": 3
+                },
+                "op": "Lt",
+                "rhs": {
+                  "type": "Constant",
+                  "value": "0"
+                }
+              }
+            ]
+          },
+          {
+            "type": "Or",
+            "conditions": [
+              {
+                "type": "And",
+                "conditions": [
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Close"
+                    },
+                    "op": "Gt",
+                    "rhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Open"
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Close"
+                      },
+                      "bars": 1
+                    },
+                    "op": "Lt",
+                    "rhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Open"
+                      },
+                      "bars": 1
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Open"
+                    },
+                    "op": "Lte",
+                    "rhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Close"
+                      },
+                      "bars": 1
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Close"
+                    },
+                    "op": "Gte",
+                    "rhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Open"
+                      },
+                      "bars": 1
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "And",
+                "conditions": [
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Close"
+                    },
+                    "op": "Gt",
+                    "rhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Open"
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Arith",
+                      "op": "mul",
+                      "lhs": {
+                        "type": "Constant",
+                        "value": "4"
+                      },
+                      "rhs": {
+                        "type": "Indicator",
+                        "series": "htf",
+                        "spec": {
+                          "indicator": "Range"
+                        }
+                      }
+                    },
+                    "op": "Gte",
+                    "rhs": {
+                      "type": "Arith",
+                      "op": "mul",
+                      "lhs": {
+                        "type": "Constant",
+                        "value": "3"
+                      },
+                      "rhs": {
+                        "type": "Arith",
+                        "op": "add",
+                        "lhs": {
+                          "type": "Arith",
+                          "op": "add",
+                          "lhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 1
+                          },
+                          "rhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 2
+                          }
+                        },
+                        "rhs": {
+                          "type": "Arith",
+                          "op": "add",
+                          "lhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 3
+                          },
+                          "rhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 4
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Indicator",
+                      "series": "htf",
+                      "spec": {
+                        "indicator": "Body"
+                      }
+                    },
+                    "op": "Gte",
+                    "rhs": {
+                      "type": "Arith",
+                      "op": "mul",
+                      "lhs": {
+                        "type": "Constant",
+                        "value": "0.7"
+                      },
+                      "rhs": {
+                        "type": "Indicator",
+                        "series": "htf",
+                        "spec": {
+                          "indicator": "Range"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "dip": {
+        "type": "Compare",
+        "lhs": {
+          "type": "Indicator",
+          "series": "primary",
+          "spec": {
+            "indicator": "WaveTrend",
+            "channel": 9,
+            "average": 12
+          }
+        },
+        "op": "Lt",
+        "rhs": {
+          "type": "Constant",
+          "value": "0"
+        }
+      },
+      "trigger": {
+        "type": "And",
+        "conditions": [
+          {
+            "type": "Compare",
+            "lhs": {
+              "type": "Price",
+              "series": "primary",
+              "field": "Close"
+            },
+            "op": "Gt",
+            "rhs": {
+              "type": "Indicator",
+              "series": "primary",
+              "spec": {
+                "indicator": "Sma",
+                "period": 50,
+                "source": "Close"
+              }
+            }
+          },
+          {
+            "type": "Compare",
+            "lhs": {
+              "type": "Price",
+              "series": "primary",
+              "field": "Close"
+            },
+            "op": "Gt",
+            "rhs": {
+              "type": "Arith",
+              "op": "max",
+              "lhs": {
+                "type": "Arith",
+                "op": "max",
+                "lhs": {
+                  "type": "Arith",
+                  "op": "max",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 5
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 11
+                    }
+                  }
+                },
+                "rhs": {
+                  "type": "Arith",
+                  "op": "max",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 15
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 18
+                    }
+                  }
+                }
+              },
+              "rhs": {
+                "type": "Arith",
+                "op": "max",
+                "lhs": {
+                  "type": "Arith",
+                  "op": "max",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 21
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 24
+                    }
+                  }
+                },
+                "rhs": {
+                  "type": "Arith",
+                  "op": "max",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 28
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 34
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "stop_anchor": {
+        "type": "Compare",
+        "lhs": {
+          "type": "Price",
+          "series": "primary",
+          "field": "Close"
+        },
+        "op": "Lt",
+        "rhs": {
+          "type": "Indicator",
+          "series": "primary",
+          "spec": {
+            "indicator": "Sma",
+            "period": 50,
+            "source": "Close"
+          }
+        }
+      }
+    },
+    "short": {
+      "arm": {
+        "type": "And",
+        "conditions": [
+          {
+            "type": "Compare",
+            "lhs": {
+              "type": "Price",
+              "series": "htf",
+              "field": "Close"
+            },
+            "op": "Lt",
+            "rhs": {
+              "type": "Indicator",
+              "series": "htf",
+              "spec": {
+                "indicator": "Sma",
+                "period": 50,
+                "source": "Close"
+              }
+            }
+          },
+          {
+            "type": "Or",
+            "conditions": [
+              {
+                "type": "Compare",
+                "lhs": {
+                  "type": "Lag",
+                  "value": {
+                    "type": "Indicator",
+                    "series": "htf",
+                    "spec": {
+                      "indicator": "WaveTrend",
+                      "channel": 9,
+                      "average": 12
+                    }
+                  },
+                  "bars": 1
+                },
+                "op": "Gt",
+                "rhs": {
+                  "type": "Constant",
+                  "value": "0"
+                }
+              },
+              {
+                "type": "Compare",
+                "lhs": {
+                  "type": "Lag",
+                  "value": {
+                    "type": "Indicator",
+                    "series": "htf",
+                    "spec": {
+                      "indicator": "WaveTrend",
+                      "channel": 9,
+                      "average": 12
+                    }
+                  },
+                  "bars": 2
+                },
+                "op": "Gt",
+                "rhs": {
+                  "type": "Constant",
+                  "value": "0"
+                }
+              },
+              {
+                "type": "Compare",
+                "lhs": {
+                  "type": "Lag",
+                  "value": {
+                    "type": "Indicator",
+                    "series": "htf",
+                    "spec": {
+                      "indicator": "WaveTrend",
+                      "channel": 9,
+                      "average": 12
+                    }
+                  },
+                  "bars": 3
+                },
+                "op": "Gt",
+                "rhs": {
+                  "type": "Constant",
+                  "value": "0"
+                }
+              }
+            ]
+          },
+          {
+            "type": "Or",
+            "conditions": [
+              {
+                "type": "And",
+                "conditions": [
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Close"
+                    },
+                    "op": "Lt",
+                    "rhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Open"
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Close"
+                      },
+                      "bars": 1
+                    },
+                    "op": "Gt",
+                    "rhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Open"
+                      },
+                      "bars": 1
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Open"
+                    },
+                    "op": "Gte",
+                    "rhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Close"
+                      },
+                      "bars": 1
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Close"
+                    },
+                    "op": "Lte",
+                    "rhs": {
+                      "type": "Lag",
+                      "value": {
+                        "type": "Price",
+                        "series": "htf",
+                        "field": "Open"
+                      },
+                      "bars": 1
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "And",
+                "conditions": [
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Close"
+                    },
+                    "op": "Lt",
+                    "rhs": {
+                      "type": "Price",
+                      "series": "htf",
+                      "field": "Open"
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Arith",
+                      "op": "mul",
+                      "lhs": {
+                        "type": "Constant",
+                        "value": "4"
+                      },
+                      "rhs": {
+                        "type": "Indicator",
+                        "series": "htf",
+                        "spec": {
+                          "indicator": "Range"
+                        }
+                      }
+                    },
+                    "op": "Gte",
+                    "rhs": {
+                      "type": "Arith",
+                      "op": "mul",
+                      "lhs": {
+                        "type": "Constant",
+                        "value": "3"
+                      },
+                      "rhs": {
+                        "type": "Arith",
+                        "op": "add",
+                        "lhs": {
+                          "type": "Arith",
+                          "op": "add",
+                          "lhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 1
+                          },
+                          "rhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 2
+                          }
+                        },
+                        "rhs": {
+                          "type": "Arith",
+                          "op": "add",
+                          "lhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 3
+                          },
+                          "rhs": {
+                            "type": "Lag",
+                            "value": {
+                              "type": "Indicator",
+                              "series": "htf",
+                              "spec": {
+                                "indicator": "Range"
+                              }
+                            },
+                            "bars": 4
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "type": "Compare",
+                    "lhs": {
+                      "type": "Indicator",
+                      "series": "htf",
+                      "spec": {
+                        "indicator": "Body"
+                      }
+                    },
+                    "op": "Gte",
+                    "rhs": {
+                      "type": "Arith",
+                      "op": "mul",
+                      "lhs": {
+                        "type": "Constant",
+                        "value": "0.7"
+                      },
+                      "rhs": {
+                        "type": "Indicator",
+                        "series": "htf",
+                        "spec": {
+                          "indicator": "Range"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "dip": {
+        "type": "Compare",
+        "lhs": {
+          "type": "Indicator",
+          "series": "primary",
+          "spec": {
+            "indicator": "WaveTrend",
+            "channel": 9,
+            "average": 12
+          }
+        },
+        "op": "Gt",
+        "rhs": {
+          "type": "Constant",
+          "value": "0"
+        }
+      },
+      "trigger": {
+        "type": "And",
+        "conditions": [
+          {
+            "type": "Compare",
+            "lhs": {
+              "type": "Price",
+              "series": "primary",
+              "field": "Close"
+            },
+            "op": "Lt",
+            "rhs": {
+              "type": "Indicator",
+              "series": "primary",
+              "spec": {
+                "indicator": "Sma",
+                "period": 50,
+                "source": "Close"
+              }
+            }
+          },
+          {
+            "type": "Compare",
+            "lhs": {
+              "type": "Price",
+              "series": "primary",
+              "field": "Close"
+            },
+            "op": "Lt",
+            "rhs": {
+              "type": "Arith",
+              "op": "min",
+              "lhs": {
+                "type": "Arith",
+                "op": "min",
+                "lhs": {
+                  "type": "Arith",
+                  "op": "min",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 5
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 11
+                    }
+                  }
+                },
+                "rhs": {
+                  "type": "Arith",
+                  "op": "min",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 15
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 18
+                    }
+                  }
+                }
+              },
+              "rhs": {
+                "type": "Arith",
+                "op": "min",
+                "lhs": {
+                  "type": "Arith",
+                  "op": "min",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 21
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 24
+                    }
+                  }
+                },
+                "rhs": {
+                  "type": "Arith",
+                  "op": "min",
+                  "lhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 28
+                    }
+                  },
+                  "rhs": {
+                    "type": "Indicator",
+                    "series": "primary",
+                    "spec": {
+                      "indicator": "Ema",
+                      "period": 34
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "stop_anchor": {
+        "type": "Compare",
+        "lhs": {
+          "type": "Price",
+          "series": "primary",
+          "field": "Close"
+        },
+        "op": "Gt",
+        "rhs": {
+          "type": "Indicator",
+          "series": "primary",
+          "spec": {
+            "indicator": "Sma",
+            "period": 50,
+            "source": "Close"
+          }
+        }
+      }
+    }
+  }
+}

@@ -38,6 +38,7 @@ use super::engine::{
     PendingExit, PreparedFill, StopRule, atr_at_signal, close_end_of_data,
     close_on_bar_open_or_price, commit_pending_fill, prepare_pending_fill, update_excursion,
 };
+use super::setup::{SetupFire, SetupState, SideState, step_side};
 use crate::adapters::backtest::regime::RegimeDetector;
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::indicators::engine::IndicatorEngine;
@@ -75,6 +76,7 @@ struct StepFrame {
     last_stamp_anchor: Option<i64>,
     next_boundary: i64,
     first_counted_open: Option<i64>,
+    setup: SetupState,
 }
 
 /// One stepwise backtest: the production event loop, owned bar by bar.
@@ -126,6 +128,9 @@ pub struct EngineSession {
     /// The next funding boundary not yet decided by the boundary rule
     /// (funding-order state).
     next_boundary: i64,
+    /// The setup state machine's per-side state (r6.s2.w2, ADR-0033). Default
+    /// and untouched for a strategy with no setup.
+    setup: SetupState,
 }
 
 impl EngineSession {
@@ -142,6 +147,7 @@ impl EngineSession {
     ///
     /// [`BacktestError::InvalidConfig`], [`BacktestError::FundingIntervalUnknown`],
     /// [`BacktestError::NoStopLoss`], [`BacktestError::ImpossibleTakeProfit`],
+    /// [`BacktestError::UnsupportedExit`] (a `StructureStop` without a setup),
     /// [`BacktestError::EngineInit`].
     pub fn new(
         compiled: &CompiledStrategy,
@@ -201,6 +207,7 @@ impl EngineSession {
             span_start: None,
             last_stamp_anchor: None,
             next_boundary: 0,
+            setup: SetupState::default(),
         })
     }
 
@@ -234,7 +241,6 @@ impl EngineSession {
             let prepared = prepare_pending_fill(
                 &self.state,
                 primary,
-                self.direction,
                 &self.plan,
                 &self.config,
                 &self.filters,
@@ -321,7 +327,7 @@ impl EngineSession {
         self.last_primary_open = Some(primary.open_time);
 
         // The signal-exit, time-stop and entry blocks over the stepped state.
-        self.evaluate_blocks(primary, counted);
+        self.evaluate_blocks(primary, counted, !closed_htf.is_empty());
 
         self.bars += 1;
         Ok(())
@@ -343,6 +349,7 @@ impl EngineSession {
             last_stamp_anchor: self.last_stamp_anchor,
             next_boundary: self.next_boundary,
             first_counted_open: self.first_counted_open,
+            setup: self.setup,
         }
     }
 
@@ -356,6 +363,7 @@ impl EngineSession {
         self.last_stamp_anchor = frame.last_stamp_anchor;
         self.next_boundary = frame.next_boundary;
         self.first_counted_open = frame.first_counted_open;
+        self.setup = frame.setup;
     }
 
     /// The pre-mutation validation half of [`EngineSession::step`] — the step
@@ -536,14 +544,7 @@ impl EngineSession {
         // one determined by already-closed bars (the detector is stepped
         // after the engines, mirroring `engine.step`) — captured in `step`
         // before any mutation, the same read with unchanged semantics.
-        commit_pending_fill(
-            &mut self.state,
-            prepared,
-            primary,
-            self.direction,
-            &self.plan,
-            regime,
-        );
+        commit_pending_fill(&mut self.state, prepared, primary, &self.plan, regime);
         if let Some(position) = self.state.position.as_mut() {
             // Fold this bar (the just-opened entry bar, or any held bar
             // including the full exit bar) into the running MFE/MAE before
@@ -615,7 +616,7 @@ impl EngineSession {
     /// exit, the time stop and the entry gate — the whole-run blocks verbatim,
     /// with the running bar count standing in for `bar.index` and the paired
     /// bars standing in for `bar.htf`/`bar.d1`.
-    fn evaluate_blocks(&mut self, primary: &Candle, counted: bool) {
+    fn evaluate_blocks(&mut self, primary: &Candle, counted: bool, htf_closed: bool) {
         // The series-routed evaluation context over the stepped engines. Built
         // from the three engine fields, never `&self`, so `self.state` stays
         // assignable below.
@@ -665,17 +666,96 @@ impl EngineSession {
         // rule, their latched readiness standing in for it), the HTF/D1 engine
         // warm gates, and the paired-bar F3 clauses — the whole-run gate
         // verbatim.
-        if counted
+        //
+        // With a setup (r6.s2.w2, ADR-0033) this block is replaced by the setup
+        // state machine: each declared side steps on EVERY bar — counted or not,
+        // with or without a position — and a fire becomes the pending entry only
+        // when the slot is free. A fire that finds a position or a pending entry
+        // enters nothing and is counted nowhere (PDR-0045).
+        if let Some(setup) = self.plan.strategy.setup() {
+            let warm = self.entry_gate_warm();
+            let gate = self.plan.strategy.entry();
+            let bar = self.bars;
+            let long_fire = setup.long.as_ref().and_then(|side| {
+                step_side(
+                    &mut self.setup.long,
+                    side,
+                    gate,
+                    &ctx,
+                    primary,
+                    bar,
+                    htf_closed,
+                    warm,
+                    setup.expiry_bars,
+                    Direction::Long,
+                )
+            });
+            let short_fire = setup.short.as_ref().and_then(|side| {
+                step_side(
+                    &mut self.setup.short,
+                    side,
+                    gate,
+                    &ctx,
+                    primary,
+                    bar,
+                    htf_closed,
+                    warm,
+                    setup.expiry_bars,
+                    Direction::Short,
+                )
+            });
+            for fire in [long_fire, short_fire].into_iter().flatten() {
+                Self::queue_entry(
+                    &mut self.state,
+                    &self.plan,
+                    primary,
+                    counted,
+                    &ctx,
+                    fire.direction,
+                    Some(fire),
+                );
+            }
+        } else if counted
             && self.state.position.is_none()
             && self.state.pending_entry.is_none()
             && self.entry_gate_warm()
             && self.plan.strategy.entry().eval(&ctx)
         {
-            let atr_at_signal_value = atr_at_signal(&self.plan, &ctx);
-            if !matches!(self.plan.stop, StopRule::Atr { .. }) || atr_at_signal_value.is_some() {
-                self.state.pending_entry = Some(PendingEntry {
+            Self::queue_entry(
+                &mut self.state,
+                &self.plan,
+                primary,
+                counted,
+                &ctx,
+                self.direction,
+                None,
+            );
+        }
+    }
+
+    /// Record the pending entry for a signal at `primary`'s close: the entry
+    /// gate's body, shared by the plain gate (`setup: None`) and a setup fire.
+    /// Does nothing unless the bar counts and the position slot is free.
+    ///
+    /// An associated function over the two fields it touches, not `&mut self`,
+    /// so the caller can keep its evaluation context (a borrow of the engines).
+    fn queue_entry(
+        state: &mut LoopState,
+        plan: &ExitPlan,
+        primary: &Candle,
+        counted: bool,
+        ctx: &DualSeriesContext<'_>,
+        direction: Direction,
+        setup: Option<SetupFire>,
+    ) {
+        if counted && state.position.is_none() && state.pending_entry.is_none() {
+            let atr_at_signal_value = atr_at_signal(plan, ctx);
+            if !matches!(plan.stop, StopRule::Atr { .. }) || atr_at_signal_value.is_some() {
+                state.pending_entry = Some(PendingEntry {
                     signal_time: primary.close_time,
                     atr_at_signal: atr_at_signal_value,
+                    setup,
+                    direction,
                 });
             }
         }
@@ -872,6 +952,16 @@ impl EngineSession {
     }
 }
 
+/// The state of each setup side the strategy declares (r6.s2.w2, ADR-0033).
+/// Each side is `Some` exactly when the strategy declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupView {
+    /// The long side's state.
+    pub long: Option<SideState>,
+    /// The short side's state.
+    pub short: Option<SideState>,
+}
+
 /// A read-only probe over a stepped [`EngineSession`] — the entry gate's own
 /// truth at the bar the session last stepped (r5.s3.w2, SPINE G3).
 ///
@@ -919,6 +1009,18 @@ impl EvalProbe<'_> {
     #[must_use]
     pub fn operand(&self, value: &CompiledValue, previous: bool) -> Option<Decimal> {
         value.eval(&self.context(), previous)
+    }
+
+    /// The state of each declared setup side at the last stepped bar (r6.s2.w2,
+    /// ADR-0033), or `None` for a strategy with no setup. Read-only: it copies
+    /// the state and steps nothing.
+    #[must_use]
+    pub fn setup_view(&self) -> Option<SetupView> {
+        let setup = self.session.plan.strategy.setup()?;
+        Some(SetupView {
+            long: setup.long.as_ref().map(|_| self.session.setup.long),
+            short: setup.short.as_ref().map(|_| self.session.setup.short),
+        })
     }
 
     /// The session's series-routed evaluation context, rebuilt per read.
@@ -1106,7 +1208,7 @@ impl EngineSession {
              count_from:{:?},tfs:{:?},interval:{},engine:{},htf:{:?},d1:{:?},\
              detector:{},state:{:?},paired_htf:{:?},paired_d1:{:?},bars:{},\
              first_counted:{:?},last_primary:{:?},last_htf:{:?},last_d1:{:?},\
-             funding_index:{:?},span_start:{:?},anchor:{:?},next_boundary:{}}}",
+             funding_index:{:?},span_start:{:?},anchor:{:?},next_boundary:{},setup:{:?}}}",
             self.plan,
             self.direction,
             self.config,
@@ -1146,6 +1248,7 @@ impl EngineSession {
             self.span_start,
             self.last_stamp_anchor,
             self.next_boundary,
+            self.setup,
         )
     }
 }
@@ -1189,6 +1292,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
                 max_leverage: SweepableValue::Fixed(dec("3")),
             },
+            setup: None,
         };
         let compiled_strategy =
             compile(&validate(&dsl).expect("probe dsl validates")).expect("probe dsl compiles");
@@ -1209,6 +1313,146 @@ mod tests {
             None,
         )
         .expect("probe session constructs")
+    }
+
+    /// A plain (no-setup) session with a fixed-percent stop and an always-true
+    /// entry, so a test can reach "position held" or "entry pending" by stepping
+    /// flat bars. `queue_entry` does not care which kind of strategy owns the
+    /// session; the slot guard is the same.
+    fn slot_session() -> EngineSession {
+        let dsl = StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "slot guard probe".to_owned(),
+            direction: Direction::Long,
+            entry: Condition::Compare {
+                lhs: ValueSource::Price {
+                    series: Series::Primary,
+                    field: PriceField::Close,
+                },
+                op: Comparator::Gt,
+                rhs: ValueSource::Constant { value: dec("0") },
+            },
+            filters: vec![],
+            exits: vec![ExitRule::StopLoss {
+                distance_pct: SweepableValue::Fixed(dec("0.05")),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
+                max_leverage: SweepableValue::Fixed(dec("3")),
+            },
+            setup: None,
+        };
+        let compiled_strategy =
+            compile(&validate(&dsl).expect("dsl validates")).expect("dsl compiles");
+        EngineSession::new(
+            &compiled_strategy,
+            &Pair::new("BTCUSDT"),
+            SessionTimeframes {
+                primary: Timeframe::M15,
+                htf: None,
+                d1: None,
+            },
+            BacktestConfig {
+                starting_equity: dec("10000"),
+                taker_fee_bps: dec("0"),
+                slippage_bps: dec("0"),
+            },
+            SymbolFilters::unconstrained(),
+            None,
+        )
+        .expect("slot session constructs")
+    }
+
+    /// A flat candle at 1: no stop or target is ever touched.
+    fn flat_bar(i: i64) -> Candle {
+        let ms = Timeframe::M15.duration_ms();
+        Candle {
+            open_time: i * ms,
+            close_time: (i + 1) * ms - 1,
+            open: dec("1"),
+            high: dec("1"),
+            low: dec("1"),
+            close: dec("1"),
+            volume: dec("1"),
+            funding_rate: if i == 0 { Some(Decimal::ZERO) } else { None },
+        }
+    }
+
+    fn some_fire(trigger_time: i64) -> SetupFire {
+        SetupFire {
+            direction: Direction::Long,
+            arm_time: 1,
+            dip_time: 2,
+            anchor_time: None,
+            trigger_time,
+            extreme: dec("1"),
+        }
+    }
+
+    /// Offer `fire` to `queue_entry` against the session's own state, on a
+    /// counted bar, and return the session for inspection.
+    fn offer(session: &mut EngineSession, fire: SetupFire) {
+        let bar = flat_bar(50);
+        let ctx = EngineSession::context_of(
+            &session.engine,
+            session.htf_engine.as_ref(),
+            session.d1_engine.as_ref(),
+        );
+        EngineSession::queue_entry(
+            &mut session.state,
+            &session.plan,
+            &bar,
+            true,
+            &ctx,
+            fire.direction,
+            Some(fire),
+        );
+    }
+
+    /// r6.s2.w2 (PDR-0045, ADR-0033 decision 4): a fire that finds the slot
+    /// taken enters nothing. `queue_entry`'s slot guard is the only thing that
+    /// stops it: the fill layer would silently consume a stray pending entry
+    /// while a position is held, so no run-level result shows the difference.
+    /// This test reads the state itself and goes red when either slot check is
+    /// removed.
+    #[test]
+    fn queue_entry_leaves_a_taken_slot_alone() {
+        // Free slot: the fire becomes the pending entry (the control).
+        let mut free = slot_session();
+        free.step(&flat_bar(0), &[], &[]).expect("bar 0 steps");
+        assert!(free.state.position.is_none() && free.state.pending_entry.is_none());
+        offer(&mut free, some_fire(7));
+        let queued = free
+            .state
+            .pending_entry
+            .expect("a free slot queues the fire");
+        assert_eq!(queued.setup, Some(some_fire(7)));
+
+        // Position held: the fire is dropped, nothing is queued.
+        let mut held = slot_session();
+        for i in 0..3 {
+            held.step(&flat_bar(i), &[], &[]).expect("bars step");
+        }
+        assert!(held.state.position.is_some(), "bar 1 signals, bar 2 fills");
+        assert!(held.state.pending_entry.is_none());
+        offer(&mut held, some_fire(7));
+        assert!(
+            held.state.pending_entry.is_none(),
+            "a fire in a position must not leave a pending entry"
+        );
+
+        // Entry pending: the fire does not replace it.
+        let mut pending = slot_session();
+        for i in 0..2 {
+            pending.step(&flat_bar(i), &[], &[]).expect("bars step");
+        }
+        assert!(pending.state.position.is_none());
+        let before = pending.state.pending_entry.expect("bar 1 signals");
+        assert_eq!(before.setup, None);
+        offer(&mut pending, some_fire(7));
+        let after = pending.state.pending_entry.expect("still pending");
+        assert_eq!(after.signal_time, before.signal_time);
+        assert_eq!(after.setup, None, "a fire must not replace a pending entry");
     }
 
     fn probe_bar(i: i64) -> Candle {
@@ -1309,6 +1553,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(dec("0.01")),
                 max_leverage: SweepableValue::Fixed(dec("3")),
             },
+            setup: None,
         };
         let compiled_strategy =
             compile(&validate(&dsl).expect("probe dsl validates")).expect("probe dsl compiles");

@@ -255,6 +255,7 @@ fn dsl(entry: Condition, exits: Vec<ExitRule>, direction: Direction) -> Strategy
             risk_per_trade_pct: SweepableValue::Fixed(dec(1, 2)),
             max_leverage: SweepableValue::Fixed(dec(3, 0)),
         },
+        setup: None,
     }
 }
 

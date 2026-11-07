@@ -41,6 +41,10 @@ pub struct Rendered {
     pub exits: Vec<String>,
     /// The risk parameters, one line each.
     pub risk: Vec<String>,
+    /// The setup lines (schema 1.6.0, ADR-0033), empty without a setup: first
+    /// `expiry <n> bars`, then per side (long, then short) its `arm`, `dip`,
+    /// `trigger` and, when present, `stop anchor`.
+    pub setup: Vec<String>,
 }
 
 /// The trade side as its display word: `"long"` / `"short"`.
@@ -407,6 +411,9 @@ pub fn exit(rule: &ExitRule) -> String {
         ExitRule::AtrStop { period, multiple } => {
             format!("atr({})\u{d7}{}", u32_leaf(period), decimal_leaf(multiple))
         }
+        ExitRule::StructureStop { buffer_pct } => {
+            format!("structure stop +{}", pct_leaf(buffer_pct))
+        }
     }
 }
 
@@ -441,7 +448,42 @@ pub fn strategy_with_prefix(dsl: &StrategyDsl, htf_prefix: &str) -> Rendered {
             .collect(),
         exits: dsl.exits.iter().map(exit).collect(),
         risk: risk(&dsl.risk),
+        setup: setup_lines(dsl, htf_prefix),
     }
+}
+
+/// The setup as summary lines (schema 1.6.0, ADR-0033): `expiry <n> bars`, then
+/// per side, long before short, `<side> arm: <cond>`, `<side> dip: <cond>`,
+/// `<side> trigger: <cond>` and `<side> stop anchor: <cond>` when present.
+fn setup_lines(dsl: &StrategyDsl, htf_prefix: &str) -> Vec<String> {
+    let Some(setup) = &dsl.setup else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("expiry {} bars", u32_leaf(&setup.expiry_bars))];
+    for (name, side) in [("long", &setup.long), ("short", &setup.short)] {
+        let Some(side) = side else {
+            continue;
+        };
+        lines.push(format!(
+            "{name} arm: {}",
+            condition_with_prefix(&side.arm, htf_prefix)
+        ));
+        lines.push(format!(
+            "{name} dip: {}",
+            condition_with_prefix(&side.dip, htf_prefix)
+        ));
+        lines.push(format!(
+            "{name} trigger: {}",
+            condition_with_prefix(&side.trigger, htf_prefix)
+        ));
+        if let Some(anchor) = &side.stop_anchor {
+            lines.push(format!(
+                "{name} stop anchor: {}",
+                condition_with_prefix(anchor, htf_prefix)
+            ));
+        }
+    }
+    lines
 }
 
 /// A conjoined/disjoined list: each member parenthesized, joined by
@@ -500,5 +542,136 @@ fn pct_leaf(value: &SweepableValue<Decimal>) -> String {
             (*start * Decimal::from(100)).normalize(),
             (*end * Decimal::from(100)).normalize()
         ),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{exit, strategy};
+    use crate::domain::dsl::condition::{Comparator, Condition};
+    use crate::domain::dsl::exit::ExitRule;
+    use crate::domain::dsl::risk::{Direction, RiskParams};
+    use crate::domain::dsl::schema_version::SchemaVersion;
+    use crate::domain::dsl::setup::{Setup, SetupSide};
+    use crate::domain::dsl::strategy::StrategyDsl;
+    use crate::domain::dsl::sweepable::SweepableValue;
+    use crate::domain::dsl::value::{IndicatorSpec, PriceField, Series, ValueSource};
+    use rust_decimal::Decimal;
+
+    fn close_gt(level: i64) -> Condition {
+        Condition::Compare {
+            lhs: ValueSource::Price {
+                series: Series::Primary,
+                field: PriceField::Close,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::new(level, 0),
+            },
+        }
+    }
+
+    fn htf_close_gt(level: i64) -> Condition {
+        Condition::Compare {
+            lhs: ValueSource::Price {
+                series: Series::Htf,
+                field: PriceField::Close,
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::new(level, 0),
+            },
+        }
+    }
+
+    fn side(with_anchor: bool) -> SetupSide {
+        SetupSide {
+            arm: htf_close_gt(1),
+            dip: close_gt(2),
+            trigger: Condition::Compare {
+                lhs: ValueSource::Indicator {
+                    series: Series::Primary,
+                    spec: IndicatorSpec::Sma {
+                        period: SweepableValue::Fixed(50),
+                        source: PriceField::Close,
+                    },
+                },
+                op: Comparator::Lt,
+                rhs: ValueSource::Constant {
+                    value: Decimal::new(3, 0),
+                },
+            },
+            stop_anchor: with_anchor.then(|| close_gt(4)),
+        }
+    }
+
+    fn dsl(setup: Option<Box<Setup>>) -> StrategyDsl {
+        StrategyDsl {
+            schema_version: SchemaVersion::CURRENT,
+            name: "render setup".to_owned(),
+            direction: Direction::Long,
+            entry: close_gt(0),
+            filters: vec![],
+            exits: vec![ExitRule::StructureStop {
+                buffer_pct: SweepableValue::Fixed(Decimal::new(5, 4)),
+            }],
+            risk: RiskParams {
+                risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
+                max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
+            },
+            setup,
+        }
+    }
+
+    #[test]
+    fn setup_structure_stop_renders_its_buffer() {
+        let rule = ExitRule::StructureStop {
+            buffer_pct: SweepableValue::Fixed(Decimal::new(5, 4)),
+        };
+        assert_eq!(exit(&rule), "structure stop +0.05%");
+        let zero = ExitRule::StructureStop {
+            buffer_pct: SweepableValue::Fixed(Decimal::ZERO),
+        };
+        assert_eq!(exit(&zero), "structure stop +0%");
+    }
+
+    #[test]
+    fn setup_lines_are_empty_without_a_setup() {
+        assert!(strategy(&dsl(None)).setup.is_empty());
+    }
+
+    #[test]
+    fn setup_lines_render_expiry_then_long_then_short() {
+        let rendered = strategy(&dsl(Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(96),
+            long: Some(side(true)),
+            short: Some(side(false)),
+        }))));
+        assert_eq!(
+            rendered.setup,
+            vec![
+                "expiry 96 bars".to_owned(),
+                "long arm: h4:close > 1".to_owned(),
+                "long dip: close > 2".to_owned(),
+                "long trigger: sma(50,close) < 3".to_owned(),
+                "long stop anchor: close > 4".to_owned(),
+                "short arm: h4:close > 1".to_owned(),
+                "short dip: close > 2".to_owned(),
+                "short trigger: sma(50,close) < 3".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_lines_for_one_side_skip_the_absent_side() {
+        let rendered = strategy(&dsl(Some(Box::new(Setup {
+            expiry_bars: SweepableValue::Fixed(8),
+            long: None,
+            short: Some(side(false)),
+        }))));
+        assert_eq!(rendered.setup[0], "expiry 8 bars");
+        assert!(rendered.setup[1..].iter().all(|l| l.starts_with("short ")));
+        assert_eq!(rendered.setup.len(), 4);
     }
 }

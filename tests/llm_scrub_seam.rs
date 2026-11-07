@@ -585,6 +585,7 @@ fn htf_dsl_json() -> String {
             risk_per_trade_pct: pulse::SweepableValue::Fixed(Decimal::new(1, 2)),
             max_leverage: pulse::SweepableValue::Fixed(Decimal::new(3, 0)),
         },
+        setup: None,
     };
     serde_json::to_string(&dsl).expect("dsl serializes")
 }

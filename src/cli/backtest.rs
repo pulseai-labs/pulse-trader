@@ -542,7 +542,8 @@ fn render_regime_breakdown(result: &BacktestResult) -> Vec<String> {
 /// The skipped-entries observability line (audit C4, VS-1.2.2 work-2.05): always
 /// prints `skipped_entries=<total()>` so a user staring at a low trade count can
 /// tell "no signals" from "too small to size". When `total() > 0`, the per-reason
-/// breakdown (`sub_lot` / `sub_notional` / `leverage_capped`) is appended.
+/// breakdown (`sub_lot` / `sub_notional` / `leverage_capped`) is appended, followed by
+/// `stop_beyond_fill` only when it is non-zero (r6.s2.w4), so every earlier line is unchanged.
 fn render_skipped_entries(result: &BacktestResult) -> String {
     let counts = &result.skipped_entries;
     let total = counts.total();
@@ -551,6 +552,9 @@ fn render_skipped_entries(result: &BacktestResult) -> String {
         cells.push(format!("sub_lot={}", counts.sub_lot));
         cells.push(format!("sub_notional={}", counts.sub_notional));
         cells.push(format!("leverage_capped={}", counts.leverage_capped));
+        if counts.stop_beyond_fill > 0 {
+            cells.push(format!("stop_beyond_fill={}", counts.stop_beyond_fill));
+        }
     }
     cells.join("\t")
 }
@@ -664,6 +668,7 @@ mod tests {
                 risk_per_trade_pct: SweepableValue::Fixed(Decimal::new(1, 2)),
                 max_leverage: SweepableValue::Fixed(Decimal::new(3, 0)),
             },
+            setup: None,
         }
     }
 
@@ -716,6 +721,7 @@ mod tests {
             source: TradeSource::Backtest,
             regime: Regime::TrendingUp,
             stop_price: Some(Decimal::new(28_500, 0)),
+            setup: None,
         }
     }
 
