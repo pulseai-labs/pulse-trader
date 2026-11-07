@@ -445,7 +445,7 @@ async fn decide(world: &World, action: CoachAction) -> CoachDecisionOutcome {
 /// move it: the hash covers results, not input provenance. Read by the (ii)
 /// case below, which lands as the TDD loop proceeds.
 const FROZEN_CONTENT_HASH: &str =
-    "b8e91b89b7727eb97c8200ee04373ffc3ef3568b51ab145bbb2e652cb2bb9228";
+    "f934ca1ceffe05ff322d44cf706a3381a766dd589d22502d3d705d13f1222d65";
 
 /// One-off capture helper (the `tests/determinism.rs::emit_content_hash`
 /// pattern): runs the fixture backtest through the REAL `run_version_backtest`

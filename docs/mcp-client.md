@@ -95,7 +95,7 @@ path of every file they write.
 
 ## Tools
 
-Twenty tools — nine library/run/paper reads, three exports, two writes,
+Twenty-one tools — ten library/run/paper reads, three exports, two writes,
 two walk-forward/certification tools, four example-mark tools. All calls
 are synchronous; write tools commit before they return.
 
@@ -107,6 +107,7 @@ are synchronous; write tools commit before they return.
 | `get_version` | Fetch one version by id — migrated DSL document, verbatim original, hash, provenance |
 | `list_runs` | List the runs recorded against a version — headline stats plus persisted input provenance |
 | `get_run` | Fetch one run — summary stats, regime breakdown, skipped entries, MFE/MAE, persisted inputs, integrity fields |
+| `loss_context` | Group one run's trades, losses and losing streaks by context at entry — 4H swing trend relative to the side, 15m regime, volatility tercile (`ATR(14)` ÷ price, in the run's own terciles) and UTC hour; R is net of fees and funding. Describes only, writes nothing; holdout-guarded like `get_run` |
 | `get_walk_forward_run` | Fetch one walk-forward run by id — the same detail shape `run_walk_forward` returns, one row per fold |
 | `list_paper_sessions` | List paper sessions with status, graduation, engine epochs, closed-trade count, out-of-sample comparison |
 | `get_paper_session` | Fetch one paper session by id — status, graduation, epochs, open position, recorded verdicts, comparison |

@@ -238,6 +238,7 @@ All load-bearing architectural decisions are recorded in
 | [0024 (addendum)](docs/adr/0024-addendum-structure-indicators-1-3-0.md) | Addendum — Structure indicators under schema 1.3.0 |
 | [0024 (addendum)](docs/adr/0024-addendum-candle-patterns-1-4-0.md) | Addendum — Named candlestick patterns under schema 1.4.0 |
 | [0024 (addendum)](docs/adr/0024-addendum-cipher-indicators-1-5-0.md) | Addendum — Cipher building blocks (SMA, `max`/`min`, WaveTrend) under schema 1.5.0 |
+| [0024 (addendum)](docs/adr/0024-addendum-previous-pivots-1-7-0.md) | Addendum — Previous pivots (`PreviousPivotHigh`, `PreviousPivotLow`) under schema 1.7.0 |
 | [0025](docs/adr/0025-walk-forward-run-kind-and-certification-seam.md) | Walk-forward as a run kind and the certification seam |
 | [0026](docs/adr/0026-client-server-split.md) | The client/server split |
 | [0027](docs/adr/0027-paper-session-event-log.md) | The paper session: a row plus an append-only event log, graduated two ways |

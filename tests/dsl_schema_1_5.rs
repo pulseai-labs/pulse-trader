@@ -6,7 +6,7 @@
 //! still deserialize, so the bump is a minor one with an identity migration.
 //! This suite pins the facts that make the bump honest:
 //!
-//! 1. **The served schema names the current version** (1.6.0 since r6.s2.w1) and lists the
+//! 1. **The served schema names the current version** (1.7.0 since r6.s3.w2) and lists the
 //!    loadable spellings.
 //! 2. **The wire shapes are the spec's**, including `Sma`'s defaulted `source`.
 //! 3. **A 1.4.0 document migrates by identity**, byte-verbatim in
@@ -70,7 +70,7 @@ fn strategy_with_entry(name: &str, entry: Condition) -> StrategyDsl {
 // 1. The served schema
 // ---------------------------------------------------------------------------
 
-/// The served schema names 1.6.0 last and lists exactly the seven loadable
+/// The served schema names 1.7.0 last and lists exactly the eight loadable
 /// spellings.
 #[test]
 fn the_served_version_enum_is_the_loadable_set_and_names_1_5_0() {
@@ -78,12 +78,12 @@ fn the_served_version_enum_is_the_loadable_set_and_names_1_5_0() {
     assert_eq!(
         schema["properties"]["schema_version"]["enum"],
         serde_json::json!([
-            "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"
+            "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"
         ]),
         "the served enum lists every loadable spelling and nothing else"
     );
-    assert_eq!(SchemaVersion::CURRENT.to_string(), "1.6.0");
-    assert_eq!(pulse::DSL_SCHEMA_VERSION, "1.6.0");
+    assert_eq!(SchemaVersion::CURRENT.to_string(), "1.7.0");
+    assert_eq!(pulse::DSL_SCHEMA_VERSION, "1.7.0");
 }
 
 /// The served schema advertises the `Sma` variant, tagged by its `indicator`
@@ -160,7 +160,7 @@ const DOC_1_4_0: &str = r#"{
   "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
 }"#;
 
-/// A 1.4.0 strategy loads unchanged under 1.6.0: `from` is the authored
+/// A 1.4.0 strategy loads unchanged under 1.7.0: `from` is the authored
 /// version, `dsl_original` stays byte-verbatim, the typed document is
 /// `CURRENT`, and the re-serialization differs only in the `schema_version`
 /// string.
@@ -177,19 +177,19 @@ fn a_1_4_0_document_loads_unchanged_under_1_5_0() {
     );
     assert!(
         loaded.migrated,
-        "the 1.4.0 → 1.6.0 identity chain was applied"
+        "the 1.4.0 → 1.7.0 identity chain was applied"
     );
     assert_eq!(
         loaded.dsl_original, DOC_1_4_0,
         "dsl_original stays byte-verbatim"
     );
     assert_eq!(loaded.dsl.schema_version, SchemaVersion::CURRENT);
-    assert_eq!(loaded.dsl.schema_version.to_string(), "1.6.0");
+    assert_eq!(loaded.dsl.schema_version.to_string(), "1.7.0");
 
     let reserialized = serde_json::to_value(&loaded.dsl).expect("re-serializes");
     let mut expected: serde_json::Value =
         serde_json::from_str(DOC_1_4_0).expect("the fixture is valid JSON");
-    expected["schema_version"] = serde_json::json!("1.6.0");
+    expected["schema_version"] = serde_json::json!("1.7.0");
     assert_eq!(
         reserialized, expected,
         "the identity step changes nothing but the schema_version string"
@@ -198,28 +198,28 @@ fn a_1_4_0_document_loads_unchanged_under_1_5_0() {
 }
 
 /// The whole registered chain is identity, end to end: a 1.0.0 document reaches
-/// 1.6.0 with its meaning intact.
+/// 1.7.0 with its meaning intact.
 #[test]
 fn the_whole_chain_migrates_identity_to_1_5_0() {
     let doc = DOC_1_4_0.replace("\"1.4.0\"", "\"1.0.0\"");
     let loaded = Migrator::v1().load(&doc).expect("a 1.0.0 document loads");
     assert_eq!(loaded.from.to_string(), "1.0.0");
-    assert_eq!(loaded.dsl.schema_version.to_string(), "1.6.0");
+    assert_eq!(loaded.dsl.schema_version.to_string(), "1.7.0");
     compile(&validate(&loaded.dsl).expect("validates")).expect("compiles");
 }
 
 /// A future minor is still refused, naming the new pair.
 #[test]
 fn a_future_minor_is_refused() {
-    let doc = DOC_1_4_0.replace("\"1.4.0\"", "\"1.7.0\"");
+    let doc = DOC_1_4_0.replace("\"1.4.0\"", "\"1.8.0\"");
     let err = Migrator::v1()
         .load(&doc)
         .expect_err("a future version must refuse");
     let pulse::LoadError::FutureVersion { found, current } = err else {
         panic!("expected FutureVersion, got {err:?}");
     };
-    assert_eq!(found.to_string(), "1.7.0");
-    assert_eq!(current.to_string(), "1.6.0");
+    assert_eq!(found.to_string(), "1.8.0");
+    assert_eq!(current.to_string(), "1.7.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +538,7 @@ fn the_wavetrend_wire_shape_is_exact_and_both_lengths_are_required() {
     assert_eq!(
         schema["properties"]["schema_version"]["enum"],
         serde_json::json!([
-            "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"
+            "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"
         ]),
         "WaveTrend adds no schema version"
     );

@@ -179,7 +179,7 @@ const DOC_1_5_0: &str = r#"{
   "risk": { "risk_per_trade_pct": "0.01", "max_leverage": "3" }
 }"#;
 
-/// A 1.5.0 strategy loads unchanged under 1.6.0 and serializes with no
+/// A 1.5.0 strategy loads unchanged under 1.7.0 and serializes with no
 /// `setup` key: the only difference is the `schema_version` string.
 #[test]
 fn a_1_5_0_document_loads_unchanged_under_1_6_0() {
@@ -197,13 +197,13 @@ fn a_1_5_0_document_loads_unchanged_under_1_6_0() {
         "dsl_original stays byte-verbatim"
     );
     assert_eq!(loaded.dsl.schema_version, SchemaVersion::CURRENT);
-    assert_eq!(loaded.dsl.schema_version.to_string(), "1.6.0");
+    assert_eq!(loaded.dsl.schema_version.to_string(), "1.7.0");
     assert_eq!(loaded.dsl.setup, None, "an absent setup reads as none");
 
     let reserialized = serde_json::to_value(&loaded.dsl).expect("re-serializes");
     let mut expected: serde_json::Value =
         serde_json::from_str(DOC_1_5_0).expect("the fixture is valid JSON");
-    expected["schema_version"] = serde_json::json!("1.6.0");
+    expected["schema_version"] = serde_json::json!("1.7.0");
     assert_eq!(
         reserialized, expected,
         "the identity step changes nothing but the schema_version string"
@@ -223,7 +223,7 @@ fn a_strategy_without_a_setup_serializes_byte_identically() {
     before.schema_version = "1.5.0".parse().expect("a version string");
     let before = serde_json::to_string(&before).expect("serializes");
     assert_eq!(
-        now.replace("1.6.0", "1.5.0"),
+        now.replace("1.7.0", "1.5.0"),
         before,
         "the bytes differ only in the version string"
     );
@@ -239,22 +239,22 @@ fn the_whole_chain_migrates_identity_to_1_6_0() {
     let doc = doc.replace("\"Sma\"", "\"Ema\"");
     let loaded = Migrator::v1().load(&doc).expect("a 1.0.0 document loads");
     assert_eq!(loaded.from.to_string(), "1.0.0");
-    assert_eq!(loaded.dsl.schema_version.to_string(), "1.6.0");
+    assert_eq!(loaded.dsl.schema_version.to_string(), "1.7.0");
     compile(&validate(&loaded.dsl).expect("validates")).expect("compiles");
 }
 
 /// A future minor is still refused, naming the new pair.
 #[test]
 fn a_future_minor_is_refused() {
-    let doc = DOC_1_5_0.replace("\"1.5.0\"", "\"1.7.0\"");
+    let doc = DOC_1_5_0.replace("\"1.5.0\"", "\"1.8.0\"");
     let err = Migrator::v1()
         .load(&doc)
         .expect_err("a future version must refuse");
     let pulse::LoadError::FutureVersion { found, current } = err else {
         panic!("expected FutureVersion, got {err:?}");
     };
-    assert_eq!(found.to_string(), "1.7.0");
-    assert_eq!(current.to_string(), "1.6.0");
+    assert_eq!(found.to_string(), "1.8.0");
+    assert_eq!(current.to_string(), "1.7.0");
 }
 
 // ---------------------------------------------------------------------------

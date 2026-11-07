@@ -753,7 +753,7 @@ async fn cipher_v1_round_trips_over_mcp() {
         .to_owned();
     let version =
         support::mcp::call(&client, "get_version", json!({"version_id": version_id})).await;
-    assert_eq!(version["dsl_schema_version"], "1.6.0");
+    assert_eq!(version["dsl_schema_version"], "1.7.0");
     assert_eq!(version["dsl"]["name"], document["name"]);
     assert_eq!(version["dsl"]["setup"], document["setup"]);
     assert_eq!(version["dsl"]["exits"], document["exits"]);

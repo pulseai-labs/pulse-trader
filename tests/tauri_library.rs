@@ -236,14 +236,14 @@ async fn overview_lists_every_strategy_and_version_with_stats_iff_a_run_exists()
         .stats
         .as_ref()
         .expect("va1 has a run -> stats");
-    assert_eq!(kpi.expectancy, "+0.3R");
+    assert_eq!(kpi.expectancy, "+0.30 USDT");
     assert_eq!(kpi.win_rate, "46.2%");
     assert_eq!(kpi.trades, 38);
     let kpi = wire(va2.as_str())
         .stats
         .as_ref()
         .expect("va2 has a run -> stats");
-    assert_eq!(kpi.expectancy, "+0.42R");
+    assert_eq!(kpi.expectancy, "+0.42 USDT");
     assert_eq!(kpi.win_rate, "48.3%");
     assert_eq!(kpi.trades, 64);
     assert!(
@@ -262,7 +262,7 @@ async fn overview_lists_every_strategy_and_version_with_stats_iff_a_run_exists()
     );
     assert_eq!(
         wire(va2.as_str()).delta_vs_parent.as_deref(),
-        Some("+0.12R")
+        Some("+0.12 USDT")
     );
     assert!(
         wire(va3.as_str()).delta_vs_parent.is_none(),
@@ -292,7 +292,7 @@ async fn overview_lists_every_strategy_and_version_with_stats_iff_a_run_exists()
     // Recent runs: the run-bearing versions list their run, the others none.
     assert_eq!(wire(va1.as_str()).recent_runs.len(), 1);
     assert_eq!(wire(va2.as_str()).recent_runs.len(), 1);
-    assert_eq!(wire(va2.as_str()).recent_runs[0].expectancy, "+0.42R");
+    assert_eq!(wire(va2.as_str()).recent_runs[0].expectancy, "+0.42 USDT");
     assert_eq!(wire(va2.as_str()).recent_runs[0].trades, 64);
     assert!(wire(va3.as_str()).recent_runs.is_empty());
     assert!(beta.versions[0].recent_runs.is_empty());

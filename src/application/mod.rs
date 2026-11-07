@@ -78,6 +78,11 @@ pub(crate) mod mark_explain;
 // every entry point routes through while a freeze is open.
 pub(crate) mod holdout;
 
+// r6.s3.w4 (PDR-0046 decision 4, STR-0003): the `loss_context` read — a stored run's
+// trades, losses and losing streaks by the context at entry, rebuilt from the run's own
+// pinned snapshots. It writes nothing and adds no field to a stored result.
+pub(crate) mod loss_context;
+
 // r1.s4.w1 (#131 / #132, ADR-0015): the SEALED coach turn. One crate-private entry
 // point that takes IDENTIFIERS and ports — a session id and a run id — claims the
 // session before any provider I/O, makes exactly one attributed call, and settles

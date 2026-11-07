@@ -1,5 +1,5 @@
-//! The twenty tools of `pulse mcp` (r2.s1.w2, w3; r2.s3.w5; r3.s4.w4;
-//! r4.s1.w5; r5.s3), grouped as the README groups them:
+//! The twenty-one tools of `pulse mcp` (r2.s1.w2, w3; r2.s3.w5; r3.s4.w4;
+//! r4.s1.w5; r5.s3; r6.s3.w4), grouped as the README groups them:
 //!
 //! - Nine library/run/paper reads: the repository and run queries
 //!   (`list_strategies`, `get_version`, `list_runs`, `get_run`,
@@ -20,6 +20,9 @@
 //!   open freeze on one C1-judged attempt.
 //! - Four example-mark tools (r5.s3): `write_mark`, `list_marks`,
 //!   `withdraw_mark` and `explain_marks`.
+//! - One run read more (r6.s3.w4): `loss_context` groups a stored run's trades,
+//!   losses and losing streaks by their context at entry. It describes and writes
+//!   nothing.
 //!
 //! No tool can promote a session, stop one, sweep-stop every session or run a
 //! shadow check (A3, least privilege): the surface is read-only by
@@ -52,6 +55,7 @@ use crate::application::certification::{
     CertifyError, CertifyRequest, apply_pair_override, certify_version,
 };
 use crate::application::example_marks::{MarkRequest, list_marks, write_mark};
+use crate::application::loss_context::loss_context_for_run;
 use crate::application::mark_explain::{
     ExplainError, ExplainRequest, MarkSelection, RuleRequest,
     explain_marks as explain_marks_use_case,
@@ -1012,6 +1016,50 @@ impl PulseMcp {
         Ok(CallToolResult::structured(
             serde_json::to_value(run_detail(&run, &aggregates)).unwrap_or_else(|_| json!({})),
         ))
+    }
+
+    /// Group one run's trades, losses and losing streaks by context at entry
+    /// (r6.s3.w4, PDR-0046 decision 4). Reads only: the context is rebuilt from the
+    /// run's own recorded snapshots and nothing is stored.
+    #[tool(
+        description = "Group a backtest run's trades, losses and losing streaks by context at entry: 4H swing trend relative to the side, 15m regime, volatility tercile (ATR(14)/price) and UTC hour. R is net of fees and funding. Describes only."
+    )]
+    async fn loss_context(
+        &self,
+        Parameters(args): Parameters<GetRunArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let holdout = match open_holdout(&self.state).await {
+            Ok(holdout) => holdout,
+            Err(result) => return Ok(result),
+        };
+        let repo = SqliteBacktestRunRepo::new(self.state.db.pool().clone());
+        let run = match resolve_run(&repo, args.run_id).await {
+            Ok(run) => run,
+            Err(result) => return Ok(result),
+        };
+        if let Err(result) = guard_run_read(&self.state, holdout, &run).await {
+            return Ok(result);
+        }
+        let trades = match repo.get_trades(&run.id).await {
+            Ok(t) => t,
+            Err(e) => return Ok(tool_error(e)),
+        };
+        // Snapshot decoding and the two indicator passes are blocking work: off the
+        // async runtime, as the holdout guard's own snapshot read does.
+        let candles = self.state.candles.clone();
+        let read = match tokio::task::spawn_blocking(move || {
+            loss_context_for_run(&candles, holdout, &run, &trades)
+        })
+        .await
+        {
+            Ok(Ok(read)) => read,
+            Ok(Err(e)) => return Ok(tool_error(e)),
+            Err(e) => return Ok(tool_error(e)),
+        };
+        match serde_json::to_value(&read) {
+            Ok(value) => Ok(CallToolResult::structured(value)),
+            Err(e) => Ok(tool_error(e)),
+        }
     }
 
     /// Export a run's full trade log as CSV under the exports dir.

@@ -28,7 +28,7 @@ Claude Code can drive the loop directly.
 1. **You describe a target.** In the app's Designer, or with `pulse compose "<target>"`: pair,
    direction, setup, stop, target — plain words.
 2. **The agent writes the strategy.** The composer drives six validated builder tools and emits a
-   DSL document (schema 1.6.0). The strategy is stored as that document; the engine never reads
+   DSL document (schema 1.7.0). The strategy is stored as that document; the engine never reads
    prose.
 3. **The Rust engine backtests it.** Deterministic, on real Binance USDT-M candles fetched by
    `pulse fetch-data`. Every trade carries its fee (4 bp taker by default), its slippage (1 bp) and
@@ -140,12 +140,12 @@ builds the strategy with its six validated builder tools and saves it as a new v
 
 ## Drive it from Claude Code
 
-`pulse mcp` is an MCP server over the same database and candle store the app uses. It exposes twenty
+`pulse mcp` is an MCP server over the same database and candle store the app uses. It exposes twenty-one
 tools and no more.
 
 | Group | Tools |
 |---|---|
-| Library, runs and paper reads | `list_strategies`, `get_version`, `list_runs`, `get_run`, `get_walk_forward_run`, `list_paper_sessions`, `get_paper_session`, `get_paper_trades`, `get_paper_comparison` |
+| Library, runs and paper reads | `list_strategies`, `get_version`, `list_runs`, `get_run`, `get_walk_forward_run`, `list_paper_sessions`, `get_paper_session`, `get_paper_trades`, `get_paper_comparison`, `loss_context` |
 | Exports | `export_trades`, `export_candles`, `export_indicators` |
 | Writes | `submit_strategy_version`, `run_backtest` |
 | Walk-forward and certification | `run_walk_forward`, `certify_version` |
@@ -153,7 +153,7 @@ tools and no more.
 
 An agent can read the version tree and any run, walk-forward or paper session; submit a variant with
 a hypothesis; backtest it; walk it forward; and certify it — one call, one hypothesis, and only when
-a qualifying power review allows the attempt. It can export trades, candles or indicator columns as
+a qualifying power review allows the attempt. It can ask `loss_context` where a run's losses fall by 4H trend, 15m regime, volatility and hour. It can export trades, candles or indicator columns as
 CSV; candles can also be a Parquet byte copy. It can mark example trades on candles and ask
 `explain_marks` which conjuncts of a candidate rule held at each mark. The DSL schema is served as
 the `pulse://dsl/schema` resource.
@@ -188,7 +188,7 @@ tool calls to the server's `/mcp`.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/agent-loop-dark.svg">
-  <img src="docs/assets/readme/agent-loop-light.svg" width="880" alt="Claude Code speaks MCP to pulse mcp; the twenty tools call the same application use cases the app uses, against one SQLite database and one Parquet store, with the holdout fence on every persisted run, export and mark.">
+  <img src="docs/assets/readme/agent-loop-light.svg" width="880" alt="Claude Code speaks MCP to pulse mcp; the twenty-one tools call the same application use cases the app uses, against one SQLite database and one Parquet store, with the holdout fence on every persisted run, export and mark.">
 </picture>
 
 ## Quickstart

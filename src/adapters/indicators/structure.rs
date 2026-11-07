@@ -184,43 +184,84 @@ fn group_mean(total: Decimal, count: u32) -> Option<Decimal> {
     total.checked_div(divisor)
 }
 
-/// The pivot tracker as an indicator: `PivotHigh` / `PivotLow`.
+/// Which confirmed pivot a [`PivotIndicator`] reads out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PivotRead {
+    /// The most recent confirmed pivot (`PivotHigh` / `PivotLow`).
+    Latest,
+    /// The confirmed pivot before the most recent one (`PreviousPivotHigh` /
+    /// `PreviousPivotLow`, schema 1.7.0).
+    Previous,
+}
+
+/// The pivot tracker as an indicator: `PivotHigh` / `PivotLow`, and with
+/// [`PivotRead::Previous`] `PreviousPivotHigh` / `PreviousPivotLow`.
 ///
 /// The value at bar t is the price of the **most recent confirmed** pivot —
 /// `None` until the first confirmation, which lands exactly `right` bars after
-/// its pivot bar.
+/// its pivot bar. Read as `Previous`, it is the price of the confirmed pivot
+/// before that one, `None` until two are confirmed; when a pivot confirms, the
+/// old latest becomes the previous on that same bar. Two confirmed pivots at one
+/// price are two pivots, so the previous takes the old price even when it equals
+/// the new one.
 #[derive(Debug, Clone)]
 pub struct PivotIndicator {
     tracker: PivotTracker,
     latest: Option<Decimal>,
+    previous: Option<Decimal>,
+    read: PivotRead,
 }
 
 impl PivotIndicator {
-    /// Build the indicator for `left`/`right`; `None` when either is 0 (a
-    /// degenerate window, refused by the engine as an invalid period).
+    /// Build the indicator for `left`/`right`, reading the latest pivot; `None`
+    /// when either is 0 (a degenerate window, refused by the engine as an
+    /// invalid period).
     #[must_use]
     pub fn new(left: u32, right: u32, extreme: Extreme) -> Option<Self> {
+        Self::with_read(left, right, extreme, PivotRead::Latest)
+    }
+
+    /// Build the indicator for `left`/`right`, reading the pivot before the
+    /// latest one; `None` when either is 0, exactly as [`Self::new`].
+    #[must_use]
+    pub fn new_previous(left: u32, right: u32, extreme: Extreme) -> Option<Self> {
+        Self::with_read(left, right, extreme, PivotRead::Previous)
+    }
+
+    fn with_read(left: u32, right: u32, extreme: Extreme, read: PivotRead) -> Option<Self> {
         if left == 0 || right == 0 {
             return None;
         }
         Some(Self {
             tracker: PivotTracker::new(left, right, extreme),
             latest: None,
+            previous: None,
+            read,
         })
+    }
+
+    /// The value the selector reads.
+    fn read_value(&self) -> Option<Decimal> {
+        match self.read {
+            PivotRead::Latest => self.latest,
+            PivotRead::Previous => self.previous,
+        }
     }
 }
 
 impl Indicator for PivotIndicator {
     fn next(&mut self, candle: &Candle) -> Option<Decimal> {
         if let Some(pivot) = self.tracker.push(candle) {
+            self.previous = self.latest;
             self.latest = Some(pivot.price);
         }
-        self.latest
+        self.read_value()
     }
 
     fn is_ready(&self) -> bool {
-        // Ready iff the NEXT call returns Some: a pivot is already confirmed.
-        self.latest.is_some()
+        // Ready iff the NEXT call returns Some: the selected pivot is already
+        // confirmed.
+        self.read_value().is_some()
     }
 }
 

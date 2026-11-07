@@ -1508,7 +1508,7 @@ export type LibraryRunSummary = {
 	id: string,
 	/**  Run timestamp (RFC3339 UTC, from the record). */
 	createdAt: string,
-	/**  Mean P&L per trade, e.g. `"+0.42R"`. */
+	/**  Mean P&L per trade in USDT, e.g. `"+0.42 USDT"`. */
 	expectancy: string,
 	/**  Completed trades in the run. */
 	trades: number,
@@ -1564,7 +1564,7 @@ export type LibraryVersion = {
 	 */
 	stats: VersionStats | null,
 	/**
-	 *  The expectancy delta vs the parent's, formatted (e.g. `"+0.12R"`), when
+	 *  The expectancy delta vs the parent's, formatted (e.g. `"+0.12 USDT"`), when
 	 *  BOTH this version and its parent carry a run. `None` otherwise.
 	 */
 	deltaVsParent: string | null,
@@ -2465,7 +2465,7 @@ export type TradeRowDto = {
  *  the persisted run's [`SummaryStats`].
  */
 export type VersionStats = {
-	/**  Mean P&L per trade, e.g. `"+0.42R"`. */
+	/**  Mean P&L per trade in USDT, e.g. `"+0.42 USDT"`. */
 	expectancy: string,
 	/**  Fraction of winners, e.g. `"48.3%"`. */
 	winRate: string,

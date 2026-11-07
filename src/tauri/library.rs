@@ -81,7 +81,7 @@ pub struct LibraryVersion {
     /// `created_at`, so reading one as "the latest" would render an arbitrary
     /// sub-window as the version's result.
     pub stats: Option<VersionStats>,
-    /// The expectancy delta vs the parent's, formatted (e.g. `"+0.12R"`), when
+    /// The expectancy delta vs the parent's, formatted (e.g. `"+0.12 USDT"`), when
     /// BOTH this version and its parent carry a run. `None` otherwise.
     pub delta_vs_parent: Option<String>,
     /// This version's run catalog (best-effort — one corrupt row costs its row
@@ -112,7 +112,7 @@ pub struct LibraryVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionStats {
-    /// Mean P&L per trade, e.g. `"+0.42R"`.
+    /// Mean P&L per trade in USDT, e.g. `"+0.42 USDT"`.
     pub expectancy: String,
     /// Fraction of winners, e.g. `"48.3%"`.
     pub win_rate: String,
@@ -128,7 +128,7 @@ pub struct LibraryRunSummary {
     pub id: String,
     /// Run timestamp (RFC3339 UTC, from the record).
     pub created_at: String,
-    /// Mean P&L per trade, e.g. `"+0.42R"`.
+    /// Mean P&L per trade in USDT, e.g. `"+0.42 USDT"`.
     pub expectancy: String,
     /// Completed trades in the run.
     pub trades: u32,
@@ -178,7 +178,7 @@ pub fn dsl_summary(dsl: &StrategyDsl) -> DslSummary {
 #[must_use]
 pub fn version_stats(summary: &SummaryStats) -> VersionStats {
     VersionStats {
-        expectancy: format_expectancy(summary.expectancy),
+        expectancy: format_expectancy_usdt(summary.expectancy),
         win_rate: format_win_rate(summary.win_rate),
         trades: u32::try_from(summary.trade_count).unwrap_or(u32::MAX),
     }
@@ -190,7 +190,7 @@ pub fn recent_run_summary(run: &RunSummary) -> LibraryRunSummary {
     LibraryRunSummary {
         id: run.id.as_str().to_owned(),
         created_at: run.created_at.clone(),
-        expectancy: format_expectancy(run.expectancy),
+        expectancy: format_expectancy_usdt(run.expectancy),
         trades: u32::try_from(run.trade_count).unwrap_or(u32::MAX),
     }
 }
@@ -203,20 +203,26 @@ pub fn latest_run_summary(run: &PersistedRun) -> LibraryRunSummary {
     LibraryRunSummary {
         id: run.id.as_str().to_owned(),
         created_at: run.created_at.clone(),
-        expectancy: format_expectancy(run.summary.expectancy),
+        expectancy: format_expectancy_usdt(run.summary.expectancy),
         trades: u32::try_from(run.summary.trade_count).unwrap_or(u32::MAX),
     }
 }
 
-/// Format an expectancy (or a delta of one) as signed R-multiples, e.g.
-/// `"+0.42R"` / `"-0.04R"`.
+/// Format an expectancy (or a delta of one) as signed USDT, e.g.
+/// `"+12.34 USDT"` / `"-0.04 USDT"` (r6.s3.w1, #457).
+///
+/// `SummaryStats.expectancy` is the mean net P&L per trade in USDT, not an
+/// R-multiple, so the label names its unit. Two decimals; the sign is always
+/// shown; a value that rounds to zero reads `+0.00`.
 #[must_use]
-pub fn format_expectancy(value: Decimal) -> String {
-    let rounded = value.round_dp(2).normalize();
-    if rounded.is_sign_negative() {
-        format!("{rounded}R")
+pub fn format_expectancy_usdt(value: Decimal) -> String {
+    let rounded = value.round_dp(2);
+    if rounded.is_zero() {
+        "+0.00 USDT".to_owned()
+    } else if rounded.is_sign_negative() {
+        format!("{rounded:.2} USDT")
     } else {
-        format!("+{rounded}R")
+        format!("+{rounded:.2} USDT")
     }
 }
 
@@ -229,7 +235,7 @@ pub fn format_win_rate(rate: Decimal) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{DslSummary, dsl_summary, format_expectancy, format_win_rate, version_stats};
+    use super::{DslSummary, dsl_summary, format_expectancy_usdt, format_win_rate, version_stats};
     use crate::domain::backtest::SummaryStats;
     use crate::domain::dsl::render;
     use crate::domain::{
@@ -364,11 +370,17 @@ mod tests {
     }
 
     #[test]
-    fn expectancy_renders_signed_r_multiples() {
-        assert_eq!(format_expectancy(Decimal::new(42, 2)), "+0.42R");
-        assert_eq!(format_expectancy(Decimal::new(-4, 2)), "-0.04R");
-        assert_eq!(format_expectancy(Decimal::new(12, 2)), "+0.12R");
-        assert_eq!(format_expectancy(Decimal::new(2, 0)), "+2R");
+    fn expectancy_renders_signed_usdt() {
+        // `SummaryStats.expectancy` is USDT per trade (r6.s3.w1, #457): the
+        // label carries its unit, two decimals, the sign always shown.
+        assert_eq!(format_expectancy_usdt(Decimal::new(1234, 2)), "+12.34 USDT");
+        assert_eq!(format_expectancy_usdt(Decimal::new(-4, 2)), "-0.04 USDT");
+        assert_eq!(format_expectancy_usdt(Decimal::new(12, 2)), "+0.12 USDT");
+        assert_eq!(format_expectancy_usdt(Decimal::new(2, 0)), "+2.00 USDT");
+        assert_eq!(format_expectancy_usdt(Decimal::new(1005, 3)), "+1.00 USDT");
+        // A value that rounds to zero reads as +0.00, never as "-0.00".
+        assert_eq!(format_expectancy_usdt(Decimal::new(-1, 3)), "+0.00 USDT");
+        assert_eq!(format_expectancy_usdt(Decimal::ZERO), "+0.00 USDT");
     }
 
     #[test]
@@ -388,7 +400,7 @@ mod tests {
         };
 
         let stats = version_stats(&summary);
-        assert_eq!(stats.expectancy, "+0.42R");
+        assert_eq!(stats.expectancy, "+0.42 USDT");
         assert_eq!(stats.win_rate, "48.3%");
         assert_eq!(stats.trades, 64);
     }

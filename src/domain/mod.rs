@@ -104,8 +104,8 @@ mod version;
 // its lifetime is tied to the caller's `CandleSeries`.
 pub use backtest::{
     AlignedBar, BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole,
-    SetupTrace, Side, Trade, TradeSource, align, apply_slippage, funding_payment, realized_pnl,
-    realized_r, resolve_intra_bar_exit, taker_fee,
+    SetupTrace, Side, Trade, TradeSource, align, apply_slippage, funding_payment, net_r,
+    realized_pnl, realized_r, resolve_intra_bar_exit, taker_fee,
 };
 // VS-1.2.2 work-2.03: the pure regime surface (EMA50/200 + ADX14 classifier).
 // Re-exported here so `lib.rs` can curate the crate surface; an un-re-exported
@@ -116,6 +116,13 @@ pub use backtest::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, cla
 // un-re-exported public domain type is a `dead_code` BUILD error under
 // `deny(warnings)`.
 pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
+// r6.s3.w4 (PDR-0046 decision 4): the loss-by-context fold's surface. Re-exported so
+// `lib.rs` can curate the crate surface — an un-re-exported public domain type is a
+// `dead_code` BUILD error under `deny(warnings)`.
+pub use backtest::{
+    ContextCell, ContextLengthMismatch, LossContextReport, TradeContext, TrendSide, VolatilityBand,
+    loss_context,
+};
 // r5.s4.w1 (PDR-0035): the streak and drawdown card's surface (the seeded Monte
 // Carlo's constants, its value types and the pure card function). Re-exported so
 // `lib.rs` can curate the crate surface — an un-re-exported public domain type is

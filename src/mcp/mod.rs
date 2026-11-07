@@ -143,7 +143,9 @@ impl ServerHandler for PulseMcp {
             "Access to the PulseTrader strategy library and backtester. Read tools: \
              list_strategies, get_version, list_runs, get_run, export_trades, \
              export_candles, export_indicators, list_paper_sessions, \
-             get_paper_session, get_paper_trades, get_paper_comparison. Write tools: \
+             get_paper_session, get_paper_trades, get_paper_comparison, and loss_context \
+             (a run's trades, losses and losing streaks by 4H trend, 15m regime, \
+             volatility and UTC hour at entry; it describes only). Write tools: \
              submit_strategy_version \
              (persist an agent-authored DSL variant with its hypothesis) and \
              run_backtest (run a version, optionally windowed to [from, to)). \

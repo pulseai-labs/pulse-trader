@@ -29,6 +29,8 @@ mod stats;
 // r5.s4.w1 (PDR-0035): the streak and drawdown card — a seeded Monte Carlo over
 // a run's own closed trades. Zero-I/O, `Decimal` and integer draws only.
 mod streak_card;
+// r6.s3.w4 (PDR-0046 decision 4): the pure loss-by-context fold.
+mod loss_context;
 // VS-1.2.4 work-4.04: the persisted backtest-run projection types (FR-6 / FR-7 /
 // NFR-2). `BacktestRunId`/`PersistedRun`/`RunSummary` are the typed read-back
 // projections of a persisted run (explicit columns per README C4, NOT a
@@ -45,10 +47,14 @@ mod holdout;
 // can curate them onto the crate's public API (an un-re-exported public domain
 // type is a `dead_code` BUILD error under `deny(warnings)`).
 pub use collision::{IntraBarExit, resolve_intra_bar_exit};
-pub use cost::{Side, apply_slippage, funding_payment, realized_pnl, realized_r, taker_fee};
+pub use cost::{Side, apply_slippage, funding_payment, net_r, realized_pnl, realized_r, taker_fee};
 pub use error::{BacktestError, SeriesRole};
 pub use feed::{AlignedBar, align};
 pub use holdout::{HOLDOUT_ALPHA, HoldoutVerdict, holdout_test};
+pub use loss_context::{
+    ContextCell, ContextLengthMismatch, LossContextReport, TradeContext, TrendSide, VolatilityBand,
+    loss_context,
+};
 pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
 pub use run::{

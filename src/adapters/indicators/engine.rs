@@ -12,7 +12,7 @@ use super::{
     rolling::RollingExtremes,
     rsi::Rsi,
     sma::Sma,
-    structure::{Anatomy, AnatomyKind, Extreme, LevelIndicator, PivotIndicator},
+    structure::{Anatomy, AnatomyKind, Extreme, LevelIndicator, PivotIndicator, PivotRead},
     wavetrend::WaveTrend,
 };
 use crate::{
@@ -411,6 +411,8 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
         // still breaks this match and has to be routed by hand.
         IndicatorSpec::PivotHigh { .. }
         | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::PreviousPivotHigh { .. }
+        | IndicatorSpec::PreviousPivotLow { .. }
         | IndicatorSpec::Resistance { .. }
         | IndicatorSpec::Support { .. }
         | IndicatorSpec::DoubleTopNeckline { .. }
@@ -436,12 +438,30 @@ fn build_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineErr
 /// factory's own match first, and that match is where its builder is chosen.
 fn build_structure_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>, EngineError> {
     match spec {
-        IndicatorSpec::PivotHigh { left, right } => {
-            build_pivot(spec, left, right, Extreme::High, "PivotHigh")
-        }
-        IndicatorSpec::PivotLow { left, right } => {
-            build_pivot(spec, left, right, Extreme::Low, "PivotLow")
-        }
+        IndicatorSpec::PivotHigh { left, right } => build_pivot(
+            spec,
+            (left, right),
+            (Extreme::High, PivotRead::Latest),
+            "PivotHigh",
+        ),
+        IndicatorSpec::PivotLow { left, right } => build_pivot(
+            spec,
+            (left, right),
+            (Extreme::Low, PivotRead::Latest),
+            "PivotLow",
+        ),
+        IndicatorSpec::PreviousPivotHigh { left, right } => build_pivot(
+            spec,
+            (left, right),
+            (Extreme::High, PivotRead::Previous),
+            "PreviousPivotHigh",
+        ),
+        IndicatorSpec::PreviousPivotLow { left, right } => build_pivot(
+            spec,
+            (left, right),
+            (Extreme::Low, PivotRead::Previous),
+            "PreviousPivotLow",
+        ),
         IndicatorSpec::Resistance {
             left,
             right,
@@ -512,17 +532,22 @@ fn build_structure_indicator(spec: &IndicatorSpec) -> Result<Box<dyn Indicator>,
     }
 }
 
-/// Build a `PivotHigh`/`PivotLow` slot from its fixed span.
+/// Build a `PivotHigh`/`PivotLow` slot, or with [`PivotRead::Previous`] a
+/// `PreviousPivotHigh`/`PreviousPivotLow` slot, from its fixed span.
 fn build_pivot(
     spec: &IndicatorSpec,
-    left: &SweepableValue<u32>,
-    right: &SweepableValue<u32>,
-    extreme: Extreme,
+    span: (&SweepableValue<u32>, &SweepableValue<u32>),
+    (extreme, read): (Extreme, PivotRead),
     name: &str,
 ) -> Result<Box<dyn Indicator>, EngineError> {
-    let left = fixed_u32(left, &format!("{}.left", name.to_ascii_lowercase()))?;
-    let right = fixed_u32(right, &format!("{}.right", name.to_ascii_lowercase()))?;
-    PivotIndicator::new(left, right, extreme)
+    let field = name.to_ascii_lowercase();
+    let left = fixed_u32(span.0, &format!("{field}.left"))?;
+    let right = fixed_u32(span.1, &format!("{field}.right"))?;
+    let built = match read {
+        PivotRead::Latest => PivotIndicator::new(left, right, extreme),
+        PivotRead::Previous => PivotIndicator::new_previous(left, right, extreme),
+    };
+    built
         .map(|indicator| Box::new(indicator) as Box<dyn Indicator>)
         .ok_or_else(|| {
             invalid_period(
