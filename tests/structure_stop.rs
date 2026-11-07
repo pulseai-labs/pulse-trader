@@ -25,6 +25,8 @@
 //! - `target_is_three_r_from_the_fill` — a `TakeProfit` of 3 sits at fill + 3 × (fill − stop).
 //! - `short_mirror_uses_highs` — the short side uses the window's highest high.
 //! - `fill_past_the_stop_is_skipped` — a fill at or past the stop skips and counts, no failed run.
+//! - `short_target_below_zero_is_skipped_not_a_failed_run` — a short target that resolves to a
+//!   non-positive price skips and counts, no failed run.
 //! - `skip_count_feeds_the_hash` — the count is covered by `result_content_hash`.
 //! - `persisted_run_keeps_the_skip_count` — a saved run reads back with its count and hash.
 //! - `pre_0024_rows_read_zero` — a row with the column NULL reads as 0, hash unchanged.
@@ -405,6 +407,35 @@ fn short_mirror_uses_highs() {
         trade.exit_price,
         dec("95.34775"),
         "100 − 3 × (101.55075 − 100)"
+    );
+}
+
+/// A short whose window high (140 on the anchor bar) puts the 3R target below zero:
+/// stop 140 × 1.0005 = 140.07, 1R = 40.07 from the fill at 100, target 100 − 3 × 40.07 < 0.
+/// The control is `short_mirror_uses_highs`: the same scenario with a 102 high fills.
+#[test]
+fn short_target_below_zero_is_skipped_not_a_failed_run() {
+    let primary = primary_with(&[
+        (49, m15(49, "100", "140", "100", "100.3")),
+        (50, m15(50, "100", "101.5", "100", "101.5")),
+        (55, m15(55, "100", "100", "98.5", "98.5")),
+    ]);
+    let compiled = strategy(Direction::Short, None, Some(short_side()));
+    let result = run(&compiled, &primary, &htf_with(&[], &[2]));
+
+    assert!(
+        result.trades.is_empty(),
+        "no trade is filled: {:?}",
+        result.trades
+    );
+    assert_eq!(
+        result.skipped_entries.stop_beyond_fill, 1,
+        "the skip is counted"
+    );
+    assert_eq!(
+        result.skipped_entries.total(),
+        1,
+        "and it is the only skip of the run"
     );
 }
 

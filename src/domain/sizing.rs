@@ -139,8 +139,9 @@ pub enum SkipReason {
     /// size to `0` — the effective cap left no notional room for any position at
     /// all (distinct from a positive size that merely floors below one lot).
     LeverageCapZero,
-    /// A structure stop the fill price had already reached: the next bar opened at or
-    /// past the stop level, so the entry is skipped, not filled (ADR-0033).
+    /// A structure-stop entry whose levels cannot be placed at the fill: the next bar opened
+    /// at or past the stop level, or a short's `TakeProfit` resolves to a non-positive
+    /// price. The entry is skipped, not filled (ADR-0033).
     StopBeyondFill,
 }
 
@@ -246,8 +247,8 @@ pub struct SkippedEntryCounts {
     /// Entries skipped because the leverage cap floored the qty to `0`
     /// ([`SkipReason::LeverageCapZero`]).
     pub leverage_capped: usize,
-    /// Entries skipped because the fill price had already reached the structure stop
-    /// ([`SkipReason::StopBeyondFill`], ADR-0033). A zero count is never serialized, so every
+    /// Entries skipped because the fill price had already reached the structure stop, or a
+    /// short's target price resolved non-positive ([`SkipReason::StopBeyondFill`], ADR-0033). A zero count is never serialized, so every
     /// result that predates the field serializes byte-identically.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub stop_beyond_fill: usize,

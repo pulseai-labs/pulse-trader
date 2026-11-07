@@ -1038,20 +1038,31 @@ pub(super) fn prepare_pending_fill(
     // kinds (r2.s2.w2): fixed-fraction keeps its closed form, `AtrStop` takes
     // `entry ± target_r × |entry − stop|` — with the short-TP impossibility
     // check moved here from plan time, where the ATR distance was unknowable.
-    let take_profit_price = plan
-        .take_profit_target_r
-        .map(|target| match plan.stop {
-            StopRule::Pct(distance_pct) => Ok(take_profit_price(
-                entry_price,
-                distance_pct,
-                target,
-                direction,
-            )),
-            StopRule::Atr { .. } | StopRule::Structure { .. } => {
-                atr_take_profit_price(entry_price, stop, target, direction)
+    let take_profit_price = match plan.take_profit_target_r {
+        None => None,
+        Some(target) => Some(match plan.stop {
+            StopRule::Pct(distance_pct) => {
+                take_profit_price(entry_price, distance_pct, target, direction)
             }
-        })
-        .transpose()?;
+            StopRule::Atr { .. } => atr_take_profit_price(entry_price, stop, target, direction)?,
+            // A short whose window high sits so far above the fill that the
+            // target resolves to a non-positive price is a skipped entry, not
+            // a failed run: the structure is a market fact, not a broken
+            // strategy (ADR-0033 decision 6). It shares the skip cell of the
+            // stop-beyond-fill case: the entry's levels cannot be placed.
+            StopRule::Structure { .. } => {
+                match atr_take_profit_price(entry_price, stop, target, direction) {
+                    Ok(price) => price,
+                    Err(BacktestError::ImpossibleTakeProfit(_)) => {
+                        return Ok(PreparedFill::Consume {
+                            skipped: Some(SkipReason::StopBeyondFill),
+                        });
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }),
+    };
     Ok(PreparedFill::Open(PreparedEntry {
         qty,
         entry_price,
@@ -1702,7 +1713,7 @@ fn atr_take_profit_price(
     };
     if tp <= Decimal::ZERO {
         return Err(BacktestError::ImpossibleTakeProfit(format!(
-            "short take-profit at {target_r}R × ATR stop distance {distance} \
+            "short take-profit at {target_r}R × stop distance {distance} \
              resolves to a non-positive price"
         )));
     }
