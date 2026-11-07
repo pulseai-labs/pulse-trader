@@ -116,6 +116,13 @@ pub use backtest::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, cla
 // un-re-exported public domain type is a `dead_code` BUILD error under
 // `deny(warnings)`.
 pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
+// r6.s3.w4 (PDR-0046 decision 4): the loss-by-context fold's surface. Re-exported so
+// `lib.rs` can curate the crate surface — an un-re-exported public domain type is a
+// `dead_code` BUILD error under `deny(warnings)`.
+pub use backtest::{
+    ContextCell, ContextLengthMismatch, LossContextReport, TradeContext, TrendSide, VolatilityBand,
+    loss_context,
+};
 // r5.s4.w1 (PDR-0035): the streak and drawdown card's surface (the seeded Monte
 // Carlo's constants, its value types and the pure card function). Re-exported so
 // `lib.rs` can curate the crate surface — an un-re-exported public domain type is

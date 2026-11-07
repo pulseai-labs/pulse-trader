@@ -1,5 +1,6 @@
 //! Deterministic backtest event loop adapter.
 
+mod context_read;
 mod engine;
 // VS-1.2.2 work-2.03: the stateful regime detector (EMA50/200 + ADX14),
 // composing the VS-1.1.3 `Ema`/`Adx` adapters independently of the strategy's
@@ -10,6 +11,7 @@ pub mod session;
 // r6.s2.w2 (ADR-0033): the one-sided setup state machine.
 mod setup;
 
+pub use context_read::{BarReading, SwingPivots, bar_readings, swing_pivots_at};
 pub use engine::{
     BacktestConfig, FundingGapWindow, first_fully_warm_bar_ms, funding_gaps, run_backtest,
 };

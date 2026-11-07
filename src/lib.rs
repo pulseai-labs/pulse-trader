@@ -945,10 +945,22 @@ pub use application::example_marks::{MarkHoldout, MarkList, MarkRequest, list_ma
 // embeds a value whose module is private (the `private_interfaces` ring
 // inversion, R5).
 pub use application::holdout::{HoldoutRefusal, guard_candle};
+// r6.s3.w4 (PDR-0046 decision 4, STR-0003): the `loss_context` read — a stored run's
+// trades, losses and losing streaks by the context at entry. The fold is pure; the use
+// case rebuilds each trade's context from the run's own pinned snapshots and writes
+// nothing. Surfaced for the `loss_context` MCP tool and `tests/loss_context.rs`.
+pub use application::loss_context::{
+    ATR_PERIOD, LossContextError, LossContextRead, PIVOT_SPAN, SwingTrend, loss_context_for_run,
+    swing_trend_at,
+};
 pub use application::mark_explain::{
     ConjunctReport, ExplainError, ExplainHoldout, ExplainReport, ExplainRequest, MarkExplanation,
     MarkJson, MarkRefusal, MarkSelection, MarkWriterJson, OperandReport, PatternReport,
     RuleRequest, SetupReport, TriggerReport, explain_marks,
+};
+pub use domain::{
+    ContextCell, ContextLengthMismatch, LossContextReport, TradeContext, TrendSide, VolatilityBand,
+    loss_context,
 };
 pub use domain::{
     ExampleMark, ExampleMarkDraft, ExampleMarkRepository, MarkError, MarkFilter, MarkNote,

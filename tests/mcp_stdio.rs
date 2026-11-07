@@ -36,11 +36,11 @@ async fn tools_and_dsl_schema_resource_are_served() {
     copy_tree(&manifest(FIXTURE_STORE), &store_dir);
     let client = spawn_client(&db_path, &store_dir).await;
 
-    // Exactly the twenty declared tools — the eleven read tools (w2's seven,
-    // r3.s4.w4's four paper reads), w3's two write tools, r2.s3.w5's two
-    // walk-forward tools, r4.s1.w5's certification tool, and r5.s3's four
-    // example-mark tools (w1's three writers and w2's explain_marks) — no more,
-    // no fewer.
+    // Exactly the twenty-one declared tools — the twelve read tools (w2's seven,
+    // r3.s4.w4's four paper reads, r6.s3.w4's loss_context), w3's two write tools,
+    // r2.s3.w5's two walk-forward tools, r4.s1.w5's certification tool, and
+    // r5.s3's four example-mark tools (w1's three writers and w2's explain_marks)
+    // — no more, no fewer.
     let tools = client.list_tools(None).await.expect("tools/list").tools;
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     names.sort_unstable();
@@ -62,13 +62,14 @@ async fn tools_and_dsl_schema_resource_are_served() {
             "list_paper_sessions",
             "list_runs",
             "list_strategies",
+            "loss_context",
             "run_backtest",
             "run_walk_forward",
             "submit_strategy_version",
             "withdraw_mark",
             "write_mark",
         ],
-        "the advertised tool set is exactly the twenty declared tools"
+        "the advertised tool set is exactly the twenty-one declared tools"
     );
 
     // The one advertised resource, then its document body.
