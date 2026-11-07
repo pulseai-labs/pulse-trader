@@ -45,7 +45,7 @@ mod holdout;
 // can curate them onto the crate's public API (an un-re-exported public domain
 // type is a `dead_code` BUILD error under `deny(warnings)`).
 pub use collision::{IntraBarExit, resolve_intra_bar_exit};
-pub use cost::{Side, apply_slippage, funding_payment, realized_pnl, realized_r, taker_fee};
+pub use cost::{Side, apply_slippage, funding_payment, net_r, realized_pnl, realized_r, taker_fee};
 pub use error::{BacktestError, SeriesRole};
 pub use feed::{AlignedBar, align};
 pub use holdout::{HOLDOUT_ALPHA, HoldoutVerdict, holdout_test};

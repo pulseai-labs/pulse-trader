@@ -49,7 +49,7 @@ const GOLDEN_NET_PNL: &str = "142.29083294950040454";
 /// `tests/dsl_schema_1_2.rs`'s `FROZEN_COMMITTED_1_0_0` result content hash
 /// (dsl_schema_1_2.rs:257-258) — captured from the BASE engine.
 const FROZEN_COMMITTED_1_0_0_HASH: &str =
-    "b8e91b89b7727eb97c8200ee04373ffc3ef3568b51ab145bbb2e652cb2bb9228";
+    "f934ca1ceffe05ff322d44cf706a3381a766dd589d22502d3d705d13f1222d65";
 
 /// `tests/dsl_schema_1_2.rs`'s `FROZEN_COMMITTED_1_0_0` trade log
 /// (dsl_schema_1_2.rs:259-260), extracted verbatim into a fixture file so the

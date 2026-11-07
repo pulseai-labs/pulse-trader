@@ -524,6 +524,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Trade R is net of fees and funding (#457).
+
 - **`certify_version` requires a qualifying power review (r5.s5.w2, PDR-0040, ADR-0032).** A certify call now
   spends one of the open freeze's hypotheses only when the latest power review for that version, pair and freeze
   allows an attempt **and** was taken on the data versions the call would pin now; otherwise it refuses with a

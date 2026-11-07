@@ -71,7 +71,7 @@ use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 // r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks' wire shapes.
 use super::library::{
-    LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
+    LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy_usdt,
     latest_run_summary, recent_run_summary, version_stats,
 };
 use super::marks::{ListMarksRequest, MarkDto, MarkListDto, WithdrawMarkRequest, WriteMarkRequest};
@@ -663,7 +663,9 @@ async fn library_strategy(
                 .as_ref()
                 .and_then(|parent| expectancies.get(parent.as_str())),
         ) {
-            (Some(run), Some(parent)) => Some(format_expectancy(run.summary.expectancy - *parent)),
+            (Some(run), Some(parent)) => {
+                Some(format_expectancy_usdt(run.summary.expectancy - *parent))
+            }
             _ => None,
         };
         if let Some(run) = &latest {

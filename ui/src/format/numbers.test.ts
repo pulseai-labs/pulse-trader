@@ -98,6 +98,12 @@ describe("rMultiple — 2 decimals, the R suffix, always a sign", () => {
   it("renders a magnitude that rounds to zero unsigned", () => {
     expect(rMultiple("-0.004")).toBe("0.00 R");
   });
+
+  it("passes a USDT expectancy through as written (r6.s3.w1, #457)", () => {
+    // The Library formats its expectancy with its unit; the string is not a
+    // number, so `rMultiple` must not relabel it as R.
+    expect(rMultiple("+12.34 USDT")).toBe("+12.34 USDT");
+  });
 });
 
 describe("percentFromFraction — the point shift on the string, one decimal", () => {

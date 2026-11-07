@@ -13,7 +13,7 @@ use crate::domain::{
     RegimeBreakdown, Series, SeriesEnd, SeriesRole, SetupTrace, Side, SizingOutcome, SkipReason,
     SkippedEntryCounts, SummaryStats, SweepableValue, SymbolFilters, Timeframe, Trade, TradeSource,
     ValidationError, align, apply_slippage, atr_stop_price, compute_position_size, funding_payment,
-    realized_pnl, realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
+    net_r, realized_pnl, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -1365,13 +1365,14 @@ fn close_position(
     // already embedded in it. `slippage_total` is a reporting figure only — do
     // NOT subtract it again here (that would double-count it).
     let net = gross + funding_total - fees_total;
-    let realized_r = realized_r(
+    // r6.s3.w1 (#457): R is net of costs — `net` over the initial risk in USDT.
+    let realized_r = net_r(
+        net,
+        position.qty,
         position.entry_price,
-        exit_price,
         // G1 (r3.s1.w1): realized R keeps its sizing basis — the INITIAL stop
         // distance — even when a trailing stop moved the effective level.
         position.initial_stop,
-        position.direction,
     )?;
 
     // All fallible computation is done — the mutations start here.

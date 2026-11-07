@@ -111,8 +111,9 @@ pub struct Trade {
     /// Net realized P&L in quote currency (gross P&L minus the cost totals; the
     /// loop computes the aggregate).
     pub realized_pnl: Decimal,
-    /// Realized R-multiple (price move ÷ stop distance); a clean stop ≈ −1R, but
-    /// costs can push it past −1R (G3).
+    /// Net R: `realized_pnl` ÷ initial risk in USDT (`qty × |entry − initial
+    /// stop|`) (r6.s3.w1); runs stored before this change carry gross R. A clean
+    /// stop is ≈ −1R and costs push it past −1R (G3).
     pub realized_r: Decimal,
 
     /// Maximum **favorable** excursion in R-multiples (FR-6, C5): the largest

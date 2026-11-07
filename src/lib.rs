@@ -520,7 +520,7 @@ pub use cli::watch::{
 // MTF feed extends the same `backtest` tree at the R1→R2 merge).
 pub use domain::{
     BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, SeriesRole, SetupTrace, Side,
-    Trade, TradeSource, apply_slippage, funding_payment, realized_pnl, realized_r,
+    Trade, TradeSource, apply_slippage, funding_payment, net_r, realized_pnl, realized_r,
     resolve_intra_bar_exit, taker_fee,
 };
 
