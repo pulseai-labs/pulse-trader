@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **DSL schema 1.7.0: `PreviousPivotHigh` / `PreviousPivotLow` (r6.s3.w2).** A rule can now read the swing **before** the
+  latest one: `PreviousPivotHigh{left, right}` is the high of the confirmed swing high before the most recent confirmed
+  one, and `PreviousPivotLow` is the mirror on lows. Both are `None` until two pivots are confirmed, change on the same
+  bar the latest pivot changes, and count two pivots at one price as two. With `PivotHigh` and `PivotLow` they say
+  "of the last two confirmed swing highs, the later is higher" as `PivotHigh > PreviousPivotHigh`, which is STR-0003
+  v2's rule. The read-path tokens are `prev_pivot_high:<left>-<right>` and `prev_pivot_low:<left>-<right>`; explain shows
+  both prices. The `1.6.0 → 1.7.0` migration is identity, so every earlier document keeps its meaning and its
+  `result_content_hash`. See the ADR-0024 addendum (`docs/adr/0024-addendum-previous-pivots-1-7-0.md`).
+
 - **DSL schema 1.6.0: `setup` (arm, dip, trigger, expiry; long and short sides) and the `StructureStop` exit
   (r6.s2.w1).** A strategy can now be written as a stateful **setup**: a long side, a short side or both, each with an
   `arm` condition (checked when a 4H bar closes), a `dip`, a `trigger` and an optional `stop_anchor`, plus an

@@ -71,7 +71,7 @@ const CONVENTIONS: &[(&str, &str)] = &[
     // same-bar comparison would violate.
     (
         "structure_indicators",
-        "the schema-1.3.0 structure and pattern variants work on any series (an `h4:` operand reads the last closed H4 bar): `PivotHigh{left,right}`/`PivotLow{left,right}` are the most recent confirmed swing high/low, confirmed only once the `right` bars after them have closed, so a value never repaints; `Resistance{left,right,tolerance_pct,min_touches,lookback}`/`Support{…}` are the nearest level strictly above/below the current close, built from the confirmed pivots within the last `lookback` bars: a candidate level is a run of sorted pivot prices whose highest is within `tolerance_pct` of their lowest (for each start pivot, the maximal run within tolerance of that start's own price; runs may overlap), and a run of at least `min_touches` (>= 2) pivots is a candidate whose value is the mean of its pivots — the value is the LOWEST candidate strictly above the close (`Support`: the HIGHEST strictly below it), a pivot counting while it stays inside `lookback` bars (`lookback` > `left + right`); `tolerance_pct` is a decimal fraction in (0, 0.10] (`0.003` = 0.3%); `Body`/`UpperWick`/`LowerWick`/`Range` are the current bar's `abs(close−open)`, `high−max(open,close)`, `min(open,close)−low` and `high−low`; `DoubleTopNeckline{left,right,tolerance_pct}`/`DoubleBottomNeckline{…}` are the lowest low/highest high strictly between the last two confirmed pivot highs/lows within tolerance; `TrendlineLows{left,right}`/`TrendlineHighs{left,right}` are the line through the last two rising/falling confirmed pivots extended to the current bar, its quotient rounded to 8 decimal places half-even; because a `Resistance`/`Support` level sits strictly above/below the close of its own bar by definition, a break compares the close with the PREVIOUS bar's level — `CrossesAbove(close, lag(Resistance{…}, 1))`, the lag counting H4 bars on an `h4:` operand (the mirror is `CrossesBelow` over `lag(Support{…}, 1)`) — never the same bar's level; after warm-up a comparison over a level/pattern operand with no level at that bar is false, so a `Not` over it is true",
+        "the schema-1.3.0 structure and pattern variants work on any series (an `h4:` operand reads the last closed H4 bar): `PivotHigh{left,right}`/`PivotLow{left,right}` are the most recent confirmed swing high/low, confirmed only once the `right` bars after them have closed, so a value never repaints; `PreviousPivotHigh{left,right}`/`PreviousPivotLow{left,right}` (schema 1.7.0) are the confirmed swing high/low BEFORE the most recent one — the pivot the latest one replaced, `None` until two are confirmed, the same `left`/`right` rule and confirmation, two pivots at one price counting as two (token `prev_pivot_high:3-3`), so `PivotHigh > PreviousPivotHigh` says the later of the last two swing highs is higher; `Resistance{left,right,tolerance_pct,min_touches,lookback}`/`Support{…}` are the nearest level strictly above/below the current close, built from the confirmed pivots within the last `lookback` bars: a candidate level is a run of sorted pivot prices whose highest is within `tolerance_pct` of their lowest (for each start pivot, the maximal run within tolerance of that start's own price; runs may overlap), and a run of at least `min_touches` (>= 2) pivots is a candidate whose value is the mean of its pivots — the value is the LOWEST candidate strictly above the close (`Support`: the HIGHEST strictly below it), a pivot counting while it stays inside `lookback` bars (`lookback` > `left + right`); `tolerance_pct` is a decimal fraction in (0, 0.10] (`0.003` = 0.3%); `Body`/`UpperWick`/`LowerWick`/`Range` are the current bar's `abs(close−open)`, `high−max(open,close)`, `min(open,close)−low` and `high−low`; `DoubleTopNeckline{left,right,tolerance_pct}`/`DoubleBottomNeckline{…}` are the lowest low/highest high strictly between the last two confirmed pivot highs/lows within tolerance; `TrendlineLows{left,right}`/`TrendlineHighs{left,right}` are the line through the last two rising/falling confirmed pivots extended to the current bar, its quotient rounded to 8 decimal places half-even; because a `Resistance`/`Support` level sits strictly above/below the close of its own bar by definition, a break compares the close with the PREVIOUS bar's level — `CrossesAbove(close, lag(Resistance{…}, 1))`, the lag counting H4 bars on an `h4:` operand (the mirror is `CrossesBelow` over `lag(Support{…}, 1)`) — never the same bar's level; after warm-up a comparison over a level/pattern operand with no level at that bar is false, so a `Not` over it is true",
     ),
     // r5.s1.w1/w2 (schema 1.4.0), published by r5.s1.w3: the named candlestick
     // patterns, their read-path token, and the support-touch form the example
@@ -115,10 +115,11 @@ const CONVENTIONS: &[(&str, &str)] = &[
     // pattern variant); the served set grows by 1.3.0. r6.s1.w1: moved to 1.5.0
     // (the `Sma` indicator and `max`/`min` arithmetic); the served set grows by
     // 1.4.0. r6.s2.w1: moved to 1.6.0 (`setup` and the `StructureStop` exit); the
-    // served set grows by 1.5.0.
+    // served set grows by 1.5.0. r6.s3.w2: moved to 1.7.0 (`PreviousPivotHigh` and
+    // `PreviousPivotLow`); the served set grows by 1.6.0.
     (
         "schema_version",
-        "this engine writes and serves schema 1.6.0 and also loads 1.0.0, 1.1.0, 1.2.0, 1.3.0, 1.4.0 and 1.5.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.6.0",
+        "this engine writes and serves schema 1.7.0 and also loads 1.0.0, 1.1.0, 1.2.0, 1.3.0, 1.4.0, 1.5.0 and 1.6.0 (identity-migrated); any newer version is refused — never write a schema_version other than 1.7.0",
     ),
 ];
 
@@ -167,7 +168,7 @@ mod tests {
         }
         // F6: `schema_version` publishes the ACCEPTED values, not an
         // unconstrained string — `Migrator::v1()` loads `1.0.0`, `1.1.0`,
-        // `1.2.0`, `1.3.0`, `1.4.0` and `1.5.0` (identity-migrated) and `CURRENT`, so the schema a
+        // `1.2.0`, `1.3.0`, `1.4.0`, `1.5.0` and `1.6.0` (identity-migrated) and `CURRENT`, so the schema a
         // validating agent reads must pin exactly that enum.
         assert_eq!(
             properties["schema_version"]["enum"],
@@ -178,6 +179,7 @@ mod tests {
                 "1.3.0",
                 "1.4.0",
                 "1.5.0",
+                "1.6.0",
                 DSL_SCHEMA_VERSION
             ]),
             "schema_version property must publish the accepted enum"

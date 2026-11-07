@@ -92,7 +92,7 @@ async fn tools_and_dsl_schema_resource_are_served() {
         other => panic!("dsl_schema must be text contents, got {other:?}"),
     };
     let doc: Value = serde_json::from_str(&text).expect("dsl_schema body parses as JSON");
-    assert_eq!(doc["schema_version"], "1.6.0");
+    assert_eq!(doc["schema_version"], "1.7.0");
     let properties = doc["json_schema"]["properties"]
         .as_object()
         .expect("json_schema has properties");
@@ -154,8 +154,8 @@ async fn strategy_and_version_tools_return_the_seed() {
     assert_eq!(version["parent_version_id"], parent_id);
     assert_eq!(version["created_by"], "composer_llm");
     // The seeded `1.0.0` document was identity-migrated on write — the stored
-    // column and the migrated `.dsl` read back at CURRENT (1.6.0).
-    assert_eq!(version["dsl_schema_version"], "1.6.0");
+    // column and the migrated `.dsl` read back at CURRENT (1.7.0).
+    assert_eq!(version["dsl_schema_version"], "1.7.0");
     assert_eq!(version["dsl"]["name"], "RSI Oversold (mcp child)");
     assert_eq!(
         version["dsl_original"],
@@ -737,7 +737,7 @@ async fn unknown_identifiers_refuse_instead_of_returning_empty() {
 
 /// r6.s1.w3 (AC-4): the Cipher composition example round-trips over MCP. The
 /// example's rule submits through `submit_strategy_version` as a new strategy,
-/// reads back through `get_version` at schema 1.6.0, and `pulse://dsl/schema`
+/// reads back through `get_version` at schema 1.7.0, and `pulse://dsl/schema`
 /// lists `Sma`, `WaveTrend` and the `max` / `min` arithmetic operations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cipher_example_round_trips_over_mcp() {
@@ -790,9 +790,9 @@ async fn cipher_example_round_trips_over_mcp() {
         .to_owned();
     assert_eq!(submitted["created_by"], "external_agent");
 
-    // It reads back at 1.6.0 with the rule intact.
+    // It reads back at 1.7.0 with the rule intact.
     let version = call(&client, "get_version", json!({"version_id": version_id})).await;
-    assert_eq!(version["dsl_schema_version"], "1.6.0");
+    assert_eq!(version["dsl_schema_version"], "1.7.0");
     assert_eq!(version["dsl"]["name"], example["name"]);
     assert_eq!(version["dsl"]["entry"], example["entry"]);
     assert_eq!(version["dsl"]["filters"], example["filters"]);
