@@ -379,6 +379,23 @@ pub enum IndicatorSpec {
         /// The average length (n2).
         average: SweepableValue<u32>,
     },
+    /// The high of the confirmed swing high **before** the most recent confirmed
+    /// one (schema 1.7.0, r6.s3.w2). Same pivot rule and confirmation as
+    /// [`IndicatorSpec::PivotHigh`]; `None` until two pivots are confirmed. When a
+    /// new pivot confirms, the old latest becomes this value on that same bar.
+    PreviousPivotHigh {
+        /// Bars the pivot must exceed to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at least equal to on its right.
+        right: SweepableValue<u32>,
+    },
+    /// The mirror of [`IndicatorSpec::PreviousPivotHigh`] on swing lows.
+    PreviousPivotLow {
+        /// Bars the pivot must undercut to its left (strictly).
+        left: SweepableValue<u32>,
+        /// Bars the pivot must be at most equal to on its right.
+        right: SweepableValue<u32>,
+    },
 }
 
 /// `#[serde(default = …)]` target for [`IndicatorSpec::Sma`]'s `source`.

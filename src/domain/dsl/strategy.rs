@@ -329,6 +329,13 @@ mod prop_tests {
             (arb_sweepable_u32(), arb_sweepable_u32())
                 .prop_map(|(left, right)| IndicatorSpec::PivotLow { left, right })
                 .boxed(),
+            // r6.s3.w2 (schema 1.7.0): the previous pivots — any span.
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::PreviousPivotHigh { left, right })
+                .boxed(),
+            (arb_sweepable_u32(), arb_sweepable_u32())
+                .prop_map(|(left, right)| IndicatorSpec::PreviousPivotLow { left, right })
+                .boxed(),
             (
                 arb_sweepable_u32(),
                 arb_sweepable_u32(),

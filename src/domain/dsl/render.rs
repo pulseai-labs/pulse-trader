@@ -113,11 +113,14 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
             )
         }
         // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
-        // indicators (r4.s6.w3): twelve variants, one formatter. They are listed
-        // here BY NAME — never matched with a wildcard — so a new variant still
-        // breaks this match and has to be routed by hand.
+        // indicators (r4.s6.w3), and the previous pivots (schema 1.7.0, r6.s3.w2):
+        // fourteen variants, one formatter. They are listed here BY NAME — never
+        // matched with a wildcard — so a new variant still breaks this match and
+        // has to be routed by hand.
         IndicatorSpec::PivotHigh { .. }
         | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::PreviousPivotHigh { .. }
+        | IndicatorSpec::PreviousPivotLow { .. }
         | IndicatorSpec::Resistance { .. }
         | IndicatorSpec::Support { .. }
         | IndicatorSpec::DoubleTopNeckline { .. }
@@ -137,7 +140,7 @@ pub fn indicator(spec: &IndicatorSpec) -> String {
 /// PERCENT (the DSL stores the fraction) and the window for the levels, the
 /// tops'/bottoms' tolerance for the necklines, and the direction for the lines.
 ///
-/// `indicator` routes exactly the twelve variants here, so the trailing arm is a
+/// `indicator` routes exactly the fourteen variants here, so the trailing arm is a
 /// contract guard, unreachable by construction (the house shape at
 /// `agent/tools.rs`'s `Op` dispatch).
 fn structure_indicator(spec: &IndicatorSpec) -> String {
@@ -147,6 +150,16 @@ fn structure_indicator(spec: &IndicatorSpec) -> String {
         }
         IndicatorSpec::PivotLow { left, right } => {
             format!("pivot low({}/{})", u32_leaf(left), u32_leaf(right))
+        }
+        IndicatorSpec::PreviousPivotHigh { left, right } => {
+            format!(
+                "previous pivot high({}/{})",
+                u32_leaf(left),
+                u32_leaf(right)
+            )
+        }
+        IndicatorSpec::PreviousPivotLow { left, right } => {
+            format!("previous pivot low({}/{})", u32_leaf(left), u32_leaf(right))
         }
         IndicatorSpec::Resistance {
             left,

@@ -677,6 +677,20 @@ fn spec_name(spec: &IndicatorSpec) -> String {
         IndicatorSpec::PivotLow { left, right } => {
             format!("PivotLow({}/{})", period_value(left), period_value(right))
         }
+        IndicatorSpec::PreviousPivotHigh { left, right } => {
+            format!(
+                "PreviousPivotHigh({}/{})",
+                period_value(left),
+                period_value(right)
+            )
+        }
+        IndicatorSpec::PreviousPivotLow { left, right } => {
+            format!(
+                "PreviousPivotLow({}/{})",
+                period_value(left),
+                period_value(right)
+            )
+        }
         IndicatorSpec::Resistance {
             left,
             right,
@@ -971,11 +985,14 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
         }
         // The structure indicators (schema 1.3.0, r4.s6.w1), the pattern
         // indicators (r4.s6.w3) and the named candle patterns (schema 1.4.0,
-        // r5.s1.w1): thirteen variants, checked by their own helper. They are
-        // listed here BY NAME — never matched with a wildcard — so a new variant
-        // still breaks this match and has to be routed by hand.
+        // r5.s1.w1) and the previous pivots (schema 1.7.0, r6.s3.w2): fifteen
+        // variants, checked by their own helper. They are listed here BY NAME —
+        // never matched with a wildcard — so a new variant still breaks this match
+        // and has to be routed by hand.
         IndicatorSpec::PivotHigh { .. }
         | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::PreviousPivotHigh { .. }
+        | IndicatorSpec::PreviousPivotLow { .. }
         | IndicatorSpec::Resistance { .. }
         | IndicatorSpec::Support { .. }
         | IndicatorSpec::DoubleTopNeckline { .. }
@@ -1003,6 +1020,7 @@ fn check_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError
 /// arm is a contract guard, unreachable by construction (the house shape at
 /// `agent/tools.rs`'s `Op` dispatch): a new variant is a compile error in the
 /// dispatcher's own match first.
+#[allow(clippy::too_many_lines)] // one arm per structure variant: the variant → rule table IS the function
 fn check_structure_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<FieldError>) {
     match spec {
         IndicatorSpec::PivotHigh { left, right } => {
@@ -1010,6 +1028,26 @@ fn check_structure_indicator(spec: &IndicatorSpec, path: &str, errors: &mut Vec<
         }
         IndicatorSpec::PivotLow { left, right } => {
             check_pivot_span(left, right, path, "pivot_low", "PivotLow", errors);
+        }
+        IndicatorSpec::PreviousPivotHigh { left, right } => {
+            check_pivot_span(
+                left,
+                right,
+                path,
+                "previous_pivot_high",
+                "PreviousPivotHigh",
+                errors,
+            );
+        }
+        IndicatorSpec::PreviousPivotLow { left, right } => {
+            check_pivot_span(
+                left,
+                right,
+                path,
+                "previous_pivot_low",
+                "PreviousPivotLow",
+                errors,
+            );
         }
         IndicatorSpec::Resistance {
             left,
@@ -1114,7 +1152,8 @@ fn check_u32_at_least(
     }
 }
 
-/// The pivot span rule shared by `PivotHigh`/`PivotLow`: `left`/`right` >= 1.
+/// The pivot span rule shared by `PivotHigh`/`PivotLow` and the previous pivots:
+/// `left`/`right` >= 1.
 fn check_pivot_span(
     left: &SweepableValue<u32>,
     right: &SweepableValue<u32>,

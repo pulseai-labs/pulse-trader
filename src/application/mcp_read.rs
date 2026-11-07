@@ -182,7 +182,12 @@ fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {
     // r4.s6.w1: the structure indicators. The pivot variants carry the
     // `left`/`right` span; the level variants add `tolerance_pct` (a decimal
     // FRACTION — `0.003` is 0.3%), `min_touches` and `lookback`.
-    if kind == "pivot_high" || kind == "pivot_low" {
+    // r6.s3.w2 (schema 1.7.0): `prev_pivot_high` / `prev_pivot_low` carry the
+    // same span — the confirmed swing before the latest one.
+    if matches!(
+        kind.as_str(),
+        "pivot_high" | "pivot_low" | "prev_pivot_high" | "prev_pivot_low"
+    ) {
         return parse_pivot(token, &kind, rest);
     }
     if kind == "resistance" || kind == "support" {
@@ -334,7 +339,8 @@ fn anatomy_spec(kind: &str) -> Option<IndicatorSpec> {
 }
 
 /// Parse the `pivot_high:<left>-<right>` / `pivot_low:<left>-<right>` forms
-/// (r4.s6.w1).
+/// (r4.s6.w1) and their `prev_pivot_high:` / `prev_pivot_low:` twins (schema
+/// 1.7.0, r6.s3.w2).
 fn parse_pivot(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorColumn> {
     let parts: Vec<&str> = rest.split('-').collect();
     let [left, right] = parts[..] else {
@@ -342,17 +348,24 @@ fn parse_pivot(token: &str, kind: &str, rest: &str) -> anyhow::Result<IndicatorC
     };
     let left = parse_period(token, left)?;
     let right = parse_period(token, right)?;
-    let fixed = SweepableValue::Fixed;
-    let spec = if kind == "pivot_high" {
-        IndicatorSpec::PivotHigh {
-            left: fixed(left),
-            right: fixed(right),
-        }
-    } else {
-        IndicatorSpec::PivotLow {
-            left: fixed(left),
-            right: fixed(right),
-        }
+    let span = (SweepableValue::Fixed(left), SweepableValue::Fixed(right));
+    let spec = match kind {
+        "pivot_high" => IndicatorSpec::PivotHigh {
+            left: span.0,
+            right: span.1,
+        },
+        "prev_pivot_high" => IndicatorSpec::PreviousPivotHigh {
+            left: span.0,
+            right: span.1,
+        },
+        "prev_pivot_low" => IndicatorSpec::PreviousPivotLow {
+            left: span.0,
+            right: span.1,
+        },
+        _ => IndicatorSpec::PivotLow {
+            left: span.0,
+            right: span.1,
+        },
     };
     Ok(IndicatorColumn {
         label: format!("{kind}:{left}-{right}"),
@@ -493,6 +506,7 @@ fn parse_trendline(token: &str, kind: &str, rest: &str) -> anyhow::Result<Indica
 /// compiled rule can carry one — so a swept leaf renders as its bounds
 /// (`50..100..10`), diagnostic text no parser accepts.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one arm per indicator variant: the variant → token table IS the function
 pub fn indicator_label(spec: &IndicatorSpec) -> String {
     match spec {
         IndicatorSpec::Rsi { period } => format!("rsi:{}", period_label(period)),
@@ -540,6 +554,20 @@ pub fn indicator_label(spec: &IndicatorSpec) -> String {
         }
         IndicatorSpec::PivotLow { left, right } => {
             format!("pivot_low:{}-{}", period_label(left), period_label(right))
+        }
+        IndicatorSpec::PreviousPivotHigh { left, right } => {
+            format!(
+                "prev_pivot_high:{}-{}",
+                period_label(left),
+                period_label(right)
+            )
+        }
+        IndicatorSpec::PreviousPivotLow { left, right } => {
+            format!(
+                "prev_pivot_low:{}-{}",
+                period_label(left),
+                period_label(right)
+            )
         }
         IndicatorSpec::Resistance {
             left,
@@ -1050,12 +1078,13 @@ mod tests {
             },
             // r4.s6.w1: the structure variants carry their own leaf names; the
             // pivot span's left is the stand-in this helper reads.
-            IndicatorSpec::PivotHigh { left, .. } | IndicatorSpec::PivotLow { left, .. } => {
-                match left {
-                    SweepableValue::Fixed(left) => *left,
-                    SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
-                }
-            }
+            IndicatorSpec::PivotHigh { left, .. }
+            | IndicatorSpec::PivotLow { left, .. }
+            | IndicatorSpec::PreviousPivotHigh { left, .. }
+            | IndicatorSpec::PreviousPivotLow { left, .. } => match left {
+                SweepableValue::Fixed(left) => *left,
+                SweepableValue::Sweep { .. } => panic!("CLI specs must be fixed"),
+            },
             IndicatorSpec::Resistance { min_touches, .. }
             | IndicatorSpec::Support { min_touches, .. } => match min_touches {
                 SweepableValue::Fixed(min_touches) => *min_touches,
@@ -1458,6 +1487,14 @@ mod tests {
             IndicatorSpec::PivotLow {
                 left: fixed(1),
                 right: fixed(1),
+            },
+            IndicatorSpec::PreviousPivotHigh {
+                left: fixed(3),
+                right: fixed(3),
+            },
+            IndicatorSpec::PreviousPivotLow {
+                left: fixed(2),
+                right: fixed(4),
             },
             IndicatorSpec::Resistance {
                 left: fixed(3),

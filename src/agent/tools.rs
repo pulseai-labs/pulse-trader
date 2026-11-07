@@ -521,7 +521,8 @@ mod mapping {
         // The structure and pattern indicators (schema 1.3.0, r4.s6.w1/w3): a
         // pivot's left / right span, a level's touch count and window, and the
         // tolerance as a decimal FRACTION (`0.003` = 0.3%, the `distance_pct`
-        // convention). `pivot_high`/`pivot_low`/`trendline_lows`/
+        // convention). `pivot_high`/`pivot_low`/`prev_pivot_high`/
+        // `prev_pivot_low` (schema 1.7.0, r6.s3.w2)/`trendline_lows`/
         // `trendline_highs` take `left`/`right`; `resistance`/`support` take all
         // five; `double_top_neckline`/`double_bottom_neckline` take
         // `left`/`right`/`tolerance_pct`.
@@ -923,6 +924,16 @@ mod mapping {
                 left: fixed_u32(operand.left, &format!("{path}.left"))?,
                 right: fixed_u32(operand.right, &format!("{path}.right"))?,
             }),
+            // The swing before the latest one (schema 1.7.0, r6.s3.w2): the same
+            // `left`/`right` span as the pivots.
+            "prev_pivot_high" => Ok(IndicatorSpec::PreviousPivotHigh {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+            }),
+            "prev_pivot_low" => Ok(IndicatorSpec::PreviousPivotLow {
+                left: fixed_u32(operand.left, &format!("{path}.left"))?,
+                right: fixed_u32(operand.right, &format!("{path}.right"))?,
+            }),
             "resistance" => Ok(IndicatorSpec::Resistance {
                 left: fixed_u32(operand.left, &format!("{path}.left"))?,
                 right: fixed_u32(operand.right, &format!("{path}.right"))?,
@@ -980,7 +991,7 @@ mod mapping {
                 format!("{path}.indicator"),
                 ValidationCode::FieldRange,
                 format!(
-                    "unknown indicator {other:?}; expected rsi|ema|adx|macd|atr|highest|lowest|pivot_high|pivot_low|resistance|support|double_top_neckline|double_bottom_neckline|trendline_lows|trendline_highs|body|upper_wick|lower_wick|range|candle_pattern"
+                    "unknown indicator {other:?}; expected rsi|ema|adx|macd|atr|highest|lowest|pivot_high|pivot_low|prev_pivot_high|prev_pivot_low|resistance|support|double_top_neckline|double_bottom_neckline|trendline_lows|trendline_highs|body|upper_wick|lower_wick|range|candle_pattern"
                 ),
             )),
         }
@@ -1158,7 +1169,8 @@ fn operand_schema_level(nested: &Value) -> Value {
                 "type": "string",
                 "enum": [
                     "rsi", "ema", "adx", "macd", "atr", "sma", "wavetrend", "highest", "lowest",
-                    "pivot_high", "pivot_low", "resistance", "support",
+                    "pivot_high", "pivot_low", "prev_pivot_high", "prev_pivot_low",
+                    "resistance", "support",
                     "double_top_neckline", "double_bottom_neckline",
                     "trendline_lows", "trendline_highs",
                     "body", "upper_wick", "lower_wick", "range",
@@ -1225,12 +1237,12 @@ fn operand_schema_level(nested: &Value) -> Value {
             "left": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "pivot_high/pivot_low/resistance/support/double_top_neckline/double_bottom_neckline/trendline_lows/trendline_highs: bars the pivot must exceed to its left (strictly)"
+                "description": "pivot_high/pivot_low/prev_pivot_high/prev_pivot_low/resistance/support/double_top_neckline/double_bottom_neckline/trendline_lows/trendline_highs: bars the pivot must exceed to its left (strictly)"
             },
             "right": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "pivot_high/pivot_low/resistance/support/double_top_neckline/double_bottom_neckline/trendline_lows/trendline_highs: bars the pivot must be at least equal to on its right"
+                "description": "pivot_high/pivot_low/prev_pivot_high/prev_pivot_low/resistance/support/double_top_neckline/double_bottom_neckline/trendline_lows/trendline_highs: bars the pivot must be at least equal to on its right"
             },
             "tolerance_pct": {
                 "type": "string",

@@ -563,11 +563,14 @@ fn visit_indicator_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> C
             )?;
         }
         // The structure indicators (schema 1.3.0, r4.s6.w1) and the pattern
-        // indicators (r4.s6.w3): twelve variants, two helpers. Listed here BY
-        // NAME — never matched with a wildcard — so a new variant still breaks
-        // this match and has to be routed by hand.
+        // indicators (r4.s6.w3), and the previous pivots (schema 1.7.0, r6.s3.w2):
+        // fourteen variants, two helpers. Listed here BY NAME — never matched
+        // with a wildcard — so a new variant still breaks this match and has to
+        // be routed by hand.
         IndicatorSpec::PivotHigh { .. }
         | IndicatorSpec::PivotLow { .. }
+        | IndicatorSpec::PreviousPivotHigh { .. }
+        | IndicatorSpec::PreviousPivotLow { .. }
         | IndicatorSpec::Resistance { .. }
         | IndicatorSpec::Support { .. }
         | IndicatorSpec::Body
@@ -603,6 +606,28 @@ fn visit_structure_spec(spec: &mut IndicatorSpec, base: &str, f: Visit<'_>) -> C
         IndicatorSpec::PivotLow { left, right } => {
             f(&format!("{base}.pivot_low.left"), LeafMut::Period(left))?;
             f(&format!("{base}.pivot_low.right"), LeafMut::Period(right))?;
+        }
+        // r6.s3.w2 (schema 1.7.0): the previous pivots carry the same span
+        // leaves as `PivotHigh`/`PivotLow`.
+        IndicatorSpec::PreviousPivotHigh { left, right } => {
+            f(
+                &format!("{base}.previous_pivot_high.left"),
+                LeafMut::Period(left),
+            )?;
+            f(
+                &format!("{base}.previous_pivot_high.right"),
+                LeafMut::Period(right),
+            )?;
+        }
+        IndicatorSpec::PreviousPivotLow { left, right } => {
+            f(
+                &format!("{base}.previous_pivot_low.left"),
+                LeafMut::Period(left),
+            )?;
+            f(
+                &format!("{base}.previous_pivot_low.right"),
+                LeafMut::Period(right),
+            )?;
         }
         IndicatorSpec::Resistance {
             left,

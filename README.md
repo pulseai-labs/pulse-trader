@@ -28,7 +28,7 @@ Claude Code can drive the loop directly.
 1. **You describe a target.** In the app's Designer, or with `pulse compose "<target>"`: pair,
    direction, setup, stop, target — plain words.
 2. **The agent writes the strategy.** The composer drives six validated builder tools and emits a
-   DSL document (schema 1.6.0). The strategy is stored as that document; the engine never reads
+   DSL document (schema 1.7.0). The strategy is stored as that document; the engine never reads
    prose.
 3. **The Rust engine backtests it.** Deterministic, on real Binance USDT-M candles fetched by
    `pulse fetch-data`. Every trade carries its fee (4 bp taker by default), its slippage (1 bp) and
