@@ -100,13 +100,13 @@ pub fn realized_pnl(entry: Decimal, exit: Decimal, qty: Decimal, direction: Dire
     }
 }
 
-/// The realized R-multiple: the favourable price move divided by the stop
-/// distance (`|entry − stop_price|`).
+/// The **gross** realized R-multiple: the favourable price move divided by the
+/// stop distance (`|entry − stop_price|`).
 ///
 /// `Long` move = `exit − entry`; `Short` move = `entry − exit`. A clean stop is
-/// ≈ `−1R`; costs (booked separately by the caller) can push the *net* outcome
-/// past `−1R` (G3). This is a pure price-geometry ratio — it does NOT subtract
-/// costs.
+/// ≈ `−1R`. This is a pure price-geometry ratio — it does NOT subtract costs.
+/// Closed trades record [`net_r`] (r6.s3.w1, #457), not this ratio; this one
+/// stays for paper's unrealized R (#385) and for the cost-free comparisons.
 ///
 /// # Errors
 ///
@@ -129,10 +129,32 @@ pub fn realized_r(
     Ok(price_move / stop_distance)
 }
 
+/// The realized R-multiple **net of costs** (r6.s3.w1, #457, ADR-0028 amendment):
+/// `net_pnl ÷ (qty × |entry − stop_price|)`, the trade's net P&L in units of its
+/// initial risk. Fees and funding count; slippage is already inside `net_pnl`.
+///
+/// # Errors
+///
+/// [`BacktestError::NoStopLoss`] when the risk `qty × |entry − stop_price|` is zero.
+pub fn net_r(
+    net_pnl: Decimal,
+    qty: Decimal,
+    entry: Decimal,
+    stop_price: Decimal,
+) -> Result<Decimal, BacktestError> {
+    let risk = qty * (entry - stop_price).abs();
+    if risk.is_zero() {
+        return Err(BacktestError::NoStopLoss);
+    }
+    Ok(net_pnl / risk)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{Side, apply_slippage, funding_payment, realized_pnl, realized_r, taker_fee};
+    use super::{
+        Side, apply_slippage, funding_payment, net_r, realized_pnl, realized_r, taker_fee,
+    };
     use crate::domain::Direction;
     use crate::domain::backtest::error::BacktestError;
     use rust_decimal::Decimal;
@@ -296,5 +318,70 @@ mod tests {
         // entry == stop → NoStopLoss (G5 / #20), no divide-by-zero.
         let err = realized_r(dec(100, 0), dec(110, 0), dec(100, 0), Direction::Long).unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
+    }
+
+    // ---- net_r (r6.s3.w1, #457) --------------------------------------------
+
+    #[test]
+    fn net_r_long_stop_out_with_fees_and_negative_funding_is_below_minus_one() {
+        // Long 20 @ 100, stop 95 (risk 20 × 5 = 100), stopped out at 95:
+        // gross −100, fees 1.6, funding paid 6 → net −107.6 → −1.076R.
+        let gross = realized_pnl(dec(100, 0), dec(95, 0), dec(20, 0), Direction::Long);
+        let net = gross + dec(-6, 0) - dec(16, 1);
+        let r = net_r(net, dec(20, 0), dec(100, 0), dec(95, 0)).unwrap();
+        assert_eq!(r, dec(-1076, 3));
+        assert!(r < Decimal::NEGATIVE_ONE);
+    }
+
+    #[test]
+    fn net_r_short_with_funding_received_beats_its_gross_r() {
+        // Short 20 @ 100, stop 105, exit 98: gross +40 (0.4R); funding
+        // received +3, no fees → net +43 → 0.43R, above the gross 0.4R.
+        let gross = realized_pnl(dec(100, 0), dec(98, 0), dec(20, 0), Direction::Short);
+        let net = gross + dec(3, 0);
+        let r = net_r(net, dec(20, 0), dec(100, 0), dec(105, 0)).unwrap();
+        let gross_r = realized_r(dec(100, 0), dec(98, 0), dec(105, 0), Direction::Short).unwrap();
+        assert_eq!(r, dec(43, 2));
+        assert!(r > gross_r);
+    }
+
+    #[test]
+    fn net_r_zero_risk_is_no_stop_loss() {
+        // entry == stop: no risk, no denominator.
+        let err = net_r(dec(10, 0), dec(2, 0), dec(100, 0), dec(100, 0)).unwrap_err();
+        assert_eq!(err, BacktestError::NoStopLoss);
+        // qty == 0: the risk in USDT is zero as well.
+        let err = net_r(dec(10, 0), Decimal::ZERO, dec(100, 0), dec(95, 0)).unwrap_err();
+        assert_eq!(err, BacktestError::NoStopLoss);
+    }
+
+    #[test]
+    fn net_r_fees_only_is_gross_r_minus_fees_over_risk() {
+        // Long 2 @ 100, stop 95, exit 110: gross +20, risk 10, fees 0.5, no
+        // funding → net 19.5. Gross R 2, so net R = 2 − 0.5 ÷ 10 = 1.95.
+        let gross = realized_pnl(dec(100, 0), dec(110, 0), dec(2, 0), Direction::Long);
+        let fees = dec(5, 1);
+        let r = net_r(gross - fees, dec(2, 0), dec(100, 0), dec(95, 0)).unwrap();
+        let gross_r = realized_r(dec(100, 0), dec(110, 0), dec(95, 0), Direction::Long).unwrap();
+        let risk = dec(10, 0);
+        assert_eq!(r, gross_r - fees / risk);
+        assert_eq!(r, dec(195, 2));
+    }
+
+    #[test]
+    fn net_r_equals_realized_r_when_fees_and_funding_are_zero() {
+        for (entry, exit, stop, direction) in [
+            (dec(100, 0), dec(95, 0), dec(95, 0), Direction::Long),
+            (dec(100, 0), dec(110, 0), dec(95, 0), Direction::Long),
+            (dec(100, 0), dec(105, 0), dec(105, 0), Direction::Short),
+            (dec(100, 0), dec(90, 0), dec(105, 0), Direction::Short),
+        ] {
+            let qty = dec(7, 0);
+            let net = realized_pnl(entry, exit, qty, direction);
+            assert_eq!(
+                net_r(net, qty, entry, stop).unwrap(),
+                realized_r(entry, exit, stop, direction).unwrap()
+            );
+        }
     }
 }

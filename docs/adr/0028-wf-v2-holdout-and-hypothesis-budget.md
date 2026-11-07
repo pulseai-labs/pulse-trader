@@ -152,3 +152,20 @@ constant: the guard exists only while a freeze is open, the holdout start is rea
 record, and a spent holdout is never reused. The campaign starts with the rule, the test, the
 holdout start and the budget frozen in writing — and with its own power measured, so the operator
 knows the pass chance before the first hypothesis is spent.
+
+## Amendment (r6.s3.w1, 2026-11): R is net of costs
+
+Every R the gates read is a trade's `realized_r`: the fold R for `wf-v1` and `wf-v2`, the holdout R for
+certification, and the fold σ for the power review (ADR-0032). From r6.s3.w1 a trade's `realized_r` is net of
+fees and funding: `realized_pnl` ÷ the initial risk in USDT, where the initial risk is `qty × |entry − initial
+stop|`. Slippage is already inside `realized_pnl`. PDR-0046 decision 2 is the ruling; issue #457 found the defect.
+
+- The thresholds, `N_MIN`, `Z` and the hypothesis budget are unchanged.
+- Net R is never above gross R for a trade that pays costs, so no gate is loosened.
+- A run's engine fingerprint tells which basis it carries. The fingerprint is a hash of the engine source
+  tree, so this change mints a new one.
+- Stored runs and stored verdicts are not re-derived on the new basis (ADR-0018: immutable records). A gross-R
+  run and a net-R run are not compared as equals.
+- A paper session that spans the upgrade mixes both bases in its out-of-sample mean R. Its epochs (one per
+  build) show where the basis changed.
+- Paper's unrealized R (#385) is out of scope and stays a price-move ratio.

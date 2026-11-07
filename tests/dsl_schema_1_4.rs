@@ -539,13 +539,14 @@ fn a_1_4_0_backtest_is_deterministic() {
 
 /// The pre-bump goldens are unmoved by this bump: the committed 1.0.0 fixture
 /// strategy's `result_content_hash` on the fixture store still equals the
-/// frozen `b8e91b89…` pin, and its trade log is unchanged.
+/// frozen pin, and its trade log is unchanged. (r6.s3.w1 re-pinned it `b8e91b89…` →
+/// `f934ca1c…` once: R is net of costs (#457), which moves `realized_r` and so the hash.)
 ///
 /// That is the whole "no golden changes" claim, asserted from this suite's own
 /// side: a new variant no existing document names cannot move a number.
 #[test]
 fn the_frozen_pre_bump_golden_is_unmoved() {
-    const FROZEN: &str = "b8e91b89b7727eb97c8200ee04373ffc3ef3568b51ab145bbb2e652cb2bb9228";
+    const FROZEN: &str = "f934ca1ceffe05ff322d44cf706a3381a766dd589d22502d3d705d13f1222d65";
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/strategies/rsi-oversold-long.json");
     let json = std::fs::read_to_string(&path).expect("read the fixture strategy");
