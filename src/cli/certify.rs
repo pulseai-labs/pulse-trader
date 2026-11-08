@@ -29,10 +29,11 @@ use crate::adapters::db::{
     SqlitePowerReviewRepo, SqliteStrategyRepo,
 };
 use crate::adapters::store::CandleStore;
-use crate::application::power_review::{PowerReviewRequest, review_power};
+use crate::application::power_review::{PowerReviewRequest, review_power, search_span_verdict};
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     ExchangeAdapter as _, FreezeRecord, OpenFreezeRequest, Pair, PowerReviewRecord,
+    SearchSpanVerdict,
 };
 
 /// `pulse certify {freeze,close-freeze,status}` — the freeze lifecycle.
@@ -181,11 +182,12 @@ pub(crate) async fn run_certify(args: &CertifyArgs) -> anyhow::Result<()> {
                 .open_freeze()
                 .await
                 .map_err(|e| anyhow::anyhow!("certify power failed: {e}"))?;
+            let runs = SqliteBacktestRunRepo::new(db_handle.pool().clone());
             let outcome = review_power(
                 &SqliteStrategyRepo::new(db_handle.pool().clone()),
                 &store,
                 &exchange,
-                &SqliteBacktestRunRepo::new(db_handle.pool().clone()),
+                &runs,
                 &SqliteCertificationRepo::new(db_handle.pool().clone()),
                 &SqlitePowerReviewRepo::new(db_handle.pool().clone()),
                 freeze.as_ref(),
@@ -197,7 +199,11 @@ pub(crate) async fn run_certify(args: &CertifyArgs) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("refused: {e}"))?;
-            print_power_review(&outcome.record);
+            // The search span's wf-v2 verdict, read from the run the record names (r6.s5.w2).
+            let verdict = search_span_verdict(&runs, &outcome.record)
+                .await
+                .map_err(|e| anyhow::anyhow!("refused: {e}"))?;
+            print_power_review(&outcome.record, &verdict);
         }
     }
     Ok(())
@@ -248,9 +254,12 @@ fn rfc3339(ms: i64) -> String {
 }
 
 /// Print one power review (Approach 7): the holdout's **count**, the candidate's search-span σ and the bar's
-/// arithmetic — and the fixed line saying what is deliberately not shown. No outcome of the holdout's trades
-/// is printed, and none is stored (G1).
-fn print_power_review(record: &PowerReviewRecord) {
+/// arithmetic, the search span's wf-v2 verdict — and the fixed line saying what is deliberately not shown. No
+/// outcome of the holdout's trades is printed, and none is stored (G1).
+///
+/// The pooled line says `average` and `floor` where the verdict's fields say mean and lower bound: the
+/// CLI's G1 guard (`tests/power_review.rs`) bans those two words from stdout (operator ruling, 2026-11-08).
+fn print_power_review(record: &PowerReviewRecord, verdict: &SearchSpanVerdict) {
     println!("power review id: {}", record.id);
     println!("version: {}", record.version_id.as_str());
     println!("pair: {}", record.pair.as_str());
@@ -270,6 +279,18 @@ fn print_power_review(record: &PowerReviewRecord) {
     let bar_pct = record.bar.parse::<f64>().map_or(0.0, |bar| bar * 100.0);
     println!("bar: {bar_pct:.1}%");
     println!("min holdout trades: {}", record.min_holdout_trades);
+    println!(
+        "search walk-forward id: {}",
+        record.search_walk_forward_run_id.as_str()
+    );
+    println!(
+        "search span verdict: {}, k {}, folds holding {} of {}",
+        verdict.rule, verdict.k, verdict.folds_holding, verdict.folds_required
+    );
+    println!(
+        "search span pooled: n {}, average {} R, floor {:.4} R",
+        verdict.pooled_n, verdict.pooled_mean_r, verdict.pooled_lower_bound
+    );
     println!(
         "search span passes: {}",
         if record.search_pass { "yes" } else { "no" }

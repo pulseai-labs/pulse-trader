@@ -2069,8 +2069,8 @@ export type PaperTrades = {
 };
 
 /**
- *  One power review as the Library shows it: the count, the pass chance, the bar and the decision — no
- *  holdout outcome (G1).
+ *  One power review as the Library shows it: the count, the pass chance, the bar, the decision and the search
+ *  span's wf-v2 verdict — no holdout outcome (G1).
  */
 export type PowerReviewDto = {
 	/**  The record's id. */
@@ -2095,6 +2095,8 @@ export type PowerReviewDto = {
 	allowed: boolean,
 	/**  The first failing reason's stored spelling, or `None` when allowed. */
 	reason: string | null,
+	/**  The wf-v2 verdict of the search span the review ran — search-span data, never the holdout's. */
+	search: SearchSpanVerdictDto,
 	/**  When the review was written, RFC 3339 ms. */
 	createdAt: string,
 	/**  The calling client's label. */
@@ -2192,6 +2194,29 @@ export type RegimeCellDto = {
  *  compares it and never parses it.
  */
 export type RunId = string;
+
+/**
+ *  The search span's wf-v2 verdict as the Library shows it: the rule, the fold count, the folds holding of the
+ *  folds required, and the pooled trade count, mean R, lower bound and pass. Search-span data only (G1).
+ */
+export type SearchSpanVerdictDto = {
+	/**  The verdict rule's name (`"wf-v2"`). */
+	rule: string,
+	/**  The fold count. */
+	k: number,
+	/**  How many folds held. */
+	foldsHolding: number,
+	/**  How many folds the rule requires to hold. */
+	foldsRequired: number,
+	/**  The pooled out-of-sample trade count. */
+	pooledN: number,
+	/**  The pooled mean R, as a decimal string. */
+	pooledMeanR: string,
+	/**  The pooled lower bound, in R. */
+	pooledLowerBound: number | null,
+	/**  Whether the search span's verdict passed. */
+	pass: boolean,
+};
 
 /**
  *  What the status strip renders (spec: `state: up | down | not_connected |

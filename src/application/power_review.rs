@@ -28,13 +28,13 @@ use crate::application::certification::{
 use crate::application::walk_forward::WalkForwardAppError;
 use crate::domain::power_review::{
     ASSUMED_EDGE_R, MIN_HOLDOUT_TRADES, POWER_BAR, PowerReviewDraft, PowerReviewRecord,
-    PowerVerdict, c1_z, pass_chance, sample_sigma, verdict,
+    PowerVerdict, SearchSpanVerdict, c1_z, pass_chance, sample_sigma, verdict,
 };
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestRunRepository, CandleSeriesRepository, CertificationRepository, DataError,
     ExchangeAdapter, FreezeRecord, Pair, PowerReviewRepository, StrategyRepository,
-    WalkForwardRunRepository,
+    WalkForwardRunId, WalkForwardRunRepository,
 };
 
 /// What a power review is asked for: one persisted version, an optional **already-validated** pair override,
@@ -76,6 +76,9 @@ pub enum PowerReviewError {
     /// The holdout backtest failed (a missing snapshot, a gapped series, an empty window, an engine error).
     #[error("the holdout backtest failed before any record was written: {0}")]
     Backtest(#[from] BacktestAppError),
+    /// A stored review names a search walk-forward that no run has the id of.
+    #[error("the power review's search walk-forward `{}` is not stored", .0.as_str())]
+    SearchRunMissing(WalkForwardRunId),
     /// A defect in this layer (a failed task join).
     #[error("internal: {0}")]
     Internal(String),
@@ -206,4 +209,23 @@ where
         .await
         .map_err(PowerReviewError::Store)?;
     Ok(PowerReviewOutcome { record })
+}
+
+/// The stored search walk-forward of a power review, as its verdict.
+///
+/// # Errors
+///
+/// [`PowerReviewError::Store`] when the read fails; [`PowerReviewError::SearchRunMissing`] when no run has
+/// the id.
+pub async fn search_span_verdict<R: WalkForwardRunRepository>(
+    runs: &R,
+    record: &PowerReviewRecord,
+) -> Result<SearchSpanVerdict, PowerReviewError> {
+    let run = runs
+        .get_walk_forward_run(&record.search_walk_forward_run_id)
+        .await?
+        .ok_or_else(|| {
+            PowerReviewError::SearchRunMissing(record.search_walk_forward_run_id.clone())
+        })?;
+    Ok(SearchSpanVerdict::from_run(&run))
 }

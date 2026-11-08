@@ -906,7 +906,9 @@ pub use crate::tauri::{
 // r5.s5.w3 (PDR-0040, ADR-0032): the Library's power-review read — the wire shapes and the
 // transport-free core behind `POST /api/v1/power-reviews` and the `power_reviews` bus command
 // (ADR-0020: additive only). Count only (G1), app scope only (G6).
-pub use crate::tauri::{PowerReviewDto, PowerReviewsDto, PowerReviewsRequest, power_reviews_core};
+pub use crate::tauri::{
+    PowerReviewDto, PowerReviewsDto, PowerReviewsRequest, SearchSpanVerdictDto, power_reviews_core,
+};
 
 // r5.s4.w1 (PDR-0035): the streak and drawdown card's read contract — the wire
 // shapes and the transport-free core behind `POST /api/v1/streak-card` and the
@@ -988,9 +990,10 @@ pub use domain::{
 // `dead_code` build error.
 pub use adapters::db::SqlitePowerReviewRepo;
 pub use application::power_review::{
-    PowerReviewError, PowerReviewOutcome, PowerReviewRequest, review_power,
+    PowerReviewError, PowerReviewOutcome, PowerReviewRequest, review_power, search_span_verdict,
 };
 pub use domain::{
     ASSUMED_EDGE_R, MIN_HOLDOUT_TRADES, POWER_BAR, PowerBlock, PowerReviewDraft, PowerReviewRecord,
-    PowerReviewRepository, PowerVerdict, c1_z, normal_cdf, pass_chance, sample_sigma, verdict,
+    PowerReviewRepository, PowerVerdict, SearchSpanVerdict, c1_z, normal_cdf, pass_chance,
+    sample_sigma, verdict,
 };

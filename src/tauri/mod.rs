@@ -104,7 +104,9 @@ pub use certification::{
     CertificationSelectionDto, certification_records_core,
 };
 // r5.s5.w3 (PDR-0040, ADR-0032): the Library's power-review read's wire shapes and core.
-pub use power_review::{PowerReviewDto, PowerReviewsDto, PowerReviewsRequest, power_reviews_core};
+pub use power_review::{
+    PowerReviewDto, PowerReviewsDto, PowerReviewsRequest, SearchSpanVerdictDto, power_reviews_core,
+};
 // r5.s4.w1 (PDR-0035): the streak and drawdown card's wire shapes and core.
 pub use streak_card::{
     DecimalPercentilesDto, StreakCardDto, StreakCardRequest, StreakPercentilesDto, streak_card_core,
