@@ -736,8 +736,8 @@ describe("LibraryScreen (r5.s5.w3 — the power review)", () => {
     const inSection = within(section);
     expect(inSection.getByText("BTCUSDT")).toBeTruthy();
     expect(inSection.getByText("31t")).toBeTruthy();
-    // r6.s5.w2: the search span's wf-v2 verdict — the rule, the folds holding of required, the pooled count.
-    expect(inSection.getByText(/wf-v2 3\/4 folds · 155t/)).toBeTruthy();
+    // r6.s5.w2: the search span's wf-v2 verdict — the rule, k, the folds holding of required, the pooled count, mean R and lower bound.
+    expect(inSection.getByText(/wf-v2 k=6 3\/4 folds · 155t \+0\.04 R · floor \+0\.03 R · search fails/)).toBeTruthy();
     expect(inSection.getByText(/search fails/)).toBeTruthy();
     expect(inSection.getByText("pass 42.1%")).toBeTruthy();
     expect(inSection.getByText("bar 50.0%")).toBeTruthy();

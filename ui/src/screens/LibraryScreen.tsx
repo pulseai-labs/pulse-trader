@@ -806,7 +806,7 @@ function PowerReviews({ versionId }: { versionId: string }) {
         {rows.reviews.map((review) => (
           <div key={review.id} className="cert-rec">
             <span className="mono">{review.pair}</span>
-            <span className="mono">{`${review.search.rule} ${review.search.foldsHolding}/${review.search.foldsRequired} folds · ${review.search.pooledN}t ${rMultiple(review.search.pooledMeanR)} · search ${review.search.pass ? "passes" : "fails"}`}</span>
+            <span className="mono">{`${review.search.rule} k=${review.search.k} ${review.search.foldsHolding}/${review.search.foldsRequired} folds · ${review.search.pooledN}t ${rMultiple(review.search.pooledMeanR)} · floor ${rMultiple(review.search.pooledLowerBound?.toString())} · search ${review.search.pass ? "passes" : "fails"}`}</span>
             <span className="mono">{`${review.holdoutN}t`}</span>
             <span className="mono">{`pass ${percentFromFraction(String(review.passChance))}`}</span>
             <span className="mono dim">{`bar ${percentFromFraction(review.bar)}`}</span>
