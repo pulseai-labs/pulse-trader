@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
     onCandleClick: vi.fn(),
     fitAll: vi.fn(),
     centerOn: vi.fn(),
+    zoom: vi.fn(),
     destroy: vi.fn(),
   },
 }));
@@ -373,7 +374,7 @@ describe("the leg switch", () => {
 
     expect(
       await screen.findByText(
-        "The whole run at 15m is 38,401 bars — more than one read (the cap is 20,000). Pick a trade to load 15m around it.",
+        "The whole run at 15m is 38,401 bars — more than one read (the cap is 20,000). Pick a trade to load 15m around it, or go to a date.",
       ),
     ).toBeTruthy();
     // Nothing was read: a read the server would refuse with the cap is not sent.
@@ -1712,5 +1713,178 @@ describe("the marks table", () => {
     await expect(screen.findByText("Trades in the run")).resolves.toBeTruthy();
     await waitFor(() => expect(h.adapter.setMarks).toHaveBeenCalled());
     expect(h.adapter.setTrades).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go to a date, and zoom (r6.s4.w3)
+// ---------------------------------------------------------------------------
+
+/** Type `text` into the Go to (UTC) field and press Go. */
+function goTo(text: string) {
+  fireEvent.change(screen.getByLabelText("Go to (UTC)"), { target: { value: text } });
+  fireEvent.click(screen.getByRole("button", { name: "Go" }));
+}
+
+describe("going to a date (r6.s4.w3)", () => {
+  it("goes to a typed UTC date on the free chart through a window around it", async () => {
+    // The mount read (4h), then the 15m leg the trader picks, then the date.
+    // The 15m answer holds 2025 bars only, so the 2024 date is not in the drawn window.
+    vi.mocked(commands.chartData)
+      .mockResolvedValueOnce(ok(chartDto()))
+      .mockResolvedValue(ok(chartDto({ timeframe: "15m" })));
+    await open("#/chart");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "15m" }));
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(2));
+    // Draw 4h, clear for the read, draw 15m.
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(3));
+
+    // 2024-06-01 12:00Z is 1717243200000; ±500 15m bars is the window the server is asked for.
+    goTo("2024-06-01 12:00");
+
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: "1716793200000",
+        toMs: "1717693200000",
+        runId: null,
+      }),
+    );
+    await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith("1717243200000"));
+  });
+
+  it("centres on a date the drawn window already holds, with no read", async () => {
+    // The fixture's two bars are the run's own first and last, so 2025-02-01 is inside.
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-02-01");
+
+    await waitFor(() =>
+      expect(h.adapter.centerOn).toHaveBeenCalledWith(String(Date.UTC(2025, 1, 1))),
+    );
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a date at or after the holdout start before any read", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ holdout: { holdoutStartMs: "1736985600000", barsWithheld: 3 } })),
+    );
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-01-16");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("inside the holdout");
+    expect(alert.textContent).toContain("2025-01-16 UTC");
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    expect(h.adapter.centerOn).not.toHaveBeenCalled();
+  });
+
+  it("refuses a date it cannot read, naming the format", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-13-01");
+
+    expect(
+      await screen.findByText("Type a UTC date as YYYY-MM-DD or YYYY-MM-DD HH:mm."),
+    ).toBeTruthy();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("says to wait while the first chart read has not answered", async () => {
+    const pending = deferred<unknown>();
+    vi.mocked(commands.chartData).mockReturnValue(pending.promise as never);
+    await open("#/chart");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+
+    goTo("2025-02-01");
+
+    expect(
+      await screen.findByText("The chart has not loaded yet; go to a date once it has."),
+    ).toBeTruthy();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads a run's over-cap leg around a date, ending the wait for a trade", async () => {
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
+    await screen.findByText(/Pick a trade to load 15m around it, or go to a date\./);
+
+    // ENTRY is 2025-04-11T00:00Z, typed as a date.
+    goTo("2025-04-11");
+
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: String(ENTRY - HALF),
+        toMs: String(ENTRY + HALF),
+        runId: "run-1",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText(/Pick a trade to load/)).toBeNull());
+  });
+
+  it("refuses a date outside the run", async () => {
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2024-12-01");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "That date is outside this run (2025-01-01 00:00 UTC to 2026-02-05 00:00 UTC).",
+    );
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    expect(h.adapter.centerOn).not.toHaveBeenCalled();
+  });
+});
+
+describe("zooming (r6.s4.w3)", () => {
+  it("zooms with the buttons and with the + and - keys", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+    fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("out");
+
+    h.adapter.zoom.mockClear();
+    fireEvent.keyDown(window, { key: "+" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+    fireEvent.keyDown(window, { key: "=" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+    fireEvent.keyDown(window, { key: "-" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("out");
+    fireEvent.keyDown(window, { key: "_" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("out");
+    expect(h.adapter.zoom).toHaveBeenCalledTimes(4);
+
+    // A shortcut chord is the browser's, never the chart's.
+    fireEvent.keyDown(window, { key: "+", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "-", metaKey: true });
+    fireEvent.keyDown(window, { key: "-", altKey: true });
+    expect(h.adapter.zoom).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not zoom on + or - typed into a field", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.keyDown(screen.getByLabelText("Go to (UTC)"), { key: "+" });
+    fireEvent.keyDown(screen.getByLabelText("Setup label"), { key: "-" });
+
+    expect(h.adapter.zoom).not.toHaveBeenCalled();
   });
 });

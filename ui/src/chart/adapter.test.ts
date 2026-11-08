@@ -21,7 +21,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => {
-  const timeScale = { fitContent: vi.fn(), setVisibleLogicalRange: vi.fn() };
+  const timeScale = {
+    fitContent: vi.fn(),
+    setVisibleLogicalRange: vi.fn(),
+    getVisibleLogicalRange: vi.fn(),
+  };
   const series: {
     definition: unknown;
     options: unknown;
@@ -154,6 +158,7 @@ beforeEach(() => {
   h.markersApi.setMarkers.mockClear();
   h.timeScale.fitContent.mockClear();
   h.timeScale.setVisibleLogicalRange.mockClear();
+  h.timeScale.getVisibleLogicalRange.mockReset();
   vi.mocked(createChart).mockClear();
   vi.mocked(createSeriesMarkers).mockClear();
 });
@@ -168,6 +173,12 @@ describe("createChartAdapter", () => {
     // The logo is a LAYOUT option, and it is passed explicitly rather than left to the
     // library's default, so a default flip cannot silently drop TradingView's notice.
     expect(options?.layout).toMatchObject({ attributionLogo: true });
+  });
+
+  it("shows the time of day on the time scale and the crosshair (#456)", () => {
+    createChartAdapter(container());
+    const options = vi.mocked(createChart).mock.calls[0][1];
+    expect(options?.timeScale).toMatchObject({ timeVisible: true, secondsVisible: false });
   });
 
   it("draws the candles in the library's own units", () => {
@@ -390,6 +401,58 @@ describe("createChartAdapter", () => {
     createChartAdapter(container());
     expect(h.chart.addSeries).not.toHaveBeenCalled();
     expect(h.markersApi.setMarkers).not.toHaveBeenCalled();
+  });
+});
+
+describe("zoom (r6.s4.w3)", () => {
+  /** 200 bars, one 4h bar apart, from 2025-01-01T00:00Z. */
+  const TWO_HUNDRED: ChartCandleDto[] = Array.from({ length: 200 }, (_, index) => ({
+    t: String(1_735_689_600_000 + index * 14_400_000),
+    o: "100",
+    h: "101",
+    l: "99",
+    c: "100",
+    v: "1",
+  }));
+
+  /** An adapter with 200 bars loaded and the library reporting `range` as visible. */
+  function zoomable(range: { from: number; to: number } | null) {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(TWO_HUNDRED);
+    h.timeScale.getVisibleLogicalRange.mockReturnValue(range);
+    return adapter;
+  }
+
+  it("zooms in and out around the middle of the visible range", () => {
+    const adapter = zoomable({ from: 50, to: 150 });
+    adapter.zoom("in");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 75, to: 125 });
+    adapter.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 0, to: 200 });
+  });
+
+  it("keeps at least ten bars and at most the whole window in view", () => {
+    const tight = zoomable({ from: 95, to: 105 });
+    tight.zoom("in");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 95, to: 105 });
+
+    const whole = zoomable({ from: 0, to: 200 });
+    whole.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 0, to: 200 });
+  });
+
+  it("does not zoom without a visible range or a loaded bar", () => {
+    const blind = zoomable(null);
+    blind.zoom("in");
+    blind.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).not.toHaveBeenCalled();
+
+    // A visible range with no candle loaded: still nothing.
+    const empty = createChartAdapter(container());
+    h.timeScale.getVisibleLogicalRange.mockReturnValue({ from: 50, to: 150 });
+    empty.zoom("in");
+    empty.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).not.toHaveBeenCalled();
   });
 });
 

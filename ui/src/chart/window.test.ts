@@ -12,7 +12,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { CHART_BAR_CAP, WINDOW_HALF_BARS, covers, windowPlan } from "./window";
+import {
+  CHART_BAR_CAP,
+  WINDOW_HALF_BARS,
+  covers,
+  parseUtcInstant,
+  windowAround,
+  windowPlan,
+} from "./window";
 
 const DAY = 86_400_000;
 /** 2025-01-01T00:00Z. */
@@ -72,6 +79,49 @@ describe("windowPlan", () => {
 
   it("counts the cap the read itself enforces", () => {
     expect(CHART_BAR_CAP).toBe(20_000);
+  });
+});
+
+describe("parseUtcInstant", () => {
+  it("reads a UTC date and a UTC date-time", () => {
+    expect(parseUtcInstant("2025-03-04")).toBe(String(Date.UTC(2025, 2, 4)));
+    expect(parseUtcInstant("2025-03-04 13:45")).toBe(String(Date.UTC(2025, 2, 4, 13, 45)));
+    expect(parseUtcInstant("2025-03-04T13:45")).toBe(String(Date.UTC(2025, 2, 4, 13, 45)));
+  });
+
+  it("refuses a text that names no real UTC instant", () => {
+    expect(parseUtcInstant("2025-02-30")).toBeNull();
+    expect(parseUtcInstant("2025-03-04 24:00")).toBeNull();
+    expect(parseUtcInstant("13:45")).toBeNull();
+    expect(parseUtcInstant("")).toBeNull();
+    expect(parseUtcInstant("2025/03/04")).toBeNull();
+  });
+});
+
+describe("windowAround", () => {
+  /** A date far from either edge of `SPAN`. */
+  const A = String(ENTRY);
+
+  it("asks a free chart for 500 bars either side of the date", () => {
+    expect(windowAround(null, "15m", A)).toEqual({
+      kind: "window",
+      fromMs: String(ENTRY - HALF_MS),
+      toMs: String(ENTRY + HALF_MS),
+    });
+  });
+
+  it("plans a run leg around a date exactly as around a trade", () => {
+    // 15m is over the cap: a window, clamped near both edges.
+    for (const anchor of [A, String(FIRST + DAY), String(LAST - DAY)]) {
+      expect(windowAround(SPAN, "15m", anchor)).toEqual(windowPlan(SPAN, "15m", anchor));
+    }
+    // 4h fits in one read: the span.
+    expect(windowAround(SPAN, "4h", A)).toEqual(windowPlan(SPAN, "4h", A));
+    expect(windowAround(SPAN, "4h", A)).toEqual({ kind: "span" });
+  });
+
+  it("asks for the span on a timeframe it cannot size", () => {
+    expect(windowAround(null, "3m", A)).toEqual({ kind: "span" });
   });
 });
 

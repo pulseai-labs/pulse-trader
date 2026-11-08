@@ -82,12 +82,20 @@ export interface ChartAdapter {
   fitAll(): void;
   /** Scroll so the bar nearest `timeMs` sits in the middle of the pane. */
   centerOn(timeMs: string): void;
+  /** Halve ("in") or double ("out") the visible bar range around its middle. */
+  zoom(direction: "in" | "out"): void;
   /** Remove the chart and everything it owns. Irreversible: unmount only. */
   destroy(): void;
 }
 
 /** How many bars either side of the centred bar stay in view. */
 const CENTRE_BARS = 60;
+
+/** One zoom step halves or doubles the visible range. */
+const ZOOM_FACTOR = 2;
+
+/** The least half-range a zoom-in leaves: ten bars in view, so every bar stays clickable. */
+const MIN_ZOOM_HALF_BARS = 5;
 
 /** One mapped marker, in the library's two marker shapes. */
 function toSeriesMarker(marker: ChartMarker): SeriesMarker<Time> {
@@ -146,7 +154,9 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       horzLines: { color: palette.grid },
     },
     rightPriceScale: { borderColor: palette.grid },
-    timeScale: { borderColor: palette.grid },
+    // The library shows a `UTCTimestamp` in UTC, so with the time of day on, the axis and
+    // the crosshair label read the bar's UTC open (#456). On `1d` that is `00:00`.
+    timeScale: { borderColor: palette.grid, timeVisible: true, secondsVisible: false },
   });
 
   // What the read last handed in. The candle times are kept as the read spelled
@@ -284,6 +294,19 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
         from: index - CENTRE_BARS,
         to: index + CENTRE_BARS,
       });
+    },
+
+    zoom(direction) {
+      if (candlePoints.length === 0) return;
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (range === null) return;
+      const centre = (range.from + range.to) / 2;
+      const half = (range.to - range.from) / 2;
+      const wanted = direction === "in" ? half / ZOOM_FACTOR : half * ZOOM_FACTOR;
+      // Never fewer than ten bars, never more than the whole loaded window.
+      const most = Math.max(MIN_ZOOM_HALF_BARS, candlePoints.length / 2);
+      const next = Math.min(Math.max(wanted, MIN_ZOOM_HALF_BARS), most);
+      chart.timeScale().setVisibleLogicalRange({ from: centre - next, to: centre + next });
     },
 
     destroy() {
