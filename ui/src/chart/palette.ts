@@ -42,6 +42,18 @@ export const PALETTE_TOKENS = {
   /** An agent's example-trade mark (r5.s3.w3): the AI purple, so the two writers'
    *  marks are told apart at a glance (G5). */
   markAgent: "--chart-mark-agent",
+  /** A ribbon member's line (r6.s4.w4): muted, so the band edges read over it. */
+  ribbon: "--chart-ribbon",
+  /** The band top or band bottom: drawn strongly. */
+  bandEdge: "--chart-band-edge",
+  /** WT1, in its own pane. */
+  oscillator: "--chart-oscillator",
+  /** The dotted guide at 0 in the oscillator's pane. */
+  oscillatorGuide: "--chart-oscillator-guide",
+  /** The selected trade's arm, dip and trigger markers. */
+  setup: "--chart-setup",
+  /** The selected trade's stop line. */
+  stop: "--chart-stop",
 } as const;
 
 /** Every colour the chart draws with, resolved to a value the canvas accepts. */
@@ -70,5 +82,11 @@ export function chartPalette(root: Element): ChartPalette {
     pivotGhost: read(PALETTE_TOKENS.pivotGhost),
     markTrader: read(PALETTE_TOKENS.markTrader),
     markAgent: read(PALETTE_TOKENS.markAgent),
+    ribbon: read(PALETTE_TOKENS.ribbon),
+    bandEdge: read(PALETTE_TOKENS.bandEdge),
+    oscillator: read(PALETTE_TOKENS.oscillator),
+    oscillatorGuide: read(PALETTE_TOKENS.oscillatorGuide),
+    setup: read(PALETTE_TOKENS.setup),
+    stop: read(PALETTE_TOKENS.stop),
   };
 }
