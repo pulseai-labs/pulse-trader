@@ -1151,6 +1151,16 @@ export type ChartTradeDto = {
 	exitReason: string | null,
 	/**  Realized R multiple, exact decimal string. */
 	realizedR: string,
+	/**  The stored stop price, exact decimal string; `null` on a trade stored without one. */
+	stopPrice: string | null,
+	/**  Open of the primary bar the setup armed on (the 15m bar a 4H close armed), epoch ms; `null` without a setup. */
+	armBarTime: string | null,
+	/**  Open of the higher-timeframe bar whose close armed the setup, epoch ms; `null` without a setup or an HTF. */
+	htfArmBarTime: string | null,
+	/**  Open of the primary bar the dip was seen on, epoch ms; `null` without a setup. */
+	dipBarTime: string | null,
+	/**  Open of the primary bar the setup triggered on (the entry signal bar), epoch ms; `null` without a setup. */
+	triggerBarTime: string | null,
 };
 
 /**

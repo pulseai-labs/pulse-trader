@@ -1459,6 +1459,12 @@ function toChartTrades(rows: readonly TradeRowDto[]): ChartTradeDto[] {
     exitPrice: row.exitPrice,
     exitReason: row.exitReason,
     realizedR: row.realizedR,
+    stopPrice: row.stopPrice,
+    // the run read carries no setup trace; the drawn window's rows do (w4 draws from those)
+    armBarTime: null,
+    htfArmBarTime: null,
+    dipBarTime: null,
+    triggerBarTime: null,
   }));
 }
 

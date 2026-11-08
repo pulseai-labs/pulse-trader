@@ -193,6 +193,11 @@ describe("toMarkers", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(toMarkers([], trades, PALETTE)).toEqual([
@@ -211,6 +216,11 @@ describe("toMarkers", () => {
         exitPrice: "92000",
         exitReason: "stop_loss",
         realizedR: "-1",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(toMarkers([], trades, PALETTE)).toEqual([
@@ -231,6 +241,11 @@ describe("toMarkers", () => {
         exitPrice: null,
         exitReason: null,
         realizedR: "0",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(toMarkers([], trades, PALETTE)).toEqual([
@@ -251,6 +266,11 @@ describe("toMarkers", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     const times = toMarkers(overlays, trades, PALETTE).map((marker) => marker.time);
@@ -308,6 +328,11 @@ describe("example marks as markers (r5.s3.w3)", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     const merged = toMarkers(overlays, trades, PALETTE, [mark()]);
@@ -355,6 +380,11 @@ describe("markersInWindow", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(markersInWindow(toMarkers([], trades, PALETTE), loaded)).toEqual([
@@ -397,6 +427,11 @@ describe("markersInWindow", () => {
         exitPrice: null,
         exitReason: null,
         realizedR: "0",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(markersInWindow(toMarkers([], trades, PALETTE), loaded)).toEqual([
@@ -431,6 +466,11 @@ describe("markersInWindow", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     const markers = toMarkers([], trades, PALETTE);
@@ -505,6 +545,11 @@ describe("buildLayers", () => {
               exitPrice: "92000",
               exitReason: "take_profit",
               realizedR: "2",
+              stopPrice: null,
+              armBarTime: null,
+              htfArmBarTime: null,
+              dipBarTime: null,
+              triggerBarTime: null,
             },
           ],
           overlays: [],
@@ -532,6 +577,11 @@ describe("buildLayers", () => {
       exitPrice: "92000",
       exitReason: "take_profit",
       realizedR: "1",
+      stopPrice: null,
+      armBarTime: null,
+      htfArmBarTime: null,
+      dipBarTime: null,
+      triggerBarTime: null,
     };
     const layers = buildLayers(
       {

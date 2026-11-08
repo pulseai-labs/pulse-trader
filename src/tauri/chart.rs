@@ -208,6 +208,16 @@ pub struct ChartTradeDto {
     pub exit_reason: Option<String>,
     /// Realized R multiple, exact decimal string.
     pub realized_r: String,
+    /// The stored stop price, exact decimal string; `null` on a trade stored without one.
+    pub stop_price: Option<String>,
+    /// Open of the primary bar the setup armed on (the 15m bar a 4H close armed), epoch ms; `null` without a setup.
+    pub arm_bar_time: Option<String>,
+    /// Open of the higher-timeframe bar whose close armed the setup, epoch ms; `null` without a setup or an HTF.
+    pub htf_arm_bar_time: Option<String>,
+    /// Open of the primary bar the dip was seen on, epoch ms; `null` without a setup.
+    pub dip_bar_time: Option<String>,
+    /// Open of the primary bar the setup triggered on (the entry signal bar), epoch ms; `null` without a setup.
+    pub trigger_bar_time: Option<String>,
 }
 
 /// The run layer — `null` when the read named no run.
@@ -331,6 +341,10 @@ pub async fn chart_data_core(
 
     let trades = match &run {
         Some(run) => {
+            let legs = TradeLegs {
+                primary: run.primary_timeframe,
+                htf: run.htf_timeframe,
+            };
             let trades = state
                 .backtest_run_repo()
                 .get_trades(&BacktestRunId::new(&run.run_id))
@@ -339,7 +353,7 @@ pub async fn chart_data_core(
                 .iter()
                 .filter(|trade| trade_is_drawable(trade, read.drawable))
                 .filter(|trade| trade_clears_holdout(trade, holdout))
-                .map(trade_dto)
+                .map(|trade| trade_dto(trade, legs))
                 .collect()
         }
         None => Vec::new(),
@@ -377,6 +391,8 @@ struct ResolvedRun {
     data_version: DataVersion,
     /// The run's primary timeframe — the run's own window is its primary span.
     primary_timeframe: Timeframe,
+    /// The run's higher timeframe, when it read one.
+    htf_timeframe: Option<Timeframe>,
     /// The run's primary snapshot identity.
     primary_data_version: DataVersion,
     /// The candle slice the run recorded (`inputs.window`), or `None` for a run
@@ -445,6 +461,7 @@ async fn resolve_run(
         series,
         data_version,
         primary_timeframe: inputs.primary.timeframe,
+        htf_timeframe: inputs.htf.as_ref().map(|htf| htf.timeframe),
         primary_data_version: inputs.primary.data_version.clone(),
         window: inputs.window.clone(),
         specs,
@@ -1092,6 +1109,11 @@ fn trade_is_drawable(trade: &Trade, drawable: Option<(i64, i64)>) -> bool {
 /// reason and its realized R — so the cut withholds it whole, exactly as it
 /// withholds the candles the position ran through. `None` (no freeze open, or the
 /// certification exemption) clears every trade.
+///
+/// The fence already covers a setup trade's bars: the arm bar closes before the dip
+/// bar, the dip bar before the trigger bar, and the trigger bar before the entry fill,
+/// so a trade whose two fills are before the holdout start has every setup bar before
+/// it too, and a trade that reaches the fence is withheld with its setup bars.
 fn trade_clears_holdout(trade: &Trade, holdout: Option<HoldoutFreeze>) -> bool {
     holdout.is_none_or(|freeze| {
         trade.entry_fill_time < freeze.holdout_start_ms
@@ -1103,7 +1125,7 @@ fn trade_clears_holdout(trade: &Trade, holdout: Option<HoldoutFreeze>) -> bool {
 /// trade is closed by construction (an open position is the run's own
 /// `open_position`, never a trade row), so the exit fields are present; they cross
 /// as `Option` because the wire shape the tab draws allows an open one.
-fn trade_dto(trade: &Trade) -> ChartTradeDto {
+fn trade_dto(trade: &Trade, legs: TradeLegs) -> ChartTradeDto {
     ChartTradeDto {
         side: direction_label(trade.direction).to_owned(),
         entry_time: ms(trade.entry_fill_time),
@@ -1112,7 +1134,34 @@ fn trade_dto(trade: &Trade) -> ChartTradeDto {
         exit_price: Some(dec(trade.exit_price)),
         exit_reason: Some(exit_reason_label(trade.exit_reason).to_owned()),
         realized_r: dec(trade.realized_r),
+        stop_price: trade.stop_price.map(dec),
+        arm_bar_time: trade
+            .setup
+            .map(|setup| ms(bar_open(setup.arm_time, legs.primary))),
+        htf_arm_bar_time: trade
+            .setup
+            .zip(legs.htf)
+            .map(|(setup, htf)| ms(bar_open(setup.arm_time, htf))),
+        dip_bar_time: trade
+            .setup
+            .map(|setup| ms(bar_open(setup.dip_time, legs.primary))),
+        trigger_bar_time: trade
+            .setup
+            .map(|_| ms(bar_open(trade.entry_signal_time, legs.primary))),
     }
+}
+
+/// The timeframes a run's trades are placed on: its primary and, when it read one, its HTF.
+#[derive(Debug, Clone, Copy)]
+struct TradeLegs {
+    primary: Timeframe,
+    htf: Option<Timeframe>,
+}
+
+/// The open of the `timeframe` bar that closes at `close_ms`: the store's bars close one
+/// millisecond before the next opens (`close_time = open_time + duration − 1`).
+fn bar_open(close_ms: i64, timeframe: Timeframe) -> i64 {
+    close_ms - (timeframe.duration_ms() - 1)
 }
 
 /// Load the pinned snapshot when one is named, else HEAD.

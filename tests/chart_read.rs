@@ -21,10 +21,10 @@ use pulse::{
     ChartDataDto, ChartDataRequest, ChartOverlayDto, CompiledValue, DataVersion, DesktopState,
     Direction, EngineFingerprint, EquityCurve, EvalContext, ExitReason, FakeClock, Fill,
     FundingConfig, GetBacktestRunRequest, IndicatorEngine, IndicatorSpec, NewVersion,
-    OpenFreezeRequest, Pair, PriceField, Regime, RegimeBreakdown, Series, SkippedEntryCounts,
-    SnapshotSelection, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, StrategyId,
-    StrategyRepository, SummaryStats, SweepableValue, Timeframe, Trade, TradeSource, VersionId,
-    chart_data_core, get_backtest_run_core,
+    OpenFreezeRequest, Pair, PriceField, Regime, RegimeBreakdown, Series, SetupTrace,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo,
+    StrategyId, StrategyRepository, SummaryStats, SweepableValue, Timeframe, Trade, TradeSource,
+    VersionId, chart_data_core, get_backtest_run_core,
 };
 use rust_decimal::Decimal;
 use support::server::{ServerOptions, TestServer, spawn_server};
@@ -1476,6 +1476,202 @@ async fn an_open_freeze_withholds_every_trade_that_reaches_the_holdout() {
                     .expect("a time")
                     < holdout_start,
             "no returned trade may carry a time at or after the holdout start"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The run layer — a trade's setup bars and stop (r6.s4.w2)
+// ---------------------------------------------------------------------------
+
+/// One setup trade whose 4H bar `k` armed it, and the opens of its four bars.
+///
+/// `a` is the 15m candle that closes with `h4.candles[k]`. The setup armed on it,
+/// saw the dip two bars later and triggered five bars later; the entry fills on the
+/// bar after the trigger. The array holds the expected opens
+/// `[arm 15m, arm 4H, dip 15m, trigger 15m]`.
+fn setup_trade(m15: &CandleSeries, h4: &CandleSeries, k: usize) -> (Trade, [i64; 4]) {
+    let a = m15
+        .candles
+        .iter()
+        .position(|candle| candle.close_time == h4.candles[k].close_time)
+        .expect("a 15m candle closes with the 4H bar");
+    let mut trade = trade_at(m15.candles[a + 6].open_time, "2");
+    trade.entry_signal_time = m15.candles[a + 5].close_time;
+    trade.setup = Some(SetupTrace {
+        arm_time: m15.candles[a].close_time,
+        dip_time: m15.candles[a + 2].close_time,
+        anchor_time: None,
+    });
+    let opens = [
+        m15.candles[a].open_time,
+        h4.candles[k].open_time,
+        m15.candles[a + 2].open_time,
+        m15.candles[a + 5].open_time,
+    ];
+    (trade, opens)
+}
+
+/// The fixture's two head series: the 15m primary and the 4H HTF.
+fn fixture_series(store: &CandleStore) -> (CandleSeries, CandleSeries) {
+    let load = |timeframe| {
+        store
+            .load_version(&pair(), timeframe, &head(store, timeframe))
+            .expect("the fixture reads")
+            .series
+    };
+    (load(Timeframe::M15), load(Timeframe::H4))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_trade_carries_its_setup_bars_and_stop_on_both_legs() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let (m15, h4) = fixture_series(&store);
+    let (trade, opens) = setup_trade(&m15, &h4, 20);
+    let run_id = seed_run(&server, &version, vec![trade]).await;
+
+    for timeframe in ["15m", "4h"] {
+        let dto = read(
+            &state,
+            ChartDataRequest {
+                run_id: Some(run_id.clone()),
+                ..request("BTCUSDT", timeframe)
+            },
+        )
+        .await
+        .expect("the run reads");
+        let run = dto.run.expect("the read carries the run layer");
+        assert_eq!(run.trades.len(), 1, "the {timeframe} read lists the trade");
+        let drawn = &run.trades[0];
+        assert_eq!(
+            drawn.arm_bar_time.as_deref(),
+            Some(opens[0].to_string().as_str()),
+            "{timeframe}: the 15m bar the setup armed on"
+        );
+        assert_eq!(
+            drawn.htf_arm_bar_time.as_deref(),
+            Some(opens[1].to_string().as_str()),
+            "{timeframe}: the 4H bar whose close armed it"
+        );
+        assert_eq!(
+            drawn.dip_bar_time.as_deref(),
+            Some(opens[2].to_string().as_str()),
+            "{timeframe}: the dip bar"
+        );
+        assert_eq!(
+            drawn.trigger_bar_time.as_deref(),
+            Some(opens[3].to_string().as_str()),
+            "{timeframe}: the trigger bar"
+        );
+        assert_eq!(
+            drawn.stop_price.as_deref(),
+            Some("89000"),
+            "{timeframe}: the stored stop"
+        );
+        if timeframe == "4h" {
+            assert!(
+                dto.candles
+                    .iter()
+                    .any(|candle| candle.t == opens[1].to_string()),
+                "the 4h read draws the bar the arm time names"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trade_without_a_setup_carries_no_setup_bars() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let (m15, _) = fixture_series(&store);
+    let first = m15.candles[0].open_time;
+    let step = Timeframe::M15.duration_ms();
+    let with_stop = trade_at(first + 10 * step, "2");
+    let mut without_stop = trade_at(first + 20 * step, "-1");
+    without_stop.stop_price = None;
+    let run_id = seed_run(&server, &version, vec![with_stop, without_stop]).await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the run reads");
+    let run = dto.run.expect("the read carries the run layer");
+    assert_eq!(run.trades.len(), 2);
+    for drawn in &run.trades {
+        assert_eq!(drawn.arm_bar_time, None);
+        assert_eq!(drawn.htf_arm_bar_time, None);
+        assert_eq!(drawn.dip_bar_time, None);
+        assert_eq!(drawn.trigger_bar_time, None);
+    }
+    assert_eq!(run.trades[0].stop_price.as_deref(), Some("89000"));
+    assert_eq!(run.trades[1].stop_price, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fence_withholds_a_setup_trade_by_its_fills() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let (m15, h4) = fixture_series(&store);
+    let (before, before_opens) = setup_trade(&m15, &h4, 20);
+    // B's setup bars and entry are before the fence; its exit reaches it.
+    let k = h4
+        .candles
+        .iter()
+        .position(|candle| candle.close_time == HOLDOUT_MS - 14_400_001)
+        .expect("a 4H bar closes just under one 4H bar before the holdout start");
+    let (mut reaching, _) = setup_trade(&m15, &h4, k);
+    reaching.exit_signal_time = HOLDOUT_MS;
+    reaching.exit_fill_time = HOLDOUT_MS;
+    reaching.fills[1].time_ms = HOLDOUT_MS;
+    assert!(
+        reaching.entry_fill_time < HOLDOUT_MS,
+        "B enters before the fence"
+    );
+    let reaching_entry = reaching.entry_fill_time.to_string();
+    let expected = before_opens.map(|open| open.to_string());
+    let run_id = seed_run(&server, &version, vec![before.clone(), reaching]).await;
+    open_freeze(&server, HOLDOUT_MS).await;
+
+    for timeframe in ["15m", "4h"] {
+        let dto = read(
+            &state,
+            ChartDataRequest {
+                run_id: Some(run_id.clone()),
+                ..request("BTCUSDT", timeframe)
+            },
+        )
+        .await
+        .expect("the fenced run reads");
+        let run = dto.run.expect("the read carries the run layer");
+        assert_eq!(
+            run.trades.len(),
+            1,
+            "{timeframe}: only the trade whose fills clear the fence is listed"
+        );
+        let drawn = &run.trades[0];
+        assert_eq!(drawn.entry_time, before.entry_fill_time.to_string());
+        assert_ne!(drawn.entry_time, reaching_entry, "B is withheld whole");
+        assert_eq!(
+            [
+                drawn.arm_bar_time.as_deref(),
+                drawn.htf_arm_bar_time.as_deref(),
+                drawn.dip_bar_time.as_deref(),
+                drawn.trigger_bar_time.as_deref(),
+            ],
+            expected.each_ref().map(|open| Some(open.as_str())),
+            "{timeframe}: A keeps its four bar times"
         );
     }
 }

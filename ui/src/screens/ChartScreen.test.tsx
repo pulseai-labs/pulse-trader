@@ -117,6 +117,11 @@ function trade(over: Partial<ChartTradeDto>): ChartTradeDto {
     exitPrice: "92000",
     exitReason: "take_profit",
     realizedR: "2",
+    stopPrice: null,
+    armBarTime: null,
+    htfArmBarTime: null,
+    dipBarTime: null,
+    triggerBarTime: null,
     ...over,
   };
 }
