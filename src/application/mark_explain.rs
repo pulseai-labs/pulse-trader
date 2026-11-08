@@ -774,7 +774,7 @@ fn validation_text(errors: &crate::domain::ValidationErrors) -> String {
 /// `Price`/`Const`/`Arith`, and the read path's own tokens for an indicator
 /// (`rsi:14`, `h4:ema(200)`, `cdl:engulfing`) — never `render::value`'s prose,
 /// which spells a candle pattern `dark cloud cover` rather than `cdl:dark_cloud_cover`.
-fn operand_label(value: &ValueSource) -> String {
+pub(crate) fn operand_label(value: &ValueSource) -> String {
     use crate::application::mcp_read::indicator_label;
     fn series_prefix(series: Series) -> &'static str {
         match series {

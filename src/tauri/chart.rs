@@ -1,8 +1,9 @@
 //! The chart read contract (r5.s2.w1, PDR-0036) — the **app's** one view of what
 //! the Chart tab draws: a window of candles for a pair and timeframe (capped and
 //! cut at an open freeze's holdout start) and, when a backtest run is named, that
-//! run's trades and one overlay series per S/R, pivot, candle-pattern and EMA
-//! operand its version's rule uses on that series.
+//! run's trades and one overlay series per S/R, pivot, candle-pattern, EMA, SMA and
+//! `WaveTrend` operand its version's rule uses on that series, plus the ribbon's band
+//! edges (r6.s4.w1).
 //!
 //! **The engine computes; the tab draws (PDR-0002).** Every overlay value here
 //! comes from stepping the existing [`IndicatorEngine`] exactly as MCP
@@ -10,13 +11,16 @@
 //! step, one `current(...)` read per bar — so an overlay's values equal what an
 //! agent sees for the same token, pair, timeframe and data version (SPINE G2).
 //! No indicator, level, pivot or pattern maths lives in this module, and none
-//! lives in TypeScript.
+//! lives in TypeScript. A band edge (a rule's `max`/`min` over `line` indicators) is
+//! evaluated with the engine's own `CompiledValue::eval` over the engine values of
+//! its members, so still no maths lives here.
 //!
 //! **Wire shape.** camelCase; times cross as millisecond integer strings,
 //! decimals as exact strings (specta refuses `i64`/`u64`; NFR-2) and counts as
 //! `u32`. The overlay list is one internally tagged enum on `kind` (`level`,
-//! `line`, `pivot`, `pattern` — the `streak_card.rs` precedent); every overlay
-//! carries the `label` an agent can feed `export_indicators`.
+//! `line`, `pivot`, `pattern`, `oscillator`, `bandEdge` — the `streak_card.rs`
+//! precedent); every overlay carries the `label` an agent can feed
+//! `export_indicators`, except a `bandEdge`'s, which is explain's operand label.
 //!
 //! **Additive by design (ADR-0020).** A NEW plain route, a NEW bus command and a
 //! NEW client method; not one existing Tauri signature changes.
@@ -31,13 +35,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::adapters::store::CandleStore;
+use crate::application::mark_explain::operand_label;
 use crate::application::mcp_read::indicator_label;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, Candle, CandleSeries, CandleSeriesRepository,
-    CandleWindow, CompiledValue, DataVersion, EvalContext, HoldoutFreeze, IndicatorSpec, Pair,
-    Series, StoredCandleSeries, StrategyRepository, SweepableValue, Timeframe, Trade, compile,
-    validate,
+    ArithOp, BacktestRunId, BacktestRunRepository, Candle, CandleSeries, CandleSeriesRepository,
+    CandleWindow, CompiledValue, Condition, DataVersion, EvalContext, ExitRule, HoldoutFreeze,
+    IndicatorSpec, Pair, Series, StoredCandleSeries, StrategyDsl, StrategyRepository,
+    SweepableValue, Timeframe, Trade, ValueSource, compile, validate,
 };
 use crate::tauri::backtest::{dec, direction_label, exit_reason_label, ms};
 
@@ -124,8 +129,9 @@ pub struct ChartPatternEventDto {
     pub value: String,
 }
 
-/// One overlay series, tagged on `kind` (Q4). The `label` is always the token
-/// `export_indicators` accepts for the spec its values came from.
+/// One overlay series, tagged on `kind` (Q4). The `label` is the token
+/// `export_indicators` accepts for the spec its values came from, except a
+/// `bandEdge`'s, which is explain's operand label; its members are tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(
     tag = "kind",
@@ -141,9 +147,9 @@ pub enum ChartOverlayDto {
         /// One per window bar; `null` where the engine reads no value.
         values: Vec<Option<String>>,
     },
-    /// An EMA line: one value per window bar, `null` while the engine warms up.
+    /// An EMA or SMA line: one value per window bar, `null` while the engine warms up.
     Line {
-        /// The engine's token for the EMA's spec.
+        /// The engine's token for the line's spec.
         label: String,
         /// One per window bar; `null` while warming up.
         values: Vec<Option<String>>,
@@ -161,6 +167,26 @@ pub enum ChartOverlayDto {
         label: String,
         /// The window's firings, in bar order.
         events: Vec<ChartPatternEventDto>,
+    },
+    /// An oscillator (`WaveTrend` WT1, r6.s4.w1): one value per window bar, `null`
+    /// while warming up. Not prices, so the tab draws it in its own pane.
+    Oscillator {
+        /// The engine's token for the oscillator's spec (`wavetrend:9:12`).
+        label: String,
+        /// One per window bar; `null` while warming up.
+        values: Vec<Option<String>>,
+    },
+    /// A band edge (r6.s4.w1): a `max`/`min` operand of the rule over `line`
+    /// indicators on this series (the ribbon's band top or bottom), one value per
+    /// window bar from the engine's own `CompiledValue::eval` over its members'
+    /// engine values; `null` where any member has none.
+    BandEdge {
+        /// Explain's operand label (`max(ema:5,ema:11)`); not an `export_indicators` token.
+        label: String,
+        /// The labels of the `line` overlays it combines, in leaf order, each once.
+        members: Vec<String>,
+        /// One per window bar; `null` where any member has no value.
+        values: Vec<Option<String>>,
     },
 }
 
@@ -202,7 +228,8 @@ pub struct ChartRunDto {
     /// before the holdout start: its exit price, exit reason and realized R were
     /// produced inside the withheld period, and the cut withholds those bars.
     pub trades: Vec<ChartTradeDto>,
-    /// One overlay per drawn spec of the rule on this series.
+    /// One overlay per drawn spec of the rule on this series, then one `bandEdge`
+    /// per band edge.
     pub overlays: Vec<ChartOverlayDto>,
     /// The labels of the rule's other specs on this series — what the tab says it
     /// does not draw (Q4; PDR-0011).
@@ -260,6 +287,7 @@ pub async fn chart_data_core(
     // the cap; the plain pair read takes the latest bars up to it (Q3/G4).
     let bounded = run.is_some() || from_ms.is_some() || to_ms.is_some();
     let specs = run.as_ref().map_or_else(Vec::new, |run| run.specs.clone());
+    let edges = run.as_ref().map_or_else(Vec::new, |run| run.edges.clone());
     let version = run.as_ref().map(|run| run.data_version.clone());
     let span = run
         .as_ref()
@@ -286,6 +314,7 @@ pub async fn chart_data_core(
                 (from_ms, to_ms),
                 bounded,
                 &specs,
+                &edges,
             )
         })
         .await
@@ -356,6 +385,8 @@ struct ResolvedRun {
     window: Option<CandleWindow>,
     /// The rule's specs on the drawn series, in reference order.
     specs: Vec<IndicatorSpec>,
+    /// The rule's band edges on the drawn series, in the order the rule names them.
+    edges: Vec<RuleEdge>,
 }
 
 /// Resolve one named run against the requested pair and timeframe (Q1/Q2/Q4):
@@ -407,7 +438,7 @@ async fn resolve_run(
             ),
         ));
     };
-    let specs = compile_specs(state, &run.strategy_version_id, series).await?;
+    let (specs, edges) = compile_specs(state, &run.strategy_version_id, series).await?;
     Ok(ResolvedRun {
         run_id: run_id.to_owned(),
         version_id: run.strategy_version_id.clone(),
@@ -417,16 +448,18 @@ async fn resolve_run(
         primary_data_version: inputs.primary.data_version.clone(),
         window: inputs.window.clone(),
         specs,
+        edges,
     })
 }
 
 /// The rule's specs on one series, from the version's own compiled document
-/// (ADR-0024: read only — no DSL and no indicator change).
+/// (ADR-0024: read only — no DSL and no indicator change), and the rule's band
+/// edges on that series.
 async fn compile_specs(
     state: &DesktopState,
     version_id: &VersionId,
     series: Series,
-) -> Result<Vec<IndicatorSpec>, BusError> {
+) -> Result<(Vec<IndicatorSpec>, Vec<RuleEdge>), BusError> {
     let version = state
         .strategy_repo()
         .get_version(version_id)
@@ -450,12 +483,178 @@ async fn compile_specs(
         )
     })?;
     Ok(match series {
-        Series::Primary => compiled.required_indicators().to_vec(),
-        Series::Htf => compiled.required_htf_indicators().to_vec(),
+        Series::Primary => (
+            compiled.required_indicators().to_vec(),
+            band_edges(validated.dsl(), series),
+        ),
+        Series::Htf => (
+            compiled.required_htf_indicators().to_vec(),
+            band_edges(validated.dsl(), series),
+        ),
         // The daily series is never drawn (Q4 / out of scope), and no run records
         // it as its primary or HTF timeframe.
-        Series::D1 => Vec::new(),
+        Series::D1 => (Vec::new(), Vec::new()),
     })
+}
+
+/// One band edge of the rule on the drawn series: the operand and its distinct leaf specs.
+#[derive(Debug, Clone)]
+struct RuleEdge {
+    /// The `max`/`min` operand, as the rule writes it.
+    value: ValueSource,
+    /// Its leaf `line` specs, each once, in leaf order.
+    members: Vec<IndicatorSpec>,
+}
+
+/// The rule's band edges on `series`, in the order the rule names them — `entry`,
+/// `filters`, `SignalExit` conditions, then `setup.long` and `setup.short` (`arm`,
+/// `dip`, `trigger`, `stop_anchor`) — each once (`ValueSource` equality).
+fn band_edges(dsl: &StrategyDsl, series: Series) -> Vec<RuleEdge> {
+    let mut edges = Vec::new();
+    collect_condition_edges(&dsl.entry, series, &mut edges);
+    for filter in &dsl.filters {
+        collect_condition_edges(filter, series, &mut edges);
+    }
+    for exit in &dsl.exits {
+        if let ExitRule::SignalExit { condition } = exit {
+            collect_condition_edges(condition, series, &mut edges);
+        }
+    }
+    if let Some(setup) = dsl.setup.as_deref() {
+        for side in [setup.long.as_ref(), setup.short.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for condition in [&side.arm, &side.dip, &side.trigger]
+                .into_iter()
+                .chain(side.stop_anchor.as_ref())
+            {
+                collect_condition_edges(condition, series, &mut edges);
+            }
+        }
+    }
+    edges
+}
+
+/// Visit every operand of `condition`: `Compare`/`CrossesAbove`/`CrossesBelow` lhs then
+/// rhs, `And`/`Or` in order, `Not`, and a `Rising`/`Falling` value.
+fn collect_condition_edges(condition: &Condition, series: Series, edges: &mut Vec<RuleEdge>) {
+    match condition {
+        Condition::Compare { lhs, rhs, .. }
+        | Condition::CrossesAbove { lhs, rhs }
+        | Condition::CrossesBelow { lhs, rhs } => {
+            collect_value_edges(lhs, series, edges);
+            collect_value_edges(rhs, series, edges);
+        }
+        Condition::And { conditions } | Condition::Or { conditions } => {
+            for child in conditions {
+                collect_condition_edges(child, series, edges);
+            }
+        }
+        Condition::Not { condition } => collect_condition_edges(condition, series, edges),
+        Condition::Rising { value, .. } | Condition::Falling { value, .. } => {
+            collect_value_edges(value, series, edges);
+        }
+    }
+}
+
+/// Record `value` when it is a band edge, else look inside it. Only the outermost
+/// qualifying node is an edge, a `max` inside a sum is still one, and a `Lag` over an
+/// edge draws the edge unlagged (the line is the band; the lag is when the rule reads it).
+fn collect_value_edges(value: &ValueSource, series: Series, edges: &mut Vec<RuleEdge>) {
+    match value {
+        ValueSource::Arith { op, lhs, rhs } => {
+            let leaves = match op {
+                ArithOp::Max | ArithOp::Min => edge_leaves(value, *op, series),
+                _ => None,
+            };
+            if let Some(leaves) = leaves {
+                if !edges.iter().any(|edge| edge.value == *value) {
+                    let mut members: Vec<IndicatorSpec> = Vec::new();
+                    for leaf in leaves {
+                        if !members.contains(&leaf) {
+                            members.push(leaf);
+                        }
+                    }
+                    edges.push(RuleEdge {
+                        value: value.clone(),
+                        members,
+                    });
+                }
+                return;
+            }
+            collect_value_edges(lhs, series, edges);
+            collect_value_edges(rhs, series, edges);
+        }
+        ValueSource::Lag { value, .. } => collect_value_edges(value, series, edges),
+        ValueSource::Constant { .. }
+        | ValueSource::Price { .. }
+        | ValueSource::Indicator { .. } => {}
+    }
+}
+
+/// The leaf specs of `value` when every node is `Arith { op: root_op }` and every leaf is
+/// `ValueSource::Indicator { series, spec }` with this `series` and
+/// `drawn_kind(spec) == Some(Drawn::Line)`.
+fn edge_leaves(
+    value: &ValueSource,
+    root_op: ArithOp,
+    series: Series,
+) -> Option<Vec<IndicatorSpec>> {
+    match value {
+        ValueSource::Arith { op, lhs, rhs } if *op == root_op => {
+            let mut leaves = edge_leaves(lhs, root_op, series)?;
+            leaves.extend(edge_leaves(rhs, root_op, series)?);
+            Some(leaves)
+        }
+        ValueSource::Indicator {
+            series: leaf_series,
+            spec,
+        } if *leaf_series == series && drawn_kind(spec) == Some(Drawn::Line) => {
+            Some(vec![spec.clone()])
+        }
+        _ => None,
+    }
+}
+
+/// The engine's compiled form of an edge operand: a lag-0 indicator leaf, or an `Arith`
+/// of two such trees. Anything else is no edge.
+fn edge_value(value: &ValueSource) -> Option<CompiledValue> {
+    match value {
+        ValueSource::Indicator { series, spec } => Some(CompiledValue::Indicator {
+            series: *series,
+            spec: spec.clone(),
+            lag: 0,
+        }),
+        ValueSource::Arith { op, lhs, rhs } => Some(CompiledValue::Arith {
+            op: *op,
+            lhs: Box::new(edge_value(lhs)?),
+            rhs: Box::new(edge_value(rhs)?),
+        }),
+        _ => None,
+    }
+}
+
+/// One bar of the read's own engine pass, as `CompiledValue::eval` reads it: a lag-0
+/// indicator leaf reads its slot; every other read has no value.
+struct WindowBar<'a> {
+    specs: &'a [IndicatorSpec],
+    per_bar: &'a [Vec<Option<Decimal>>],
+    index: usize,
+}
+
+impl EvalContext for WindowBar<'_> {
+    fn current(&self, value: &CompiledValue) -> Option<Decimal> {
+        let CompiledValue::Indicator { spec, lag: 0, .. } = value else {
+            return None;
+        };
+        let slot = self.specs.iter().position(|held| held == spec)?;
+        self.per_bar.get(slot)?.get(self.index).copied().flatten()
+    }
+
+    fn previous(&self, _value: &CompiledValue) -> Option<Decimal> {
+        None
+    }
 }
 
 /// What one blocking read computed.
@@ -513,6 +712,7 @@ fn read_window(
     requested: (Option<i64>, Option<i64>),
     bounded: bool,
     specs: &[IndicatorSpec],
+    edges: &[RuleEdge],
 ) -> Result<BlockingRead, BusError> {
     let mut series = load(store, pair, timeframe, version)?.series;
     let data_version = series.version.clone();
@@ -650,6 +850,8 @@ fn read_window(
             to.min(series.candles[last].close_time),
         )
     });
+    let mut overlays = overlay_dtos(&drawn, &per_bar, &series.candles, &window);
+    overlays.extend(edge_dtos(edges, &drawn, &per_bar, &window));
     Ok(BlockingRead {
         data_version,
         candles: window
@@ -658,7 +860,7 @@ fn read_window(
             .collect(),
         drawable,
         withheld_in_window,
-        overlays: overlay_dtos(&drawn, &per_bar, &series.candles, &window),
+        overlays,
         not_drawn,
     })
 }
@@ -697,12 +899,14 @@ fn engine_pass(
 enum Drawn {
     /// `support:` / `resistance:` — a per-bar level.
     Level,
-    /// `ema:` — a per-bar line.
+    /// `ema:` / `sma:` — a per-bar line.
     Line,
     /// `pivot_high:` / `pivot_low:` — events on confirmation bars.
     Pivot(u32),
     /// `cdl:` — events on the bars a pattern fired.
     Pattern,
+    /// `wavetrend:` — a per-bar oscillator in its own pane.
+    Oscillator,
 }
 
 /// The drawn family of a spec, or `None` for everything the tab does not draw. A
@@ -711,7 +915,8 @@ enum Drawn {
 fn drawn_kind(spec: &IndicatorSpec) -> Option<Drawn> {
     match spec {
         IndicatorSpec::Support { .. } | IndicatorSpec::Resistance { .. } => Some(Drawn::Level),
-        IndicatorSpec::Ema { .. } => Some(Drawn::Line),
+        IndicatorSpec::Ema { .. } | IndicatorSpec::Sma { .. } => Some(Drawn::Line),
+        IndicatorSpec::WaveTrend { .. } => Some(Drawn::Oscillator),
         IndicatorSpec::PivotHigh { right, .. } | IndicatorSpec::PivotLow { right, .. } => {
             fixed_period(right).map(Drawn::Pivot)
         }
@@ -752,10 +957,47 @@ fn overlay_dtos(
                 label,
                 events: pattern_events(values, candles, window),
             }),
+            Some(Drawn::Oscillator) => overlays.push(ChartOverlayDto::Oscillator {
+                label,
+                values: series,
+            }),
             None => {}
         }
     }
     overlays
+}
+
+/// One `bandEdge` per rule edge, each bar evaluated by the engine's own
+/// `CompiledValue::eval` over the members' engine values from the read's pass. Every
+/// member is a `line` spec, so it is in `specs` and has a slot.
+fn edge_dtos(
+    edges: &[RuleEdge],
+    specs: &[IndicatorSpec],
+    per_bar: &[Vec<Option<Decimal>>],
+    window: &[usize],
+) -> Vec<ChartOverlayDto> {
+    edges
+        .iter()
+        .filter_map(|edge| {
+            let compiled = edge_value(&edge.value)?;
+            let values = window
+                .iter()
+                .map(|&index| {
+                    let bar = WindowBar {
+                        specs,
+                        per_bar,
+                        index,
+                    };
+                    compiled.eval(&bar, false).map(dec)
+                })
+                .collect();
+            Some(ChartOverlayDto::BandEdge {
+                label: operand_label(&edge.value),
+                members: edge.members.iter().map(indicator_label).collect(),
+                values,
+            })
+        })
+        .collect()
 }
 
 /// A pivot's confirmations inside the window: one event on each bar where the

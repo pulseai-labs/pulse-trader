@@ -1029,8 +1029,9 @@ export type ChartHoldoutDto = {
 };
 
 /**
- *  One overlay series, tagged on `kind` (Q4). The `label` is always the token
- *  `export_indicators` accepts for the spec its values came from.
+ *  One overlay series, tagged on `kind` (Q4). The `label` is the token
+ *  `export_indicators` accepts for the spec its values came from, except a
+ *  `bandEdge`'s, which is explain's operand label; its members are tokens.
  */
 export type ChartOverlayDto = 
 /**
@@ -1042,9 +1043,9 @@ export type ChartOverlayDto =
 label: string; 
 /**  One per window bar; `null` where the engine reads no value. */
 values: (string | null)[] } | 
-/**  An EMA line: one value per window bar, `null` while the engine warms up. */
+/**  An EMA or SMA line: one value per window bar, `null` while the engine warms up. */
 { kind: "line"; 
-/**  The engine's token for the EMA's spec. */
+/**  The engine's token for the line's spec. */
 label: string; 
 /**  One per window bar; `null` while warming up. */
 values: (string | null)[] } | 
@@ -1059,7 +1060,29 @@ events: ChartPivotEventDto[] } |
 /**  The engine's token for the pattern's spec. */
 label: string; 
 /**  The window's firings, in bar order. */
-events: ChartPatternEventDto[] };
+events: ChartPatternEventDto[] } | 
+/**
+ *  An oscillator (`WaveTrend` WT1, r6.s4.w1): one value per window bar, `null`
+ *  while warming up. Not prices, so the tab draws it in its own pane.
+ */
+{ kind: "oscillator"; 
+/**  The engine's token for the oscillator's spec (`wavetrend:9:12`). */
+label: string; 
+/**  One per window bar; `null` while warming up. */
+values: (string | null)[] } | 
+/**
+ *  A band edge (r6.s4.w1): a `max`/`min` operand of the rule over `line`
+ *  indicators on this series (the ribbon's band top or bottom), one value per
+ *  window bar from the engine's own `CompiledValue::eval` over its members'
+ *  engine values; `null` where any member has none.
+ */
+{ kind: "bandEdge"; 
+/**  Explain's operand label (`max(ema:5,ema:11)`); not an `export_indicators` token. */
+label: string; 
+/**  The labels of the `line` overlays it combines, in leaf order, each once. */
+members: string[]; 
+/**  One per window bar; `null` where any member has no value. */
+values: (string | null)[] };
 
 /**  One candle-pattern event: the bar it fired on and its signed value. */
 export type ChartPatternEventDto = {
@@ -1100,7 +1123,10 @@ export type ChartRunDto = {
 	 *  produced inside the withheld period, and the cut withholds those bars.
 	 */
 	trades: ChartTradeDto[],
-	/**  One overlay per drawn spec of the rule on this series. */
+	/**
+	 *  One overlay per drawn spec of the rule on this series, then one `bandEdge`
+	 *  per band edge.
+	 */
 	overlays: ChartOverlayDto[],
 	/**
 	 *  The labels of the rule's other specs on this series — what the tab says it
