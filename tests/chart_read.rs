@@ -21,10 +21,10 @@ use pulse::{
     ChartDataDto, ChartDataRequest, ChartOverlayDto, CompiledValue, DataVersion, DesktopState,
     Direction, EngineFingerprint, EquityCurve, EvalContext, ExitReason, FakeClock, Fill,
     FundingConfig, GetBacktestRunRequest, IndicatorEngine, IndicatorSpec, NewVersion,
-    OpenFreezeRequest, Pair, Regime, RegimeBreakdown, Series, SkippedEntryCounts,
-    SnapshotSelection, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo, StrategyId,
-    StrategyRepository, SummaryStats, SweepableValue, Timeframe, Trade, TradeSource, VersionId,
-    chart_data_core, get_backtest_run_core,
+    OpenFreezeRequest, Pair, PriceField, Regime, RegimeBreakdown, Series, SetupTrace,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo,
+    StrategyId, StrategyRepository, SummaryStats, SweepableValue, Timeframe, Trade, TradeSource,
+    VersionId, chart_data_core, get_backtest_run_core,
 };
 use rust_decimal::Decimal;
 use support::server::{ServerOptions, TestServer, spawn_server};
@@ -191,6 +191,11 @@ fn htf_specs() -> Vec<IndicatorSpec> {
 
 /// Seed one strategy plus the chart-read version, and return the version id.
 async fn seed_version(state: &DesktopState) -> VersionId {
+    seed_version_of(state, CHART_DSL).await
+}
+
+/// Seed one strategy plus a version of `dsl`, and return the version id.
+async fn seed_version_of(state: &DesktopState, dsl: &str) -> VersionId {
     let repo = state.strategy_repo();
     let strategy = repo
         .create_strategy("chart read", Some("alice"), &["btc".to_owned()])
@@ -199,7 +204,7 @@ async fn seed_version(state: &DesktopState) -> VersionId {
     repo.create_version(NewVersion {
         strategy_id: StrategyId::new(strategy.id.as_str().to_owned()),
         parent_version_id: None,
-        dsl_json: CHART_DSL.to_owned(),
+        dsl_json: dsl.to_owned(),
         created_by: pulse::CreatedBy::Human,
         creating_llm_call_ids: vec![],
     })
@@ -413,16 +418,21 @@ fn overlay<'a>(overlays: &'a [ChartOverlayDto], label: &str) -> &'a ChartOverlay
             ChartOverlayDto::Level { label: carried, .. }
             | ChartOverlayDto::Line { label: carried, .. }
             | ChartOverlayDto::Pivot { label: carried, .. }
-            | ChartOverlayDto::Pattern { label: carried, .. } => carried == label,
+            | ChartOverlayDto::Pattern { label: carried, .. }
+            | ChartOverlayDto::Oscillator { label: carried, .. }
+            | ChartOverlayDto::BandEdge { label: carried, .. } => carried == label,
         })
         .unwrap_or_else(|| panic!("no overlay labelled {label}: {overlays:?}"))
 }
 
-/// The per-bar values one level/line overlay carries.
+/// The per-bar values one level, line, oscillator or band-edge overlay carries.
 fn values(overlay: &ChartOverlayDto) -> &[Option<String>] {
     match overlay {
-        ChartOverlayDto::Level { values, .. } | ChartOverlayDto::Line { values, .. } => values,
-        other => panic!("expected a level or line overlay, got {other:?}"),
+        ChartOverlayDto::Level { values, .. }
+        | ChartOverlayDto::Line { values, .. }
+        | ChartOverlayDto::Oscillator { values, .. }
+        | ChartOverlayDto::BandEdge { values, .. } => values,
+        other => panic!("expected a value-per-bar overlay, got {other:?}"),
     }
 }
 
@@ -1471,6 +1481,202 @@ async fn an_open_freeze_withholds_every_trade_that_reaches_the_holdout() {
 }
 
 // ---------------------------------------------------------------------------
+// The run layer — a trade's setup bars and stop (r6.s4.w2)
+// ---------------------------------------------------------------------------
+
+/// One setup trade whose 4H bar `k` armed it, and the opens of its four bars.
+///
+/// `a` is the 15m candle that closes with `h4.candles[k]`. The setup armed on it,
+/// saw the dip two bars later and triggered five bars later; the entry fills on the
+/// bar after the trigger. The array holds the expected opens
+/// `[arm 15m, arm 4H, dip 15m, trigger 15m]`.
+fn setup_trade(m15: &CandleSeries, h4: &CandleSeries, k: usize) -> (Trade, [i64; 4]) {
+    let a = m15
+        .candles
+        .iter()
+        .position(|candle| candle.close_time == h4.candles[k].close_time)
+        .expect("a 15m candle closes with the 4H bar");
+    let mut trade = trade_at(m15.candles[a + 6].open_time, "2");
+    trade.entry_signal_time = m15.candles[a + 5].close_time;
+    trade.setup = Some(SetupTrace {
+        arm_time: m15.candles[a].close_time,
+        dip_time: m15.candles[a + 2].close_time,
+        anchor_time: None,
+    });
+    let opens = [
+        m15.candles[a].open_time,
+        h4.candles[k].open_time,
+        m15.candles[a + 2].open_time,
+        m15.candles[a + 5].open_time,
+    ];
+    (trade, opens)
+}
+
+/// The fixture's two head series: the 15m primary and the 4H HTF.
+fn fixture_series(store: &CandleStore) -> (CandleSeries, CandleSeries) {
+    let load = |timeframe| {
+        store
+            .load_version(&pair(), timeframe, &head(store, timeframe))
+            .expect("the fixture reads")
+            .series
+    };
+    (load(Timeframe::M15), load(Timeframe::H4))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_trade_carries_its_setup_bars_and_stop_on_both_legs() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let (m15, h4) = fixture_series(&store);
+    let (trade, opens) = setup_trade(&m15, &h4, 20);
+    let run_id = seed_run(&server, &version, vec![trade]).await;
+
+    for timeframe in ["15m", "4h"] {
+        let dto = read(
+            &state,
+            ChartDataRequest {
+                run_id: Some(run_id.clone()),
+                ..request("BTCUSDT", timeframe)
+            },
+        )
+        .await
+        .expect("the run reads");
+        let run = dto.run.expect("the read carries the run layer");
+        assert_eq!(run.trades.len(), 1, "the {timeframe} read lists the trade");
+        let drawn = &run.trades[0];
+        assert_eq!(
+            drawn.arm_bar_time.as_deref(),
+            Some(opens[0].to_string().as_str()),
+            "{timeframe}: the 15m bar the setup armed on"
+        );
+        assert_eq!(
+            drawn.htf_arm_bar_time.as_deref(),
+            Some(opens[1].to_string().as_str()),
+            "{timeframe}: the 4H bar whose close armed it"
+        );
+        assert_eq!(
+            drawn.dip_bar_time.as_deref(),
+            Some(opens[2].to_string().as_str()),
+            "{timeframe}: the dip bar"
+        );
+        assert_eq!(
+            drawn.trigger_bar_time.as_deref(),
+            Some(opens[3].to_string().as_str()),
+            "{timeframe}: the trigger bar"
+        );
+        assert_eq!(
+            drawn.stop_price.as_deref(),
+            Some("89000"),
+            "{timeframe}: the stored stop"
+        );
+        if timeframe == "4h" {
+            assert!(
+                dto.candles
+                    .iter()
+                    .any(|candle| candle.t == opens[1].to_string()),
+                "the 4h read draws the bar the arm time names"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trade_without_a_setup_carries_no_setup_bars() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let (m15, _) = fixture_series(&store);
+    let first = m15.candles[0].open_time;
+    let step = Timeframe::M15.duration_ms();
+    let with_stop = trade_at(first + 10 * step, "2");
+    let mut without_stop = trade_at(first + 20 * step, "-1");
+    without_stop.stop_price = None;
+    let run_id = seed_run(&server, &version, vec![with_stop, without_stop]).await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the run reads");
+    let run = dto.run.expect("the read carries the run layer");
+    assert_eq!(run.trades.len(), 2);
+    for drawn in &run.trades {
+        assert_eq!(drawn.arm_bar_time, None);
+        assert_eq!(drawn.htf_arm_bar_time, None);
+        assert_eq!(drawn.dip_bar_time, None);
+        assert_eq!(drawn.trigger_bar_time, None);
+    }
+    assert_eq!(run.trades[0].stop_price.as_deref(), Some("89000"));
+    assert_eq!(run.trades[1].stop_price, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fence_withholds_a_setup_trade_by_its_fills() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let (m15, h4) = fixture_series(&store);
+    let (before, before_opens) = setup_trade(&m15, &h4, 20);
+    // B's setup bars and entry are before the fence; its exit reaches it.
+    let k = h4
+        .candles
+        .iter()
+        .position(|candle| candle.close_time == HOLDOUT_MS - 14_400_001)
+        .expect("a 4H bar closes just under one 4H bar before the holdout start");
+    let (mut reaching, _) = setup_trade(&m15, &h4, k);
+    reaching.exit_signal_time = HOLDOUT_MS;
+    reaching.exit_fill_time = HOLDOUT_MS;
+    reaching.fills[1].time_ms = HOLDOUT_MS;
+    assert!(
+        reaching.entry_fill_time < HOLDOUT_MS,
+        "B enters before the fence"
+    );
+    let reaching_entry = reaching.entry_fill_time.to_string();
+    let expected = before_opens.map(|open| open.to_string());
+    let run_id = seed_run(&server, &version, vec![before.clone(), reaching]).await;
+    open_freeze(&server, HOLDOUT_MS).await;
+
+    for timeframe in ["15m", "4h"] {
+        let dto = read(
+            &state,
+            ChartDataRequest {
+                run_id: Some(run_id.clone()),
+                ..request("BTCUSDT", timeframe)
+            },
+        )
+        .await
+        .expect("the fenced run reads");
+        let run = dto.run.expect("the read carries the run layer");
+        assert_eq!(
+            run.trades.len(),
+            1,
+            "{timeframe}: only the trade whose fills clear the fence is listed"
+        );
+        let drawn = &run.trades[0];
+        assert_eq!(drawn.entry_time, before.entry_fill_time.to_string());
+        assert_ne!(drawn.entry_time, reaching_entry, "B is withheld whole");
+        assert_eq!(
+            [
+                drawn.arm_bar_time.as_deref(),
+                drawn.htf_arm_bar_time.as_deref(),
+                drawn.dip_bar_time.as_deref(),
+                drawn.trigger_bar_time.as_deref(),
+            ],
+            expected.each_ref().map(|open| Some(open.as_str())),
+            "{timeframe}: A keeps its four bar times"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The overlays — every value equals an independent engine pass (G2)
 // ---------------------------------------------------------------------------
 
@@ -1684,6 +1890,404 @@ async fn the_htf_read_computes_its_own_series_overlays() {
     for event in &events {
         assert_ne!(dec(&event.value), Decimal::ZERO);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cipher: SMA lines, WT1 as an oscillator, the ribbon's band edges (r6.s4.w1)
+// ---------------------------------------------------------------------------
+
+/// The shipped Cipher v1 strategy: SMA, `WaveTrend`, the eight-EMA ribbon and its
+/// `max`/`min` band edges on the primary series; SMA, `WaveTrend`, `Range` and `Body`
+/// on the HTF.
+const CIPHER_V1: &str = include_str!("../examples/strategies/cipher-v1.json");
+
+/// The ribbon's eight EMAs, in the order the rule names them.
+fn ribbon_specs() -> Vec<IndicatorSpec> {
+    [5, 11, 15, 18, 21, 24, 28, 34]
+        .into_iter()
+        .map(|period| IndicatorSpec::Ema {
+            period: fixed(period),
+        })
+        .collect()
+}
+
+/// Explain's operand label of the ribbon's band top (`r6.s1.w1`'s `max(a,b)` spelling).
+const BAND_TOP: &str =
+    "max(max(max(ema:5,ema:11),max(ema:15,ema:18)),max(max(ema:21,ema:24),max(ema:28,ema:34)))";
+
+/// The band bottom: the same tree with `min`.
+const BAND_BOTTOM: &str =
+    "min(min(min(ema:5,ema:11),min(ema:15,ema:18)),min(min(ema:21,ema:24),min(ema:28,ema:34)))";
+
+/// The expected edge at each window bar: `pick` folded over the members' slots of an
+/// independent pass, `None` where any member has no value.
+fn expected_edge(
+    rows: &[Vec<Option<Decimal>>],
+    window: &[usize],
+    slots: &[usize],
+    pick: fn(Decimal, Decimal) -> Decimal,
+) -> Vec<Option<String>> {
+    window
+        .iter()
+        .map(|&index| {
+            let mut edge: Option<Decimal> = None;
+            for &slot in slots {
+                let member = rows[index][slot]?;
+                edge = Some(edge.map_or(member, |held| pick(held, member)));
+            }
+            edge.map(|value| value.normalize().to_string())
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cipher_primary_leg_draws_sma_ribbon_wt1_and_both_band_edges() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version_of(&state, CIPHER_V1).await;
+    let store = store(&server.data_dir);
+    let m15 = head(&store, Timeframe::M15);
+    let primary = store
+        .load_version(&pair(), Timeframe::M15, &m15)
+        .expect("the fixture reads")
+        .series;
+    let from = primary.candles[0].open_time;
+    let to = primary.candles[primary.candles.len() - 1].close_time;
+    let run_id = seed_run(
+        &server,
+        &version,
+        vec![trade_at(from + 10 * Timeframe::M15.duration_ms(), "2")],
+    )
+    .await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the Cipher run reads");
+    let run = dto.run.expect("the run layer");
+    assert_eq!(run.series, "primary");
+
+    // The expected pass: SMA, WT1, then the ribbon — slot N of this pass is the
+    // spec N below. The read's own order follows `required_indicators()`, so each
+    // overlay is found by its label, never by its position.
+    let mut specs = vec![
+        IndicatorSpec::Sma {
+            period: fixed(50),
+            source: PriceField::Close,
+        },
+        IndicatorSpec::WaveTrend {
+            channel: fixed(9),
+            average: fixed(12),
+        },
+    ];
+    specs.extend(ribbon_specs());
+    let (cut, rows) = independent_pass(&store, Timeframe::M15, &m15, None, &specs);
+    let window = window_indices(&cut, from, to);
+    assert!(!window.is_empty(), "the run's window holds bars");
+
+    let sma = overlay(&run.overlays, "sma:50");
+    assert!(matches!(sma, ChartOverlayDto::Line { .. }), "{sma:?}");
+    assert_eq!(*values(sma), expected_values(&rows, &window, 0));
+
+    let wt1 = overlay(&run.overlays, "wavetrend:9:12");
+    assert!(matches!(wt1, ChartOverlayDto::Oscillator { .. }), "{wt1:?}");
+    assert_eq!(*values(wt1), expected_values(&rows, &window, 1));
+
+    let ribbon_labels: Vec<String> = [5, 11, 15, 18, 21, 24, 28, 34]
+        .iter()
+        .map(|period| format!("ema:{period}"))
+        .collect();
+    for (offset, label) in ribbon_labels.iter().enumerate() {
+        let line = overlay(&run.overlays, label);
+        assert!(matches!(line, ChartOverlayDto::Line { .. }), "{line:?}");
+        assert_eq!(
+            *values(line),
+            expected_values(&rows, &window, 2 + offset),
+            "{label}"
+        );
+    }
+
+    // Exactly two band edges, the top then the bottom, each over the eight EMAs.
+    let edges: Vec<&ChartOverlayDto> = run
+        .overlays
+        .iter()
+        .filter(|overlay| matches!(overlay, ChartOverlayDto::BandEdge { .. }))
+        .collect();
+    assert_eq!(
+        edges.len(),
+        2,
+        "one band top and one band bottom: {edges:?}"
+    );
+    let ribbon_slots: Vec<usize> = (2..10).collect();
+    for (edge, (expected_label, pick)) in edges.iter().zip([
+        (BAND_TOP, Decimal::max as fn(Decimal, Decimal) -> Decimal),
+        (BAND_BOTTOM, Decimal::min as fn(Decimal, Decimal) -> Decimal),
+    ]) {
+        let ChartOverlayDto::BandEdge {
+            label,
+            members,
+            values: edge_values,
+        } = edge
+        else {
+            unreachable!("filtered to band edges")
+        };
+        assert_eq!(label, expected_label);
+        assert_eq!(*members, ribbon_labels, "the eight EMAs in ribbon order");
+        assert_eq!(
+            *edge_values,
+            expected_edge(&rows, &window, &ribbon_slots, pick),
+            "{expected_label}"
+        );
+    }
+
+    // Every one of the twelve series holds a value somewhere in the window.
+    for overlay in &run.overlays {
+        assert!(
+            values(overlay).iter().any(Option::is_some),
+            "an all-null series: {overlay:?}"
+        );
+    }
+    assert_eq!(run.overlays.len(), 12, "{:?}", run.overlays);
+    assert!(
+        run.not_drawn.is_empty(),
+        "nothing on the primary leg is undrawn: {:?}",
+        run.not_drawn
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cipher_htf_leg_draws_its_sma_and_wt1_and_names_range_and_body() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version_of(&state, CIPHER_V1).await;
+    let store = store(&server.data_dir);
+    let h4 = head(&store, Timeframe::H4);
+    let primary = store
+        .load_version(&pair(), Timeframe::M15, &head(&store, Timeframe::M15))
+        .expect("the fixture reads")
+        .series;
+    let from = primary.candles[0].open_time;
+    let to = primary.candles[primary.candles.len() - 1].close_time;
+    let run_id = seed_run(
+        &server,
+        &version,
+        vec![trade_at(from + 10 * Timeframe::M15.duration_ms(), "2")],
+    )
+    .await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the HTF read works");
+    let run = dto.run.expect("the run layer");
+    assert_eq!(run.series, "htf", "the HTF read draws the HTF series");
+
+    let specs = vec![
+        IndicatorSpec::Sma {
+            period: fixed(50),
+            source: PriceField::Close,
+        },
+        IndicatorSpec::WaveTrend {
+            channel: fixed(9),
+            average: fixed(12),
+        },
+    ];
+    let (cut, rows) = independent_pass(&store, Timeframe::H4, &h4, None, &specs);
+    let window = window_indices(&cut, from, to);
+    assert!(!window.is_empty(), "the H4 window holds bars");
+
+    let sma = overlay(&run.overlays, "sma:50");
+    assert!(matches!(sma, ChartOverlayDto::Line { .. }), "{sma:?}");
+    assert_eq!(*values(sma), expected_values(&rows, &window, 0));
+
+    let wt1 = overlay(&run.overlays, "wavetrend:9:12");
+    assert!(matches!(wt1, ChartOverlayDto::Oscillator { .. }), "{wt1:?}");
+    assert_eq!(*values(wt1), expected_values(&rows, &window, 1));
+
+    // The ribbon lives on the primary leg only: no edge and no EMA line here.
+    assert!(
+        !run.overlays
+            .iter()
+            .any(|overlay| matches!(overlay, ChartOverlayDto::BandEdge { .. })),
+        "no band edge on the HTF leg: {:?}",
+        run.overlays
+    );
+    assert!(
+        !run.overlays.iter().any(|overlay| matches!(
+            overlay,
+            ChartOverlayDto::Line { label, .. } if label.starts_with("ema:")
+        )),
+        "no EMA line on the HTF leg: {:?}",
+        run.overlays
+    );
+    assert_eq!(run.overlays.len(), 2, "{:?}", run.overlays);
+
+    let mut not_drawn = run.not_drawn.clone();
+    not_drawn.sort();
+    assert_eq!(not_drawn, ["body", "range"]);
+}
+
+/// One `Ema` operand on `series` (`primary` or `htf`) as DSL JSON.
+fn probe_ema(series: &str, period: u32) -> String {
+    format!(
+        r#"{{ "type": "Indicator", "series": "{series}", "spec": {{ "indicator": "Ema", "period": {period} }} }}"#
+    )
+}
+
+/// `Arith { max, lhs, rhs }` as DSL JSON.
+fn probe_max(lhs: &str, rhs: &str) -> String {
+    format!(r#"{{ "type": "Arith", "op": "max", "lhs": {lhs}, "rhs": {rhs} }}"#)
+}
+
+/// `Compare(Close > rhs)` as DSL JSON.
+fn probe_close_gt(rhs: &str) -> String {
+    format!(
+        r#"{{ "type": "Compare", "lhs": {{ "type": "Price", "field": "Close" }}, "op": "Gt", "rhs": {rhs} }}"#
+    )
+}
+
+/// A schema 1.5.0 long rule with one `max` that is a band edge (inside a sum) and three
+/// that are not: a non-line leaf, a lagged leaf and another series' leaf.
+fn probe_dsl() -> String {
+    let rsi = r#"{ "type": "Indicator", "spec": { "indicator": "Rsi", "period": 14 } }"#;
+    let lagged = format!(
+        r#"{{ "type": "Lag", "value": {}, "bars": 1 }}"#,
+        probe_ema("primary", 30)
+    );
+    let sum = format!(
+        r#"{{ "type": "Arith", "op": "add", "lhs": {}, "rhs": {{ "type": "Constant", "value": "0" }} }}"#,
+        probe_max(&probe_ema("primary", 5), &probe_ema("primary", 11))
+    );
+    let entry = probe_close_gt(&sum);
+    let filters = [
+        probe_close_gt(&probe_max(&probe_ema("primary", 20), rsi)),
+        probe_close_gt(&probe_max(&lagged, &probe_ema("primary", 40))),
+        probe_close_gt(&probe_max(&probe_ema("htf", 20), &probe_ema("primary", 50))),
+    ]
+    .join(",");
+    format!(
+        r#"{{
+  "schema_version": "1.5.0",
+  "name": "r6.s4.w1 band edge probe",
+  "direction": "long",
+  "entry": {entry},
+  "filters": [{filters}],
+  "exits": [
+    {{ "type": "StopLoss", "distance_pct": "0.02" }},
+    {{ "type": "TakeProfit", "target_r": "1" }}
+  ],
+  "risk": {{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }}
+}}"#
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_band_edge_needs_line_leaves_at_no_lag_on_its_own_series() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version_of(&state, &probe_dsl()).await;
+    let store = store(&server.data_dir);
+    let m15 = head(&store, Timeframe::M15);
+    let primary = store
+        .load_version(&pair(), Timeframe::M15, &m15)
+        .expect("the fixture reads")
+        .series;
+    let from = primary.candles[0].open_time;
+    let to = primary.candles[primary.candles.len() - 1].close_time;
+    let run_id = seed_run(
+        &server,
+        &version,
+        vec![trade_at(from + 10 * Timeframe::M15.duration_ms(), "2")],
+    )
+    .await;
+
+    // The 15m leg: one edge, `max(ema:5,ema:11)`, and no other.
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id.clone()),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the probe run reads");
+    let run = dto.run.expect("the run layer");
+    let specs = [5, 11, 20, 30, 40, 50]
+        .into_iter()
+        .map(|period| IndicatorSpec::Ema {
+            period: fixed(period),
+        })
+        .collect::<Vec<_>>();
+    let (cut, rows) = independent_pass(&store, Timeframe::M15, &m15, None, &specs);
+    let window = window_indices(&cut, from, to);
+    assert!(!window.is_empty(), "the run's window holds bars");
+
+    let edges: Vec<&ChartOverlayDto> = run
+        .overlays
+        .iter()
+        .filter(|overlay| matches!(overlay, ChartOverlayDto::BandEdge { .. }))
+        .collect();
+    assert_eq!(edges.len(), 1, "exactly one band edge: {edges:?}");
+    let ChartOverlayDto::BandEdge {
+        label,
+        members,
+        values: edge_values,
+    } = edges[0]
+    else {
+        unreachable!("filtered to band edges")
+    };
+    assert_eq!(label, "max(ema:5,ema:11)");
+    assert_eq!(*members, ["ema:5", "ema:11"]);
+    assert_eq!(
+        *edge_values,
+        expected_edge(&rows, &window, &[0, 1], Decimal::max)
+    );
+    assert!(edge_values.iter().any(Option::is_some), "{edge_values:?}");
+
+    for (slot, label) in ["ema:5", "ema:11", "ema:20", "ema:30", "ema:40", "ema:50"]
+        .into_iter()
+        .enumerate()
+    {
+        let line = overlay(&run.overlays, label);
+        assert!(matches!(line, ChartOverlayDto::Line { .. }), "{line:?}");
+        assert_eq!(
+            *values(line),
+            expected_values(&rows, &window, slot),
+            "{label}"
+        );
+    }
+    assert_eq!(run.not_drawn, ["rsi:14"]);
+
+    // The 4h leg: the one edge is a primary-series operand, and the HTF leaf is mixed
+    // with a primary one, so no edge is drawn here.
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the probe run reads on 4h");
+    let run = dto.run.expect("the run layer");
+    assert_eq!(run.series, "htf");
+    assert!(
+        !run.overlays
+            .iter()
+            .any(|overlay| matches!(overlay, ChartOverlayDto::BandEdge { .. })),
+        "no band edge on the HTF leg: {:?}",
+        run.overlays
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -22,6 +22,9 @@
 //    it would be and asks for a trade — from the run's OWN stored trades, which the run
 //    read already carried, so the ask is one the trader can answer (CR1) — then reads a
 //    bounded window around that trade (Q3/G4).
+//  * **The strategy layers and the selected trade's setup (r6.s4.w4)** are drawn from the
+//    read: the ribbon, its band edges, SMA and WT1, and the selected trade's arm, dip,
+//    trigger and stop. The screen picks the trade and the leg, nothing else.
 //
 // Every state is plain and says what it is (PDR-0011): loading, failed, an empty window,
 // no run, a withheld holdout, the operands the rule uses that are not drawn, and a leg
@@ -41,7 +44,7 @@ import type { ChartAdapter } from "../chart/adapter";
 import { createChartAdapter } from "../chart/adapter";
 import { beforeFence, fenceStartMs } from "../chart/layers";
 import type { WindowPlan } from "../chart/window";
-import { covers, windowPlan } from "../chart/window";
+import { covers, parseUtcInstant, windowAround, windowPlan } from "../chart/window";
 import { Figure } from "../format/Figure";
 import { EM_DASH, price, rMultiple } from "../format/numbers";
 import { dateUtc, timeUtc } from "../format/time";
@@ -94,6 +97,9 @@ interface ChartRequest {
   readonly plan: WindowPlan;
   /** The window's centre, for the sentence shown while the read is in flight. */
   readonly anchorMs: string | null;
+  /** What the centre is: a trade's entry, or a date the trader typed (r6.s4.w3). Only
+   *  the sentence shown while the read is in flight differs. */
+  readonly anchorWhat: "entry" | "date";
 }
 
 type Phase =
@@ -152,6 +158,17 @@ const DISARMED: MarkForm = {
 function atOrAfterMs(raw: string, boundary: string): boolean {
   try {
     return BigInt(raw.trim()) >= BigInt(boundary.trim());
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the instant `raw` is before `boundary`, both epoch-ms integer text. The
+ *  same exact `BigInt` compare as `atOrAfterMs`, and the same answer for unreadable
+ *  text: `false`. */
+function beforeMs(raw: string, boundary: string): boolean {
+  try {
+    return BigInt(raw.trim()) < BigInt(boundary.trim());
   } catch {
     return false;
   }
@@ -231,6 +248,7 @@ function requestFor(
   pair: string,
   timeframe: string,
   anchorMs: string | null,
+  anchorWhat: "entry" | "date" = "entry",
 ): ChartRequest {
   const span = run === null ? null : { firstMs: run.firstOpenTimeMs, lastMs: run.lastCloseTimeMs };
   return {
@@ -239,12 +257,16 @@ function requestFor(
     runId: run?.runId ?? null,
     plan: windowPlan(span, timeframe, anchorMs),
     anchorMs,
+    anchorWhat,
   };
 }
 
 /** What the tab says it is reading, in one sentence. */
 function loadingText(request: ChartRequest): string {
   if (request.plan.kind === "window" && request.anchorMs !== null) {
+    if (request.anchorWhat === "date") {
+      return `Loading ${request.timeframe} around ${timeUtc(request.anchorMs)}…`;
+    }
     return `Loading ${request.timeframe} around the entry at ${timeUtc(request.anchorMs)}…`;
   }
   return `Loading ${request.pair} ${request.timeframe}…`;
@@ -271,6 +293,7 @@ export default function ChartScreen() {
     runId: null,
     plan: { kind: "span" },
     anchorMs: null,
+    anchorWhat: "entry",
   }) });
   const [notice, setNotice] = useState<Notice | null>(null);
   const [run, setRun] = useState<RunContext | null>(null);
@@ -294,6 +317,10 @@ export default function ChartScreen() {
    *  continuation and the drawn-answer gate are compared against this. */
   const [selected, setSelected] = useState<string | null>(fragmentRun);
   const [barsOpen, setBarsOpen] = useState(false);
+  /** The trade the trader picked, by `tradeKey`. The trade itself is found in the drawn
+   *  window's own rows (`dto.run.trades`), which carry the setup bars; the run read's rows
+   *  do not (r6.s4.w4). */
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   // The free selection, readable from the fragment effect without re-running it.
   const freeRef = useRef(free);
@@ -336,6 +363,17 @@ export default function ChartScreen() {
    *  it in silence. */
   const [undrawn, setUndrawn] = useState<string | null>(null);
 
+  // --- go to a date (r6.s4.w3) ----------------------------------------------
+  /** What the Go to (UTC) field holds, and the sentence a refused date leaves. */
+  const [goToText, setGoToText] = useState("");
+  const [goToNote, setGoToNote] = useState<string | null>(null);
+
+  /** The holdout start the last successful chart answer carried (`null`: no freeze was
+   *  open at that read). Set on every successful answer and never reset: a free choice,
+   *  a leg switch or a run switch leaves it, because it is the freshest word the tab
+   *  has on the fence. `null` as the ref's value means no answer has landed yet. */
+  const lastAnswerRef = useRef<{ holdoutStartMs: string | null } | null>(null);
+
   /** Take whatever is drawn off the canvas, and remember that nothing is. Nothing is
    *  put back until the next read's own layers arrive: an empty chart is not a stale one
    *  (PDR-0011). Called by any read that replaces the window, and by a run switch (CR3). */
@@ -346,6 +384,7 @@ export default function ChartScreen() {
       adapter.setOverlays([]);
       adapter.setTrades([]);
       adapter.setMarks([]);
+      adapter.setSelectedTrade(null, "primary");
     }
     drawnRef.current = false;
     drawnReadRef.current = null;
@@ -410,6 +449,32 @@ export default function ChartScreen() {
     });
   }, []);
 
+  // --- zoom keys (r6.s4.w3) --------------------------------------------------
+  // `+` and `=` zoom in, `-` and `_` zoom out. A chord with the platform key is the
+  // browser's own zoom, and a key typed into a field is text: neither reaches the chart.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) ||
+          target.closest('[contenteditable=""], [contenteditable="true"]') !== null)
+      ) {
+        return;
+      }
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        adapterRef.current?.zoom("in");
+      } else if (event.key === "-" || event.key === "_") {
+        event.preventDefault();
+        adapterRef.current?.zoom("out");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   // --- what the fragment names (Q1: a run deep link opens the tab with that run) ---
   // Read on mount and on every later hash change. Deliberately NOT consumed the way the
   // Lab consumes `#/backtest?wf=`: there the fragment is a one-shot selection that a
@@ -436,11 +501,13 @@ export default function ChartScreen() {
     putRequest(null);
     clearDrawing();
     select(fragmentRun);
+    setSelectedKey(null);
     setRun(null);
     setLeg("primary");
     setAnchorMs(null);
     setNotice(null);
     setUndrawn(null);
+    setGoToNote(null);
     if (fragmentRun === null) {
       const freeRequest = requestFor(null, freeRef.current.pair, freeRef.current.timeframe, null);
       setPhase({ kind: "loading", what: loadingText(freeRequest) });
@@ -627,6 +694,7 @@ export default function ChartScreen() {
         // The anchor this answer was read FOR, for the draw effect: a bounded read
         // clamped to the run's span edge must still land on the trade the trader
         // picked, and the effect that draws has no other way to know which it was.
+        lastAnswerRef.current = { holdoutStartMs: answer.data.holdout?.holdoutStartMs ?? null };
         drawnAnchorRef.current = request.anchorMs;
         drawnReadRef.current = {
           key: readKey(request),
@@ -672,6 +740,19 @@ export default function ChartScreen() {
     drawnRef.current = true;
   }, [dto]);
 
+  // The selected trade, from the drawn window's own rows: the run read's rows carry no setup
+  // bars (r6.s4.w4). After the draw effect, so the markers land on the candles just set.
+  const selectedTrade =
+    selectedKey === null
+      ? null
+      : (dto?.run?.trades.find((candidate) => tradeKey(candidate) === selectedKey) ?? null);
+  useEffect(() => {
+    adapterRef.current?.setSelectedTrade(
+      selectedTrade,
+      dto?.run?.series === "htf" ? "htf" : "primary",
+    );
+  }, [dto, selectedKey]);
+
   // --- handlers -------------------------------------------------------------
   // What is drawn, and what the trader has asked for; the handlers below are the only
   // readers of both.
@@ -703,9 +784,11 @@ export default function ChartScreen() {
     // names: the in-flight run read must not take it back (and the drawn-answer gate
     // must let the free read through).
     select(null);
+    setSelectedKey(null);
     setRun(null);
     setAnchorMs(null);
     setUndrawn(null);
+    setGoToNote(null);
     putRequest(requestFor(null, pair, timeframe, null));
   };
 
@@ -725,6 +808,7 @@ export default function ChartScreen() {
    *  returns trades that entered before its window and exited inside it, and scrolling
    *  to one of those bars would scroll to nothing. */
   const selectTrade = (trade: ChartTradeDto) => {
+    setSelectedKey(tradeKey(trade));
     setAnchorMs(trade.entryTime);
     setUndrawn(null);
     const next = requestFor(run, run?.pair ?? free.pair, timeframe, trade.entryTime);
@@ -749,6 +833,71 @@ export default function ChartScreen() {
       return;
     }
     adapterRef.current?.centerOn(trade.entryTime);
+  };
+
+  /** Go to a typed UTC date (r6.s4.w3): centre on its bar when the drawn window holds it,
+   *  else read a window around it. Every refusal says why and sends nothing (PDR-0011);
+   *  the holdout cut stays the server's guarantee, and the refusal here is only a sentence.
+   *  Every date parse is `parseUtcInstant`'s: this screen compares epoch text with `BigInt`. */
+  const goTo = (text: string) => {
+    const instant = parseUtcInstant(text);
+    if (instant === null) {
+      setGoToNote("Type a UTC date as YYYY-MM-DD or YYYY-MM-DD HH:mm.");
+      return;
+    }
+    const answered = lastAnswerRef.current;
+    // The freshest word on the fence: the last chart answer's, else the run read's. After a
+    // failed first read neither exists, and the read is sent: the server cuts at the
+    // holdout whatever the tab knows.
+    const holdoutStart = answered !== null ? answered.holdoutStartMs : run?.holdoutStartMs ?? null;
+    if (answered === null && run === null && phase.kind === "loading") {
+      setGoToNote("The chart has not loaded yet; go to a date once it has.");
+      return;
+    }
+    if (holdoutStart !== null && atOrAfterMs(instant, holdoutStart)) {
+      setGoToNote(
+        `That date is inside the holdout from ${dateUtc(holdoutStart)}; the chart withholds it.`,
+      );
+      return;
+    }
+    if (
+      run !== null &&
+      (beforeMs(instant, run.firstOpenTimeMs) || beforeMs(run.lastCloseTimeMs, instant))
+    ) {
+      setGoToNote(
+        `That date is outside this run (${timeUtc(run.firstOpenTimeMs)} to ${timeUtc(run.lastCloseTimeMs)}).`,
+      );
+      return;
+    }
+    setGoToNote(null);
+    setUndrawn(null);
+    // A later leg switch reads around the same date.
+    setAnchorMs(instant);
+    if (dto !== null && drawnTimeframe === timeframe && covers(dto.candles, instant)) {
+      adapterRef.current?.centerOn(instant);
+      return;
+    }
+    const next: ChartRequest =
+      run !== null
+        ? requestFor(run, run.pair, timeframe, instant, "date")
+        : {
+            pair: free.pair,
+            timeframe: free.timeframe,
+            runId: null,
+            plan: windowAround(null, free.timeframe, instant),
+            anchorMs: instant,
+            anchorWhat: "date",
+          };
+    // The whole span of this leg is already drawn and does not hold the bar: no read can.
+    if (
+      next.plan.kind === "span" &&
+      drawnReadRef.current?.span === true &&
+      drawnTimeframe === timeframe
+    ) {
+      setGoToNote(`No ${timeframe} bar at ${timeUtc(instant)} is drawn in this run's window.`);
+      return;
+    }
+    putRequest(next);
   };
 
   // --- what is drawn right now ---------------------------------------------
@@ -818,7 +967,15 @@ export default function ChartScreen() {
     }
     return [];
   });
-  const series = overlays.filter((overlay) => overlay.kind === "level" || overlay.kind === "line");
+  // The layers the bars table carries a column for: every drawn series, WT1 and the band
+  // edges included. A pivot or pattern is a marker, and has its own table.
+  const series = overlays.filter(
+    (overlay) =>
+      overlay.kind === "level" ||
+      overlay.kind === "line" ||
+      overlay.kind === "bandEdge" ||
+      overlay.kind === "oscillator",
+  );
 
   return (
     <section className="cw" aria-label="Chart">
@@ -878,6 +1035,47 @@ export default function ChartScreen() {
             )}
           </>
         )}
+        {/* Go to a date, and zoom (r6.s4.w3). Never disabled (G6): a control that cannot
+            be pressed cannot say why it refused. Every time here is UTC. */}
+        <form
+          className="cw-markfield"
+          aria-label="Go to a date"
+          onSubmit={(event) => {
+            event.preventDefault();
+            goTo(goToText);
+          }}
+        >
+          Go to (UTC){" "}
+          <input
+            type="text"
+            className="cw-markinput"
+            aria-label="Go to (UTC)"
+            placeholder="YYYY-MM-DD HH:mm"
+            value={goToText}
+            onChange={(event) => setGoToText(event.target.value)}
+          />{" "}
+          <button type="submit" className="seg-btn">
+            Go
+          </button>
+        </form>
+        <div className="seg" role="group" aria-label="Zoom">
+          <button
+            type="button"
+            className="seg-btn"
+            aria-label="Zoom out"
+            onClick={() => adapterRef.current?.zoom("out")}
+          >
+            −
+          </button>
+          <button
+            type="button"
+            className="seg-btn"
+            aria-label="Zoom in"
+            onClick={() => adapterRef.current?.zoom("in")}
+          >
+            +
+          </button>
+        </div>
         {/* What the chart is bound to, named by what is DRAWN: a leg the tab has not
             read yet (it is waiting for a trade) is not what the trader is looking at. */}
         <span className="cw-ctx">
@@ -958,6 +1156,11 @@ export default function ChartScreen() {
           {markRefusal}
         </p>
       )}
+      {goToNote !== null && (
+        <p className="cw-msg" role="alert">
+          {goToNote}
+        </p>
+      )}
 
       <div className="cw-canvas" ref={containerRef} />
 
@@ -979,7 +1182,7 @@ export default function ChartScreen() {
 
       {notice !== null && (
         <p className="cw-msg" role="status">
-          {`The whole run at ${notice.timeframe} is ${notice.bars.toLocaleString("en-US")} bars — more than one read (the cap is 20,000). Pick a trade to load ${notice.timeframe} around it.`}
+          {`The whole run at ${notice.timeframe} is ${notice.bars.toLocaleString("en-US")} bars — more than one read (the cap is 20,000). Pick a trade to load ${notice.timeframe} around it, or go to a date.`}
         </p>
       )}
 
@@ -996,7 +1199,7 @@ export default function ChartScreen() {
         )}
         {dto?.run != null && dto.run.overlays.length === 0 && dto.run.notDrawn.length === 0 && (
           <p className="cw-note" role="note">
-            {`This rule uses no S/R, pivot, candle-pattern or EMA operand on ${dto.timeframe}.`}
+            {`This rule uses no S/R, pivot, candle-pattern, EMA, SMA or WaveTrend operand on ${dto.timeframe}.`}
           </p>
         )}
         {undrawn !== null && (
@@ -1015,6 +1218,66 @@ export default function ChartScreen() {
           </p>
         )}
       </div>
+
+      {/* The selected trade's setup and stop, as a table: the arm, dip, trigger and stop are
+          drawn on the canvas, and none is reachable only through it (PDR-0011). */}
+      {run !== null && selectedKey !== null && (
+        <section className="cw-strip" aria-label="Selected trade">
+          {selectedTrade === null ? (
+            <p className="cw-note" role="note">
+              {`The selected trade is not in the drawn ${drawnTimeframe ?? timeframe} window.`}
+            </p>
+          ) : (
+            <>
+              <div className="cw-scroll">
+                <table className="cw-tbl cw-setup">
+                  <caption>Selected trade — setup and stop</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">what</th>
+                      <th scope="col">bar (open) / price</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <th scope="row">{`arm (${run.primaryTimeframe})`}</th>
+                      <td className="mono">{timeUtc(selectedTrade.armBarTime)}</td>
+                    </tr>
+                    {hasTwoLegs(run) && (
+                      <tr>
+                        <th scope="row">{`arm (${run.htfTimeframe})`}</th>
+                        <td className="mono">{timeUtc(selectedTrade.htfArmBarTime)}</td>
+                      </tr>
+                    )}
+                    <tr>
+                      <th scope="row">dip</th>
+                      <td className="mono">{timeUtc(selectedTrade.dipBarTime)}</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">trigger</th>
+                      <td className="mono">{timeUtc(selectedTrade.triggerBarTime)}</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">stop</th>
+                      <td className="mono">
+                        <Figure exact={selectedTrade.stopPrice}>{price(selectedTrade.stopPrice)}</Figure>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              {selectedTrade.armBarTime === null &&
+                selectedTrade.htfArmBarTime === null &&
+                selectedTrade.dipBarTime === null &&
+                selectedTrade.triggerBarTime === null && (
+                  <p className="cw-note" role="note">
+                    This trade records no setup.
+                  </p>
+                )}
+            </>
+          )}
+        </section>
+      )}
 
       <section className="cw-strip" aria-label="Trades">
         {run === null ? (
@@ -1236,6 +1499,9 @@ export default function ChartScreen() {
                               <td key={overlay.label} className="mono">
                                 {value == null ? (
                                   EM_DASH
+                                ) : overlay.kind === "oscillator" ? (
+                                  // A WT1 value is not a price: the read's own text.
+                                  <Figure exact={value}>{value}</Figure>
                                 ) : (
                                   <Figure exact={value}>{price(value)}</Figure>
                                 )}
@@ -1288,6 +1554,12 @@ function toChartTrades(rows: readonly TradeRowDto[]): ChartTradeDto[] {
     exitPrice: row.exitPrice,
     exitReason: row.exitReason,
     realizedR: row.realizedR,
+    stopPrice: row.stopPrice,
+    // the run read carries no setup trace; the drawn window's rows do (w4 draws from those)
+    armBarTime: null,
+    htfArmBarTime: null,
+    dipBarTime: null,
+    triggerBarTime: null,
   }));
 }
 

@@ -121,3 +121,33 @@ command `chart_data`, both straight through one transport-free core:
 
 Touch surfaces for registration at spine close: `ui/src/chart/**`, `src/tauri/chart.rs`, the
 `/api/v1/chart` route.
+
+## Amendment (r6.s4.w1, 2026-11): the `oscillator` and `bandEdge` kinds; SMA lines
+
+Ruled by PDR-0048. The overlay read gains two kinds, and SMA joins EMA as a `line`.
+
+- **`oscillator`** carries one value per window bar, `null` while the engine warms up, like `line`. Its values are
+  not prices, so the tab draws it in its own pane below the candles, with a guide at 0 that the tab draws and the
+  read does not send. WaveTrend WT1 (`wavetrend:<channel>:<average>`) is the one spec drawn this way; RSI, ADX,
+  MACD and ATR are still named in `notDrawn`.
+- **`bandEdge`** is a derived operand: a `max` or `min` in the version's rule whose leaves are all `line`
+  indicators on the drawn series at no lag, nested through that one operator (the Cipher ribbon's band top and
+  bottom). The read evaluates it per bar with the engine's own `CompiledValue::eval` over the engine values of its
+  leaves, so the tab computes nothing. Its `label` is explain's operand label (`max(ema:5,ema:11)`), which
+  `export_indicators` does not accept; its `members` name the `line` overlays it combines, and each of those is a
+  token an agent can export. The tab draws the members muted, as a ribbon, and the edge strongly. Only the
+  outermost such node is an edge.
+- **SMA** (`sma:<period>`, `sma:<period>:<source>`) is drawn as a `line`.
+
+The rest of this ADR stands: every overlay comes from the same engine pass over the cut series, on the timeframe
+its rule was compiled for (PDR-0036 Q2), and a further kind is still an amendment. Engulfing and pole stay
+undrawn: they are compositions of price comparisons, not indicators, and the selected trade's arm marker marks
+the 4H signal bar (PDR-0048).
+
+## Amendment (r6.s4.w2, 2026-11): a trade's setup bars and stop
+
+Each listed trade also carries `stopPrice` (the stored stop) and, for a setup trade (ADR-0033), `armBarTime`,
+`htfArmBarTime`, `dipBarTime` and `triggerBarTime`: the opens of the bars its stored trace names, derived on the
+server from the run's own timeframes, so the tab only looks a bar up. They are `null` without a setup. The fence
+is unchanged: every setup bar closes before the entry fill, so a trade withheld whole takes its setup bars with it.
+No target price is stored, so none is sent.

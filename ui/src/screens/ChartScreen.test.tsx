@@ -22,9 +22,11 @@ const h = vi.hoisted(() => ({
     setOverlays: vi.fn(),
     setTrades: vi.fn(),
     setMarks: vi.fn(),
+    setSelectedTrade: vi.fn(),
     onCandleClick: vi.fn(),
     fitAll: vi.fn(),
     centerOn: vi.fn(),
+    zoom: vi.fn(),
     destroy: vi.fn(),
   },
 }));
@@ -116,6 +118,11 @@ function trade(over: Partial<ChartTradeDto>): ChartTradeDto {
     exitPrice: "92000",
     exitReason: "take_profit",
     realizedR: "2",
+    stopPrice: null,
+    armBarTime: null,
+    htfArmBarTime: null,
+    dipBarTime: null,
+    triggerBarTime: null,
     ...over,
   };
 }
@@ -373,7 +380,7 @@ describe("the leg switch", () => {
 
     expect(
       await screen.findByText(
-        "The whole run at 15m is 38,401 bars — more than one read (the cap is 20,000). Pick a trade to load 15m around it.",
+        "The whole run at 15m is 38,401 bars — more than one read (the cap is 20,000). Pick a trade to load 15m around it, or go to a date.",
       ),
     ).toBeTruthy();
     // Nothing was read: a read the server would refuse with the cap is not sent.
@@ -1712,5 +1719,366 @@ describe("the marks table", () => {
     await expect(screen.findByText("Trades in the run")).resolves.toBeTruthy();
     await waitFor(() => expect(h.adapter.setMarks).toHaveBeenCalled());
     expect(h.adapter.setTrades).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go to a date, and zoom (r6.s4.w3)
+// ---------------------------------------------------------------------------
+
+/** Type `text` into the Go to (UTC) field and press Go. */
+function goTo(text: string) {
+  fireEvent.change(screen.getByLabelText("Go to (UTC)"), { target: { value: text } });
+  fireEvent.click(screen.getByRole("button", { name: "Go" }));
+}
+
+describe("going to a date (r6.s4.w3)", () => {
+  it("goes to a typed UTC date on the free chart through a window around it", async () => {
+    // The mount read (4h), then the 15m leg the trader picks, then the date.
+    // The 15m answer holds 2025 bars only, so the 2024 date is not in the drawn window.
+    vi.mocked(commands.chartData)
+      .mockResolvedValueOnce(ok(chartDto()))
+      .mockResolvedValue(ok(chartDto({ timeframe: "15m" })));
+    await open("#/chart");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "15m" }));
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(2));
+    // Draw 4h, clear for the read, draw 15m.
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(3));
+
+    // 2024-06-01 12:00Z is 1717243200000; ±500 15m bars is the window the server is asked for.
+    goTo("2024-06-01 12:00");
+
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: "1716793200000",
+        toMs: "1717693200000",
+        runId: null,
+      }),
+    );
+    await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith("1717243200000"));
+  });
+
+  it("centres on a date the drawn window already holds, with no read", async () => {
+    // The fixture's two bars are the run's own first and last, so 2025-02-01 is inside.
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-02-01");
+
+    await waitFor(() =>
+      expect(h.adapter.centerOn).toHaveBeenCalledWith(String(Date.UTC(2025, 1, 1))),
+    );
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a date at or after the holdout start before any read", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ holdout: { holdoutStartMs: "1736985600000", barsWithheld: 3 } })),
+    );
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-01-16");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("inside the holdout");
+    expect(alert.textContent).toContain("2025-01-16 UTC");
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    expect(h.adapter.centerOn).not.toHaveBeenCalled();
+  });
+
+  it("refuses a date it cannot read, naming the format", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-13-01");
+
+    expect(
+      await screen.findByText("Type a UTC date as YYYY-MM-DD or YYYY-MM-DD HH:mm."),
+    ).toBeTruthy();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("says to wait while the first chart read has not answered", async () => {
+    const pending = deferred<unknown>();
+    vi.mocked(commands.chartData).mockReturnValue(pending.promise as never);
+    await open("#/chart");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+
+    goTo("2025-02-01");
+
+    expect(
+      await screen.findByText("The chart has not loaded yet; go to a date once it has."),
+    ).toBeTruthy();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads a run's over-cap leg around a date, ending the wait for a trade", async () => {
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
+    await screen.findByText(/Pick a trade to load 15m around it, or go to a date\./);
+
+    // ENTRY is 2025-04-11T00:00Z, typed as a date.
+    goTo("2025-04-11");
+
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: String(ENTRY - HALF),
+        toMs: String(ENTRY + HALF),
+        runId: "run-1",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText(/Pick a trade to load/)).toBeNull());
+  });
+
+  it("refuses a date outside the run", async () => {
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2024-12-01");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "That date is outside this run (2025-01-01 00:00 UTC to 2026-02-05 00:00 UTC).",
+    );
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+    expect(h.adapter.centerOn).not.toHaveBeenCalled();
+  });
+});
+
+describe("zooming (r6.s4.w3)", () => {
+  it("zooms with the buttons and with the + and - keys", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+    fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("out");
+
+    h.adapter.zoom.mockClear();
+    fireEvent.keyDown(window, { key: "+" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+    fireEvent.keyDown(window, { key: "=" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+    fireEvent.keyDown(window, { key: "-" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("out");
+    fireEvent.keyDown(window, { key: "_" });
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("out");
+    expect(h.adapter.zoom).toHaveBeenCalledTimes(4);
+
+    // A shortcut chord is the browser's, never the chart's.
+    fireEvent.keyDown(window, { key: "+", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "-", metaKey: true });
+    fireEvent.keyDown(window, { key: "-", altKey: true });
+    expect(h.adapter.zoom).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not zoom on + or - typed into a field", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.keyDown(screen.getByLabelText("Go to (UTC)"), { key: "+" });
+    fireEvent.keyDown(screen.getByLabelText("Setup label"), { key: "-" });
+
+    expect(h.adapter.zoom).not.toHaveBeenCalled();
+  });
+});
+
+describe("the strategy on the chart (r6.s4.w4)", () => {
+  /** The setup bars a stored trade carries in the drawn window's own row: the 4H bar whose
+   *  close armed it, the 15m arm bar, the dip and the trigger, all before the entry. */
+  const SETUP = {
+    htfArmBarTime: String(ENTRY - 8 * 3_600_000),
+    armBarTime: String(ENTRY - 4 * 3_600_000),
+    dipBarTime: String(ENTRY - 2 * 3_600_000),
+    triggerBarTime: String(ENTRY - TF_MS_15M),
+    stopPrice: "89000",
+  };
+
+  it("draws the selected trade's setup from the drawn window's own row", async () => {
+    // The run read's row carries no setup (w2 maps it to null); the drawn window's row does.
+    const row = trade({ ...SETUP });
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ trades: [tradeRow()] })) as never,
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ series: "primary", trades: [row] }) })),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    // Nothing is selected yet, so no setup table.
+    expect(screen.queryByRole("table", { name: "Selected trade — setup and stop" })).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+
+    await waitFor(() => expect(h.adapter.setSelectedTrade).toHaveBeenLastCalledWith(row, "primary"));
+    const table = await screen.findByRole("table", { name: "Selected trade — setup and stop" });
+    const rows = within(table)
+      .getAllByRole("row")
+      .map((tr) => [...tr.querySelectorAll("th, td")].map((cell) => cell.textContent));
+    expect(rows).toEqual([
+      ["what", "bar (open) / price"],
+      ["arm (15m)", "2025-04-10 20:00 UTC"],
+      ["arm (4h)", "2025-04-10 16:00 UTC"],
+      ["dip", "2025-04-10 22:00 UTC"],
+      ["trigger", "2025-04-10 23:45 UTC"],
+      ["stop", "89,000.00"],
+    ]);
+    expect(within(table).getByText("89,000.00").getAttribute("data-exact")).toBe("89000");
+    expect(screen.getByRole("region", { name: "Selected trade" })).toBeTruthy();
+  });
+
+  it("passes the higher-timeframe leg to the adapter", async () => {
+    const row = trade({ ...SETUP });
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ usesHtf: false, trades: [tradeRow()] })) as never,
+    );
+    vi.mocked(commands.chartData).mockImplementation((async (args: { timeframe: string }) =>
+      args.timeframe === "15m"
+        ? ok(
+            chartDto({
+              timeframe: "15m",
+              candles: [candle(ENTRY)],
+              run: runLayer({ series: "primary", trades: [row] }),
+            }),
+          )
+        : ok(chartDto({ run: runLayer({ series: "htf", trades: [row] }) }))) as never);
+    await open("#/chart?run=run-1");
+    // The 15m leg is over the bar cap, so the tab asks for a trade first.
+    await screen.findByText(/more than one read/);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+    await waitFor(() => expect(h.adapter.setSelectedTrade).toHaveBeenLastCalledWith(row, "primary"));
+
+    fireEvent.click(screen.getByRole("button", { name: /^4h/ }));
+    await waitFor(() => expect(h.adapter.setSelectedTrade).toHaveBeenLastCalledWith(row, "htf"));
+  });
+
+  it("says the selected trade is not in the drawn window when the window's rows lack it", async () => {
+    // The run read lists a trade the drawn window does not carry.
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ trades: [tradeRow()] })) as never,
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ trades: [] }) })),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+
+    expect(await screen.findByText("The selected trade is not in the drawn 4h window.")).toBeTruthy();
+    expect(h.adapter.setSelectedTrade).toHaveBeenLastCalledWith(null, "htf");
+    expect(screen.queryByRole("table", { name: "Selected trade — setup and stop" })).toBeNull();
+  });
+
+  it("says a trade that records no setup records none", async () => {
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ trades: [tradeRow()] })) as never,
+    );
+    // The default answer's row carries all four bar times as null.
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+
+    expect(await screen.findByText("This trade records no setup.")).toBeTruthy();
+  });
+
+  it("shows a dash for a setup bar the trade did not record", async () => {
+    const row = trade({ ...SETUP, dipBarTime: null, htfArmBarTime: null, stopPrice: null });
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ trades: [tradeRow()] })) as never,
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ series: "primary", trades: [row] }) })),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+
+    const table = await screen.findByRole("table", { name: "Selected trade — setup and stop" });
+    const text = within(table)
+      .getAllByRole("row")
+      .map((tr) => [...tr.querySelectorAll("th, td")].map((cell) => cell.textContent));
+    expect(text).toContainEqual(["dip", "—"]);
+    expect(text).toContainEqual(["stop", "—"]);
+  });
+
+  it("clears the selected trade's setup when a free chart replaces the run", async () => {
+    const row = trade({ ...SETUP });
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ trades: [tradeRow()] })) as never,
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ series: "primary", trades: [row] }) })),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    fireEvent.click(await screen.findByRole("button", { name: /^Trade 1, long/ }));
+    await screen.findByRole("table", { name: "Selected trade — setup and stop" });
+
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    window.location.hash = "#/chart";
+    fireEvent(window, new HashChangeEvent("hashchange"));
+
+    await waitFor(() => expect(h.adapter.setSelectedTrade).toHaveBeenLastCalledWith(null, "primary"));
+    expect(screen.queryByRole("table", { name: "Selected trade — setup and stop" })).toBeNull();
+  });
+
+  it("lists WT1 and the band edge in the bars table", async () => {
+    const overlays: ChartOverlayDto[] = [
+      { kind: "line", label: "ema:5", values: ["90000", "90100"] },
+      { kind: "line", label: "ema:11", values: ["89900", "90200"] },
+      {
+        kind: "bandEdge",
+        label: "max(ema:5,ema:11)",
+        members: ["ema:5", "ema:11"],
+        values: ["90000", "90250"],
+      },
+      { kind: "oscillator", label: "wavetrend:9:12", values: [null, "-12.5"] },
+    ];
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ overlays, notDrawn: [] }) })),
+    );
+    await open("#/chart?run=run-1");
+
+    fireEvent.click(await screen.findByText(/Bars, levels and lines/));
+    const table = await screen.findByRole("table", { name: "Bars, levels and lines" });
+    const headers = within(table)
+      .getAllByRole("columnheader")
+      .map((cell) => cell.textContent);
+    expect(headers).toContain("max(ema:5,ema:11)");
+    expect(headers).toContain("wavetrend:9:12");
+    // A WT1 value is not a price: it shows the read's exact text, not `-12.50`.
+    const wt1 = within(table).getByText("-12.5");
+    expect(wt1.getAttribute("data-exact")).toBe("-12.5");
+    // The band edge is a price like any line.
+    expect(within(table).getByText("90,250.00")).toBeTruthy();
+  });
+
+  it("names the WaveTrend operand in the empty-rule note", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer({ overlays: [], notDrawn: [] }) })),
+    );
+    await open("#/chart?run=run-1");
+
+    expect(
+      await screen.findByText(
+        "This rule uses no S/R, pivot, candle-pattern, EMA, SMA or WaveTrend operand on 4h.",
+      ),
+    ).toBeTruthy();
   });
 });

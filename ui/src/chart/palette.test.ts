@@ -1,4 +1,4 @@
-// The chart palette's own tests (r5.s2.w2) — the ten aliases the adapter draws with.
+// The chart palette's own tests (r5.s2.w2) — the aliases the adapter draws with (eighteen since r6.s4.w4).
 //
 // Two things are worth proving here and nothing else is:
 //
@@ -26,7 +26,7 @@ interface FsLike {
 }
 const fs = nodeRuntime.getBuiltinModule("node:fs") as FsLike;
 
-/** The ten aliases, in the order the sheet declares them. */
+/** The aliases, in the order the sheet declares them. */
 const ALIASES = Object.values(PALETTE_TOKENS);
 
 /** A container with every alias set on it, as the loaded sheet would. */
@@ -73,6 +73,29 @@ describe("chartPalette", () => {
       expect(aliased, `${name} is not a bare alias: ${value.trim()}`).not.toBeNull();
       expect(aliased?.[1]).not.toBe("--focus");
     }
+  });
+
+  it("names the six strategy aliases (r6.s4.w4), after the twelve before them, and the sheet declares them", () => {
+    const names = Object.values(PALETTE_TOKENS);
+    expect(names.slice(-6)).toEqual([
+      "--chart-ribbon",
+      "--chart-band-edge",
+      "--chart-oscillator",
+      "--chart-oscillator-guide",
+      "--chart-setup",
+      "--chart-stop",
+    ]);
+    const sheet = fs.readFileSync(
+      `${nodeRuntime.cwd()}/ui/src/styles/chart-tab.css`,
+      "utf8",
+    );
+    expect(sheet).toContain("--chart-ribbon: var(--text-4);");
+    expect(sheet).toContain("--chart-band-edge: var(--text-1);");
+    expect(sheet).toContain("--chart-oscillator: var(--text-2);");
+    expect(sheet).toContain("--chart-oscillator-guide: var(--line-3);");
+    expect(sheet).toContain("--chart-setup: var(--warn-2);");
+    expect(sheet).toContain("--chart-stop: var(--bear-2);");
+    expect(sheet).toContain("eighteen aliases");
   });
 
   it("carries no colour literal in TypeScript", () => {

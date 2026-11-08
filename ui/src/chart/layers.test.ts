@@ -22,7 +22,15 @@ import { describe, expect, it } from "vitest";
 import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "../bindings";
 import type { ChartMarker } from "./layers";
 import type { ChartPalette } from "./palette";
-import { buildLayers, markersInWindow, toCandles, toMarkers, toOverlayLayers } from "./layers";
+import {
+  buildLayers,
+  markersInWindow,
+  setupMarkers,
+  stopLine,
+  toCandles,
+  toMarkers,
+  toOverlayLayers,
+} from "./layers";
 
 /** The palette as `chartPalette` returns it, with values a test can name. */
 const PALETTE: ChartPalette = {
@@ -38,6 +46,12 @@ const PALETTE: ChartPalette = {
   pivotGhost: "ghost",
   markTrader: "mark-trader",
   markAgent: "mark-agent",
+  ribbon: "ribbon",
+  bandEdge: "band-edge",
+  oscillator: "oscillator",
+  oscillatorGuide: "oscillator-guide",
+  setup: "setup",
+  stop: "stop",
 };
 
 /** One example-trade mark, as `listMarks` reads it (r5.s3.w1). Times are ms strings. */
@@ -93,6 +107,9 @@ describe("toOverlayLayers", () => {
         label: "support:3-3-0.005-2-100",
         stepped: true,
         color: "level",
+        pane: 0,
+        width: 1,
+        zeroGuide: false,
         // The warm-up is whitespace, not a value: the level draws nothing there
         // rather than a line the engine never computed.
         data: [{ time: 1735689600 }, { time: 1735704000, value: 93460.2 }],
@@ -109,6 +126,9 @@ describe("toOverlayLayers", () => {
         label: "ema:20",
         stepped: false,
         color: "line",
+        pane: 0,
+        width: 1,
+        zeroGuide: false,
         data: [
           { time: 1735689600, value: 90000 },
           { time: 1735704000, value: 90100 },
@@ -123,6 +143,117 @@ describe("toOverlayLayers", () => {
       { kind: "pattern", label: "cdl:engulfing", events: [] },
     ];
     expect(toOverlayLayers(overlays, candles(), PALETTE)).toEqual([]);
+  });
+});
+
+describe("the strategy layers (r6.s4.w4)", () => {
+  it("draws a band edge strongly and its member lines muted", () => {
+    const overlays: ChartOverlayDto[] = [
+      { kind: "line", label: "ema:5", values: ["90000", "90100"] },
+      { kind: "line", label: "ema:11", values: ["89900", "90200"] },
+      { kind: "line", label: "sma:50", values: ["88000", "88100"] },
+      {
+        kind: "bandEdge",
+        label: "max(ema:5,ema:11)",
+        members: ["ema:5", "ema:11"],
+        values: ["90000", "90200"],
+      },
+    ];
+    const layers = toOverlayLayers(overlays, candles(), PALETTE);
+    expect(layers.map((layer) => [layer.label, layer.color, layer.width, layer.pane])).toEqual([
+      ["ema:5", "ribbon", 1, 0],
+      ["ema:11", "ribbon", 1, 0],
+      ["sma:50", "line", 1, 0],
+      ["max(ema:5,ema:11)", "band-edge", 2, 0],
+    ]);
+    expect(layers.every((layer) => !layer.stepped && !layer.zeroGuide)).toBe(true);
+    expect(layers[3].data).toEqual([
+      { time: 1735689600, value: 90000 },
+      { time: 1735704000, value: 90200 },
+    ]);
+  });
+
+  it("puts WT1 in pane 1 with a zero guide", () => {
+    const overlays: ChartOverlayDto[] = [
+      { kind: "line", label: "ema:5", values: ["90000", "90100"] },
+      { kind: "level", label: "support:3-3-0.005-2-100", values: [null, "93460.2"] },
+      { kind: "oscillator", label: "wavetrend:9:12", values: [null, "-12.5"] },
+    ];
+    const layers = toOverlayLayers(overlays, candles(), PALETTE);
+    const wt1 = layers.find((layer) => layer.label === "wavetrend:9:12");
+    expect(wt1).toEqual({
+      label: "wavetrend:9:12",
+      stepped: false,
+      color: "oscillator",
+      pane: 1,
+      width: 1,
+      zeroGuide: true,
+      data: [{ time: 1735689600 }, { time: 1735704000, value: -12.5 }],
+    });
+    expect(layers.filter((layer) => layer.zeroGuide)).toHaveLength(1);
+    expect(layers.filter((layer) => layer.pane === 1)).toHaveLength(1);
+  });
+
+  /** A trade carrying its setup bars: arm 00:00, dip 04:00, trigger 08:00, HTF arm at the
+   *  day's open (all 2025-01-01, UTC), and its stored stop. */
+  function setupTrade(over: Partial<ChartTradeDto> = {}): ChartTradeDto {
+    return {
+      side: "long",
+      entryTime: "1735718400000",
+      entryPrice: "90000",
+      exitTime: null,
+      exitPrice: null,
+      exitReason: null,
+      realizedR: "0",
+      stopPrice: "89000",
+      armBarTime: "1735689600000",
+      htfArmBarTime: "1735675200000",
+      dipBarTime: "1735704000000",
+      triggerBarTime: "1735718400000",
+      ...over,
+    };
+  }
+
+  it("marks a long trade's arm, dip and trigger on the primary leg", () => {
+    expect(setupMarkers(setupTrade(), "primary", PALETTE)).toEqual([
+      { time: 1735689600, position: "belowBar", shape: "circle", color: "setup", text: "arm" },
+      { time: 1735704000, position: "belowBar", shape: "circle", color: "setup", text: "dip" },
+      { time: 1735718400, position: "belowBar", shape: "circle", color: "setup", text: "trigger" },
+    ]);
+  });
+
+  it("marks only the arm on the higher-timeframe leg", () => {
+    expect(setupMarkers(setupTrade(), "htf", PALETTE)).toEqual([
+      { time: 1735675200, position: "belowBar", shape: "circle", color: "setup", text: "arm" },
+    ]);
+    // A short trade's markers sit on the entry arrow's side: above the bar.
+    expect(setupMarkers(setupTrade({ side: "short" }), "htf", PALETTE)).toEqual([
+      { time: 1735675200, position: "aboveBar", shape: "circle", color: "setup", text: "arm" },
+    ]);
+    expect(
+      setupMarkers(setupTrade({ side: "short" }), "primary", PALETTE).map((m) => m.position),
+    ).toEqual(["aboveBar", "aboveBar", "aboveBar"]);
+  });
+
+  it("draws no setup marker and no stop line without them", () => {
+    expect(setupMarkers(null, "primary", PALETTE)).toEqual([]);
+    expect(setupMarkers(null, "htf", PALETTE)).toEqual([]);
+    expect(stopLine(null)).toBeNull();
+    const bare = setupTrade({
+      armBarTime: null,
+      htfArmBarTime: null,
+      dipBarTime: null,
+      triggerBarTime: null,
+      stopPrice: null,
+    });
+    expect(setupMarkers(bare, "primary", PALETTE)).toEqual([]);
+    expect(setupMarkers(bare, "htf", PALETTE)).toEqual([]);
+    expect(stopLine(bare)).toBeNull();
+    // One null field draws none, and the others still draw.
+    expect(
+      setupMarkers(setupTrade({ dipBarTime: null }), "primary", PALETTE).map((m) => m.text),
+    ).toEqual(["arm", "trigger"]);
+    expect(stopLine(setupTrade({ stopPrice: "89000" }))).toEqual({ price: 89000, title: "stop" });
   });
 });
 
@@ -193,6 +324,11 @@ describe("toMarkers", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(toMarkers([], trades, PALETTE)).toEqual([
@@ -211,6 +347,11 @@ describe("toMarkers", () => {
         exitPrice: "92000",
         exitReason: "stop_loss",
         realizedR: "-1",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(toMarkers([], trades, PALETTE)).toEqual([
@@ -231,6 +372,11 @@ describe("toMarkers", () => {
         exitPrice: null,
         exitReason: null,
         realizedR: "0",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(toMarkers([], trades, PALETTE)).toEqual([
@@ -251,6 +397,11 @@ describe("toMarkers", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     const times = toMarkers(overlays, trades, PALETTE).map((marker) => marker.time);
@@ -308,6 +459,11 @@ describe("example marks as markers (r5.s3.w3)", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     const merged = toMarkers(overlays, trades, PALETTE, [mark()]);
@@ -355,6 +511,11 @@ describe("markersInWindow", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(markersInWindow(toMarkers([], trades, PALETTE), loaded)).toEqual([
@@ -397,6 +558,11 @@ describe("markersInWindow", () => {
         exitPrice: null,
         exitReason: null,
         realizedR: "0",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     expect(markersInWindow(toMarkers([], trades, PALETTE), loaded)).toEqual([
@@ -431,6 +597,11 @@ describe("markersInWindow", () => {
         exitPrice: "92000",
         exitReason: "take_profit",
         realizedR: "2",
+        stopPrice: null,
+        armBarTime: null,
+        htfArmBarTime: null,
+        dipBarTime: null,
+        triggerBarTime: null,
       },
     ];
     const markers = toMarkers([], trades, PALETTE);
@@ -505,6 +676,11 @@ describe("buildLayers", () => {
               exitPrice: "92000",
               exitReason: "take_profit",
               realizedR: "2",
+              stopPrice: null,
+              armBarTime: null,
+              htfArmBarTime: null,
+              dipBarTime: null,
+              triggerBarTime: null,
             },
           ],
           overlays: [],
@@ -532,6 +708,11 @@ describe("buildLayers", () => {
       exitPrice: "92000",
       exitReason: "take_profit",
       realizedR: "1",
+      stopPrice: null,
+      armBarTime: null,
+      htfArmBarTime: null,
+      dipBarTime: null,
+      triggerBarTime: null,
     };
     const layers = buildLayers(
       {

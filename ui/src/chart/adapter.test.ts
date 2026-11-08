@@ -21,17 +21,40 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => {
-  const timeScale = { fitContent: vi.fn(), setVisibleLogicalRange: vi.fn() };
+  const timeScale = {
+    fitContent: vi.fn(),
+    setVisibleLogicalRange: vi.fn(),
+    getVisibleLogicalRange: vi.fn(),
+  };
   const series: {
     definition: unknown;
     options: unknown;
+    pane: number | undefined;
     setData: ReturnType<typeof vi.fn>;
+    createPriceLine: ReturnType<typeof vi.fn>;
+    removePriceLine: ReturnType<typeof vi.fn>;
   }[] = [];
+  // The library's panes: pane 0 always exists, and a series added at a higher index makes
+  // the panes up to it. `removePane` takes the pane away, as the library does.
+  const panes: { setStretchFactor: ReturnType<typeof vi.fn> }[] = [];
+  const makePane = () => ({ setStretchFactor: vi.fn() });
   const chart = {
-    addSeries: vi.fn((definition: unknown, options: unknown) => {
-      const created = { definition, options, setData: vi.fn() };
+    addSeries: vi.fn((definition: unknown, options: unknown, pane?: number) => {
+      while (panes.length <= (pane ?? 0)) panes.push(makePane());
+      const created = {
+        definition,
+        options,
+        pane,
+        setData: vi.fn(),
+        createPriceLine: vi.fn((line: unknown) => ({ line })),
+        removePriceLine: vi.fn(),
+      };
       series.push(created);
       return created;
+    }),
+    panes: vi.fn(() => panes),
+    removePane: vi.fn((index: number) => {
+      panes.splice(index, 1);
     }),
     removeSeries: vi.fn(),
     applyOptions: vi.fn(),
@@ -41,7 +64,7 @@ const h = vi.hoisted(() => {
     remove: vi.fn(),
   };
   const markersApi = { setMarkers: vi.fn() };
-  return { timeScale, chart, series, markersApi };
+  return { timeScale, chart, series, panes, makePane, markersApi };
 });
 
 vi.mock("lightweight-charts", () => ({
@@ -49,7 +72,7 @@ vi.mock("lightweight-charts", () => ({
   createSeriesMarkers: vi.fn(() => h.markersApi),
   CandlestickSeries: { type: "Candlestick" },
   LineSeries: { type: "Line" },
-  LineStyle: { Solid: 0, Dashed: 2 },
+  LineStyle: { Solid: 0, Dotted: 1, Dashed: 2 },
   LineType: { Simple: 0, WithSteps: 1 },
   ColorType: { Solid: "solid" },
 }));
@@ -60,7 +83,7 @@ import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "..
 import { createChartAdapter } from "./adapter";
 import { PALETTE_TOKENS } from "./palette";
 
-/** A container carrying the chart's twelve aliases, as the loaded sheet leaves it. */
+/** A container carrying the chart's eighteen aliases, as the loaded sheet leaves it. */
 function container(): HTMLElement {
   const el = document.createElement("div");
   el.style.setProperty(PALETTE_TOKENS.bull, "bull");
@@ -75,6 +98,12 @@ function container(): HTMLElement {
   el.style.setProperty(PALETTE_TOKENS.background, "bg");
   el.style.setProperty(PALETTE_TOKENS.text, "text");
   el.style.setProperty(PALETTE_TOKENS.grid, "grid");
+  el.style.setProperty(PALETTE_TOKENS.ribbon, "ribbon");
+  el.style.setProperty(PALETTE_TOKENS.bandEdge, "band-edge");
+  el.style.setProperty(PALETTE_TOKENS.oscillator, "oscillator");
+  el.style.setProperty(PALETTE_TOKENS.oscillatorGuide, "oscillator-guide");
+  el.style.setProperty(PALETTE_TOKENS.setup, "setup");
+  el.style.setProperty(PALETTE_TOKENS.stop, "stop");
   document.body.append(el);
   return el;
 }
@@ -142,10 +171,20 @@ const TRADE: ChartTradeDto = {
   exitPrice: "92000",
   exitReason: "take_profit",
   realizedR: "2",
+  stopPrice: null,
+  armBarTime: null,
+  htfArmBarTime: null,
+  dipBarTime: null,
+  triggerBarTime: null,
 };
 
 beforeEach(() => {
   h.series.length = 0;
+  // Pane 0 is the chart's own: it exists before any series is added.
+  h.panes.length = 0;
+  h.panes.push(h.makePane());
+  h.chart.panes.mockClear();
+  h.chart.removePane.mockClear();
   h.chart.addSeries.mockClear();
   h.chart.removeSeries.mockClear();
   h.chart.remove.mockClear();
@@ -154,6 +193,7 @@ beforeEach(() => {
   h.markersApi.setMarkers.mockClear();
   h.timeScale.fitContent.mockClear();
   h.timeScale.setVisibleLogicalRange.mockClear();
+  h.timeScale.getVisibleLogicalRange.mockReset();
   vi.mocked(createChart).mockClear();
   vi.mocked(createSeriesMarkers).mockClear();
 });
@@ -168,6 +208,12 @@ describe("createChartAdapter", () => {
     // The logo is a LAYOUT option, and it is passed explicitly rather than left to the
     // library's default, so a default flip cannot silently drop TradingView's notice.
     expect(options?.layout).toMatchObject({ attributionLogo: true });
+  });
+
+  it("shows the time of day on the time scale and the crosshair (#456)", () => {
+    createChartAdapter(container());
+    const options = vi.mocked(createChart).mock.calls[0][1];
+    expect(options?.timeScale).toMatchObject({ timeVisible: true, secondsVisible: false });
   });
 
   it("draws the candles in the library's own units", () => {
@@ -220,6 +266,150 @@ describe("createChartAdapter", () => {
     expect(layerSeries()).toHaveLength(2);
     // The candle series is never removed: it is the chart's floor.
     expect(h.chart.removeSeries).not.toHaveBeenCalledWith(candleSeries());
+  });
+
+  it("creates WT1 in pane 1 with its zero guide as a price line, not data", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setOverlays([
+      { kind: "line", label: "ema:5", values: ["90000", "90100"] },
+      { kind: "oscillator", label: "wavetrend:9:12", values: [null, "-12.5"] },
+    ]);
+    const [ema, wt1] = layerSeries();
+    // The ribbon line stays in pane 0; WT1 is added at pane index 1.
+    expect(ema.pane).toBe(0);
+    expect(wt1.pane).toBe(1);
+    expect(wt1.options).toMatchObject({ color: "oscillator", lineStyle: 2, lineWidth: 1 });
+    // The guide is a dotted price line at 0 with no axis label; the pane's data is the
+    // read's values only: the read sends no value for the guide.
+    expect(wt1.createPriceLine).toHaveBeenCalledTimes(1);
+    expect(wt1.createPriceLine).toHaveBeenCalledWith({
+      price: 0,
+      color: "oscillator-guide",
+      lineStyle: 1,
+      lineWidth: 1,
+      axisLabelVisible: false,
+      title: "",
+    });
+    expect(ema.createPriceLine).not.toHaveBeenCalled();
+    expect(wt1.setData).toHaveBeenCalledWith([{ time: 1735689600 }, { time: 1735704000, value: -12.5 }]);
+    // The candles keep three parts of the height to WT1's one.
+    expect(h.panes[0].setStretchFactor).toHaveBeenCalledWith(3);
+    expect(h.panes[1].setStretchFactor).toHaveBeenCalledWith(1);
+  });
+
+  it("draws a band edge two pixels wide", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setOverlays([
+      { kind: "line", label: "ema:5", values: ["90000", "90100"] },
+      { kind: "bandEdge", label: "max(ema:5)", members: ["ema:5"], values: ["90000", "90100"] },
+    ]);
+    const [ema, edge] = layerSeries();
+    expect(ema.options).toMatchObject({ color: "ribbon", lineWidth: 1, lineStyle: 2 });
+    expect(edge.options).toMatchObject({ color: "band-edge", lineWidth: 2, lineStyle: 2 });
+    expect(edge.pane).toBe(0);
+  });
+
+  it("removes the oscillator pane when a read has none", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setOverlays([{ kind: "oscillator", label: "wavetrend:9:12", values: [null, "-12.5"] }]);
+    expect(h.chart.panes()).toHaveLength(2);
+    h.chart.removePane.mockClear();
+    adapter.setOverlays([{ kind: "line", label: "ema:5", values: ["90000", "90100"] }]);
+    expect(h.chart.removePane).toHaveBeenCalledTimes(1);
+    expect(h.chart.removePane).toHaveBeenCalledWith(1);
+    expect(h.chart.panes()).toHaveLength(1);
+  });
+
+  it("draws the selected trade's setup in the one markers list", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    // Entry at 12:00Z (open), with its arm at 00:00Z, dip at 04:00Z and trigger at 08:00Z.
+    const trade: ChartTradeDto = {
+      ...TRADE,
+      entryTime: "1735747200000",
+      exitTime: null,
+      exitPrice: null,
+      exitReason: null,
+      stopPrice: "89000",
+      armBarTime: "1735689600000",
+      htfArmBarTime: "1735675200000",
+      dipBarTime: "1735704000000",
+      triggerBarTime: "1735718400000",
+    };
+    adapter.setTrades([trade]);
+    adapter.setSelectedTrade(trade, "primary");
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as {
+      time: number;
+      text?: string;
+      shape: string;
+      color: string;
+    }[];
+    // One list, ascending: arm, dip, trigger, then the trade's own entry.
+    expect(last.map((marker) => [marker.time, marker.text ?? marker.shape])).toEqual([
+      [1735689600, "arm"],
+      [1735704000, "dip"],
+      [1735718400, "trigger"],
+      [1735747200, "arrowUp"],
+    ]);
+    expect(last[0]).toMatchObject({ shape: "circle", color: "setup", position: "belowBar" });
+    // A selection of nothing clears the setup and keeps the trade's own marker.
+    adapter.setSelectedTrade(null, "primary");
+    const cleared = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
+    expect(cleared.map((marker) => marker.time)).toEqual([1735747200]);
+  });
+
+  it("draws the setup bar outside the loaded window as nothing", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    // The arm bar is two days before the loaded window; the dip is a loaded bar.
+    adapter.setSelectedTrade(
+      {
+        ...TRADE,
+        armBarTime: "1735516800000",
+        dipBarTime: "1735704000000",
+        triggerBarTime: null,
+      },
+      "primary",
+    );
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number; text?: string }[];
+    expect(last.map((marker) => marker.text)).toEqual(["dip"]);
+  });
+
+  it("draws the stop as a price line labelled stop, and replaces it", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setSelectedTrade({ ...TRADE, stopPrice: "89000" }, "primary");
+    const candles = candleSeries();
+    expect(candles.createPriceLine).toHaveBeenCalledTimes(1);
+    expect(candles.createPriceLine).toHaveBeenCalledWith({
+      price: 89000,
+      color: "stop",
+      lineStyle: 2,
+      lineWidth: 1,
+      axisLabelVisible: true,
+      title: "stop",
+    });
+    expect(candles.removePriceLine).not.toHaveBeenCalled();
+    const first = candles.createPriceLine.mock.results[0].value;
+
+    // A second selection takes the first line off before it draws its own.
+    adapter.setSelectedTrade({ ...TRADE, stopPrice: "88000" }, "primary");
+    expect(candles.removePriceLine).toHaveBeenCalledTimes(1);
+    expect(candles.removePriceLine).toHaveBeenCalledWith(first);
+    expect(candles.createPriceLine).toHaveBeenCalledTimes(2);
+    const second = candles.createPriceLine.mock.results[1].value;
+
+    // `null`, or a trade with no stop, removes the line and creates none.
+    adapter.setSelectedTrade(null, "primary");
+    expect(candles.removePriceLine).toHaveBeenCalledTimes(2);
+    expect(candles.removePriceLine).toHaveBeenLastCalledWith(second);
+    expect(candles.createPriceLine).toHaveBeenCalledTimes(2);
+    adapter.setSelectedTrade({ ...TRADE, stopPrice: null }, "primary");
+    expect(candles.createPriceLine).toHaveBeenCalledTimes(2);
+    expect(candles.removePriceLine).toHaveBeenCalledTimes(2);
   });
 
   it("puts every marker on the candle series, in ONE ascending list", () => {
@@ -390,6 +580,58 @@ describe("createChartAdapter", () => {
     createChartAdapter(container());
     expect(h.chart.addSeries).not.toHaveBeenCalled();
     expect(h.markersApi.setMarkers).not.toHaveBeenCalled();
+  });
+});
+
+describe("zoom (r6.s4.w3)", () => {
+  /** 200 bars, one 4h bar apart, from 2025-01-01T00:00Z. */
+  const TWO_HUNDRED: ChartCandleDto[] = Array.from({ length: 200 }, (_, index) => ({
+    t: String(1_735_689_600_000 + index * 14_400_000),
+    o: "100",
+    h: "101",
+    l: "99",
+    c: "100",
+    v: "1",
+  }));
+
+  /** An adapter with 200 bars loaded and the library reporting `range` as visible. */
+  function zoomable(range: { from: number; to: number } | null) {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(TWO_HUNDRED);
+    h.timeScale.getVisibleLogicalRange.mockReturnValue(range);
+    return adapter;
+  }
+
+  it("zooms in and out around the middle of the visible range", () => {
+    const adapter = zoomable({ from: 50, to: 150 });
+    adapter.zoom("in");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 75, to: 125 });
+    adapter.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 0, to: 200 });
+  });
+
+  it("keeps at least ten bars and at most the whole window in view", () => {
+    const tight = zoomable({ from: 95, to: 105 });
+    tight.zoom("in");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 95, to: 105 });
+
+    const whole = zoomable({ from: 0, to: 200 });
+    whole.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 0, to: 200 });
+  });
+
+  it("does not zoom without a visible range or a loaded bar", () => {
+    const blind = zoomable(null);
+    blind.zoom("in");
+    blind.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).not.toHaveBeenCalled();
+
+    // A visible range with no candle loaded: still nothing.
+    const empty = createChartAdapter(container());
+    h.timeScale.getVisibleLogicalRange.mockReturnValue({ from: 50, to: 150 });
+    empty.zoom("in");
+    empty.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).not.toHaveBeenCalled();
   });
 });
 

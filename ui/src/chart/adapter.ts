@@ -25,8 +25,14 @@
 //    cannot place onto the first or last loaded candle and resolving an interior time to
 //    the NEXT loaded bar.
 //  * **The layers are redrawn, not stacked.** A new read removes the previous run's
-//    level and line series before creating its own; only the candle series, and the
-//    marker plugin hanging off it, outlive a read.
+//    layer series, and every pane but the candles', before creating its own; only the
+//    candle series, and the marker plugin hanging off it, outlive a read.
+//  * **WT1 has its own pane (r6.s4.w4).** An oscillator is not a price, so it is created in
+//    pane 1 and the candles keep three parts of the height to its one. Its guide at 0 is a
+//    price line, not data: the read sends no value for it.
+//  * **The selected trade's setup rides the same marker list (r6.s4.w4).** Its arm, dip and
+//    trigger markers join the one list `markersInWindow` clips and places, so a setup bar
+//    outside the loaded window draws nothing. Its stop is a price line on the candle series.
 
 import {
   CandlestickSeries,
@@ -40,6 +46,7 @@ import {
 import type {
   CandlestickData,
   IChartApi,
+  IPriceLine,
   ISeriesApi,
   ISeriesMarkersPluginApi,
   LineData,
@@ -56,6 +63,8 @@ import type { CandlePoint, ChartMarker, OverlayLayer } from "./layers";
 import {
   containingIndex,
   markersInWindow,
+  setupMarkers,
+  stopLine,
   toCandles,
   toMarkers,
   toOverlayLayers,
@@ -74,6 +83,9 @@ export interface ChartAdapter {
   setTrades(trades: readonly ChartTradeDto[]): void;
   /** Draw these example marks' markers (r5.s3.w3). */
   setMarks(marks: readonly MarkDto[]): void;
+  /** Draw this trade's setup markers and stop line on the leg the read drew (`null` clears
+   *  both). */
+  setSelectedTrade(trade: ChartTradeDto | null, series: "primary" | "htf"): void;
   /** Call `handler` with the open of the loaded candle a click landed on. A click
    *  outside the loaded candles, or before any read has drawn a bar, calls nothing.
    *  One handler: a second call replaces the first. */
@@ -82,12 +94,20 @@ export interface ChartAdapter {
   fitAll(): void;
   /** Scroll so the bar nearest `timeMs` sits in the middle of the pane. */
   centerOn(timeMs: string): void;
+  /** Halve ("in") or double ("out") the visible bar range around its middle. */
+  zoom(direction: "in" | "out"): void;
   /** Remove the chart and everything it owns. Irreversible: unmount only. */
   destroy(): void;
 }
 
 /** How many bars either side of the centred bar stay in view. */
 const CENTRE_BARS = 60;
+
+/** One zoom step halves or doubles the visible range. */
+const ZOOM_FACTOR = 2;
+
+/** The least half-range a zoom-in leaves: ten bars in view, so every bar stays clickable. */
+const MIN_ZOOM_HALF_BARS = 5;
 
 /** One mapped marker, in the library's two marker shapes. */
 function toSeriesMarker(marker: ChartMarker): SeriesMarker<Time> {
@@ -146,7 +166,9 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       horzLines: { color: palette.grid },
     },
     rightPriceScale: { borderColor: palette.grid },
-    timeScale: { borderColor: palette.grid },
+    // The library shows a `UTCTimestamp` in UTC, so with the time of day on, the axis and
+    // the crosshair label read the bar's UTC open (#456). On `1d` that is `00:00`.
+    timeScale: { borderColor: palette.grid, timeVisible: true, secondsVisible: false },
   });
 
   // What the read last handed in. The candle times are kept as the read spelled
@@ -157,10 +179,14 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
   let overlayDtos: readonly ChartOverlayDto[] = [];
   let tradeDtos: readonly ChartTradeDto[] = [];
   let markDtos: readonly MarkDto[] = [];
+  let selectedTrade: ChartTradeDto | null = null;
+  let selectedSeries: "primary" | "htf" = "primary";
 
   let candleSeries: ISeriesApi<"Candlestick"> | null = null;
   let markerPlugin: ISeriesMarkersPluginApi<Time> | null = null;
   let layerSeries: ISeriesApi<"Line">[] = [];
+  /** The selected trade's stop line on the candle series, kept so it can be taken off. */
+  let stopPriceLine: IPriceLine | null = null;
   /** The one click handler the screen subscribed, kept so `destroy` unsubscribes the
    *  EXACT function it subscribed rather than every handler on the chart. */
   let clickHandler: ((param: MouseEventParams<Time>) => void) | null = null;
@@ -181,7 +207,8 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     return candleSeries;
   };
 
-  /** Rebuild the merged marker list from the overlays and trades last handed in, and
+  /** Rebuild the merged marker list from the overlays, trades, marks and the selected
+   *  trade's setup last handed in, and
    *  hand the library ONLY the markers the loaded bars can hold, each on its containing
    *  bar (CR2, CR4): a marker time the series cannot place is snapped onto the first or
    *  last loaded candle, and a time inside a bar would otherwise resolve to the NEXT one. */
@@ -189,7 +216,10 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     if (markerPlugin === null) return;
     markerPlugin.setMarkers(
       markersInWindow(
-        toMarkers(overlayDtos, tradeDtos, palette, markDtos),
+        [
+          ...toMarkers(overlayDtos, tradeDtos, palette, markDtos),
+          ...setupMarkers(selectedTrade, selectedSeries, palette),
+        ],
         candlePoints,
       ).map(toSeriesMarker),
     );
@@ -222,20 +252,41 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
         chart.removeSeries(stale);
       }
       layerSeries = [];
+      // Removing a pane's last series does not remove the pane: take every pane but the
+      // candles' away, so a read without WT1 leaves no empty pane behind.
+      while (chart.panes().length > 1) chart.removePane(chart.panes().length - 1);
       for (const layer of toOverlayLayers(overlayDtos, candleDtos, palette)) {
-        const line = chart.addSeries(LineSeries, {
-          color: layer.color,
-          // Both are dashed: they are the server's, not the trader's (design §0
-          // rule 5). A level holds its value between the bars the engine moved it,
-          // an EMA moves every bar — that is the only difference between them.
-          lineStyle: LineStyle.Dashed,
-          lineType: layer.stepped ? LineType.WithSteps : LineType.Simple,
-          lineWidth: 1,
-          priceLineVisible: false,
-          lastValueVisible: false,
-          crosshairMarkerVisible: false,
-        });
+        const line = chart.addSeries(
+          LineSeries,
+          {
+            color: layer.color,
+            // Every server layer is dashed: they are the server's, not the trader's
+            // (design §0 rule 5). A level holds its value between the bars the engine
+            // moved it, an EMA moves every bar — that is the only difference between them.
+            lineStyle: LineStyle.Dashed,
+            lineType: layer.stepped ? LineType.WithSteps : LineType.Simple,
+            lineWidth: layer.width,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          },
+          layer.pane,
+        );
         line.setData(toLineData(layer));
+        if (layer.zeroGuide) {
+          // a guide at 0, not data: the read sends no value for it
+          line.createPriceLine({
+            price: 0,
+            color: palette.oscillatorGuide,
+            lineStyle: LineStyle.Dotted,
+            lineWidth: 1,
+            axisLabelVisible: false,
+            title: "",
+          });
+          // The candles keep three parts of the height to WT1's one.
+          chart.panes()[0]?.setStretchFactor(3);
+          chart.panes()[1]?.setStretchFactor(1);
+        }
         layerSeries.push(line);
       }
       drawMarkers();
@@ -251,6 +302,28 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       markDtos = [...next];
       ensureCandles();
       drawMarkers();
+    },
+
+    setSelectedTrade(trade, series) {
+      selectedTrade = trade;
+      selectedSeries = series;
+      const candles = ensureCandles();
+      drawMarkers();
+      if (stopPriceLine !== null) {
+        candles.removePriceLine(stopPriceLine);
+        stopPriceLine = null;
+      }
+      const stop = stopLine(trade);
+      if (stop !== null) {
+        stopPriceLine = candles.createPriceLine({
+          price: stop.price,
+          color: palette.stop,
+          lineStyle: LineStyle.Dashed,
+          lineWidth: 1,
+          axisLabelVisible: true,
+          title: stop.title,
+        });
+      }
     },
 
     onCandleClick(handler) {
@@ -286,6 +359,19 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       });
     },
 
+    zoom(direction) {
+      if (candlePoints.length === 0) return;
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (range === null) return;
+      const centre = (range.from + range.to) / 2;
+      const half = (range.to - range.from) / 2;
+      const wanted = direction === "in" ? half / ZOOM_FACTOR : half * ZOOM_FACTOR;
+      // Never fewer than ten bars, never more than the whole loaded window.
+      const most = Math.max(MIN_ZOOM_HALF_BARS, candlePoints.length / 2);
+      const next = Math.min(Math.max(wanted, MIN_ZOOM_HALF_BARS), most);
+      chart.timeScale().setVisibleLogicalRange({ from: centre - next, to: centre + next });
+    },
+
     destroy() {
       // Unsubscribe the exact handler this adapter put on, before the chart it belongs to
       // is taken down. A handler left subscribed would fire against a destroyed chart.
@@ -297,6 +383,9 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       candleSeries = null;
       markerPlugin = null;
       layerSeries = [];
+      stopPriceLine = null;
+      selectedTrade = null;
+      selectedSeries = "primary";
       candleDtos = [];
       candlePoints = [];
       overlayDtos = [];

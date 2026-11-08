@@ -78,6 +78,52 @@ export function windowPlan(
   };
 }
 
+const UTC_INSTANT = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?$/;
+
+/** The epoch-ms text of a UTC instant typed as `YYYY-MM-DD` or `YYYY-MM-DD HH:mm` (a `T` may
+ *  stand for the space), or `null` when the text names no real instant (2025-02-30, 24:00, junk).
+ *
+ *  Every date parse of the Chart tab lives here, not in the screen: `ui/src/screens/` is
+ *  scanned for `Number(` and friends, and an epoch bound must never be read as a figure. */
+export function parseUtcInstant(text: string): string | null {
+  const match = UTC_INSTANT.exec(text.trim());
+  if (match === null) return null;
+  const [year, month, day, hour, minute] = [
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+    match[4] === undefined ? 0 : Number(match[4]),
+    match[5] === undefined ? 0 : Number(match[5]),
+  ];
+  const ms = Date.UTC(year, month - 1, day, hour, minute);
+  const date = new Date(ms);
+  // `Date.UTC` rolls an impossible field over (Feb 30 becomes Mar 2, 24:00 the next
+  // day): a text names a real instant only when the fields read back as typed.
+  const real =
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day &&
+    date.getUTCHours() === hour &&
+    date.getUTCMinutes() === minute;
+  return real ? String(ms) : null;
+}
+
+/** Which bars to ask for around `anchorMs`. With a run, exactly `windowPlan(span, timeframe,
+ *  anchorMs)`. With no run, a window of `WINDOW_HALF_BARS` bars either side, unclamped (the
+ *  read returns what exists), or `{ kind: "span" }` on a timeframe `TIMEFRAME_MS` cannot size. */
+export function windowAround(
+  span: RunSpan | null,
+  timeframe: string,
+  anchorMs: string,
+): WindowPlan {
+  if (span !== null) return windowPlan(span, timeframe, anchorMs);
+  const ms = TIMEFRAME_MS[timeframe];
+  if (ms === undefined) return { kind: "span" };
+  const anchor = Number(anchorMs);
+  const half = WINDOW_HALF_BARS * ms;
+  return { kind: "window", fromMs: String(anchor - half), toMs: String(anchor + half) };
+}
+
 /** Whether the window the chart is drawing holds the bar at `ms`. A trade whose bar is
  *  not here cannot be scrolled to — the screen re-reads around it instead (a trade the
  *  read returned may have entered before the window and exited inside it).
