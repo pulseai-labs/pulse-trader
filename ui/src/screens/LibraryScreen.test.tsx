@@ -698,6 +698,16 @@ function powerReview(allowed: boolean): PowerReviewDto {
     minHoldoutTrades: 20,
     allowed,
     reason: allowed ? null : "below_bar",
+    search: {
+      rule: "wf-v2",
+      k: 6,
+      foldsHolding: 3,
+      foldsRequired: 4,
+      pooledN: 155,
+      pooledMeanR: "0.0412",
+      pooledLowerBound: 0.0272,
+      pass: false,
+    },
     createdAt: "2026-11-30T09:00:00.000Z",
     calledBy: "cli",
   };
@@ -726,6 +736,9 @@ describe("LibraryScreen (r5.s5.w3 — the power review)", () => {
     const inSection = within(section);
     expect(inSection.getByText("BTCUSDT")).toBeTruthy();
     expect(inSection.getByText("31t")).toBeTruthy();
+    // r6.s5.w2: the search span's wf-v2 verdict — the rule, the folds holding of required, the pooled count.
+    expect(inSection.getByText(/wf-v2 3\/4 folds · 155t/)).toBeTruthy();
+    expect(inSection.getByText(/search fails/)).toBeTruthy();
     expect(inSection.getByText("pass 42.1%")).toBeTruthy();
     expect(inSection.getByText("bar 50.0%")).toBeTruthy();
     expect(inSection.getByText("attempt not allowed — pass chance below the bar")).toBeTruthy();

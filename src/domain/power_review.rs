@@ -14,10 +14,10 @@
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::strategy::VersionId;
-use crate::domain::{CertificationInputs, Pair, WalkForwardRunId, holdout_test};
+use crate::domain::{CertificationInputs, Pair, WalkForwardRun, WalkForwardRunId, holdout_test};
 
 /// The pass chance an attempt must reach before it may spend a hypothesis (PDR-0040 ruling 1).
 pub const POWER_BAR: f64 = 0.50;
@@ -143,6 +143,45 @@ pub fn verdict(search_pass: bool, holdout_n: usize, pass_chance: f64) -> PowerVe
     PowerVerdict {
         allowed: reason.is_none(),
         reason,
+    }
+}
+
+/// The search span's wf-v2 verdict as a power review shows it, read from the review's stored search walk-forward.
+/// Search-span data only: nothing here comes from the holdout (G1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchSpanVerdict {
+    /// `VerdictRule::name()` of the run (`"wf-v2"` for every power review).
+    pub rule: String,
+    /// The fold count: `run.folds.len()`.
+    pub k: u8,
+    /// How many folds held.
+    pub folds_holding: u8,
+    /// How many folds the rule requires to hold.
+    pub folds_required: u8,
+    /// `run.verdict.pooled.n`.
+    pub pooled_n: usize,
+    /// `run.verdict.pooled.mean_r.normalize().to_string()`.
+    pub pooled_mean_r: String,
+    /// `run.verdict.pooled.lower_bound`.
+    pub pooled_lower_bound: f64,
+    /// `run.verdict.pass`.
+    pub pass: bool,
+}
+
+impl SearchSpanVerdict {
+    /// The verdict a stored search walk-forward carries, field for field.
+    #[must_use]
+    pub fn from_run(run: &WalkForwardRun) -> Self {
+        Self {
+            rule: run.rule.name().to_owned(),
+            k: u8::try_from(run.folds.len()).unwrap_or(u8::MAX),
+            folds_holding: run.verdict.folds_holding,
+            folds_required: run.verdict.folds_required,
+            pooled_n: run.verdict.pooled.n,
+            pooled_mean_r: run.verdict.pooled.mean_r.normalize().to_string(),
+            pooled_lower_bound: run.verdict.pooled.lower_bound,
+            pass: run.verdict.pass,
+        }
     }
 }
 
