@@ -73,6 +73,12 @@ export interface OverlayLayer {
   readonly label: string;
   readonly stepped: boolean;
   readonly color: string;
+  /** The chart pane it draws in: `0` is the candles' own, `1` is WT1's (r6.s4.w4). */
+  readonly pane: 0 | 1;
+  /** The line's width in pixels: a band edge is drawn strongly, the rest at 1. */
+  readonly width: 1 | 2;
+  /** Whether the adapter draws a guide at 0 on this layer. Only an oscillator has one. */
+  readonly zeroGuide: boolean;
   readonly data: readonly LinePoint[];
 }
 
@@ -125,20 +131,38 @@ export function toCandles(candles: readonly ChartCandleDto[]): CandlePoint[] {
   }));
 }
 
-/** The level and line overlays, as drawable series.
+/** The level, line, band-edge and oscillator overlays, as drawable series.
  *
  *  `values[i]` belongs to `candles[i]` — the read returns one value per WINDOW bar —
  *  so the two are zipped positionally. A read that ever disagreed with its own candle
  *  count is truncated to the shorter of the two rather than drawn against the wrong
- *  bars. */
+ *  bars.
+ *
+ *  The strategy layers (r6.s4.w4): a `line` that a band edge names as a member is a ribbon
+ *  member, muted; the `bandEdge` itself is drawn strongly over it; an `oscillator` (WT1) is
+ *  not a price, so it goes to pane 1 with a guide at 0. Pivots and patterns stay markers. */
 export function toOverlayLayers(
   overlays: readonly ChartOverlayDto[],
   candles: readonly ChartCandleDto[],
   palette: ChartPalette,
 ): OverlayLayer[] {
+  // The labels the read's band edges combine: those lines are the ribbon.
+  const members = new Set<string>();
+  for (const overlay of overlays) {
+    if (overlay.kind === "bandEdge") {
+      for (const member of overlay.members) members.add(member);
+    }
+  }
   const layers: OverlayLayer[] = [];
   for (const overlay of overlays) {
-    if (overlay.kind !== "level" && overlay.kind !== "line") continue;
+    if (
+      overlay.kind !== "level" &&
+      overlay.kind !== "line" &&
+      overlay.kind !== "bandEdge" &&
+      overlay.kind !== "oscillator"
+    ) {
+      continue;
+    }
     const count = Math.min(overlay.values.length, candles.length);
     const data: LinePoint[] = [];
     for (let i = 0; i < count; i += 1) {
@@ -146,15 +170,62 @@ export function toOverlayLayers(
       const value = overlay.values[i];
       data.push(value === null ? { time } : { time, value: decimal(value) });
     }
-    layers.push({
-      label: overlay.label,
-      // A level is the same price until the engine moves it; an EMA moves every bar.
-      stepped: overlay.kind === "level",
-      color: overlay.kind === "level" ? palette.serverLevel : palette.serverLine,
-      data,
-    });
+    const shape = ((): Pick<OverlayLayer, "stepped" | "color" | "pane" | "width" | "zeroGuide"> => {
+      switch (overlay.kind) {
+        // A level is the same price until the engine moves it; an EMA moves every bar.
+        case "level":
+          return { stepped: true, color: palette.serverLevel, pane: 0, width: 1, zeroGuide: false };
+        case "line":
+          return {
+            stepped: false,
+            color: members.has(overlay.label) ? palette.ribbon : palette.serverLine,
+            pane: 0,
+            width: 1,
+            zeroGuide: false,
+          };
+        case "bandEdge":
+          return { stepped: false, color: palette.bandEdge, pane: 0, width: 2, zeroGuide: false };
+        case "oscillator":
+          return { stepped: false, color: palette.oscillator, pane: 1, width: 1, zeroGuide: true };
+      }
+    })();
+    layers.push({ label: overlay.label, ...shape, data });
   }
   return layers;
+}
+
+/** The selected trade's setup markers on the leg the read drew (r6.s4.w4).
+ *
+ *  On the primary leg: the arm, dip and trigger bars. On the higher-timeframe leg: the one
+ *  4H bar whose close armed the setup. A `null` bar time draws no marker (PDR-0011: never a
+ *  guessed bar). Each sits on the entry arrow's side — below the bar for a long, above it for
+ *  a short — in the setup colour. The list is NOT sorted or clipped here: it joins the
+ *  adapter's one list, which `markersInWindow` clips and places. */
+export function setupMarkers(
+  trade: ChartTradeDto | null,
+  series: "primary" | "htf",
+  palette: ChartPalette,
+): ChartMarker[] {
+  if (trade === null) return [];
+  const position = trade.side === "long" ? "belowBar" : "aboveBar";
+  const marker = (ms: string | null, text: string): ChartMarker[] =>
+    ms === null
+      ? []
+      : [{ time: seconds(ms), position, shape: "circle", color: palette.setup, text }];
+  return series === "htf"
+    ? marker(trade.htfArmBarTime, "arm")
+    : [
+        ...marker(trade.armBarTime, "arm"),
+        ...marker(trade.dipBarTime, "dip"),
+        ...marker(trade.triggerBarTime, "trigger"),
+      ];
+}
+
+/** The selected trade's stored structure stop as a price line, or `null` when the trade or
+ *  its stop is absent (r6.s4.w4). The price is the stored one; nothing is computed. */
+export function stopLine(trade: ChartTradeDto | null): { price: number; title: "stop" } | null {
+  if (trade === null || trade.stopPrice === null) return null;
+  return { price: decimal(trade.stopPrice), title: "stop" };
 }
 
 /** Every marker the window's overlays, trades and example marks draw, in ascending time

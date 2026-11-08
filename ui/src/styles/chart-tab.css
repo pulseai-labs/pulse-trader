@@ -7,7 +7,7 @@
    `backtest.css` follows against the mock's `backtest-lab.css`.
 
    THE PALETTE. The chart draws on a canvas, so the adapter needs colour VALUES and
-   reads these ten aliases off the element the chart is mounted in (`palette.ts`).
+   reads these eighteen aliases off the element the chart is mounted in (`palette.ts`).
    Every alias is an alias of a hue `tokens.css` already owns, and `--focus` is never
    one of them: focus blue is the selection colour, not an indicator colour
    (PDR-0031). The brief asks for no new colours, and these add none — they only name
@@ -16,7 +16,7 @@
    ============================================================ */
 
 .cw {
-  /* the chart's palette — twelve aliases, each `var()` of an existing hue */
+  /* the chart's palette — eighteen aliases, each `var()` of an existing hue */
   --chart-bg: var(--bg-raised);
   --chart-text: var(--text-2);
   --chart-grid: var(--line-1);
@@ -32,6 +32,15 @@
      selection colour, not an indicator colour (PDR-0031). */
   --chart-mark-trader: var(--text-1);
   --chart-mark-agent: var(--ai-1);
+  /* The strategy layers (r6.s4.w4). The ribbon is muted and its band edges strong;
+     WT1 and its 0 guide sit in their own pane; the selected trade's setup markers
+     are amber and its stop line is the loss red. Still no new hue, still no `--focus`. */
+  --chart-ribbon: var(--text-4);
+  --chart-band-edge: var(--text-1);
+  --chart-oscillator: var(--text-2);
+  --chart-oscillator-guide: var(--line-3);
+  --chart-setup: var(--warn-2);
+  --chart-stop: var(--bear-2);
 
   display: flex;
   flex-direction: column;

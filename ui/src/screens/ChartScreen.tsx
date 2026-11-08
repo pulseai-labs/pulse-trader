@@ -22,6 +22,9 @@
 //    it would be and asks for a trade — from the run's OWN stored trades, which the run
 //    read already carried, so the ask is one the trader can answer (CR1) — then reads a
 //    bounded window around that trade (Q3/G4).
+//  * **The strategy layers and the selected trade's setup (r6.s4.w4)** are drawn from the
+//    read: the ribbon, its band edges, SMA and WT1, and the selected trade's arm, dip,
+//    trigger and stop. The screen picks the trade and the leg, nothing else.
 //
 // Every state is plain and says what it is (PDR-0011): loading, failed, an empty window,
 // no run, a withheld holdout, the operands the rule uses that are not drawn, and a leg
@@ -314,6 +317,10 @@ export default function ChartScreen() {
    *  continuation and the drawn-answer gate are compared against this. */
   const [selected, setSelected] = useState<string | null>(fragmentRun);
   const [barsOpen, setBarsOpen] = useState(false);
+  /** The trade the trader picked, by `tradeKey`. The trade itself is found in the drawn
+   *  window's own rows (`dto.run.trades`), which carry the setup bars; the run read's rows
+   *  do not (r6.s4.w4). */
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   // The free selection, readable from the fragment effect without re-running it.
   const freeRef = useRef(free);
@@ -377,6 +384,7 @@ export default function ChartScreen() {
       adapter.setOverlays([]);
       adapter.setTrades([]);
       adapter.setMarks([]);
+      adapter.setSelectedTrade(null, "primary");
     }
     drawnRef.current = false;
     drawnReadRef.current = null;
@@ -493,6 +501,7 @@ export default function ChartScreen() {
     putRequest(null);
     clearDrawing();
     select(fragmentRun);
+    setSelectedKey(null);
     setRun(null);
     setLeg("primary");
     setAnchorMs(null);
@@ -731,6 +740,19 @@ export default function ChartScreen() {
     drawnRef.current = true;
   }, [dto]);
 
+  // The selected trade, from the drawn window's own rows: the run read's rows carry no setup
+  // bars (r6.s4.w4). After the draw effect, so the markers land on the candles just set.
+  const selectedTrade =
+    selectedKey === null
+      ? null
+      : (dto?.run?.trades.find((candidate) => tradeKey(candidate) === selectedKey) ?? null);
+  useEffect(() => {
+    adapterRef.current?.setSelectedTrade(
+      selectedTrade,
+      dto?.run?.series === "htf" ? "htf" : "primary",
+    );
+  }, [dto, selectedKey]);
+
   // --- handlers -------------------------------------------------------------
   // What is drawn, and what the trader has asked for; the handlers below are the only
   // readers of both.
@@ -762,6 +784,7 @@ export default function ChartScreen() {
     // names: the in-flight run read must not take it back (and the drawn-answer gate
     // must let the free read through).
     select(null);
+    setSelectedKey(null);
     setRun(null);
     setAnchorMs(null);
     setUndrawn(null);
@@ -785,6 +808,7 @@ export default function ChartScreen() {
    *  returns trades that entered before its window and exited inside it, and scrolling
    *  to one of those bars would scroll to nothing. */
   const selectTrade = (trade: ChartTradeDto) => {
+    setSelectedKey(tradeKey(trade));
     setAnchorMs(trade.entryTime);
     setUndrawn(null);
     const next = requestFor(run, run?.pair ?? free.pair, timeframe, trade.entryTime);
@@ -943,7 +967,15 @@ export default function ChartScreen() {
     }
     return [];
   });
-  const series = overlays.filter((overlay) => overlay.kind === "level" || overlay.kind === "line");
+  // The layers the bars table carries a column for: every drawn series, WT1 and the band
+  // edges included. A pivot or pattern is a marker, and has its own table.
+  const series = overlays.filter(
+    (overlay) =>
+      overlay.kind === "level" ||
+      overlay.kind === "line" ||
+      overlay.kind === "bandEdge" ||
+      overlay.kind === "oscillator",
+  );
 
   return (
     <section className="cw" aria-label="Chart">
@@ -1167,7 +1199,7 @@ export default function ChartScreen() {
         )}
         {dto?.run != null && dto.run.overlays.length === 0 && dto.run.notDrawn.length === 0 && (
           <p className="cw-note" role="note">
-            {`This rule uses no S/R, pivot, candle-pattern or EMA operand on ${dto.timeframe}.`}
+            {`This rule uses no S/R, pivot, candle-pattern, EMA, SMA or WaveTrend operand on ${dto.timeframe}.`}
           </p>
         )}
         {undrawn !== null && (
@@ -1186,6 +1218,66 @@ export default function ChartScreen() {
           </p>
         )}
       </div>
+
+      {/* The selected trade's setup and stop, as a table: the arm, dip, trigger and stop are
+          drawn on the canvas, and none is reachable only through it (PDR-0011). */}
+      {run !== null && selectedKey !== null && (
+        <section className="cw-strip" aria-label="Selected trade">
+          {selectedTrade === null ? (
+            <p className="cw-note" role="note">
+              {`The selected trade is not in the drawn ${drawnTimeframe ?? timeframe} window.`}
+            </p>
+          ) : (
+            <>
+              <div className="cw-scroll">
+                <table className="cw-tbl cw-setup">
+                  <caption>Selected trade — setup and stop</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">what</th>
+                      <th scope="col">bar (open) / price</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <th scope="row">{`arm (${run.primaryTimeframe})`}</th>
+                      <td className="mono">{timeUtc(selectedTrade.armBarTime)}</td>
+                    </tr>
+                    {hasTwoLegs(run) && (
+                      <tr>
+                        <th scope="row">{`arm (${run.htfTimeframe})`}</th>
+                        <td className="mono">{timeUtc(selectedTrade.htfArmBarTime)}</td>
+                      </tr>
+                    )}
+                    <tr>
+                      <th scope="row">dip</th>
+                      <td className="mono">{timeUtc(selectedTrade.dipBarTime)}</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">trigger</th>
+                      <td className="mono">{timeUtc(selectedTrade.triggerBarTime)}</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">stop</th>
+                      <td className="mono">
+                        <Figure exact={selectedTrade.stopPrice}>{price(selectedTrade.stopPrice)}</Figure>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              {selectedTrade.armBarTime === null &&
+                selectedTrade.htfArmBarTime === null &&
+                selectedTrade.dipBarTime === null &&
+                selectedTrade.triggerBarTime === null && (
+                  <p className="cw-note" role="note">
+                    This trade records no setup.
+                  </p>
+                )}
+            </>
+          )}
+        </section>
+      )}
 
       <section className="cw-strip" aria-label="Trades">
         {run === null ? (
@@ -1407,6 +1499,9 @@ export default function ChartScreen() {
                               <td key={overlay.label} className="mono">
                                 {value == null ? (
                                   EM_DASH
+                                ) : overlay.kind === "oscillator" ? (
+                                  // A WT1 value is not a price: the read's own text.
+                                  <Figure exact={value}>{value}</Figure>
                                 ) : (
                                   <Figure exact={value}>{price(value)}</Figure>
                                 )}
