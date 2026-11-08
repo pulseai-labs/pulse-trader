@@ -143,3 +143,11 @@ The rest of this ADR stands: every overlay comes from the same engine pass over 
 its rule was compiled for (PDR-0036 Q2), and a further kind is still an amendment. Engulfing and pole stay
 undrawn: they are compositions of price comparisons, not indicators, and the selected trade's arm marker marks
 the 4H signal bar (PDR-0048).
+
+## Amendment (r6.s4.w2, 2026-11): a trade's setup bars and stop
+
+Each listed trade also carries `stopPrice` (the stored stop) and, for a setup trade (ADR-0033), `armBarTime`,
+`htfArmBarTime`, `dipBarTime` and `triggerBarTime`: the opens of the bars its stored trace names, derived on the
+server from the run's own timeframes, so the tab only looks a bar up. They are `null` without a setup. The fence
+is unchanged: every setup bar closes before the entry fill, so a trade withheld whole takes its setup bars with it.
+No target price is stored, so none is sent.
