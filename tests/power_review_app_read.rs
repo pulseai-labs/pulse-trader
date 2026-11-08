@@ -310,6 +310,7 @@ async fn a_review_carries_no_holdout_outcome() {
             "pair",
             "passChance",
             "reason",
+            "search",
             "versionId",
         ],
         "a review carries no holdout outcome (G1): {body}"

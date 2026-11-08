@@ -169,7 +169,7 @@ pub use certification::{
 // un-re-exported public domain item is a `dead_code` BUILD error under `deny(warnings)`.
 pub use power_review::{
     ASSUMED_EDGE_R, MIN_HOLDOUT_TRADES, POWER_BAR, PowerBlock, PowerReviewDraft, PowerReviewRecord,
-    PowerVerdict, c1_z, normal_cdf, pass_chance, sample_sigma, verdict,
+    PowerVerdict, SearchSpanVerdict, c1_z, normal_cdf, pass_chance, sample_sigma, verdict,
 };
 // r5.s3.w1 (PDR-0037, ADR-0031): the example-trade mark's surface — the stored
 // row, its draft, the read shape, the filter and the refusal vocabulary.

@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The power review shows its search-span verdict (r6.s5.w2).** `pulse certify power` now prints three lines before
+  `search span passes:`: `search walk-forward id: …`, `search span verdict: wf-v2, k 6, folds holding 3 of 4` and
+  `search span pooled: n 155, average 0.0412 R, floor 0.0272 R` (the CLI says `average` and `floor` because its G1 test
+  bans the words mean and bound from stdout). The Library's Power review row gains a span with the rule, folds holding
+  of required, the pooled trade count and mean R, and whether the search passes. The verdict is read from the stored
+  search walk-forward, so the record and the migrations are unchanged; the holdout still shows its count and nothing
+  else (ADR-0032 addendum, PDR-0047 decision 3).
+
 - **`loss_context` MCP tool: where a run's losses fall (r6.s3.w4).** For any stored backtest run, `loss_context
   {run_id}` groups the run's trades, losses and losing streaks by four contexts at entry: the 4H swing trend relative
   to the trade's side (with the trend, ranging, against it), the 15m regime, volatility (`ATR(14, 15m)` ÷ price, in

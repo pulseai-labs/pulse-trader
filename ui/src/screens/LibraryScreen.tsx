@@ -756,10 +756,12 @@ function allowedText(review: PowerReviewDto): string {
 
 /**
  * The latest power review per pair under the open freeze, read on selection:
- * each pair's holdout trade count, its pass chance against the bar fixed at
- * plan time, and whether a certify attempt is allowed. The count is the only
- * thing this pane learns about the holdout (G1); no outcome, window or σ is
- * shown, and the fence is stated on the pane itself.
+ * each pair's search-span wf-v2 verdict (rule, folds holding of required,
+ * pooled trades, mean R and pass), its holdout trade count, its pass chance
+ * against the bar fixed at plan time, and whether a certify attempt is
+ * allowed. The count is the only thing this pane learns about the holdout
+ * (G1); no outcome, window or σ is shown, and the fence is stated on the
+ * pane itself.
  */
 function PowerReviews({ versionId }: { versionId: string }) {
   const [rows, setRows] = useState<PowerReviewRows>({ kind: "loading" });
@@ -804,6 +806,7 @@ function PowerReviews({ versionId }: { versionId: string }) {
         {rows.reviews.map((review) => (
           <div key={review.id} className="cert-rec">
             <span className="mono">{review.pair}</span>
+            <span className="mono">{`${review.search.rule} k=${review.search.k} ${review.search.foldsHolding}/${review.search.foldsRequired} folds · ${review.search.pooledN}t ${rMultiple(review.search.pooledMeanR)} · floor ${rMultiple(review.search.pooledLowerBound?.toString())} · search ${review.search.pass ? "passes" : "fails"}`}</span>
             <span className="mono">{`${review.holdoutN}t`}</span>
             <span className="mono">{`pass ${percentFromFraction(String(review.passChance))}`}</span>
             <span className="mono dim">{`bar ${percentFromFraction(review.bar)}`}</span>

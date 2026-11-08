@@ -124,3 +124,7 @@ PDR-0040 (rulings 1, 4, 5); PDR-0026; PDR-0033; PDR-0007; ADR-0028 (C1, `H`, the
 known limits); ADR-0010, ADR-0012, ADR-0015, ADR-0018, ADR-0019; RELEASE r5 criterion 5;
 `docs/specs/r5/r5.s5-certify-power-review-and-one-certify-attempt-under-freeze-30f98b21/SPINE.md` (G1–G7 and the
 risk posture); Abramowitz & Stegun, *Handbook of Mathematical Functions*, 26.2.17; r5.s5.w1.
+
+## Addendum (r6.s5, 2026-11): the search-span verdict is shown
+
+The CLI (`pulse certify power`) and the app read (`power_reviews`, the Library's Power review section) now show the search walk-forward's rule, `k`, folds holding of folds required, and pooled `n`, mean R, lower bound and pass; the CLI prints them as `search walk-forward id: …`, `search span verdict: wf-v2, k 6, folds holding 3 of 4` and `search span pooled: n 155, average 0.0412 R, floor 0.0272 R`, saying `average` and `floor` because its word-ban test bans `mean` and `bound` from stdout, while the DTO and the Library keep `pooledMeanR` and `pooledLowerBound`. The record and the migration are unchanged, because the verdict is read at read time from the stored search walk-forward the record names. G1 is unchanged, because nothing from the holdout but its count is shown: the verdict is search-span data, like `search_n`, `search_pass` and σ.

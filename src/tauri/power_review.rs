@@ -6,9 +6,10 @@
 //! (r5.s5.w1) writes one immutable `power_review` row per read; this is the surface that shows them.
 //!
 //! **Count only (SPINE G1).** The DTO crosses the count, the pass chance, the bar and the decision — and
-//! nothing about how the holdout's trades went: no `z`, no window, no pinned inputs, no search-span
-//! `pass`/`n`, no σ, no assumed edge, no fingerprint, no verdict number. The record's field list is the
-//! contract, and the suite asserts the wire key set mechanically.
+//! nothing about how the holdout's trades went: no `z`, no window, no pinned inputs, no σ, no assumed edge,
+//! no fingerprint, no holdout verdict number. The record's field list is the contract, and the suite asserts
+//! the wire key set mechanically. The search span's wf-v2 verdict crosses as well (r6.s5.w2, ADR-0032's
+//! addendum): it is search-span data, read from the review's stored search walk-forward.
 //!
 //! **App scope only (SPINE G6).** The route is mounted through `mount_post_json`, so an `agent` token is a
 //! 403 `scope_refused` with an audit row. There is no power read over MCP, and this module names none.
@@ -18,12 +19,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::application::power_review::search_span_verdict;
 use crate::domain::PowerReviewRepository;
-use crate::domain::power_review::PowerReviewRecord;
+use crate::domain::power_review::{PowerReviewRecord, SearchSpanVerdict};
 use crate::domain::strategy::VersionId;
 
 use super::commands::DesktopState;
-use super::error::BusError;
+use super::error::{BusError, BusErrorCode};
 
 /// What `power_reviews` is asked for: one strategy version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
@@ -33,8 +35,46 @@ pub struct PowerReviewsRequest {
     pub version_id: String,
 }
 
-/// One power review as the Library shows it: the count, the pass chance, the bar and the decision — no
-/// holdout outcome (G1).
+/// The search span's wf-v2 verdict as the Library shows it: the rule, the fold count, the folds holding of the
+/// folds required, and the pooled trade count, mean R, lower bound and pass. Search-span data only (G1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSpanVerdictDto {
+    /// The verdict rule's name (`"wf-v2"`).
+    pub rule: String,
+    /// The fold count.
+    pub k: u32,
+    /// How many folds held.
+    pub folds_holding: u32,
+    /// How many folds the rule requires to hold.
+    pub folds_required: u32,
+    /// The pooled out-of-sample trade count.
+    pub pooled_n: u32,
+    /// The pooled mean R, as a decimal string.
+    pub pooled_mean_r: String,
+    /// The pooled lower bound, in R.
+    pub pooled_lower_bound: f64,
+    /// Whether the search span's verdict passed.
+    pub pass: bool,
+}
+
+impl From<&SearchSpanVerdict> for SearchSpanVerdictDto {
+    fn from(verdict: &SearchSpanVerdict) -> Self {
+        Self {
+            rule: verdict.rule.clone(),
+            k: u32::from(verdict.k),
+            folds_holding: u32::from(verdict.folds_holding),
+            folds_required: u32::from(verdict.folds_required),
+            pooled_n: u32::try_from(verdict.pooled_n).unwrap_or(u32::MAX),
+            pooled_mean_r: verdict.pooled_mean_r.clone(),
+            pooled_lower_bound: verdict.pooled_lower_bound,
+            pass: verdict.pass,
+        }
+    }
+}
+
+/// One power review as the Library shows it: the count, the pass chance, the bar, the decision and the search
+/// span's wf-v2 verdict — no holdout outcome (G1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct PowerReviewDto {
@@ -60,6 +100,8 @@ pub struct PowerReviewDto {
     pub allowed: bool,
     /// The first failing reason's stored spelling, or `None` when allowed.
     pub reason: Option<String>,
+    /// The wf-v2 verdict of the search span the review ran — search-span data, never the holdout's.
+    pub search: SearchSpanVerdictDto,
     /// When the review was written, RFC 3339 ms.
     pub created_at: String,
     /// The calling client's label.
@@ -79,8 +121,9 @@ pub struct PowerReviewsDto {
 }
 
 /// One record → its wire shape. **Only the decision's own fields cross** (G1): the record's `z`, window,
-/// inputs, search-span fields, σ, assumed edge and fingerprint stay on the stored row.
-fn review_dto(record: &PowerReviewRecord) -> PowerReviewDto {
+/// inputs, σ, assumed edge and fingerprint stay on the stored row. The search span's wf-v2 verdict crosses as
+/// well, because it is search-span data (ADR-0032).
+fn review_dto(record: &PowerReviewRecord, search: &SearchSpanVerdict) -> PowerReviewDto {
     PowerReviewDto {
         id: record.id.clone(),
         version_id: record.version_id.as_str().to_owned(),
@@ -93,6 +136,7 @@ fn review_dto(record: &PowerReviewRecord) -> PowerReviewDto {
         min_holdout_trades: u32::try_from(record.min_holdout_trades).unwrap_or(u32::MAX),
         allowed: record.allowed,
         reason: record.reason.clone(),
+        search: SearchSpanVerdictDto::from(search),
         created_at: record.created_at.clone(),
         called_by: record.called_by.clone(),
     }
@@ -132,12 +176,18 @@ pub async fn power_reviews_core(
     // millisecond or step backwards — so the first record seen for a pair is that pair's latest under this
     // freeze. A `HashSet` of pairs keeps the filter one pass.
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let reviews = records
+    let runs = state.backtest_run_repo();
+    let mut reviews = Vec::new();
+    for record in records
         .iter()
         .filter(|record| record.freeze_id == freeze.id)
         .filter(|record| seen.insert(record.pair.as_str()))
-        .map(review_dto)
-        .collect();
+    {
+        let search = search_span_verdict(&runs, record)
+            .await
+            .map_err(|e| BusError::new(BusErrorCode::Data, e.to_string()))?;
+        reviews.push(review_dto(record, &search));
+    }
 
     Ok(PowerReviewsDto {
         version_id: request.version_id,
