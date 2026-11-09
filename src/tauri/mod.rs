@@ -84,8 +84,8 @@ pub use commands::{
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
 pub use library::{
-    DslSummary, LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, VersionStats,
-    dsl_summary,
+    DslSummary, LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion,
+    StrategyArchiveResult, VersionStats, dsl_summary,
 };
 pub use paper::{
     PaperCertifiedDataVersion, PaperComparison, PaperComparisonVerdict, PaperEpochMs,
@@ -176,6 +176,9 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::withdraw_mark,
         // r5.s5.w3: the Library's power-review read (PDR-0040).
         commands::power_reviews,
+        // r7.s1.w2: archive / unarchive a strategy (PDR-0051 d3).
+        commands::archive_strategy,
+        commands::unarchive_strategy,
     ])
 }
 

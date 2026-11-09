@@ -95,6 +95,8 @@ interface SelectionId {
 
 /** The resolved selection the details pane renders. */
 interface Selection {
+  strategyId: string;
+  archived: boolean;
   strategyName: string;
   label: string;
   version: LibraryVersion;
@@ -106,6 +108,10 @@ export default function LibraryScreen() {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [selected, setSelected] = useState<SelectionId | null>(null);
   const [paneHost, setPaneHost] = useState<HTMLElement | null>(null);
+  // r7.s1.w2 (PDR-0051 d3): the Archived filter. The ref is what `load` reads, so
+  // the poll and the focus refetch keep the filter the trader chose.
+  const [showArchived, setShowArchived] = useState(false);
+  const showArchivedRef = useRef(false);
 
   // #324 (d37): the ordering guard `useServerStatus` already uses (#389) —
   // `issued` numbers every read, `applied` holds the highest read whose answer
@@ -141,7 +147,7 @@ export default function LibraryScreen() {
   const load = useCallback(async (alive: () => boolean = () => true): Promise<void> => {
     const read = ++issued.current;
     try {
-      const result = await commands.libraryOverview();
+      const result = await commands.libraryOverview(showArchivedRef.current);
       if (!alive() || read <= applied.current) return;
       if (result.status === "ok") {
         applied.current = read;
@@ -174,6 +180,15 @@ export default function LibraryScreen() {
     return () => {
       alive = false;
     };
+  }, [load]);
+
+  // r7.s1.w2: flip the Archived filter and read again. The read rides the same
+  // `load`, so the ordering guard and the payload dedup apply to it unchanged.
+  const toggleArchived = useCallback(() => {
+    const next = !showArchivedRef.current;
+    showArchivedRef.current = next;
+    setShowArchived(next);
+    void load();
   }, [load]);
 
   // #324 (d37): the Library's one poll. A hidden window does not poll — the
@@ -209,6 +224,9 @@ export default function LibraryScreen() {
     const version = strategy?.versions.find((v) => v.id === selected.versionId);
     if (strategy === undefined || version === undefined) return null;
     return {
+      strategyId: strategy.id,
+      // `archived` is optional on the wire (`#[serde(default)]`: an older server omits it).
+      archived: strategy.archived === true,
       strategyName: strategy.name,
       label: versionLabels(strategy.versions).get(version.id) ?? "?",
       version,
@@ -238,8 +256,17 @@ export default function LibraryScreen() {
             {totalVersions} {totalVersions === 1 ? "version" : "versions"}
           </span>
         </div>
+        <button
+          type="button"
+          className={`fpill${showArchived ? " is-active" : ""}`}
+          aria-pressed={showArchived}
+          onClick={toggleArchived}
+        >
+          Archived
+        </button>
         {/* Search, view-mode segments and the "New strategy" button are r1
-            dead controls — omitted rather than rendered inert. */}
+            dead controls — omitted rather than rendered inert. The Archived
+            filter (r7.s1.w2) is the one control built. */}
       </div>
 
       {overview.strategies.length === 0 ? (
@@ -271,7 +298,10 @@ export default function LibraryScreen() {
         </div>
       )}
 
-      {paneHost !== null && createPortal(<DetailsPane selection={selection} />, paneHost)}
+      {paneHost !== null && createPortal(
+          <DetailsPane selection={selection} onArchiveChange={() => load()} />,
+          paneHost,
+        )}
     </div>
   );
 }
@@ -329,6 +359,7 @@ function StrategyCard({
             </span>
           )}
           <span className="scard-name">{strategy.name}</span>
+          {strategy.archived && <span className="scard-archived fpill-count">Archived</span>}
           <span className="scard-meta">
             {strategy.versions.length} {strategy.versions.length === 1 ? "version" : "versions"} ·
             created{" "}
@@ -824,8 +855,20 @@ function PowerReviews({ versionId }: { versionId: string }) {
 // Details pane (portaled into the shell's third track)
 // ---------------------------------------------------------------------------
 
-function DetailsPane({ selection }: { selection: Selection | null }) {
+function DetailsPane({
+  selection,
+  onArchiveChange,
+}: {
+  selection: Selection | null;
+  onArchiveChange: () => Promise<void>;
+}) {
   const [promoting, setPromoting] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const selectedStrategyId = selection?.strategyId ?? null;
+  useEffect(() => {
+    setArchiveError(null);
+  }, [selectedStrategyId]);
   if (selection === null) {
     // The route still declares the track — the Library is two-pane by design;
     // with nothing selected, the pane holds this hint, not fabricated content.
@@ -835,6 +878,28 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
   const { strategyName, label, version } = selection;
   const stats = version.stats;
 
+  // r7.s1.w2: archive or unarchive the selected version's strategy. No confirm:
+  // archiving deletes nothing and Unarchive undoes it.
+  const archiveStrategy = async () => {
+    const verb = selection.archived ? "unarchive" : "archive";
+    setArchiving(true);
+    setArchiveError(null);
+    try {
+      const result = selection.archived
+        ? await commands.unarchiveStrategy(selection.strategyId)
+        : await commands.archiveStrategy(selection.strategyId);
+      if (result.status === "ok") {
+        await onArchiveChange();
+      } else {
+        setArchiveError(`Could not ${verb} ${strategyName}: ${result.error.message}`);
+      }
+    } catch {
+      setArchiveError(`Could not ${verb} ${strategyName}: the request failed.`);
+    } finally {
+      setArchiving(false);
+    }
+  };
+
   return (
     <>
       <header className="details-head">
@@ -843,7 +908,20 @@ function DetailsPane({ selection }: { selection: Selection | null }) {
           <span className="db-sep">/</span>
           <span className="db-ver mono">{label}</span>
         </div>
+        <button
+          type="button"
+          className="btn-sec-sm"
+          disabled={archiving}
+          onClick={() => void archiveStrategy()}
+        >
+          {selection.archived ? "Unarchive strategy" : "Archive strategy"}
+        </button>
       </header>
+      {archiveError !== null && (
+        <p className="d-archive-error" role="alert">
+          {archiveError}
+        </p>
+      )}
 
       <div className="details-kpis">
         <div className="dkpi">

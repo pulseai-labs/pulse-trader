@@ -71,8 +71,8 @@ use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 // r5.s3.w1 (PDR-0037, ADR-0031): the example-trade marks' wire shapes.
 use super::library::{
-    LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy_usdt,
-    latest_run_summary, recent_run_summary, version_stats,
+    LibraryOverview, LibraryStrategy, LibraryVersion, StrategyArchiveResult, dsl_summary,
+    format_expectancy_usdt, latest_run_summary, recent_run_summary, version_stats,
 };
 use super::marks::{ListMarksRequest, MarkDto, MarkListDto, WithdrawMarkRequest, WriteMarkRequest};
 use super::streak_card::{StreakCardDto, StreakCardRequest};
@@ -171,6 +171,9 @@ pub const BUS_COMMANDS: &[&str] = &[
     "withdraw_mark",
     // r5.s5.w3: the Library's power-review read (PDR-0040).
     "power_reviews",
+    // r7.s1.w2: archive / unarchive a strategy (PDR-0051 d3).
+    "archive_strategy",
+    "unarchive_strategy",
 ];
 
 // ---------------------------------------------------------------------------
@@ -566,7 +569,7 @@ pub struct ShellInfo {
 ///
 /// Returns a [`BusError`] if the strategy read fails.
 pub async fn shell_info_core(state: &DesktopState) -> Result<ShellInfo, BusError> {
-    let strategies = state.strategy_repo().list_strategies(true).await?;
+    let strategies = state.strategy_repo().list_strategies(false).await?;
     Ok(ShellInfo {
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
@@ -587,8 +590,9 @@ const RECENT_RUN_LIMIT: usize = 5;
 /// The transport-free core of the `library_overview` command — the whole
 /// Strategy Library payload in one read.
 ///
-/// Every strategy (archived included — the record exists, and the Library hides
-/// nothing that is persisted), each with its `version_tree`-ordered versions,
+/// Every strategy (archived strategies only when `include_archived` — PDR-0051
+/// decision 3: the Library hides them by default behind its Archived filter, and
+/// archiving deletes nothing), each with its `version_tree`-ordered versions,
 /// each version with its DSL summary, its latest run's stats (`None` when no
 /// run exists — the screen renders an em dash there, grill A1), its expectancy
 /// delta vs the parent when both carry a run, and its recent run catalog.
@@ -604,10 +608,13 @@ const RECENT_RUN_LIMIT: usize = 5;
 /// # Errors
 ///
 /// Returns a [`BusError`] if any repository read fails.
-pub async fn library_overview_core(state: &DesktopState) -> Result<LibraryOverview, BusError> {
+pub async fn library_overview_core(
+    state: &DesktopState,
+    include_archived: bool,
+) -> Result<LibraryOverview, BusError> {
     let strategies_repo = state.strategy_repo();
     let runs_repo = state.backtest_run_repo();
-    let strategies = strategies_repo.list_strategies(true).await?;
+    let strategies = strategies_repo.list_strategies(include_archived).await?;
 
     let mut wire = Vec::with_capacity(strategies.len());
     for strategy in &strategies {
@@ -715,6 +722,7 @@ async fn library_strategy(
             .pinned_version_id
             .as_ref()
             .map(|pinned| pinned.as_str().to_owned()),
+        archived: strategy.archived,
         versions: wire_versions,
     })
 }
@@ -1286,8 +1294,8 @@ pub async fn credential_status(
 /// The Strategy Library's one read: every strategy, its version tree, per-version
 /// stats where a persisted run exists, and each version's recent run catalog.
 ///
-/// A pure read — the Library writes nothing (ADR-0010); pin/archive/rename each
-/// need a write command and are out of this item's budget.
+/// A pure read — the Library writes nothing (ADR-0010); archive and unarchive are
+/// their own commands (r7.s1.w2); pin and rename are not built.
 ///
 /// # Errors
 ///
@@ -1297,8 +1305,13 @@ pub async fn credential_status(
 #[specta::specta]
 pub async fn library_overview(
     state: tauri::State<'_, ClientState>,
+    include_archived: bool,
 ) -> Result<LibraryOverview, BusError> {
-    state.get("/api/v1/library-overview").await
+    if include_archived {
+        state.get("/api/v1/library-overview/with-archived").await
+    } else {
+        state.get("/api/v1/library-overview").await
+    }
 }
 
 // The compose command (r1.s1.w4) — the Designer's one bus entry
@@ -1864,6 +1877,44 @@ pub async fn power_reviews(
     request: PowerReviewsRequest,
 ) -> Result<PowerReviewsDto, BusError> {
     state.post("/api/v1/power-reviews", &request).await
+}
+
+/// Archive one strategy; nothing is deleted (r7.s1.w2).
+///
+/// # Errors
+///
+/// `not_found` for an unknown id, or the proxied-call failure.
+#[tauri::command]
+#[specta::specta]
+pub async fn archive_strategy(
+    state: tauri::State<'_, ClientState>,
+    id: String,
+) -> Result<StrategyArchiveResult, BusError> {
+    state
+        .post(
+            &format!("/api/v1/strategies/{id}/archive"),
+            &serde_json::json!({}),
+        )
+        .await
+}
+
+/// Unarchive one strategy (r7.s1.w2).
+///
+/// # Errors
+///
+/// `not_found` for an unknown id, or the proxied-call failure.
+#[tauri::command]
+#[specta::specta]
+pub async fn unarchive_strategy(
+    state: tauri::State<'_, ClientState>,
+    id: String,
+) -> Result<StrategyArchiveResult, BusError> {
+    state
+        .post(
+            &format!("/api/v1/strategies/{id}/unarchive"),
+            &serde_json::json!({}),
+        )
+        .await
 }
 
 /// `streak_card` — the losing streak and drawdown a normal bad run of one

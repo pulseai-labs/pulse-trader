@@ -938,7 +938,7 @@ async fn the_library_card_survives_a_corrupt_latest_row() {
     let state = DesktopState::open(&world.db_path())
         .await
         .expect("open the desktop state over the world's db");
-    let overview = library_overview_core(&state)
+    let overview = library_overview_core(&state, false)
         .await
         .expect("the Library overview reads despite the corrupt latest row");
     let version = overview

@@ -122,6 +122,7 @@ const CATALOG: LibraryOverview = {
       name: "Alpha Wave",
       createdAt: "2026-08-01T09:00:00.000Z",
       pinnedVersionId: null,
+      archived: false,
       versions: [catalogVersion("v-alpha-1", null), catalogVersion("v-alpha-2", "v-alpha-1")],
     },
     {
@@ -129,6 +130,7 @@ const CATALOG: LibraryOverview = {
       name: "Beta Break",
       createdAt: "2026-08-10T09:00:00.000Z",
       pinnedVersionId: null,
+      archived: false,
       versions: [catalogVersion("v-beta-1", null)],
     },
   ],
@@ -1688,6 +1690,7 @@ const CHILD_CATALOG: LibraryOverview = {
       name: "Alpha Wave",
       createdAt: "2026-08-01T09:00:00.000Z",
       pinnedVersionId: null,
+      archived: false,
       versions: [
         catalogVersion("v-alpha-1", null),
         {
@@ -1758,6 +1761,7 @@ describe("BacktestLabScreen (C3 — compare with parent, r2.s1.w4)", () => {
           name: "Alpha Wave",
           createdAt: "2026-08-01T09:00:00.000Z",
           pinnedVersionId: null,
+          archived: false,
           versions: [
             catalogVersion("v-alpha-1", null),
             {
@@ -2433,6 +2437,7 @@ function reopenableCatalog(
         name: "Alpha Wave",
         createdAt: "2026-08-01T09:00:00.000Z",
         pinnedVersionId: null,
+        archived: false,
         versions: [
           { ...catalogVersion("v-alpha-1", null), latestWalkForwardRunId: alphaLatest },
           { ...catalogVersion("v-alpha-2", "v-alpha-1"), latestWalkForwardRunId: secondLatest },
@@ -2443,6 +2448,7 @@ function reopenableCatalog(
         name: "Beta Break",
         createdAt: "2026-08-10T09:00:00.000Z",
         pinnedVersionId: null,
+        archived: false,
         versions: [catalogVersion("v-beta-1", null)],
       },
     ],
@@ -2910,6 +2916,7 @@ function w3Catalog(): LibraryOverview {
         name: "Alpha Wave",
         createdAt: "2026-08-01T09:00:00.000Z",
         pinnedVersionId: null,
+        archived: false,
         versions: [
           {
             ...catalogVersion("ver-own-1", null, W3_OWN_RUN, [W3_OWN_RUN]),
@@ -3233,6 +3240,7 @@ function w3FoldCatalog(olderFold: LibraryRunSummary | null): LibraryOverview {
         name: "Alpha Wave",
         createdAt: "2026-08-01T09:00:00.000Z",
         pinnedVersionId: null,
+        archived: false,
         versions: [
           {
             ...catalogVersion(
@@ -3353,6 +3361,7 @@ function w3LinkCatalog(): LibraryOverview {
         name: "Alpha Wave",
         createdAt: "2026-08-01T09:00:00.000Z",
         pinnedVersionId: null,
+        archived: false,
         versions: [
           catalogVersion("ver-own-1", null),
           catalogVersion("ver-second", "ver-own-1"),

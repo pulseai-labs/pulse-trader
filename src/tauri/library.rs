@@ -48,8 +48,23 @@ pub struct LibraryStrategy {
     pub created_at: String,
     /// The pinned version's id, if the strategy has one (FR-11 pin).
     pub pinned_version_id: Option<String>,
+    /// Whether the strategy is archived (FR-11 archive). The default Library read lists none;
+    /// the Archived filter's read lists them with true.
+    #[serde(default)]
+    pub archived: bool,
     /// All versions, parent-before-child (`version_tree` order).
     pub versions: Vec<LibraryVersion>,
+}
+
+/// What `archive_strategy` / `unarchive_strategy` answer: the strategy's id and its archived state
+/// after the call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StrategyArchiveResult {
+    /// The strategy's id.
+    pub id: String,
+    /// The strategy's archived state after the call.
+    pub archived: bool,
 }
 
 /// One version: tree position, DSL summary, stats-or-em-dash, recent runs.

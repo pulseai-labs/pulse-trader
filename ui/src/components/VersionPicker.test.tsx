@@ -80,6 +80,7 @@ function fixtureStrategy(
     name,
     createdAt,
     pinnedVersionId: overrides.pinnedVersionId ?? null,
+    archived: false,
     versions: Array.from({ length: 10 }, (_, i) =>
       fixtureVersion(key, i + 1, createdBy, agentName),
     ),
