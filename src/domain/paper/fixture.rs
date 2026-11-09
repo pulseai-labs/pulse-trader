@@ -9,7 +9,7 @@
 //!
 //! Determinism is the point: same seed, same bars, same content version, on
 //! every machine and every run — so the certification fixture's data versions
-//! (pinned in `tests/certify_fixture.rs`) are a stable contract, not a value
+//! (pinned in `tests/fixture_history.rs`) are a stable contract, not a value
 //! that drifts with the generator's internals.
 //!
 //! The module is pure: it builds [`Candle`]s and nothing else. Stamping the

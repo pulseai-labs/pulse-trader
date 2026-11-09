@@ -163,8 +163,8 @@ fn walk_forward_request(
 }
 
 /// A version whose LATEST walk-forward run is whatever this build produces
-/// over the fixture series (a real pass — the fixture proof, `certify_fixture`
-/// case (i), guarantees wf-v1 holds for it).
+/// over the fixture series (a real pass — the fixture proof, `fixture_history`'s
+/// `the_generator_walk_forward_is_a_real_wf_v1_pass_on_this_build`, guarantees wf-v1 holds for it).
 async fn certified_version(world: &World, name: &str) -> pulse::VersionId {
     certified_version_over(world, name, fixture_m15_candles()).await
 }
@@ -681,8 +681,8 @@ async fn v_foreign_fingerprint_refuses_even_with_override() {
 async fn vi_fixture_flag_and_oos_comparability() {
     let world = world().await;
     // Fixture-certified: every certified data version has a fixture_snapshot
-    // row (the seed writes them; here the test writes the two stamps
-    // directly — the seed's own idempotency is AC-4's (iii)).
+    // row. Nothing writes one since r7.s1.w1 retired the seed; the test writes
+    // the two stamps directly, standing for a row already in a database.
     let version_id = certified_version(&world, "fixture-certified").await;
     let (m15_version, h4_version) = write_fixture_snapshots(&world);
     world

@@ -261,7 +261,7 @@ pub use paper::{MarkBar, PaperPnl, PaperPnlEntry, PaperPnlOpenPosition, PaperPnl
 pub use port::{
     BacktestRunRepository, CandleSeriesRepository, CertificationRepository, ClosedBarSource,
     CoachAcceptanceRepository, CoachingRepository, ExampleMarkRepository, ExchangeAdapter,
-    FixtureSnapshotStore, LlmCallRepository, LlmProvider, MarketDataSource, PaperSessionRepository,
+    LlmCallRepository, LlmProvider, MarketDataSource, PaperSessionRepository,
     PowerReviewRepository, StrategyRepository, WalkForwardRunRepository,
 };
 // r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They

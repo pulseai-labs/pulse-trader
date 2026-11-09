@@ -610,8 +610,7 @@ where
 /// `holdout` is the open freeze's holdout start (r4.s1.w4, Q4): `Some` wires the
 /// holdout guard into the span resolution (an explicit bound into the holdout is
 /// refused, a defaulted `to` is clamped to the holdout start), `None` — no
-/// freeze open, or an exempt caller (the certify-fixture seed) — leaves every
-/// behaviour byte-identical.
+/// freeze open — leaves every behaviour byte-identical.
 ///
 /// # Errors
 ///

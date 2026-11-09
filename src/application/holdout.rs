@@ -21,10 +21,9 @@
 //!
 //! EXEMPTIONS (grill Q4, G8), named where they are exempt rather than here:
 //! the **certification step** (w5 — the one caller that must evaluate the
-//! holdout, and the reason this record exists), the **certify-fixture seed**
-//! (`pulse fixture`'s synthetic snapshots, never HEAD — it passes
-//! `holdout: None` at its `run_walk_forward` call), and **paper sessions**
+//! holdout, and the reason this record exists), and **paper sessions**
 //! (they step their own engine session and never enter these use cases).
+//! The retired certify-fixture command was a third (removed in r7.s1.w1).
 //!
 //! The guard consumes [`HoldoutFreeze`] — the open record's holdout start and
 //! nothing else — so the entry points read the freeze once and pass it down;

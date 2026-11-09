@@ -5,7 +5,7 @@
 //! The snapshots are the certify fixture's deterministic synthetic series
 //! (`application::fixture`: 16,800 M15 bars plus the H4 aggregation), committed
 //! into a temporary store under each pair — the same generator
-//! `tests/certify_fixture.rs` rides, so the four runs are comparable and no
+//! `tests/fixture_history.rs` rides, so the four runs are comparable and no
 //! network is touched.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
