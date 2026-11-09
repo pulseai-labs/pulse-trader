@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Walk teardown and the one-time prod cleanup (r7.s1.w3).** `scripts/walk-teardown.sh` records the strategies and
+  paper sessions a release walk creates in a manifest it writes before the walk, and its teardown stops and archives
+  only those — never an id outside the manifest or one that existed before the walk — then checks that the Library
+  lists exactly the keep-list. Its cleanup mode archives every strategy off the keep-list and stops every running
+  paper session off it, after a dry run whose digest the apply must quote (PDR-0051 decision 3). `just walk-teardown`
+  and `just prod-cleanup` wrap the two; `scripts/walk-teardown-test.sh` proves them against a scratch server (d134).
+
 - **The power review shows its search-span verdict (r6.s5.w2).** `pulse certify power` now prints three lines before
   `search span passes:`: `search walk-forward id: …`, `search span verdict: wf-v2, k 6, folds holding 3 of 4` and
   `search span pooled: n 155, average 0.0412 R, floor 0.0272 R` (the CLI says `average` and `floor` because its G1 test
