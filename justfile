@@ -477,6 +477,20 @@ prod-reset:
     ssh macmini 'rm -f "$HOME/Library/Application Support/PulseTrader/serve-start-limit" "$HOME/Library/Application Support/PulseTrader/serve-starts"'
     ssh macmini 'launchctl kickstart -k "gui/$(id -u)/com.pulsetrader.serve"'
 
+# r7.s1.w3 (PDR-0051 d3) — a release walk's teardown: stop and archive only the ids
+# the walk recorded in its manifest (`scripts/walk-teardown.sh start` / `record`),
+# then check that the Library lists exactly the keep-list. The token file holds an
+# APP-scope token (an agent token is refused, 403) and has no group/other bits.
+walk-teardown manifest keep token_file server="http://100.103.30.74:8420":
+    bash scripts/walk-teardown.sh teardown --manifest {{ quote(manifest) }} --keep {{ quote(keep) }} --server {{ quote(server) }} --token-file {{ quote(token_file) }}
+
+# r7.s1.w3 (PDR-0051 d3) — the one-time prod cleanup: archive every strategy off the
+# keep-list and stop every running paper session off it. Without `confirm` it is a
+# dry run that prints the list and its digest; with `confirm=<digest>` it applies
+# exactly that list, and refuses if the live list has changed.
+prod-cleanup keep token_file confirm="" server="http://100.103.30.74:8420":
+    bash scripts/walk-teardown.sh cleanup --keep {{ quote(keep) }} --server {{ quote(server) }} --token-file {{ quote(token_file) }} {{ if confirm == "" { "--dry-run" } else { "--apply --confirm " + quote(confirm) } }}
+
 # --- desktop bundle (r1.s1.w1) ----------------------------------------------
 
 # Build PulseTrader.app — the local bundle (r1.s1.w5's AC-11 manual walk runs it).
