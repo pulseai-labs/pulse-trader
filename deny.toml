@@ -90,6 +90,7 @@ unmaintained = "workspace"
 ignore = [
     #"RUSTSEC-0000-0000",
     #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 bundles SQLite 3.46.0 (sqlx's `sqlite` feature enables `bundled`), so the advisory applies to this build; no released sqlx can resolve libsqlite3-sys >= 0.39 (sqlx-sqlite 0.8.6 needs ^0.30.1, 0.9.0 needs <0.38.0), so there is no fix to take; the attack needs a crafted database plus a mismatched sibling -wal that a less trusted party wrote, and the app opens its own pulse.db while `pulse import` opens a copy of one file and refuses stray sidecars (#258, #259); expires at r8; tracked in #519" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

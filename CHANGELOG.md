@@ -980,6 +980,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Security: `rmcp` 3.4.0 → 3.9.0 for RUSTSEC-2026-0457, -0461 and -0462, and one reasoned ignore for
+  RUSTSEC-2026-0459 (cargo-deny, 0.1.11, #518).** `Cargo.toml` moves both exact pins (the
+  dependency and the dev-dependency) to `=3.9.0` and keeps the `=` pin and its comment (ADR-0015
+  delivery ring: the decision stays, only the version moves); `cargo update -p rmcp --precise 3.9.0`
+  moves `rmcp` and `rmcp-macros`. 3.9.0 clears RUSTSEC-2026-0457 (fixed in 3.7.0), -0461 (3.6.0) and
+  -0462 (3.9.0). The bump forced no source change: the `pulse mcp` server, the `pulse serve` HTTP
+  transport and the `mcp_stdio` child-process client compile and pass unchanged. The lockfile also
+  re-points a few Windows-only `windows-sys` and one build-time `proc-macro-crate` edge to versions
+  already in the lock; no other package version moves. RUSTSEC-2026-0459 (`libsqlite3-sys` < 0.39,
+  SQLite before 3.54.0, via `sqlx =0.8.6`) is NOT fixed: no released `sqlx` can resolve
+  `libsqlite3-sys` 0.39 (`sqlx-sqlite` 0.8.6 needs `^0.30.1`, 0.9.0 needs `<0.38.0`), so `sqlx` stays
+  at `=0.8.6` and `deny.toml` ignores that one advisory with its reason, until r8, tracked in
+  [#519](https://github.com/pulseai-labs/pulse-trader/issues/519). The build uses the bundled SQLite
+  (3.46.0); the exposure needs a crafted database plus a mismatched sibling `-wal` that a less trusted
+  party wrote, and the app opens its own `pulse.db` while `pulse import` opens a copy of one file.
+  `cargo deny check` (advisories, bans, licenses, sources) is green. No golden, paper replay digest,
+  Parquet content hash or engine source-set hash moves; the engine fingerprint moves only because it
+  hashes `Cargo.lock` (expected).
+
 - **Security: dependency updates for GHSA-m665-v7pm-7grj (`zip`) and five `undici` advisories
   (0.1.10).** `zip` 9.0.3 → 9.3.0 (`cargo update -p zip`; `Cargo.toml` keeps `zip = "9"` with
   the deflate-only feature set, `typed-path` follows 0.12.3 → 0.13.0, and
