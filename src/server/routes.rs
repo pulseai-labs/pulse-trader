@@ -136,7 +136,9 @@ pub(crate) fn mount_all(router: axum::Router, state: &Arc<ServerState>) -> axum:
         );
     // r3.s4.w4: the paper routes (promote, stop, stop-all, the reads, the
     // shadow check and the session SSE stream) — all `Scope::App`.
-    super::paper::mount(router, state)
+    let router = super::paper::mount(router, state);
+    // r7.s1.w2 (PDR-0051 d3): archive, unarchive and the with-archived Library read — all `Scope::App`.
+    super::strategies::mount(router, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -300,9 +302,9 @@ fn plain_credential_status() -> Response {
     (StatusCode::OK, axum::Json(status)).into_response()
 }
 
-/// `GET /api/v1/library-overview` — the persisted-library read.
+/// `GET /api/v1/library-overview` — the persisted-library read, archived strategies hidden (r7.s1.w2).
 async fn plain_library_overview(state: Arc<ServerState>) -> Response {
-    match crate::tauri::commands::library_overview_core(&state.desktop).await {
+    match crate::tauri::commands::library_overview_core(&state.desktop, false).await {
         Ok(dto) => (StatusCode::OK, axum::Json(dto)).into_response(),
         Err(err) => ops::bus_422(&err),
     }

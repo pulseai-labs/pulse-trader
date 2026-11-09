@@ -18,7 +18,7 @@ use crate::domain::paper::gate::{
     PromotionDraft, PromotionOverride, PromotionRefused, decide_promotion,
 };
 use crate::domain::paper::session::{Graduation, NonEmptyLabel, NonEmptyReason, PaperSession};
-use crate::domain::strategy::VersionId;
+use crate::domain::strategy::{StrategyVersion, VersionId};
 use crate::domain::{
     BacktestRunRepository, CertificationRepository, Clock, DataError, EngineFingerprint, Pair,
     PaperSessionRepository, StrategyRepository, Timeframe, WalkForwardRunRepository, compile,
@@ -39,6 +39,9 @@ pub enum PaperPromotionError {
     /// (a D1 primary, a D1 or not-higher HTF, or a series the strategy reads
     /// that the shape does not supply), or a version that does not compile.
     InvalidShape(String),
+    /// The version's strategy is archived (r7.s1.w2, PDR-0051): it carries the
+    /// strategy's name. Promotion is refused before any gate check.
+    ArchivedStrategy(String),
 }
 
 impl core::fmt::Display for PaperPromotionError {
@@ -48,6 +51,9 @@ impl core::fmt::Display for PaperPromotionError {
             Self::UnknownVersion(id) => write!(f, "no such strategy version: {}", id.as_str()),
             Self::Data(e) => write!(f, "paper promotion store failure: {e}"),
             Self::InvalidShape(message) => write!(f, "invalid session shape: {message}"),
+            Self::ArchivedStrategy(name) => {
+                write!(f, "strategy {name} is archived; unarchive it to promote")
+            }
         }
     }
 }
@@ -83,8 +89,9 @@ pub struct OverrideRequest {
 /// # Errors
 ///
 /// [`PaperPromotionError::Refused`] for the gate's typed refusals,
-/// [`PaperPromotionError::UnknownVersion`] for an absent version, and
-/// [`PaperPromotionError::Data`] for store failures.
+/// [`PaperPromotionError::UnknownVersion`] for an absent version,
+/// [`PaperPromotionError::ArchivedStrategy`] for a version of an archived
+/// strategy, and [`PaperPromotionError::Data`] for store failures.
 #[allow(clippy::too_many_arguments)] // the five injected ports + the request trio — every argument is a named seam, the engine.rs precedent
 pub async fn promote<S, W, R, P, C, T>(
     strategies: &S,
@@ -110,6 +117,8 @@ where
         .await
         .map_err(PaperPromotionError::Data)?
         .ok_or_else(|| PaperPromotionError::UnknownVersion(version_id.clone()))?;
+
+    refuse_archived(strategies, &version).await?;
 
     let latest_run = match &version.latest_walk_forward_run_id {
         Some(run_id) => walk_forwards
@@ -212,6 +221,24 @@ where
         })
         .await
         .map_err(PaperPromotionError::Data)
+}
+
+/// An archived strategy starts no new session (r7.s1.w2, PDR-0051): refuse
+/// before any gate check. A version whose strategy row is absent is an unknown
+/// version.
+async fn refuse_archived<S: StrategyRepository>(
+    strategies: &S,
+    version: &StrategyVersion,
+) -> Result<(), PaperPromotionError> {
+    let strategy = strategies
+        .get_strategy(&version.strategy_id)
+        .await
+        .map_err(PaperPromotionError::Data)?
+        .ok_or_else(|| PaperPromotionError::UnknownVersion(version.id.clone()))?;
+    if strategy.archived {
+        return Err(PaperPromotionError::ArchivedStrategy(strategy.name));
+    }
+    Ok(())
 }
 
 /// The run that certifies `version` (r4.s1.w5, spec A5), with the version's

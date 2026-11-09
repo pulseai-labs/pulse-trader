@@ -19,6 +19,9 @@ vi.mock("../bindings", () => ({
     // mock carries the `typedError` union shape.
     credentialStatus: vi.fn().mockResolvedValue({ status: "ok", data: "env" }),
     libraryOverview: vi.fn(),
+    // r7.s1.w2: the details pane's archive / unarchive actions.
+    archiveStrategy: vi.fn(),
+    unarchiveStrategy: vi.fn(),
     // r3.s3.w5: App polls the connection status (the Connect gate + the
     // titlebar strip); an `up` answer keeps the Library where it always was.
     serverStatus: vi.fn().mockResolvedValue({
@@ -78,6 +81,8 @@ const certificationRecordsMock = vi.mocked(commands.certificationRecords);
 // r5.s5.w3: the pane's power-review read.
 const powerReviewsMock = vi.mocked(commands.powerReviews);
 const walkForwardRunMock = vi.mocked(commands.getWalkForwardRun);
+const archiveMock = vi.mocked(commands.archiveStrategy);
+const unarchiveMock = vi.mocked(commands.unarchiveStrategy);
 
 /** The figure helper (r4.s5.w1): the A2 display text plus the ring's own exact
  * string on the same element (`title`/`data-exact`), asserted together. */
@@ -177,6 +182,7 @@ const SEEDED: LibraryOverview = {
       name: "Alpha Wave",
       createdAt: "2026-08-01T09:00:00.000Z",
       pinnedVersionId: "v-alpha-2",
+      archived: false,
       versions: [
         version("v-alpha-1", null, stats("+0.3R", "46.2%", 38)),
         version("v-alpha-2", "v-alpha-1", stats("+0.42R", "48.3%", 64), "+0.12R"),
@@ -188,6 +194,7 @@ const SEEDED: LibraryOverview = {
       name: "Beta Break",
       createdAt: "2026-08-10T09:00:00.000Z",
       pinnedVersionId: null,
+      archived: false,
       versions: [version("v-beta-1", null, null)],
     },
   ],
@@ -290,6 +297,7 @@ describe("LibraryScreen (seeded payload)", () => {
             name: "D47 Breakout",
             createdAt: "2026-08-01T09:00:00.000Z",
             pinnedVersionId: null,
+            archived: false,
             versions: [withH4Filter],
           },
         ],
@@ -338,6 +346,7 @@ describe("LibraryScreen (seeded payload)", () => {
             name: "Long Line",
             createdAt: "2026-08-01T09:00:00.000Z",
             pinnedVersionId: null,
+            archived: false,
             versions: [longDsl],
           },
         ],
@@ -475,6 +484,7 @@ const WITH_AGENT: LibraryOverview = {
       name: "Alpha Wave",
       createdAt: "2026-08-01T09:00:00.000Z",
       pinnedVersionId: null,
+      archived: false,
       versions: [
         version("v-alpha-1", null, stats("+0.3R", "46.2%", 38)),
         version(
@@ -559,6 +569,7 @@ const CERTIFIED: LibraryOverview = {
       name: "Alpha Wave",
       createdAt: "2026-08-01T09:00:00.000Z",
       pinnedVersionId: null,
+      archived: false,
       versions: [
         version("v-alpha-1", null, stats("+0.3R", "46.2%", 38)),
         version(
@@ -1197,6 +1208,7 @@ function foldCatalog(olderFold: LibraryRunSummary | null): LibraryOverview {
         name: "Alpha Wave",
         createdAt: "2026-08-01T09:00:00.000Z",
         pinnedVersionId: null,
+        archived: false,
         versions: [
           {
             ...version(
@@ -1667,5 +1679,167 @@ describe("LibraryScreen (#404 — the version node's geometry)", () => {
     const hypothesis = requiredBlock(SHARED_CSS, ".vnode-hypothesis");
     expect(numberIn(decl(hypothesis, "-webkit-line-clamp"))).toBe(2);
     expect(decl(hypothesis, "overflow")).toBe("hidden");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r7.s1.w2 (PDR-0051 d3) — the Archived filter and the archive action
+// ---------------------------------------------------------------------------
+
+/** SEEDED plus one archived strategy: what the Archived filter's read answers. */
+const WITH_ARCHIVED: LibraryOverview = {
+  strategies: [
+    ...SEEDED.strategies,
+    {
+      id: "strat-gamma",
+      name: "Gamma Fade",
+      createdAt: "2026-08-12T09:00:00.000Z",
+      pinnedVersionId: null,
+      archived: true,
+      versions: [version("v-gamma-1", null, null)],
+    },
+  ],
+};
+
+/** The library read as the server answers it: archived strategies only when asked. */
+function answerByFilter(): void {
+  overviewMock.mockImplementation(async (includeArchived: boolean) => ({
+    status: "ok",
+    data: includeArchived ? WITH_ARCHIVED : SEEDED,
+  }));
+}
+
+function lastReadArgument(): boolean | undefined {
+  return overviewMock.mock.calls[overviewMock.mock.calls.length - 1]?.[0];
+}
+
+/** Select version `label` of the strategy whose toggle is named `strategy`. */
+async function selectVersion(container: HTMLElement, strategy: RegExp, label: string): Promise<void> {
+  fireEvent.click(await screen.findByRole("button", { name: strategy }));
+  const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+  fireEvent.click(within(tree).getByText(label));
+}
+
+describe("LibraryScreen (r7.s1.w2 — the Archived filter and the archive action)", () => {
+  it("reads the library without archived strategies by default, the Archived filter off", async () => {
+    answerByFilter();
+    render(<App />);
+    await screen.findByText("Alpha Wave");
+
+    expect(overviewMock).toHaveBeenCalledWith(false);
+    expect(overviewMock).not.toHaveBeenCalledWith(true);
+    expect(screen.getByRole("button", { name: "Archived" }).getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByText("Gamma Fade")).toBeNull();
+  });
+
+  it("the Archived filter reads with archived strategies and tags each archived one", async () => {
+    answerByFilter();
+    const { container } = render(<App />);
+    await screen.findByText("Alpha Wave");
+
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    expect(await screen.findByText("Gamma Fade")).toBeTruthy();
+    expect(lastReadArgument()).toBe(true);
+    expect(screen.getByRole("button", { name: "Archived" }).getAttribute("aria-pressed")).toBe("true");
+    const gamma = screen.getByText("Gamma Fade").closest(".scard") as HTMLElement;
+    expect(within(gamma).getByText("Archived")).toBeTruthy();
+    const alpha = screen.getByText("Alpha Wave").closest(".scard") as HTMLElement;
+    expect(within(alpha).queryByText("Archived")).toBeNull();
+    expect(container.querySelectorAll(".scard-archived").length).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    await waitFor(() => {
+      expect(screen.queryByText("Gamma Fade")).toBeNull();
+    });
+    expect(lastReadArgument()).toBe(false);
+  });
+
+  it("Archive strategy archives the selected version's strategy and reads the library again", async () => {
+    answerByFilter();
+    archiveMock.mockResolvedValue({ status: "ok", data: { id: "strat-alpha", archived: true } });
+    const { container } = render(<App />);
+    await selectVersion(container, /toggle alpha wave/i, "v2");
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const readsBefore = overviewMock.mock.calls.length;
+    fireEvent.click(await within(pane).findByRole("button", { name: "Archive strategy" }));
+
+    await waitFor(() => {
+      expect(overviewMock.mock.calls.length).toBe(readsBefore + 1);
+    });
+    expect(archiveMock).toHaveBeenCalledTimes(1);
+    expect(archiveMock).toHaveBeenCalledWith("strat-alpha");
+    expect(unarchiveMock).not.toHaveBeenCalled();
+  });
+
+  it("Unarchive strategy shows on an archived strategy and unarchives it", async () => {
+    answerByFilter();
+    unarchiveMock.mockResolvedValue({ status: "ok", data: { id: "strat-gamma", archived: false } });
+    const { container } = render(<App />);
+    await screen.findByText("Alpha Wave");
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    await screen.findByText("Gamma Fade");
+    await selectVersion(container, /toggle gamma fade/i, "v1");
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    expect(within(pane).queryByRole("button", { name: "Archive strategy" })).toBeNull();
+    fireEvent.click(await within(pane).findByRole("button", { name: "Unarchive strategy" }));
+
+    await waitFor(() => {
+      expect(unarchiveMock).toHaveBeenCalledWith("strat-gamma");
+    });
+    expect(archiveMock).not.toHaveBeenCalled();
+  });
+
+  it("a failed archive names the strategy and the server's reason", async () => {
+    answerByFilter();
+    archiveMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "not_found",
+        message: "no strategy with id strat-alpha",
+        run_id: null,
+        session_id: null,
+        child_run_id: null,
+      },
+    });
+    const { container } = render(<App />);
+    await selectVersion(container, /toggle alpha wave/i, "v2");
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    fireEvent.click(await within(pane).findByRole("button", { name: "Archive strategy" }));
+
+    expect(
+      await within(pane).findByText("Could not archive Alpha Wave: no strategy with id strat-alpha"),
+    ).toBeTruthy();
+    expect(screen.getByText("Alpha Wave", { selector: ".scard-name" })).toBeTruthy();
+  });
+
+  it("a slower earlier read cannot overwrite the filter's later read", async () => {
+    answerByFilter();
+    render(<App />);
+    await screen.findByText("Alpha Wave");
+
+    const older = deferredOverview();
+    const newer = deferredOverview();
+    overviewMock.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+
+    // The filter on (the earlier read), then off again (the later read).
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    await act(async () => {});
+    expect(overviewMock.mock.calls.length).toBe(3);
+    expect(lastReadArgument()).toBe(false);
+
+    // The later read lands first, then the slower earlier one.
+    await act(async () => {
+      newer.resolve({ status: "ok", data: SEEDED });
+    });
+    await act(async () => {
+      older.resolve({ status: "ok", data: WITH_ARCHIVED });
+    });
+    // The stale answer must not put the archived strategy back on screen.
+    expect(screen.queryByText("Gamma Fade")).toBeNull();
+    expect(screen.getByText("2 strategies · 4 versions")).toBeTruthy();
   });
 });

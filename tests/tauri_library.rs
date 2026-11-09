@@ -1,7 +1,8 @@
 //! r1.s1.w3 AC-1 — the Strategy Library's read (ledger line `d2`'s own command).
 //!
-//! `d2` claims: "the Strategy Library lists every strategy and version persisted
-//! in `pulse.db`, with per-version stats where a run exists". This test asserts
+//! `d2` claims (r7.s1.w2, PDR-0051 decision 3): "the Strategy Library lists every
+//! non-archived strategy and version by default with per-version stats, and the
+//! Archived filter lists the archived ones". This test asserts
 //! that claim against the transport-free core (`library_overview_core`) over a
 //! migrated tempfile `pulse.db` seeded through the REAL repositories — never a
 //! fixture row, never the real Application Support dir.
@@ -21,7 +22,7 @@ use pulse::{
     DataVersion, DesktopState, EngineFingerprint, EquityCurve, FakeClock, FundingConfig,
     NewAgentSubmission, NewVersion, Pair, RegimeBreakdown, SkippedEntryCounts, SnapshotSelection,
     SqliteBacktestRunRepo, StrategyRepository, SummaryStats, Timeframe, VersionId,
-    WalkForwardRunRepository, library_overview_core,
+    WalkForwardRunRepository, library_overview_core, shell_info_core,
 };
 use support::mcp::seeded_walk_forward_draft;
 
@@ -187,7 +188,7 @@ async fn seeded_state() -> (DesktopState, TempDir, Vec<VersionId>, String) {
 async fn overview_lists_every_strategy_and_version_with_stats_iff_a_run_exists() {
     let (state, _tmp, alpha_versions, beta_root) = seeded_state().await;
 
-    let overview = library_overview_core(&state)
+    let overview = library_overview_core(&state, false)
         .await
         .expect("the library read succeeds over the seeded db");
 
@@ -301,6 +302,101 @@ async fn overview_lists_every_strategy_and_version_with_stats_iff_a_run_exists()
     assert_eq!(alpha.pinned_version_id.as_deref(), Some(va2.as_str()));
 }
 
+/// Archive the seeded strategy named `name` through the repository.
+async fn archive_named(state: &DesktopState, name: &str) {
+    let repo = state.strategy_repo();
+    let strategy = repo
+        .list_strategies(true)
+        .await
+        .expect("list the strategies")
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("{name} is seeded"));
+    repo.archive_strategy(&strategy.id, true)
+        .await
+        .expect("archive the strategy");
+}
+
+/// r7.s1.w2 (d2): the default read hides an archived strategy, `include_archived`
+/// lists it tagged, and archiving leaves every version and its stats as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overview_hides_archived_strategies_by_default_and_lists_them_with_archived() {
+    let (state, _tmp, alpha_versions, _beta_root) = seeded_state().await;
+    archive_named(&state, "Beta").await;
+
+    let default = library_overview_core(&state, false)
+        .await
+        .expect("the default library read succeeds");
+    let names: Vec<&str> = default.strategies.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["Alpha"], "the default read lists only Alpha");
+    let alpha = &default.strategies[0];
+    assert!(!alpha.archived, "Alpha is not archived");
+    let pos = |id: &VersionId| {
+        alpha
+            .versions
+            .iter()
+            .position(|v| v.id == id.as_str())
+            .unwrap_or_else(|| panic!("version {} is listed", id.as_str()))
+    };
+    let expectancy = |id: &VersionId| {
+        alpha.versions[pos(id)]
+            .stats
+            .as_ref()
+            .map(|stats| stats.expectancy.clone())
+    };
+    assert_eq!(
+        expectancy(&alpha_versions[0]).as_deref(),
+        Some("+0.30 USDT")
+    );
+    assert_eq!(
+        expectancy(&alpha_versions[1]).as_deref(),
+        Some("+0.42 USDT")
+    );
+    assert_eq!(expectancy(&alpha_versions[2]), None);
+
+    let all = library_overview_core(&state, true)
+        .await
+        .expect("the archived-inclusive read succeeds");
+    assert_eq!(all.strategies.len(), 2, "both strategies are listed");
+    let beta = all
+        .strategies
+        .iter()
+        .find(|s| s.name == "Beta")
+        .expect("Beta is listed with archived");
+    assert!(beta.archived, "Beta carries archived == true");
+    assert_eq!(beta.versions.len(), 1, "Beta keeps its one version");
+    let alpha = all
+        .strategies
+        .iter()
+        .find(|s| s.name == "Alpha")
+        .expect("Alpha is listed");
+    assert!(!alpha.archived);
+}
+
+/// r7.s1.w2 (criterion 1): the sidebar's strategy count agrees with the Library's
+/// default list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_shell_count_omits_archived_strategies() {
+    let (state, _tmp, _alpha_versions, _beta_root) = seeded_state().await;
+    assert_eq!(
+        shell_info_core(&state)
+            .await
+            .expect("the shell read succeeds")
+            .strategy_count,
+        2,
+        "two strategies before any archive"
+    );
+    archive_named(&state, "Beta").await;
+    assert_eq!(
+        shell_info_core(&state)
+            .await
+            .expect("the shell read succeeds")
+            .strategy_count,
+        1,
+        "the archived strategy leaves the count"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_database_lists_no_strategies() {
     let tmp = TempDir::new().expect("tempdir");
@@ -308,7 +404,7 @@ async fn an_empty_database_lists_no_strategies() {
         .await
         .expect("open a fresh db");
 
-    let overview = library_overview_core(&state)
+    let overview = library_overview_core(&state, false)
         .await
         .expect("the library read succeeds over an empty db");
 
@@ -373,7 +469,7 @@ async fn provenance_and_hypothesis_reach_the_wire_per_version_kind() {
         .await
         .expect("create a submission-less agent version");
 
-    let overview = library_overview_core(&state)
+    let overview = library_overview_core(&state, false)
         .await
         .expect("the library read succeeds over the seeded db");
     let alpha = overview
@@ -438,7 +534,7 @@ async fn certification_fields_reach_the_wire() {
     .await
     .expect("the certifying walk-forward run persists");
 
-    let overview = library_overview_core(&state)
+    let overview = library_overview_core(&state, false)
         .await
         .expect("the library read succeeds");
     let alpha = overview
@@ -515,7 +611,7 @@ async fn latest_run_is_the_version_latest_non_fold_run() {
         .collect();
     assert_eq!(fold_ids.len(), 2, "the fixture is a two-fold run");
 
-    let overview = library_overview_core(&state)
+    let overview = library_overview_core(&state, false)
         .await
         .expect("the library read succeeds");
     let va2 = overview

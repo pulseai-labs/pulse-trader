@@ -313,7 +313,7 @@ async fn every_plain_route_answers_its_tauri_dto_with_an_app_token() {
     // 3. library-overview — deserializes AND equals the core's own result.
     let (status, body) = get_json(&ts, "/api/v1/library-overview", &ts.app_token).await;
     assert_eq!(status, reqwest::StatusCode::OK, "{body:?}");
-    let core = library_overview_core(&desktop)
+    let core = library_overview_core(&desktop, false)
         .await
         .expect("the core answers on the same state");
     assert_eq!(

@@ -691,7 +691,9 @@ export default function BacktestLabScreen() {
   const loadCatalog = useCallback(
     async (alive: () => boolean = () => true): Promise<Set<string>> => {
       try {
-        const result = await commands.libraryOverview();
+        // archived strategies are hidden here too, as in the Library's default
+        // (r7.s1.w2, exit criterion 1)
+        const result = await commands.libraryOverview(false);
         if (!alive()) return new Set();
         if (result.status === "ok") {
           const ids = catalogVersionIds(result.data);

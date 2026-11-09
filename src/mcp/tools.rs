@@ -866,7 +866,7 @@ pub(crate) struct ExplainMarksArgs {
 impl PulseMcp {
     /// List strategies with their version trees (parent-first order).
     #[tool(
-        description = "List strategies with their version trees in parent-first order. The result is an object carrying the tree under `strategies`. Pass include_archived to include archived strategies."
+        description = "List strategies with their version trees in parent-first order. The result is an object carrying the tree under `strategies`. Archived strategies are hidden by default, exactly as the app's Library hides them; pass include_archived: true to list them too, each carrying archived: true. Archiving deletes nothing: get_version still reads an archived strategy's versions by id."
     )]
     async fn list_strategies(
         &self,

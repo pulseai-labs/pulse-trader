@@ -103,7 +103,7 @@ are synchronous; write tools commit before they return.
 
 | Tool | What it does |
 |---|---|
-| `list_strategies` | List strategies with their version trees in parent-first order; `include_archived` opts in |
+| `list_strategies` | List strategies with their version trees in parent-first order; archived strategies are hidden unless `include_archived: true`, as in the app's Library |
 | `get_version` | Fetch one version by id — migrated DSL document, verbatim original, hash, provenance |
 | `list_runs` | List the runs recorded against a version — headline stats plus persisted input provenance |
 | `get_run` | Fetch one run — summary stats, regime breakdown, skipped entries, MFE/MAE, persisted inputs, integrity fields |

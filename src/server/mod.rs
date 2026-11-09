@@ -30,6 +30,7 @@ pub mod role;
 pub mod routes;
 // r4.s2.w1 (G5): the launchd start bound — `pulse serve --start-limit`.
 pub mod start_limit;
+pub mod strategies;
 
 use std::path::PathBuf;
 use std::sync::Arc;

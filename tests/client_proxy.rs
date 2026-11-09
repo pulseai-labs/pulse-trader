@@ -192,7 +192,9 @@ async fn library_overview_via_the_proxy_matches_the_core() {
         .get_json("/api/v1/library-overview")
         .await
         .expect("proxy the library read");
-    let core = library_overview_core(&desktop).await.expect("core read");
+    let core = library_overview_core(&desktop, false)
+        .await
+        .expect("core read");
 
     assert!(
         same_wire(&proxied, &core),
