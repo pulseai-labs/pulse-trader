@@ -50,9 +50,7 @@ pub(crate) mod paper_read;
 
 // r3.s4.w2 (ADR-0027): the certify-fixture ring — the deterministic synthetic
 // series' pair/candle accessors, the pinned dip-buy strategy document minted
-// from the generator's own constants, and (with the AC-4 loop) the `seed` use
-// case that stamps the series into the candle store and the durable
-// fixture/strategy/walk-forward rows.
+// from the generator's own constants.
 pub(crate) mod fixture;
 
 pub(crate) mod backtest;

@@ -77,7 +77,7 @@ one call, one validated mutation, one durable session — lives in
 
 The `pulse` binary's argument surface. Its `clap` subcommands: data
 (`fetch-data`, `indicators`, `import`, `backup`, `backup-verify`,
-`restore`, `fixture`), strategies and runs (`strategy`, `backtest`,
+`restore`), strategies and runs (`strategy`, `backtest`,
 `runs`), the agent loop (`compose`, `coach`, `llm-check`), the server and
 its administration (`serve`, `mcp`, `token`, `certify`, `watch`), plus one
 hidden diagnostic (`keychain-probe`). Each subcommand is a composition

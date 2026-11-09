@@ -968,9 +968,10 @@ pub trait PaperSessionRepository {
         events: &[crate::domain::paper::event::PaperEvent],
     ) -> impl Future<Output = Result<Vec<crate::domain::paper::event::PaperEvent>, DataError>> + Send;
 
-    /// Stamp one `(pair, timeframe, data_version)` into `fixture_snapshot`
-    /// — the certify fixture's durable row (E4). Idempotent: an existing row
-    /// is left alone, so a second seed adds nothing.
+    /// Stamp one `(pair, timeframe, data_version)` into `fixture_snapshot`.
+    /// Idempotent: an existing row is left alone. No production caller since
+    /// r7.s1.w1 retired the seeder; kept so tests can stand for a fixture row
+    /// already in a database (ADR-0027 amendment).
     ///
     /// # Errors
     ///
@@ -2334,39 +2335,4 @@ mod llm_call_repository_tests {
         assert_eq!(fetched.cost_currency, "CNY");
         assert_eq!(fetched.cost, Decimal::new(1234, 4));
     }
-}
-
-/// The snapshot-stamping capability the certify fixture's seed needs (r3.s4.w2,
-/// E4) — content-addressed identity, existence probing, and content-addressed
-/// writes, NEVER a `commit` and never `HEAD`. A domain port so the application
-/// ring can stamp snapshots without naming an adapters namespace (ADR-0015's
-/// one-import rule); the candle store implements it in the adapters ring, and
-/// the CLI composes the two.
-pub trait FixtureSnapshotStore {
-    /// The content-hash `data_version` of `(pair, timeframe, candles)` under
-    /// the store's candle schema version.
-    fn fixture_content_version(
-        &self,
-        pair: &Pair,
-        timeframe: Timeframe,
-        candles: &[Candle],
-    ) -> DataVersion;
-
-    /// Whether the content-addressed snapshot file for this exact version
-    /// already exists (`true` = the seed skips the write; no new file).
-    fn fixture_snapshot_exists(
-        &self,
-        pair: &Pair,
-        timeframe: Timeframe,
-        version: &DataVersion,
-    ) -> bool;
-
-    /// Write the series as a content-addressed snapshot. The write derives the
-    /// version from the content and refuses a mismatched caller-supplied one;
-    /// a repeat write of the same content is a no-op. Never sets HEAD.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DataError`] on a store failure.
-    fn fixture_write_snapshot(&self, series: &CandleSeries) -> Result<(), DataError>;
 }

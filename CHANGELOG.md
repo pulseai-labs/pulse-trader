@@ -677,6 +677,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   application calling the API directly, by usage shape rather than by user count.
   Preserved unmerged as [PR #123](https://github.com/pulseai-labs/pulse-trader/pull/123).
 
+### Removed
+
+- **`pulse fixture seed` is retired (r7.s1.w1).** The command and its code path are removed (PDR-0051
+  decision 2); records it made stay readable as fixture history, and the certification gate and the override
+  promotion are unchanged (ADR-0027 amendment).
+
 ### Fixed
 
 - **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount

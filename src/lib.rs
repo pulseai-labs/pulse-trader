@@ -626,9 +626,9 @@ pub use domain::{
 
 // r3.s4.w2 (ADR-0027): the certify-fixture surface — the deterministic
 // synthetic series' accessors and the pinned fixture strategy document the
-// fixture proof (`tests/certify_fixture.rs`) and the `pulse fixture` command
-// ride. Re-exported because an un-re-exported public item is a `dead_code`
-// BUILD error under `deny(warnings)` (the harvested gotcha).
+// fixture history proof (`tests/fixture_history.rs`) and the paper and
+// certification tests ride. Re-exported because an un-re-exported public item
+// is a `dead_code` BUILD error under `deny(warnings)` (the harvested gotcha).
 pub use application::fixture::{
     FIXTURE_PAIR, FIXTURE_SEED, FIXTURE_STRATEGY_NAME, FIXTURE_STRATEGY_TAG, fixture_h4_candles,
     fixture_h4_candles_from, fixture_m15_candles, fixture_pair, fixture_strategy_dsl,
@@ -651,7 +651,6 @@ pub use adapters::binance::RestClosedBars;
 pub use application::paper_runtime::{
     LiveEnv, PaperRuntime, PaperRuntimeError, RuntimeLog, SessionEnv, SessionFailure, SettlePolicy,
 };
-pub use domain::FixtureSnapshotStore;
 pub use domain::PaperSessionRepository;
 pub use domain::{
     BarBoundaries, ClosedBarSource, EpochStart, ShadowResult, StepView, boundaries, compare,
