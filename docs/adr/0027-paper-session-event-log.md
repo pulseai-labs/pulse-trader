@@ -111,3 +111,17 @@ This decision is revisited when any of the following lands: live execution
 money), a second pair (the fixture stamp and the `pair` columns grow a second
 identity), or a websocket feed (REST polling's amend to design §4.1 is
 re-amended, and `data_event`'s payload grows the reconnect vocabulary).
+
+## Amendment (r7.s1.w1, 2026-11-09): the fixture-certified variant is history
+
+`pulse fixture seed`, its use case and the `FixtureSnapshotStore` port are removed (PDR-0051 decision 2), so
+nothing writes a `fixture_snapshot` row any more. Every record the seeder made stays: the `fixture_snapshot` rows,
+the FIXTURE strategy's versions and walk-forward runs, the snapshots they pin, and any fixture-certified session's
+row and events. They read as before (`fixture = true`, "OOS comparison: n/a, certified on fixture data"); the
+event log stays append-only and migration 0018 is unchanged. No new session can be fixture-certified while the
+FIXTURE strategy stays archived: the flag is set only when every certified data version already has a
+`fixture_snapshot` row, the only such versions are the two synthetic series stamped for the FIXTURE strategy, and
+r7.s1.w2 makes promotion refuse a version whose strategy is archived. Unarchiving FIXTURE is the operator's
+deliberate act, and a session promoted from it is still labelled fixture, never OOS-comparable. The Consequences bullet on
+`pulse fixture seed` is history. The certification gate, the override promotion and the E2 refusal are unchanged;
+a certified promotion returns with the first real strategy that passes wf-v2.

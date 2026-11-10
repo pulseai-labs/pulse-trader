@@ -61,15 +61,15 @@ export const commands = {
 	 *  The Strategy Library's one read: every strategy, its version tree, per-version
 	 *  stats where a persisted run exists, and each version's recent run catalog.
 	 * 
-	 *  A pure read — the Library writes nothing (ADR-0010); pin/archive/rename each
-	 *  need a write command and are out of this item's budget.
+	 *  A pure read — the Library writes nothing (ADR-0010); archive and unarchive are
+	 *  their own commands (r7.s1.w2); pin and rename are not built.
 	 * 
 	 *  # Errors
 	 * 
 	 *  Returns a [`BusError`] if any repository read fails — including a corrupt
 	 *  run row surfacing from the fail-closed `latest_run_for_version` (#39).
 	 */
-	libraryOverview: () => typedError<LibraryOverview, BusError>(__TAURI_INVOKE("library_overview")),
+	libraryOverview: (includeArchived: boolean) => typedError<LibraryOverview, BusError>(__TAURI_INVOKE("library_overview", { includeArchived })),
 	composeStrategy: (nlTarget: string, channel: Channel<BusEvent>) => typedError<ComposeResult, BusError>(__TAURI_INVOKE("compose_strategy", { nlTarget, channel })),
 	/**
 	 *  Cancel an in-flight compose run by id.
@@ -413,6 +413,22 @@ export const commands = {
 	 *  [`power_reviews_core`]: crate::tauri::power_review::power_reviews_core
 	 */
 	powerReviews: (request: PowerReviewsRequest) => typedError<PowerReviewsDto, BusError>(__TAURI_INVOKE("power_reviews", { request })),
+	/**
+	 *  Archive one strategy; nothing is deleted (r7.s1.w2).
+	 * 
+	 *  # Errors
+	 * 
+	 *  `not_found` for an unknown id, or the proxied-call failure.
+	 */
+	archiveStrategy: (id: string) => typedError<StrategyArchiveResult, BusError>(__TAURI_INVOKE("archive_strategy", { id })),
+	/**
+	 *  Unarchive one strategy (r7.s1.w2).
+	 * 
+	 *  # Errors
+	 * 
+	 *  `not_found` for an unknown id, or the proxied-call failure.
+	 */
+	unarchiveStrategy: (id: string) => typedError<StrategyArchiveResult, BusError>(__TAURI_INVOKE("unarchive_strategy", { id })),
 };
 
 /* Types */
@@ -1560,6 +1576,11 @@ export type LibraryStrategy = {
 	createdAt: string,
 	/**  The pinned version's id, if the strategy has one (FR-11 pin). */
 	pinnedVersionId: string | null,
+	/**
+	 *  Whether the strategy is archived (FR-11 archive). The default Library read lists none;
+	 *  the Archived filter's read lists them with true.
+	 */
+	archived?: boolean,
 	/**  All versions, parent-before-child (`version_tree` order). */
 	versions: LibraryVersion[],
 };
@@ -2339,6 +2360,17 @@ export type StopFailure = {
 	id: string,
 	/**  The runtime's typed error code for it. */
 	code: string,
+};
+
+/**
+ *  What `archive_strategy` / `unarchive_strategy` answer: the strategy's id and its archived state
+ *  after the call.
+ */
+export type StrategyArchiveResult = {
+	/**  The strategy's id. */
+	id: string,
+	/**  The strategy's archived state after the call. */
+	archived: boolean,
 };
 
 /**

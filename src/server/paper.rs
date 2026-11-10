@@ -211,6 +211,9 @@ async fn promote_route(state: Arc<ServerState>, req: Request) -> Response {
             "validation",
             error.to_string(),
         ),
+        Err(error @ PaperPromotionError::ArchivedStrategy(_)) => {
+            api_error(StatusCode::CONFLICT, "archived", error.to_string())
+        }
     }
 }
 

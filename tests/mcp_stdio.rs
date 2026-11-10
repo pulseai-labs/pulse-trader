@@ -177,6 +177,56 @@ async fn strategy_and_version_tools_return_the_seed() {
     client.cancel().await.expect("cancel session");
 }
 
+/// r7.s1.w2 (PDR-0051 decision 4): `list_strategies` hides an archived strategy
+/// by default — the app Library's predicate — and `include_archived` lists it
+/// with `archived: true`. Archiving deletes nothing: `get_version` still reads
+/// the archived strategy's versions by id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_strategies_hides_an_archived_strategy_unless_include_archived() {
+    let (fixture, client) = seeded_fixture().await;
+    let (parent, child, _run) = &fixture.seed;
+    let parent_id = parent.as_str().to_owned();
+    let child_id = child.as_str().to_owned();
+
+    let repo = pulse::SqliteStrategyRepo::new(fixture.db.pool().clone());
+    let strategy_id = pulse::StrategyRepository::get_version(&repo, parent)
+        .await
+        .expect("read the seeded version")
+        .expect("the seeded version exists")
+        .strategy_id;
+    pulse::StrategyRepository::archive_strategy(&repo, &strategy_id, true)
+        .await
+        .expect("archive the seeded strategy");
+    let sid = strategy_id.as_str().to_owned();
+
+    let default = call(&client, "list_strategies", json!({})).await;
+    let default = default["strategies"].as_array().expect("strategy array");
+    assert!(
+        default.iter().all(|s| s["id"] != sid.as_str()),
+        "the archived strategy is hidden by default: {default:?}"
+    );
+
+    let all = call(
+        &client,
+        "list_strategies",
+        json!({"include_archived": true}),
+    )
+    .await;
+    let all = all["strategies"].as_array().expect("strategy array");
+    let listed = all
+        .iter()
+        .find(|s| s["id"] == sid.as_str())
+        .expect("include_archived lists the archived strategy");
+    assert_eq!(listed["archived"], true);
+    assert_eq!(listed["versions"].as_array().expect("versions").len(), 2);
+
+    let version = call(&client, "get_version", json!({"version_id": child_id})).await;
+    assert_eq!(version["id"], child_id);
+    assert_eq!(version["parent_version_id"], parent_id);
+
+    client.cancel().await.expect("cancel session");
+}
+
 /// #183: the MCP spec types `structuredContent` as a JSON OBJECT — Claude
 /// Code's tools/call validator refuses anything else (`expected: record`,
 /// the failure the r2.s1 walk hit). The object invariant itself is carried

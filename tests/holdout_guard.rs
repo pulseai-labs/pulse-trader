@@ -19,7 +19,6 @@
 //! - a defaulted window is clamped to the holdout start and the result says so;
 //! - an agent export stops at the holdout start;
 //! - with no freeze open nothing changes; after `close-freeze` the guard lifts;
-//! - the exemptions run unguarded (the certify-fixture seed).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod coach_gate_support;
@@ -757,32 +756,6 @@ async fn guard_exports_stop_at_the_holdout_start() {
             .contains("cannot be cut at the holdout start"),
         "{err}"
     );
-}
-
-// ---------------------------------------------------------------------------
-// AC-1: the exemptions run unguarded
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exemptions_run_unguarded() {
-    let world = world().await;
-    world.open_freeze(HOLDOUT_MS).await;
-
-    // The certify-fixture seed (grill Q4, G8) walks its own synthetic
-    // snapshots with `holdout: None` — a freeze must not refuse it.
-    let data_dir = world.store_dir.join("fixture-synthetic");
-    let out = Command::new(env!("CARGO_BIN_EXE_pulse"))
-        .args([
-            "fixture",
-            "seed",
-            "--db",
-            &world.db_path.to_string_lossy(),
-            "--data-dir",
-            &data_dir.to_string_lossy(),
-        ])
-        .output()
-        .expect("run pulse fixture seed");
-    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
 }
 
 // ---------------------------------------------------------------------------
