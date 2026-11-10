@@ -1,6 +1,6 @@
 [package]
 name = "pulse"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 rust-version = "1.98.0"
 description = "PulseTrader core engine — domain types, ports, and adapters"
@@ -110,11 +110,11 @@ toml = "0.9"
 # zero lockfile churn and no determinism-fingerprint impact. I/O not math, so a caret
 # pin is fine (unlike ta/sqlx). Use it for the uid read ONLY.
 libc = "0.2"
-# r2.s1.w2 (ADR-0015 delivery ring): the `pulse mcp` stdio server. EXACT `=3.4.0`
+# r2.s1.w2 (ADR-0015 delivery ring): the `pulse mcp` stdio server. EXACT `=3.9.0`
 # pin — the MCP SDK is the delivery surface's wire contract; `transport-io` adds
 # `tokio/io-std` for `rmcp::transport::stdio()` (defaults stay server+macros+base64;
 # no http/auth/reqwest pulls). Do NOT relax to a caret.
-rmcp = { version = "=3.4.0", features = ["transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "=3.9.0", features = ["transport-io", "transport-streamable-http-server"] }
 # `JsonSchema` derives on the DSL types feed the `pulse://dsl/schema` resource;
 # `rust_decimal1` gives `Decimal` its string/number wire schema.
 schemars = { version = "1", features = ["rust_decimal1"] }
@@ -226,7 +226,7 @@ proptest = "1"
 rayon = "1"
 # r2.s1.w2: the mcp_stdio test drives a real child process through rmcp's client
 # side (`TokioChildProcess`) — same exact pin as the server SDK above.
-rmcp = { version = "=3.4.0", features = ["client", "transport-child-process"] }
+rmcp = { version = "=3.9.0", features = ["client", "transport-child-process"] }
 
 # Lints: deny(warnings) + clippy all + pedantic (MASTER-SPEC §7.1, audit C4).
 # unwrap/expect denied so library paths cannot panic (audit C5 / AC-7).
