@@ -624,13 +624,14 @@ function VersionNode({
             ★
           </span>
         )}
-        {/* d22 (r2.s3.w4): the certification badge follows the version's
-            LATEST walk-forward run — rendered when `certified` is true, absent
-            entirely when false so the mark can't fade into decoration. The
+        {/* d22 (r2.s3.w4; #545): the certification badge follows the promotion
+            gate's rule — rendered when `certified` is true (the version's latest
+            certified record names a passing walk-forward run), absent entirely
+            when false so the mark can't fade into decoration. The
             shared `CertBadge` (r3.s4.w5) states it, so the Library, the sheet
             and the session screens cannot drift apart on the word. */}
         {version.certified && (
-          <span className="vnode-cert" title="Latest walk-forward passed">
+          <span className="vnode-cert" title="A certified record names a passing walk-forward run">
             <CertBadge kind="certified" />
           </span>
         )}
@@ -961,9 +962,10 @@ function DetailsPane({
             `StrategyDsl` carries neither field. */}
       </section>
 
-      {/* d22 (r2.s3.w4): certification state is part of the version's record,
-          so the pane always states it — "certified" or "uncertified" — and
-          names the certifying walk-forward run only when the pointer is set.
+      {/* d22 (r2.s3.w4; #545): certification state is part of the version's
+          record, so the pane always states it — "certified" or "uncertified",
+          by the promotion gate's rule — and names the version's latest
+          walk-forward run only when the pointer is set.
           r3.s4.w5 states it through the shared `CertBadge`. */}
       <section className="d-section">
         <h4 className="dsl-h">Certification</h4>
@@ -1015,11 +1017,9 @@ function DetailsPane({
           with THIS version; the sheet decides the variant from the server.
           The certification state itself is NOT repeated here: the section
           directly above states it once, and a second badge in the same pane
-          would be the same fact twice. */}
+          would be the same fact twice. The version's latest run is not named
+          here either: it need not be the run a certified record names (#545). */}
       <div className="promote-row">
-        {version.certified && version.latestWalkForwardRunId !== null && (
-          <span className="pr-meta mono">{version.latestWalkForwardRunId} · PASS</span>
-        )}
         <button className="btn-sec-sm" onClick={() => setPromoting(true)}>
           Promote to paper…
         </button>

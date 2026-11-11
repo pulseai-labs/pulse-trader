@@ -310,13 +310,15 @@ struct RunRow {
 /// (r2.s3.w4): the `walk_forward_run` parent row, each fold's ordinary
 /// `backtest_run` + `trade` + `walk_forward_fold` rows, and — last — the owning
 /// version's certification pointer moved to this run (ADR-0025 L6: EVERY
-/// persisted walk-forward advances `latest_walk_forward_run_id`, pass or fail —
-/// a newer failing run is exactly how a version de-certifies).
+/// persisted walk-forward advances `latest_walk_forward_run_id`, pass or fail;
+/// the pointer is the version's latest run, and a version is certified only by
+/// a certified record that names a passing run — #525, #545).
 ///
 /// Fail closed on a draft that is not internally the scheme's own shape (F5).
 /// `WalkForwardRunDraft` is a public struct with unconstrained fields — a
 /// caller can build `k=6` with zero folds and `pass=true` and, absent this
-/// gate, the pointer update below would still read the version "certified".
+/// gate, the pointer update below would still move the version's latest run to
+/// a run whose `pass` no fold supports.
 /// So the SHARED insert path — the one funnel `save_walk_forward_run` and the
 /// coach accept both pass through — refuses an incoherent draft before a
 /// single row is written:
@@ -357,10 +359,9 @@ struct RunRow {
 /// public variant, so a caller can hand the gate a `k` the domain refuses to
 /// construct — `rolling_oos(13)` cannot return it — and the row such a draft
 /// writes is one the READ rejects (`decode_scheme_and_rule` re-derives the scheme
-/// through that same constructor) while `get_version` still derives `certified`
-/// from the stored `pass`. Reconstructing it refuses the draft before a single
-/// row exists, so the write path and the read path cannot disagree about which
-/// schemes exist.
+/// through that same constructor) while the stored run still carries its `pass`.
+/// Reconstructing it refuses the draft before a single row exists, so the write
+/// path and the read path cannot disagree about which schemes exist.
 fn validate_scheme(draft: &WalkForwardRunDraft) -> Result<(), DataError> {
     let incoherent = |what: String| DataError::Db(format!("walk-forward draft refused: {what}"));
     let reconstructed = FoldScheme::rolling_oos(i64::from(draft.scheme.k())).map_err(|e| {

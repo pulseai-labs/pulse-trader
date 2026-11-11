@@ -1,18 +1,20 @@
 //! r2.s3.w4 — AC-3: `certified` is DERIVED, on every read path.
 //!
-//! The database stores one fact — `strategy_version.latest_walk_forward_run_id`
-//! — and `certified` is `true` exactly when the run that pointer names has
-//! `pass != 0`. A newer FAILING walk-forward revokes certification by simply
-//! being the row the pointer now names; there is no flag to forget to flip.
+//! The database stores one pointer — `strategy_version.latest_walk_forward_run_id`
+//! — and `certified` is the promotion gate's own rule (#525, #545): `true`
+//! exactly when the version's latest certified record names a run that passed.
+//! A passing run no record names does not certify, and there is no flag to
+//! forget to flip.
 //!
 //! i.   A fresh version reads `certified: false`, `latest_walk_forward_run_id:
 //!      None` — on `get_version`, `list_versions` and `version_tree` alike.
-//! ii.  A passing walk-forward run certifies the version on the next read —
-//!      same three surfaces, plus the pointer names the run.
-//! iii. A later FAILING run de-certifies: the pointer advanced, `certified`
-//!      reads `false` again, on all three surfaces.
-//! iv.  `certified` follows the JOIN, not the pointer: a version pointing at a
-//!      failing run is uncertified even though the pointer is set.
+//! ii.  A passing walk-forward run alone leaves the version uncertified, and a
+//!      certified record that names the run certifies it — same three
+//!      surfaces, plus the pointer names the run.
+//! iii. A later FAILING run moves the pointer and leaves the record-backed
+//!      certification as it was: the record names the passing run.
+//! iv.  `certified` follows the record, not the pointer: a version pointing at
+//!      a failing run, with no record, is uncertified.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
@@ -154,10 +156,11 @@ async fn a_fresh_version_is_uncertified_on_every_read() {
     }
 }
 
-/// ii. A passing walk-forward certifies the version on the next read — the
-/// pointer names the run, `certified` is true, on all three surfaces.
+/// ii. A passing walk-forward alone does not certify the version (#545): the
+/// pointer names the run and `certified` stays false, on all three surfaces.
+/// A certified record that names the run then certifies it on the next read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_passing_walk_forward_certifies_on_every_read() {
+async fn a_passing_walk_forward_certifies_only_through_a_record_on_every_read() {
     let world = world().await;
     let run = save_wf(&world, true, 1_756_512_000_000).await;
 
@@ -174,17 +177,50 @@ async fn a_passing_walk_forward_certifies_on_every_read() {
             Some(run.as_str()),
             "{surface}: the pointer names the passing run"
         );
-        assert!(version.certified, "{surface}: derived certified is true");
+        assert!(
+            !version.certified,
+            "{surface}: a passing run no record names is not certified"
+        );
+    }
+
+    support::certification::record_certification(
+        world.pool(),
+        &world.version_id,
+        &pulse::fixture_pair(),
+        &run,
+    )
+    .await;
+
+    for (surface, version) in [
+        ("get_version", world.get().await),
+        ("list_versions", world.listed().await),
+        ("version_tree", world.tree().await),
+    ] {
+        assert!(
+            version.certified,
+            "{surface}: a record naming the passing run certifies it"
+        );
     }
 }
 
-/// iii. A later FAILING run de-certifies: the pointer advances to it, and
-/// `certified` reads `false` — the revocation is the newest row, not a flag.
+/// iii. A later FAILING run moves the pointer and leaves the record-backed
+/// certification as it was: the record names the earlier passing run, which
+/// is the run the promotion gate reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_later_failing_run_decertifies_on_every_read() {
+async fn a_later_failing_run_leaves_a_record_backed_certification_on_every_read() {
     let world = world().await;
     let certified_run = save_wf(&world, true, 1_756_512_000_000).await;
-    assert!(world.get().await.certified, "setup: the pass certifies");
+    support::certification::record_certification(
+        world.pool(),
+        &world.version_id,
+        &pulse::fixture_pair(),
+        &certified_run,
+    )
+    .await;
+    assert!(
+        world.get().await.certified,
+        "setup: the record certifies the pass"
+    );
 
     let failing_run = save_wf(&world, false, 1_756_598_400_000).await;
     assert_ne!(
@@ -207,8 +243,8 @@ async fn a_later_failing_run_decertifies_on_every_read() {
             "{surface}: the pointer advanced to the newer run"
         );
         assert!(
-            !version.certified,
-            "{surface}: a newer failing run de-certifies"
+            version.certified,
+            "{surface}: the record still names the earlier passing run"
         );
     }
 }

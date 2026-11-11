@@ -623,6 +623,23 @@ describe("LibraryScreen (d22 — certification badge, r2.s3.w4)", () => {
     expect(inPane.getByText("wf-run-7f3a9c21")).toBeTruthy();
   });
 
+  it("the promote row does not call the version's latest run a PASS (#545)", async () => {
+    // `certified` means a certified record names a passing run; the version's
+    // latest run is only the pointer and need not be that run.
+    overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap") as HTMLElement;
+    fireEvent.click(within(tree).getByText("v2"));
+
+    const pane = document.getElementById("details-pane") as HTMLElement;
+    const inPane = within(pane);
+    expect(await inPane.findByText("Certification")).toBeTruthy();
+    expect(inPane.queryByText(/· PASS/)).toBeNull();
+    expect(inPane.getByRole("button", { name: /Promote to paper/ })).toBeTruthy();
+  });
+
   it("the details pane reads 'uncertified' with no run id when the pointer is absent", async () => {
     overviewMock.mockResolvedValue({ status: "ok", data: CERTIFIED });
     const { container } = render(<App />);

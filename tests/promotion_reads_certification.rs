@@ -203,6 +203,7 @@ async fn promotion_reads_certification_certifies_a_wf_v1_run_the_record_names() 
                 htf_version: world.h4_version.as_str(),
             },
             &search.run.id,
+            search.run.rule,
         ))
         .await
         .expect("the naming record persists");
@@ -252,6 +253,7 @@ async fn promotion_reads_certification_refuses_a_record_naming_another_run() {
                 htf_version: world.h4_version.as_str(),
             },
             &other_run,
+            VerdictRule::WfV1,
         ))
         .await
         .expect("the seeded record persists");
@@ -291,6 +293,7 @@ async fn promotion_reads_certification_refuses_a_record_naming_another_run() {
                 htf_version: world.h4_version.as_str(),
             },
             &search.run.id,
+            search.run.rule,
         ))
         .await
         .expect("the naming record persists");
@@ -389,5 +392,57 @@ async fn certified_record_promotes_after_a_later_failed_wf_v1_pointer() {
     assert_eq!(
         walk_forward_run_id,
         outcome.record.search_walk_forward_run_id
+    );
+}
+
+/// #545: the derived `certified` flag the Library and the MCP read show is the
+/// gate's own rule. A passing `wf-v1` run that no record names reads not
+/// certified (the gate refuses it); a certified record that names the run makes
+/// it read certified (the gate promotes it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_reads_certification_flag_follows_the_record_not_the_run() {
+    let world = world().await;
+    let search = walk_forward_under(&world, VerdictRule::WfV1).await;
+    assert!(
+        search.run.verdict.pass,
+        "the fixture shape passes under wf-v1"
+    );
+    let read = || async {
+        pulse::SqliteStrategyRepo::new(world.db.pool().clone())
+            .get_version(&world.version)
+            .await
+            .unwrap()
+            .expect("the version exists")
+    };
+
+    let recordless = read().await;
+    assert_eq!(
+        recordless.latest_walk_forward_run_id,
+        Some(search.run.id.clone()),
+        "the pointer names the passing wf-v1 run"
+    );
+    assert!(
+        !recordless.certified,
+        "a passing wf-v1 run no record names is not certified"
+    );
+
+    certifications(&world)
+        .insert(&probe_draft(
+            &Probe {
+                version: &world.version,
+                pair: &world.pair,
+                freeze_id: &world.freeze.id,
+                holdout_start_ms: world.holdout_start_ms,
+                primary_version: world.m15_version.as_str(),
+                htf_version: world.h4_version.as_str(),
+            },
+            &search.run.id,
+            search.run.rule,
+        ))
+        .await
+        .expect("the naming record persists");
+    assert!(
+        read().await.certified,
+        "a certified record that names the passing run makes the version certified"
     );
 }

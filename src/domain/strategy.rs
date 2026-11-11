@@ -184,10 +184,11 @@ pub struct StrategyVersion {
     /// `strategy_version_certification_owner` trigger keeps it honest (this
     /// version's runs only, strictly advancing).
     pub latest_walk_forward_run_id: Option<WalkForwardRunId>,
-    /// Whether this version is certified — **derived**, never stored: `false`
-    /// when [`Self::latest_walk_forward_run_id`] is `None`, otherwise the named
-    /// run's persisted `pass`. A newer failing walk-forward therefore
-    /// de-certifies the version by taking the pointer, not by flipping a flag.
+    /// Whether this version is certified — **derived**, never stored, and the
+    /// promotion gate's own rule (#525, #545): `true` only when the version's
+    /// latest certified record names a walk-forward run that passed. A passing
+    /// run no record names is not certified, under either verdict rule, and a
+    /// version with no certified record reads `false`.
     ///
     /// `#[serde(default)]`: the field is absent from records serialized before
     /// certification existed, and `deny_unknown_fields` makes the missing key

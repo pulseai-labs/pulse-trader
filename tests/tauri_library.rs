@@ -516,23 +516,57 @@ async fn provenance_and_hypothesis_reach_the_wire_per_version_kind() {
 // r2.s3.w4 — a12: the Library wire carries certification
 // ---------------------------------------------------------------------------
 
-/// `LibraryVersion.certified`/`latest_walk_forward_run_id` are filled from the
-/// version's joined latest walk-forward run: `true` + the run id when it
-/// passed, `false` + `None` everywhere else — never invented.
+/// `LibraryVersion.certified` reads the promotion gate's rule (#545): `true`
+/// only when the version's latest certified record names a passing walk-forward
+/// run. `latest_walk_forward_run_id` is the pointer's run, or `None` — never
+/// invented.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certification_fields_reach_the_wire() {
     let (state, _tmp, alpha_versions, _beta_root) = seeded_state().await;
 
-    // Certify va1 with a synthetic passing walk-forward — the pointer +
-    // recorded `pass` is the seam, and `save_walk_forward_run` is the only
-    // product path that moves it.
+    // Give va1 a synthetic passing walk-forward — `save_walk_forward_run` is the
+    // only product path that moves the pointer.
     let wf_id = SqliteBacktestRunRepo::with_deps(
         state.db().pool().clone(),
         FakeClock::at(1_756_512_000_000),
     )
     .save_walk_forward_run(&alpha_versions[0], &seeded_walk_forward_draft(true))
     .await
-    .expect("the certifying walk-forward run persists");
+    .expect("the passing walk-forward run persists");
+
+    // A passing wf-v1 run alone does not certify (#525): the Library reads the
+    // same rule as the promotion gate, so va1 shows not certified until a
+    // certified record names the run (#545). The pointer is still shown.
+    let recordless = library_overview_core(&state, false)
+        .await
+        .expect("the library read succeeds");
+    let recordless_va1 = recordless
+        .strategies
+        .iter()
+        .find(|s| s.name == "Alpha")
+        .and_then(|s| {
+            s.versions
+                .iter()
+                .find(|v| v.id == alpha_versions[0].as_str())
+        })
+        .expect("va1 is listed");
+    assert!(
+        !recordless_va1.certified,
+        "va1's passing wf-v1 run is named by no certified record"
+    );
+    assert_eq!(
+        recordless_va1.latest_walk_forward_run_id.as_deref(),
+        Some(wf_id.as_str()),
+        "the pointer still names the run"
+    );
+
+    support::certification::record_certification(
+        state.db().pool(),
+        &alpha_versions[0],
+        &Pair::new("BTCUSDT"),
+        &wf_id,
+    )
+    .await;
 
     let overview = library_overview_core(&state, false)
         .await
@@ -556,7 +590,10 @@ async fn certification_fields_reach_the_wire() {
     };
 
     let certified = wire(&alpha_versions[0]);
-    assert!(certified.certified, "va1's latest walk-forward passed");
+    assert!(
+        certified.certified,
+        "va1's certified record names its passing walk-forward run"
+    );
     assert_eq!(
         certified.latest_walk_forward_run_id.as_deref(),
         Some(wf_id.as_str()),

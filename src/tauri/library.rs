@@ -114,8 +114,10 @@ pub struct LibraryVersion {
     /// — there is then nothing comparable to show, which is a state to report
     /// rather than a fold to substitute.
     pub latest_run: Option<LibraryRunSummary>,
-    /// Whether the version's latest walk-forward run passed — the badge signal
-    /// (r2.s3.w4); `false` until a run passes AND whenever a newer run failed.
+    /// Whether the promotion gate would certify the version — the badge signal
+    /// (r2.s3.w4; #545): `true` only when its latest certified record names a
+    /// walk-forward run that passed. A passing run no record names reads
+    /// `false`.
     pub certified: bool,
     /// The certifying run's id — `None` until a walk-forward run is persisted.
     /// The Details pane renders it when present.

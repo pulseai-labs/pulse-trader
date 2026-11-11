@@ -2,10 +2,11 @@
 //! certification seam).
 //!
 //! [`decide_promotion`] is the whole gate as one pure function: given the
-//! version, its latest walk-forward run (if any), the fold runs' recorded
-//! inputs, this build's fingerprint, an optional human override and the
-//! promoting token's label, it either returns the promotion draft the
-//! repository persists — or refuses, typed. It never reads the store or the
+//! version, the walk-forward run that may certify it (if any), the version's
+//! certified record (if any), the fold runs' recorded inputs, this build's
+//! fingerprint, an optional human override and the promoting token's label, it
+//! either returns the promotion draft the repository persists — or refuses,
+//! typed. It never reads the store or the
 //! clock: the inputs arrive resolved (the application ring's job), and an
 //! override carries its own `at` instant, read from the injected clock by the
 //! caller before this function runs.
@@ -23,9 +24,9 @@
 //!    distinct `(timeframe, data_version)` pairs over every fold's
 //!    `primary`/`htf`/`d1`, in fold order, and the session's timeframes come
 //!    from those same inputs (A10).
-//! 2. **Override** — no passing run: without an override the promotion
-//!    refuses (`Uncertified`); with one, the session promotes as
-//!    `Graduation::Override`.
+//! 2. **Override** — no certification record naming a passing run: without an
+//!    override the promotion refuses (`Uncertified`); with one, the session
+//!    promotes as `Graduation::Override`.
 //!
 //! Every session gets the A1 settings (10,000 USDT, 4 bps taker, 1 bps
 //! slippage, `min_trades = 20`). The `fixture` flag is NOT decided here — it
