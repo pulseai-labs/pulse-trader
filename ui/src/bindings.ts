@@ -1645,8 +1645,10 @@ export type LibraryVersion = {
 	 */
 	latestRun: LibraryRunSummary | null,
 	/**
-	 *  Whether the version's latest walk-forward run passed — the badge signal
-	 *  (r2.s3.w4); `false` until a run passes AND whenever a newer run failed.
+	 *  Whether the promotion gate would certify the version — the badge signal
+	 *  (r2.s3.w4; #545): `true` only when its latest certified record names a
+	 *  walk-forward run that passed. A passing run no record names reads
+	 *  `false`.
 	 */
 	certified: boolean,
 	/**

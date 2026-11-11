@@ -33,7 +33,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::adapters::clock::SystemClock;
-use crate::domain::backtest::{VerdictRule, WalkForwardRunId};
+use crate::domain::backtest::WalkForwardRunId;
 use crate::domain::strategy::{
     AgentName, AgentSubmission, AgentSubmissionId, CreatedBy, Hypothesis, NewAgentSubmission,
     NewVersion, Strategy, StrategyId, StrategyVersion, VersionId,
@@ -507,13 +507,16 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
                  v.creating_llm_call_ids AS "creating_llm_call_ids!: String",
                  v.created_at            AS "created_at!: String",
                  v.latest_walk_forward_run_id AS "latest_walk_forward_run_id?: String",
-                 w.pass                  AS "certifying_pass?: i64",
-                 w.rule                  AS "certifying_rule?: String",
-                 EXISTS (SELECT 1 FROM certification c
-                          WHERE c.version_id = v.id AND c.certified = 1)
-                                         AS "certified_record!: i64"
+                 EXISTS (SELECT 1 FROM walk_forward_run cw
+                          WHERE cw.pass = 1
+                            AND cw.id = (SELECT c.search_walk_forward_run_id
+                                           FROM certification c
+                                           JOIN certification_freeze f ON f.id = c.freeze_id
+                                          WHERE c.version_id = v.id AND c.certified = 1
+                                          ORDER BY f.opened_at_ms DESC, c.hypothesis_index DESC
+                                          LIMIT 1))
+                                         AS "certified!: i64"
                FROM strategy_version v
-               LEFT JOIN walk_forward_run w ON w.id = v.latest_walk_forward_run_id
                WHERE v.strategy_id = ?1 ORDER BY v.created_at, v.id"#,
             sid,
         )
@@ -534,9 +537,7 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
                 creating_llm_call_ids: r.creating_llm_call_ids,
                 created_at: r.created_at,
                 latest_walk_forward_run_id: r.latest_walk_forward_run_id,
-                certifying_pass: r.certifying_pass,
-                certifying_rule: r.certifying_rule,
-                certified_record: r.certified_record,
+                certified: r.certified,
             })?);
         }
         Ok(out)
@@ -794,16 +795,10 @@ struct VersionRow {
     /// The `0014` certification pointer — NULL on every version with no
     /// walk-forward run yet.
     latest_walk_forward_run_id: Option<String>,
-    /// The named run's `pass`, read through the `LEFT JOIN` — NULL both when
-    /// the pointer is NULL and (impossibly, under the FK) when it dangles.
-    certifying_pass: Option<i64>,
-    /// The named run's `rule` (r4.s1.w5): a `wf-v2` run's pass is a SEARCH-span
-    /// verdict, so it certifies only through a `certification` record. NULL
-    /// under the same two conditions as `certifying_pass`.
-    certifying_rule: Option<String>,
-    /// Whether the version has a `certification` record with `certified = 1`
-    /// (r4.s1.w5) — the second half of the derived flag.
-    certified_record: i64,
+    /// Whether the version's latest `certification` record with
+    /// `certified = 1` names a walk-forward run that passed — the promotion
+    /// gate's own rule (#525, #545), read in the same `latest_certified` order.
+    certified: i64,
 }
 
 impl<C: Clock> SqliteStrategyRepo<C> {
@@ -873,13 +868,16 @@ impl<C: Clock> SqliteStrategyRepo<C> {
                  v.creating_llm_call_ids AS "creating_llm_call_ids!: String",
                  v.created_at            AS "created_at!: String",
                  v.latest_walk_forward_run_id AS "latest_walk_forward_run_id?: String",
-                 w.pass                  AS "certifying_pass?: i64",
-                 w.rule                  AS "certifying_rule?: String",
-                 EXISTS (SELECT 1 FROM certification c
-                          WHERE c.version_id = v.id AND c.certified = 1)
-                                         AS "certified_record!: i64"
+                 EXISTS (SELECT 1 FROM walk_forward_run cw
+                          WHERE cw.pass = 1
+                            AND cw.id = (SELECT c.search_walk_forward_run_id
+                                           FROM certification c
+                                           JOIN certification_freeze f ON f.id = c.freeze_id
+                                          WHERE c.version_id = v.id AND c.certified = 1
+                                          ORDER BY f.opened_at_ms DESC, c.hypothesis_index DESC
+                                          LIMIT 1))
+                                         AS "certified!: i64"
                FROM strategy_version v
-               LEFT JOIN walk_forward_run w ON w.id = v.latest_walk_forward_run_id
                WHERE v.id = ?1"#,
             id_str,
         )
@@ -900,9 +898,7 @@ impl<C: Clock> SqliteStrategyRepo<C> {
                 creating_llm_call_ids: r.creating_llm_call_ids,
                 created_at: r.created_at,
                 latest_walk_forward_run_id: r.latest_walk_forward_run_id,
-                certifying_pass: r.certifying_pass,
-                certifying_rule: r.certifying_rule,
-                certified_record: r.certified_record,
+                certified: r.certified,
             })?)),
         }
     }
@@ -991,16 +987,15 @@ impl<C: Clock> SqliteStrategyRepo<C> {
             creating_llm_call_ids: parse_json_str_array(&row.creating_llm_call_ids)?,
             created_at: parse_created_at(&row.created_at)?,
             latest_walk_forward_run_id: row.latest_walk_forward_run_id.map(WalkForwardRunId::new),
-            // Derived, never stored (r4.s1.w5, spec A5): a version is certified
-            // when its latest walk-forward run is `wf-v1` AND passed — today's
-            // rule, kept for the fixture and older lineages — OR it carries a
-            // certification record with `certified = 1`. A `wf-v2` search-span
-            // pass on its own certifies nothing: the campaign tunes candidates
-            // towards that verdict. No pointer (or an impossibly dangling one,
-            // or a rule this build does not know) reads `false`, fail-closed.
-            certified: (row.certifying_rule.as_deref() == Some(VerdictRule::WfV1.name())
-                && row.certifying_pass.unwrap_or(0) != 0)
-                || row.certified_record != 0,
+            // Derived, never stored (r4.s1.w5, spec A5; #525, #545): a version
+            // is certified exactly when the promotion gate would certify it —
+            // its latest certified record names a walk-forward run that passed.
+            // A passing run on its own certifies nothing, under either rule:
+            // the campaign tunes candidates towards that verdict. A version
+            // with no such record reads `false`, fail-closed. The query reads
+            // the record in `latest_certified`'s order, so the flag and the
+            // gate cannot disagree.
+            certified: row.certified != 0,
         })
     }
 }

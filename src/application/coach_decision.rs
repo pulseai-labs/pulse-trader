@@ -575,9 +575,10 @@ where
 {
     // The gate's precondition is the parent's own certification — the child of
     // a version whose latest walk-forward run PASSED must out-certify it — read
-    // from the RUN, not from `StrategyVersion::certified` (r4.s1.w5): that flag
-    // also means "carries a certification record", and G4 gates a `wf-v2`
-    // lineage under wf-v2 whether or not such a record exists yet. A parent
+    // from the RUN, not from `StrategyVersion::certified` (r4.s1.w5; #545): that
+    // flag means "a certified record names a passing run" (the promotion gate's
+    // rule), and G4 gates a `wf-v2` lineage under wf-v2 whether or not such a
+    // record exists yet. A parent
     // with no run at all, or whose run failed, is ungated — exactly as before
     // the record existed. (A pointer that names a run which no longer exists is
     // the corrupt case this gate refuses by name, below.)
@@ -653,9 +654,9 @@ where
     Ok(Some(output.draft))
 }
 
-/// The certified parent's certifying walk-forward run. `certified` derives one
-/// hop from the pointer's `pass`, so `Some` is guaranteed when the rows are
-/// honest — a corrupt or absent run is exactly what this gate refuses, and
+/// The parent's latest walk-forward run — the run this gate out-certifies. Its
+/// caller has checked the pointer is set, so `Some` is guaranteed when the rows
+/// are honest — a corrupt or absent run is exactly what this gate refuses, and
 /// every arm names the pointer it could not honor.
 async fn certifying_run<R>(
     runs: &R,

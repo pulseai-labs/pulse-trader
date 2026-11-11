@@ -473,10 +473,13 @@ pub struct Probe<'a> {
 }
 
 /// One seeded hypothesis draft: a passing certification pointing at `run_id`.
+/// The record carries `run_rule`, the rule of the run it names, so a record
+/// that names a `wf-v1` run does not claim `wf-v2`.
 #[must_use]
 pub fn probe_draft(
     probe: &Probe<'_>,
     run_id: &pulse::WalkForwardRunId,
+    run_rule: pulse::VerdictRule,
 ) -> pulse::CertificationDraft {
     let selection = |timeframe: Timeframe, version: &str| pulse::SnapshotSelection {
         timeframe,
@@ -490,7 +493,7 @@ pub fn probe_draft(
     pulse::CertificationDraft {
         version_id: probe.version.clone(),
         freeze_id: probe.freeze_id.to_owned(),
-        rule: "wf-v2".to_owned(),
+        rule: run_rule.name().to_owned(),
         pair: probe.pair.clone(),
         search_walk_forward_run_id: run_id.clone(),
         search_pass: true,
@@ -508,7 +511,8 @@ pub fn probe_draft(
     }
 }
 
-/// [`probe_draft`] over the world's own version and freeze.
+/// [`probe_draft`] over the world's own version and freeze, for a run
+/// [`seed_search_run`] made (a `wf-v1` run).
 #[must_use]
 pub fn seeded_draft(world: &World, run_id: &pulse::WalkForwardRunId) -> pulse::CertificationDraft {
     probe_draft(
@@ -521,6 +525,7 @@ pub fn seeded_draft(world: &World, run_id: &pulse::WalkForwardRunId) -> pulse::C
             htf_version: world.h4_version.as_str(),
         },
         run_id,
+        pulse::VerdictRule::WfV1,
     )
 }
 
@@ -553,6 +558,7 @@ pub async fn walk_forward_run_count(world: &World) -> i64 {
 /// alone never certifies). Works on any migrated pool, so the paper suites that
 /// seed their own walk-forward runs share it. It reuses the open freeze, or
 /// opens one, and writes one record through the store the certify step uses.
+/// The record carries the rule the named run was judged under.
 pub async fn record_certification(
     pool: &sqlx::SqlitePool,
     version: &VersionId,
@@ -573,6 +579,13 @@ pub async fn record_certification(
             .await
             .unwrap(),
     };
+    let run_rule: String = sqlx::query_scalar("SELECT rule FROM walk_forward_run WHERE id = ?1")
+        .bind(run_id.as_str())
+        .fetch_one(pool)
+        .await
+        .expect("the named walk-forward run exists");
+    let run_rule = pulse::VerdictRule::from_name(&run_rule)
+        .unwrap_or_else(|| panic!("the named run carries an unknown rule `{run_rule}`"));
     let draft = probe_draft(
         &Probe {
             version,
@@ -583,6 +596,7 @@ pub async fn record_certification(
             htf_version: "recorded-by-test",
         },
         run_id,
+        run_rule,
     );
     SqliteCertificationRepo::with_deps(pool.clone(), FakeClock::at(FREEZE_OPENED_MS))
         .insert(&draft)

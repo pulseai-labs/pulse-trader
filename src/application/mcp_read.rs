@@ -823,7 +823,8 @@ pub struct VersionEntry {
     pub created_at: String,
     /// The strategy name stored inside the version's DSL document.
     pub dsl_name: String,
-    /// Whether the version's latest walk-forward run passed (r2.s3.w4).
+    /// Whether the promotion gate would certify the version (r2.s3.w4; #545):
+    /// its latest certified record names a walk-forward run that passed.
     pub certified: bool,
     /// The certifying walk-forward run's id — `null` until one is persisted.
     pub latest_walk_forward_run_id: Option<String>,
@@ -898,7 +899,8 @@ pub struct VersionDetail {
     pub version_hash: String,
     /// The adapter-minted creation timestamp (RFC3339).
     pub created_at: String,
-    /// Whether the version's latest walk-forward run passed (r2.s3.w4).
+    /// Whether the promotion gate would certify the version (r2.s3.w4; #545):
+    /// its latest certified record names a walk-forward run that passed.
     pub certified: bool,
     /// The certifying walk-forward run's id — `null` until one is persisted.
     pub latest_walk_forward_run_id: Option<String>,

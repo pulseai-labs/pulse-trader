@@ -1,11 +1,14 @@
 // The promote-to-paper sheet (r3.s4.w5, spec §2) — certified / stale /
 // uncertified, from `promote-sheet.jsx`.
 //
-// **The variant is decided BEFORE the request**, from the server's own reads:
-// `get_walk_forward_run` (does the version's latest run pass, and under which
-// engine?) plus `server_status` (this server's fingerprint). The server's 422
-// stays the backstop: `certified_under_other_engine` re-renders the sheet as
-// stale, `uncertified` as uncertified.
+// **The variant is decided BEFORE the request**, from the server's own reads,
+// by the promotion gate's own rule (#525, #545): the version's latest certified
+// record (`certification_records`) names a walk-forward run, `get_walk_forward_run`
+// says whether that run passes and under which engine, and `server_status`
+// gives this server's fingerprint. A passing run no certified record names is
+// not a certification, so it reads uncertified. The server's 422 stays the
+// backstop: `certified_under_other_engine` re-renders the sheet as stale,
+// `uncertified` as uncertified.
 //
 // Stale means NO override and no promote button — E2 is not overridable, and
 // the only action is "Re-run walk-forward", which opens the Backtest Lab on
@@ -20,7 +23,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { commands } from "../bindings";
-import type { BacktestRunDto, LibraryVersion, PromoteOverride, WalkForwardRunDto } from "../bindings";
+import type {
+  BacktestRunDto,
+  CertificationRecordDto,
+  LibraryVersion,
+  PromoteOverride,
+  WalkForwardRunDto,
+} from "../bindings";
 import { foldsHold } from "../format/numbers";
 import { openBacktestLab, requestPaperCountRefresh } from "../paper/handoff";
 import { CertBadge } from "./CertBadge";
@@ -41,7 +50,7 @@ export interface PromoteTarget {
 type Variant =
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "certified"; run: WalkForwardRunDto }
+  | { kind: "certified"; record: CertificationRecordDto; run: WalkForwardRunDto }
   | { kind: "stale"; certifiedUnder: string | null; serverEngine: string | null; note: string | null }
   | { kind: "uncertified"; note: string | null };
 
@@ -103,18 +112,45 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
         if (alive && loaded.status === "ok") setShape(loaded.data);
       };
 
-      if (latestWalkForwardRunId === null) {
-        if (alive) setVariant({ kind: "uncertified", note: null });
+      // The version's latest certified record is the gate's `latest_certified`:
+      // the list is newest first in the same order, so the first certified
+      // record is the one the gate reads (#545).
+      const records = await commands.certificationRecords({ versionId });
+      if (!alive) return;
+      if (records.status === "error") {
+        // The record cannot be read: there is nothing to certify with, and the
+        // server's own gate stays the authority on the promotion.
+        setVariant({ kind: "uncertified", note: records.error.message });
         await loadShape(latestRun?.id ?? null);
         return;
       }
+      const record = records.data.records.find((candidate) => candidate.certified) ?? null;
+      if (record === null) {
+        // No certified record: a passing run alone does not certify. The
+        // version's newest walk-forward run still gives an override its shape.
+        setVariant({ kind: "uncertified", note: null });
+        let shapeRunId = latestRun?.id ?? null;
+        if (latestWalkForwardRunId !== null) {
+          const pointer = await commands.getWalkForwardRun({
+            walkForwardRunId: latestWalkForwardRunId,
+          });
+          if (!alive) return;
+          if (pointer.status === "ok") {
+            shapeRunId = pointer.data.folds[0]?.backtestRunId ?? shapeRunId;
+          }
+        }
+        await loadShape(shapeRunId);
+        return;
+      }
+      // The certifying run is the run the record names, whatever the version's
+      // latest-run pointer says.
       const run = await commands.getWalkForwardRun({
-        walkForwardRunId: latestWalkForwardRunId,
+        walkForwardRunId: record.searchWalkForwardRunId,
       });
       if (!alive) return;
       if (run.status === "error") {
-        // The certificate cannot be read: there is nothing to certify with,
-        // and the server's own gate stays the authority on the promotion.
+        // The named run cannot be read: there is nothing to certify with, and
+        // the server's own gate stays the authority on the promotion.
         setVariant({ kind: "uncertified", note: run.error.message });
         await loadShape(latestRun?.id ?? null);
         return;
@@ -123,7 +159,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
       if (!dto.verdict.pass) {
         setVariant({ kind: "uncertified", note: null });
       } else if (serverEngine !== null && dto.engineFingerprint === serverEngine) {
-        setVariant({ kind: "certified", run: dto });
+        setVariant({ kind: "certified", record, run: dto });
       } else {
         setVariant({
           kind: "stale",
@@ -315,8 +351,10 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
             <div className="sh-box tone-bull">
               <div>
                 <b>
-                  Certified by walk-forward run{" "}
-                  <span className="mono">{variant.run.walkForwardRunId}</span>, PASS under wf-v1
+                  Certified by record <span className="mono">{variant.record.id}</span>, which names
+                  walk-forward run{" "}
+                  <span className="mono">{variant.run.walkForwardRunId}</span>, PASS under{" "}
+                  {variant.run.rule}
                 </b>
                 <span className="mono sh-box-sub">
                   {foldsHold(
@@ -388,10 +426,10 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
           <div className="sh-body">
             <div className="sh-box tone-neutral">
               <div>
-                <b>No walk-forward run certifies this version.</b>
+                <b>No certification record certifies this version.</b>
                 <span className="sh-box-sub">
-                  Run a walk-forward first and it promotes as certified, with an out-of-sample range
-                  to compare the session against.
+                  A version promotes as certified only through a certification record that names a
+                  passing walk-forward run. Certification is the missing step.
                 </span>
               </div>
             </div>

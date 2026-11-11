@@ -2,14 +2,18 @@
 //
 // Same discipline as the other screen tests: `../bindings` is mocked so the
 // sheet's behaviour is asserted against payload SHAPES, never a live IPC
-// bridge. The variant is decided BEFORE the request (`get_walk_forward_run` +
-// `server_status`), the version's own pair/timeframes come from its newest
-// recorded run (`get_backtest_run`), and the server's 422 stays the backstop.
+// bridge. The variant is decided BEFORE the request, by the gate's own rule
+// (#545): the version's latest certified record (`certification_records`) names
+// a walk-forward run (`get_walk_forward_run`), checked against `server_status`.
+// A passing run no record names reads uncertified. The version's own
+// pair/timeframes come from its newest recorded run (`get_backtest_run`), and
+// the server's 422 stays the backstop.
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const getWalkForwardRunMock = vi.fn();
+const certificationRecordsMock = vi.fn();
 const getBacktestRunMock = vi.fn();
 const serverStatusMock = vi.fn();
 const paperPromoteMock = vi.fn();
@@ -18,6 +22,7 @@ const streakCardMock = vi.fn();
 vi.mock("../bindings", () => ({
   commands: {
     getWalkForwardRun: (...args: unknown[]) => getWalkForwardRunMock(...args),
+    certificationRecords: (...args: unknown[]) => certificationRecordsMock(...args),
     getBacktestRun: (...args: unknown[]) => getBacktestRunMock(...args),
     serverStatus: (...args: unknown[]) => serverStatusMock(...args),
     paperPromote: (...args: unknown[]) => paperPromoteMock(...args),
@@ -29,6 +34,7 @@ import type {
   BacktestRunDto,
   BusError,
   BusErrorCode,
+  CertificationRecordDto,
   LibraryVersion,
   StreakCardDto,
   WalkForwardRunDto,
@@ -102,9 +108,49 @@ const FOLD_RUN: BacktestRunDto = {
   walkForward: null,
 };
 
-function walkForward(pass: boolean, engineFingerprint: string): WalkForwardRunDto {
+/** A certification record for `ver-1` that names `runId` — what the gate reads. */
+function certificationRecord(
+  runId: string,
+  overrides: Partial<CertificationRecordDto> = {},
+): CertificationRecordDto {
   return {
-    walkForwardRunId: "wf-1",
+    id: "cert-1",
+    versionId: "ver-1",
+    freezeId: "freeze-1",
+    hypothesisIndex: 1,
+    rule: "wf-v2",
+    pair: "BTCUSDT",
+    searchWalkForwardRunId: runId,
+    searchPass: true,
+    holdoutStart: "2025-09-01T00:00:00.000Z",
+    holdoutEnd: "2025-10-01T00:00:00.000Z",
+    holdoutN: 200,
+    holdoutMeanR: "0.4",
+    holdoutZ: 2.64,
+    holdoutLowerBound: 0.2,
+    holdoutPasses: true,
+    certified: true,
+    searchDataVersions: [],
+    holdoutDataVersions: [],
+    engineFingerprint: SERVER_ENGINE,
+    createdAt: "2026-09-02T00:00:00.000Z",
+    calledBy: "test-agent",
+    ...overrides,
+  };
+}
+
+/** What `certification_records` answers: the version's records, newest first. */
+function records(...list: CertificationRecordDto[]) {
+  return ok({ versionId: "ver-1", records: list });
+}
+
+function walkForward(
+  pass: boolean,
+  engineFingerprint: string,
+  walkForwardRunId = "wf-1",
+): WalkForwardRunDto {
+  return {
+    walkForwardRunId,
     versionId: "ver-1",
     scheme: "rolling-oos/v1",
     k: 6,
@@ -223,6 +269,9 @@ beforeEach(() => {
   getBacktestRunMock.mockResolvedValue(ok(FOLD_RUN));
   // The card's own read (r5.s4.w2); a test overrides it for the other states.
   streakCardMock.mockResolvedValue(ok(streakCardReady()));
+  // The default version carries a certified record that names `wf-1`; the
+  // tests for a recordless version override it (#545).
+  certificationRecordsMock.mockResolvedValue(records(certificationRecord("wf-1")));
 });
 
 // ---------------------------------------------------------------------------
@@ -237,6 +286,11 @@ describe("certified", () => {
   it("shows the run, the snapshots and the server match, and promotes with no override", async () => {
     const { onPromoted } = sheet();
     expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+    // The claim names the record and the run it names (#545).
+    expect(screen.getByText("cert-1")).toBeTruthy();
+    expect(screen.getByText("wf-1")).toBeTruthy();
+    expect(screen.getByText(/Certified by record/)).toBeTruthy();
+    expect(certificationRecordsMock).toHaveBeenCalledWith({ versionId: "ver-1" });
     // The folds sentence (r4.s5.w1, #305/#328): the scheme's count stated in
     // words — never the bare `6/4` ratio — from the verdict's own numbers.
     expect(screen.getByText("6 of 6 folds hold (4 required)")).toBeTruthy();
@@ -254,6 +308,105 @@ describe("certified", () => {
       override: null,
     });
     await waitFor(() => expect(onPromoted).toHaveBeenCalledWith("s-new"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #545 — the certified variant follows the certification record
+// ---------------------------------------------------------------------------
+
+describe("the certified variant reads the record, not the run's verdict (#545)", () => {
+  const PASSING_RUN = () => ok(walkForward(true, SERVER_ENGINE));
+
+  it("reads a passing wf-v1 run that no certified record names as uncertified", async () => {
+    getWalkForwardRunMock.mockResolvedValue(PASSING_RUN());
+    certificationRecordsMock.mockResolvedValue(records());
+    sheet();
+
+    expect(
+      await screen.findByText(/No certification record certifies this version\./),
+    ).toBeTruthy();
+    // The claim box never shows, and the plain Promote is not offered.
+    expect(screen.queryByText(/Certified by record/)).toBeNull();
+    expect(screen.queryByText(/PASS under wf-v1/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /^promote$/i })).toBeNull();
+    // The copy names certification as the missing step, not another walk-forward.
+    expect(screen.getByText(/Certification is the missing step/)).toBeTruthy();
+    expect(screen.queryByText(/Run a walk-forward first/)).toBeNull();
+    // The override path is untouched.
+    expect(screen.getByRole("button", { name: /Continue uncertified/ })).toBeTruthy();
+  });
+
+  it("reads a version whose only records are uncertified as uncertified", async () => {
+    getWalkForwardRunMock.mockResolvedValue(PASSING_RUN());
+    certificationRecordsMock.mockResolvedValue(
+      records(certificationRecord("wf-1", { certified: false, holdoutPasses: false })),
+    );
+    sheet();
+
+    expect(
+      await screen.findByText(/No certification record certifies this version\./),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^promote$/i })).toBeNull();
+  });
+
+  it("reads a certified record that names the passing run as certified, naming both", async () => {
+    getWalkForwardRunMock.mockResolvedValue(PASSING_RUN());
+    certificationRecordsMock.mockResolvedValue(records(certificationRecord("wf-1")));
+    sheet();
+
+    expect(await screen.findByText(/Certified by record/)).toBeTruthy();
+    expect(screen.getByText("cert-1")).toBeTruthy();
+    expect(screen.getByText("wf-1")).toBeTruthy();
+    expect(screen.getByText(/PASS under wf-v1/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^promote$/i })).toBeTruthy();
+    expect(screen.queryByText(/No certification record certifies this version/)).toBeNull();
+  });
+
+  it("reads the run the record names, not the version's latest-run pointer", async () => {
+    // The pointer says `wf-1`; the latest certified record names `wf-0`.
+    getWalkForwardRunMock.mockImplementation(
+      async ({ walkForwardRunId }: { walkForwardRunId: string }) =>
+        ok(walkForward(true, SERVER_ENGINE, walkForwardRunId)),
+    );
+    certificationRecordsMock.mockResolvedValue(
+      records(
+        certificationRecord("wf-new", { id: "cert-3", certified: false, hypothesisIndex: 3 }),
+        certificationRecord("wf-0", { id: "cert-2", hypothesisIndex: 2 }),
+      ),
+    );
+    sheet();
+
+    expect(await screen.findByText(/Certified by record/)).toBeTruthy();
+    expect(screen.getByText("cert-2")).toBeTruthy();
+    expect(screen.getByText("wf-0")).toBeTruthy();
+    expect(getWalkForwardRunMock).toHaveBeenCalledWith({ walkForwardRunId: "wf-0" });
+  });
+
+  it("reads a record whose named run did not pass as uncertified", async () => {
+    getWalkForwardRunMock.mockResolvedValue(ok(walkForward(false, SERVER_ENGINE)));
+    certificationRecordsMock.mockResolvedValue(records(certificationRecord("wf-1")));
+    sheet();
+
+    expect(
+      await screen.findByText(/No certification record certifies this version\./),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^promote$/i })).toBeNull();
+  });
+
+  it("reads a certification record that cannot be read as uncertified, with the reason", async () => {
+    getWalkForwardRunMock.mockResolvedValue(PASSING_RUN());
+    certificationRecordsMock.mockResolvedValue({
+      status: "error",
+      error: busError("data", "the certification read failed on the server"),
+    });
+    sheet();
+
+    expect(
+      await screen.findByText(/No certification record certifies this version\./),
+    ).toBeTruthy();
+    expect(screen.getByText("the certification read failed on the server")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^promote$/i })).toBeNull();
   });
 });
 
@@ -320,6 +473,11 @@ describe("uncertified", () => {
     versionLabel: "v3",
   };
 
+  beforeEach(() => {
+    // No walk-forward run and no certification record (#545).
+    certificationRecordsMock.mockResolvedValue(records());
+  });
+
   function renderUncertified() {
     return render(
       <PromoteSheet target={uncertifiedTarget} onClose={vi.fn()} onPromoted={vi.fn()} />,
@@ -328,7 +486,7 @@ describe("uncertified", () => {
 
   it("keeps Continue disabled for a whitespace reason, then sends the override", async () => {
     renderUncertified();
-    expect(await screen.findByText(/No walk-forward run certifies this version\./)).toBeTruthy();
+    expect(await screen.findByText(/No certification record certifies this version\./)).toBeTruthy();
 
     const next = screen.getByRole("button", { name: /Continue uncertified/ });
     expect(next.hasAttribute("disabled")).toBe(true);
@@ -367,9 +525,10 @@ describe("uncertified", () => {
   });
 
   it("re-renders as uncertified when the server refuses with uncertified", async () => {
-    // The local decision says certified (a passing run on this engine); the
-    // server's 422 overrules it.
+    // The local decision says certified (a record names a passing run on this
+    // engine); the server's 422 overrules it.
     getWalkForwardRunMock.mockResolvedValue(ok(walkForward(true, SERVER_ENGINE)));
+    certificationRecordsMock.mockResolvedValue(records(certificationRecord("wf-1")));
     sheet();
     expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
 
@@ -379,12 +538,12 @@ describe("uncertified", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^promote$/i }));
 
-    expect(await screen.findByText(/No walk-forward run certifies this version\./)).toBeTruthy();
+    expect(await screen.findByText(/No certification record certifies this version\./)).toBeTruthy();
   });
 
   it("shows the card in the confirm step after the reason row, and never in the explain step", async () => {
     renderUncertified();
-    expect(await screen.findByText(/No walk-forward run certifies this version\./)).toBeTruthy();
+    expect(await screen.findByText(/No certification record certifies this version\./)).toBeTruthy();
     // The explain step asks for a reason; the card belongs at the decision.
     expect(screen.queryByRole("table", { name: "A normal bad run" })).toBeNull();
 

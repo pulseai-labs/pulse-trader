@@ -370,6 +370,7 @@ async fn assert_the_route_is_app_scope() {
                 htf_version: "h4-fixture-version",
             },
             &run_id,
+            pulse::VerdictRule::WfV1,
         ))
         .await
         .expect("the record persists on the server's own pool");
