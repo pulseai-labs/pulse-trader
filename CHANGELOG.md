@@ -692,6 +692,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Certified promotion needs a certification record (0.1.12, #525).** A passing walk-forward run, under either
+  verdict rule, no longer promotes a strategy version as `Certified` without a certification record that names
+  the run; the promotion is refused as uncertified, and the operator override is unchanged. Sessions promoted
+  before this change keep their stored graduation.
+
 - **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount
   and on a window focus / visibility return, so an agent-submitted child version never reached an untouched,
   focused Library — the r5 close watched two submissions stay invisible for 5.5 and 10.5 minutes until

@@ -24,10 +24,10 @@
 
 use crate::support::mcp::migrated_db;
 use pulse::{
-    Candle, CandleSeries, CandleStore, CertifyRequest, CreatedBy, Db, FakeClock, NewVersion,
-    OpenFreezeRequest, Pair, SqliteBacktestRunRepo, SqliteCertificationFreezeRepo,
-    SqliteCertificationRepo, SqliteStrategyRepo, StrategyRepository, Timeframe, VersionId,
-    WalkForwardRunRepository, certify_version, fixture_h4_candles_from,
+    Candle, CandleSeries, CandleStore, CertificationRepository, CertifyRequest, CreatedBy, Db,
+    FakeClock, NewVersion, OpenFreezeRequest, Pair, SqliteBacktestRunRepo,
+    SqliteCertificationFreezeRepo, SqliteCertificationRepo, SqliteStrategyRepo, StrategyRepository,
+    Timeframe, VersionId, WalkForwardRunRepository, certify_version, fixture_h4_candles_from,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -546,4 +546,46 @@ pub async fn walk_forward_run_count(world: &World) -> i64 {
         .fetch_one(world.db.pool())
         .await
         .unwrap()
+}
+
+/// Record a certified certification record that names `run_id` — what a
+/// version needs to promote as `Certified` (#525: a passing walk-forward run
+/// alone never certifies). Works on any migrated pool, so the paper suites that
+/// seed their own walk-forward runs share it. It reuses the open freeze, or
+/// opens one, and writes one record through the store the certify step uses.
+pub async fn record_certification(
+    pool: &sqlx::SqlitePool,
+    version: &VersionId,
+    pair: &Pair,
+    run_id: &pulse::WalkForwardRunId,
+) -> pulse::CertificationRecord {
+    let freezes =
+        SqliteCertificationFreezeRepo::with_deps(pool.clone(), FakeClock::at(FREEZE_OPENED_MS));
+    let freeze = match freezes.open_freeze().await.unwrap() {
+        Some(open) => open,
+        None => freezes
+            .open(&OpenFreezeRequest {
+                holdout_start_ms: FREEZE_OPENED_MS,
+                h: H,
+                alpha: "0.05".to_owned(),
+                holdout_test: "one-sided lower confidence bound at 1 - 0.05/H (C1)".to_owned(),
+            })
+            .await
+            .unwrap(),
+    };
+    let draft = probe_draft(
+        &Probe {
+            version,
+            pair,
+            freeze_id: &freeze.id,
+            holdout_start_ms: freeze.holdout_start_ms,
+            primary_version: "recorded-by-test",
+            htf_version: "recorded-by-test",
+        },
+        run_id,
+    );
+    SqliteCertificationRepo::with_deps(pool.clone(), FakeClock::at(FREEZE_OPENED_MS))
+        .insert(&draft)
+        .await
+        .expect("the certification record persists")
 }

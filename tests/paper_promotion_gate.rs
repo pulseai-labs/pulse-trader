@@ -1,8 +1,8 @@
 //! r3.s4.w2 — AC-1: the promotion gate (`paper_promotion_gate`, ledger d57).
 //!
 //! A version is promoted to a live paper session either by a CERTIFIED
-//! path (its latest walk-forward run passed on THIS build; the session names
-//! the run and the fold runs' data versions) or by an OVERRIDE (a human's
+//! path (a certified record names a walk-forward run that passed on THIS
+//! build; the session names the run and the fold runs' data versions) or by an OVERRIDE (a human's
 //! reasoned manual promotion, which is never a live basis and never
 //! OOS-comparable). Everything runs on a real migrated database through the
 //! real use case (`promote`) — the refusals below are the gate's typed
@@ -32,15 +32,16 @@ mod support;
 
 use pulse::{
     BacktestConfig, BacktestInputs, BacktestRequest, BacktestResult, BacktestRunId,
-    BacktestRunRepository, BinanceAdapter, CandleSeries, CandleStore, CandleWindow, CreatedBy,
-    DataError, DataVersion, Db, EngineFingerprint, FakeClock, FoldScheme, FoldVerdict,
-    FundingConfig, Graduation, LatestReadableRun, NewVersion, NonEmptyLabel, NonEmptyReason,
-    PaperPromotionError, PaperSessionRepository, PersistedRun, PromotionRefused, RunSummary,
-    RunVerdict, SnapshotPins, SnapshotSelection, SqliteBacktestRunRepo, SqlitePaperSessionRepo,
-    SqliteStrategyRepo, StrategyRepository, SummaryStats, Timeframe, Trade, VerdictRule,
-    WalkForwardFoldDraft, WalkForwardRequest, WalkForwardRunDraft, WalkForwardRunRepository,
-    decide_promotion, fixture_h4_candles, fixture_h4_candles_from, fixture_m15_candles,
-    fixture_pair, fixture_strategy_dsl, promote, run_version_backtest, run_walk_forward,
+    BacktestRunRepository, BinanceAdapter, CandleSeries, CandleStore, CandleWindow,
+    CertificationRepository, CreatedBy, DataError, DataVersion, Db, EngineFingerprint, FakeClock,
+    FoldScheme, FoldVerdict, FundingConfig, Graduation, LatestReadableRun, NewVersion,
+    NonEmptyLabel, NonEmptyReason, PaperPromotionError, PaperSessionRepository, PersistedRun,
+    PromotionRefused, RunSummary, RunVerdict, SnapshotPins, SnapshotSelection,
+    SqliteBacktestRunRepo, SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyRepository,
+    SummaryStats, Timeframe, Trade, VerdictRule, WalkForwardFoldDraft, WalkForwardRequest,
+    WalkForwardRunDraft, WalkForwardRunRepository, decide_promotion, fixture_h4_candles,
+    fixture_h4_candles_from, fixture_m15_candles, fixture_pair, fixture_strategy_dsl, promote,
+    run_version_backtest, run_walk_forward,
 };
 use rust_decimal::Decimal;
 use support::mcp::migrated_db;
@@ -57,9 +58,9 @@ struct World {
     runs: SqliteBacktestRunRepo<pulse::SystemClock>,
     paper: SqlitePaperSessionRepo<FakeClock>,
     store: CandleStore,
-    /// The certification-record store (r4.s1.w5) — empty in this suite: none of
-    /// its versions is certified through a record, which is the point (the
-    /// `wf-v1` and override paths must not need one).
+    /// The certification-record store (r4.s1.w5). A certified version here is
+    /// one whose passing run a certified record names (#525: a pass alone never
+    /// certifies); an override version has no run and no record.
     certifications: pulse::SqliteCertificationRepo<pulse::SystemClock>,
 }
 
@@ -197,6 +198,7 @@ async fn certified_version_over(
         outcome.run.verdict.pass,
         "the fixture walk-forward must pass on this build"
     );
+    record_certification_for(world, &version_id, &outcome.run.id).await;
     version_id
 }
 
@@ -373,7 +375,7 @@ async fn save_walk_forward(
     span: CandleWindow,
     folds: Vec<WalkForwardFoldDraft>,
     verdict: RunVerdict,
-) {
+) -> pulse::WalkForwardRunId {
     world
         .runs
         .save_walk_forward_run(
@@ -389,7 +391,23 @@ async fn save_walk_forward(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// Make the version certified the way promotion reads it: a certified record
+/// that names `run_id` (#525).
+async fn record_certification_for(
+    world: &World,
+    version_id: &pulse::VersionId,
+    run_id: &pulse::WalkForwardRunId,
+) {
+    support::certification::record_certification(
+        world.db.pool(),
+        version_id,
+        &fixture_pair(),
+        run_id,
+    )
+    .await;
 }
 
 /// The pre-upgrade state, honestly persisted: a walk-forward run whose
@@ -408,7 +426,7 @@ async fn foreign_fingerprint_version(world: &World, name: &str) -> pulse::Versio
         verdict.pass,
         "the fabricated pre-upgrade run must pass (real fixture trades)"
     );
-    save_walk_forward(
+    let run_id = save_walk_forward(
         world,
         &scenario.version_id,
         FOREIGN,
@@ -417,6 +435,7 @@ async fn foreign_fingerprint_version(world: &World, name: &str) -> pulse::Versio
         verdict,
     )
     .await;
+    record_certification_for(world, &scenario.version_id, &run_id).await;
     scenario.version_id
 }
 
@@ -1040,12 +1059,20 @@ async fn x_disagreeing_fold_inputs_refuse_at_the_gate() {
         .unwrap()
         .expect("the version exists");
     let run = latest_run_of(&world, &version_id).await;
+    // The certified record that names the run (#525): the gate reaches the
+    // provenance checks below only for a run a record certifies.
+    let record = world
+        .certifications
+        .latest_certified(&version_id)
+        .await
+        .unwrap()
+        .expect("the certified version carries its record");
 
     // Every fold unreadable is the missing-provenance arm …
     let error = decide_promotion(
         &version,
         Some(&run),
-        None,
+        Some(&record),
         &[None, None],
         &EngineFingerprint::current(),
         None,
@@ -1064,7 +1091,7 @@ async fn x_disagreeing_fold_inputs_refuse_at_the_gate() {
     let error = decide_promotion(
         &version,
         Some(&run),
-        None,
+        Some(&record),
         &borrowed,
         &EngineFingerprint::current(),
         None,
@@ -1082,7 +1109,7 @@ async fn x_disagreeing_fold_inputs_refuse_at_the_gate() {
     let draft = decide_promotion(
         &version,
         Some(&run),
-        None,
+        Some(&record),
         &borrowed,
         &EngineFingerprint::current(),
         None,
@@ -1126,7 +1153,7 @@ async fn d1_certified_version(world: &World, name: &str) -> (pulse::VersionId, D
         },
     );
     assert!(verdict.pass, "the fabricated run must pass (real trades)");
-    save_walk_forward(
+    let run_id = save_walk_forward(
         world,
         &version_id,
         EngineFingerprint::current().as_str(),
@@ -1135,6 +1162,7 @@ async fn d1_certified_version(world: &World, name: &str) -> (pulse::VersionId, D
         verdict,
     )
     .await;
+    record_certification_for(world, &version_id, &run_id).await;
     (version_id, derived)
 }
 

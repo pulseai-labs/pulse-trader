@@ -87,9 +87,18 @@ async fn uncertified_version(db: &Db, name: &str) -> VersionId {
 async fn certified_version(db: &Db, name: &str) -> VersionId {
     let version_id = uncertified_version(db, name).await;
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
-    runs.save_walk_forward_run(&version_id, &seeded_walk_forward_draft(true))
+    let run_id = runs
+        .save_walk_forward_run(&version_id, &seeded_walk_forward_draft(true))
         .await
         .expect("save the passing certification");
+    // A passing run alone never certifies (#525): a certified record names it.
+    support::certification::record_certification(
+        db.pool(),
+        &version_id,
+        &pulse::fixture_pair(),
+        &run_id,
+    )
+    .await;
     version_id
 }
 
@@ -105,9 +114,17 @@ async fn foreign_certified_version(db: &Db, name: &str) -> VersionId {
     for fold in &mut draft.folds {
         fold.result.engine_fingerprint = pulse::EngineFingerprint::from_stored(FOREIGN.to_owned());
     }
-    runs.save_walk_forward_run(&version_id, &draft)
+    let run_id = runs
+        .save_walk_forward_run(&version_id, &draft)
         .await
         .expect("save the foreign certification");
+    support::certification::record_certification(
+        db.pool(),
+        &version_id,
+        &pulse::fixture_pair(),
+        &run_id,
+    )
+    .await;
     version_id
 }
 

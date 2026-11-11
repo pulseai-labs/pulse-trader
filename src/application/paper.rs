@@ -78,12 +78,13 @@ pub struct OverrideRequest {
 
 /// Promote a strategy version to a live paper session.
 ///
-/// - **Certified path** — the version's latest walk-forward run passed: the
+/// - **Certified path** — the version has a certified record naming a passing
+///   walk-forward run (#525: a pass alone never certifies): the
 ///   session's pair/timeframes come from the fold inputs (A10), its
 ///   certified data versions are the distinct `(timeframe, data_version)`
 ///   pairs in fold order, and `fixture` is true only when every one of them
 ///   has a `fixture_snapshot` row (A12).
-/// - **Override path** — no passing run: promotes only with an
+/// - **Override path** — no certifying run: promotes only with an
 ///   [`OverrideRequest`], whose `at` is the injected clock's instant.
 ///
 /// # Errors
@@ -246,8 +247,8 @@ async fn refuse_archived<S: StrategyRepository>(
 ///
 /// A certified record selects its `search_walk_forward_run_id` regardless of
 /// the latest pointer run's rule or verdict, matching the version's derived
-/// certified flag. Without a certified record the pointer run is unchanged:
-/// a passing wf-v1 can certify, while a wf-v2 search verdict alone cannot.
+/// certified flag. Without a certified record the pointer run is passed on
+/// as is, and the gate refuses it: a pass certifies only through a record.
 async fn certifying_run<W, T>(
     walk_forwards: &W,
     certifications: &T,
