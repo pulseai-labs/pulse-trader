@@ -1,12 +1,12 @@
-//! r4.s1.w5 — AC-3: the promotion gate reads the certification record.
+//! r4.s1.w5 — AC-3 (#525 tightens it): the promotion gate reads the certification record.
 //!
+//! A passing walk-forward run certifies nothing by itself, under either rule.
 //! A `wf-v2` verdict is a SEARCH-span verdict, and the campaign tunes its
-//! candidates towards it (grill Q2/C1). So a `wf-v2` pass certifies nothing by
-//! itself: the version promotes as `Certified` only through a
+//! candidates towards it (grill Q2/C1); a `wf-v1` verdict is not the holdout
+//! test either. So a version promotes as `Certified` only through a
 //! `certification.certified = true` record, and the run that certifies it is
-//! the record's `search_walk_forward_run_id`. The `wf-v1` path — today's rule,
-//! kept for the fixture and older lineages — and the override path are
-//! unchanged.
+//! the record's `search_walk_forward_run_id`. With no such record the promotion
+//! refuses `Uncertified`, for every lineage. The override path is unchanged.
 //!
 //! These tests drive the REAL use case (`promote`) over the shared synthetic
 //! world plus one pure-gate case for the rule itself, so the policy is pinned
@@ -21,7 +21,8 @@ use pulse::{
     decide_promotion, promote,
 };
 use support::certification::{
-    Probe, certifications, probe_draft, runs, seed_search_run, walk_forward_under, world,
+    FREEZE_OPENED_MS, Probe, certifications, probe_draft, runs, seed_search_run,
+    walk_forward_under, world, world_with_clocks,
 };
 
 /// Promote `version_id` through the real promotion use case over the world's
@@ -125,15 +126,17 @@ async fn promotion_reads_certification_refuses_a_wf_v2_pass_without_a_record() {
     assert_eq!(sessions, 0, "a refusal writes no session");
 }
 
-/// The `wf-v1` path is unchanged: a passing `wf-v1` run certifies with no
-/// record anywhere — the fixture's own lineage shape, kept for older versions.
+/// #525: certified promotion needs a certification record. A passing `wf-v1`
+/// run on a version whose lineage root was created after the freeze opened does
+/// not certify it without one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn promotion_reads_certification_keeps_the_wf_v1_path() {
+async fn promotion_reads_certification_refuses_a_wf_v1_pass_without_a_record() {
     let world = world().await;
     let search = walk_forward_under(&world, VerdictRule::WfV1).await;
     assert!(
         search.run.verdict.pass,
-        "the fixture shape passes under wf-v1"
+        "the fixture shape passes under wf-v1 — the refusal below is about the \
+         missing RECORD, not a failing run"
     );
     assert!(
         certifications(&world)
@@ -141,12 +144,73 @@ async fn promotion_reads_certification_keeps_the_wf_v1_path() {
             .await
             .unwrap()
             .is_empty(),
-        "no certification record exists — wf-v1 does not need one"
+        "no certification record exists"
     );
+
+    let error = promote_version(&world, &world.version)
+        .await
+        .expect_err("a wf-v1 pass alone does not promote as certified");
+    assert!(
+        matches!(&error, pulse::PaperPromotionError::Refused(refused) if *refused == pulse::PromotionRefused::Uncertified),
+        "the refusal is the typed `Uncertified`: {error}"
+    );
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paper_session")
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0, "a refusal writes no session");
+}
+
+/// The rule holds for every lineage: a version whose lineage root predates the
+/// freeze needs the record too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_reads_certification_refuses_a_wf_v1_pass_for_a_pre_freeze_lineage() {
+    let world = world_with_clocks(
+        pulse::fixture_strategy_dsl(),
+        FREEZE_OPENED_MS - 86_400_000,
+        FREEZE_OPENED_MS,
+    )
+    .await;
+    let search = walk_forward_under(&world, VerdictRule::WfV1).await;
+    assert!(
+        search.run.verdict.pass,
+        "the fixture shape passes under wf-v1"
+    );
+
+    let error = promote_version(&world, &world.version)
+        .await
+        .expect_err("a pre-freeze lineage needs the record too");
+    assert!(
+        matches!(&error, pulse::PaperPromotionError::Refused(refused) if *refused == pulse::PromotionRefused::Uncertified),
+        "the refusal is the typed `Uncertified`: {error}"
+    );
+}
+
+/// The control arm: a certified record that names the `wf-v1` run certifies it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promotion_reads_certification_certifies_a_wf_v1_run_the_record_names() {
+    let world = world().await;
+    let search = walk_forward_under(&world, VerdictRule::WfV1).await;
+    assert!(search.run.verdict.pass);
+    let record = certifications(&world)
+        .insert(&probe_draft(
+            &Probe {
+                version: &world.version,
+                pair: &world.pair,
+                freeze_id: &world.freeze.id,
+                holdout_start_ms: world.holdout_start_ms,
+                primary_version: world.m15_version.as_str(),
+                htf_version: world.h4_version.as_str(),
+            },
+            &search.run.id,
+        ))
+        .await
+        .expect("the naming record persists");
+    assert!(record.certified);
 
     let session = promote_version(&world, &world.version)
         .await
-        .expect("a wf-v1 pass still certifies");
+        .expect("a record naming the run certifies it");
     let Graduation::Certified {
         walk_forward_run_id,
         ..
