@@ -97,8 +97,8 @@ pub struct PromotionDraft {
 /// the API's error surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromotionRefused {
-    /// No walk-forward run, or the latest one did not pass, and no override
-    /// was supplied.
+    /// No certified record names a passing walk-forward run (no run, a failing
+    /// run, or a passing run no record names), and no override was supplied.
     Uncertified,
     /// The certifying run passed under a DIFFERENT engine fingerprint. The
     /// override cannot bypass this (E2): re-run the walk-forward.
@@ -118,7 +118,7 @@ impl core::fmt::Display for PromotionRefused {
         match self {
             Self::Uncertified => write!(
                 f,
-                "strategy version is not certified: its latest walk-forward run did not pass"
+                "strategy version is not certified: no certified record names a passing walk-forward run"
             ),
             Self::CertifiedUnderOtherEngine {
                 certified_under,
