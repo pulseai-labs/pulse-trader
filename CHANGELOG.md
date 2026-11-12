@@ -702,7 +702,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   passing walk-forward run, the same rule the promotion gate uses.
 
 - **The default taker fee is 5 bps (0.1.14, #527).** A backtest, walk-forward, certify or paper run now charges
-  0.0500% per fill by default, the Binance USDⓈ-M base taker rate; earlier runs keep 4 bps and are not comparable.
+  0.0500% per fill by default, the Binance USDⓈ-M base taker rate; earlier runs keep the fee they recorded (4 bps by
+  default), and runs at different fees are not comparable.
 
 - **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount
   and on a window focus / visibility return, so an agent-submitted child version never reached an untouched,

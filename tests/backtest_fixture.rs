@@ -131,7 +131,7 @@ fn run_golden(primary: &CandleSeries) -> BacktestResult {
     let filters = BinanceAdapter::new()
         .symbol_filters(&Pair::new("BTCUSDT"))
         .expect("BTCUSDT filters resolve through the port");
-    // Single-TF M15: no HTF feed (htf = None). Default cost model: 4bps taker
+    // Single-TF M15: no HTF feed (htf = None). Default cost model: 5bps taker
     // fee, 1bp slippage, 10_000 starting equity.
     run_backtest(
         &compiled,

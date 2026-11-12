@@ -865,7 +865,7 @@ async fn inputs_inheritance_falls_back_when_the_latest_row_is_unreadable() {
     plant_trade_damage(world.pool(), "corrupt-1").await;
 
     // The readable walk skips corrupt-1 and inherits from the REAL run
-    // beneath it: the real run's cost model (4 bps), never the corrupt row's.
+    // beneath it: the real run's cost model (5 bps, the default), never the corrupt row's.
     let inherited =
         resolve_default_request(&world.strategies(), &world.runs(), &world.version_id, None)
             .await

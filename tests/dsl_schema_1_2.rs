@@ -263,7 +263,7 @@ fn frozen_run(primary: &CandleSeries, doc: &str) -> (String, String) {
 }
 
 /// The frozen pre-bump `(result_content_hash, trade log json)` per document —
-/// captured from the BASE engine; see the module-header recipe.
+/// re-captured at 0.1.14 (#527, fee 5 bps); see the module-header recipe.
 const FROZEN_COMMITTED_1_0_0: (&str, &str) = (
     "a288a464d597feb4b10ce641d132a2504621f22cac4467645c5b915dbead18a9",
     // The full pre-bump trade log (serde_json of `result.trades`).
