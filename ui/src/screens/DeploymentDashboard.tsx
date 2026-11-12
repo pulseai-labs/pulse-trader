@@ -80,6 +80,10 @@ export default function DeploymentDashboard() {
   const [sessions, setSessions] = useState<PaperSessionSummary[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The stop-all outcome has its own state (#541): `load()` clears `error` on
+  // every good sessions read, and the reload after a refused stop-all must not
+  // erase the refusal. Only a later successful stop-all clears this.
+  const [stopAllError, setStopAllError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [sweeping, setSweeping] = useState(false);
   const [sweep, setSweep] = useState<StopAllResult | null>(null);
@@ -147,6 +151,12 @@ export default function DeploymentDashboard() {
       {error !== null && (
         <p className="ds-empty bear" role="alert">
           {error}
+        </p>
+      )}
+
+      {stopAllError !== null && (
+        <p className="ds-empty bear" role="alert">
+          {stopAllError}
         </p>
       )}
 
@@ -248,12 +258,18 @@ export default function DeploymentDashboard() {
                     .then((result) => {
                       if (result.status === "ok") {
                         setSweep(result.data);
+                        setStopAllError(null);
                       } else {
-                        setError(result.error.message);
+                        // An older sweep report must not sit beside a new refusal.
+                        setSweep(null);
+                        setStopAllError(result.error.message);
                       }
                       return load();
                     })
-                    .catch(() => setError("The stop-all call itself failed."))
+                    .catch(() => {
+                      setSweep(null);
+                      setStopAllError("The stop-all call itself failed.");
+                    })
                     .finally(() => setSweeping(false));
                 }}
               >

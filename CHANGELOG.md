@@ -705,6 +705,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   0.0500% per fill by default, the Binance USDⓈ-M base taker rate; earlier runs keep the fee they recorded (4 bps by
   default), and runs at different fees are not comparable.
 
+- **A refused stop-all keeps its message on screen (0.1.15, #541).** The Paper sessions screen keeps the
+  message of a refused or failed stop-all until a later stop-all succeeds.
+
 - **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount
   and on a window focus / visibility return, so an agent-submitted child version never reached an untouched,
   focused Library — the r5 close watched two submissions stay invisible for 5.5 and 10.5 minutes until

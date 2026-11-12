@@ -268,6 +268,101 @@ describe("stop all", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The stop-all outcome has its own state (#541): the sessions reload that
+// follows a stop-all, or a later focus refetch, must not erase a refusal.
+// ---------------------------------------------------------------------------
+
+describe("a refused or failed stop-all (#541)", () => {
+  const REFUSAL = "The kill switch refused: the server is read-only.";
+
+  /** A refused stop-all, in the shape of the generated `BusError`. */
+  function refused() {
+    return {
+      status: "error" as const,
+      error: {
+        code: "data" as const,
+        message: REFUSAL,
+        run_id: null,
+        session_id: null,
+        child_run_id: null,
+      },
+    };
+  }
+
+  /** Open the confirm sheet and press its button: one stop-all attempt. */
+  async function stopAll() {
+    fireEvent.click(screen.getByRole("button", { name: /Stop all…/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Stop all sessions/ }));
+  }
+
+  it("keeps the refusal's message on screen after the sessions reload", async () => {
+    paperSessionsMock.mockResolvedValue(ok([session()]));
+    paperStopAllMock.mockResolvedValue(refused());
+    renderDashboard();
+    await screen.findByText("BTCUSDT · 15m · 4h");
+
+    await stopAll();
+
+    // The reload after the stop-all is the second sessions read. The button
+    // is enabled again once the whole handler, reload included, has settled.
+    await waitFor(() => expect(paperSessionsMock).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Stop all…/ }).hasAttribute("disabled")).toBe(false),
+    );
+    expect(screen.getByText(REFUSAL)).toBeTruthy();
+  });
+
+  it("keeps the thrown call's message on screen after a later sessions reload", async () => {
+    paperSessionsMock.mockResolvedValue(ok([session()]));
+    paperStopAllMock.mockRejectedValue(new Error("transport down"));
+    renderDashboard();
+    await screen.findByText("BTCUSDT · 15m · 4h");
+
+    await stopAll();
+    expect(await screen.findByText("The stop-all call itself failed.")).toBeTruthy();
+
+    // A thrown call skips the stop-all's own reload, so the window's focus
+    // refetch is the later good sessions read that used to wipe the message.
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => expect(paperSessionsMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("The stop-all call itself failed.")).toBeTruthy();
+  });
+
+  it("clears the message and shows the sweep report when a later stop-all succeeds", async () => {
+    paperSessionsMock.mockResolvedValue(ok([session()]));
+    paperStopAllMock.mockResolvedValueOnce(refused());
+    renderDashboard();
+    await screen.findByText("BTCUSDT · 15m · 4h");
+
+    await stopAll();
+    expect(await screen.findByText(REFUSAL)).toBeTruthy();
+
+    paperStopAllMock.mockResolvedValueOnce(ok({ stopped: ["s-1"], failures: [] }));
+    await stopAll();
+
+    const report = await screen.findByRole("status", { name: /stop-all result/i });
+    expect(within(report).getByText(/s-1/)).toBeTruthy();
+    expect(screen.queryByText(REFUSAL)).toBeNull();
+  });
+
+  it("clears the old sweep report when a later stop-all fails", async () => {
+    paperSessionsMock.mockResolvedValue(ok([session()]));
+    paperStopAllMock.mockResolvedValueOnce(ok({ stopped: ["s-1"], failures: [] }));
+    renderDashboard();
+    await screen.findByText("BTCUSDT · 15m · 4h");
+
+    await stopAll();
+    await screen.findByRole("status", { name: /stop-all result/i });
+
+    paperStopAllMock.mockResolvedValueOnce(refused());
+    await stopAll();
+
+    expect(await screen.findByText(REFUSAL)).toBeTruthy();
+    expect(screen.queryByRole("status", { name: /stop-all result/i })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The detail track
 // ---------------------------------------------------------------------------
 
