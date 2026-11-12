@@ -1664,7 +1664,7 @@ async fn the_response_reports_the_reloaded_snapshot_date_range_and_saved_values(
     assert_eq!(i64::from(dto.schema_version), saved.schema_version);
     assert_eq!(dto.strategy_version_id, version_id.as_str());
     assert_eq!(dto.starting_equity, "10000");
-    assert_eq!(dto.taker_fee_bps, "4");
+    assert_eq!(dto.taker_fee_bps, "5");
     assert_eq!(dto.slippage_bps, "1");
     assert_eq!(dto.funding, "snapshot_rates");
 

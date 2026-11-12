@@ -445,7 +445,7 @@ async fn decide(world: &World, action: CoachAction) -> CoachDecisionOutcome {
 /// move it: the hash covers results, not input provenance. Read by the (ii)
 /// case below, which lands as the TDD loop proceeds.
 const FROZEN_CONTENT_HASH: &str =
-    "f934ca1ceffe05ff322d44cf706a3381a766dd589d22502d3d705d13f1222d65";
+    "a288a464d597feb4b10ce641d132a2504621f22cac4467645c5b915dbead18a9";
 
 /// One-off capture helper (the `tests/determinism.rs::emit_content_hash`
 /// pattern): runs the fixture backtest through the REAL `run_version_backtest`
@@ -865,7 +865,7 @@ async fn inputs_inheritance_falls_back_when_the_latest_row_is_unreadable() {
     plant_trade_damage(world.pool(), "corrupt-1").await;
 
     // The readable walk skips corrupt-1 and inherits from the REAL run
-    // beneath it: the real run's cost model (4 bps), never the corrupt row's.
+    // beneath it: the real run's cost model (5 bps, the default), never the corrupt row's.
     let inherited =
         resolve_default_request(&world.strategies(), &world.runs(), &world.version_id, None)
             .await

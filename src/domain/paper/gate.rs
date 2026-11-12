@@ -28,7 +28,7 @@
 //!    override the promotion refuses (`Uncertified`); with one, the session
 //!    promotes as `Graduation::Override`.
 //!
-//! Every session gets the A1 settings (10,000 USDT, 4 bps taker, 1 bps
+//! Every session gets the A1 settings (10,000 USDT, 5 bps taker, 1 bps
 //! slippage, `min_trades = 20`). The `fixture` flag is NOT decided here — it
 //! names a store fact (every certified version is a `fixture_snapshot` row),
 //! so the application ring derives it after this function and sets it on the

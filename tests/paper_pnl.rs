@@ -42,8 +42,8 @@ const FUNDING_TRADE: usize = 5;
 /// 15:00; the trade entered at 14:00).
 const OPEN_PREFIX_LEN: usize = 61;
 
-/// The fixture session's taker fee, bps (A1's default).
-const TAKER_FEE_BPS: i64 = 4;
+/// The fixture session's taker fee, bps (A1's default, 5 since 0.1.14).
+const TAKER_FEE_BPS: i64 = 5;
 
 /// One M15 bar in milliseconds.
 const M15_MS: i64 = 900_000;

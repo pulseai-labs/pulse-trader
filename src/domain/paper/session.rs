@@ -21,8 +21,10 @@ use crate::domain::{DataVersion, EngineFingerprint, Pair, Timeframe};
 /// The session's opening equity, in USDT (A1 — every session, no exceptions).
 pub const STARTING_EQUITY_USDT: i64 = 10_000;
 
-/// The session's taker fee, in basis points (A1).
-pub const TAKER_FEE_BPS: i64 = 4;
+/// The taker fee a new session records on its row, in basis points (A1): 0.0500%,
+/// the Binance USDⓈ-M base taker rate. A session keeps the fee on its own row;
+/// changing this constant never re-costs a session that already started.
+pub const TAKER_FEE_BPS: i64 = 5;
 
 /// The session's adverse-fill slippage, in basis points (A1).
 pub const SLIPPAGE_BPS: i64 = 1;

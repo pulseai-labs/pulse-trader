@@ -77,7 +77,7 @@ const GOLDEN_TRADE_COUNT: usize = 5;
 /// fees/funding/slippage) across the run. Exact `Decimal` — a silent engine
 /// drift changes this and fails the golden assertion. See the module header for
 /// regeneration.
-const GOLDEN_NET_PNL: &str = "70.327031281570424226";
+const GOLDEN_NET_PNL: &str = "63.7061134440347937825";
 
 /// The checked-in example this suite pins.
 fn example_path() -> PathBuf {

@@ -23,8 +23,8 @@
 //! [`SqliteBacktestRunRepo`]. There is no `--save` flag — every versioned run is
 //! recorded provenance (README C7).
 //!
-//! **C5 flag defaults** match [`BacktestConfig::default`]: `--fee-bps 4`
-//! (0.04% Binance USDⓂ taker), `--slippage-bps 1`, `--equity 10000` (USDT).
+//! **C5 flag defaults** match [`BacktestConfig::default`]: `--fee-bps 5`
+//! (0.0500% Binance USDⓈ-M taker), `--slippage-bps 1`, `--equity 10000` (USDT).
 //!
 //! **Error surfacing (spec §3):** a `NoStopLoss` engine error, a missing
 //! snapshot, or a bad `--dsl` surface as typed `anyhow` errors with a clear
@@ -106,8 +106,8 @@ pub struct BacktestArgs {
     /// `BacktestConfig::default`.
     #[arg(long, default_value = "10000")]
     pub equity: Decimal,
-    /// Taker fee in basis points. C5 default `4` = 0.04% Binance USDⓂ taker.
-    #[arg(long = "fee-bps", default_value = "4")]
+    /// Taker fee in basis points. C5 default `5` = 0.0500% Binance USDⓈ-M taker.
+    #[arg(long = "fee-bps", default_value = "5")]
     pub fee_bps: Decimal,
     /// Adverse-fill slippage in basis points. C5 default `1`.
     #[arg(long = "slippage-bps", default_value = "1")]

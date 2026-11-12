@@ -173,48 +173,48 @@ const V1_GOLDEN: &str = r#"
   "losses": 22,
   "volatility_cuts": ["0.0034556103095326180786780121","0.0047596054496578690127077224"],
   "by_trend": [
-    ["with",{"longest_losing_streak":2,"losing_streaks":1,"losses":6,"net_pnl":"5.7547092842593697","net_r":"0.0575672260593578474203088543","trades":8}],
-    ["ranging",{"longest_losing_streak":5,"losing_streaks":2,"losses":9,"net_pnl":"-420.4828608674817128","net_r":"-4.2048986064454142118518612827","trades":11}],
-    ["against",{"longest_losing_streak":7,"losing_streaks":2,"losses":7,"net_pnl":"-474.0449244782362716","net_r":"-4.7406109171093935474651090286","trades":8}],
+    ["with",{"longest_losing_streak":2,"losing_streaks":1,"losses":6,"net_pnl":"-16.0015855797438786","net_r":"-0.1600031478526707447220899202","trades":8}],
+    ["ranging",{"longest_losing_streak":5,"losing_streaks":2,"losses":9,"net_pnl":"-447.2160174481585989","net_r":"-4.4722404270824951025929847390","trades":11}],
+    ["against",{"longest_losing_streak":7,"losing_streaks":2,"losses":7,"net_pnl":"-490.3020485650544405","net_r":"-4.9031871102611438002982626316","trades":8}],
     ["unknown",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}]
   ],
   "by_regime": [
-    ["trending_up",{"longest_losing_streak":5,"losing_streaks":1,"losses":4,"net_pnl":"417.3396876024126588","net_r":"4.1736208054045071815608733970","trades":7}],
-    ["trending_down",{"longest_losing_streak":5,"losing_streaks":2,"losses":7,"net_pnl":"-665.9893848107431438","net_r":"-6.6600865813781308520941632664","trades":7}],
-    ["ranging",{"longest_losing_streak":7,"losing_streaks":2,"losses":11,"net_pnl":"-640.1233788531281297","net_r":"-6.4014765215218262413633715876","trades":13}],
+    ["trending_up",{"longest_losing_streak":5,"losing_streaks":1,"losses":4,"net_pnl":"398.9585178400454355","net_r":"3.9898028422191817147329293932","trades":7}],
+    ["trending_down",{"longest_losing_streak":5,"losing_streaks":2,"losses":7,"net_pnl":"-681.0679052493709548","net_r":"-6.8108758617516622901000024016","trades":7}],
+    ["ranging",{"longest_losing_streak":7,"losing_streaks":2,"losses":11,"net_pnl":"-671.4102641836313987","net_r":"-6.7143576656638290722462642824","trades":13}],
     ["unknown",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}]
   ],
   "by_volatility": [
-    ["low",{"longest_losing_streak":5,"losing_streaks":2,"losses":8,"net_pnl":"-628.2519290317972555","net_r":"-6.2826690738450624755636451662","trades":9}],
-    ["mid",{"longest_losing_streak":7,"losing_streaks":1,"losses":6,"net_pnl":"313.5658899573079308","net_r":"3.1359181516243925581938174353","trades":9}],
-    ["high",{"longest_losing_streak":5,"losing_streaks":2,"losses":8,"net_pnl":"-574.0870369869692900","net_r":"-5.7411913752747799945268337261","trades":9}],
+    ["low",{"longest_losing_streak":5,"losing_streaks":2,"losses":8,"net_pnl":"-657.2420678872947707","net_r":"-6.5725763574758423026211608811","trades":9}],
+    ["mid",{"longest_losing_streak":7,"losing_streaks":1,"losses":6,"net_pnl":"293.5044451765649124","net_r":"2.9352947107370792793679869159","trades":9}],
+    ["high",{"longest_losing_streak":5,"losing_streaks":2,"losses":8,"net_pnl":"-589.7820288822270597","net_r":"-5.8981490384575466243601633256","trades":9}],
     ["unknown",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}]
   ],
   "by_hour": [
-    [0,{"longest_losing_streak":0,"losing_streaks":0,"losses":4,"net_pnl":"-427.873931037751156","net_r":"-4.2789727818059125154323684650","trades":4}],
+    [0,{"longest_losing_streak":0,"losing_streaks":0,"losses":4,"net_pnl":"-434.075212259036445","net_r":"-4.3409887567434110767142149579","trades":4}],
     [1,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [2,{"longest_losing_streak":7,"losing_streaks":1,"losses":2,"net_pnl":"72.0513785495805715","net_r":"0.7207020605940678880493543472","trades":3}],
-    [3,{"longest_losing_streak":5,"losing_streaks":2,"losses":2,"net_pnl":"-213.9252258562140696","net_r":"-2.1393673878604862587439436607","trades":2}],
+    [2,{"longest_losing_streak":7,"losing_streaks":1,"losses":2,"net_pnl":"65.4949849314210114","net_r":"0.6551352247644165014390869208","trades":3}],
+    [3,{"longest_losing_streak":5,"losing_streaks":2,"losses":2,"net_pnl":"-217.3203974618383086","net_r":"-2.1733204343027981174174246561","trades":2}],
     [4,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [5,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"173.5984146476148672","net_r":"1.7361480994475348507577158661","trades":2}],
-    [6,{"longest_losing_streak":2,"losing_streaks":1,"losses":1,"net_pnl":"-105.8383791864408","net_r":"-1.058574352184990933327853947","trades":1}],
-    [7,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-106.7712312875202888","net_r":"-1.0677426299323401348928540937","trades":1}],
+    [5,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"168.2568446203632355","net_r":"1.6827301416278840501067051717","trades":2}],
+    [6,{"longest_losing_streak":2,"losing_streaks":1,"losses":1,"net_pnl":"-106.6440195621828","net_r":"-1.0666322064851106236740313044","trades":1}],
+    [7,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-108.0827463980739978","net_r":"-1.0808581534348053444890292837","trades":1}],
     [8,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [9,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-107.377984068984798","net_r":"-1.0739076191583504886695541514","trades":1}],
+    [9,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-109.0212820911047475","net_r":"-1.0903425548838033023824126504","trades":1}],
     [10,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [11,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [12,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-107.976223064318364","net_r":"-1.0798081272397470891061742045","trades":1}],
-    [13,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-123.887613060738624","net_r":"-1.2388978499733736932088903837","trades":1}],
+    [12,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-109.312078856526252","net_r":"-1.0931672529834502297619458937","trades":1}],
+    [13,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-129.19744274756328","net_r":"-1.2919970777348019843605482216","trades":1}],
     [14,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [15,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [16,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-117.8454837900988692","net_r":"-1.1784686865579119086460032626","trades":1}],
-    [17,{"longest_losing_streak":0,"losing_streaks":0,"losses":2,"net_pnl":"-121.2039252114686982","net_r":"-1.2120858287028004790790560446","trades":2}],
-    [18,{"longest_losing_streak":0,"losing_streaks":0,"losses":2,"net_pnl":"58.5931595931566642","net_r":"0.5860552928531925493873094549","trades":3}],
+    [16,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-121.8797114510499777","net_r":"-1.2188114372512234910277324633","trades":1}],
+    [17,{"longest_losing_streak":0,"losing_streaks":0,"losses":2,"net_pnl":"-126.7889599705033242","net_r":"-1.2679391602349884977170956891","trades":2}],
+    [18,{"longest_losing_streak":0,"losing_streaks":0,"losses":2,"net_pnl":"49.3543833219594213","net_r":"0.4936657651638812087589885288","trades":3}],
     [19,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [20,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-111.0312286668301872","net_r":"-1.1103197631174587997205737985","trades":1}],
-    [21,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"290.9882964298712864","net_r":"2.9100114052181118189322193027","trades":1}],
-    [22,{"longest_losing_streak":2,"losing_streaks":1,"losses":1,"net_pnl":"-114.5348777840323452","net_r":"-1.1453606915386286293534139454","trades":1}],
-    [23,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"174.2617777327161962","net_r":"1.7426465624636439111574255292","trades":2}]
+    [20,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-113.4259308311805492","net_r":"-1.1342669460117131564717104179","trades":1}],
+    [21,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"289.114594502380944","net_r":"2.8912735588996427288709098127","trades":1}],
+    [22,{"longest_losing_streak":2,"losing_streaks":1,"losses":1,"net_pnl":"-117.8766723253321422","net_r":"-1.178778984558685106074867859","trades":1}],
+    [23,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"167.8839949853102940","net_r":"1.6788675889726567933019856723","trades":2}]
   ]
 }
 "#;
@@ -226,31 +226,31 @@ const V2_GOLDEN: &str = r#"
   "losses": 6,
   "volatility_cuts": ["0.0036444085529854760623991393","0.0049018287644787644787644788"],
   "by_trend": [
-    ["with",{"longest_losing_streak":3,"losing_streaks":2,"losses":6,"net_pnl":"5.7547092842593697","net_r":"0.0575672260593578474203088543","trades":8}],
-    ["ranging",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"287.4906667181560932","net_r":"2.8750953706160968747790598739","trades":1}],
+    ["with",{"longest_losing_streak":3,"losing_streaks":2,"losses":6,"net_pnl":"-16.0015855797438786","net_r":"-0.1600031478526707447220899202","trades":8}],
+    ["ranging",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"284.9927633700651165","net_r":"2.8501146975586877924028290088","trades":1}],
     ["against",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     ["unknown",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}]
   ],
   "by_regime": [
-    ["trending_up",{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"459.7827709372236906","net_r":"4.5980474384258348615469523930","trades":3}],
-    ["trending_down",{"longest_losing_streak":2,"losing_streaks":1,"losses":2,"net_pnl":"-129.819924379947004","net_r":"-1.2982118661955092478313501705","trades":2}],
-    ["ranging",{"longest_losing_streak":3,"losing_streaks":1,"losses":3,"net_pnl":"-36.7174705548612237","net_r":"-0.3671729755548708915162334943","trades":4}],
+    ["trending_up",{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"450.9853029360433407","net_r":"4.5100700354415692631025722341","trades":3}],
+    ["trending_down",{"longest_losing_streak":2,"losing_streaks":1,"losses":2,"net_pnl":"-137.321424420561255","net_r":"-1.3732288885455072342433459874","trades":2}],
+    ["ranging",{"longest_losing_streak":3,"losing_streaks":1,"losses":3,"net_pnl":"-44.6727007251608478","net_r":"-0.4467295971900449811784871581","trades":4}],
     ["unknown",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}]
   ],
   "by_volatility": [
-    ["low",{"longest_losing_streak":2,"losing_streaks":1,"losses":2,"net_pnl":"40.5248721308173109","net_r":"0.4052383676895432201549581094","trades":3}],
-    ["mid",{"longest_losing_streak":0,"losing_streaks":0,"losses":2,"net_pnl":"182.099445006713046","net_r":"1.8212229736722643603137784904","trades":3}],
-    ["high",{"longest_losing_streak":3,"losing_streaks":1,"losses":2,"net_pnl":"70.6210588648851060","net_r":"0.7062012553136471417306321284","trades":3}],
+    ["low",{"longest_losing_streak":2,"losing_streaks":1,"losses":2,"net_pnl":"27.3588713844877032","net_r":"0.2735757913616518981606801683","trades":3}],
+    ["mid",{"longest_losing_streak":0,"losing_streaks":0,"losses":2,"net_pnl":"176.7094934291317674","net_r":"1.7673202132825011372629716338","trades":3}],
+    ["high",{"longest_losing_streak":3,"losing_streaks":1,"losses":2,"net_pnl":"64.9228129767017673","net_r":"0.6492155450618640122570872865","trades":3}],
     ["unknown",{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}]
   ],
   "by_hour": [
-    [0,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-108.945187087499796","net_r":"-1.0894699706754087788362063174","trades":1}],
+    [0,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-110.934475722997245","net_r":"-1.1093631875243520670706310712","trades":1}],
     [1,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [2,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"180.1521372984097635","net_r":"1.8017211397475788415321942512","trades":2}],
+    [2,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"175.3972496682025014","net_r":"1.7541695553067787989672545642","trades":2}],
     [3,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [4,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [5,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"287.4906667181560932","net_r":"2.8750953706160968747790598739","trades":1}],
-    [6,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-105.8383791864408","net_r":"-1.058574352184990933327853947","trades":1}],
+    [5,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"284.9927633700651165","net_r":"2.8501146975586877924028290088","trades":1}],
+    [6,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-106.6440195621828","net_r":"-1.0666322064851106236740313044","trades":1}],
     [7,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [8,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [9,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
@@ -261,13 +261,13 @@ const V2_GOLDEN: &str = r#"
     [14,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [15,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [16,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [17,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-4.573062704952","net_r":"-0.0457345797977827627686205663","trades":1}],
-    [18,{"longest_losing_streak":2,"losing_streaks":1,"losses":1,"net_pnl":"-125.246861674995004","net_r":"-1.2524772863977264850627296042","trades":1}],
+    [17,{"longest_losing_streak":0,"losing_streaks":0,"losses":1,"net_pnl":"-6.46291523619","net_r":"-0.0646347386130888520433043987","trades":1}],
+    [18,{"longest_losing_streak":2,"losing_streaks":1,"losses":1,"net_pnl":"-130.858509184371255","net_r":"-1.3085941499324183822000415887","trades":1}],
     [19,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [20,{"longest_losing_streak":3,"losing_streaks":1,"losses":1,"net_pnl":"-111.0312286668301872","net_r":"-1.1103197631174587997205737985","trades":1}],
+    [20,{"longest_losing_streak":3,"losing_streaks":1,"losses":1,"net_pnl":"-113.4259308311805492","net_r":"-1.1342669460117131564717104179","trades":1}],
     [21,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
     [22,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"0","net_r":"0","trades":0}],
-    [23,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"281.2372913065673934","net_r":"2.8124220384851467656040988365","trades":1}]
+    [23,{"longest_losing_streak":0,"losing_streaks":0,"losses":0,"net_pnl":"276.9270152889754692","net_r":"2.7693185254072335377703742965","trades":1}]
   ]
 }
 "#;

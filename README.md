@@ -31,7 +31,7 @@ Claude Code can drive the loop directly.
    DSL document (schema 1.7.0). The strategy is stored as that document; the engine never reads
    prose.
 3. **The Rust engine backtests it.** Deterministic, on real Binance USDT-M candles fetched by
-   `pulse fetch-data`. Every trade carries its fee (4 bp taker by default), its slippage (1 bp) and
+   `pulse fetch-data`. Every trade carries its fee (5 bp taker by default), its slippage (1 bp) and
    its funding. The run stores an `engine_fingerprint`; same inputs, same bytes.
 4. **The coach proposes one change.** One mutation per loop with a stated hypothesis. You accept,
    reject or modify, and the child run is compared with its parent.
