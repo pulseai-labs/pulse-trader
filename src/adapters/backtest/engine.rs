@@ -31,7 +31,7 @@ impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             starting_equity: Decimal::new(10_000, 0),
-            taker_fee_bps: Decimal::new(4, 0),
+            taker_fee_bps: Decimal::new(5, 0),
             slippage_bps: Decimal::ONE,
         }
     }

@@ -83,7 +83,7 @@ const GOLDEN_TRADE_COUNT: usize = 6;
 /// flooring bound across 6 trades). Trade count is unchanged at 6 (no entry
 /// skipped). The constant-independent `golden_entry_qty_is_lot_aligned` guard
 /// proves the floor applied regardless of this value.
-const GOLDEN_NET_PNL: &str = "142.29083294950040454";
+const GOLDEN_NET_PNL: &str = "139.93307930316927185";
 
 /// The RSI lookback period the canonical fixture uses. The streaming indicator
 /// engine has a current RSI value from candle index `period` and — since #36 —

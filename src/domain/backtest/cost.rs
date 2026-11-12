@@ -41,7 +41,7 @@ pub enum Side {
 /// The taker fee on a fill: `notional × fee_bps / 10_000`.
 ///
 /// Always non-negative for a non-negative `notional` and `fee_bps` (the v1
-/// default is 4 bps — Binance USDⓂ taker). Pure; the caller books it against a
+/// default is 5 bps — Binance USDⓈ-M taker). Pure; the caller books it against a
 /// [`Fill`](super::trade::Fill).
 #[must_use]
 pub fn taker_fee(notional: Decimal, fee_bps: Decimal) -> Decimal {

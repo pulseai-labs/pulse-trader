@@ -100,7 +100,8 @@ work, and the API surface is w4's.
   graduation path end to end on every build without ever claiming an edge.
 - Sessions are per version with the A1 settings (10,000 USDT, 4 bps taker,
   1 bps slippage, `min_trades = 20`); several sessions may shadow the same
-  version.
+  version. Amended 2026-11-12 (PDR-0052, #527): the taker fee is 5 bps;
+  sessions started before 0.1.14 keep the fee on their row.
 - What this ADR deliberately does NOT decide: the shadow backtest's scheduling
   policy (w3), the REST API's shapes (w4), and the UI rendering (w5).
 

@@ -1116,7 +1116,7 @@ async fn the_versioned_cli_persists_the_inputs_that_actually_ran() {
         "the persisted HTF identity is the snapshot the engine actually consumed"
     );
     // The exact engine cost config, not the run's cost OUTCOMES.
-    assert_eq!(inputs.taker_fee_bps, Decimal::new(4, 0));
+    assert_eq!(inputs.taker_fee_bps, Decimal::new(5, 0));
     assert_eq!(inputs.slippage_bps, Decimal::new(1, 0));
     assert_eq!(inputs.funding, FundingConfig::SnapshotRates);
     // The run is a real one, not an empty shell.

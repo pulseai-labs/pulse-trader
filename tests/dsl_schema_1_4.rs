@@ -546,7 +546,7 @@ fn a_1_4_0_backtest_is_deterministic() {
 /// side: a new variant no existing document names cannot move a number.
 #[test]
 fn the_frozen_pre_bump_golden_is_unmoved() {
-    const FROZEN: &str = "f934ca1ceffe05ff322d44cf706a3381a766dd589d22502d3d705d13f1222d65";
+    const FROZEN: &str = "a288a464d597feb4b10ce641d132a2504621f22cac4467645c5b915dbead18a9";
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/strategies/rsi-oversold-long.json");
     let json = std::fs::read_to_string(&path).expect("read the fixture strategy");

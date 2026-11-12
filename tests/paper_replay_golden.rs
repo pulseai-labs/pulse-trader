@@ -48,18 +48,19 @@ const WINDOW_START: usize = 0;
 const WINDOW_LEN: usize = 96;
 
 /// The pinned closed trades, one line each (r6.s3.w1 re-pinned the R column: R is net of
-/// costs, #457; every other column and `events.json`'s other fields are unchanged):
+/// costs, #457; 0.1.14 re-pinned it again for the 5 bps taker fee, #527; every other column
+/// and `events.json`'s other fields are unchanged):
 /// `side qty entry_price exit_price entry_fill exit_fill exit_reason realized_r`.
 const PINNED_TRADES: &[&str] = &[
-    "long 0.334 59814.9809 59509.95440490045 2025-01-01T01:00:00.000Z 2025-01-01T01:15:00.000Z stoploss -1.179492040",
-    "long 0.335 59537.9532 60187.9806 2025-01-01T01:30:00.000Z 2025-01-01T02:15:00.000Z signal 2.0226997876709003157333934012",
-    "long 0.334 59737.9732 60012.9981 2025-01-01T02:45:00.000Z 2025-01-01T03:00:00.000Z signal 0.7604024686930623886650376012",
-    "long 0.334 59746.9741 60044.9949 2025-01-01T04:00:00.000Z 2025-01-01T05:00:00.000Z signal 0.8372106409318559950302152624",
-    "long 0.335 59636.9631 59977.0017 2025-01-01T11:45:00.000Z 2025-01-01T12:15:00.000Z signal 0.9799057460053662591682171019",
-    "long 0.334 59806.9801 60014.9979 2025-01-01T14:00:00.000Z 2025-01-01T16:00:00.000Z signal 0.5333522566507249544271839935",
-    "long 0.334 59716.9711 59974.002 2025-01-01T17:30:00.000Z 2025-01-01T19:00:00.000Z signal 0.7004859988955467970812739362",
-    "long 0.334 59756.9751 60159.9834 2025-01-01T20:15:00.000Z 2025-01-01T20:45:00.000Z signal 1.1882847684504030392261270936",
-    "long 0.334 59740.9735 60048.9945 2025-01-01T22:45:00.000Z 2025-01-01T23:30:00.000Z signal 0.8707759434151169297567606594",
+    "long 0.334 59814.9809 59509.95440490045 2025-01-01T01:00:00.000Z 2025-01-01T01:15:00.000Z stoploss -1.219390050",
+    "long 0.335 59537.9532 60187.9806 2025-01-01T01:30:00.000Z 2025-01-01T02:15:00.000Z signal 1.9824814303492045473944844983",
+    "long 0.334 59737.9732 60012.9981 2025-01-01T02:45:00.000Z 2025-01-01T03:00:00.000Z signal 0.7203103916153620022716137279",
+    "long 0.334 59746.9741 60044.9949 2025-01-01T04:00:00.000Z 2025-01-01T05:00:00.000Z signal 0.7971108799633754171995799868",
+    "long 0.335 59636.9631 59977.0017 2025-01-01T11:45:00.000Z 2025-01-01T12:15:00.000Z signal 0.9397917098162900920754631786",
+    "long 0.334 59806.9801 60014.9979 2025-01-01T14:00:00.000Z 2025-01-01T16:00:00.000Z signal 0.4932826935998395277610748315",
+    "long 0.334 59716.9711 59974.002 2025-01-01T17:30:00.000Z 2025-01-01T19:00:00.000Z signal 0.6603999158624440012832465979",
+    "long 0.334 59756.9751 60159.9834 2025-01-01T20:15:00.000Z 2025-01-01T20:45:00.000Z signal 1.1481498860205860721353681773",
+    "long 0.334 59740.9735 60048.9945 2025-01-01T22:45:00.000Z 2025-01-01T23:30:00.000Z signal 0.8306728245732386667585857134",
 ];
 
 /// The pinned open position at the window's end (empty = none, else
@@ -75,7 +76,7 @@ const PINNED_FUNDING_EVENTS: usize = 1;
 
 /// The pinned SHA-256 over the replayed final state.
 const PINNED_STATE_DIGEST: &str =
-    "36ddff251c962297c390fac2262692150b1129ae96d990f185e0b7918f87a396";
+    "c71f973a80b06ef8aab52249c1a5906e192a4f336d751a9b22f9f873a492e6ce";
 
 /// The session row the fixture was recorded for. No `engine_upgraded` event
 /// rides the log, so this fingerprint never has to match the running build's.
@@ -98,7 +99,7 @@ fn session() -> PaperSession {
         htf_timeframe: None,
         uses_d1: false,
         starting_equity: Decimal::from(10_000),
-        taker_fee_bps: Decimal::from(4),
+        taker_fee_bps: Decimal::from(5),
         slippage_bps: Decimal::from(1),
         engine_fingerprint: EngineFingerprint::from_stored(SESSION_FINGERPRINT.to_owned()),
         graduation: Graduation::Override {

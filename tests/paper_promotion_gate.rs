@@ -513,7 +513,7 @@ async fn i_certified_promotion_names_run_and_data_versions() {
     assert!(!session.uses_d1);
     // A1 settings on every session.
     assert_eq!(session.starting_equity, rust_decimal::Decimal::from(10_000));
-    assert_eq!(session.taker_fee_bps, rust_decimal::Decimal::from(4));
+    assert_eq!(session.taker_fee_bps, rust_decimal::Decimal::from(5));
     assert_eq!(session.slippage_bps, rust_decimal::Decimal::from(1));
     assert_eq!(session.min_trades, 20);
     // The fingerprint at start is THIS build's.
@@ -994,7 +994,7 @@ fn typed_inputs(primary_version: &str) -> BacktestInputs {
             data_version: DataVersion::new("76f15836cc357256"),
         }),
         d1: None,
-        taker_fee_bps: Decimal::from(4),
+        taker_fee_bps: Decimal::from(5),
         slippage_bps: Decimal::from(1),
         funding: FundingConfig::SnapshotRates,
         symbol_filters: None,

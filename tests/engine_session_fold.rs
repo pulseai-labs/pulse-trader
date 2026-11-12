@@ -44,12 +44,12 @@ use pulse::{
 /// `tests/backtest_fixture.rs`'s frozen golden (`backtest_fixture.rs:70,86`).
 const GOLDEN_TRADE_COUNT: usize = 6;
 /// `tests/backtest_fixture.rs`'s frozen golden net P&L string.
-const GOLDEN_NET_PNL: &str = "142.29083294950040454";
+const GOLDEN_NET_PNL: &str = "139.93307930316927185";
 
 /// `tests/dsl_schema_1_2.rs`'s `FROZEN_COMMITTED_1_0_0` result content hash
 /// (dsl_schema_1_2.rs:257-258) — captured from the BASE engine.
 const FROZEN_COMMITTED_1_0_0_HASH: &str =
-    "f934ca1ceffe05ff322d44cf706a3381a766dd589d22502d3d705d13f1222d65";
+    "a288a464d597feb4b10ce641d132a2504621f22cac4467645c5b915dbead18a9";
 
 /// `tests/dsl_schema_1_2.rs`'s `FROZEN_COMMITTED_1_0_0` trade log
 /// (dsl_schema_1_2.rs:259-260), extracted verbatim into a fixture file so the

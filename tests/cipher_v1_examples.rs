@@ -436,7 +436,7 @@ fn v1_trades_carry_the_structure_stop() {
 const GOLDEN_TRADE_COUNT: usize = 5;
 
 /// Frozen golden: the exact net P&L (quote currency, net of costs) of that run.
-const GOLDEN_NET_PNL: &str = "-542.7172938521261942";
+const GOLDEN_NET_PNL: &str = "-552.2652387762507962";
 
 /// One run of v1 over the BTCUSDT fixture's M15 primary + H4 htf.
 fn run_btcusdt(compiled: &CompiledStrategy) -> BacktestResult {
