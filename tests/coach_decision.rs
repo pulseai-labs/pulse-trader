@@ -840,6 +840,43 @@ async fn the_child_is_re_backtested_on_the_parents_exact_persisted_inputs() {
     );
 }
 
+/// #555 — a path that REPRODUCES a recorded run keeps the fee that run
+/// recorded. The inherited default request takes the current fee, but the coach
+/// accept replays the parent's persisted inputs so the before/after differ only by
+/// the mutation: a parent recorded at 4 bps is replayed at 4 bps, not 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_of_a_four_bps_parent_is_re_backtested_at_four_bps() {
+    let world = world().await;
+    repoint_parent_taker_fee(world.pool(), &world.parent_run_id, "4").await;
+
+    let outcome = decide(&world, CoachAction::Accept)
+        .await
+        .expect("the accept commits");
+    let CoachDecisionOutcome::Accepted(accepted) = outcome else {
+        panic!("expected Accepted, got {outcome:?}");
+    };
+    let child_inputs = world
+        .runs()
+        .get_run(&accepted.accepted_run_id)
+        .await
+        .expect("read the child run")
+        .expect("the child run exists")
+        .inputs
+        .expect("a fresh run records its provenance");
+
+    assert_eq!(
+        child_inputs.taker_fee_bps,
+        Decimal::new(4, 0),
+        "the replay charges the parent run's recorded fee"
+    );
+    let mut expected = world.parent_inputs.clone();
+    expected.taker_fee_bps = Decimal::new(4, 0);
+    assert_eq!(
+        child_inputs, expected,
+        "every other recorded input is the parent's too"
+    );
+}
+
 /// r2.s1 G1: the parent run was WINDOWED and its `to` cuts inside a hold the
 /// child's (mutated) strategy keeps open. The accept must replay the parent's
 /// persisted slice — every child trade confined to `[from, to)` — and the

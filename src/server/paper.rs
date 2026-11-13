@@ -605,6 +605,19 @@ fn promotion_refusal(refused: &PromotionRefused) -> Response {
             "certification_unreadable",
             refused.to_string(),
         ),
+        PromotionRefused::CertifiedAtOtherFee {
+            certified_fee_bps,
+            session_fee_bps,
+        } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({
+                "code": "certified_at_other_fee",
+                "message": refused.to_string(),
+                "certified_fee_bps": certified_fee_bps.to_string(),
+                "session_fee_bps": session_fee_bps.to_string(),
+            })),
+        )
+            .into_response(),
         PromotionRefused::CertifiedUnderOtherEngine {
             certified_under,
             current,

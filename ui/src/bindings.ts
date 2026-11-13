@@ -804,6 +804,12 @@ export type BusErrorCode =
  */
 "certified_under_other_engine" | 
 /**
+ *  The certifying folds ran at a different taker fee from the one a new
+ *  paper session charges — `certified_at_other_fee` (#555). The override
+ *  does not apply to this case either: re-run the walk-forward.
+ */
+"certified_at_other_fee" | 
+/**
  *  The certifying run's recorded inputs cannot be read, so the certified
  *  data versions cannot be named — `certification_unreadable`.
  */

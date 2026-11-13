@@ -215,10 +215,25 @@ async fn uncertified_version(db: &Db, name: &str) -> VersionId {
 }
 
 async fn certified_version(db: &Db, name: &str) -> VersionId {
+    // The certifying folds ran at a new session's 5 bps taker fee (#555): a
+    // certification at another fee does not promote.
+    certified_version_at_fee(db, name, rust_decimal::Decimal::from(pulse::TAKER_FEE_BPS)).await
+}
+
+/// The same certification with its folds recorded at `taker_fee_bps`.
+async fn certified_version_at_fee(
+    db: &Db,
+    name: &str,
+    taker_fee_bps: rust_decimal::Decimal,
+) -> VersionId {
     let version_id = uncertified_version(db, name).await;
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let mut draft = seeded_walk_forward_draft(true);
+    for fold in &mut draft.folds {
+        fold.inputs.taker_fee_bps = taker_fee_bps;
+    }
     let run_id = runs
-        .save_walk_forward_run(&version_id, &seeded_walk_forward_draft(true))
+        .save_walk_forward_run(&version_id, &draft)
         .await
         .expect("save the passing certification");
     // A passing run alone never certifies (#525): a certified record names it.
@@ -700,6 +715,26 @@ async fn ii_every_paper_error_code_decodes_to_its_bus_error_code() {
         .await
         .expect_err("the override does not bypass E2");
     assert_eq!(error.code, BusErrorCode::CertifiedUnderOtherEngine);
+
+    // `certified_at_other_fee` (#555) — folds at 4 bps, a session at 5; the
+    // override cannot bypass it, and the message names both fees.
+    let at_four =
+        certified_version_at_fee(&ts.db, "w5-fee-4", rust_decimal::Decimal::from(4)).await;
+    let error = state
+        .paper_promote(&promote_request(&at_four))
+        .await
+        .expect_err("a certification at another fee refuses");
+    assert_eq!(error.code, BusErrorCode::CertifiedAtOtherFee);
+    assert!(
+        error.message.contains("4 bps") && error.message.contains("5 bps"),
+        "the message names both fees: {}",
+        error.message
+    );
+    let error = state
+        .paper_promote(&override_request(&at_four, "override attempt"))
+        .await
+        .expect_err("the override does not bypass the fee refusal");
+    assert_eq!(error.code, BusErrorCode::CertifiedAtOtherFee);
 
     // `certification_unreadable` — a fold run whose recorded inputs cannot be
     // read. The inputs are immutable once written (0003's trigger), so the

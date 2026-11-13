@@ -83,6 +83,10 @@ pub enum BusErrorCode {
     /// `certified_under_other_engine` (E2). The override does not apply to
     /// this case, so the code must be distinguishable from `uncertified`.
     CertifiedUnderOtherEngine,
+    /// The certifying folds ran at a different taker fee from the one a new
+    /// paper session charges — `certified_at_other_fee` (#555). The override
+    /// does not apply to this case either: re-run the walk-forward.
+    CertifiedAtOtherFee,
     /// The certifying run's recorded inputs cannot be read, so the certified
     /// data versions cannot be named — `certification_unreadable`.
     CertificationUnreadable,
@@ -128,6 +132,7 @@ impl BusErrorCode {
             "uncertified" => Self::Uncertified,
             "empty_reason" => Self::EmptyReason,
             "certified_under_other_engine" => Self::CertifiedUnderOtherEngine,
+            "certified_at_other_fee" => Self::CertifiedAtOtherFee,
             "certification_unreadable" => Self::CertificationUnreadable,
             "session_stopped" => Self::SessionStopped,
             "runtime_unavailable" => Self::RuntimeUnavailable,

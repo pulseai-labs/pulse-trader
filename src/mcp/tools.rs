@@ -1414,7 +1414,8 @@ impl PulseMcp {
     ///
     /// The request resolves through [`resolve_default_request`]: the version's
     /// parent's latest run (then its own, then the app defaults) supplies the
-    /// pair, timeframes, cost model and exact snapshot pins. `from`/`to` are an
+    /// pair, timeframes, slippage and exact snapshot pins; the taker fee is the
+    /// current default, never the prior run's (#555). `from`/`to` are an
     /// optional RFC 3339 window — both or neither — the counted half-open
     /// slice `[from, to)`: both series still load from the snapshot's start so
     /// the engines step every bar before `from` and arrive warm (r2.s3.w2);
@@ -1526,7 +1527,8 @@ impl PulseMcp {
     /// `from`/`to` are INDEPENDENT RFC 3339 bounds — either may be given alone:
     /// `from` defaults to the first fully-warm bar, `to` to the snapshot's last
     /// candle's `close_time`. `k` defaults to `K_DEFAULT` (6), `rule` to
-    /// `wf-v1`. Pair, timeframes, cost model and the exact snapshot pins resolve
+    /// `wf-v1`. Pair, timeframes, slippage and the exact snapshot pins (the taker
+    /// fee is the current default, #555) resolve
     /// through the same [`resolve_default_request`] seam `run_backtest` uses —
     /// the surfaces run a version identically — and the answer is the one
     /// `WalkForwardRunDetail` shape, built from the saved rows. An optional

@@ -17,7 +17,9 @@
 //!    (#525: a pass alone never certifies, under either rule), and that run
 //!    passed on THIS build. A
 //!    foreign fingerprint refuses (`CertifiedUnderOtherEngine`), override or
-//!    not: re-running the walk-forward is the only re-certification (E2). A
+//!    not: re-running the walk-forward is the only re-certification (E2). Folds
+//!    that ran at a taker fee other than the session's `TAKER_FEE_BPS` refuse
+//!    the same way (`CertifiedAtOtherFee`, #555). A
 //!    fold run with unreadable inputs refuses (`CertificationUnreadable`) —
 //!    a certification whose data provenance cannot be named is not a
 //!    certification. Otherwise the session's certified data versions are the
@@ -109,6 +111,16 @@ pub enum PromotionRefused {
         /// This build's fingerprint.
         current: EngineFingerprint,
     },
+    /// The certifying folds ran at a different taker fee from the one a new
+    /// session charges (#555, PDR-0052): the session's paper net R would not be
+    /// the certified result's. The override cannot bypass this, as with
+    /// [`Self::CertifiedUnderOtherEngine`]: re-run the walk-forward.
+    CertifiedAtOtherFee {
+        /// The taker fee, bps, the certifying folds ran at.
+        certified_fee_bps: Decimal,
+        /// The taker fee, bps, a new paper session charges (A1).
+        session_fee_bps: Decimal,
+    },
     /// A fold run's recorded inputs are missing or disagree across folds —
     /// the certification's data provenance cannot be named.
     CertificationUnreadable,
@@ -129,6 +141,14 @@ impl core::fmt::Display for PromotionRefused {
                 "certified under engine {}; re-run walk-forward to re-certify (this build is {})",
                 certified_under.as_str(),
                 current.as_str()
+            ),
+            Self::CertifiedAtOtherFee {
+                certified_fee_bps,
+                session_fee_bps,
+            } => write!(
+                f,
+                "certified at a taker fee of {certified_fee_bps} bps; a new paper session \
+                 charges {session_fee_bps} bps; re-run the walk-forward to re-certify"
             ),
             Self::CertificationUnreadable => write!(
                 f,
@@ -209,7 +229,9 @@ fn certified_versions(fold_inputs: &[Option<&BacktestInputs>]) -> Vec<CertifiedD
 /// [`PromotionRefused::Uncertified`] when there is no run that certifies (a
 /// failing run, or a passing run with no certified record that names it) and
 /// no override, [`PromotionRefused::CertifiedUnderOtherEngine`] when the
-/// certifying run predates this build (with or without an override), and
+/// certifying run predates this build (with or without an override),
+/// [`PromotionRefused::CertifiedAtOtherFee`] when the certifying folds ran at a
+/// taker fee other than the new session's (with or without an override), and
 /// [`PromotionRefused::CertificationUnreadable`] when a fold run's inputs are
 /// missing or disagree across folds.
 pub fn decide_promotion(
@@ -236,6 +258,16 @@ pub fn decide_promotion(
             });
         }
         let inputs = common_inputs(fold_inputs)?;
+        // #555 (PDR-0052): a new session charges `TAKER_FEE_BPS`. A certification
+        // measured at another fee is not the result the session would shadow, and
+        // the override cannot bypass it (as with the engine check above).
+        let session_fee_bps = Decimal::from(TAKER_FEE_BPS);
+        if inputs.taker_fee_bps != session_fee_bps {
+            return Err(PromotionRefused::CertifiedAtOtherFee {
+                certified_fee_bps: inputs.taker_fee_bps,
+                session_fee_bps,
+            });
+        }
         let data_versions = certified_versions(fold_inputs);
         return Ok(PromotionDraft {
             pair: inputs.pair.clone(),
@@ -243,7 +275,7 @@ pub fn decide_promotion(
             htf_timeframe: inputs.htf.as_ref().map(|h| h.timeframe),
             uses_d1: inputs.d1.is_some(),
             starting_equity: Decimal::from(STARTING_EQUITY_USDT),
-            taker_fee_bps: Decimal::from(TAKER_FEE_BPS),
+            taker_fee_bps: session_fee_bps,
             slippage_bps: Decimal::from(SLIPPAGE_BPS),
             engine_fingerprint: current_fingerprint.clone(),
             graduation: Graduation::Certified {

@@ -1454,9 +1454,12 @@ pub(crate) fn apply_lead_in_window(
 /// consulted (N1): a fold's pins describe one sub-window of a walk-forward, not
 /// a run of this version the caller would inherit comparably. From a run the
 /// resolver takes the
-/// pair, the timeframes, the taker/slippage bps and [`SnapshotPins`] naming the
-/// run's exact `data_version`s — an agent run is then comparable with the run
-/// it iterates on. `window` is NEVER inherited: it is always the caller's.
+/// pair, the timeframes, the slippage bps and [`SnapshotPins`] naming the
+/// run's exact `data_version`s. The taker fee is NOT taken from the run: it is
+/// the current default (#555, PDR-0052), so a lineage recorded at the old 4 bps
+/// runs at 5 bps from here on; a run at another fee is not comparable with its
+/// prior, and the Lab's compare lists the fee difference. `window` is NEVER
+/// inherited: it is always the caller's.
 ///
 /// One correction sits on top of the inherit (r2.s2 round-3 fix): when the prior
 /// run recorded **no** HTF selection and the version's compiled strategy needs
@@ -1588,10 +1591,15 @@ where
 }
 
 /// Build the request off a prior run's recorded inputs: pair, timeframes,
-/// taker/slippage bps, and `SnapshotPins` naming the exact `data_version`s the
-/// prior run consumed. `starting_equity` stays the app default — comparability
-/// lives in the snapshots and the cost model, and the spec enumerates exactly
-/// these fields. The window is the caller's, never the prior run's.
+/// slippage bps, and `SnapshotPins` naming the exact `data_version`s the prior
+/// run consumed. `starting_equity` stays the app default. The taker fee is NOT
+/// inherited (#555, PDR-0052): it is the current default
+/// (`BacktestConfig::default().taker_fee_bps`), so a lineage recorded at the old
+/// 4 bps does not keep under-charging; a run at another fee is not comparable
+/// with the prior one, and the Lab's compare names the fee difference. A path
+/// that REPRODUCES a recorded run (`prepare_backtest` over `BacktestInputs`)
+/// keeps that run's recorded fee. The window is the caller's, never the prior
+/// run's.
 fn request_from_inputs(
     version_id: &VersionId,
     inputs: BacktestInputs,
@@ -1602,7 +1610,6 @@ fn request_from_inputs(
         primary,
         htf,
         d1,
-        taker_fee_bps,
         slippage_bps,
         ..
     } = inputs;
@@ -1612,7 +1619,6 @@ fn request_from_inputs(
         primary_timeframe: primary.timeframe,
         htf_timeframe: htf.as_ref().map(|selection| selection.timeframe),
         config: BacktestConfig {
-            taker_fee_bps,
             slippage_bps,
             ..BacktestConfig::default()
         },
@@ -2081,7 +2087,12 @@ mod tests {
         assert_eq!(request.version_id.as_str(), "child-1");
         assert_eq!(request.primary_timeframe, Timeframe::M15);
         assert_eq!(request.htf_timeframe, Some(Timeframe::H4));
-        assert_eq!(request.config.taker_fee_bps, Decimal::new(7, 0));
+        // #555: the fee is the one input an inherited request does not inherit.
+        assert_eq!(
+            request.config.taker_fee_bps,
+            BacktestConfig::default().taker_fee_bps,
+            "the parent's recorded 7 bps is not inherited: the current default is"
+        );
         assert_eq!(request.config.slippage_bps, Decimal::new(2, 0));
         assert_eq!(
             request.snapshots,
@@ -2093,6 +2104,85 @@ mod tests {
             "the parent's recorded data_versions pin the load, not the child's"
         );
         assert_eq!(request.window, None);
+    }
+
+    /// #555: a lineage recorded at 4 bps (the pre-#527 default) resolves to the
+    /// current default fee, from the parent's run and from the version's own,
+    /// and every OTHER recorded input is inherited exactly as before.
+    #[tokio::test]
+    async fn resolve_default_request_takes_the_current_fee_over_a_recorded_four_bps() {
+        let default_fee = BacktestConfig::default().taker_fee_bps;
+        assert_eq!(
+            default_fee,
+            Decimal::new(5, 0),
+            "the premise: the default is 5 bps"
+        );
+        let expected_pins = SnapshotPins {
+            primary: DataVersion::new("v-rec"),
+            htf: Some(DataVersion::new("v-rec-htf")),
+            d1: Some(DataVersion::new("v-rec-d1")),
+        };
+
+        // (a) the child has no run; its parent's run is at 4 bps.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version("child-1", Some("parent-1")));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("parent-1"),
+            Some(recorded_inputs(
+                "v-rec",
+                Some("v-rec-htf"),
+                4,
+                3,
+                Some("v-rec-d1"),
+            )),
+        ));
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("child-1"), None)
+            .await
+            .expect("resolve the child");
+        assert_eq!(request.config.taker_fee_bps, default_fee, "child: 5 bps");
+        assert_eq!(
+            request.config.slippage_bps,
+            Decimal::new(3, 0),
+            "child: slippage inherited"
+        );
+        assert_eq!(request.pair, Pair::new("BTCUSDT"));
+        assert_eq!(request.primary_timeframe, Timeframe::M15);
+        assert_eq!(request.htf_timeframe, Some(Timeframe::H4));
+        assert_eq!(
+            request.snapshots,
+            Some(expected_pins.clone()),
+            "child: pins inherited"
+        );
+
+        // (b) a version with its OWN 4 bps run and no parent.
+        let strategies = FakeStrategies::default();
+        strategies.insert(version("solo-1", None));
+        let runs = FakeRuns::default();
+        runs.push(persisted_run(
+            &VersionId::new("solo-1"),
+            Some(recorded_inputs(
+                "v-rec",
+                Some("v-rec-htf"),
+                4,
+                3,
+                Some("v-rec-d1"),
+            )),
+        ));
+        let request = resolve_default_request(&strategies, &runs, &VersionId::new("solo-1"), None)
+            .await
+            .expect("resolve the version");
+        assert_eq!(request.config.taker_fee_bps, default_fee, "own run: 5 bps");
+        assert_eq!(
+            request.config.slippage_bps,
+            Decimal::new(3, 0),
+            "own run: slippage inherited"
+        );
+        assert_eq!(
+            request.snapshots,
+            Some(expected_pins),
+            "own run: pins inherited"
+        );
     }
 
     #[tokio::test]

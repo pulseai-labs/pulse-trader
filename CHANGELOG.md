@@ -712,6 +712,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   version changes while the sheet is open, the override stays disabled until the new version's own pair and
   timeframes load.
 
+- **Inherited runs now use the 5 bps default fee (0.1.17, #555).** A backtest, walk-forward or certify run that
+  inherits its pair, snapshots and slippage from an earlier run now charges the current 5 bps taker fee, not the
+  4 bps that run recorded. A certification measured at another taker fee no longer promotes to a paper session
+  (the override cannot bypass it); re-run the walk-forward to re-certify.
+
 - **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount
   and on a window focus / visibility return, so an agent-submitted child version never reached an untouched,
   focused Library — the r5 close watched two submissions stay invisible for 5.5 and 10.5 minutes until
