@@ -732,7 +732,7 @@ async fn v2_folds_at_another_fee_refuse_naming_both_fees() {
     assert_eq!(
         error.to_string(),
         "certified at a taker fee of 4 bps; a new paper session charges 5 bps; \
-         re-run the walk-forward to re-certify"
+         certify the version again at the current fee to promote it"
     );
     assert_eq!(session_count(&world).await, 0, "no row is written");
 }

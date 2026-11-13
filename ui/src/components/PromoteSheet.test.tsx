@@ -463,14 +463,14 @@ describe("stale", () => {
       status: "error",
       error: busError(
         "certified_at_other_fee",
-        "certified at a taker fee of 4 bps; a new paper session charges 5 bps; re-run the walk-forward to re-certify",
+        "certified at a taker fee of 4 bps; a new paper session charges 5 bps; certify the version again at the current fee to promote it",
       ),
     });
     fireEvent.click(screen.getByRole("button", { name: /^promote$/i }));
 
     expect(
       await screen.findByText(
-        /certified at a taker fee of 4 bps; a new paper session charges 5 bps; re-run the walk-forward to re-certify/,
+        /certified at a taker fee of 4 bps; a new paper session charges 5 bps; certify the version again at the current fee to promote it/,
       ),
     ).toBeTruthy();
   });

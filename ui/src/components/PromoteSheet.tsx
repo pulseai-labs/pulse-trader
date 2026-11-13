@@ -8,7 +8,8 @@
 // gives this server's fingerprint. A passing run no certified record names is
 // not a certification, so it reads uncertified. The server's 422 stays the
 // backstop: `certified_under_other_engine` re-renders the sheet as stale,
-// `uncertified` as uncertified.
+// `uncertified` as uncertified; `certified_at_other_fee` falls through to the
+// generic refusal path and shows the server's message.
 //
 // Stale means NO override and no promote button — E2 is not overridable, and
 // the only action is "Re-run walk-forward", which opens the Backtest Lab on

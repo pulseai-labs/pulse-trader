@@ -449,7 +449,7 @@ async fn i_a_certification_at_another_fee_refuses_with_both_fees() {
             body["message"],
             json!(
                 "certified at a taker fee of 4 bps; a new paper session charges 5 bps; \
-                 re-run the walk-forward to re-certify"
+                 certify the version again at the current fee to promote it"
             ),
             "{body:?}"
         );

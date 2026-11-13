@@ -806,7 +806,8 @@ export type BusErrorCode =
 /**
  *  The certifying folds ran at a different taker fee from the one a new
  *  paper session charges — `certified_at_other_fee` (#555). The override
- *  does not apply to this case either: re-run the walk-forward.
+ *  does not apply to this case either: only a new certification of the
+ *  version at the current fee clears it.
  */
 "certified_at_other_fee" | 
 /**

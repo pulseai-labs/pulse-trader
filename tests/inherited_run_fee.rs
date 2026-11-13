@@ -4,12 +4,15 @@
 //! run inputs. Before 0.1.17 it copied the fee too, so a lineage whose run was
 //! recorded at 4 bps kept running at 4 bps after #527 made the default 5 bps
 //! (PDR-0052). The fee is now the one input an inherited request does NOT
-//! inherit; every other recorded input still is.
+//! inherit; the pair, the timeframes, the primary/htf/d1 snapshot pins and the
+//! slippage still are. (Funding is the constant `FundingConfig::SnapshotRates`,
+//! and `symbol_filters`, `window` and `lead_in_from_ms` are the run's own, so
+//! none of those is inherited.)
 //!
 //! The suite runs the real MCP tools (`run_backtest`, `run_walk_forward`) over
 //! a lineage whose only run was recorded at 4 bps: the child with no run, and
 //! the version with its own run. It reads the persisted runs back and compares
-//! their recorded inputs with the 4 bps run's, field by field.
+//! their recorded inputs with the 4 bps run's on exactly the inherited fields.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -17,8 +20,8 @@ mod support;
 
 use pulse::{
     BacktestConfig, BacktestInputs, BacktestRequest, BacktestRunId, BacktestRunRepository,
-    BinanceAdapter, CandleStore, Pair, SqliteBacktestRunRepo, SqliteStrategyRepo, Timeframe,
-    VersionId, run_version_backtest,
+    BinanceAdapter, CandleStore, FundingConfig, Pair, SqliteBacktestRunRepo, SqliteStrategyRepo,
+    Timeframe, VersionId, run_version_backtest,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -110,9 +113,10 @@ fn run_id_of(result: &Value) -> BacktestRunId {
     BacktestRunId::new(result["run_id"].as_str().expect("run_id on the wire"))
 }
 
-/// Every recorded input except the fee equals the 4 bps run's, and the fee is
-/// the current default. `window` and `lead_in_from_ms` are the run's own (a
-/// walk-forward fold is windowed), so they are not compared.
+/// The inherited inputs (pair, primary/htf/d1 pins, slippage) equal the 4 bps
+/// run's, and the fee is the current default. `window` and `lead_in_from_ms` are
+/// the run's own (a walk-forward fold is windowed), and funding is a constant
+/// rather than an inherited input, so none of those is compared for inheritance.
 fn assert_only_the_fee_moved(got: &BacktestInputs, recorded: &BacktestInputs, what: &str) {
     assert_eq!(
         got.taker_fee_bps,
@@ -135,7 +139,11 @@ fn assert_only_the_fee_moved(got: &BacktestInputs, recorded: &BacktestInputs, wh
         got.slippage_bps, recorded.slippage_bps,
         "{what}: slippage inherited"
     );
-    assert_eq!(got.funding, recorded.funding, "{what}: funding inherited");
+    assert_eq!(
+        got.funding,
+        FundingConfig::SnapshotRates,
+        "{what}: funding is the constant, not an inherited input"
+    );
 }
 
 /// `run_backtest` on `version`: the persisted run's inputs.

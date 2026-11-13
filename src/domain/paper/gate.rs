@@ -114,7 +114,9 @@ pub enum PromotionRefused {
     /// The certifying folds ran at a different taker fee from the one a new
     /// session charges (#555, PDR-0052): the session's paper net R would not be
     /// the certified result's. The override cannot bypass this, as with
-    /// [`Self::CertifiedUnderOtherEngine`]: re-run the walk-forward.
+    /// [`Self::CertifiedUnderOtherEngine`]: only a new certification of the
+    /// version at the current fee clears it (the gate reads the run the latest
+    /// certified record names, not the version's latest walk-forward).
     CertifiedAtOtherFee {
         /// The taker fee, bps, the certifying folds ran at.
         certified_fee_bps: Decimal,
@@ -148,7 +150,8 @@ impl core::fmt::Display for PromotionRefused {
             } => write!(
                 f,
                 "certified at a taker fee of {certified_fee_bps} bps; a new paper session \
-                 charges {session_fee_bps} bps; re-run the walk-forward to re-certify"
+                 charges {session_fee_bps} bps; certify the version again at the current fee \
+                 to promote it"
             ),
             Self::CertificationUnreadable => write!(
                 f,
