@@ -159,9 +159,13 @@ async fn opening_a_run_saved_before_inputs_were_recorded_says_so() {
         err.message
     );
     assert_eq!(
-        err.child_run_id.as_deref(),
+        err.run_id.as_deref(),
         Some(run_id.as_str()),
-        "the asked-for id rides `child_run_id`, as the `not_found` refusal carries it"
+        "the run IS persisted, so its id rides `run_id`, as the base mapping carried it"
+    );
+    assert_eq!(
+        err.child_run_id, None,
+        "`child_run_id` is for an asked-for id that names no run"
     );
 }
 

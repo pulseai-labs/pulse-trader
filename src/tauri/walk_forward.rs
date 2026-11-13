@@ -428,8 +428,9 @@ pub async fn get_walk_forward_run_core(
     walk_forward_run_dto(&run, &fold_runs)
 }
 
-/// The refusal text for a persisted run that records no inputs (#391) — one
-/// place, so the wording cannot drift between the arm and its test.
+/// The refusal text for a persisted run that records no inputs (#391). The text
+/// lives in this one place in the code; the test repeats it, so a change to the
+/// wording fails the test.
 fn predates_recorded_inputs_message(run_id: &str) -> String {
     format!(
         "backtest run {run_id} predates recorded inputs, so it cannot be opened; \
@@ -447,8 +448,8 @@ fn predates_recorded_inputs_message(run_id: &str) -> String {
 /// Returns a [`BusError`]: [`BusErrorCode::NotFound`] when the id names no run
 /// (the asked-for id rides `child_run_id`, the same slot
 /// `compare_child_run`'s refusal uses), [`BusErrorCode::Data`] when the run was
-/// saved before inputs were recorded (#391; the id rides `child_run_id` the
-/// same way), and the read-back's own
+/// saved before inputs were recorded (#391; that run IS persisted, so its id
+/// rides `run_id`, as the base mapping carried it), and the read-back's own
 /// [`BacktestAppError`](crate::application::backtest::BacktestAppError)
 /// mapping otherwise — including its `run_id` carry when a saved row exists
 /// but its projection fails.
@@ -489,7 +490,7 @@ pub async fn get_backtest_run_core(
             failure: ReadBackFailure::FreshInputsMissing,
             ..
         }) => {
-            return Err(BusError::with_child_run_id(
+            return Err(BusError::with_run_id(
                 BusErrorCode::Data,
                 predates_recorded_inputs_message(&request.run_id),
                 request.run_id,
