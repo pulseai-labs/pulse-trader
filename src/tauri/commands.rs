@@ -1419,7 +1419,8 @@ pub async fn compose_cancel(
 /// ([`resolve_default_request`], r2.s1.w3) decides what the version runs with:
 /// the version's parent's latest persisted run (then its own, then the r1
 /// BTCUSDT M15+H4 / default-cost configuration) supplies the pair, timeframes,
-/// cost model and the exact snapshot pins — the desktop and MCP surfaces run a
+/// slippage and the exact snapshot pins (the taker fee is the current default,
+/// #555) — the desktop and MCP surfaces run a
 /// version identically, and a field the user cannot vary would be a control
 /// that does not exist. The desktop sends no window, so the run covers the
 /// whole pinned snapshot.

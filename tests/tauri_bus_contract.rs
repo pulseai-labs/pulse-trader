@@ -282,6 +282,7 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
             BusErrorCode::CertifiedUnderOtherEngine,
             "certified_under_other_engine",
         ),
+        (BusErrorCode::CertifiedAtOtherFee, "certified_at_other_fee"),
         (
             BusErrorCode::CertificationUnreadable,
             "certification_unreadable",
@@ -319,13 +320,14 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
             | BusErrorCode::Uncertified
             | BusErrorCode::EmptyReason
             | BusErrorCode::CertifiedUnderOtherEngine
+            | BusErrorCode::CertifiedAtOtherFee
             | BusErrorCode::CertificationUnreadable
             | BusErrorCode::SessionStopped
             | BusErrorCode::RuntimeUnavailable
             | BusErrorCode::SessionNotAttached => {}
         }
     }
-    assert_eq!(pinned.len(), 16, "every code is pinned exactly once");
+    assert_eq!(pinned.len(), 17, "every code is pinned exactly once");
 }
 
 /// The one crossable error that CAN name a persisted run. The shape test above

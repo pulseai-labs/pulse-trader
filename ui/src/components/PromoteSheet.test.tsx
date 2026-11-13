@@ -451,6 +451,29 @@ describe("stale", () => {
     expect(screen.getByText(/re-run walk-forward to re-certify/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^promote$/i })).toBeNull();
   });
+
+  it("shows the server's message when it refuses with certified_at_other_fee (#555)", async () => {
+    // The certifying folds ran at another taker fee than a new session's: the
+    // 422 backstop names both fees and the remedy, and the sheet shows it as is.
+    getWalkForwardRunMock.mockResolvedValue(ok(walkForward(true, SERVER_ENGINE)));
+    sheet();
+    expect(await screen.findByText(/PASS under wf-v1/)).toBeTruthy();
+
+    paperPromoteMock.mockResolvedValue({
+      status: "error",
+      error: busError(
+        "certified_at_other_fee",
+        "certified at a taker fee of 4 bps; a new paper session charges 5 bps; certify the version again at the current fee to promote it",
+      ),
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^promote$/i }));
+
+    expect(
+      await screen.findByText(
+        /certified at a taker fee of 4 bps; a new paper session charges 5 bps; certify the version again at the current fee to promote it/,
+      ),
+    ).toBeTruthy();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -177,6 +177,17 @@ async fn certified_version_over(
     name: &str,
     m15: Vec<pulse::Candle>,
 ) -> pulse::VersionId {
+    certified_version_at_fee(world, name, m15, BacktestConfig::default().taker_fee_bps).await
+}
+
+/// The same, with the certifying walk-forward's folds run at `taker_fee_bps`
+/// (#555: a certification measured at a fee other than a new session's).
+async fn certified_version_at_fee(
+    world: &World,
+    name: &str,
+    m15: Vec<pulse::Candle>,
+    taker_fee_bps: Decimal,
+) -> pulse::VersionId {
     let pair = fixture_pair();
     let m15_version = CandleStore::content_version(&pair, Timeframe::M15, &m15);
     let h4 = fixture_h4_candles_from(&m15);
@@ -189,7 +200,11 @@ async fn certified_version_over(
         &world.store,
         &BinanceAdapter::new(),
         &world.runs,
-        &walk_forward_request(version_id.clone(), m15_version, h4_version),
+        &{
+            let mut request = walk_forward_request(version_id.clone(), m15_version, h4_version);
+            request.config.taker_fee_bps = taker_fee_bps;
+            request
+        },
         None,
     )
     .await
@@ -691,6 +706,81 @@ async fn v_foreign_fingerprint_refuses_even_with_override() {
         PaperPromotionError::Refused(PromotionRefused::CertifiedUnderOtherEngine { .. })
     ));
     assert_eq!(session_count(&world).await, 0, "no row on either refusal");
+}
+
+/// (#555) A certification whose folds ran at 4 bps does not promote into a
+/// session that charges 5 bps: refused as `CertifiedAtOtherFee`, naming both
+/// fees, with no row.
+#[tokio::test]
+async fn v2_folds_at_another_fee_refuse_naming_both_fees() {
+    let world = world().await;
+    let version_id =
+        certified_version_at_fee(&world, "fee-4", fixture_m15_candles(), Decimal::from(4)).await;
+
+    let error = try_promote(&world, &version_id, None, "operator-token")
+        .await
+        .expect_err("a certification measured at 4 bps refuses a 5 bps session");
+    let PaperPromotionError::Refused(PromotionRefused::CertifiedAtOtherFee {
+        certified_fee_bps,
+        session_fee_bps,
+    }) = &error
+    else {
+        panic!("expected CertifiedAtOtherFee, got {error:?}");
+    };
+    assert_eq!(*certified_fee_bps, Decimal::from(4));
+    assert_eq!(*session_fee_bps, Decimal::from(5));
+    assert_eq!(
+        error.to_string(),
+        "certified at a taker fee of 4 bps; a new paper session charges 5 bps; \
+         certify the version again at the current fee to promote it"
+    );
+    assert_eq!(session_count(&world).await, 0, "no row is written");
+}
+
+/// (#555) The override cannot bypass the fee refusal, as with E2: the certified
+/// path refuses before the override is read.
+#[tokio::test]
+async fn v3_the_override_cannot_bypass_a_fee_mismatch() {
+    let world = world().await;
+    let version_id = certified_version_at_fee(
+        &world,
+        "fee-4-override",
+        fixture_m15_candles(),
+        Decimal::from(4),
+    )
+    .await;
+
+    let request = pulse::OverrideRequest {
+        reason: NonEmptyReason::try_new("4 bps is close enough").unwrap(),
+        pair: fixture_pair(),
+        primary_timeframe: Timeframe::M15,
+        htf_timeframe: None,
+        uses_d1: false,
+    };
+    let error = try_promote(&world, &version_id, Some(request), "operator-token")
+        .await
+        .expect_err("the override cannot bypass a fee mismatch");
+    assert!(
+        matches!(
+            error,
+            PaperPromotionError::Refused(PromotionRefused::CertifiedAtOtherFee { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(session_count(&world).await, 0, "no row on the refusal");
+}
+
+/// (#555) Folds at the session's own 5 bps certify as before.
+#[tokio::test]
+async fn v4_folds_at_the_session_fee_promote_as_certified() {
+    let world = world().await;
+    let version_id =
+        certified_version_at_fee(&world, "fee-5", fixture_m15_candles(), Decimal::from(5)).await;
+    let session = try_promote(&world, &version_id, None, "operator-token")
+        .await
+        .expect("a certification at the session's fee promotes");
+    assert!(matches!(session.graduation, Graduation::Certified { .. }));
+    assert_eq!(session.taker_fee_bps, Decimal::from(5));
 }
 
 /// (vi) Fixture data: `fixture = true`, `oos_comparable() = false`.

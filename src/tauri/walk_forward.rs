@@ -357,8 +357,9 @@ pub async fn run_walk_forward_version_core(
         .transpose()?;
     let strategies = state.strategy_repo();
     let runs = state.backtest_run_repo();
-    // The same resolver `run_backtest_version` uses — pair, timeframes, costs
-    // and the exact snapshot pins come from the version's recorded lineage.
+    // The same resolver `run_backtest_version` uses — pair, timeframes, slippage
+    // and the exact snapshot pins come from the version's recorded lineage; the
+    // taker fee is the current default, never the recorded one (#555).
     // `window: None`: the walk-forward's independent `from`/`to` are not the
     // backtest window; the counted span resolves inside `run_walk_forward`.
     let resolved = resolve_default_request(

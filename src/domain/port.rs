@@ -574,7 +574,7 @@ pub trait BacktestRunRepository {
     /// walk-forward are `backtest_run` rows of the version sharing ONE
     /// `created_at`, so the `id DESC` tie-break would pick an arbitrary fold and
     /// report a sub-window measurement as the version's latest result — its KPIs,
-    /// its parent delta, and the snapshot/cost pins a later run inherits. Rows
+    /// its parent delta, and the snapshot and slippage pins a later run inherits. Rows
     /// carrying `walk_forward_run_id` are therefore excluded: the answer is the
     /// version's most recent ordinary run, or `None` when it has none.
     ///

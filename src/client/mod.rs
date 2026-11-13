@@ -1634,7 +1634,8 @@ impl ClientState {
     /// # Errors
     ///
     /// The promotion gate's typed refusals (`uncertified`, `empty_reason`,
-    /// `certified_under_other_engine`, `certification_unreadable`), the
+    /// `certified_under_other_engine`, `certified_at_other_fee`,
+    /// `certification_unreadable`), the
     /// not-connected refusal, or the wire failure flattened.
     pub async fn paper_promote(
         &self,

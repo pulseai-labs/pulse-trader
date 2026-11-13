@@ -26,9 +26,9 @@ use pulse::{
     BarRef, Candle, CandleStore, CreatedBy, Db, Direction, EngineFingerprint, Graduation,
     NewVersion, NonEmptyReason, Pair, PaperEvent, PaperSessionDraft, PaperSessionId,
     PaperSessionRepository, PaperSide, SqliteBacktestRunRepo, SqliteClientTokenRepo,
-    SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyRepository, Timeframe, VersionId,
-    WalkForwardRunDraft, WalkForwardRunRepository, list_summaries, realized_pnl, session_summary,
-    session_trades, taker_fee,
+    SqlitePaperSessionRepo, SqliteStrategyRepo, StrategyRepository, TAKER_FEE_BPS, Timeframe,
+    VersionId, WalkForwardRunDraft, WalkForwardRunRepository, list_summaries, realized_pnl,
+    session_summary, session_trades, taker_fee,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -83,12 +83,23 @@ async fn uncertified_version(db: &Db, name: &str) -> VersionId {
 }
 
 /// A version whose latest walk-forward run is the seeded passing draft — a
-/// certification on THIS build, with known fold `mean_r` values.
+/// certification on THIS build, with known fold `mean_r` values — whose folds
+/// ran at a new session's 5 bps taker fee (#555: a certification at another
+/// fee does not promote).
 async fn certified_version(db: &Db, name: &str) -> VersionId {
+    certified_version_at_fee(db, name, Decimal::from(TAKER_FEE_BPS)).await
+}
+
+/// The same certification with its folds recorded at `taker_fee_bps`.
+async fn certified_version_at_fee(db: &Db, name: &str, taker_fee_bps: Decimal) -> VersionId {
     let version_id = uncertified_version(db, name).await;
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let mut draft = seeded_walk_forward_draft(true);
+    for fold in &mut draft.folds {
+        fold.inputs.taker_fee_bps = taker_fee_bps;
+    }
     let run_id = runs
-        .save_walk_forward_run(&version_id, &seeded_walk_forward_draft(true))
+        .save_walk_forward_run(&version_id, &draft)
         .await
         .expect("save the passing certification");
     // A passing run alone never certifies (#525): a certified record names it.
@@ -391,6 +402,55 @@ async fn i_a_foreign_certification_refuses_with_both_fingerprints() {
         assert_eq!(
             body["current"],
             json!(pulse::EngineFingerprint::current().as_str()),
+            "{body:?}"
+        );
+    }
+}
+
+/// (#555) A certification whose folds ran at 4 bps refuses a 5 bps session with
+/// 422 `certified_at_other_fee`, both fees in the body — with and without an
+/// override (the override does not apply).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i_a_certification_at_another_fee_refuses_with_both_fees() {
+    let ts = paper_server().await;
+    let version_id = certified_version_at_fee(&ts.db, "routes-fee-4", Decimal::from(4)).await;
+    for body in [
+        json!({ "version_id": version_id.as_str() }),
+        json!({
+            "version_id": version_id.as_str(),
+            "override": {
+                "reason": "override cannot bypass the fee gate",
+                "pair": "BTCUSDT",
+                "primary_timeframe": "15m",
+            },
+        }),
+    ] {
+        let response = post_promote(&ts, body).await;
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = response.json().await.expect("a json refusal");
+        assert_eq!(body["code"], json!("certified_at_other_fee"), "{body:?}");
+        // Least disclosure: the refusal carries the code, the message and the
+        // two fees, nothing else (no token, no engine, no run id).
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["certified_fee_bps", "code", "message", "session_fee_bps"],
+            "{body:?}"
+        );
+        assert_eq!(body["certified_fee_bps"], json!("4"), "{body:?}");
+        assert_eq!(body["session_fee_bps"], json!("5"), "{body:?}");
+        assert_eq!(
+            body["message"],
+            json!(
+                "certified at a taker fee of 4 bps; a new paper session charges 5 bps; \
+                 certify the version again at the current fee to promote it"
+            ),
             "{body:?}"
         );
     }
