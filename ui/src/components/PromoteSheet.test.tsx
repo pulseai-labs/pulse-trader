@@ -837,3 +837,130 @@ describe("the title strip's count refresh (#335)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// #548 — a version change while the sheet is open never carries the previous
+// version's shape into the override
+// ---------------------------------------------------------------------------
+
+describe("the version changes while the sheet is open (#548)", () => {
+  /** Version A: uncertified, with a latest run whose shape is `SHAPE_A`. */
+  const SHAPE_A: BacktestRunDto = { ...FOLD_RUN, runId: "run-a" };
+  /** Version B has a different pair, timeframes and a D1 series. */
+  const SHAPE_B: BacktestRunDto = {
+    ...FOLD_RUN,
+    runId: "run-b",
+    strategyVersionId: "ver-2",
+    pair: "ETHUSDT",
+    primaryTimeframe: "1h",
+    primaryDataVersion: "snap-eth-h1",
+    htfTimeframe: null,
+    htfDataVersion: null,
+    d1DataVersion: "snap-eth-d1",
+  };
+  const runOf = (id: string, label: string) => ({
+    id,
+    createdAt: "2026-09-01T00:00:00.000Z",
+    expectancy: "+0.10R",
+    trades: label.length,
+  });
+  const targetA = {
+    version: { ...version(null, false), id: "ver-a", latestRun: runOf("run-a", "a") },
+    strategyName: "EMA Cross Trend",
+    versionLabel: "v3",
+  };
+  const targetB = {
+    version: { ...version(null, false), id: "ver-b", latestRun: runOf("run-b", "b") },
+    strategyName: "EMA Cross Trend",
+    versionLabel: "v4",
+  };
+  const REASON = "I want live-bar evidence first.";
+
+  beforeEach(() => {
+    certificationRecordsMock.mockResolvedValue(records());
+    getBacktestRunMock.mockImplementation(({ runId }: { runId: string }) =>
+      Promise.resolve(ok(runId === "run-b" ? SHAPE_B : SHAPE_A)),
+    );
+  });
+
+  /** Open the sheet on A, type a reason and read A's shape. */
+  async function openOnA() {
+    const view = render(
+      <PromoteSheet target={targetA} onClose={vi.fn()} onPromoted={vi.fn()} />,
+    );
+    expect(await screen.findByText(/No certification record certifies this version\./)).toBeTruthy();
+    // A's own shape is on screen once it loads.
+    expect(await screen.findByText(/BTCUSDT · 15m · 4h/)).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: REASON } });
+    expect(
+      screen.getByRole("button", { name: /Continue uncertified/ }).hasAttribute("disabled"),
+    ).toBe(false);
+    return view;
+  }
+
+  /** What the sheet must show while B's shape has not loaded: nothing of A's. */
+  function expectNothingOfA() {
+    expect(screen.queryByText(/BTCUSDT/)).toBeNull();
+    const next = screen.getByRole("button", { name: /Continue uncertified/ });
+    expect(next.hasAttribute("disabled")).toBe(true);
+    // The disabled control submits nothing, and nothing reaches the server.
+    fireEvent.click(next);
+    expect(screen.queryByRole("button", { name: /Promote uncertified/ })).toBeNull();
+    expect(paperPromoteMock).not.toHaveBeenCalled();
+  }
+
+  it("keeps the override disabled and hides A's shape while B's run read is pending", async () => {
+    const view = await openOnA();
+    getBacktestRunMock.mockImplementation(({ runId }: { runId: string }) =>
+      runId === "run-b" ? new Promise(() => {}) : Promise.resolve(ok(SHAPE_A)),
+    );
+    view.rerender(<PromoteSheet target={targetB} onClose={vi.fn()} onPromoted={vi.fn()} />);
+
+    expect(await screen.findByText(/No certification record certifies this version\./)).toBeTruthy();
+    await waitFor(() => expect(getBacktestRunMock).toHaveBeenCalledWith({ runId: "run-b" }));
+    expectNothingOfA();
+  });
+
+  it("keeps the override disabled and hides A's shape when B's run read fails", async () => {
+    const view = await openOnA();
+    getBacktestRunMock.mockImplementation(({ runId }: { runId: string }) =>
+      Promise.resolve(
+        runId === "run-b"
+          ? { status: "error" as const, error: busError("data", "run b is unreadable") }
+          : ok(SHAPE_A),
+      ),
+    );
+    view.rerender(<PromoteSheet target={targetB} onClose={vi.fn()} onPromoted={vi.fn()} />);
+
+    await waitFor(() => expect(getBacktestRunMock).toHaveBeenCalledWith({ runId: "run-b" }));
+    // Let B's refused read settle before the sheet is judged.
+    await act(async () => {});
+    expectNothingOfA();
+    // B has no readable shape: the sheet says so, as it does for a version with no run.
+    expect(screen.getByText(/This version has no recorded run yet/)).toBeTruthy();
+  });
+
+  it("submits B's own shape once B's run loads", async () => {
+    const view = await openOnA();
+    view.rerender(<PromoteSheet target={targetB} onClose={vi.fn()} onPromoted={vi.fn()} />);
+
+    expect(await screen.findByText(/ETHUSDT · 1h/)).toBeTruthy();
+    expect(screen.queryByText(/BTCUSDT/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Continue uncertified/ }));
+    expect(await screen.findByText(/Promote v4 without a certificate\?/)).toBeTruthy();
+
+    paperPromoteMock.mockResolvedValue(ok(summaryFixture()));
+    fireEvent.click(screen.getByRole("button", { name: /Promote uncertified/ }));
+    await waitFor(() => expect(paperPromoteMock).toHaveBeenCalledTimes(1));
+    expect(paperPromoteMock.mock.calls[0][0]).toEqual({
+      version_id: "ver-b",
+      override: {
+        reason: REASON,
+        pair: "ETHUSDT",
+        primary_timeframe: "1h",
+        htf_timeframe: null,
+        uses_d1: true,
+      },
+    });
+  });
+});

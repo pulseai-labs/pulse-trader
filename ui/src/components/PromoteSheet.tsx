@@ -81,6 +81,9 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
   useEffect(() => {
     let alive = true;
     setVariant({ kind: "loading" });
+    // The shape belongs to one version (#548): until THIS version's own run
+    // loads, the override has no shape to send, so it stays disabled.
+    setShape(null);
     setStep("explain");
     setRefusal(null);
     setCard({ state: "loading" });
