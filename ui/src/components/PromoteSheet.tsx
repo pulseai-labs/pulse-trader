@@ -63,7 +63,10 @@ interface PromoteSheetProps {
 
 export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps) {
   const [variant, setVariant] = useState<Variant>({ kind: "loading" });
-  const [shape, setShape] = useState<BacktestRunDto | null>(null);
+  // The shape run, tagged with the version it was read for (#548). Nothing reads
+  // this state except `currentShape` below: a run read for another version never
+  // counts, even in the render between a version change and the effect's reset.
+  const [shape, setShape] = useState<{ versionId: string; run: BacktestRunDto } | null>(null);
   // The streak and drawdown card (r5.s4.w2) reads on its OWN state: a failed
   // card read never changes the variant, the refusal or the buttons.
   const [card, setCard] = useState<StreakCardState>({ state: "loading" });
@@ -112,7 +115,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
       const loadShape = async (runId: string | null) => {
         if (runId === null) return;
         const loaded = await commands.getBacktestRun({ runId });
-        if (alive && loaded.status === "ok") setShape(loaded.data);
+        if (alive && loaded.status === "ok") setShape({ versionId, run: loaded.data });
       };
 
       // The version's latest certified record is the gate's `latest_certified`:
@@ -184,11 +187,18 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
     };
   }, [versionId, latestWalkForwardRunId, latestRun]);
 
+  /** The shape run of THIS version, or null while it loads or for another version's. */
+  const currentShape = shape !== null && shape.versionId === versionId ? shape.run : null;
+
   /** The snapshots the certification named — the shape run's data versions. */
   const snapshots =
-    shape === null
+    currentShape === null
       ? []
-      : [shape.primaryDataVersion, shape.htfDataVersion, shape.d1DataVersion].filter(
+      : [
+          currentShape.primaryDataVersion,
+          currentShape.htfDataVersion,
+          currentShape.d1DataVersion,
+        ].filter(
           (version): version is string => version !== null,
         );
 
@@ -249,9 +259,9 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
           {target.strategyName} <span className="dc-ver mono">{target.versionLabel}</span>
         </h2>
         <span className="sh-sub mono">
-          {shape === null
+          {currentShape === null
             ? "the version's recorded run sets the pair and timeframes"
-            : `${shape.pair} · ${shape.primaryTimeframe}${shape.htfTimeframe === null ? "" : ` · ${shape.htfTimeframe}`}`}
+            : `${currentShape.pair} · ${currentShape.primaryTimeframe}${currentShape.htfTimeframe === null ? "" : ` · ${currentShape.htfTimeframe}`}`}
         </span>
       </div>
       <button className="drawer-close" aria-label="Close" onClick={onClose}>
@@ -296,7 +306,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
           </button>
           <button
             className="btn-sec"
-            disabled={trimmed.length === 0 || shape === null}
+            disabled={trimmed.length === 0 || currentShape === null}
             onClick={() => setStep("confirm")}
           >
             Continue uncertified…
@@ -310,15 +320,15 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
           </button>
           <button
             className="btn-warn-solid"
-            disabled={busy || shape === null}
+            disabled={busy || currentShape === null}
             onClick={() => {
-              if (shape === null) return;
+              if (currentShape === null) return;
               void promote({
                 reason: trimmed,
-                pair: shape.pair,
-                primary_timeframe: shape.primaryTimeframe,
-                htf_timeframe: shape.htfTimeframe,
-                uses_d1: shape.d1DataVersion !== null,
+                pair: currentShape.pair,
+                primary_timeframe: currentShape.primaryTimeframe,
+                htf_timeframe: currentShape.htfTimeframe,
+                uses_d1: currentShape.d1DataVersion !== null,
               });
             }}
           >
@@ -450,7 +460,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
                 />
               </label>
               <span className="sh-hint">Saved with the session and shown on its badge, for good.</span>
-              {shape === null && (
+              {currentShape === null && (
                 <span className="sh-hint">
                   This version has no recorded run yet — run a backtest first, so the session's pair
                   and timeframes are its own.
@@ -459,7 +469,7 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
             </div>
           </div>
         )}
-        {variant.kind === "uncertified" && step === "confirm" && shape !== null && (
+        {variant.kind === "uncertified" && step === "confirm" && currentShape !== null && (
           <div className="sh-body">
             <div className="sh-box tone-warn">
               <div>
@@ -489,8 +499,8 @@ export function PromoteSheet({ target, onClose, onPromoted }: PromoteSheetProps)
             <div className="ps-row">
               <span className="ps-lab">Session</span>
               <span className="ps-eng mono">
-                {shape.pair} · {shape.primaryTimeframe}
-                {shape.htfTimeframe === null ? "" : ` · ${shape.htfTimeframe}`}
+                {currentShape.pair} · {currentShape.primaryTimeframe}
+                {currentShape.htfTimeframe === null ? "" : ` · ${currentShape.htfTimeframe}`}
               </span>
             </div>
             <div className="ps-row">

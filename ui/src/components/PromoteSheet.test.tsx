@@ -10,6 +10,7 @@
 // the server's 422 stays the backstop.
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const getWalkForwardRunMock = vi.fn();
@@ -962,5 +963,45 @@ describe("the version changes while the sheet is open (#548)", () => {
         uses_d1: true,
       },
     });
+  });
+
+  it("shows nothing of A in the render that carries B's id, before any effect lands", async () => {
+    // A layout effect runs at the commit, before the sheet's passive effect can
+    // reset its state: it sees the DOM of the render between the version change
+    // and the effect, the one a click could reach.
+    const seen: { aPairShown: boolean; overrideEnabled: boolean }[] = [];
+    function CommitProbe() {
+      useLayoutEffect(() => {
+        const submit = screen.queryByRole("button", { name: /Promote uncertified/ });
+        seen.push({
+          aPairShown: document.body.textContent?.includes("BTCUSDT") ?? false,
+          overrideEnabled: submit !== null && !submit.hasAttribute("disabled"),
+        });
+      });
+      return null;
+    }
+    const tree = (target: typeof targetA) => (
+      <>
+        <PromoteSheet target={target} onClose={vi.fn()} onPromoted={vi.fn()} />
+        <CommitProbe />
+      </>
+    );
+
+    const view = render(tree(targetA));
+    expect(await screen.findByText(/BTCUSDT · 15m · 4h/)).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: REASON } });
+    fireEvent.click(screen.getByRole("button", { name: /Continue uncertified/ }));
+    // On A the override is live: the guard below is the only thing that can turn it off.
+    expect(
+      (await screen.findByRole("button", { name: /Promote uncertified/ })).hasAttribute("disabled"),
+    ).toBe(false);
+
+    seen.length = 0;
+    view.rerender(tree(targetB));
+
+    // The first commit with B's props: A's pair is gone and the override is not live.
+    expect(seen[0]).toEqual({ aPairShown: false, overrideEnabled: false });
+    await act(async () => {});
+    expect(paperPromoteMock).not.toHaveBeenCalled();
   });
 });
