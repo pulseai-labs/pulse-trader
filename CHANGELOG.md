@@ -717,6 +717,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   4 bps that run recorded. A certification measured at another taker fee no longer promotes to a paper session
   (the override cannot bypass it); certify the version again at the current fee to promote it.
 
+- **Opening an old run says why it cannot open (0.1.18, #391).** Opening a run saved before inputs were recorded now says
+  so and asks for a re-run, instead of a "freshly saved" read-back error.
+
 - **The open Library follows the server (#324, d37).** The Strategy Library read its overview only on mount
   and on a window focus / visibility return, so an agent-submitted child version never reached an untouched,
   focused Library — the r5 close watched two submissions stay invisible for 5.5 and 10.5 minutes until
