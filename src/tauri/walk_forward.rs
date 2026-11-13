@@ -428,6 +428,16 @@ pub async fn get_walk_forward_run_core(
     walk_forward_run_dto(&run, &fold_runs)
 }
 
+/// The refusal text for a persisted run that records no inputs (#391). The text
+/// lives in this one place in the code; the test repeats it, so a change to the
+/// wording fails the test.
+fn predates_recorded_inputs_message(run_id: &str) -> String {
+    format!(
+        "backtest run {run_id} predates recorded inputs, so it cannot be opened; \
+         re-run the version to get a run that opens"
+    )
+}
+
 /// `get_backtest_run`'s transport-free core (r2.s3.w5): one persisted run id
 /// in, the same [`BacktestRunDto`] `run_backtest_version` answers with out —
 /// a walk-forward fold's id therefore opens as an ordinary run carrying its
@@ -437,7 +447,9 @@ pub async fn get_walk_forward_run_core(
 ///
 /// Returns a [`BusError`]: [`BusErrorCode::NotFound`] when the id names no run
 /// (the asked-for id rides `child_run_id`, the same slot
-/// `compare_child_run`'s refusal uses), and the read-back's own
+/// `compare_child_run`'s refusal uses), [`BusErrorCode::Data`] when the run was
+/// saved before inputs were recorded (#391; that run IS persisted, so its id
+/// rides `run_id`, as the base mapping carried it), and the read-back's own
 /// [`BacktestAppError`](crate::application::backtest::BacktestAppError)
 /// mapping otherwise — including its `run_id` carry when a saved row exists
 /// but its projection fails.
@@ -465,6 +477,22 @@ pub async fn get_backtest_run_core(
             return Err(BusError::with_child_run_id(
                 BusErrorCode::NotFound,
                 format!("no backtest run {}", request.run_id),
+                request.run_id,
+            ));
+        }
+        // #391: a run saved before `0006` has no recorded inputs. `read_back`
+        // words that for the SAVE path ("a freshly saved run read back with no
+        // input provenance"), which is false for a run opened later from the
+        // list, so this read answers it with its own refusal. The save path's
+        // text and `FreshInputsMissing` itself are unchanged.
+        Err(BacktestAppError::SavedButReadBackFailed {
+            stage: ReadBackStage::Run,
+            failure: ReadBackFailure::FreshInputsMissing,
+            ..
+        }) => {
+            return Err(BusError::with_run_id(
+                BusErrorCode::Data,
+                predates_recorded_inputs_message(&request.run_id),
                 request.run_id,
             ));
         }
