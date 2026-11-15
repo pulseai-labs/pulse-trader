@@ -131,6 +131,30 @@ export function toCandles(candles: readonly ChartCandleDto[]): CandlePoint[] {
   }));
 }
 
+/** The loaded bars a holdout band starts from (r7.s2.w1): the first loaded bar opening at or
+ *  after the holdout start, and the loaded bar before it. Times are the library's seconds. */
+export interface HoldoutBandBars {
+  /** The first held-out bar's open. */
+  readonly first: number;
+  /** The open of the loaded bar before it, or `null` when the first loaded bar is already inside. */
+  readonly before: number | null;
+}
+
+/** Where the holdout band starts in `candles`, or `null` when no start is known or no loaded
+ *  bar opens at or after it. A bar that opens before the start is not held out, even when the
+ *  start falls inside it: the server's cut is by open time too. */
+export function holdoutBandBars(
+  candles: readonly CandlePoint[],
+  holdoutStartMs: string | null,
+): HoldoutBandBars | null {
+  if (holdoutStartMs === null) return null;
+  // Compared in milliseconds: a start inside a bar must not round down onto that bar's open.
+  const start = Number(holdoutStartMs);
+  const index = candles.findIndex((candle) => candle.time * 1000 >= start);
+  if (index === -1) return null;
+  return { first: candles[index].time, before: index === 0 ? null : candles[index - 1].time };
+}
+
 /** The level, line, band-edge and oscillator overlays, as drawable series.
  *
  *  `values[i]` belongs to `candles[i]` — the read returns one value per WINDOW bar —

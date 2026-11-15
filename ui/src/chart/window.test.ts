@@ -103,25 +103,23 @@ describe("windowAround", () => {
   const A = String(ENTRY);
 
   it("asks a free chart for 500 bars either side of the date", () => {
-    expect(windowAround(null, "15m", A)).toEqual({
+    expect(windowAround("15m", A)).toEqual({
       kind: "window",
       fromMs: String(ENTRY - HALF_MS),
       toMs: String(ENTRY + HALF_MS),
     });
   });
 
-  it("plans a run leg around a date exactly as around a trade", () => {
-    // 15m is over the cap: a window, clamped near both edges.
-    for (const anchor of [A, String(FIRST + DAY), String(LAST - DAY)]) {
-      expect(windowAround(SPAN, "15m", anchor)).toEqual(windowPlan(SPAN, "15m", anchor));
-    }
-    // 4h fits in one read: the span.
-    expect(windowAround(SPAN, "4h", A)).toEqual(windowPlan(SPAN, "4h", A));
-    expect(windowAround(SPAN, "4h", A)).toEqual({ kind: "span" });
+  it("asks for 500 4h bars either side on 4h", () => {
+    expect(windowAround("4h", A)).toEqual({
+      kind: "window",
+      fromMs: String(ENTRY - 500 * 14_400_000),
+      toMs: String(ENTRY + 500 * 14_400_000),
+    });
   });
 
   it("asks for the span on a timeframe it cannot size", () => {
-    expect(windowAround(null, "3m", A)).toEqual({ kind: "span" });
+    expect(windowAround("3m", A)).toEqual({ kind: "span" });
   });
 });
 

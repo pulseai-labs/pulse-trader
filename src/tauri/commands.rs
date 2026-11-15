@@ -1939,7 +1939,7 @@ pub async fn streak_card(
 }
 
 /// `chart_data` — what the Chart tab draws for a pair and timeframe: a window of
-/// candles (capped, cut at an open freeze's holdout start) and, when a backtest
+/// candles (capped; cut at an open freeze's holdout start when a run is named) and, when a backtest
 /// run is named, that run's trades and one overlay series per S/R, pivot,
 /// candle-pattern and EMA operand its version's rule uses on that series
 /// (r5.s2.w1, PDR-0036). Every overlay value is the engine's, read exactly as

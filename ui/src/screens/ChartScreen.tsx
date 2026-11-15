@@ -42,6 +42,8 @@ import type {
 } from "../bindings";
 import type { ChartAdapter } from "../chart/adapter";
 import { createChartAdapter } from "../chart/adapter";
+import type { ChartContext, PaneReadGate } from "../chart/context";
+import { MAIN_PANE, chartDataRequest, createPaneReadGate } from "../chart/context";
 import { beforeFence, fenceStartMs } from "../chart/layers";
 import type { WindowPlan } from "../chart/window";
 import { covers, parseUtcInstant, windowAround, windowPlan } from "../chart/window";
@@ -179,16 +181,13 @@ function beforeMs(raw: string, boundary: string): boolean {
  *  The server's message is ALWAYS what is shown when nothing better can be said: it is
  *  prose, safe to show a trader, and it names the offending member.
  *
- *  Two refusals get the spec's own sentence instead, and both are decided from a fact the
- *  tab holds rather than from the message's wording:
+ *  Two refusals get the spec's own sentence instead, and both are decided from the
+ *  refusal's code rather than from the message's wording:
  *
- *  * **The holdout fence.** The bus folds the route's own `holdout` token onto
- *    `Validation` (`tauri/error.rs::from_server_token`), so by the time a refusal reaches
- *    this screen its code no longer says which refusal it was. What DOES decide it is the
- *    tab's own knowledge of the fence plus the bar it sent: the fence is the write's FIRST
- *    step after field parsing (G2), so a bar at or after a known holdout start is refused
- *    for the fence and nothing else. When the freeze opened after this tab's last read the
- *    start is unknown, and the server's message — which names the date itself — is shown.
+ *  * **The holdout fence** crosses the bus as its own code, `holdout` (#427), so a field
+ *    refusal at a bar inside the holdout keeps its own message. With the holdout start known
+ *    the tab names its date; when the freeze opened after the tab's last read the start is
+ *    unknown, and the server's message, which names the date itself, is shown.
  *  * **A candle that does not exist.** `candle_not_found` survives the fold as
  *    `Validation` too, and the tab cannot tell it from another validation, so it names the
  *    time, the pair and the timeframe ONLY when the message's own code came through
@@ -199,12 +198,8 @@ function refusalText(
   context: { readonly pair: string; readonly timeframe: string; readonly barTime: string },
   holdoutStartMs: string | null,
 ): string {
-  const fenceKnown =
-    holdoutStartMs !== null && atOrAfterMs(context.barTime, holdoutStartMs);
-  if (code === "holdout" || fenceKnown) {
-    if (holdoutStartMs !== null) {
-      return `This candle is inside the holdout from ${dateUtc(holdoutStartMs)}; marks there are refused for every writer`;
-    }
+  if (code === "holdout" && holdoutStartMs !== null) {
+    return `This candle is inside the holdout from ${dateUtc(holdoutStartMs)}; marks there are refused for every writer`;
   }
   if (code === "candle_not_found") {
     return `No candle opens at ${timeUtc(context.barTime)} on ${context.pair} ${context.timeframe} in the data the server holds.`;
@@ -283,6 +278,8 @@ function readKey(request: ChartRequest): string {
 export default function ChartScreen() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const adapterRef = useRef<ChartAdapter | null>(null);
+  /** The pane's read ids (ADR-0030 amendment, 2026-11-14). */
+  const readGateRef = useRef<PaneReadGate>(createPaneReadGate());
   /** Whether anything is currently drawn, so a new read clears it first: the chart
    *  never shows one window's candles under the next window's label. */
   const drawnRef = useRef(false);
@@ -385,6 +382,7 @@ export default function ChartScreen() {
       adapter.setTrades([]);
       adapter.setMarks([]);
       adapter.setSelectedTrade(null, "primary");
+      adapter.setHoldout(null);
     }
     drawnRef.current = false;
     drawnReadRef.current = null;
@@ -671,21 +669,34 @@ export default function ChartScreen() {
     clearDrawing();
     setPhase({ kind: "loading", what: loadingText(request) });
     let cancelled = false;
+    // This pane's request id: a later read of the pane makes this answer late, and a late
+    // answer is dropped.
+    const requestId = readGateRef.current.begin(MAIN_PANE);
     /** Whether an answer that just arrived is still the answer to the request the tab
      *  holds now. It is not, when this request was replaced while the read was in flight
      *  — a leg switch, another trade, a free selection — or when the fragment named
      *  another run, which invalidates the request outright (CR5): an answer asked for
      *  under an identity the tab has left writes nothing, neither a refusal nor a window. */
-    const stillWanted = (): boolean => !cancelled && requestRef.current === request;
+    const stillWanted = (): boolean =>
+      !cancelled &&
+      requestRef.current === request &&
+      readGateRef.current.accepts(MAIN_PANE, requestId);
+    const paneContext: ChartContext = {
+      paneId: MAIN_PANE,
+      pair: request.pair,
+      timeframe: request.timeframe,
+      indicators: [],
+    };
     void (async () => {
       try {
-        const answer = await commands.chartData({
-          pair: request.pair,
-          timeframe: request.timeframe,
-          fromMs: request.plan.kind === "window" ? request.plan.fromMs : null,
-          toMs: request.plan.kind === "window" ? request.plan.toMs : null,
-          runId: request.runId,
-        });
+        const answer = await commands.chartData(
+          chartDataRequest(
+            paneContext,
+            request.plan.kind === "window" ? request.plan.fromMs : null,
+            request.plan.kind === "window" ? request.plan.toMs : null,
+            request.runId,
+          ),
+        );
         if (!stillWanted()) return;
         if (answer.status !== "ok") {
           setPhase({ kind: "failed", message: answer.error.message, code: answer.error.code });
@@ -729,6 +740,9 @@ export default function ChartScreen() {
     adapter.setCandles(dto.candles);
     adapter.setOverlays(overlays);
     adapter.setTrades(dto.run?.trades ?? []);
+    // A run-less read carries the holdout's bars; a run's read was cut before them (ADR-0030
+    // amendment, 2026-11-14).
+    adapter.setHoldout(dto.run === null ? (dto.holdout?.holdoutStartMs ?? null) : null);
     // Where the view lands: on the anchor the read was asked around (a bounded read,
     // clamped or not), else the whole window.
     const anchor = drawnAnchorRef.current;
@@ -854,7 +868,9 @@ export default function ChartScreen() {
       setGoToNote("The chart has not loaded yet; go to a date once it has.");
       return;
     }
-    if (holdoutStart !== null && atOrAfterMs(instant, holdoutStart)) {
+    // A run's chart is cut at the holdout start, so a date inside it is refused; the free chart
+    // draws the holdout's bars (ADR-0030 amendment, 2026-11-14).
+    if (run !== null && holdoutStart !== null && atOrAfterMs(instant, holdoutStart)) {
       setGoToNote(
         `That date is inside the holdout from ${dateUtc(holdoutStart)}; the chart withholds it.`,
       );
@@ -884,7 +900,7 @@ export default function ChartScreen() {
             pair: free.pair,
             timeframe: free.timeframe,
             runId: null,
-            plan: windowAround(null, free.timeframe, instant),
+            plan: windowAround(free.timeframe, instant),
             anchorMs: instant,
             anchorWhat: "date",
           };
@@ -1189,7 +1205,9 @@ export default function ChartScreen() {
       <div className="cw-notes">
         {dto?.holdout != null && (
           <p className="cw-note" role="note">
-            {`Holdout from ${dateUtc(dto.holdout.holdoutStartMs)} — ${dto.holdout.barsWithheld} bars withheld`}
+            {dto.run === null
+              ? `Holdout — from ${dateUtc(dto.holdout.holdoutStartMs)} · agents can't test here`
+              : `Holdout from ${dateUtc(dto.holdout.holdoutStartMs)} — ${dto.holdout.barsWithheld} bars withheld`}
           </p>
         )}
         {dto?.run != null && dto.run.notDrawn.length > 0 && (

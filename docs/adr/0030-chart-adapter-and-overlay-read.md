@@ -59,9 +59,10 @@ command `chart_data`, both straight through one transport-free core:
   candles the cut removed **inside the resolved window** — an explicit `fromMs`/`toMs`, else the
   run's own recorded window, else, for a read naming no run and no bounds, the whole pinned
   snapshot. The count is NOT narrowed by the 20,000-bar slice such a read returns: it answers
-  "how many of this window's bars did the fence withhold" (r5.s2 close review). Every chart read
-  cuts at an open freeze's holdout start BEFORE the engine steps (grill Q5), exactly as the agent
-  exports do.
+  "how many of this window's bars did the fence withhold" (r5.s2 close review). A read that names
+  a run cuts at an open freeze's holdout start BEFORE the engine steps (grill Q5), exactly as the
+  agent exports do; a read that names no run returns the holdout bars (amendment r7.s2.w1,
+  2026-11-14).
 - **`run` is `null` when no run is named**, else `{ runId, versionId, series, trades, overlays,
   notDrawn }`. `series` is `primary` or `htf` — each overlay is computed on the timeframe its
   rule was compiled for (grill Q2), and trades ride both. `trades` are the run's stored rows
@@ -101,7 +102,7 @@ command `chart_data`, both straight through one transport-free core:
 - **A library swap touches `ui/src/chart/` only** — and a library that cannot draw a level
   series, an event marker or an accessible table copy is not adoptable without amending this
   ADR (the spine's F2 requires the table copy).
-- **A new overlay kind is an ADR amendment,** not a quiet extension: the four kinds above are
+- **A new overlay kind is an ADR amendment,** not a quiet extension: the kinds this ADR and its amendments name are
   the contract the tab switches on. Oscillators (RSI, ADX, MACD, ATR) and the geometry beyond
   the per-bar series (necklines, trendlines, zone rectangles) stay OUT by ruling: they are
   named in `notDrawn`, not drawn (grill Q4; PDR-0011).
@@ -148,6 +149,33 @@ the 4H signal bar (PDR-0048).
 
 Each listed trade also carries `stopPrice` (the stored stop) and, for a setup trade (ADR-0033), `armBarTime`,
 `htfArmBarTime`, `dipBarTime` and `triggerBarTime`: the opens of the bars its stored trace names, derived on the
-server from the run's own timeframes, so the tab only looks a bar up. They are `null` without a setup. The fence
+server from the run's own timeframes, so the tab only looks a bar up. `stopPrice` is `null` on a trade stored without a stop; `armBarTime`, `dipBarTime` and `triggerBarTime` are `null` without a setup; and
+`htfArmBarTime` is `null` without a setup or when the run read no higher timeframe. The fence
 is unchanged: every setup bar closes before the entry fill, so a trade withheld whole takes its setup bars with it.
 No target price is stored, so none is sent.
+
+## Amendment (r7.s2.w1, 2026-11-14): a run-less read draws the holdout; the chart context
+
+Ruled by the operator on 2026-11-14 ("proceed with recommendation") under PDR-0051 decision 8: the r7 chart
+may show every candle.
+
+- **A read that names no run returns every candle.** Its candles run on past an open freeze's holdout start,
+  its `holdout` still names that start, and its `barsWithheld` is `0`, because it withholds nothing. The tab
+  hatches the bars that open at or after the start and says "Holdout — from <date> · agents can't test here".
+  Such a read carries no overlay and no trade, so nothing computed reaches past the start.
+- **A read that names a run is fenced exactly as above.** Its candles are cut at the holdout start before the
+  engine steps, `barsWithheld` counts the window's bars the cut removed, its overlays come from the cut series
+  only, and it lists only trades that end before the start. A mark at or after the start is still refused, and
+  the refusal now crosses the bus as its own code, `holdout` (#427).
+- **Agents never read past the start.** The chart route is mounted `Scope::App` only, so an agent token is
+  refused 403 `scope_refused` before the read runs, and agents read candles only through MCP, whose exports
+  keep the cut.
+- **The chart context lives in `ui/src/chart/context.ts`, not on the wire.** A pane is `{ paneId, pair,
+  timeframe, indicators }`: `paneId` names the pane, `pair` and `timeframe` are what it reads, and `indicators`
+  is the slot r7.s4 fills under its own amendment (empty until then; an entry is an engine token). Every read
+  takes a request id from a per-pane gate, and an answer whose id is no longer its pane's newest is dropped.
+  Neither id crosses the wire: a bus call already answers the call that made it, so the ids decide only which
+  answer a pane still wants. A dropped read is not cancelled: the bus has no abort, and its answer is not drawn.
+  No drawing is attached to a pane; drawings are server state (r7.s7 design).
+
+The rest of this ADR stands.

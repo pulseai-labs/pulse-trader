@@ -290,6 +290,8 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
         (BusErrorCode::SessionStopped, "session_stopped"),
         (BusErrorCode::RuntimeUnavailable, "runtime_unavailable"),
         (BusErrorCode::SessionNotAttached, "session_not_attached"),
+        // r7.s2.w1 (#427): the holdout fence is its own family.
+        (BusErrorCode::Holdout, "holdout"),
     ];
 
     for (code, token) in &pinned {
@@ -324,10 +326,11 @@ fn every_bus_error_code_serializes_as_its_pinned_token() {
             | BusErrorCode::CertificationUnreadable
             | BusErrorCode::SessionStopped
             | BusErrorCode::RuntimeUnavailable
-            | BusErrorCode::SessionNotAttached => {}
+            | BusErrorCode::SessionNotAttached
+            | BusErrorCode::Holdout => {}
         }
     }
-    assert_eq!(pinned.len(), 17, "every code is pinned exactly once");
+    assert_eq!(pinned.len(), 18, "every code is pinned exactly once");
 }
 
 /// The one crossable error that CAN name a persisted run. The shape test above

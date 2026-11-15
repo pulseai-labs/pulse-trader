@@ -1,9 +1,9 @@
 //! The chart read contract (r5.s2.w1, PDR-0036) — the **app's** one view of what
-//! the Chart tab draws: a window of candles for a pair and timeframe (capped and
-//! cut at an open freeze's holdout start) and, when a backtest run is named, that
-//! run's trades and one overlay series per S/R, pivot, candle-pattern, EMA, SMA and
-//! `WaveTrend` operand its version's rule uses on that series, plus the ribbon's band
-//! edges (r6.s4.w1).
+//! the Chart tab draws: a window of candles for a pair and timeframe (capped; cut
+//! at an open freeze's holdout start when a run is named) and, when a backtest
+//! run is named, that run's trades and one overlay series per S/R, pivot,
+//! candle-pattern, EMA, SMA and `WaveTrend` operand its version's rule uses on
+//! that series, plus the ribbon's band edges (r6.s4.w1).
 //!
 //! **The engine computes; the tab draws (PDR-0002).** Every overlay value here
 //! comes from stepping the existing [`IndicatorEngine`] exactly as MCP
@@ -97,12 +97,17 @@ pub struct ChartCandleDto {
 /// snapshot. It is NOT the capped slice a default pair read hands back: the count
 /// answers "how many of this window's bars did the fence withhold", which is why a
 /// read with no window of its own can report bars the returned slice never held.
+///
+/// A read that names no run cuts nothing (ADR-0030 amendment, 2026-11-14): it returns the
+/// candles from the holdout start onward too, its `barsWithheld` is 0, and the tab hatches those
+/// bars.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartHoldoutDto {
     /// The open freeze's holdout start, epoch ms as an exact integer string.
     pub holdout_start_ms: String,
-    /// How many candles the cut removed inside the resolved window.
+    /// How many candles the cut removed inside the resolved window; 0 on a read that names no
+    /// run, which cuts nothing.
     pub bars_withheld: u32,
 }
 
@@ -283,9 +288,10 @@ pub async fn chart_data_core(
     let timeframe = parse_timeframe(&request.timeframe).map_err(|e| field("timeframe", e))?;
     let from_ms = parse_window_ms(request.from_ms.as_deref(), "fromMs")?;
     let to_ms = parse_window_ms(request.to_ms.as_deref(), "toMs")?;
-    // The open freeze, read ONCE and BEFORE any candle is loaded or stepped:
-    // while one is open this read stops at the holdout start (Q5). A read failure
-    // is an error, never a silent `None`.
+    // The open freeze, read ONCE and BEFORE any candle is loaded or stepped. A read
+    // that names a run stops at its holdout start (Q5); a read that names none
+    // returns every candle and names the start. A read failure is an error, never a
+    // silent `None`.
     let holdout = state.open_holdout().await?;
     let store = state.candles();
 
@@ -293,6 +299,11 @@ pub async fn chart_data_core(
         Some(run_id) => Some(resolve_run(state, run_id, &pair, timeframe).await?),
         None => None,
     };
+    // ADR-0030 amendment (2026-11-14, PDR-0051 d8): only a read that names a run is cut at the
+    // holdout start — its candles, overlays and trades stop there exactly as before. A read that
+    // names no run returns every candle and still names the holdout start, so the tab hatches the
+    // bars from it on; it carries no overlay and no trade to fence.
+    let cut = if run.is_some() { holdout } else { None };
     // A bounded read — an explicit window, or a run's own span — is refused over
     // the cap; the plain pair read takes the latest bars up to it (Q3/G4).
     let bounded = run.is_some() || from_ms.is_some() || to_ms.is_some();
@@ -320,7 +331,7 @@ pub async fn chart_data_core(
                 version.as_ref(),
                 span.as_ref().map(|(tf, version)| (*tf, version)),
                 window,
-                holdout,
+                cut,
                 (from_ms, to_ms),
                 bounded,
                 &specs,
@@ -716,7 +727,8 @@ impl DrawEdge {
 /// the engine's first step and before any window is taken, so no holdout candle
 /// reaches either (Q5); the engine then steps the WHOLE cut series from its first
 /// candle, so warm-up matches `export_indicators` bar for bar (G2), and only
-/// afterwards is the window kept.
+/// afterwards is the window kept. `holdout` is the freeze to cut at: `None` for a read that
+/// names no run (ADR-0030 amendment, 2026-11-14), which cuts nothing.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one read in one place; the caller is the core
 fn read_window(
     store: &CandleStore,
@@ -1252,4 +1264,219 @@ fn field(field_name: &str, message: impl std::fmt::Display) -> BusError {
 /// A count as the wire's `u32` — specta refuses 64-bit integers.
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::band_edges;
+    use crate::application::mark_explain::operand_label;
+    use crate::application::mcp_read::indicator_label;
+    use crate::domain::{Series, StrategyDsl};
+
+    /// `ema:<period>` on `series` (`primary` / `htf`), as DSL JSON.
+    fn ema(series: &str, period: u32) -> String {
+        format!(
+            r#"{{ "type": "Indicator", "series": "{series}", "spec": {{ "indicator": "Ema", "period": {period} }} }}"#
+        )
+    }
+
+    /// `Arith { op, lhs, rhs }` as DSL JSON; `op` is `max` or `min`.
+    fn arith(op: &str, lhs: &str, rhs: &str) -> String {
+        format!(r#"{{ "type": "Arith", "op": "{op}", "lhs": {lhs}, "rhs": {rhs} }}"#)
+    }
+
+    /// The primary close, as DSL JSON.
+    const CLOSE: &str = r#"{ "type": "Price", "field": "Close" }"#;
+
+    /// `Close > rhs` as DSL JSON.
+    fn close_gt(rhs: &str) -> String {
+        format!(r#"{{ "type": "Compare", "lhs": {CLOSE}, "op": "Gt", "rhs": {rhs} }}"#)
+    }
+
+    /// `Close > 0`: a condition with no edge.
+    fn no_edge() -> String {
+        close_gt(r#"{ "type": "Constant", "value": "0" }"#)
+    }
+
+    /// A long rule: `entry`, `filters`, a stop and a target plus `exits`, and an optional `setup`.
+    fn dsl(entry: &str, filters: &[String], exits: &[String], setup: Option<&str>) -> StrategyDsl {
+        let mut all_exits = vec![
+            r#"{ "type": "StopLoss", "distance_pct": "0.02" }"#.to_owned(),
+            r#"{ "type": "TakeProfit", "target_r": "1" }"#.to_owned(),
+        ];
+        all_exits.extend(exits.iter().cloned());
+        let setup = setup.map_or_else(String::new, |setup| format!(r#", "setup": {setup}"#));
+        let json = format!(
+            r#"{{ "schema_version": "1.6.0", "name": "band edge walk", "direction": "long", "entry": {entry}, "filters": [{}], "exits": [{}], "risk": {{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }}{setup} }}"#,
+            filters.join(","),
+            all_exits.join(",")
+        );
+        serde_json::from_str(&json).expect("the walk DSL parses")
+    }
+
+    /// Each edge's label and member tokens, in the order `band_edges` found them.
+    fn edges(dsl: &StrategyDsl, series: Series) -> Vec<(String, Vec<String>)> {
+        band_edges(dsl, series)
+            .iter()
+            .map(|edge| {
+                (
+                    operand_label(&edge.value),
+                    edge.members.iter().map(indicator_label).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// One expected edge.
+    fn edge(label: &str, members: &[&str]) -> (String, Vec<String>) {
+        (
+            label.to_owned(),
+            members.iter().map(|member| (*member).to_owned()).collect(),
+        )
+    }
+
+    /// `max(ema:<a>,ema:<b>)` / `min(..)` as the tests expect it, with its two members.
+    fn pair_edge(op: &str, a: u32, b: u32) -> (String, Vec<String>) {
+        (
+            format!("{op}(ema:{a},ema:{b})"),
+            vec![format!("ema:{a}"), format!("ema:{b}")],
+        )
+    }
+
+    fn max_of(a: u32, b: u32) -> String {
+        arith("max", &ema("primary", a), &ema("primary", b))
+    }
+
+    fn min_of(a: u32, b: u32) -> String {
+        arith("min", &ema("primary", a), &ema("primary", b))
+    }
+
+    #[test]
+    fn band_edges_reads_signal_exit_conditions() {
+        let rule = dsl(
+            &no_edge(),
+            &[],
+            &[format!(
+                r#"{{ "type": "SignalExit", "condition": {} }}"#,
+                close_gt(&max_of(5, 11))
+            )],
+            None,
+        );
+        assert_eq!(
+            edges(&rule, Series::Primary),
+            vec![edge("max(ema:5,ema:11)", &["ema:5", "ema:11"])]
+        );
+    }
+
+    #[test]
+    fn band_edges_reads_each_setup_condition_in_order() {
+        let setup = format!(
+            r#"{{ "expiry_bars": 96, "long": {{ "arm": {}, "dip": {}, "trigger": {}, "stop_anchor": {} }}, "short": {{ "arm": {}, "dip": {}, "trigger": {} }} }}"#,
+            close_gt(&max_of(5, 11)),
+            close_gt(&min_of(5, 11)),
+            close_gt(&max_of(15, 18)),
+            close_gt(&min_of(15, 18)),
+            close_gt(&max_of(21, 24)),
+            no_edge(),
+            no_edge(),
+        );
+        let rule = dsl(&no_edge(), &[], &[], Some(&setup));
+        assert_eq!(
+            edges(&rule, Series::Primary),
+            vec![
+                pair_edge("max", 5, 11),
+                pair_edge("min", 5, 11),
+                pair_edge("max", 15, 18),
+                pair_edge("min", 15, 18),
+                pair_edge("max", 21, 24),
+            ]
+        );
+    }
+
+    #[test]
+    fn band_edges_reads_every_condition_arm() {
+        let filters = vec![
+            format!(
+                r#"{{ "type": "CrossesAbove", "lhs": {}, "rhs": {CLOSE} }}"#,
+                max_of(5, 11)
+            ),
+            format!(
+                r#"{{ "type": "CrossesBelow", "lhs": {CLOSE}, "rhs": {} }}"#,
+                min_of(5, 11)
+            ),
+            format!(
+                r#"{{ "type": "Not", "condition": {} }}"#,
+                close_gt(&max_of(15, 18))
+            ),
+            format!(
+                r#"{{ "type": "Rising", "value": {}, "bars": 1 }}"#,
+                max_of(21, 24)
+            ),
+            format!(
+                r#"{{ "type": "Falling", "value": {}, "bars": 1 }}"#,
+                min_of(21, 24)
+            ),
+            format!(
+                r#"{{ "type": "Or", "conditions": [{}] }}"#,
+                close_gt(&max_of(28, 34))
+            ),
+            format!(
+                r#"{{ "type": "And", "conditions": [{}] }}"#,
+                close_gt(&min_of(28, 34))
+            ),
+        ];
+        let rule = dsl(&no_edge(), &filters, &[], None);
+        assert_eq!(
+            edges(&rule, Series::Primary),
+            vec![
+                pair_edge("max", 5, 11),
+                pair_edge("min", 5, 11),
+                pair_edge("max", 15, 18),
+                pair_edge("max", 21, 24),
+                pair_edge("min", 21, 24),
+                pair_edge("max", 28, 34),
+                pair_edge("min", 28, 34),
+            ]
+        );
+    }
+
+    #[test]
+    fn band_edges_lists_a_repeated_edge_once_and_a_repeated_member_once() {
+        let nested = arith("max", &max_of(5, 11), &ema("primary", 5));
+        let rule = dsl(
+            &close_gt(&max_of(5, 11)),
+            &[close_gt(&max_of(5, 11)), close_gt(&nested)],
+            &[],
+            None,
+        );
+        assert_eq!(
+            edges(&rule, Series::Primary),
+            vec![
+                edge("max(ema:5,ema:11)", &["ema:5", "ema:11"]),
+                edge("max(max(ema:5,ema:11),ema:5)", &["ema:5", "ema:11"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn band_edges_on_each_series_keeps_only_its_own_leaves() {
+        let rule = dsl(
+            &no_edge(),
+            &[
+                close_gt(&arith("max", &ema("htf", 20), &ema("htf", 30))),
+                close_gt(&max_of(5, 11)),
+            ],
+            &[],
+            None,
+        );
+        assert_eq!(
+            edges(&rule, Series::Htf),
+            vec![edge("max(h4:ema:20,h4:ema:30)", &["ema:20", "ema:30"])]
+        );
+        assert_eq!(
+            edges(&rule, Series::Primary),
+            vec![edge("max(ema:5,ema:11)", &["ema:5", "ema:11"])]
+        );
+    }
 }

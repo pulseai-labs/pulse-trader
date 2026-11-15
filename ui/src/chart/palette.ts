@@ -54,6 +54,12 @@ export const PALETTE_TOKENS = {
   setup: "--chart-setup",
   /** The selected trade's stop line. */
   stop: "--chart-stop",
+  /** The holdout band's fill (r7.s2.w1), drawn at the band's own opacity. */
+  holdoutFill: "--chart-holdout-fill",
+  /** The holdout band's hatch lines. */
+  holdoutHatch: "--chart-holdout-hatch",
+  /** The holdout band's dashed left edge. */
+  holdoutEdge: "--chart-holdout-edge",
 } as const;
 
 /** Every colour the chart draws with, resolved to a value the canvas accepts. */
@@ -88,5 +94,8 @@ export function chartPalette(root: Element): ChartPalette {
     oscillatorGuide: read(PALETTE_TOKENS.oscillatorGuide),
     setup: read(PALETTE_TOKENS.setup),
     stop: read(PALETTE_TOKENS.stop),
+    holdoutFill: read(PALETTE_TOKENS.holdoutFill),
+    holdoutHatch: read(PALETTE_TOKENS.holdoutHatch),
+    holdoutEdge: read(PALETTE_TOKENS.holdoutEdge),
   };
 }
