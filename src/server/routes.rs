@@ -386,8 +386,8 @@ async fn plain_streak_card(
     }
 }
 
-/// `POST /api/v1/chart` — the Chart tab's read: a window of candles (capped, cut
-/// at an open freeze's holdout start) and, for a named run, its trades and its
+/// `POST /api/v1/chart` — the Chart tab's read: a window of candles (capped; a read naming a run is
+/// cut at an open freeze's holdout start) and, for a named run, its trades and its
 /// rule's overlays, straight through the core (r5.s2.w1, PDR-0036). Mounted
 /// `Scope::App`: an `agent` token is a 403 `scope_refused` with an audit row,
 /// exactly like every other route on this table.

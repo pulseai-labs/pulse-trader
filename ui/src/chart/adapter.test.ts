@@ -25,15 +25,20 @@ const h = vi.hoisted(() => {
     fitContent: vi.fn(),
     setVisibleLogicalRange: vi.fn(),
     getVisibleLogicalRange: vi.fn(),
+    timeToCoordinate: vi.fn(),
   };
   const series: {
     definition: unknown;
     options: unknown;
     pane: number | undefined;
+    removed: boolean;
     setData: ReturnType<typeof vi.fn>;
+    attachPrimitive: ReturnType<typeof vi.fn>;
     createPriceLine: ReturnType<typeof vi.fn>;
     removePriceLine: ReturnType<typeof vi.fn>;
   }[] = [];
+  // A library that keeps an empty pane (`preserveEmptyPane`) is the other branch of C2.
+  const flags = { preserveEmptyPanes: false };
   // The library's panes: pane 0 always exists, and a series added at a higher index makes
   // the panes up to it. `removePane` takes the pane away, as the library does.
   const panes: { setStretchFactor: ReturnType<typeof vi.fn> }[] = [];
@@ -45,7 +50,9 @@ const h = vi.hoisted(() => {
         definition,
         options,
         pane,
+        removed: false,
         setData: vi.fn(),
+        attachPrimitive: vi.fn(),
         createPriceLine: vi.fn((line: unknown) => ({ line })),
         removePriceLine: vi.fn(),
       };
@@ -56,7 +63,14 @@ const h = vi.hoisted(() => {
     removePane: vi.fn((index: number) => {
       panes.splice(index, 1);
     }),
-    removeSeries: vi.fn(),
+    // The pinned library (5.2.1, `_cleanupIfPaneIsEmpty`) removes a pane with its last series,
+    // unless it is the only pane or it preserves itself.
+    removeSeries: vi.fn((gone: { pane: number | undefined; removed: boolean }) => {
+      gone.removed = true;
+      const index = gone.pane ?? 0;
+      const left = series.some((each) => !each.removed && (each.pane ?? 0) === index);
+      if (!left && panes.length > 1 && !flags.preserveEmptyPanes) panes.splice(index, 1);
+    }),
     applyOptions: vi.fn(),
     timeScale: vi.fn(() => timeScale),
     subscribeClick: vi.fn(),
@@ -64,7 +78,7 @@ const h = vi.hoisted(() => {
     remove: vi.fn(),
   };
   const markersApi = { setMarkers: vi.fn() };
-  return { timeScale, chart, series, panes, makePane, markersApi };
+  return { timeScale, chart, series, panes, makePane, markersApi, flags };
 });
 
 vi.mock("lightweight-charts", () => ({
@@ -83,7 +97,7 @@ import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "..
 import { createChartAdapter } from "./adapter";
 import { PALETTE_TOKENS } from "./palette";
 
-/** A container carrying the chart's eighteen aliases, as the loaded sheet leaves it. */
+/** A container carrying the chart's twenty-one aliases, as the loaded sheet leaves it. */
 function container(): HTMLElement {
   const el = document.createElement("div");
   el.style.setProperty(PALETTE_TOKENS.bull, "bull");
@@ -104,6 +118,9 @@ function container(): HTMLElement {
   el.style.setProperty(PALETTE_TOKENS.oscillatorGuide, "oscillator-guide");
   el.style.setProperty(PALETTE_TOKENS.setup, "setup");
   el.style.setProperty(PALETTE_TOKENS.stop, "stop");
+  el.style.setProperty(PALETTE_TOKENS.holdoutFill, "holdout-fill");
+  el.style.setProperty(PALETTE_TOKENS.holdoutHatch, "holdout-hatch");
+  el.style.setProperty(PALETTE_TOKENS.holdoutEdge, "holdout-edge");
   document.body.append(el);
   return el;
 }
@@ -194,6 +211,8 @@ beforeEach(() => {
   h.timeScale.fitContent.mockClear();
   h.timeScale.setVisibleLogicalRange.mockClear();
   h.timeScale.getVisibleLogicalRange.mockReset();
+  h.timeScale.timeToCoordinate.mockReset();
+  h.flags.preserveEmptyPanes = false;
   vi.mocked(createChart).mockClear();
   vi.mocked(createSeriesMarkers).mockClear();
 });
@@ -311,7 +330,19 @@ describe("createChartAdapter", () => {
     expect(edge.pane).toBe(0);
   });
 
-  it("removes the oscillator pane when a read has none", () => {
+  it("loses the oscillator pane with its last series, as the pinned library does", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    adapter.setOverlays([{ kind: "oscillator", label: "wavetrend:9:12", values: [null, "-12.5"] }]);
+    expect(h.chart.panes()).toHaveLength(2);
+    h.chart.removePane.mockClear();
+    adapter.setOverlays([{ kind: "line", label: "ema:5", values: ["90000", "90100"] }]);
+    expect(h.chart.panes()).toHaveLength(1);
+    expect(h.chart.removePane).not.toHaveBeenCalled();
+  });
+
+  it("takes away an empty pane a library keeps, so a read without WT1 leaves none", () => {
+    h.flags.preserveEmptyPanes = true;
     const adapter = createChartAdapter(container());
     adapter.setCandles(CANDLES);
     adapter.setOverlays([{ kind: "oscillator", label: "wavetrend:9:12", values: [null, "-12.5"] }]);
@@ -712,5 +743,104 @@ describe("the candle click (r5.s3.w3)", () => {
     const subscribed = h.chart.subscribeClick.mock.calls[0][0];
     adapter.destroy();
     expect(h.chart.unsubscribeClick).toHaveBeenCalledWith(subscribed);
+  });
+});
+
+describe("the holdout band (r7.s2.w1)", () => {
+  interface BandView {
+    attached(param: unknown): void;
+    updateAllViews(): void;
+    paneViews(): { renderer(): { drawBackground(target: unknown): void } }[];
+  }
+  /** The primitive the adapter attached to the candle series. */
+  function band(): BandView {
+    return candleSeries().attachPrimitive.mock.calls[0][0] as BandView;
+  }
+  /** Draw the band onto `ctx`, in a 100 x 50 bitmap at pixel ratio 1. */
+  function paint(ctx: unknown): void {
+    band().updateAllViews();
+    band()
+      .paneViews()[0]
+      .renderer()
+      .drawBackground({
+        useBitmapCoordinateSpace: (draw: (scope: unknown) => void) =>
+          draw({
+            context: ctx,
+            bitmapSize: { width: 100, height: 50 },
+            mediaSize: { width: 100, height: 50 },
+            horizontalPixelRatio: 1,
+            verticalPixelRatio: 1,
+          }),
+      });
+  }
+  /** A canvas context that records what the band draws. */
+  function context() {
+    return {
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      rect: vi.fn(),
+      clip: vi.fn(),
+      fillRect: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: vi.fn(),
+      setLineDash: vi.fn(),
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 0,
+      globalAlpha: 1,
+    };
+  }
+  /** An adapter drawing SPANNED_CANDLES, its band attached and the time scale mocked: a bar's
+   *  centre is 10 px per 4h from 5 px at 2025-01-01T00:00Z. */
+  function drawn() {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    band().attached({ chart: h.chart, series: candleSeries(), requestUpdate: vi.fn() });
+    h.timeScale.timeToCoordinate.mockImplementation(
+      (time: number) => ((time - 1735689600) / 14400) * 10 + 5,
+    );
+    return adapter;
+  }
+
+  it("hatches from halfway before the first held-out bar to the right edge", () => {
+    const adapter = drawn();
+    adapter.setHoldout("1735718400000");
+    const ctx = context();
+    paint(ctx);
+    expect(ctx.fillRect).toHaveBeenCalledWith(20, 0, 80, 50);
+    expect(ctx.fillStyle).toBe("holdout-fill");
+    expect(ctx.strokeStyle).toBe("holdout-edge");
+  });
+
+  it("hatches the whole pane when every loaded bar is held out", () => {
+    const adapter = drawn();
+    adapter.setHoldout("1735689600000");
+    const ctx = context();
+    paint(ctx);
+    expect(ctx.fillRect).toHaveBeenCalledWith(0, 0, 100, 50);
+  });
+
+  it("draws no band when no loaded bar is held out, or once it is cleared", () => {
+    const adapter = drawn();
+    adapter.setHoldout("1735750000000");
+    const none = context();
+    paint(none);
+    expect(none.fillRect).not.toHaveBeenCalled();
+    adapter.setHoldout("1735718400000");
+    adapter.setHoldout(null);
+    const cleared = context();
+    paint(cleared);
+    expect(cleared.fillRect).not.toHaveBeenCalled();
+  });
+
+  it("attaches one band to the candle series across reads", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    adapter.setHoldout("1735718400000");
+    adapter.setCandles(CANDLES);
+    adapter.setHoldout(null);
+    expect(candleSeries().attachPrimitive).toHaveBeenCalledTimes(1);
   });
 });

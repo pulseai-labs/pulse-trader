@@ -98,6 +98,13 @@ pub enum BusErrorCode {
     RuntimeUnavailable,
     /// The session runs but this runtime does not hold it — `session_not_attached`.
     SessionNotAttached,
+    /// The holdout fence refused the request: the candle it names reaches an open
+    /// freeze's holdout start — `holdout` (#427).
+    ///
+    /// A family of its own rather than `Validation`: the remedy is another candle,
+    /// before the holdout start, not a corrected field, and the Chart tab must tell the
+    /// fence from a field refusal at the same bar without inferring it from its own state.
+    Holdout,
 }
 
 impl BusErrorCode {
@@ -113,16 +120,17 @@ impl BusErrorCode {
     pub fn from_server_token(token: &str) -> Option<Self> {
         Some(match token {
             "data" => Self::Data,
-            // r5.s3.w1: the example-mark routes' own vocabulary (PDR-0037), folded
-            // onto the family each belongs to. Each is a correctable rejection —
-            // the caller can move the time, pick a candle that exists, or withdraw a
+            // r5.s3.w1: the example-mark routes' own vocabulary (PDR-0037). `holdout` is
+            // its own family (#427); the rest fold onto the family each belongs to.
+            // Each is a correctable rejection — the caller can move the time, pick a candle that exists, or withdraw a
             // mark it is allowed to — so they read as `Validation` and keep the
             // server's message verbatim. Without this they would fall through to the
             // synthetic `Internal`, and the app would tell a trader the fence had
             // *broken*.
-            "validation" | "holdout" | "candle_not_found" | "already_withdrawn" | "not_writer" => {
+            "validation" | "candle_not_found" | "already_withdrawn" | "not_writer" => {
                 Self::Validation
             }
+            "holdout" => Self::Holdout,
             "backtest" => Self::Backtest,
             "exchange" => Self::Exchange,
             "llm" => Self::Llm,
@@ -459,5 +467,21 @@ mod tests {
         assert_eq!(err.code, BusErrorCode::Validation);
         assert!(err.message.contains("BTCUSDT"), "{}", err.message);
         assert!(err.message.contains("ETHUSDT"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_holdout_token_is_its_own_bus_code() {
+        assert_eq!(
+            BusErrorCode::from_server_token("holdout"),
+            Some(BusErrorCode::Holdout)
+        );
+        assert_eq!(
+            serde_json::to_value(BusErrorCode::Holdout).unwrap(),
+            serde_json::json!("holdout")
+        );
+        assert_eq!(
+            BusErrorCode::from_server_token("candle_not_found"),
+            Some(BusErrorCode::Validation)
+        );
     }
 }

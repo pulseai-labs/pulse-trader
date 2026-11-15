@@ -1,9 +1,10 @@
 //! r5.s2.w1 (PDR-0036, d104) — the chart read contract.
 //!
 //! The window and the default window, the 20,000-bar cap, the holdout cut and
-//! its count, the run layer (its stored trades, and one overlay per S/R, pivot,
-//! candle-pattern and EMA operand of its version's rule), the refusals, and the
-//! app-scope route over the spawned server.
+//! its count on a run read, and the run-less read that draws the holdout
+//! (r7.s2.w1), the run layer (its stored trades, and one overlay per S/R,
+//! pivot, candle-pattern and EMA operand of its version's rule), the refusals,
+//! and the app-scope route over the spawned server.
 //!
 //! **Every overlay is checked against an INDEPENDENT engine pass** over the same
 //! cut series for the same spec (SPINE G2): this suite loads the fixture, applies
@@ -1239,8 +1240,14 @@ async fn no_window_over_a_long_series_keeps_the_latest_bars_up_to_the_cap() {
     );
 }
 
+/// The window every freeze case reads: three bars before the holdout start and five from it on.
+fn holdout_window() -> (i64, i64) {
+    let step = Timeframe::M15.duration_ms();
+    (HOLDOUT_MS - 3 * step, HOLDOUT_MS + 5 * step)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_open_freeze_cuts_the_candles_and_counts_only_its_window() {
+async fn a_run_less_read_draws_the_holdout_candles_and_withholds_none() {
     let server = spawn_server(ServerOptions::default()).await;
     let state = server.desktop().await;
     open_freeze(&server, HOLDOUT_MS).await;
@@ -1249,9 +1256,7 @@ async fn an_open_freeze_cuts_the_candles_and_counts_only_its_window() {
         .load_version(&pair(), Timeframe::M15, &head(&store, Timeframe::M15))
         .expect("the fixture reads")
         .series;
-    let step = Timeframe::M15.duration_ms();
-    let from = HOLDOUT_MS - 3 * step;
-    let to = HOLDOUT_MS + 5 * step;
+    let (from, to) = holdout_window();
 
     let dto = read(
         &state,
@@ -1264,9 +1269,76 @@ async fn an_open_freeze_cuts_the_candles_and_counts_only_its_window() {
     .await
     .expect("the frozen window reads");
 
-    // The independent truth: the cut removes every bar opening at/after the
-    // holdout start, so the returned candles are exactly the window's bars before
-    // it and the count is exactly the window's bars at/after it.
+    // The independent truth: a read that names no run cuts nothing, so the returned
+    // candles are exactly the window's bars, the holdout's bars among them.
+    let opens: Vec<i64> = series
+        .candles
+        .iter()
+        .map(|candle| candle.open_time)
+        .filter(|open| (from..=to).contains(open))
+        .collect();
+    let inside = opens.iter().filter(|open| **open >= HOLDOUT_MS).count();
+    assert!(
+        inside > 0 && inside < opens.len(),
+        "the window must straddle the holdout start to test anything"
+    );
+    let drawn: Vec<i64> = dto
+        .candles
+        .iter()
+        .map(|candle| candle.t.parse::<i64>().unwrap())
+        .collect();
+    assert_eq!(drawn, opens);
+    let holdout = dto.holdout.expect("the read still names the freeze");
+    assert_eq!(holdout.holdout_start_ms, HOLDOUT_MS.to_string());
+    assert_eq!(
+        holdout.bars_withheld, 0,
+        "a run-less read withholds nothing"
+    );
+    assert!(dto.run.is_none());
+
+    // The latest bars, with no window, run on past the start too.
+    let latest = read(&state, request("BTCUSDT", "15m"))
+        .await
+        .expect("the latest bars read");
+    let last_open = series
+        .candles
+        .last()
+        .expect("the fixture has bars")
+        .open_time;
+    assert!(last_open >= HOLDOUT_MS, "the fixture runs past the start");
+    assert_eq!(
+        latest.candles.last().expect("a candle").t,
+        last_open.to_string()
+    );
+    assert_eq!(latest.holdout.expect("the freeze").bars_withheld, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_read_still_cuts_at_the_holdout_and_counts_what_it_withheld() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    open_freeze(&server, HOLDOUT_MS).await;
+    let version = seed_version(&state).await;
+    let run_id = seed_run(&server, &version, vec![]).await;
+    let store = store(&server.data_dir);
+    let series = store
+        .load_version(&pair(), Timeframe::M15, &head(&store, Timeframe::M15))
+        .expect("the fixture reads")
+        .series;
+    let (from, to) = holdout_window();
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            from_ms: Some(from.to_string()),
+            to_ms: Some(to.to_string()),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the run's frozen window reads");
+
     let kept = series
         .candles
         .iter()
@@ -1281,21 +1353,81 @@ async fn an_open_freeze_cuts_the_candles_and_counts_only_its_window() {
         kept > 0 && withheld > 0,
         "the window must straddle the holdout start to test anything"
     );
-
-    assert_eq!(dto.candles.len(), kept);
     assert!(
         dto.candles
             .iter()
             .all(|candle| candle.t.parse::<i64>().unwrap() < HOLDOUT_MS),
-        "no candle at or after the holdout start may cross"
+        "no candle at or after the holdout start may cross on a run's read"
     );
+    assert_eq!(dto.candles.len(), kept);
     let holdout = dto.holdout.expect("the read says a freeze cut it");
     assert_eq!(holdout.holdout_start_ms, HOLDOUT_MS.to_string());
     assert_eq!(
         holdout.bars_withheld,
         u32::try_from(withheld).unwrap(),
-        "barsWithheld counts only the candles the cut removed inside the window"
+        "barsWithheld counts the window's bars the cut removed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chart_route_draws_holdout_candles_for_the_app_only_and_logs_no_token() {
+    let server = spawn_server(ServerOptions::default()).await;
+    open_freeze(&server, HOLDOUT_MS).await;
+    let (from, to) = holdout_window();
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "pair": "BTCUSDT", "timeframe": "15m",
+        "fromMs": from.to_string(), "toMs": to.to_string()
+    });
+
+    let app = client
+        .post(format!("{}/api/v1/chart", server.base))
+        .bearer_auth(&server.app_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("POST the app route");
+    assert_eq!(app.status(), reqwest::StatusCode::OK);
+    let answer: serde_json::Value = app.json().await.expect("the route's JSON");
+    assert_eq!(answer["holdout"]["holdoutStartMs"], HOLDOUT_MS.to_string());
+    assert_eq!(answer["holdout"]["barsWithheld"], 0);
+    assert!(
+        answer["candles"]
+            .as_array()
+            .expect("the candles")
+            .iter()
+            .any(|candle| candle["t"].as_str().unwrap().parse::<i64>().unwrap() >= HOLDOUT_MS),
+        "the app's run-less read draws a candle at or after the holdout start"
+    );
+
+    let refused = client
+        .post(format!("{}/api/v1/chart", server.base))
+        .bearer_auth(&server.agent_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("POST the app route with an agent token");
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+    let refusal: serde_json::Value = refused.json().await.expect("the refusal's JSON");
+    assert_eq!(refusal["code"], "scope_refused");
+    assert!(
+        refusal.get("candles").is_none(),
+        "an agent never receives a candle from the chart route: {refusal}"
+    );
+
+    let lines = server.log.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("pulse serve: POST /api/v1/chart 200 w2-app ")),
+        "the app's read is logged with the token's label: {lines:?}"
+    );
+    for line in &lines {
+        assert!(
+            !line.contains(&server.app_token) && !line.contains(&server.agent_token),
+            "a token leaked into the log: {line}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2287,6 +2419,99 @@ async fn a_band_edge_needs_line_leaves_at_no_lag_on_its_own_series() {
             .any(|overlay| matches!(overlay, ChartOverlayDto::BandEdge { .. })),
         "no band edge on the HTF leg: {:?}",
         run.overlays
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_htf_leg_draws_a_band_edge_of_its_own_lines() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let dsl = format!(
+        r#"{{ "schema_version": "1.5.0", "name": "r7.s2.w1 htf band edge", "direction": "long", "entry": {}, "filters": [], "exits": [{{ "type": "StopLoss", "distance_pct": "0.02" }}, {{ "type": "TakeProfit", "target_r": "1" }}], "risk": {{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }} }}"#,
+        probe_close_gt(&probe_max(&probe_ema("htf", 20), &probe_ema("htf", 30)))
+    );
+    let version = seed_version_of(&state, &dsl).await;
+    let run_id = seed_run(&server, &version, vec![]).await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "4h")
+        },
+    )
+    .await
+    .expect("the HTF leg reads");
+    let run = dto.run.expect("the run layer");
+    assert_eq!(run.series, "htf");
+    let edges: Vec<&ChartOverlayDto> = run
+        .overlays
+        .iter()
+        .filter(|overlay| matches!(overlay, ChartOverlayDto::BandEdge { .. }))
+        .collect();
+    assert_eq!(edges.len(), 1, "exactly one band edge: {edges:?}");
+    let ChartOverlayDto::BandEdge {
+        label,
+        members,
+        values: edge_values,
+    } = edges[0]
+    else {
+        unreachable!("filtered to band edges")
+    };
+    assert_eq!(label, "max(h4:ema:20,h4:ema:30)");
+    assert_eq!(*members, ["ema:20", "ema:30"]);
+    assert_eq!(edge_values.len(), dto.candles.len());
+    assert!(edge_values.iter().any(Option::is_some), "{edge_values:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_trade_on_a_run_with_no_htf_carries_no_htf_arm_bar() {
+    let server = spawn_server(ServerOptions::default()).await;
+    let state = server.desktop().await;
+    let version = seed_version(&state).await;
+    let store = store(&server.data_dir);
+    let (m15, h4) = fixture_series(&store);
+    let (trade, opens) = setup_trade(&m15, &h4, 20);
+    let run_id = seed_run_on(
+        &server,
+        &version,
+        SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: head(&store, Timeframe::M15),
+        },
+        None,
+        None,
+        vec![trade],
+    )
+    .await;
+
+    let dto = read(
+        &state,
+        ChartDataRequest {
+            run_id: Some(run_id),
+            ..request("BTCUSDT", "15m")
+        },
+    )
+    .await
+    .expect("the run reads");
+    let run = dto.run.expect("the read carries the run layer");
+    assert_eq!(run.trades.len(), 1);
+    let drawn = &run.trades[0];
+    assert_eq!(
+        drawn.arm_bar_time.as_deref(),
+        Some(opens[0].to_string().as_str())
+    );
+    assert_eq!(
+        drawn.htf_arm_bar_time, None,
+        "the run read no higher timeframe"
+    );
+    assert_eq!(
+        drawn.dip_bar_time.as_deref(),
+        Some(opens[2].to_string().as_str())
+    );
+    assert_eq!(
+        drawn.trigger_bar_time.as_deref(),
+        Some(opens[3].to_string().as_str())
     );
 }
 

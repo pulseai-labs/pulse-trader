@@ -108,15 +108,10 @@ export function parseUtcInstant(text: string): string | null {
   return real ? String(ms) : null;
 }
 
-/** Which bars to ask for around `anchorMs`. With a run, exactly `windowPlan(span, timeframe,
- *  anchorMs)`. With no run, a window of `WINDOW_HALF_BARS` bars either side, unclamped (the
- *  read returns what exists), or `{ kind: "span" }` on a timeframe `TIMEFRAME_MS` cannot size. */
-export function windowAround(
-  span: RunSpan | null,
-  timeframe: string,
-  anchorMs: string,
-): WindowPlan {
-  if (span !== null) return windowPlan(span, timeframe, anchorMs);
+/** The free chart's window around `anchorMs`: `WINDOW_HALF_BARS` bars either side, unclamped
+ *  (the read returns what exists), or `{ kind: "span" }` on a timeframe `TIMEFRAME_MS` cannot
+ *  size. A run's chart plans its window with `windowPlan`, which clamps into the run's span. */
+export function windowAround(timeframe: string, anchorMs: string): WindowPlan {
   const ms = TIMEFRAME_MS[timeframe];
   if (ms === undefined) return { kind: "span" };
   const anchor = Number(anchorMs);

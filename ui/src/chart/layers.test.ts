@@ -24,6 +24,7 @@ import type { ChartMarker } from "./layers";
 import type { ChartPalette } from "./palette";
 import {
   buildLayers,
+  holdoutBandBars,
   markersInWindow,
   setupMarkers,
   stopLine,
@@ -52,6 +53,9 @@ const PALETTE: ChartPalette = {
   oscillatorGuide: "oscillator-guide",
   setup: "setup",
   stop: "stop",
+  holdoutFill: "holdout-fill",
+  holdoutHatch: "holdout-hatch",
+  holdoutEdge: "holdout-edge",
 };
 
 /** One example-trade mark, as `listMarks` reads it (r5.s3.w1). Times are ms strings. */
@@ -94,6 +98,43 @@ describe("toCandles", () => {
       { time: 1735689600, open: 93548.8, high: 94449.2, low: 93460.2, close: 93810 },
       { time: 1735704000, open: 93810, high: 93914.7, low: 93502, close: 93660.7 },
     ]);
+  });
+});
+
+describe("holdoutBandBars (r7.s2.w1)", () => {
+  /** Four 4h candles: 2025-01-01T00:00Z, 04:00Z, 08:00Z and 12:00Z. */
+  const BARS = toCandles(
+    ["1735689600000", "1735704000000", "1735718400000", "1735732800000"].map((t) => ({
+      t,
+      o: "1",
+      h: "2",
+      l: "1",
+      c: "2",
+      v: "1",
+    })),
+  );
+
+  it("starts at the first bar opening at or after the holdout start, after the bar before it", () => {
+    expect(holdoutBandBars(BARS, "1735718400000")).toEqual({
+      first: 1735718400,
+      before: 1735704000,
+    });
+  });
+
+  it("does not count a bar that opens before a start inside it", () => {
+    for (const start of ["1735704000001", "1735710000000"]) {
+      expect(holdoutBandBars(BARS, start)).toEqual({ first: 1735718400, before: 1735704000 });
+    }
+  });
+
+  it("starts at the pane's first bar when every loaded bar is held out", () => {
+    expect(holdoutBandBars(BARS, "1735689600000")).toEqual({ first: 1735689600, before: null });
+  });
+
+  it("is null with no start, no bar inside, or no bar", () => {
+    expect(holdoutBandBars(BARS, null)).toBeNull();
+    expect(holdoutBandBars(BARS, "1735747200000")).toBeNull();
+    expect(holdoutBandBars([], "1735689600000")).toBeNull();
   });
 });
 

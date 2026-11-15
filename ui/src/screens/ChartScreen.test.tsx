@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
     setTrades: vi.fn(),
     setMarks: vi.fn(),
     setSelectedTrade: vi.fn(),
+    setHoldout: vi.fn(),
     onCandleClick: vi.fn(),
     fitAll: vi.fn(),
     centerOn: vi.fn(),
@@ -697,19 +698,33 @@ describe("an answer that outlived its run (CR5)", () => {
 });
 
 describe("the plain states", () => {
-  it("names the withheld bars when the read was cut at a holdout", async () => {
+  it("names the holdout band on the free chart and hatches its bars (r7.s2.w1)", async () => {
     vi.mocked(commands.chartData).mockResolvedValue(
-      ok(
-        chartDto({
-          holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 12 },
-        }),
-      ),
+      ok(chartDto({ holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 0 } })),
     );
     await open("#/chart");
 
     expect(
+      await screen.findByText("Holdout — from 2025-04-11 UTC · agents can't test here"),
+    ).toBeTruthy();
+    await waitFor(() => expect(h.adapter.setHoldout).toHaveBeenLastCalledWith(String(ENTRY)));
+  });
+
+  it("names the withheld bars when a run's read was cut at a holdout", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          run: runLayer(),
+          holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 12 },
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+
+    expect(
       await screen.findByText("Holdout from 2025-04-11 UTC — 12 bars withheld"),
     ).toBeTruthy();
+    await waitFor(() => expect(h.adapter.setHoldout).toHaveBeenLastCalledWith(null));
   });
 
   it("says the window is empty rather than drawing an empty chart", async () => {
@@ -1551,11 +1566,7 @@ describe("marking a candle", () => {
   });
 
   it("shows a holdout refusal in plain words, with the date, and adds no mark", async () => {
-    // The bus folds the route's own `holdout` token onto `validation`
-    // (`tauri/error.rs::from_server_token` keeps the message and drops the token), so this
-    // is the refusal the screen actually receives. What identifies it is the tab's own
-    // knowledge of the fence plus the bar it sent: the fence is the write's first step
-    // (G2), so a bar at or after the known start is refused for the fence.
+    // The fence crosses the bus as its own code, `holdout` (#427).
     const holdoutMs = FIRST + 50 * DAY;
     vi.mocked(commands.listMarks).mockResolvedValue(
       ok(markList({ hiddenByHoldout: { holdoutStartMs: String(holdoutMs), count: 0 } })),
@@ -1563,7 +1574,7 @@ describe("marking a candle", () => {
     vi.mocked(commands.writeMark).mockResolvedValue(
       failure(
         "the holdout freeze refuses this run on BTCUSDT: `barTime` reaches into the holdout, which starts at 2025-02-20T00:00:00Z",
-        "validation",
+        "holdout",
       ),
     );
     await open("#/chart");
@@ -1587,7 +1598,7 @@ describe("marking a candle", () => {
     vi.mocked(commands.writeMark).mockResolvedValue(
       failure(
         "the holdout freeze refuses this run on BTCUSDT: `barTime` reaches into the holdout, which starts at 2025-10-10T00:00:00Z",
-        "validation",
+        "holdout",
       ),
     );
     await open("#/chart");
@@ -1596,6 +1607,25 @@ describe("marking a candle", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("starts at 2025-10-10T00:00:00Z");
+    expect(alert.textContent).not.toContain("This candle is inside the holdout from");
+  });
+
+  it("shows a field refusal's own words at a bar inside the holdout (#427)", async () => {
+    // The fence is not the only refusal at a bar inside the holdout: field parsing comes
+    // first, so a bad setup label there is a `validation` refusal, and the tab must show its
+    // own message rather than the fence's sentence.
+    vi.mocked(commands.listMarks).mockResolvedValue(
+      ok(markList({ hiddenByHoldout: { holdoutStartMs: String(FIRST + 50 * DAY), count: 0 } })),
+    );
+    vi.mocked(commands.writeMark).mockResolvedValue(
+      failure("setup: setup must not carry a control character", "validation"),
+    );
+    await open("#/chart");
+    await arm();
+    await act(async () => fireCandleClick(String(FIRST + 60 * DAY)));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("setup: setup must not carry a control character");
     expect(alert.textContent).not.toContain("This candle is inside the holdout from");
   });
 
@@ -1775,18 +1805,38 @@ describe("going to a date (r6.s4.w3)", () => {
     expect(commands.chartData).toHaveBeenCalledTimes(1);
   });
 
-  it("refuses a date at or after the holdout start before any read", async () => {
+  it("goes to a date inside the holdout on the free chart, which draws it (r7.s2.w1)", async () => {
     vi.mocked(commands.chartData).mockResolvedValue(
-      ok(chartDto({ holdout: { holdoutStartMs: "1736985600000", barsWithheld: 3 } })),
+      ok(chartDto({ holdout: { holdoutStartMs: "1736985600000", barsWithheld: 0 } })),
     );
     await open("#/chart");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
 
     goTo("2025-01-16");
 
+    await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith("1736985600000"));
+    expect(screen.queryByText(/inside the holdout/)).toBeNull();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a date at or after the holdout start on a run's chart, before any read", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          run: runLayer(),
+          holdout: { holdoutStartMs: "1736985600000", barsWithheld: 3 },
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-01-16");
+
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("inside the holdout");
-    expect(alert.textContent).toContain("2025-01-16 UTC");
+    expect(alert.textContent).toBe(
+      "That date is inside the holdout from 2025-01-16 UTC; the chart withholds it.",
+    );
     expect(commands.chartData).toHaveBeenCalledTimes(1);
     expect(h.adapter.centerOn).not.toHaveBeenCalled();
   });
@@ -1852,6 +1902,33 @@ describe("going to a date (r6.s4.w3)", () => {
     expect(commands.chartData).toHaveBeenCalledTimes(1);
     expect(h.adapter.centerOn).not.toHaveBeenCalled();
   });
+
+  it("refuses a date after the run's last bar", async () => {
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2026-03-01");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "That date is outside this run (2025-01-01 00:00 UTC to 2026-02-05 00:00 UTC).",
+    );
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("says no bar is drawn when the run's whole leg is drawn and does not hold the date", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ candles: [candle(FIRST), candle(FIRST + TF_MS_4H)], run: runLayer() })),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-06-01");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("No 4h bar at 2025-06-01 00:00 UTC is drawn in this run's window.");
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("zooming (r6.s4.w3)", () => {
@@ -1892,6 +1969,35 @@ describe("zooming (r6.s4.w3)", () => {
     fireEvent.keyDown(screen.getByLabelText("Setup label"), { key: "-" });
 
     expect(h.adapter.zoom).not.toHaveBeenCalled();
+  });
+
+  it("does not zoom on + or - typed into a textarea, a select or an editable region", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    const textarea = document.createElement("textarea");
+    const select = document.createElement("select");
+    const editable = document.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    const inner = document.createElement("span");
+    editable.append(inner);
+    const blank = document.createElement("div");
+    blank.setAttribute("contenteditable", "");
+    const plain = document.createElement("div");
+    document.body.append(textarea, select, editable, blank, plain);
+
+    fireEvent.keyDown(textarea, { key: "+" });
+    fireEvent.keyDown(select, { key: "+" });
+    fireEvent.keyDown(inner, { key: "+" });
+    fireEvent.keyDown(blank, { key: "+" });
+    expect(h.adapter.zoom).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(plain, { key: "+" });
+    expect(h.adapter.zoom).toHaveBeenCalledTimes(1);
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+
+    for (const element of [textarea, select, editable, blank, plain]) element.remove();
   });
 });
 

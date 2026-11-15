@@ -33,6 +33,10 @@
 //  * **The selected trade's setup rides the same marker list (r6.s4.w4).** Its arm, dip and
 //    trigger markers join the one list `markersInWindow` clips and places, so a setup bar
 //    outside the loaded window draws nothing. Its stop is a price line on the candle series.
+//  * **The holdout band (r7.s2.w1).** A read that names no run carries the bars from the
+//    holdout start onward; a series primitive hatches them behind the candles, from halfway
+//    between the last bar before the start and the first bar inside it to the pane's right
+//    edge, with a dashed edge line. It is drawn on the candle pane only.
 
 import {
   CandlestickSeries,
@@ -47,10 +51,14 @@ import type {
   CandlestickData,
   IChartApi,
   IPriceLine,
+  IPrimitivePaneRenderer,
+  IPrimitivePaneView,
   ISeriesApi,
   ISeriesMarkersPluginApi,
+  ISeriesPrimitive,
   LineData,
   MouseEventParams,
+  SeriesAttachedParameter,
   SeriesMarker,
   SeriesMarkerPricePosition,
   Time,
@@ -59,9 +67,10 @@ import type {
 } from "lightweight-charts";
 
 import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "../bindings";
-import type { CandlePoint, ChartMarker, OverlayLayer } from "./layers";
+import type { CandlePoint, ChartMarker, HoldoutBandBars, OverlayLayer } from "./layers";
 import {
   containingIndex,
+  holdoutBandBars,
   markersInWindow,
   setupMarkers,
   stopLine,
@@ -69,6 +78,7 @@ import {
   toMarkers,
   toOverlayLayers,
 } from "./layers";
+import type { ChartPalette } from "./palette";
 import { chartPalette } from "./palette";
 
 /** The chart, as the screen sees it. No library type crosses this interface, so the
@@ -86,6 +96,9 @@ export interface ChartAdapter {
   /** Draw this trade's setup markers and stop line on the leg the read drew (`null` clears
    *  both). */
   setSelectedTrade(trade: ChartTradeDto | null, series: "primary" | "htf"): void;
+  /** Hatch the loaded bars that open at or after `holdoutStartMs` — a run-less read's holdout
+   *  band (ADR-0030 amendment, 2026-11-14). `null` clears it. */
+  setHoldout(holdoutStartMs: string | null): void;
   /** Call `handler` with the open of the loaded candle a click landed on. A click
    *  outside the loaded candles, or before any read has drawn a bar, calls nothing.
    *  One handler: a second call replaces the first. */
@@ -108,6 +121,16 @@ const ZOOM_FACTOR = 2;
 
 /** The least half-range a zoom-in leaves: ten bars in view, so every bar stays clickable. */
 const MIN_ZOOM_HALF_BARS = 5;
+
+/** The holdout band's fill opacity: canvas v9's hatch fill (`fillOpacity="0.55"`). */
+const HOLDOUT_FILL_ALPHA = 0.55;
+
+/** The hatch lines' spacing and width, in CSS pixels (canvas v9's 6 px pattern, 1.2 px line). */
+const HOLDOUT_HATCH_STEP = 6;
+const HOLDOUT_HATCH_WIDTH = 1.2;
+
+/** The band edge's dash, in CSS pixels (canvas v9's `4 3`). */
+const HOLDOUT_EDGE_DASH = [4, 3];
 
 /** One mapped marker, in the library's two marker shapes. */
 function toSeriesMarker(marker: ChartMarker): SeriesMarker<Time> {
@@ -149,6 +172,92 @@ function toLineData(layer: OverlayLayer): (LineData<Time> | WhitespaceData<Time>
   );
 }
 
+/** The holdout band as the adapter drives it: a series primitive plus the one setter it calls. */
+interface HoldoutBand extends ISeriesPrimitive<Time> {
+  /** Hatch from these loaded bars; `null` draws no band. */
+  setBars(bars: HoldoutBandBars | null): void;
+}
+
+/** The holdout band primitive. Its left edge is halfway between the last bar before the start and
+ *  the first bar inside it (the pane's left edge when the first loaded bar is inside), so the hatch
+ *  covers whole bars; it is drawn in the background, under the candles. */
+function createHoldoutBand(palette: ChartPalette): HoldoutBand {
+  let bars: HoldoutBandBars | null = null;
+  let chart: SeriesAttachedParameter<Time>["chart"] | null = null;
+  let requestUpdate: (() => void) | null = null;
+  let left: number | null = null;
+  const renderer: IPrimitivePaneRenderer = {
+    draw: () => {
+      // The band is background only.
+    },
+    drawBackground: (target) => {
+      const edge = left;
+      if (edge === null) return;
+      target.useBitmapCoordinateSpace(({ context, bitmapSize, horizontalPixelRatio: ratio }) => {
+        const x = Math.max(0, Math.round(edge * ratio));
+        const width = bitmapSize.width - x;
+        if (width <= 0) return;
+        const height = bitmapSize.height;
+        context.save();
+        context.beginPath();
+        context.rect(x, 0, width, height);
+        context.clip();
+        context.globalAlpha = HOLDOUT_FILL_ALPHA;
+        context.fillStyle = palette.holdoutFill;
+        context.fillRect(x, 0, width, height);
+        context.globalAlpha = 1;
+        context.strokeStyle = palette.holdoutHatch;
+        context.lineWidth = HOLDOUT_HATCH_WIDTH * ratio;
+        context.beginPath();
+        for (let offset = x - height; offset < bitmapSize.width; offset += HOLDOUT_HATCH_STEP * ratio) {
+          context.moveTo(offset, height);
+          context.lineTo(offset + height, 0);
+        }
+        context.stroke();
+        context.strokeStyle = palette.holdoutEdge;
+        context.lineWidth = Math.max(1, Math.round(ratio));
+        context.setLineDash(HOLDOUT_EDGE_DASH.map((dash) => dash * ratio));
+        context.beginPath();
+        context.moveTo(x, 0);
+        context.lineTo(x, height);
+        context.stroke();
+        context.restore();
+      });
+    },
+  };
+  const view: IPrimitivePaneView = { renderer: () => renderer, zOrder: () => "bottom" };
+  return {
+    attached(param) {
+      chart = param.chart;
+      requestUpdate = param.requestUpdate;
+    },
+    detached() {
+      chart = null;
+      requestUpdate = null;
+    },
+    updateAllViews() {
+      left = null;
+      if (bars === null || chart === null) return;
+      const scale = chart.timeScale();
+      const first = scale.timeToCoordinate(bars.first as UTCTimestamp);
+      if (first === null) return;
+      if (bars.before === null) {
+        left = 0;
+        return;
+      }
+      const before = scale.timeToCoordinate(bars.before as UTCTimestamp);
+      left = before === null ? first : (before + first) / 2;
+    },
+    paneViews() {
+      return [view];
+    },
+    setBars(next) {
+      bars = next;
+      requestUpdate?.();
+    },
+  };
+}
+
 /** Create the chart in `container` and return the handle the screen drives. */
 export function createChartAdapter(container: HTMLElement): ChartAdapter {
   const palette = chartPalette(container);
@@ -181,9 +290,11 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
   let markDtos: readonly MarkDto[] = [];
   let selectedTrade: ChartTradeDto | null = null;
   let selectedSeries: "primary" | "htf" = "primary";
+  let holdoutStartMs: string | null = null;
 
   let candleSeries: ISeriesApi<"Candlestick"> | null = null;
   let markerPlugin: ISeriesMarkersPluginApi<Time> | null = null;
+  let holdoutBand: HoldoutBand | null = null;
   let layerSeries: ISeriesApi<"Line">[] = [];
   /** The selected trade's stop line on the candle series, kept so it can be taken off. */
   let stopPriceLine: IPriceLine | null = null;
@@ -204,6 +315,8 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     });
     // Created with the series and fed on every draw: one plugin, one ascending list.
     markerPlugin = createSeriesMarkers(candleSeries, []);
+    holdoutBand = createHoldoutBand(palette);
+    candleSeries.attachPrimitive(holdoutBand);
     return candleSeries;
   };
 
@@ -225,6 +338,12 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     );
   };
 
+  /** Hatch the loaded bars the holdout start last handed in reaches (`null` clears the band). */
+  const drawHoldout = (): void => {
+    ensureCandles();
+    holdoutBand?.setBars(holdoutBandBars(candlePoints, holdoutStartMs));
+  };
+
   /** Whether `logical` names a loaded bar. The library resolves a click's position with
    *  `Math.ceil` and no clamp, so a click in the pane past the last bar yields an index
    *  one past it, and a click before the first yields a negative one; a position it
@@ -243,6 +362,7 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       candleDtos = [...next];
       candlePoints = toCandles(candleDtos);
       ensureCandles().setData(candlePoints as CandlestickData<Time>[]);
+      drawHoldout();
     },
 
     setOverlays(next) {
@@ -252,8 +372,9 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
         chart.removeSeries(stale);
       }
       layerSeries = [];
-      // Removing a pane's last series does not remove the pane: take every pane but the
-      // candles' away, so a read without WT1 leaves no empty pane behind.
+      // The pinned library (5.2.1) removes a pane with its last series, so the removals above
+      // already took WT1's pane away; this takes away any empty pane a library that keeps one
+      // (`preserveEmptyPane`) would leave behind.
       while (chart.panes().length > 1) chart.removePane(chart.panes().length - 1);
       for (const layer of toOverlayLayers(overlayDtos, candleDtos, palette)) {
         const line = chart.addSeries(
@@ -326,6 +447,11 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       }
     },
 
+    setHoldout(next) {
+      holdoutStartMs = next;
+      drawHoldout();
+    },
+
     onCandleClick(handler) {
       if (clickHandler !== null) chart.unsubscribeClick(clickHandler);
       clickHandler = (param: MouseEventParams<Time>): void => {
@@ -382,6 +508,8 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       chart.remove();
       candleSeries = null;
       markerPlugin = null;
+      holdoutBand = null;
+      holdoutStartMs = null;
       layerSeries = [];
       stopPriceLine = null;
       selectedTrade = null;

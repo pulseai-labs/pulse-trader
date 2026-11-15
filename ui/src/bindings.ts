@@ -339,7 +339,7 @@ export const commands = {
 	streakCard: (request: StreakCardRequest) => typedError<StreakCardDto, BusError>(__TAURI_INVOKE("streak_card", { request })),
 	/**
 	 *  `chart_data` — what the Chart tab draws for a pair and timeframe: a window of
-	 *  candles (capped, cut at an open freeze's holdout start) and, when a backtest
+	 *  candles (capped; cut at an open freeze's holdout start when a run is named) and, when a backtest
 	 *  run is named, that run's trades and one overlay series per S/R, pivot,
 	 *  candle-pattern and EMA operand its version's rule uses on that series
 	 *  (r5.s2.w1, PDR-0036). Every overlay value is the engine's, read exactly as
@@ -823,7 +823,16 @@ export type BusErrorCode =
  */
 "runtime_unavailable" | 
 /**  The session runs but this runtime does not hold it — `session_not_attached`. */
-"session_not_attached";
+"session_not_attached" | 
+/**
+ *  The holdout fence refused the request: the candle it names reaches an open
+ *  freeze's holdout start — `holdout` (#427).
+ * 
+ *  A family of its own rather than `Validation`: the remedy is another candle,
+ *  before the holdout start, not a corrected field, and the Chart tab must tell the
+ *  fence from a field refusal at the same bar without inferring it from its own state.
+ */
+"holdout";
 
 /**
  *  One event on one run's channel.
@@ -1043,11 +1052,18 @@ export type ChartDataRequest = {
  *  snapshot. It is NOT the capped slice a default pair read hands back: the count
  *  answers "how many of this window's bars did the fence withhold", which is why a
  *  read with no window of its own can report bars the returned slice never held.
+ * 
+ *  A read that names no run cuts nothing (ADR-0030 amendment, 2026-11-14): it returns the
+ *  candles from the holdout start onward too, its `barsWithheld` is 0, and the tab hatches those
+ *  bars.
  */
 export type ChartHoldoutDto = {
 	/**  The open freeze's holdout start, epoch ms as an exact integer string. */
 	holdoutStartMs: string,
-	/**  How many candles the cut removed inside the resolved window. */
+	/**
+	 *  How many candles the cut removed inside the resolved window; 0 on a read that names no
+	 *  run, which cuts nothing.
+	 */
 	barsWithheld: number,
 };
 
