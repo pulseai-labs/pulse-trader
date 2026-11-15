@@ -108,15 +108,10 @@ export function parseUtcInstant(text: string): string | null {
   return real ? String(ms) : null;
 }
 
-/** Which bars to ask for around `anchorMs`. With a run, exactly `windowPlan(span, timeframe,
- *  anchorMs)`. With no run, a window of `WINDOW_HALF_BARS` bars either side, unclamped (the
- *  read returns what exists), or `{ kind: "span" }` on a timeframe `TIMEFRAME_MS` cannot size. */
-export function windowAround(
-  span: RunSpan | null,
-  timeframe: string,
-  anchorMs: string,
-): WindowPlan {
-  if (span !== null) return windowPlan(span, timeframe, anchorMs);
+/** The free chart's window around `anchorMs`: `WINDOW_HALF_BARS` bars either side, unclamped
+ *  (the read returns what exists), or `{ kind: "span" }` on a timeframe `TIMEFRAME_MS` cannot
+ *  size. A run's chart plans its window with `windowPlan`, which clamps into the run's span. */
+export function windowAround(timeframe: string, anchorMs: string): WindowPlan {
   const ms = TIMEFRAME_MS[timeframe];
   if (ms === undefined) return { kind: "span" };
   const anchor = Number(anchorMs);
@@ -141,4 +136,13 @@ export function covers(candles: readonly Pick<ChartCandleDto, "t">[], ms: string
   const lastOpen = times[times.length - 1];
   const bar = barSpacing(times);
   return bar === 0 ? target === first : target >= first && target < lastOpen + bar;
+}
+
+/** How many whole bars of `timeframe` lie between a trade's entry and exit fills (r7.s2.w3, canvas v9's strip
+ *  "bars" column): time arithmetic on the run's own fill times, like the window sizing above. `null` while the
+ *  trade is open, or for an interval this tab cannot size. */
+export function barsHeld(entryMs: string, exitMs: string | null, timeframe: string): number | null {
+  const bar = TIMEFRAME_MS[timeframe];
+  if (exitMs === null || bar === undefined) return null;
+  return Math.floor((Number(exitMs) - Number(entryMs)) / bar);
 }

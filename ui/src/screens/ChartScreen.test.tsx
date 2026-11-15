@@ -16,6 +16,17 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+/** The Node runtime globals vitest always runs on (the same pattern `chart/palette.test.ts` uses — this
+ *  toolchain ships no `@types/node`). */
+const nodeRuntime = (globalThis as unknown as {
+  process: { cwd(): string; getBuiltinModule(id: string): unknown };
+}).process;
+
+interface FsLike {
+  readFileSync(path: string, encoding: "utf8"): string;
+}
+const fs = nodeRuntime.getBuiltinModule("node:fs") as FsLike;
+
 const h = vi.hoisted(() => ({
   adapter: {
     setCandles: vi.fn(),
@@ -23,8 +34,11 @@ const h = vi.hoisted(() => ({
     setTrades: vi.fn(),
     setMarks: vi.fn(),
     setSelectedTrade: vi.fn(),
+    setHoldout: vi.fn(),
     onCandleClick: vi.fn(),
-    fitAll: vi.fn(),
+    onCrosshairMove: vi.fn(),
+    clearCrosshair: vi.fn(),
+    showLatest: vi.fn(),
     centerOn: vi.fn(),
     zoom: vi.fn(),
     destroy: vi.fn(),
@@ -333,7 +347,7 @@ describe("opening the Chart tab", () => {
       }),
     );
     expect(commands.getBacktestRun).not.toHaveBeenCalled();
-    await waitFor(() => expect(h.adapter.fitAll).toHaveBeenCalled());
+    await waitFor(() => expect(h.adapter.showLatest).toHaveBeenCalled());
     expect(h.adapter.setCandles).toHaveBeenCalledWith(chartDto().candles);
     expect(h.adapter.setOverlays).toHaveBeenCalledWith([]);
     expect(
@@ -367,7 +381,8 @@ describe("opening the Chart tab", () => {
     await waitFor(() => expect(h.adapter.setOverlays).toHaveBeenCalled());
     expect(h.adapter.setOverlays).toHaveBeenCalledWith(SERIES_OVERLAYS);
     expect(h.adapter.setTrades).toHaveBeenCalledWith([trade({})]);
-    expect(await screen.findByText("Not drawn on the chart: rsi:14")).toBeTruthy();
+    expect(await screen.findByText("Not drawn on the 4h leg")).toBeTruthy();
+    expect(screen.getByText("rsi:14")).toBeTruthy();
   });
 });
 
@@ -378,11 +393,11 @@ describe("the leg switch", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
 
-    expect(
-      await screen.findByText(
-        "The whole run at 15m is 38,401 bars — more than one read (the cap is 20,000). Pick a trade to load 15m around it, or go to a date.",
-      ),
-    ).toBeTruthy();
+    const card = (await screen.findByText(/more than one read/)).closest(".cv-card") as Element;
+    expect(card.querySelector("b")?.textContent).toBe("The whole run at 15m is 38,401 bars");
+    expect(card.querySelector("p")?.textContent).toBe(
+      "That is more than one read (the cap is 20,000). Pick a trade to load 15m around it, or go to a date.",
+    );
     // Nothing was read: a read the server would refuse with the cap is not sent.
     expect(commands.chartData).toHaveBeenCalledTimes(1);
     expect(h.adapter.setCandles).toHaveBeenCalledTimes(1);
@@ -599,7 +614,7 @@ describe("a switch to another run (CR3)", () => {
     expect(h.adapter.setCandles).toHaveBeenLastCalledWith([]);
     expect(h.adapter.setOverlays).toHaveBeenLastCalledWith([]);
     expect(h.adapter.setTrades).toHaveBeenLastCalledWith([]);
-    expect(h.adapter.fitAll).toHaveBeenCalledTimes(1);
+    expect(h.adapter.showLatest).toHaveBeenCalledTimes(1);
     // The rows are run-new's own stored trades, and the table says so.
     const after = screen.getByRole("table", { name: "Trades in the run" });
     expect(within(after).queryByText("2025-04-11 00:00 UTC")).toBeNull();
@@ -697,19 +712,33 @@ describe("an answer that outlived its run (CR5)", () => {
 });
 
 describe("the plain states", () => {
-  it("names the withheld bars when the read was cut at a holdout", async () => {
+  it("names the holdout band on the free chart and hatches its bars (r7.s2.w1)", async () => {
     vi.mocked(commands.chartData).mockResolvedValue(
-      ok(
-        chartDto({
-          holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 12 },
-        }),
-      ),
+      ok(chartDto({ holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 0 } })),
     );
     await open("#/chart");
 
     expect(
+      await screen.findByText("Holdout — from 2025-04-11 UTC · agents can't test here"),
+    ).toBeTruthy();
+    await waitFor(() => expect(h.adapter.setHoldout).toHaveBeenLastCalledWith(String(ENTRY)));
+  });
+
+  it("names the withheld bars when a run's read was cut at a holdout", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          run: runLayer(),
+          holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 12 },
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+
+    expect(
       await screen.findByText("Holdout from 2025-04-11 UTC — 12 bars withheld"),
     ).toBeTruthy();
+    await waitFor(() => expect(h.adapter.setHoldout).toHaveBeenLastCalledWith(null));
   });
 
   it("says the window is empty rather than drawing an empty chart", async () => {
@@ -921,7 +950,7 @@ describe("the holdout fence over the tab's trades", () => {
     );
     await open("#/chart?run=run-1");
 
-    expect(await screen.findByText(/of these trades/)).toBeTruthy();
+    expect(await screen.findByText(/in the drawn window/)).toBeTruthy();
     const table = screen.getByRole("table", { name: "Trades in the run" });
     expect(within(table).getAllByRole("button")).toHaveLength(2);
     expect(within(table).getByText("2025-04-14 00:00 UTC")).toBeTruthy();
@@ -1049,6 +1078,13 @@ describe("the run-wide trade selector", () => {
 // The selection the tab is drawing (a free choice must not be lost)
 // ---------------------------------------------------------------------------
 
+/** Pick a free pair from the pair chip's list (r7.s2.w3), the way the trader does. */
+async function pickPair(pair: string) {
+  fireEvent.click(await screen.findByRole("button", { name: /^Pair: / }));
+  const list = screen.getByRole("dialog", { name: "Pairs" });
+  fireEvent.click(within(list).getByRole("button", { name: new RegExp(`^${pair}`) }));
+}
+
 describe("the selection the tab owns", () => {
   it("draws a free pair and timeframe chosen after the fragment's run read refused", async () => {
     vi.mocked(commands.getBacktestRun).mockResolvedValue(
@@ -1061,7 +1097,7 @@ describe("the selection the tab owns", () => {
     // The refusal is shown, the free controls are the only controls, and the trader
     // picks one: the tab must draw what it just read.
     expect(await screen.findByText(/no backtest run gone/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /^ETHUSDT/ }));
+    await pickPair("ETHUSDT");
     await waitFor(() =>
       expect(commands.chartData).toHaveBeenLastCalledWith({
         pair: "ETHUSDT",
@@ -1081,13 +1117,13 @@ describe("the selection the tab owns", () => {
     vi.mocked(commands.chartData).mockResolvedValue(ok(free));
     await open("#/chart?run=run-1");
 
-    fireEvent.click(await screen.findByRole("button", { name: /^SOLUSDT/ }));
+    await pickPair("SOLUSDT");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles));
 
     // The run read lands afterwards: it must write nothing for this chart, and the
     // free controls must stay the trader's.
     await act(async () => runRead.resolve(ok(runDto())));
-    expect(screen.getByText("No run")).toBeTruthy();
+    expect(screen.getByText("Free chart")).toBeTruthy();
     expect(screen.queryByText(/Backtest run run-1/)).toBeNull();
     expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles);
     expect(commands.chartData).toHaveBeenCalledTimes(1);
@@ -1100,12 +1136,12 @@ describe("the selection the tab owns", () => {
     vi.mocked(commands.chartData).mockResolvedValue(ok(free));
     await open("#/chart?run=run-1");
 
-    fireEvent.click(await screen.findByRole("button", { name: /^XRPUSDT/ }));
+    await pickPair("XRPUSDT");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles));
 
     await act(async () => runRead.resolve(failure("no backtest run run-1", "not_found")));
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.getByText("No run")).toBeTruthy();
+    expect(screen.getByText("Free chart")).toBeTruthy();
     expect(h.adapter.setCandles).toHaveBeenLastCalledWith(free.candles);
   });
 });
@@ -1371,13 +1407,12 @@ function fireCandleClick(openTime: string) {
 
 /** Arm "Mark example" with a setup label, the way the trader does. */
 async function arm(setup = "support-rejection longs", side?: "Long" | "Short") {
-  if (side !== undefined) {
-    fireEvent.click(await screen.findByRole("button", { name: side }));
-  }
+  const toggle = await screen.findByRole("button", { name: "Mark example" });
+  if (toggle.getAttribute("aria-pressed") !== "true") fireEvent.click(toggle);
+  if (side !== undefined) fireEvent.click(await screen.findByRole("button", { name: side }));
   fireEvent.change(await screen.findByLabelText(/Setup label/i), {
     target: { value: setup },
   });
-  fireEvent.click(await screen.findByRole("button", { name: /Mark example/ }));
 }
 
 describe("the marks read", () => {
@@ -1551,11 +1586,7 @@ describe("marking a candle", () => {
   });
 
   it("shows a holdout refusal in plain words, with the date, and adds no mark", async () => {
-    // The bus folds the route's own `holdout` token onto `validation`
-    // (`tauri/error.rs::from_server_token` keeps the message and drops the token), so this
-    // is the refusal the screen actually receives. What identifies it is the tab's own
-    // knowledge of the fence plus the bar it sent: the fence is the write's first step
-    // (G2), so a bar at or after the known start is refused for the fence.
+    // The fence crosses the bus as its own code, `holdout` (#427).
     const holdoutMs = FIRST + 50 * DAY;
     vi.mocked(commands.listMarks).mockResolvedValue(
       ok(markList({ hiddenByHoldout: { holdoutStartMs: String(holdoutMs), count: 0 } })),
@@ -1563,7 +1594,7 @@ describe("marking a candle", () => {
     vi.mocked(commands.writeMark).mockResolvedValue(
       failure(
         "the holdout freeze refuses this run on BTCUSDT: `barTime` reaches into the holdout, which starts at 2025-02-20T00:00:00Z",
-        "validation",
+        "holdout",
       ),
     );
     await open("#/chart");
@@ -1587,7 +1618,7 @@ describe("marking a candle", () => {
     vi.mocked(commands.writeMark).mockResolvedValue(
       failure(
         "the holdout freeze refuses this run on BTCUSDT: `barTime` reaches into the holdout, which starts at 2025-10-10T00:00:00Z",
-        "validation",
+        "holdout",
       ),
     );
     await open("#/chart");
@@ -1596,6 +1627,25 @@ describe("marking a candle", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("starts at 2025-10-10T00:00:00Z");
+    expect(alert.textContent).not.toContain("This candle is inside the holdout from");
+  });
+
+  it("shows a field refusal's own words at a bar inside the holdout (#427)", async () => {
+    // The fence is not the only refusal at a bar inside the holdout: field parsing comes
+    // first, so a bad setup label there is a `validation` refusal, and the tab must show its
+    // own message rather than the fence's sentence.
+    vi.mocked(commands.listMarks).mockResolvedValue(
+      ok(markList({ hiddenByHoldout: { holdoutStartMs: String(FIRST + 50 * DAY), count: 0 } })),
+    );
+    vi.mocked(commands.writeMark).mockResolvedValue(
+      failure("setup: setup must not carry a control character", "validation"),
+    );
+    await open("#/chart");
+    await arm();
+    await act(async () => fireCandleClick(String(FIRST + 60 * DAY)));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("setup: setup must not carry a control character");
     expect(alert.textContent).not.toContain("This candle is inside the holdout from");
   });
 
@@ -1669,8 +1719,8 @@ describe("the marks table", () => {
     await open("#/chart");
     const table = await screen.findByRole("table", { name: /Example marks/ });
     expect(table.textContent).toContain("Reference — not an order");
-    expect((await screen.findByRole("button", { name: /Mark example/ })).textContent)
-      .toContain("Reference — not an order");
+    fireEvent.click(await screen.findByRole("button", { name: "Mark example" }));
+    expect(document.querySelector(".markbar .mb-ref")?.textContent).toBe("Reference — not an order");
   });
 
   it("withdraws a mark: the row and the layer both lose it", async () => {
@@ -1726,8 +1776,9 @@ describe("the marks table", () => {
 // Go to a date, and zoom (r6.s4.w3)
 // ---------------------------------------------------------------------------
 
-/** Type `text` into the Go to (UTC) field and press Go. */
+/** Open Go to date when it is shut, type `text` into the Go to (UTC) field and press Go. */
 function goTo(text: string) {
+  if (screen.queryByLabelText("Go to (UTC)") === null) fireEvent.click(screen.getByRole("button", { name: "Go to date" }));
   fireEvent.change(screen.getByLabelText("Go to (UTC)"), { target: { value: text } });
   fireEvent.click(screen.getByRole("button", { name: "Go" }));
 }
@@ -1775,18 +1826,38 @@ describe("going to a date (r6.s4.w3)", () => {
     expect(commands.chartData).toHaveBeenCalledTimes(1);
   });
 
-  it("refuses a date at or after the holdout start before any read", async () => {
+  it("goes to a date inside the holdout on the free chart, which draws it (r7.s2.w1)", async () => {
     vi.mocked(commands.chartData).mockResolvedValue(
-      ok(chartDto({ holdout: { holdoutStartMs: "1736985600000", barsWithheld: 3 } })),
+      ok(chartDto({ holdout: { holdoutStartMs: "1736985600000", barsWithheld: 0 } })),
     );
     await open("#/chart");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
 
     goTo("2025-01-16");
 
+    await waitFor(() => expect(h.adapter.centerOn).toHaveBeenCalledWith("1736985600000"));
+    expect(screen.queryByText(/inside the holdout/)).toBeNull();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a date at or after the holdout start on a run's chart, before any read", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          run: runLayer(),
+          holdout: { holdoutStartMs: "1736985600000", barsWithheld: 3 },
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-01-16");
+
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("inside the holdout");
-    expect(alert.textContent).toContain("2025-01-16 UTC");
+    expect(alert.textContent).toBe(
+      "That date is inside the holdout from 2025-01-16 UTC; the chart withholds it.",
+    );
     expect(commands.chartData).toHaveBeenCalledTimes(1);
     expect(h.adapter.centerOn).not.toHaveBeenCalled();
   });
@@ -1852,20 +1923,41 @@ describe("going to a date (r6.s4.w3)", () => {
     expect(commands.chartData).toHaveBeenCalledTimes(1);
     expect(h.adapter.centerOn).not.toHaveBeenCalled();
   });
+
+  it("refuses a date after the run's last bar", async () => {
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2026-03-01");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "That date is outside this run (2025-01-01 00:00 UTC to 2026-02-05 00:00 UTC).",
+    );
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("says no bar is drawn when the run's whole leg is drawn and does not hold the date", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ candles: [candle(FIRST), candle(FIRST + TF_MS_4H)], run: runLayer() })),
+    );
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    goTo("2025-06-01");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("No 4h bar at 2025-06-01 00:00 UTC is drawn in this run's window.");
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("zooming (r6.s4.w3)", () => {
-  it("zooms with the buttons and with the + and - keys", async () => {
+  it("zooms with the + and - keys", async () => {
     vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
     await open("#/chart");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
-    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
-    fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
-    expect(h.adapter.zoom).toHaveBeenLastCalledWith("out");
-
-    h.adapter.zoom.mockClear();
     fireEvent.keyDown(window, { key: "+" });
     expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
     fireEvent.keyDown(window, { key: "=" });
@@ -1888,10 +1980,41 @@ describe("zooming (r6.s4.w3)", () => {
     await open("#/chart");
     await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
 
+    fireEvent.click(screen.getByRole("button", { name: "Go to date" }));
+    fireEvent.click(screen.getByRole("button", { name: "Mark example" }));
     fireEvent.keyDown(screen.getByLabelText("Go to (UTC)"), { key: "+" });
     fireEvent.keyDown(screen.getByLabelText("Setup label"), { key: "-" });
 
     expect(h.adapter.zoom).not.toHaveBeenCalled();
+  });
+
+  it("does not zoom on + or - typed into a textarea, a select or an editable region", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+
+    const textarea = document.createElement("textarea");
+    const select = document.createElement("select");
+    const editable = document.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    const inner = document.createElement("span");
+    editable.append(inner);
+    const blank = document.createElement("div");
+    blank.setAttribute("contenteditable", "");
+    const plain = document.createElement("div");
+    document.body.append(textarea, select, editable, blank, plain);
+
+    fireEvent.keyDown(textarea, { key: "+" });
+    fireEvent.keyDown(select, { key: "+" });
+    fireEvent.keyDown(inner, { key: "+" });
+    fireEvent.keyDown(blank, { key: "+" });
+    expect(h.adapter.zoom).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(plain, { key: "+" });
+    expect(h.adapter.zoom).toHaveBeenCalledTimes(1);
+    expect(h.adapter.zoom).toHaveBeenLastCalledWith("in");
+
+    for (const element of [textarea, select, editable, blank, plain]) element.remove();
   });
 });
 
@@ -2080,5 +2203,836 @@ describe("the strategy on the chart (r6.s4.w4)", () => {
         "This rule uses no S/R, pivot, candle-pattern, EMA, SMA or WaveTrend operand on 4h.",
       ),
     ).toBeTruthy();
+  });
+});
+
+describe("the chart canvas aligned to canvas v9 (r7.s2.w2)", () => {
+  /** The text between the first `${selector} {` and the next `}` of the Chart tab's sheet. */
+  function ruleBody(sheet: string, selector: string): string {
+    const start = sheet.indexOf(`${selector} {`);
+    expect(start, `chart-tab.css has no ${selector} rule`).toBeGreaterThanOrEqual(0);
+    return sheet.slice(start, sheet.indexOf("}", start));
+  }
+
+  /** The first class of each child of `parent`. */
+  function firstClasses(parent: Element): (string | undefined)[] {
+    return Array.from(parent.children).map((child) => child.classList[0]);
+  }
+
+  const TAG_HOLDOUT = { holdoutStartMs: String(ENTRY), barsWithheld: 0 };
+
+  it("fills the content track: the draw rail, the canvas pane and the right rail", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const region = screen.getByRole("region", { name: "Chart" });
+    expect(firstClasses(region)).toEqual(["cw-tool", "cw-body"]);
+    const body = region.querySelector(".cw-body") as Element;
+    expect(firstClasses(body)).toEqual(["draw-rail", "cw-main", "rrail"]);
+    const main = body.querySelector(".cw-main") as Element;
+    expect(firstClasses(main)).toEqual(["cv-wrap"]);
+    expect(main.querySelector(".cv-wrap")?.firstElementChild?.classList.contains("cw-canvas")).toBe(true);
+
+    const sheet = fs.readFileSync(`${nodeRuntime.cwd()}/ui/src/styles/chart-tab.css`, "utf8");
+    expect(ruleBody(sheet, ".cw")).toContain("height: calc(100% + 2 * var(--sp-6))");
+    expect(ruleBody(sheet, ".cw")).toContain("margin: calc(-1 * var(--sp-6))");
+    expect(ruleBody(sheet, ".cv-wrap")).toContain("position: relative");
+    expect(ruleBody(sheet, ".cv-wrap")).toContain("flex: 1");
+    expect(ruleBody(sheet, ".cw-canvas")).toContain("position: absolute");
+    expect(ruleBody(sheet, ".cw-canvas")).toContain("inset: 0");
+    expect(ruleBody(sheet, ".tstrip")).toContain("height: 170px");
+  });
+
+  it("shows the drawing tools as not built yet in the draw rail", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const rail = document.querySelector(".draw-rail") as Element;
+    expect(rail.textContent).toBe("Drawing tools: not built yet");
+    expect(rail.querySelector(".not-built")?.getAttribute("title")).toBe("Drawing tools — not built yet");
+    expect(rail.querySelector("button")).toBeNull();
+  });
+
+  it("shows the last bar's OHLC in the legend, and the bar under the crosshair while it moves", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const legend = await screen.findByRole("group", { name: "OHLC legend" });
+    const line = legend.querySelector(".ro-l1") as Element;
+    for (const part of [
+      "BTCUSDT · 4h",
+      "2026-02-05 00:00 UTC",
+      "O 93,548.80",
+      "H 94,449.20",
+      "L 93,460.20",
+      "C 93,810.00",
+    ]) {
+      expect(line.textContent).toContain(part);
+    }
+    expect(line.querySelectorAll("b.bull")).toHaveLength(4);
+    expect(legend.querySelector('[data-exact="93548.8"]')).not.toBeNull();
+
+    const moved = h.adapter.onCrosshairMove.mock.calls.at(-1)?.[0] as (open: string | null) => void;
+    act(() => moved(String(FIRST)));
+    expect(line.textContent).toContain("2025-01-01 00:00 UTC");
+    act(() => moved(null));
+    expect(line.textContent).toContain("2026-02-05 00:00 UTC");
+  });
+
+  it("shows the change and the candle anatomy as not built yet, never a number", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const legend = await screen.findByRole("group", { name: "OHLC legend" });
+    expect(legend.querySelector(".ro-l1 .not-built")?.getAttribute("title")).toBe(
+      "Change from the previous close — not built yet",
+    );
+    const row = legend.querySelector(".ro-row") as Element;
+    expect(row.textContent).toBe("AnatomyCandle anatomy: not built yet");
+    expect(row.querySelector(".not-built")?.getAttribute("title")).toBe("Candle anatomy — not built yet");
+    expect(legend.textContent).not.toContain("%");
+  });
+
+  it("tags the holdout band on the canvas of a free chart", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto({ holdout: TAG_HOLDOUT })));
+    await open("#/chart");
+    await screen.findByText("Holdout — from 2025-04-11 UTC · agents can't test here");
+    const tag = document.querySelector(".cv-wrap .cv-ho-tag") as Element;
+    expect(tag.getAttribute("role")).toBe("note");
+    expect(tag.textContent).toBe("Holdout — from 2025-04-11 UTC · agents can't test here");
+    expect(document.querySelector(".cw-notes")?.textContent).not.toContain("Holdout");
+  });
+
+  it("keeps the holdout sentence in the rail's notes when no loaded bar is inside", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ holdout: { holdoutStartMs: String(LAST + DAY), barsWithheld: 0 } })),
+    );
+    await open("#/chart");
+    await screen.findByText("Holdout — from 2026-02-06 UTC · agents can't test here");
+    expect(document.querySelector(".cv-ho-tag")).toBeNull();
+    expect(document.querySelector(".cw-notes")?.textContent).toContain(
+      "Holdout — from 2026-02-06 UTC · agents can't test here",
+    );
+  });
+
+  it("keeps a run's withheld note in the rail's notes, with no tag", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer(), holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 12 } })),
+    );
+    await open("#/chart?run=run-1");
+    await screen.findByText("Holdout from 2025-04-11 UTC — 12 bars withheld");
+    expect(document.querySelector(".cv-ho-tag")).toBeNull();
+    expect(document.querySelector(".cw-notes")?.textContent).toContain(
+      "Holdout from 2025-04-11 UTC — 12 bars withheld",
+    );
+  });
+
+  it("opens on the latest bars, not the whole window (#456)", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.showLatest).toHaveBeenCalledTimes(1));
+    expect(h.adapter.centerOn).not.toHaveBeenCalled();
+  });
+
+  it("shows a refused date over the canvas without moving it, and clears the crosshair (#505)", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    goTo("not a date");
+    const refusal = await screen.findByText("Type a UTC date as YYYY-MM-DD or YYYY-MM-DD HH:mm.");
+    const alerts = refusal.closest(".cv-alerts");
+    expect(alerts).not.toBeNull();
+    expect(alerts?.closest(".cv-wrap")).not.toBeNull();
+    expect(h.adapter.clearCrosshair).toHaveBeenCalledTimes(1);
+    expect(document.querySelector("section.cw > .cw-msg")).toBeNull();
+  });
+
+  it("shows the loading sentence over the canvas, not above it", async () => {
+    vi.mocked(commands.chartData).mockReturnValue(new Promise(() => {}) as never);
+    await open("#/chart");
+    const loading = await screen.findByText("Loading BTCUSDT 4h…");
+    expect(loading.closest(".cv-over")).not.toBeNull();
+  });
+
+  it("shows a refused read over the canvas, not above it", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(failure("refused") as never);
+    await open("#/chart");
+    const alert = await screen.findByRole("alert");
+    expect(alert.closest(".cv-over")).not.toBeNull();
+  });
+
+  it("carries every candle's exact open, high, low, close and volume, with no run (#420)", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    fireEvent.click(await screen.findByText("Candles — 2 bars (open, high, low, close, volume)"));
+    const table = await screen.findByRole("table", { name: "Candles — open, high, low, close, volume" });
+    expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "bar",
+      "open",
+      "high",
+      "low",
+      "close",
+      "volume",
+    ]);
+    const first = within(table).getAllByRole("row")[1];
+    expect(Array.from(first.querySelectorAll("td")).map((cell) => cell.textContent)).toEqual([
+      "2025-01-01 00:00 UTC",
+      "93,548.80",
+      "94,449.20",
+      "93,460.20",
+      "93,810.00",
+      "13962.019",
+    ]);
+    expect(Array.from(first.querySelectorAll("[data-exact]")).map((el) => el.getAttribute("data-exact"))).toEqual([
+      "93548.8",
+      "94449.2",
+      "93460.2",
+      "93810",
+      "13962.019",
+    ]);
+  });
+
+  it("carries the candle table on a run's chart too (#420)", async () => {
+    await open("#/chart?run=run-1");
+    expect(await screen.findByText("Candles — 2 bars (open, high, low, close, volume)")).toBeTruthy();
+  });
+
+  it("renders exactly the canvas strings this item adds", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto({ holdout: TAG_HOLDOUT })));
+    await open("#/chart");
+    const legend = await screen.findByRole("group", { name: "OHLC legend" });
+    const candles = screen.getByRole("region", { name: "Candles" });
+    expect([
+      (document.querySelector(".draw-rail") as Element).textContent,
+      (legend.querySelector("b.mono") as Element).textContent,
+      (legend.querySelector(".ro-k") as Element).textContent,
+      ...Array.from(document.querySelectorAll(".draw-rail .not-built, .cv-wrap .not-built")).map((el) => el.getAttribute("title")),
+      (document.querySelector(".cv-ho-tag") as Element).textContent,
+      (candles.querySelector("summary") as Element).textContent,
+    ]).toEqual([
+      "Drawing tools: not built yet",
+      "BTCUSDT · 4h",
+      "Anatomy",
+      "Drawing tools — not built yet",
+      "Change from the previous close — not built yet",
+      "Candle anatomy — not built yet",
+      "Holdout — from 2025-04-11 UTC · agents can't test here",
+      "Candles — 2 bars (open, high, low, close, volume)",
+    ]);
+  });
+});
+
+describe("the chart toolbar, rail and trade strip aligned to canvas v9 (r7.s2.w3)", () => {
+  /** The text between the first `${selector} {` and the next `}` of the Chart tab's sheet. */
+  function ruleBody(sheet: string, selector: string): string {
+    const start = sheet.indexOf(`${selector} {`);
+    expect(start, `chart-tab.css has no ${selector} rule`).toBeGreaterThanOrEqual(0);
+    return sheet.slice(start, sheet.indexOf("}", start));
+  }
+
+  /** The first class of each child of `parent`. */
+  function firstClasses(parent: Element): (string | undefined)[] {
+    return Array.from(parent.children).map((child) => child.classList[0]);
+  }
+
+  /** The Layers section whose name is `name`. */
+  function layerSection(name: string): Element {
+    const head = Array.from(document.querySelectorAll(".lg-n")).find((el) => el.textContent === name);
+    expect(head, `no Layers section ${name}`).toBeDefined();
+    return (head as Element).closest(".lg") as Element;
+  }
+  /** Each row of a Layers section as [label, count]. */
+  function layerRows(section: Element): (string | null)[][] {
+    return Array.from(section.querySelectorAll(".lg-sub")).map((row) => [
+      row.querySelector(".mono")?.textContent ?? null,
+      row.querySelector(".lg-c")?.textContent ?? null,
+    ]);
+  }
+  /** The title of every not-built chip under `root`, in DOM order. */
+  function notBuiltTitles(root: ParentNode): (string | null)[] {
+    return Array.from(root.querySelectorAll(".not-built")).map((el) => el.getAttribute("title"));
+  }
+
+  const sheetText = (): string => fs.readFileSync(`${nodeRuntime.cwd()}/ui/src/styles/chart-tab.css`, "utf8");
+
+  const FREE_TITLES = [
+    "All timeframes — not built yet",
+    "Indicator picker — not built yet",
+    "Chart layouts — not built yet",
+    "Drawing tools — not built yet",
+    "Change from the previous close — not built yet",
+    "Candle anatomy — not built yet",
+    "Show or hide indicators — not built yet",
+    "Show or hide structure — not built yet",
+    "Market structure — not built yet",
+    "Show or hide candle patterns — not built yet",
+    "Candle patterns — not built yet",
+    "Show or hide trades — not built yet",
+    "Binding a paper session — not built yet",
+    "Drawings — not built yet",
+    "Show or hide example marks — not built yet",
+  ];
+
+  /** A free chart: the read answers with candles and no run. */
+  async function openFree() {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+  }
+
+  /** A run's chart with one stored trade, once its strip table is there. */
+  async function openRunWithTrade() {
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(ok(runDto({ trades: [tradeRow()] })));
+    await open("#/chart?run=run-1");
+    return screen.findByRole("table", { name: "Trades in the run" });
+  }
+
+  it("lays out a run's chart as canvas v9 does: the canvas, the trade strip below it, the rail beside", async () => {
+    await open("#/chart?run=run-1");
+    await screen.findByRole("table", { name: "Trades in the run" });
+    const body = document.querySelector(".cw-body") as Element;
+    expect(firstClasses(body)).toEqual(["draw-rail", "cw-main", "rrail"]);
+    expect(firstClasses(body.querySelector(".cw-main") as Element)).toEqual(["cv-wrap", "tstrip"]);
+    const chip = document.querySelector(".ctx-chip") as Element;
+    expect(chip.classList.contains("ctx-bt")).toBe(true);
+    expect(chip.textContent).toBe("Backtest run run-1 · 4h");
+
+    const sheet = sheetText();
+    expect(ruleBody(sheet, ".cw-body")).toContain("grid-template-columns: 40px minmax(0, 1fr) 304px");
+    expect(ruleBody(sheet, ".cw-body.rail-closed")).toContain("grid-template-columns: 40px minmax(0, 1fr) 0");
+    expect(ruleBody(sheet, ".tstrip")).toContain("height: 170px");
+    expect(ruleBody(sheet, ".cw-tool")).toContain("height: 42px");
+  });
+
+  it("opens the held pairs from the pair chip and charts the one picked", async () => {
+    await openFree();
+    const chip = screen.getByRole("button", { name: "Pair: BTCUSDT" });
+    expect(chip.textContent).toBe("BBTCUSDTPERPBinance");
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(chip);
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+
+    const list = screen.getByRole("dialog", { name: "Pairs" });
+    expect((list.querySelector(".sym-sec") as Element).textContent).toBe("Bars on server4ready to chart");
+    expect(within(list).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "BBTCUSDTon chartBinance",
+      "EETHUSDTBinance",
+      "SSOLUSDTBinance",
+      "XXRPUSDTBinance",
+    ]);
+    expect(notBuiltTitles(list)).toEqual(["Symbol search — not built yet"]);
+
+    fireEvent.click(within(list).getByRole("button", { name: /^ETHUSDT/ }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "ETHUSDT",
+        timeframe: "4h",
+        fromMs: null,
+        toMs: null,
+        runId: null,
+      }),
+    );
+    expect(screen.queryByRole("dialog", { name: "Pairs" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Pair: ETHUSDT" })).toBeTruthy();
+  });
+
+  it("closes the pair list on Escape", async () => {
+    await openFree();
+    const chip = screen.getByRole("button", { name: "Pair: BTCUSDT" });
+    fireEvent.click(chip);
+    expect(screen.getByRole("dialog", { name: "Pairs" })).toBeTruthy();
+    fireEvent.keyDown(chip, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Pairs" })).toBeNull();
+  });
+
+  it("shows a run's pair as a chip that opens nothing", async () => {
+    await open("#/chart?run=run-1");
+    await screen.findByText("Backtest run run-1 · 4h");
+    expect(screen.queryByRole("button", { name: /^Pair: / })).toBeNull();
+    const chip = document.querySelector(".sym-btn") as Element;
+    expect(chip.tagName).toBe("SPAN");
+    expect(chip.getAttribute("title")).toBe("The run sets the pair");
+    expect(chip.textContent).toBe("BBTCUSDTPERPBinance");
+  });
+
+  it("offers the free chart's timeframes in canvas v9's row, with every other interval not built yet", async () => {
+    await openFree();
+    const row = document.querySelector(".tf-row") as Element;
+    expect(Array.from(row.querySelectorAll("button")).map((button) => button.textContent)).toEqual([
+      "15m",
+      "4h",
+      "1d",
+    ]);
+    expect((row.querySelector(".is-active") as Element).textContent).toBe("4h");
+    expect(notBuiltTitles(row)).toEqual(["All timeframes — not built yet"]);
+    fireEvent.click(within(row as HTMLElement).getByRole("button", { name: "1d" }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "1d",
+        fromMs: null,
+        toMs: null,
+        runId: null,
+      }),
+    );
+  });
+
+  it("shows a run's two legs in the timeframe row", async () => {
+    await open("#/chart?run=run-1");
+    await screen.findByText("Backtest run run-1 · 4h");
+    const row = document.querySelector(".tf-row") as Element;
+    const buttons = Array.from(row.querySelectorAll("button"));
+    expect(buttons.map((button) => button.textContent)).toEqual(["15m", "4h"]);
+    expect(buttons.map((button) => button.getAttribute("title"))).toEqual([
+      "Primary timeframe",
+      "Higher timeframe",
+    ]);
+    expect((row.querySelector(".is-active") as Element).textContent).toBe("4h");
+  });
+
+  it("goes to a date from the Go to date popover, which Go and Escape close", async () => {
+    await openFree();
+    const opener = screen.getByRole("button", { name: "Go to date" });
+    expect(opener.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByLabelText("Go to (UTC)")).toBeNull();
+    fireEvent.click(opener);
+    expect(opener.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.change(screen.getByLabelText("Go to (UTC)"), { target: { value: "2025-02-01" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    expect(h.adapter.centerOn).toHaveBeenCalledWith(String(Date.UTC(2025, 1, 1)));
+    expect(screen.queryByLabelText("Go to (UTC)")).toBeNull();
+
+    fireEvent.click(opener);
+    const field = screen.getByLabelText("Go to (UTC)") as HTMLInputElement;
+    expect(field.value).toBe("2025-02-01");
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(screen.queryByLabelText("Go to (UTC)")).toBeNull();
+  });
+
+  it("shows + Indicator and the layout picker as not built yet in v9's place, with no zoom buttons", async () => {
+    await openFree();
+    const later = Array.from(document.querySelectorAll(".cw-tool .cwt-later"));
+    expect(later).toHaveLength(2);
+    expect(later[0].textContent).toBe("+ IndicatorIndicator picker: not built yet");
+    expect(notBuiltTitles(later[1])).toEqual(["Chart layouts — not built yet"]);
+    expect(screen.queryByRole("button", { name: "Zoom in" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Zoom out" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Indicator/ })).toBeNull();
+  });
+
+  it("names a free chart Free chart in the context chip", async () => {
+    await openFree();
+    const chip = document.querySelector(".ctx-chip") as Element;
+    expect(chip.classList.contains("ctx-free")).toBe(true);
+    expect(chip.textContent).toBe("Free chart");
+  });
+
+  it("hides and shows the right rail, and Layers opens it on the Layers tab", async () => {
+    await openFree();
+    const toggle = screen.getByRole("button", { name: "Hide right rail" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("tab", { name: "Inspector" }));
+    fireEvent.click(toggle);
+    expect((document.querySelector(".cw-body") as Element).classList.contains("rail-closed")).toBe(true);
+    expect(document.querySelector(".rrail")).toBeNull();
+    expect(document.querySelectorAll(".rrail-closed")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Show right rail" }).getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Layers" }));
+    expect(document.querySelector(".rrail")).not.toBeNull();
+    expect(screen.getByRole("tab", { name: "Layers" }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("shows the rail's three tabs, Layers first in view, and the chart agent as not built yet", async () => {
+    await openFree();
+    const tabs = within(screen.getByRole("tablist", { name: "Right rail" })).getAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Inspector", "Layers", "✦Agent"]);
+    expect(screen.getByRole("tab", { name: "Layers" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(screen.getByRole("tab", { name: /Agent/ }));
+    const panel = screen.getByRole("tabpanel", { name: "Agent" });
+    expect(panel.textContent).toBe("Chart agent: not built yet");
+    expect(notBuiltTitles(panel)).toEqual(["Chart agent — not built yet"]);
+  });
+
+  it("shows a clicked bar's values in the Inspector, with Explain not built yet, when marking is off, and drops it on another pair", async () => {
+    await openFree();
+    act(() => fireCandleClick(String(FIRST)));
+    expect(screen.getByRole("tab", { name: "Inspector" }).getAttribute("aria-selected")).toBe("true");
+    const bar = screen.getByRole("region", { name: "Bar" });
+    expect((bar.querySelector(".ins-h") as Element).textContent).toBe("Bar2025-01-01 00:00 UTC");
+    expect(Array.from(bar.querySelectorAll("dt")).map((el) => el.textContent)).toEqual([
+      "open",
+      "high",
+      "low",
+      "close",
+      "volume",
+    ]);
+    expect(Array.from(bar.querySelectorAll("dd")).map((el) => el.textContent)).toEqual([
+      "93,548.80",
+      "94,449.20",
+      "93,460.20",
+      "93,810.00",
+      "13962.019",
+    ]);
+    expect(notBuiltTitles(bar)).toEqual(["Explain this bar — not built yet"]);
+    expect(commands.writeMark).not.toHaveBeenCalled();
+
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto({ pair: "ETHUSDT" })));
+    await pickPair("ETHUSDT");
+    await screen.findByText("ETHUSDT · 4h");
+    expect(screen.queryByRole("region", { name: "Bar" })).toBeNull();
+    expect(document.querySelector(".ins-empty")).not.toBeNull();
+  });
+
+  it("says a clicked bar inside the holdout is frozen, with no Explain", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 0 } })),
+    );
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    act(() => fireCandleClick(String(LAST)));
+    const bar = screen.getByRole("region", { name: "Bar" });
+    expect((bar.querySelector(".ho-note") as Element).textContent).toBe(
+      "This bar is inside the frozen holdout; agents can't test here.",
+    );
+    expect(notBuiltTitles(bar)).toEqual([]);
+  });
+
+  it("shows the Inspector's empty state with a drawing's fields not built yet", async () => {
+    await openFree();
+    fireEvent.click(screen.getByRole("tab", { name: "Inspector" }));
+    const empty = document.querySelector(".ins-empty") as Element;
+    expect(empty.textContent).toBe(
+      "Click a bar to see what the server sees there.A drawing's stored fields: not built yet",
+    );
+    expect(notBuiltTitles(empty)).toEqual(["A drawing's stored fields — not built yet"]);
+  });
+
+  it("lists a run's layers, the volume and the operands it does not draw in the Layers rail (#507)", async () => {
+    await open("#/chart?run=run-1");
+    await screen.findByText("Not drawn on the 4h leg");
+    const indicators = layerSection("Indicators");
+    expect(layerRows(indicators)).toEqual([
+      ["Volume", null],
+      ["ema:20", null],
+    ]);
+    expect((indicators.querySelector(".lg-h .lg-c") as Element).textContent).toBe("2");
+
+    const structure = layerSection("Structure");
+    expect(layerRows(structure)).toEqual([
+      ["support:3-3-0.005-2-100", null],
+      ["pivot_low:2-2", "1"],
+    ]);
+    expect((structure.querySelector(".lg-note") as Element).textContent).toBe(
+      "Pivots appear on the bar that confirmed them. The faint marker is the peak; the solid one is when the strategy could know it.",
+    );
+
+    const patterns = layerSection("Candle patterns");
+    expect(layerRows(patterns)).toEqual([["cdl:engulfing", "1"]]);
+    expect((patterns.querySelector(".pl") as Element).textContent).toBe("bullish · below barbearish · aboveneutral");
+
+    const trades = layerSection("Trades");
+    expect((trades.querySelector(".lg-h .lg-c") as Element).textContent).toBe("1");
+    expect((trades.querySelector(".pl") as Element).textContent).toBe("winnerloseropen");
+
+    const notDrawn = layerSection("Not drawn on the 4h leg");
+    expect(layerRows(notDrawn)).toEqual([["rsi:14", null]]);
+    expect((notDrawn.querySelector(".lg-h .lg-c") as Element).textContent).toBe("1");
+    expect((notDrawn.querySelector(".lg-note") as Element).textContent).toBe(
+      "The rule reads these on this leg. The chart draws only S/R levels, pivots, candle patterns, EMA, SMA, WaveTrend and band edges, so it lists the rest here.",
+    );
+    expect(notBuiltTitles(layerSection("My drawings"))).toEqual(["Drawings — not built yet"]);
+  });
+
+  it("shows a free chart's Layers: the volume only, and what needs a run or a later spine as not built yet", async () => {
+    await openFree();
+    expect(layerRows(layerSection("Indicators"))).toEqual([["Volume", null]]);
+    expect(notBuiltTitles(layerSection("Structure"))).toEqual([
+      "Show or hide structure — not built yet",
+      "Market structure — not built yet",
+    ]);
+    expect(notBuiltTitles(layerSection("Candle patterns"))).toEqual([
+      "Show or hide candle patterns — not built yet",
+      "Candle patterns — not built yet",
+    ]);
+    const trades = layerSection("Trades");
+    expect(trades.classList.contains("is-dis")).toBe(true);
+    expect((trades.querySelector(".lg-h .lg-c") as Element).textContent).toBe("0");
+    expect(trades.textContent).toContain("No run is open, so there are no trades to draw.");
+    expect(notBuiltTitles(trades)).toEqual([
+      "Show or hide trades — not built yet",
+      "Binding a paper session — not built yet",
+    ]);
+    const names = Array.from(document.querySelectorAll(".lg-n")).map((el) => el.textContent ?? "");
+    expect(names.some((name) => name.startsWith("Not drawn"))).toBe(false);
+  });
+
+  it("says a run's empty structure and patterns hold none in the drawn window, not that they are not built (CR3)", async () => {
+    // Before the chart read answers, a section names nothing: neither the chip nor "None" is true yet (C-1).
+    const read = deferred<unknown>();
+    vi.mocked(commands.chartData).mockReturnValue(read.promise as never);
+    await open("#/chart?run=run-1");
+    await screen.findByText("Backtest run run-1 · 4h");
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    for (const name of ["Structure", "Candle patterns"]) {
+      const section = layerSection(name);
+      expect(section.querySelector(".lg-note")).toBeNull();
+      expect(section.textContent).not.toContain("None in the drawn window");
+    }
+    expect(notBuiltTitles(document)).not.toContain("Market structure — not built yet");
+    expect(notBuiltTitles(document)).not.toContain("Candle patterns — not built yet");
+
+    await act(async () => read.resolve(ok(chartDto({ run: runLayer({ overlays: [], notDrawn: [] }) }))));
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    const structure = layerSection("Structure");
+    expect((structure.querySelector(".lg-note") as Element).textContent).toBe("None in the drawn window");
+    expect(notBuiltTitles(structure)).toEqual(["Show or hide structure — not built yet"]);
+    const patterns = layerSection("Candle patterns");
+    expect((patterns.querySelector(".lg-note") as Element).textContent).toBe("None in the drawn window");
+    expect(notBuiltTitles(patterns)).toEqual(["Show or hide candle patterns — not built yet"]);
+  });
+
+  it("draws canvas v9's trade strip: the side tag, the stop, the bars held and the R by outcome (#507)", async () => {
+    const table = await openRunWithTrade();
+    expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "#",
+      "side",
+      "entry",
+      "price",
+      "exit",
+      "price",
+      "stop",
+      "bars",
+      "reason",
+      "R",
+    ]);
+    const row = within(table).getAllByRole("row")[1];
+    expect(Array.from(row.querySelectorAll("th, td")).map((cell) => cell.textContent)).toEqual([
+      "1",
+      "long",
+      "2025-04-11 00:00 UTC",
+      "90,000.00",
+      "2025-04-12 00:00 UTC",
+      "92,000.00",
+      "89,000.00",
+      "96",
+      "take_profit",
+      "+2.00 R",
+    ]);
+    expect(row.querySelector(".dir-tag.dir-long")).not.toBeNull();
+    expect((row.lastElementChild as Element).classList.contains("bull")).toBe(true);
+    expect((document.querySelector(".ts-h") as Element).textContent).toBe(
+      "Tradesrun-1 · 1 of 1 in the drawn windowclick a row to center it",
+    );
+  });
+
+  it("shows v9's setup column on a setup strategy's run: the drawn window's bars, else not built yet", async () => {
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(
+        runDto({
+          trades: [
+            tradeRow(),
+            tradeRow({ entryFillTime: String(EARLIER_ENTRY), exitFillTime: String(EARLIER_ENTRY + DAY) }),
+          ],
+        }),
+      ),
+    );
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(
+        chartDto({
+          run: runLayer({
+            trades: [
+              trade({
+                armBarTime: String(ENTRY - 4 * 3_600_000),
+                dipBarTime: String(ENTRY - 2 * 3_600_000),
+                triggerBarTime: String(ENTRY - TF_MS_15M),
+              }),
+            ],
+          }),
+        }),
+      ),
+    );
+    await open("#/chart?run=run-1");
+    const table = await screen.findByRole("table", { name: "Trades in the run" });
+    await waitFor(() =>
+      expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+        "#",
+        "side",
+        "entry",
+        "price",
+        "exit",
+        "price",
+        "stop",
+        "bars",
+        "reason",
+        "setup · arm → dip → trigger",
+        "R",
+      ]),
+    );
+    const rows = within(table).getAllByRole("row");
+    expect(rows[1].querySelectorAll("th, td")[9].textContent).toBe("04-10 20:00 → 22:00 → 23:45");
+    const outside = rows[2].querySelectorAll("th, td")[9];
+    expect(notBuiltTitles(outside)).toEqual(["Setup outside the drawn window — not built yet"]);
+    expect(outside.textContent).toBe("Setup outside the drawn window: not built yet");
+  });
+
+  it("picks a trade from anywhere on its row, marks the row, and shows it in the Inspector (#422, #506)", async () => {
+    const table = await openRunWithTrade();
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    fireEvent.click(within(table).getByText("2025-04-11 00:00 UTC"));
+    expect(h.adapter.centerOn).toHaveBeenCalledWith(String(ENTRY));
+    expect(within(table).getAllByRole("row")[1].classList.contains("is-on")).toBe(true);
+    expect(screen.getByRole("tab", { name: "Inspector" }).getAttribute("aria-selected")).toBe("true");
+    expect(await screen.findByRole("table", { name: "Selected trade — setup and stop" })).toBeTruthy();
+    expect(commands.chartData).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists every one of a run's trades in the strip (#507)", async () => {
+    const rows = Array.from({ length: 25 }, (_, k) =>
+      tradeRow({
+        entryFillTime: String(ENTRY + k * DAY),
+        exitFillTime: String(ENTRY + k * DAY + DAY),
+      }),
+    );
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(ok(runDto({ trades: rows })));
+    await open("#/chart?run=run-1");
+    const table = await screen.findByRole("table", { name: "Trades in the run" });
+    expect(within(table).getAllByRole("row")).toHaveLength(26);
+    expect(within(table).getByRole("button", { name: /^Trade 25, long/ })).toBeTruthy();
+  });
+
+  /** A run whose 15m leg is over the cap, on that leg, with the over-cap card showing. */
+  async function openOverCapCard() {
+    await openRunWithTrade();
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
+    return (await screen.findByText(/more than one read/)).closest(".cv-card") as HTMLElement;
+  }
+
+  it("shows canvas v9's over-cap card, whose Show trade 1 loads that trade's window", async () => {
+    const card = await openOverCapCard();
+    expect(card.classList.contains("nd")).toBe(true);
+    expect(within(card).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "Show trade 1",
+      "Open the 4h leg",
+    ]);
+    fireEvent.click(within(card).getByRole("button", { name: "Show trade 1" }));
+    await waitFor(() =>
+      expect(commands.chartData).toHaveBeenLastCalledWith({
+        pair: "BTCUSDT",
+        timeframe: "15m",
+        fromMs: String(ENTRY - HALF),
+        toMs: String(ENTRY + HALF),
+        runId: "run-1",
+      }),
+    );
+  });
+
+  it("opens the run's other leg from the over-cap card", async () => {
+    const card = await openOverCapCard();
+    fireEvent.click(within(card).getByRole("button", { name: "Open the 4h leg" }));
+    await waitFor(() => expect(commands.chartData).toHaveBeenCalledTimes(2));
+    expect(commands.chartData).toHaveBeenLastCalledWith({
+      pair: "BTCUSDT",
+      timeframe: "4h",
+      fromMs: null,
+      toMs: null,
+      runId: "run-1",
+    });
+    await waitFor(() => expect(screen.queryByText(/more than one read/)).toBeNull());
+  });
+
+  it("shows the over-cap card alone when the run opens on a leg over the cap (CR6)", async () => {
+    vi.mocked(commands.getBacktestRun).mockResolvedValue(
+      ok(runDto({ primaryTimeframe: "15m", htfTimeframe: null, usesHtf: false, trades: [tradeRow()] })),
+    );
+    await open("#/chart?run=run-1");
+    await screen.findByText(/Pick a trade to load 15m around it/);
+    expect(screen.queryByText("Loading backtest run run-1…")).toBeNull();
+    const over = document.querySelector(".cv-over") as Element;
+    expect(over.children).toHaveLength(1);
+    expect(Array.from(over.querySelectorAll("button")).map((button) => button.textContent)).toEqual([
+      "Show trade 1",
+    ]);
+  });
+
+  it("names the typed date, not an entry, when a leg switch reads around it (#502 C9)", async () => {
+    vi.mocked(commands.chartData)
+      .mockResolvedValueOnce(ok(chartDto({ run: runLayer() })))
+      .mockReturnValue(new Promise(() => {}) as never);
+    await open("#/chart?run=run-1");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    goTo("2025-04-11");
+    expect(h.adapter.centerOn).toHaveBeenCalledWith(String(ENTRY));
+    fireEvent.click(screen.getByRole("button", { name: /^15m/ }));
+    expect(await screen.findByText("Loading 15m around 2025-04-11 00:00 UTC…")).toBeTruthy();
+    expect(screen.queryByText(/around the entry at/)).toBeNull();
+  });
+
+  it("arms from the toolbar's Mark example, shows canvas v9's mark bar, and Done disarms it (#439)", async () => {
+    await openFree();
+    const toggle = screen.getByRole("button", { name: "Mark example" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    expect(document.querySelector(".markbar")).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    const bar = document.querySelector(".markbar") as Element;
+    expect((bar.querySelector("b") as Element).textContent).toBe("Mark example");
+    expect(Array.from(bar.querySelectorAll(".mb-f > span")).map((el) => el.textContent)).toEqual(["Setup", "Note"]);
+    expect(screen.getByLabelText("Note (optional)").getAttribute("placeholder")).toBe("what made this a setup");
+    expect((bar.querySelector(".mb-ref") as Element).textContent).toBe("Reference — not an order");
+    expect((bar.querySelector("[role=status]") as Element).textContent).toBe("click a candle to place it");
+
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(document.querySelector(".markbar")).toBeNull();
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    act(() => fireCandleClick(String(FIRST)));
+    expect(commands.writeMark).not.toHaveBeenCalled();
+  });
+
+  it("keeps the marks table on screen while a write re-reads it (#439)", async () => {
+    vi.mocked(commands.listMarks)
+      .mockResolvedValueOnce(ok(markList({ marks: [mark()] })))
+      .mockReturnValue(new Promise(() => {}) as never);
+    vi.mocked(commands.writeMark).mockResolvedValue(ok(mark({ markId: "mark-2", barTime: String(LAST) })));
+    await openFree();
+    await screen.findByText("support-rejection longs");
+    await arm();
+    await act(async () => fireCandleClick(String(LAST)));
+    await waitFor(() => expect(commands.listMarks).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("Loading example marks…")).toBeNull();
+    expect(screen.getByText("support-rejection longs")).toBeTruthy();
+    expect(h.adapter.setMarks).toHaveBeenLastCalledWith([mark()]);
+  });
+
+  it("sends one withdraw however often its button is pressed (#439)", async () => {
+    vi.mocked(commands.listMarks).mockResolvedValue(ok(markList({ marks: [mark()] })));
+    vi.mocked(commands.withdrawMark).mockReturnValue(new Promise(() => {}) as never);
+    await openFree();
+    const button = await screen.findByRole("button", { name: "Withdraw mark 1" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(commands.withdrawMark).toHaveBeenCalledTimes(1);
+  });
+
+  it("tags each trade's and each mark's side, with no inert data-side left (#439)", async () => {
+    vi.mocked(commands.listMarks).mockResolvedValue(ok(markList({ marks: [mark({ side: "short" })] })));
+    const strip = await openRunWithTrade();
+    expect(within(strip).getAllByRole("row")[1].querySelector(".dir-tag.dir-long")?.textContent).toBe("long");
+    const marks = await screen.findByRole("table", { name: /Example marks/ });
+    const tag = within(marks).getAllByRole("row")[1].querySelector(".dir-tag.dir-short");
+    expect(tag?.textContent).toBe("short");
+    expect(document.querySelector("[data-side]")).toBeNull();
+    expect(sheetText()).not.toContain("data-side");
+  });
+
+  it("gives cw-setup a rule and keeps none for a control that is gone (#433, #502 C6)", () => {
+    const sheet = sheetText();
+    expect(ruleBody(sheet, '.cw-setup th[scope="row"]')).toContain("text-transform: none");
+    for (const gone of [".cw-markarm", ".cw-markbar", ".cw-below", ".cw-ctx", ".cw-tool-lab"]) {
+      expect(sheet, gone).not.toContain(gone);
+    }
+  });
+
+  it("shows every control a later spine builds as not built yet, in canvas v9's order, on a free chart", async () => {
+    await openFree();
+    await screen.findByRole("group", { name: "OHLC legend" });
+    expect(notBuiltTitles(document.querySelector("section.cw") as Element)).toEqual(FREE_TITLES);
   });
 });

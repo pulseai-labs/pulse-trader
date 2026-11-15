@@ -131,6 +131,53 @@ export function toCandles(candles: readonly ChartCandleDto[]): CandlePoint[] {
   }));
 }
 
+/** Whether a candle closed at or above its open ("bull") or below it ("bear") (r7.s2.w2): the side its volume
+ *  bar and its legend values are coloured by. A comparison of the read's own prices, not a computed figure. */
+export function candleDirection(candle: Pick<ChartCandleDto, "o" | "c">): "bull" | "bear" {
+  return decimal(candle.c) >= decimal(candle.o) ? "bull" : "bear";
+}
+
+/** One volume bar, as the library's histogram series takes it (r7.s2.w2). */
+export interface VolumeBar {
+  readonly time: number;
+  readonly value: number;
+  readonly color: string;
+}
+
+/** The window's volume as histogram bars (r7.s2.w2, canvas v9 `chart-canvas.jsx:88-89`), each in its candle's
+ *  direction colour. */
+export function toVolumeBars(candles: readonly ChartCandleDto[], palette: ChartPalette): VolumeBar[] {
+  return candles.map((candle) => ({
+    time: seconds(candle.t),
+    value: decimal(candle.v),
+    color: candleDirection(candle) === "bull" ? palette.volumeUp : palette.volumeDown,
+  }));
+}
+
+/** The loaded bars a holdout band starts from (r7.s2.w1): the first loaded bar opening at or
+ *  after the holdout start, and the loaded bar before it. Times are the library's seconds. */
+export interface HoldoutBandBars {
+  /** The first held-out bar's open. */
+  readonly first: number;
+  /** The open of the loaded bar before it, or `null` when the first loaded bar is already inside. */
+  readonly before: number | null;
+}
+
+/** Where the holdout band starts in `candles`, or `null` when no start is known or no loaded
+ *  bar opens at or after it. A bar that opens before the start is not held out, even when the
+ *  start falls inside it: the server's cut is by open time too. */
+export function holdoutBandBars(
+  candles: readonly CandlePoint[],
+  holdoutStartMs: string | null,
+): HoldoutBandBars | null {
+  if (holdoutStartMs === null) return null;
+  // Compared in milliseconds: a start inside a bar must not round down onto that bar's open.
+  const start = Number(holdoutStartMs);
+  const index = candles.findIndex((candle) => candle.time * 1000 >= start);
+  if (index === -1) return null;
+  return { first: candles[index].time, before: index === 0 ? null : candles[index - 1].time };
+}
+
 /** The level, line, band-edge and oscillator overlays, as drawable series.
  *
  *  `values[i]` belongs to `candles[i]` — the read returns one value per WINDOW bar —
@@ -226,6 +273,14 @@ export function setupMarkers(
 export function stopLine(trade: ChartTradeDto | null): { price: number; title: "stop" } | null {
   if (trade === null || trade.stopPrice === null) return null;
   return { price: decimal(trade.stopPrice), title: "stop" };
+}
+
+/** A trade's outcome, as the strip colours its R (r7.s2.w3): open while it has no exit, else a winner at or above
+ *  0 R and a loser below. The same rule `toMarkers` colours a trade's markers by; a comparison of the read's own
+ *  values, not a computed figure. */
+export function tradeOutcome(trade: Pick<ChartTradeDto, "exitTime" | "realizedR">): "bull" | "bear" | "open" {
+  if (trade.exitTime === null) return "open";
+  return decimal(trade.realizedR) >= 0 ? "bull" : "bear";
 }
 
 /** Every marker the window's overlays, trades and example marks draw, in ascending time
@@ -429,6 +484,40 @@ export function markersInWindow(
     }))
     .sort((a, b) => a.marker.time - b.marker.time || a.index - b.index)
     .map((entry) => entry.marker);
+}
+
+/** The least gap, in CSS pixels, between two marker labels on one side of the bars (#504): wide enough for
+ *  "+2.91 R" at the library's marker font. */
+export const LABEL_GAP_PX = 48;
+
+/** The markers with every label that would overlap dropped (#504). The list is in ascending time, so its x
+ *  coordinates ascend: a label is kept when it lies at least `LABEL_GAP_PX` right of the last kept label on the
+ *  same side (above, below, or in the bar), and dropped otherwise; the marker itself stays. A marker `xOf`
+ *  cannot place keeps its label. The tables carry every value whatever is drawn (PDR-0011). */
+export function declutterTexts(
+  markers: readonly ChartMarker[],
+  xOf: (time: number) => number | null,
+): ChartMarker[] {
+  const lastKept = new Map<ChartMarker["position"], number>();
+  return markers.map((marker) => {
+    if (marker.text === undefined) return marker;
+    const x = xOf(marker.time);
+    // The library could not place it (`null`, or nothing at all from a test double): keep its label.
+    if (x == null) return marker;
+    const previous = lastKept.get(marker.position);
+    if (previous !== undefined && x - previous < LABEL_GAP_PX) {
+      return {
+        time: marker.time,
+        position: marker.position,
+        shape: marker.shape,
+        color: marker.color,
+        ...(marker.price === undefined ? {} : { price: marker.price }),
+        ...(marker.size === undefined ? {} : { size: marker.size }),
+      };
+    }
+    lastKept.set(marker.position, x);
+    return marker;
+  });
 }
 
 /** Whether a trade lies wholly BEFORE the fence (r5.s2 close review, Q5). `null`

@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   CHART_BAR_CAP,
   WINDOW_HALF_BARS,
+  barsHeld,
   covers,
   parseUtcInstant,
   windowAround,
@@ -103,25 +104,23 @@ describe("windowAround", () => {
   const A = String(ENTRY);
 
   it("asks a free chart for 500 bars either side of the date", () => {
-    expect(windowAround(null, "15m", A)).toEqual({
+    expect(windowAround("15m", A)).toEqual({
       kind: "window",
       fromMs: String(ENTRY - HALF_MS),
       toMs: String(ENTRY + HALF_MS),
     });
   });
 
-  it("plans a run leg around a date exactly as around a trade", () => {
-    // 15m is over the cap: a window, clamped near both edges.
-    for (const anchor of [A, String(FIRST + DAY), String(LAST - DAY)]) {
-      expect(windowAround(SPAN, "15m", anchor)).toEqual(windowPlan(SPAN, "15m", anchor));
-    }
-    // 4h fits in one read: the span.
-    expect(windowAround(SPAN, "4h", A)).toEqual(windowPlan(SPAN, "4h", A));
-    expect(windowAround(SPAN, "4h", A)).toEqual({ kind: "span" });
+  it("asks for 500 4h bars either side on 4h", () => {
+    expect(windowAround("4h", A)).toEqual({
+      kind: "window",
+      fromMs: String(ENTRY - 500 * 14_400_000),
+      toMs: String(ENTRY + 500 * 14_400_000),
+    });
   });
 
   it("asks for the span on a timeframe it cannot size", () => {
-    expect(windowAround(null, "3m", A)).toEqual({ kind: "span" });
+    expect(windowAround("3m", A)).toEqual({ kind: "span" });
   });
 });
 
@@ -163,5 +162,15 @@ describe("covers", () => {
   it("covers only the open of a single loaded bar, which has no spacing to read", () => {
     expect(covers([{ t: String(ENTRY) }], String(ENTRY))).toBe(true);
     expect(covers([{ t: String(ENTRY) }], String(ENTRY + 1))).toBe(false);
+  });
+});
+
+describe("bars held (r7.s2.w3)", () => {
+  it("counts the whole bars between the fills, and none for an open trade or an unknown interval", () => {
+    expect(barsHeld("1735689600000", "1735732800000", "4h")).toBe(3);
+    expect(barsHeld("1735689600000", "1735732800000", "15m")).toBe(48);
+    expect(barsHeld("1735689600000", "1735696800000", "4h")).toBe(0);
+    expect(barsHeld("1735689600000", null, "4h")).toBeNull();
+    expect(barsHeld("1735689600000", "1735704000000", "3m")).toBeNull();
   });
 });

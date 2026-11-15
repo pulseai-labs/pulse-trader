@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::SecondsFormat;
 use pulse::{
-    CandleSeries, CandleSeriesRepository, CandleStore, Db, FakeClock, MarkWriter, MarkWriterKind,
-    OpenFreezeRequest, Pair, SqliteCertificationFreezeRepo, Timeframe, WithdrawMarkRequest,
-    WriteMarkRequest, withdraw_mark_core, write_mark_core,
+    BusErrorCode, CandleSeries, CandleSeriesRepository, CandleStore, Db, FakeClock, MarkWriter,
+    MarkWriterKind, OpenFreezeRequest, Pair, ServerClient, SqliteCertificationFreezeRepo,
+    Timeframe, WithdrawMarkRequest, WriteMarkRequest, withdraw_mark_core, write_mark_core,
 };
 use serde_json::{Value, json};
 use support::server::{ServerOptions, TestServer, spawn_server};
@@ -532,6 +532,45 @@ async fn a_time_after_the_start_with_no_candle_is_refused_for_the_holdout_not_fo
     assert_eq!(
         refused["code"], "holdout",
         "the fence answers BEFORE the lookup for the agent too: {refused}"
+    );
+}
+
+/// #427: the holdout fence crosses the bus as its own code, and a field refusal at the
+/// same bar does not borrow it — field parsing precedes the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fence_reaches_the_bus_as_its_own_code_and_a_field_refusal_at_the_same_bar_does_not() {
+    let server = spawn_server(ServerOptions::default()).await;
+    open_freeze(&server, HOLDOUT_MS).await;
+    let (client, _) = ServerClient::connect(&server.base, &server.app_token)
+        .await
+        .expect("handshake");
+
+    let fenced = client
+        .post_json::<Value, _>(
+            "/api/v1/marks",
+            &write_body("15m", HOLDOUT_MS, "inside the holdout"),
+        )
+        .await
+        .expect_err("a mark inside the holdout is refused");
+    assert_eq!(fenced.code, BusErrorCode::Holdout, "{fenced:?}");
+    assert!(fenced.message.contains("holdout"), "{}", fenced.message);
+
+    let field = client
+        .post_json::<Value, _>(
+            "/api/v1/marks",
+            &write_body("15m", HOLDOUT_MS, "bad\u{7}label"),
+        )
+        .await
+        .expect_err("a control character in the setup is refused");
+    assert_eq!(field.code, BusErrorCode::Validation, "{field:?}");
+    assert_eq!(
+        field.message,
+        "setup: setup must not carry a control character"
+    );
+    assert_eq!(
+        mark_rows(&server.db).await,
+        0,
+        "a refused write writes nothing"
     );
 }
 

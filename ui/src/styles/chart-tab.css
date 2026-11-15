@@ -7,7 +7,7 @@
    `backtest.css` follows against the mock's `backtest-lab.css`.
 
    THE PALETTE. The chart draws on a canvas, so the adapter needs colour VALUES and
-   reads these eighteen aliases off the element the chart is mounted in (`palette.ts`).
+   reads these twenty-three aliases off the element the chart is mounted in (`palette.ts`).
    Every alias is an alias of a hue `tokens.css` already owns, and `--focus` is never
    one of them: focus blue is the selection colour, not an indicator colour
    (PDR-0031). The brief asks for no new colours, and these add none — they only name
@@ -16,8 +16,9 @@
    ============================================================ */
 
 .cw {
-  /* the chart's palette — eighteen aliases, each `var()` of an existing hue */
-  --chart-bg: var(--bg-raised);
+  /* the chart's palette — twenty-three aliases, each `var()` of an existing hue */
+  /* r7.s2.w2: canvas v9's pane background (.cv-wrap) */
+  --chart-bg: var(--bg-base);
   --chart-text: var(--text-2);
   --chart-grid: var(--line-1);
   --chart-bull: var(--bull-1);
@@ -41,90 +42,40 @@
   --chart-oscillator-guide: var(--line-3);
   --chart-setup: var(--warn-2);
   --chart-stop: var(--bear-2);
+  /* r7.s2.w1: the holdout band — canvas v9's hatch */
+  --chart-holdout-fill: var(--bg-sunken);
+  --chart-holdout-hatch: var(--line-2);
+  --chart-holdout-edge: var(--text-3);
+  /* r7.s2.w2: the volume bars — canvas v9's bull and bear, at the low alpha the tokens already hold */
+  --chart-volume-up: var(--bull-bg);
+  --chart-volume-down: var(--bear-bg);
 
   display: flex;
   flex-direction: column;
-  gap: var(--sp-3);
+  min-width: 0;
   min-height: 0;
+  /* r7.s2.w2: full height (canvas v9 .cw). The screen fills the content track edge to edge, so it cancels
+     the track's own padding here rather than the shell changing it for one screen. */
+  height: calc(100% + 2 * var(--sp-6));
+  margin: calc(-1 * var(--sp-6));
+  background: var(--bg-window);
 }
 
 /* ---- toolbar ---- */
 .cw-tool {
+  /* r7.s2.w3: canvas v9's toolbar (chart.css:4) */
+  height: 42px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
-  flex-wrap: wrap;
-}
-.cw-tool-lab {
-  font-size: var(--fs-11);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  color: var(--text-3);
-}
-.cw-ctx {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-2);
-  font-size: var(--fs-12);
-  color: var(--text-2);
+  gap: 8px;
+  padding: 0 10px 0 12px;
+  border-bottom: 1px solid var(--line-1);
+  background: var(--bg-base);
+  white-space: nowrap;
 }
 
-/* ---- the example-trade marks' controls (r5.s3.w3) ---- */
-.cw-markbar {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-3);
-  flex-wrap: wrap;
-  padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-6);
-  background: var(--bg-raised);
-}
-.cw-markfield {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--sp-2);
-  font-size: var(--fs-11);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  color: var(--text-3);
-}
-.cw-markinput {
-  padding: var(--sp-1) var(--sp-2);
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-4);
-  background: var(--bg-overlay);
-  color: var(--text-1);
-  font-family: var(--font-mono);
-  font-size: var(--fs-12);
-  min-width: 180px;
-}
-.cw-markarm {
-  padding: var(--sp-1) var(--sp-3);
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-4);
-  background: var(--bg-overlay);
-  color: var(--text-2);
-  font-size: var(--fs-12);
-  cursor: pointer;
-}
-.cw-markarm.is-on {
-  border-color: var(--text-2);
-  color: var(--text-1);
-}
-.cw-markarm:disabled {
-  color: var(--text-4);
-  cursor: default;
-}
-.cw-markarm:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: -2px;
-}
-.cw-markhint {
-  font-size: var(--fs-12);
-  color: var(--text-3);
-}
+/* ---- the example marks' withdraw (r5.s3.w3) ---- */
 .cw-markwithdraw {
   padding: var(--sp-1) var(--sp-2);
   border: 1px solid var(--line-1);
@@ -149,13 +100,11 @@
 
 /* ---- the chart itself ---- */
 .cw-canvas {
-  flex: 1 1 auto;
-  min-height: 360px;
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-6);
-  background: var(--bg-raised);
-  /* The library's attribution logo sits in this box's bottom-left corner and must
-     never be covered (grill Q6). Nothing in this sheet overlays the canvas. */
+  /* The library's attribution logo sits in this box's bottom-left corner and must never be covered (grill Q6).
+     Over the canvas sit only the legend (top left), the holdout tag (bottom right), the state cards (centre) and
+     the refusals (bottom centre). */
+  position: absolute;
+  inset: 0;
   overflow: hidden;
 }
 
@@ -189,8 +138,7 @@
   font-weight: var(--fw-medium);
 }
 
-/* ---- the trade strip and the table copy ---- */
-.cw-strip,
+/* ---- the table copy ---- */
 .cw-data {
   display: flex;
   flex-direction: column;
@@ -236,12 +184,6 @@
   background: var(--bg-overlay);
   color: var(--text-1);
 }
-.cw-tbl tr[data-side="long"] td:first-child {
-  color: var(--bull-1);
-}
-.cw-tbl tr[data-side="short"] td:first-child {
-  color: var(--bear-1);
-}
 .cw-row-btn {
   all: unset;
   cursor: pointer;
@@ -257,4 +199,863 @@
   font-size: var(--fs-12);
   color: var(--text-3);
   padding: var(--sp-1) 0;
+}
+
+/* ============================================================
+   r7.s2.w2 — the chart canvas aligned to canvas v9 (PDR-0049 d7)
+   Ported from canvas v9 chart.css: .cw-body, .draw-rail, .cw-main,
+   .cv-wrap, .readout / .ro-*, .cv-over; plus the holdout tag, the
+   refusal line and the strip region below the pane.
+   ============================================================ */
+.cw-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 304px;
+}
+.draw-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 0;
+  border-right: 1px solid var(--line-1);
+  background: var(--bg-base);
+}
+.draw-rail .not-built {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+.cw-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.cv-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-base);
+}
+.readout {
+  position: absolute;
+  left: 8px;
+  top: 6px;
+  z-index: 11;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: none;
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.ro-l1 {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex-wrap: wrap;
+  color: var(--text-3);
+}
+.ro-l1 b.mono {
+  color: var(--text-1);
+  font-size: 11.5px;
+}
+.ro-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--bg-base) 82%, transparent);
+  padding-right: 6px;
+  border-radius: 3px;
+  width: fit-content;
+}
+.ro-k {
+  color: var(--text-3);
+  min-width: 76px;
+}
+.ro-sw {
+  width: 10px;
+  height: 2px;
+  border-radius: 1px;
+  flex-shrink: 0;
+  background: var(--text-3);
+}
+.readout .bull {
+  color: var(--bull-1);
+}
+.readout .bear {
+  color: var(--bear-1);
+}
+.readout .dim {
+  color: var(--text-4);
+}
+/* The holdout tag: canvas v9's, right-anchored above the volume (chart-canvas.jsx:264). */
+.cv-ho-tag {
+  position: absolute;
+  right: 68px;
+  bottom: calc(12% + 26px);
+  z-index: 11;
+  margin: 0;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--text-1);
+  background: var(--bg-base);
+  border: 1px solid var(--line-3);
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+/* The read's states, centred over the canvas as canvas v9's .cv-over cards; no backdrop, so the
+   attribution corner is never covered. */
+.cv-over {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  pointer-events: none;
+}
+.cv-over .cw-msg {
+  max-width: 420px;
+  text-align: center;
+  box-shadow: var(--shadow-pop);
+}
+/* The refusals, at the bottom centre where canvas v9 puts its .selbar: they never move the chart (#505). */
+.cv-alerts {
+  position: absolute;
+  left: 50%;
+  bottom: 34px;
+  transform: translateX(-50%);
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 70%;
+}
+.cv-alerts .cw-msg {
+  box-shadow: var(--shadow-pop);
+}
+
+/* ============================================================
+   r7.s2.w3 — the toolbar, the right rail and the trade strip
+   aligned to canvas v9 (PDR-0049 d7). Ported from canvas v9
+   chart.css, one property per line. A control a later spine
+   builds sits in a dashed frame with its chip (.cwt-later).
+   ============================================================ */
+
+/* ---- toolbar (chart.css:8-17, :226-243) ---- */
+.cwt-ic {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.cwt-ic svg {
+  width: 13px;
+  height: 13px;
+}
+.btn-sec-sm.is-on {
+  background: var(--bg-overlay);
+  color: var(--text-1);
+  border-color: var(--line-2);
+}
+.cwt-spacer {
+  flex: 1;
+}
+.cwt-pop-anchor {
+  position: relative;
+}
+.cwt-div {
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--line-2);
+}
+.cwt-rail {
+  width: 26px;
+  height: 26px;
+}
+.cwt-rail svg {
+  width: 14px;
+  height: 14px;
+}
+.cwt-rail.is-on {
+  color: var(--text-1);
+  background: var(--bg-overlay);
+}
+.cwt-later {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px dashed var(--line-2);
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.ctx-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  font-size: 11.5px;
+  color: var(--text-1);
+  background: var(--bg-sunken);
+}
+.ctx-chip.ctx-free {
+  color: var(--text-2);
+  border-style: dashed;
+  background: transparent;
+}
+.ctx-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-1);
+}
+.ctx-free .ctx-dot {
+  background: var(--text-3);
+}
+.sym-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 8px 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-1);
+  font: inherit;
+  cursor: pointer;
+}
+button.sym-btn:hover {
+  background: var(--bg-overlay);
+  border-color: var(--line-2);
+}
+span.sym-btn {
+  cursor: default;
+}
+.sym-btn b {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.sym-mk {
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 15px;
+  padding: 0 4px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  color: var(--text-2);
+}
+.sym-ex {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.sym-chev {
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+/* The coin glyph keeps v9's shape in neutral hues: tokens.css owns every hue, and the app names no coin colour. */
+.sym-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 50%;
+  background: var(--bg-overlay);
+  color: var(--text-1);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+}
+/* The held pairs: canvas v9's symbol list, its "Bars on server" section (chart.css:286-303). */
+.sym-pop {
+  position: absolute;
+  top: 32px;
+  left: 0;
+  z-index: 30;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-pop);
+  white-space: normal;
+}
+.sym-sec {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 14px 5px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.sym-sec i {
+  font-style: normal;
+  color: var(--text-2);
+}
+.sym-sec em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-3);
+}
+.sym-pick {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 14px;
+  border: 0;
+  background: transparent;
+  color: var(--text-1);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sym-pick:hover {
+  background: var(--bg-overlay);
+}
+.sym-t {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--focus);
+}
+.sym-cur {
+  padding: 0 5px;
+  border: 1px solid var(--bull-line);
+  border-radius: 3px;
+  background: var(--bull-bg);
+  color: var(--bull-1);
+  font-family: var(--font-ui);
+  font-size: 9.5px;
+  font-weight: 600;
+}
+.sym-exch {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.sym-later {
+  margin-top: 4px;
+  padding: 8px 14px 0;
+  border-top: 1px solid var(--line-1);
+}
+.tf-row {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.tf-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  min-width: 30px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+button.tf-btn:hover {
+  background: var(--bg-overlay);
+  color: var(--text-1);
+}
+.tf-btn.is-active {
+  color: var(--focus);
+  font-weight: 600;
+  background: var(--focus-bg);
+}
+.tf-row .not-built {
+  margin-left: 4px;
+}
+/* Go to date: v8's popover (.pop, .date-pop), since v9 draws the button only. */
+.date-pop {
+  position: absolute;
+  top: 32px;
+  left: 0;
+  z-index: 30;
+  width: 250px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--bg-overlay);
+  box-shadow: var(--shadow-pop);
+  white-space: normal;
+}
+.date-pop label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.date-pop button {
+  align-self: flex-start;
+}
+.if-k {
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.date-in {
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: var(--bg-input);
+  color: var(--text-1);
+  font-size: 12px;
+}
+.date-in:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* ---- mark bar (chart.css:347-354) ---- */
+.markbar {
+  height: 38px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line-1);
+  background: var(--bg-base);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.markbar .seg-btn {
+  padding: 3px 8px;
+  font-size: 11.5px;
+}
+.markbar .dim {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.mb-f {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.mb-f input {
+  width: 190px;
+  padding: 3px 7px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: var(--bg-input);
+  color: var(--text-1);
+  font: 12px var(--font-ui);
+}
+.mb-note input {
+  width: 220px;
+}
+.mb-f input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.mb-ref {
+  padding: 2px 6px;
+  border: 1px solid var(--warn-line);
+  border-radius: 3px;
+  background: var(--warn-bg);
+  color: var(--warn-1);
+  font: 600 10px var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* ---- the rail beside the canvas (chart.css:41-42, :111-120) ---- */
+.cw-body.rail-closed {
+  grid-template-columns: 40px minmax(0, 1fr) 0;
+}
+.rrail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--line-1);
+  background: var(--bg-base);
+}
+.rrail-closed {
+  border-left: 1px solid var(--line-1);
+}
+.rr-tabs {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
+  padding: 6px 8px 0;
+  border-bottom: 1px solid var(--line-1);
+}
+.rr-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: -1px;
+  padding: 6px 10px 7px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-3);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rr-tab:hover {
+  color: var(--text-1);
+}
+.rr-tab.is-on {
+  color: var(--text-1);
+  border-bottom-color: var(--text-1);
+}
+.rr-tab.is-ai.is-on {
+  color: var(--ai-1);
+  border-bottom-color: var(--ai-1);
+}
+.ai-glyph {
+  color: var(--ai-1);
+}
+.rr-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.agent-nb {
+  padding: 16px 14px;
+}
+
+/* ---- Layers (chart.css:122-160) ---- */
+.lyr {
+  display: flex;
+  flex-direction: column;
+}
+.lyr > .cw-notes {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-1);
+}
+.lyr > .cw-notes:empty {
+  display: none;
+}
+.lg {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-1);
+}
+.lg.is-dis .lg-n {
+  color: var(--text-3);
+}
+.lg-h {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 2px;
+}
+.lg-n {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+}
+.lg-c {
+  padding: 0 6px;
+  border: 1px solid var(--line-1);
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.lg-sub {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 2px 0 2px 2px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.lg-sub .lg-c {
+  margin-left: auto;
+}
+.lg-note {
+  margin: 4px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+.ro-sw.dash {
+  background: repeating-linear-gradient(90deg, var(--text-2) 0 3px, transparent 3px 5px);
+}
+.pl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.pl span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.pd {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+}
+.pd-bull {
+  background: var(--bull-1);
+}
+.pd-bear {
+  background: var(--bear-1);
+}
+.pd-open {
+  background: var(--warn-1);
+}
+.lyr-key {
+  display: flex;
+  gap: 14px;
+  padding: 10px 12px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.lyr-key span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.lyr-key i {
+  width: 16px;
+  height: 0;
+  border-top: 1.5px solid var(--text-2);
+}
+.lyr-key .k-dash {
+  border-top-style: dashed;
+}
+.lyr-key .k-ai {
+  border-top-color: var(--ai-1);
+}
+.lyr-data {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: 10px 12px;
+}
+
+/* ---- Inspector (chart.css:162-192) ---- */
+.ins-wrap {
+  display: flex;
+  flex-direction: column;
+}
+.ins {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px;
+}
+.ins-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.ins-h .mono {
+  margin-left: auto;
+  font-size: 11px;
+}
+.ins-empty {
+  padding: 16px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.ins-empty p {
+  margin: 0 0 6px;
+}
+.ins-dl {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 3px 10px;
+  margin: 0;
+  font-size: 11.5px;
+}
+.ins-dl dt {
+  color: var(--text-3);
+}
+.ins-dl dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  color: var(--text-1);
+}
+.ins-acts {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.ho-note {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: var(--bg-sunken);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+/* The selected trade's setup rows (#502 C6): plain terms, as canvas v9's Inspector names them (.ins-dl dt). */
+.cw-setup th[scope="row"] {
+  position: static;
+  background: transparent;
+  font-size: var(--fs-12);
+  font-weight: var(--fw-regular);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-3);
+}
+
+/* ---- trade strip (chart.css:98-109) ---- */
+.tstrip {
+  height: 170px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid var(--line-2);
+  background: var(--bg-base);
+}
+.ts-h {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line-1);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.ts-h .mono {
+  font-size: 10.5px;
+}
+.ts-note {
+  font-size: 11px;
+  color: var(--text-2);
+}
+.ts-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.ts-t {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+/* The header stays while the rows scroll in the strip's own box. */
+.ts-t th {
+  position: sticky;
+  top: 0;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--line-1);
+  background: var(--bg-base);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: var(--tracking-caps);
+  text-align: left;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.ts-t tbody th {
+  position: static;
+  background: transparent;
+}
+.ts-t td {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--line-1);
+  white-space: nowrap;
+}
+.ts-t .num {
+  text-align: right;
+}
+.ts-t tbody tr {
+  cursor: pointer;
+}
+.ts-t tbody tr:hover td {
+  background: var(--bg-overlay);
+}
+.ts-t tr.is-on td {
+  background: var(--bg-overlay);
+  box-shadow: inset 0 1px 0 var(--line-3), inset 0 -1px 0 var(--line-3);
+}
+.ts-t .warn {
+  color: var(--warn-1);
+}
+
+/* ---- the over-cap card (chart.css:90-96) ---- */
+.cv-card {
+  width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 18px;
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  font-size: 12.5px;
+}
+.cv-card p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.cv-card.nd {
+  width: 420px;
+}
+/* w2's .cv-over takes no pointer; the card's buttons must. */
+.cv-over .cv-card {
+  pointer-events: auto;
+  box-shadow: var(--shadow-pop);
+}
+.nd-acts {
+  display: flex;
+  gap: 6px;
 }

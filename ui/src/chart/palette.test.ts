@@ -1,4 +1,4 @@
-// The chart palette's own tests (r5.s2.w2) — the aliases the adapter draws with (eighteen since r6.s4.w4).
+// The chart palette's own tests (r5.s2.w2) — the aliases the adapter draws with (twenty-three since r7.s2.w2).
 //
 // Two things are worth proving here and nothing else is:
 //
@@ -75,27 +75,38 @@ describe("chartPalette", () => {
     }
   });
 
-  it("names the six strategy aliases (r6.s4.w4), after the twelve before them, and the sheet declares them", () => {
-    const names = Object.values(PALETTE_TOKENS);
-    expect(names.slice(-6)).toEqual([
+  it("declares the six strategy aliases (r6.s4.w4) and the three holdout aliases (r7.s2.w1)", () => {
+    const sheet = fs.readFileSync(
+      `${nodeRuntime.cwd()}/ui/src/styles/chart-tab.css`,
+      "utf8",
+    );
+    const declared = [...sheet.matchAll(/(--chart-[a-z-]+):\s*([^;]+);/g)].map((m) => m[1]);
+    for (const name of [
       "--chart-ribbon",
       "--chart-band-edge",
       "--chart-oscillator",
       "--chart-oscillator-guide",
       "--chart-setup",
       "--chart-stop",
-    ]);
+      "--chart-holdout-fill",
+      "--chart-holdout-hatch",
+      "--chart-holdout-edge",
+    ]) {
+      expect(ALIASES).toContain(name);
+      expect(declared).toContain(name);
+    }
+  });
+
+  it("declares the two volume aliases (r7.s2.w2)", () => {
     const sheet = fs.readFileSync(
       `${nodeRuntime.cwd()}/ui/src/styles/chart-tab.css`,
       "utf8",
     );
-    expect(sheet).toContain("--chart-ribbon: var(--text-4);");
-    expect(sheet).toContain("--chart-band-edge: var(--text-1);");
-    expect(sheet).toContain("--chart-oscillator: var(--text-2);");
-    expect(sheet).toContain("--chart-oscillator-guide: var(--line-3);");
-    expect(sheet).toContain("--chart-setup: var(--warn-2);");
-    expect(sheet).toContain("--chart-stop: var(--bear-2);");
-    expect(sheet).toContain("eighteen aliases");
+    const declared = [...sheet.matchAll(/(--chart-[a-z-]+):\s*([^;]+);/g)].map((m) => m[1]);
+    for (const name of ["--chart-volume-up", "--chart-volume-down"]) {
+      expect(ALIASES).toContain(name);
+      expect(declared).toContain(name);
+    }
   });
 
   it("carries no colour literal in TypeScript", () => {
