@@ -16,6 +16,7 @@ import type { ReactNode } from "react";
 import { CredentialBanner } from "./components/CredentialBanner";
 import { ActiveOperationsProvider } from "./hooks/useActiveOperations";
 import { useServerStatus } from "./hooks/useServerStatus";
+import { useServerAddress, useStrategyCount } from "./hooks/useShellReads";
 import ConnectScreen from "./screens/ConnectScreen";
 import { NAV_ALL, Sidebar, WindowChrome } from "./shell/AppShell";
 import { ConnectionProvider } from "./shell/ConnectionContext";
@@ -173,6 +174,10 @@ export function App() {
   // (`onConnected` below), so records made against one server are never shown
   // against the next one — while Back and a FAILED attempt keep them (B2).
   const [connectEpoch, setConnectEpoch] = useState(0);
+  // r7.s2.w4: the sidebar's Library count and the server's name, each from an
+  // existing read, re-read when an accepted connect changes the server.
+  const strategyCount = useStrategyCount(connectEpoch);
+  const serverAddress = useServerAddress(connectEpoch);
   // The gate's memory. A read that FAILED changes no status (the hook keeps the
   // last one), so it counts nothing here either: only statuses that actually
   // arrived are folded in.
@@ -209,6 +214,7 @@ export function App() {
     return null;
   }
   const gated = gateDecision(serverStatus, gateMemory) === "gated";
+  const up = serverStatus.state === "up";
   // r4.s3 fix round (B2): the provider wraps both of the SCREEN returns (this
   // Connect branch and the app branch below), not just the app one. Opening
   // Connect over a live app used to unmount it — and with it every in-flight
@@ -264,15 +270,23 @@ export function App() {
           lastGoodAt,
         }}
       >
-        {/* The count is only claimed while the server is up: a down server's
-            last-known count would read as a live one beside "server down". */}
+        {/* Counts are only claimed while the server is up: a down server's
+            last-known count would read as a live one beside "reconnecting…". */}
         <WindowChrome
           docTitle={title}
           serverStatus={serverStatus}
-          paperRunning={serverStatus.state === "up" ? (paperRunning ?? undefined) : undefined}
+          serverAddress={serverAddress}
+          paperRunning={up ? (paperRunning ?? undefined) : undefined}
+          hasSidebar
         >
           <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
-            <Sidebar active={navId} serverStatus={serverStatus} />
+            <Sidebar
+              active={navId}
+              serverStatus={serverStatus}
+              serverAddress={serverAddress}
+              strategyCount={up ? (strategyCount ?? undefined) : undefined}
+              paperRunning={up ? (paperRunning ?? undefined) : undefined}
+            />
             <main className="content">
               <CredentialBanner />
               <RouteContent route={route} />

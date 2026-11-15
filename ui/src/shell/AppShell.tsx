@@ -14,14 +14,11 @@
 //      its 1440x900 window (`tauri.conf.json`, `resizable: false`), so there is
 //      nothing to fit. `scripts/check-window-config.sh` fails if a scale-transform
 //      reappears in any frontend source file, this one included.
-//   2. The titlebar's `.title-status` pills (Claude Code turn count, Binance
-//      connection, paper/live counts, LLM cost MTD) and the sidebar's per-item nav
-//      counts and `.status-card` are NOT ported. Every one of those numbers in the
-//      mock is invented sample data sized for layout (`r1.s1` SPINE.md, "Mock
-//      numbers are fiction") — none of it is backed by a real read in this item's
-//      scope, and rendering it would present a fabrication as real. This item ships
-//      the frame, not fake state; a later item wires each of those to a real read
-//      when the feature behind it actually exists.
+//   2. The titlebar's status strip, the sidebar's nav counts and its `.status-card` are
+//      ported from canvas v9 by r7.s2.w4 (`ShellStatus.tsx`), each value from an existing
+//      read. The canvas's sample values (its cost figure, its agent name and last-seen
+//      time, its token label) are not: those have no backend in r7, and each renders
+//      `NotBuiltYet` in the canvas's place (PDR-0049 decision 7).
 //
 // One thing the mock's traffic lights never needed that this file now does: they are
 // wired to real Tauri window APIs (`getCurrentWindow().close()` / `.minimize()`),
@@ -33,7 +30,7 @@
 // maximizing a fixed 1440x900 canvas is the same contradiction
 // `check-window-config.sh` already polices for `fullscreen`/`maximized`.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { HTMLAttributes, ReactNode } from "react";
 
 import type { ServerStatus } from "../bindings";
@@ -42,41 +39,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { isNavBuilt } from "../routes";
 import { EM_DASH } from "../format/numbers";
+import { StatusCard, TitleStatus } from "./ShellStatus";
 
 // ---------------------------------------------------------------------------
-// Atoms (`app-shell.jsx`'s `Dot` / `Pill`)
+// Atoms (`app-shell.jsx`'s `Pill`; its `Dot` lives in `ShellStatus.tsx`)
 // ---------------------------------------------------------------------------
-
-interface DotProps {
-  /** A CSS colour value — usually one of `tokens.css`'s semantic custom properties. */
-  color: string;
-  /** Whether the dot pulses (`shared.css`'s `@keyframes pulse`). */
-  pulse?: boolean;
-}
-
-/**
- * A small status dot. Ported per the spec's step 3, but unused by the chrome
- * itself for the same reason `Pill` is below — the mock's only uses of it are the
- * fabricated `.title-status`/`.status-card` widgets this item does not render.
- * Built-but-unwired, ready for a later item with a real status to show.
- */
-export function Dot({ color, pulse = false }: DotProps) {
-  return (
-    <span
-      className="dot"
-      style={{
-        width: 6,
-        height: 6,
-        borderRadius: 99,
-        background: color,
-        flexShrink: 0,
-        display: "inline-block",
-        boxShadow: pulse ? `0 0 0 0 ${color}` : "none",
-        animation: pulse ? "pulse 1.6s var(--ease-out) infinite" : "none",
-      }}
-    />
-  );
-}
 
 /** The tone variants `strategy-library.css`/`strategy-designer.css` style `.pill-*` for. */
 export type PillTone = "neutral" | "bull" | "bear" | "warn" | "ai";
@@ -250,6 +217,12 @@ interface SidebarProps {
    * the Connect screen showed the real one.
    */
   serverStatus?: ServerStatus;
+  /** The stored server URL (`server_address`), for the status card's server name (r7.s2.w4). */
+  serverAddress?: string | null;
+  /** The Library row's count: `shell_info.strategyCount`, only while the server is up (r7.s2.w4). */
+  strategyCount?: number;
+  /** The Deployment row's count: running paper sessions, only while the server is up (r7.s2.w4). */
+  paperRunning?: number;
 }
 
 /** Navigate to the Strategy Designer -- shared by the "New strategy" button's
@@ -262,13 +235,16 @@ function goToDesigner() {
 /**
  * The ported sidebar: brand mark, the "New strategy" affordance, and the nav list.
  *
- * Deliberately NOT ported: the per-item nav counts, the `filter-pills` block (a
- * per-screen concern `Strategy Library.html` alone used — no consumer needs it
- * yet, and an unused prop is exactly the speculative abstraction this codebase's
- * "Simplicity First" discipline rules out), and the `.status-card` panel. See this
- * file's header comment.
+ * The nav counts and the `.status-card` are ported from canvas v9 (r7.s2.w4). The
+ * `filter-pills` block stays unported: it is the Library screen's own (r8).
  */
-export function Sidebar({ active, serverStatus }: SidebarProps) {
+export function Sidebar({
+  active,
+  serverStatus,
+  serverAddress,
+  strategyCount,
+  paperRunning,
+}: SidebarProps) {
   // The version label (#310): the handshake's own `binary_version`, and the
   // mode of the app's actual connection — a client of a server, never the
   // mock's hard-coded `local`. Until an `up` handshake answers, the em dash
@@ -277,6 +253,11 @@ export function Sidebar({ active, serverStatus }: SidebarProps) {
     serverStatus?.state === "up" && serverStatus.binary_version !== null
       ? `v${serverStatus.binary_version} · server`
       : EM_DASH;
+  // r7.s2.w4: the canvas counts two rows, each from an existing read.
+  const counts: Readonly<Record<string, number | undefined>> = {
+    library: strategyCount,
+    deploy: paperRunning,
+  };
   // The `⌘N` hint next to "New strategy" below only means something if the
   // shortcut is actually bound -- this is that binding (`/designer` is a real
   // route as of `r1.s1.w4`).
@@ -335,6 +316,7 @@ export function Sidebar({ active, serverStatus }: SidebarProps) {
           >
             <NavIcon name={item.icon} />
             <span className="nav-label">{item.label}</span>
+            {counts[item.id] !== undefined && <span className="nav-count">{counts[item.id]}</span>}
             {/* The tier badge and the derived "not built yet" badge share one
                 slot and one vehicle -- `nav-soon` (r1.s1.w6, step 5) -- rather
                 than stacking two badges on a row. A tier is itself a
@@ -363,6 +345,8 @@ export function Sidebar({ active, serverStatus }: SidebarProps) {
           </a>
         ))}
       </nav>
+
+      <StatusCard status={serverStatus} serverAddress={serverAddress} />
     </aside>
   );
 }
@@ -420,6 +404,44 @@ function useTheme(): { mode: ThemeMode; theme: Theme; cycle: () => void } {
   return { mode, theme, cycle };
 }
 
+const SIDEBAR_STORAGE_KEY = "pt-sidebar";
+
+function readStoredSidebar(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_STORAGE_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+/** The canvas's sidebar show/hide (`app-shell.jsx` `useSidebar`): persisted as "on"/"off",
+ * toggled by the titlebar button and ⌘\ (Ctrl+\ too, as the canvas binds it). */
+function useSidebar(enabled: boolean): { open: boolean; toggle: () => void } {
+  const [open, setOpen] = useState<boolean>(readStoredSidebar);
+  const toggle = useCallback(() => setOpen((current) => !current), []);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_STORAGE_KEY, open ? "on" : "off");
+    } catch {
+      // Not persisting is not fatal.
+    }
+  }, [open]);
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key === "\\") {
+        event.preventDefault();
+        toggle();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [enabled, toggle]);
+  return { open, toggle };
+}
+
 /** The titlebar's theme-toggle glyph, one per mode. */
 function ThemeIcon({ mode }: { mode: ThemeMode }) {
   const shared = {
@@ -460,43 +482,25 @@ function ThemeIcon({ mode }: { mode: ThemeMode }) {
 // Window chrome (`app-shell.jsx`'s `WindowChrome`)
 // ---------------------------------------------------------------------------
 
-/**
- * The strip's exact words for a `ServerStatus` — the state word plus the
- * server's version when a handshake answered (`up`), or the recorded reason
- * when the last exchange was refused. No invented numbers.
- */
-export function serverStatusText(status: ServerStatus): string {
-  switch (status.state) {
-    case "up":
-      return `server up · ${status.binary_version ?? "?"}`;
-    case "down":
-      return "server down";
-    case "not_connected":
-      return "not connected";
-    case "refused":
-      return status.reason ?? "connection refused";
-  }
-}
-
 interface WindowChromeProps {
   /** The open document's title, rendered after an em-dash. Omitted when nothing is open. */
   docTitle?: string;
   /**
-   * The live server connection status (r3.s3.w5). The `.title-status` strip
-   * is ported ONLY now that a real read exists — r1.s1 deliberately shipped
-   * the chrome without it because the mock's pills were fabricated sample
-   * data; this one renders exactly what `server_status` answered and nothing
-   * else. Absent (undefined) renders no pill at all.
+   * The live server connection status. The strip renders only from it and the
+   * props below, never sample data. Absent renders no strip.
    */
   serverStatus?: ServerStatus;
+  /** The stored server URL, for the strip's server name and popover (r7.s2.w4). */
+  serverAddress?: string | null;
   /**
    * How many paper sessions are running, when the count is known (r3.s4.w5).
    * The strip renders "N paper · 0 live" — the live half is the recorded truth
    * that no live-execution path exists in this release, never a count read
-   * from anywhere. Absent (undefined) renders no paper pill at all, so a
-   * disconnected app claims nothing.
+   * from anywhere. Absent renders the pill with an em dash.
    */
   paperRunning?: number;
+  /** Whether a sidebar is mounted below: renders the canvas's show/hide toggle and binds ⌘\ (r7.s2.w4). */
+  hasSidebar?: boolean;
   children?: ReactNode;
 }
 
@@ -508,12 +512,15 @@ interface WindowChromeProps {
 export function WindowChrome({
   docTitle,
   serverStatus,
+  serverAddress = null,
   paperRunning,
+  hasSidebar = false,
   children,
 }: WindowChromeProps) {
   const { mode, theme, cycle } = useTheme();
+  const { open: sidebarOpen, toggle: toggleSidebar } = useSidebar(hasSidebar);
   return (
-    <div className="window" data-theme={theme}>
+    <div className={`window${hasSidebar && !sidebarOpen ? " sb-off" : ""}`} data-theme={theme}>
       {/* `deep` (Tauri 2.11+, resolved here at 2.11.5) makes every non-interactive
           descendant a drag target too, not just the elements literally carrying the
           attribute -- Tauri's drag handler tests the EVENT TARGET, not its ancestors,
@@ -560,6 +567,32 @@ export function WindowChrome({
             disabled
           />
         </div>
+        {hasSidebar && (
+          <button
+            type="button"
+            className={`icon-btn sb-toggle${sidebarOpen ? "" : " is-off"}`}
+            onClick={toggleSidebar}
+            aria-pressed={!sidebarOpen}
+            aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            title={`${sidebarOpen ? "Hide" : "Show"} sidebar  ⌘\\`}
+          >
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.4"
+              aria-hidden="true"
+            >
+              <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+              <line x1="6" y1="2.5" x2="6" y2="13.5" />
+              {sidebarOpen && (
+                <path d="M3.4 5.5 H4.6 M3.4 7.5 H4.6 M3.4 9.5 H4.6" strokeLinecap="round" />
+              )}
+            </svg>
+          </button>
+        )}
         <div className="title-block">
           <span className="title-app">PulseTrader</span>
           {docTitle !== undefined && (
@@ -568,33 +601,14 @@ export function WindowChrome({
               <span className="title-doc">{docTitle}</span>
             </>
           )}
-          {serverStatus !== undefined && (
-            <span className="title-status">
-              <span className="dot" data-state={serverStatus.state} />
-              {/* r4.s5.w4 (#319): the strip stays on ONE line — this span is
-                  what truncates at a narrow width, and the full words ride its
-                  `title`. */}
-              <span className="ts-text" title={serverStatusText(serverStatus)}>
-                {serverStatusText(serverStatus)}
-              </span>
-              {/* r4.s2.w3 (C5): QA's database is a copy of prod's, so a stale
-                  URL landing on QA must be visible at a glance. `prod` and an
-                  absent role (an older server) render nothing new. */}
-              {serverStatus.role === "qa" && (
-                <span className="qa-badge" title="Connected to a QA server">
-                  QA
-                </span>
-              )}
-            </span>
-          )}
-          {paperRunning !== undefined && (
-            <span className="title-status">
-              <span className="ts-text" title={`${paperRunning} paper · 0 live`}>
-                {paperRunning} paper · 0 live
-              </span>
-            </span>
-          )}
         </div>
+        {serverStatus !== undefined && (
+          <TitleStatus
+            status={serverStatus}
+            serverAddress={serverAddress}
+            paperRunning={paperRunning}
+          />
+        )}
 
         <div className="title-right">
           <button
