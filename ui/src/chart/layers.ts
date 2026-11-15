@@ -131,6 +131,29 @@ export function toCandles(candles: readonly ChartCandleDto[]): CandlePoint[] {
   }));
 }
 
+/** Whether a candle closed at or above its open ("bull") or below it ("bear") (r7.s2.w2): the side its volume
+ *  bar and its legend values are coloured by. A comparison of the read's own prices, not a computed figure. */
+export function candleDirection(candle: Pick<ChartCandleDto, "o" | "c">): "bull" | "bear" {
+  return decimal(candle.c) >= decimal(candle.o) ? "bull" : "bear";
+}
+
+/** One volume bar, as the library's histogram series takes it (r7.s2.w2). */
+export interface VolumeBar {
+  readonly time: number;
+  readonly value: number;
+  readonly color: string;
+}
+
+/** The window's volume as histogram bars (r7.s2.w2, canvas v9 `chart-canvas.jsx:88-89`), each in its candle's
+ *  direction colour. */
+export function toVolumeBars(candles: readonly ChartCandleDto[], palette: ChartPalette): VolumeBar[] {
+  return candles.map((candle) => ({
+    time: seconds(candle.t),
+    value: decimal(candle.v),
+    color: candleDirection(candle) === "bull" ? palette.volumeUp : palette.volumeDown,
+  }));
+}
+
 /** The loaded bars a holdout band starts from (r7.s2.w1): the first loaded bar opening at or
  *  after the holdout start, and the loaded bar before it. Times are the library's seconds. */
 export interface HoldoutBandBars {
@@ -453,6 +476,40 @@ export function markersInWindow(
     }))
     .sort((a, b) => a.marker.time - b.marker.time || a.index - b.index)
     .map((entry) => entry.marker);
+}
+
+/** The least gap, in CSS pixels, between two marker labels on one side of the bars (#504): wide enough for
+ *  "+2.91 R" at the library's marker font. */
+export const LABEL_GAP_PX = 48;
+
+/** The markers with every label that would overlap dropped (#504). The list is in ascending time, so its x
+ *  coordinates ascend: a label is kept when it lies at least `LABEL_GAP_PX` right of the last kept label on the
+ *  same side (above, below, or in the bar), and dropped otherwise; the marker itself stays. A marker `xOf`
+ *  cannot place keeps its label. The tables carry every value whatever is drawn (PDR-0011). */
+export function declutterTexts(
+  markers: readonly ChartMarker[],
+  xOf: (time: number) => number | null,
+): ChartMarker[] {
+  const lastKept = new Map<ChartMarker["position"], number>();
+  return markers.map((marker) => {
+    if (marker.text === undefined) return marker;
+    const x = xOf(marker.time);
+    // The library could not place it (`null`, or nothing at all from a test double): keep its label.
+    if (x == null) return marker;
+    const previous = lastKept.get(marker.position);
+    if (previous !== undefined && x - previous < LABEL_GAP_PX) {
+      return {
+        time: marker.time,
+        position: marker.position,
+        shape: marker.shape,
+        color: marker.color,
+        ...(marker.price === undefined ? {} : { price: marker.price }),
+        ...(marker.size === undefined ? {} : { size: marker.size }),
+      };
+    }
+    lastKept.set(marker.position, x);
+    return marker;
+  });
 }
 
 /** Whether a trade lies wholly BEFORE the fence (r5.s2 close review, Q5). `null`

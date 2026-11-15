@@ -23,7 +23,10 @@ import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "..
 import type { ChartMarker } from "./layers";
 import type { ChartPalette } from "./palette";
 import {
+  LABEL_GAP_PX,
   buildLayers,
+  candleDirection,
+  declutterTexts,
   holdoutBandBars,
   markersInWindow,
   setupMarkers,
@@ -31,6 +34,7 @@ import {
   toCandles,
   toMarkers,
   toOverlayLayers,
+  toVolumeBars,
 } from "./layers";
 
 /** The palette as `chartPalette` returns it, with values a test can name. */
@@ -56,6 +60,8 @@ const PALETTE: ChartPalette = {
   holdoutFill: "holdout-fill",
   holdoutHatch: "holdout-hatch",
   holdoutEdge: "holdout-edge",
+  volumeUp: "volume-up",
+  volumeDown: "volume-down",
 };
 
 /** One example-trade mark, as `listMarks` reads it (r5.s3.w1). Times are ms strings. */
@@ -781,5 +787,51 @@ describe("buildLayers", () => {
     // its exact 01:00Z and 02:00Z fill times.
     expect(trade.entryTime).toBe("1735693200000");
     expect(trade.exitTime).toBe("1735696800000");
+  });
+});
+
+describe("candle direction, volume bars and label spacing (r7.s2.w2)", () => {
+  it("reads a candle that closed at or above its open as bull, else bear", () => {
+    expect(candleDirection({ o: "100", c: "100" })).toBe("bull");
+    expect(candleDirection({ o: "100", c: "101" })).toBe("bull");
+    expect(candleDirection({ o: "100", c: "99.5" })).toBe("bear");
+  });
+
+  it("maps each candle's volume to a histogram bar in its direction's colour", () => {
+    const candles: ChartCandleDto[] = [
+      { t: "1735689600000", o: "1", h: "2", l: "1", c: "2", v: "13962.019" },
+      { t: "1735704000000", o: "2", h: "2", l: "1", c: "1", v: "7852.483" },
+    ];
+    expect(toVolumeBars(candles, PALETTE)).toEqual([
+      { time: 1735689600, value: 13962.019, color: "volume-up" },
+      { time: 1735704000, value: 7852.483, color: "volume-down" },
+    ]);
+  });
+
+  /** Four labelled markers: `b` shares `a`'s side, `c` is on the other side, `d` is on `a`'s side again. */
+  function labelled(): ChartMarker[] {
+    const at = (time: number, position: ChartMarker["position"], text: string): ChartMarker => ({
+      time,
+      position,
+      shape: "circle",
+      color: "x",
+      text,
+    });
+    return [at(0, "aboveBar", "a"), at(1, "aboveBar", "b"), at(2, "belowBar", "c"), at(5, "aboveBar", "d")];
+  }
+
+  it("drops a marker's text when it would overlap the last kept text on its side (#504)", () => {
+    const result = declutterTexts(labelled(), (time) => time * 20);
+    expect(result.map((marker) => marker.text)).toEqual(["a", undefined, "c", "d"]);
+    expect("text" in result[1]).toBe(false);
+    expect(result[1]).toMatchObject({ time: 1, position: "aboveBar", shape: "circle", color: "x" });
+    expect(LABEL_GAP_PX).toBe(48);
+  });
+
+  it("keeps a text it cannot place, and every text with room", () => {
+    const texts = (xOf: (time: number) => number | null): (string | undefined)[] =>
+      declutterTexts(labelled(), xOf).map((marker) => marker.text);
+    expect(texts(() => null)).toEqual(["a", "b", "c", "d"]);
+    expect(texts((time) => time * 100)).toEqual(["a", "b", "c", "d"]);
   });
 });

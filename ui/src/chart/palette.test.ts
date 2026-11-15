@@ -1,4 +1,4 @@
-// The chart palette's own tests (r5.s2.w2) — the aliases the adapter draws with (twenty-one since r7.s2.w1).
+// The chart palette's own tests (r5.s2.w2) — the aliases the adapter draws with (twenty-three since r7.s2.w2).
 //
 // Two things are worth proving here and nothing else is:
 //
@@ -92,6 +92,18 @@ describe("chartPalette", () => {
       "--chart-holdout-hatch",
       "--chart-holdout-edge",
     ]) {
+      expect(ALIASES).toContain(name);
+      expect(declared).toContain(name);
+    }
+  });
+
+  it("declares the two volume aliases (r7.s2.w2)", () => {
+    const sheet = fs.readFileSync(
+      `${nodeRuntime.cwd()}/ui/src/styles/chart-tab.css`,
+      "utf8",
+    );
+    const declared = [...sheet.matchAll(/(--chart-[a-z-]+):\s*([^;]+);/g)].map((m) => m[1]);
+    for (const name of ["--chart-volume-up", "--chart-volume-down"]) {
       expect(ALIASES).toContain(name);
       expect(declared).toContain(name);
     }

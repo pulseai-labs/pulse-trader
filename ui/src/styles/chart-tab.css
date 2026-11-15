@@ -7,7 +7,7 @@
    `backtest.css` follows against the mock's `backtest-lab.css`.
 
    THE PALETTE. The chart draws on a canvas, so the adapter needs colour VALUES and
-   reads these twenty-one aliases off the element the chart is mounted in (`palette.ts`).
+   reads these twenty-three aliases off the element the chart is mounted in (`palette.ts`).
    Every alias is an alias of a hue `tokens.css` already owns, and `--focus` is never
    one of them: focus blue is the selection colour, not an indicator colour
    (PDR-0031). The brief asks for no new colours, and these add none — they only name
@@ -16,8 +16,9 @@
    ============================================================ */
 
 .cw {
-  /* the chart's palette — twenty-one aliases, each `var()` of an existing hue */
-  --chart-bg: var(--bg-raised);
+  /* the chart's palette — twenty-three aliases, each `var()` of an existing hue */
+  /* r7.s2.w2: canvas v9's pane background (.cv-wrap) */
+  --chart-bg: var(--bg-base);
   --chart-text: var(--text-2);
   --chart-grid: var(--line-1);
   --chart-bull: var(--bull-1);
@@ -45,11 +46,19 @@
   --chart-holdout-fill: var(--bg-sunken);
   --chart-holdout-hatch: var(--line-2);
   --chart-holdout-edge: var(--text-3);
+  /* r7.s2.w2: the volume bars — canvas v9's bull and bear, at the low alpha the tokens already hold */
+  --chart-volume-up: var(--bull-bg);
+  --chart-volume-down: var(--bear-bg);
 
   display: flex;
   flex-direction: column;
-  gap: var(--sp-3);
+  min-width: 0;
   min-height: 0;
+  /* r7.s2.w2: full height (canvas v9 .cw). The screen fills the content track edge to edge, so it cancels
+     the track's own padding here rather than the shell changing it for one screen. */
+  height: calc(100% + 2 * var(--sp-6));
+  margin: calc(-1 * var(--sp-6));
+  background: var(--bg-window);
 }
 
 /* ---- toolbar ---- */
@@ -58,6 +67,10 @@
   align-items: center;
   gap: var(--sp-3);
   flex-wrap: wrap;
+  flex-shrink: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line-1);
+  background: var(--bg-base);
 }
 .cw-tool-lab {
   font-size: var(--fs-11);
@@ -80,10 +93,12 @@
   align-items: center;
   gap: var(--sp-3);
   flex-wrap: wrap;
+  flex-shrink: 0;
   padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-6);
-  background: var(--bg-raised);
+  border: 0;
+  border-bottom: 1px solid var(--line-1);
+  border-radius: 0;
+  background: var(--bg-base);
 }
 .cw-markfield {
   display: inline-flex;
@@ -153,13 +168,11 @@
 
 /* ---- the chart itself ---- */
 .cw-canvas {
-  flex: 1 1 auto;
-  min-height: 360px;
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-6);
-  background: var(--bg-raised);
-  /* The library's attribution logo sits in this box's bottom-left corner and must
-     never be covered (grill Q6). Nothing in this sheet overlays the canvas. */
+  /* The library's attribution logo sits in this box's bottom-left corner and must never be covered (grill Q6).
+     Over the canvas sit only the legend (top left), the holdout tag (bottom right), the state cards (centre) and
+     the refusals (bottom centre). */
+  position: absolute;
+  inset: 0;
   overflow: hidden;
 }
 
@@ -261,4 +274,163 @@
   font-size: var(--fs-12);
   color: var(--text-3);
   padding: var(--sp-1) 0;
+}
+
+/* ============================================================
+   r7.s2.w2 — the chart canvas aligned to canvas v9 (PDR-0049 d7)
+   Ported from canvas v9 chart.css: .cw-body, .draw-rail, .cw-main,
+   .cv-wrap, .readout / .ro-*, .cv-over; plus the holdout tag, the
+   refusal line and the strip region below the pane.
+   ============================================================ */
+.cw-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+}
+.draw-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 0;
+  border-right: 1px solid var(--line-1);
+  background: var(--bg-base);
+}
+.draw-rail .not-built {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+.cw-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.cv-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-base);
+}
+.readout {
+  position: absolute;
+  left: 8px;
+  top: 6px;
+  z-index: 11;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: none;
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.ro-l1 {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex-wrap: wrap;
+  color: var(--text-3);
+}
+.ro-l1 b.mono {
+  color: var(--text-1);
+  font-size: 11.5px;
+}
+.ro-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--bg-base) 82%, transparent);
+  padding-right: 6px;
+  border-radius: 3px;
+  width: fit-content;
+}
+.ro-k {
+  color: var(--text-3);
+  min-width: 76px;
+}
+.ro-sw {
+  width: 10px;
+  height: 2px;
+  border-radius: 1px;
+  flex-shrink: 0;
+  background: var(--text-3);
+}
+.readout .bull {
+  color: var(--bull-1);
+}
+.readout .bear {
+  color: var(--bear-1);
+}
+.readout .dim {
+  color: var(--text-4);
+}
+/* The holdout tag: canvas v9's, right-anchored above the volume (chart-canvas.jsx:264). */
+.cv-ho-tag {
+  position: absolute;
+  right: 68px;
+  bottom: calc(12% + 26px);
+  z-index: 11;
+  margin: 0;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--text-1);
+  background: var(--bg-base);
+  border: 1px solid var(--line-3);
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+/* The read's states, centred over the canvas as canvas v9's .cv-over cards; no backdrop, so the
+   attribution corner is never covered. */
+.cv-over {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  pointer-events: none;
+}
+.cv-over .cw-msg {
+  max-width: 420px;
+  text-align: center;
+  box-shadow: var(--shadow-pop);
+}
+/* The refusals, at the bottom centre where canvas v9 puts its .selbar: they never move the chart (#505). */
+.cv-alerts {
+  position: absolute;
+  left: 50%;
+  bottom: 34px;
+  transform: translateX(-50%);
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 70%;
+}
+.cv-alerts .cw-msg {
+  box-shadow: var(--shadow-pop);
+}
+/* The strip region below the pane: canvas v9's .tstrip height. r7.s2.w3 turns it into the trade strip. */
+.cw-below {
+  flex: 0 0 auto;
+  max-height: 170px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-top: 1px solid var(--line-2);
+  background: var(--bg-base);
+}
+.cw-below .cw-scroll {
+  max-height: none;
 }
