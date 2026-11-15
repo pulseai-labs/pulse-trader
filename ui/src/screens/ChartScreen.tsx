@@ -33,16 +33,12 @@
 // handlers and derived values live in `./chart/`, moved unchanged; this file only calls them in the order the
 // effects were declared and lays the screen out as canvas v9 does: the toolbar, the mark bar, then the draw
 // rail beside the canvas pane, with the notes and tables in the strip region below it.
+// r7.s2.w3 (canvas v9): the toolbar, the mark bar while armed, then the draw rail, the canvas pane with the
+// trade strip below it on a run's chart, and the right rail.
 
-import {
-  CandleTable,
-  ChartDataTables,
-  ChartNotes,
-  MarksTable,
-  SelectedTradeTable,
-  TradesTable,
-} from "./chart/ChartTables";
 import { ChartPane, DrawRail } from "./chart/ChartPane";
+import { RightRail } from "./chart/ChartRail";
+import { TradeStrip } from "./chart/ChartTables";
 import { ChartToolbar, MarkBar } from "./chart/ChartToolbar";
 import {
   useChartCanvas,
@@ -55,11 +51,16 @@ import {
 } from "./chart/effects";
 import { chartHandlers, goToHandler } from "./chart/handlers";
 import type { ChartState } from "./chart/state";
-import { useMarkState, useReadState, useSelectionState } from "./chart/state";
+import { useMarkState, useRailState, useReadState, useSelectionState } from "./chart/state";
 import { chartView } from "./chart/view";
 
 export default function ChartScreen() {
-  const s: ChartState = { ...useReadState(), ...useSelectionState(), ...useMarkState() };
+  const s: ChartState = {
+    ...useReadState(),
+    ...useSelectionState(),
+    ...useMarkState(),
+    ...useRailState(),
+  };
   useChartCanvas(s);
   useMarkWriter(s);
   useZoomKeys(s);
@@ -81,20 +82,14 @@ export default function ChartScreen() {
   return (
     <section className="cw" aria-label="Chart">
       <ChartToolbar s={s} view={view} onSelectFree={selectFree} onSelectLeg={selectLeg} onGoTo={goTo} />
-      <MarkBar s={s} view={view} />
-      <div className="cw-body">
+      <MarkBar s={s} />
+      <div className={s.railOpen ? "cw-body" : "cw-body rail-closed"}>
         <DrawRail />
         <div className="cw-main">
-          <ChartPane s={s} view={view} />
-          <div className="cw-below">
-            <ChartNotes s={s} view={view} />
-            <SelectedTradeTable s={s} view={view} />
-            <TradesTable s={s} view={view} onSelectTrade={selectTrade} />
-            <MarksTable s={s} view={view} onWithdraw={withdraw} />
-            <ChartDataTables s={s} view={view} />
-            <CandleTable dto={view.dto} />
-          </div>
+          <ChartPane s={s} view={view} onSelectTrade={selectTrade} onSelectLeg={selectLeg} />
+          <TradeStrip s={s} view={view} onSelectTrade={selectTrade} />
         </div>
+        <RightRail s={s} view={view} onWithdraw={withdraw} />
       </div>
     </section>
   );

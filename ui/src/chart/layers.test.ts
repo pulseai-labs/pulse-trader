@@ -35,6 +35,7 @@ import {
   toMarkers,
   toOverlayLayers,
   toVolumeBars,
+  tradeOutcome,
 } from "./layers";
 
 /** The palette as `chartPalette` returns it, with values a test can name. */
@@ -833,5 +834,14 @@ describe("candle direction, volume bars and label spacing (r7.s2.w2)", () => {
       declutterTexts(labelled(), xOf).map((marker) => marker.text);
     expect(texts(() => null)).toEqual(["a", "b", "c", "d"]);
     expect(texts((time) => time * 100)).toEqual(["a", "b", "c", "d"]);
+  });
+});
+
+describe("the trade outcome (r7.s2.w3)", () => {
+  it("reads an open trade, a winner at or above 0 R and a loser", () => {
+    expect(tradeOutcome({ exitTime: null, realizedR: "0" })).toBe("open");
+    expect(tradeOutcome({ exitTime: "1", realizedR: "0" })).toBe("bull");
+    expect(tradeOutcome({ exitTime: "1", realizedR: "2.5" })).toBe("bull");
+    expect(tradeOutcome({ exitTime: "1", realizedR: "-1" })).toBe("bear");
   });
 });

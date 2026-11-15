@@ -2,9 +2,10 @@
 // answer, the selected trade, the timeframes, the marks on the leg, the trade rows, the overlay rows, the holdout
 // tag and the legend's bar. Pure: no hook, no handle.
 
-import type { ChartCandleDto, ChartDataDto } from "../../bindings";
+import type { ChartCandleDto, ChartDataDto, ChartOverlayDto, ChartTradeDto } from "../../bindings";
 import { beforeFence, fenceStartMs } from "../../chart/layers";
-import { dateUtc } from "../../format/time";
+import { EM_DASH } from "../../format/numbers";
+import { dateUtc, timeUtc } from "../../format/time";
 import type { RunContext } from "./model";
 import { atOrAfterMs, timeframeOf, tradeKey } from "./model";
 import type { ChartState } from "./state";
@@ -109,7 +110,7 @@ export function legendBar(
 
 /** What this render draws and lists, derived from the state. */
 export function chartView(s: ChartState) {
-  const { phase, selected, selectedKey, run, free, leg, marksPhase } = s;
+  const { phase, selected, selectedKey, run, free, leg, marksPhase, focusBar } = s;
   // Only what the tab has SELECTED is this tab's to draw: an answer read for another
   // run — or a run's answer that outlived a free choice — is not drawn, not listed and
   // not centred on (CR3). The gate compares the DTO against the selection, never
@@ -117,6 +118,13 @@ export function chartView(s: ChartState) {
   // fragment may still name the run the trader deep-linked away from.
   const dto =
     phase.kind === "ready" && (phase.dto.run?.runId ?? null) === selected ? phase.dto : null;
+  // The bar the trader clicked, from the drawn window's own candles, only while the drawn read is the pair and
+  // timeframe it was clicked on: another chart, or a bar the window does not hold, leaves the Inspector empty
+  // (r7.s2.w3, CR1).
+  const focusCandle =
+    focusBar === null || dto === null || dto.pair !== focusBar.pair || dto.timeframe !== focusBar.timeframe
+      ? null
+      : (dto.candles.find((candle) => candle.t === focusBar.t) ?? null);
   // The selected trade, from the drawn window's own rows: the run read's rows carry no setup
   // bars (r6.s4.w4). After the draw effect, so the markers land on the candles just set.
   const selectedTrade =
@@ -148,10 +156,57 @@ export function chartView(s: ChartState) {
     markPair,
     marksOnLeg,
     liveHoldout,
+    focusCandle,
     holdoutTag: holdoutTag(dto),
     ...tradeRows(run, dto),
     ...overlayRows(dto),
   };
+}
+
+/** One row of the Layers rail (r7.s2.w3): a drawn layer's label, its event count for a pivot or a pattern, and
+ *  whether its swatch is dashed (a server layer) or solid (the volume). */
+export interface LayerRow {
+  readonly label: string;
+  readonly count: number | null;
+  readonly dashed: boolean;
+}
+
+/** The Layers rail's rows, grouped as canvas v9 groups them (`chart.jsx` `LayersPanel`): the volume and the run's
+ *  lines, oscillator and band edges under Indicators; its S/R levels and pivots under Structure; its patterns under
+ *  Candle patterns. Every row is a layer the read drew. */
+export function layerGroups(dto: ChartDataDto | null) {
+  const overlays = dto?.run?.overlays ?? [];
+  const row = (overlay: ChartOverlayDto): LayerRow => ({
+    label: overlay.label,
+    count: overlay.kind === "pivot" || overlay.kind === "pattern" ? overlay.events.length : null,
+    dashed: true,
+  });
+  const volume: LayerRow[] =
+    dto !== null && dto.candles.length > 0 ? [{ label: "Volume", count: null, dashed: false }] : [];
+  return {
+    indicators: [
+      ...volume,
+      ...overlays
+        .filter((each) => each.kind === "line" || each.kind === "oscillator" || each.kind === "bandEdge")
+        .map(row),
+    ],
+    structure: overlays.filter((each) => each.kind === "level" || each.kind === "pivot").map(row),
+    patterns: overlays.filter((each) => each.kind === "pattern").map(row),
+    hasPivots: overlays.some((each) => each.kind === "pivot"),
+  };
+}
+
+/** The strip's setup cell for one drawn-window row (canvas v9's `setup · arm → dip → trigger`, A4; r7.s2.w3), from
+ *  the read's own bar times through `timeUtc`: the arm as `MM-DD HH:mm`, the dip and the trigger as `HH:mm`, a bar
+ *  the trade did not record as an em dash. `null` when the row carries no setup bar. The read sends no setup
+ *  label (`ChartTradeDto` has none), so none is shown. */
+export function setupText(row: ChartTradeDto | null): string | null {
+  if (row === null || (row.armBarTime === null && row.dipBarTime === null && row.triggerBarTime === null)) {
+    return null;
+  }
+  const part = (ms: string | null, from: number): string =>
+    ms === null ? EM_DASH : timeUtc(ms).slice(from, 16);
+  return `${part(row.armBarTime, 5)} → ${part(row.dipBarTime, 11)} → ${part(row.triggerBarTime, 11)}`;
 }
 
 /** One render's derived values. */

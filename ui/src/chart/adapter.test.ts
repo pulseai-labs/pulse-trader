@@ -408,10 +408,10 @@ describe("createChartAdapter", () => {
       [1735747200, "arrowUp"],
     ]);
     expect(last[0]).toMatchObject({ shape: "circle", color: "setup", position: "belowBar" });
-    // A selection of nothing clears the setup and keeps the trade's own marker.
+    // A selection of nothing keeps every drawn trade's setup (#506, r7.s2.w3); only the stop goes with it.
     adapter.setSelectedTrade(null, "primary");
-    const cleared = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
-    expect(cleared.map((marker) => marker.time)).toEqual([1735747200]);
+    const kept = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number }[];
+    expect(kept.map((marker) => marker.time)).toEqual([1735689600, 1735704000, 1735718400, 1735747200]);
   });
 
   it("draws the setup bar outside the loaded window as nothing", () => {
@@ -1055,5 +1055,30 @@ describe("the chart canvas aligned to canvas v9 (r7.s2.w2)", () => {
     h.chart.clearCrosshairPosition.mockClear();
     el.dispatchEvent(new MouseEvent("mouseleave"));
     expect(h.chart.clearCrosshairPosition).not.toHaveBeenCalled();
+  });
+});
+
+describe("the setup of every drawn trade (r7.s2.w3, #506)", () => {
+  it("draws each drawn trade's setup, selected or not, and never twice", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    const open = { exitTime: null, exitPrice: null, exitReason: null };
+    const a: ChartTradeDto = { ...TRADE, ...open, entryTime: "1735704000000", armBarTime: "1735689600000" };
+    const b: ChartTradeDto = { ...TRADE, ...open, entryTime: "1735747200000", armBarTime: "1735718400000" };
+    adapter.setTrades([a, b]);
+    const drawn = (): [number, string][] =>
+      (
+        h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { time: number; text?: string; shape: string }[]
+      ).map((marker) => [marker.time, marker.text ?? marker.shape]);
+    const all = [
+      [1735689600, "arm"],
+      [1735704000, "arrowUp"],
+      [1735718400, "arm"],
+      [1735747200, "arrowUp"],
+    ];
+    adapter.setSelectedTrade(null, "primary");
+    expect(drawn()).toEqual(all);
+    adapter.setSelectedTrade(a, "primary");
+    expect(drawn()).toEqual(all);
   });
 });

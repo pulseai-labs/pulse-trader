@@ -31,9 +31,10 @@
 //  * **WT1 has its own pane (r6.s4.w4).** An oscillator is not a price, so it is created in
 //    pane 1 and the candles keep three parts of the height to its one. Its guide at 0 is a
 //    price line, not data: the read sends no value for it.
-//  * **The selected trade's setup rides the same marker list (r6.s4.w4).** Its arm, dip and
-//    trigger markers join the one list `markersInWindow` clips and places, so a setup bar
-//    outside the loaded window draws nothing. Its stop is a price line on the candle series.
+//  * **Every drawn trade's setup rides the same marker list (r6.s4.w4; r7.s2.w3, #506).** Each trade's
+//    arm, dip and trigger markers join the one list `markersInWindow` clips and places, as canvas v9 draws
+//    every trade's, so a setup bar outside the loaded window draws nothing. Only the selected trade's stop is
+//    drawn: a price line on the candle series.
 //  * **The holdout band (r7.s2.w1).** A read that names no run carries the bars from the
 //    holdout start onward; a series primitive hatches them over the candles, as canvas v9
 //    does, and on through the time axis (r7.s2.w2), from halfway between the last bar before
@@ -104,8 +105,9 @@ export interface ChartAdapter {
   setTrades(trades: readonly ChartTradeDto[]): void;
   /** Draw these example marks' markers (r5.s3.w3). */
   setMarks(marks: readonly MarkDto[]): void;
-  /** Draw this trade's setup markers and stop line on the leg the read drew (`null` clears
-   *  both). */
+  /** Draw this trade's stop line on the leg the read drew (`null` clears it). Every drawn trade's setup
+   *  markers are drawn on that leg whatever is selected (#506); a selected trade the drawn trades do not hold
+   *  draws its own. */
   setSelectedTrade(trade: ChartTradeDto | null, series: "primary" | "htf"): void;
   /** Hatch the loaded bars that open at or after `holdoutStartMs` — a run-less read's holdout
    *  band (ADR-0030 amendment, 2026-11-14). `null` clears it. */
@@ -370,7 +372,12 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     return candleSeries;
   };
 
-  /** Rebuild the merged marker list from the overlays, trades, marks and the selected
+  /** The trades whose setup is drawn: every drawn trade, and the selected one when the drawn trades do not hold it
+   *  (#506, r7.s2.w3). */
+  const setupTrades = (): readonly ChartTradeDto[] =>
+    selectedTrade === null || tradeDtos.includes(selectedTrade) ? tradeDtos : [...tradeDtos, selectedTrade];
+
+  /** Rebuild the merged marker list from the overlays, trades, marks and every drawn
    *  trade's setup last handed in, and
    *  hand the library ONLY the markers the loaded bars can hold, each on its containing
    *  bar (CR2, CR4): a marker time the series cannot place is snapped onto the first or
@@ -383,7 +390,7 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
         markersInWindow(
           [
             ...toMarkers(overlayDtos, tradeDtos, palette, markDtos),
-            ...setupMarkers(selectedTrade, selectedSeries, palette),
+            ...setupTrades().flatMap((trade) => setupMarkers(trade, selectedSeries, palette)),
           ],
           candlePoints,
         ),

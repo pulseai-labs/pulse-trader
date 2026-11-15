@@ -137,3 +137,12 @@ export function covers(candles: readonly Pick<ChartCandleDto, "t">[], ms: string
   const bar = barSpacing(times);
   return bar === 0 ? target === first : target >= first && target < lastOpen + bar;
 }
+
+/** How many whole bars of `timeframe` lie between a trade's entry and exit fills (r7.s2.w3, canvas v9's strip
+ *  "bars" column): time arithmetic on the run's own fill times, like the window sizing above. `null` while the
+ *  trade is open, or for an interval this tab cannot size. */
+export function barsHeld(entryMs: string, exitMs: string | null, timeframe: string): number | null {
+  const bar = TIMEFRAME_MS[timeframe];
+  if (exitMs === null || bar === undefined) return null;
+  return Math.floor((Number(exitMs) - Number(entryMs)) / bar);
+}

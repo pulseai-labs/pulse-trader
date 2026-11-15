@@ -7,7 +7,17 @@ import type { ChartAdapter } from "../../chart/adapter";
 import type { PaneReadGate } from "../../chart/context";
 import { createPaneReadGate } from "../../chart/context";
 import { chartDeepLink } from "../../routes";
-import type { ChartRequest, Leg, MarkForm, MarksPhase, Notice, Phase, RunContext } from "./model";
+import type {
+  ChartRequest,
+  FocusBar,
+  Leg,
+  MarkForm,
+  MarksPhase,
+  Notice,
+  Phase,
+  RailTab,
+  RunContext,
+} from "./model";
 import { DEFAULT_PAIR, DEFAULT_TIMEFRAME, DISARMED, loadingText } from "./model";
 
 /** The read's state: the chart's handles, the phase, the request, and what the drawn answer answered. */
@@ -104,6 +114,12 @@ export function useSelectionState() {
   const [leg, setLeg] = useState<Leg>("primary");
   const [free, setFree] = useState({ pair: DEFAULT_PAIR, timeframe: DEFAULT_TIMEFRAME });
   const [anchorMs, setAnchorMs] = useState<string | null>(null);
+  /** What `anchorMs` is: a trade's entry or a date the trader typed, so a later leg switch's loading sentence names
+   *  it rightly (#502 C9, r7.s2.w3). */
+  const [anchorWhat, setAnchorWhat] = useState<"entry" | "date">("entry");
+  /** The bar the trader clicked with the mark control disarmed, with the pair and timeframe it was clicked on:
+   *  the Inspector shows it while that chart is drawn (canvas v9 `focusBar`, r7.s2.w3; CR1). */
+  const [focusBar, setFocusBar] = useState<FocusBar | null>(null);
 
   const [fragmentRun, setFragmentRun] = useState<string | null>(
     () => chartDeepLink(window.location.hash)?.run ?? null,
@@ -166,6 +182,10 @@ export function useSelectionState() {
     setGoToText,
     goToNote,
     setGoToNote,
+    anchorWhat,
+    setAnchorWhat,
+    focusBar,
+    setFocusBar,
   };
 }
 
@@ -200,6 +220,10 @@ export function useMarkState() {
    *  so two clicks in one render pass both observe the old `false` and both write. */
   const markInFlightRef = useRef<boolean>(false);
 
+  /** The marks whose withdraw is in flight (#439, r7.s2.w3): a second press before the first settles sends
+   *  nothing. */
+  const withdrawInFlightRef = useRef<Set<string>>(new Set());
+
   const [marksSeq, setMarksSeq] = useState(0);
   return {
     marksPhase,
@@ -213,10 +237,20 @@ export function useMarkState() {
     markClickRef,
     liveHoldoutRef,
     markInFlightRef,
+    withdrawInFlightRef,
   };
+}
+
+/** The right rail's state (r7.s2.w3, canvas v9 `rail` and `railOpen`): the tab shown and whether the rail is open.
+ *  It opens on Layers, as v9 does. */
+export function useRailState() {
+  const [rail, setRail] = useState<RailTab>("layers");
+  const [railOpen, setRailOpen] = useState(true);
+  return { rail, setRail, railOpen, setRailOpen };
 }
 
 /** Everything the screen's hooks, handlers and components read. */
 export type ChartState = ReturnType<typeof useReadState> &
   ReturnType<typeof useSelectionState> &
-  ReturnType<typeof useMarkState>;
+  ReturnType<typeof useMarkState> &
+  ReturnType<typeof useRailState>;

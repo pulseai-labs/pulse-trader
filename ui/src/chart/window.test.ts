@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   CHART_BAR_CAP,
   WINDOW_HALF_BARS,
+  barsHeld,
   covers,
   parseUtcInstant,
   windowAround,
@@ -161,5 +162,15 @@ describe("covers", () => {
   it("covers only the open of a single loaded bar, which has no spacing to read", () => {
     expect(covers([{ t: String(ENTRY) }], String(ENTRY))).toBe(true);
     expect(covers([{ t: String(ENTRY) }], String(ENTRY + 1))).toBe(false);
+  });
+});
+
+describe("bars held (r7.s2.w3)", () => {
+  it("counts the whole bars between the fills, and none for an open trade or an unknown interval", () => {
+    expect(barsHeld("1735689600000", "1735732800000", "4h")).toBe(3);
+    expect(barsHeld("1735689600000", "1735732800000", "15m")).toBe(48);
+    expect(barsHeld("1735689600000", "1735696800000", "4h")).toBe(0);
+    expect(barsHeld("1735689600000", null, "4h")).toBeNull();
+    expect(barsHeld("1735689600000", "1735704000000", "3m")).toBeNull();
   });
 });
