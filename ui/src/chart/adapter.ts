@@ -11,8 +11,9 @@
 //  * **The attribution logo stays on.** `attributionLogo: true` is passed EXPLICITLY
 //    rather than left to the library's default, so a future version cannot drop
 //    TradingView's notice from the chart by changing that default (grill Q6). The
-//    library draws it in the container's bottom-left corner, and nothing in this
-//    screen overlays the canvas.
+//    library draws it in the container's bottom-left corner. The screen's legend, holdout
+//    tag, state cards and refusals sit over the canvas (canvas v9), each clear of that
+//    corner (r7.s2.w2).
 //  * **The palette is read once, off the element the chart is mounted in.** The
 //    aliases live in `ui/src/styles/chart-tab.css`, so the chart follows the app's
 //    theme without this file naming a colour.
@@ -34,13 +35,20 @@
 //    trigger markers join the one list `markersInWindow` clips and places, so a setup bar
 //    outside the loaded window draws nothing. Its stop is a price line on the candle series.
 //  * **The holdout band (r7.s2.w1).** A read that names no run carries the bars from the
-//    holdout start onward; a series primitive hatches them behind the candles, from halfway
-//    between the last bar before the start and the first bar inside it to the pane's right
-//    edge, with a dashed edge line. It is drawn on the candle pane only.
+//    holdout start onward; a series primitive hatches them over the candles, as canvas v9
+//    does, and on through the time axis (r7.s2.w2), from halfway between the last bar before
+//    the start and the first bar inside it to the pane's right edge, with a dashed edge line.
+//  * **The volume (r7.s2.w2).** A histogram on its own price scale fills the candle pane's bottom 12%, as
+//    canvas v9 draws it; it never moves the candles' scale.
+//  * **The default view (r7.s2.w2, #456).** A read with no anchor shows its latest 164 bars, canvas v9's
+//    view, where every 4h bar is wide enough to click; a shorter window is shown whole.
+//  * **Labels never overlap (r7.s2.w2, #504).** On every draw, scroll, zoom and resize the marker labels are
+//    thinned by their on-screen gap (`declutterTexts`); the markers stay.
 
 import {
   CandlestickSeries,
   ColorType,
+  HistogramSeries,
   LineSeries,
   LineStyle,
   LineType,
@@ -49,6 +57,7 @@ import {
 } from "lightweight-charts";
 import type {
   CandlestickData,
+  HistogramData,
   IChartApi,
   IPriceLine,
   IPrimitivePaneRenderer,
@@ -70,6 +79,7 @@ import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "..
 import type { CandlePoint, ChartMarker, HoldoutBandBars, OverlayLayer } from "./layers";
 import {
   containingIndex,
+  declutterTexts,
   holdoutBandBars,
   markersInWindow,
   setupMarkers,
@@ -77,6 +87,7 @@ import {
   toCandles,
   toMarkers,
   toOverlayLayers,
+  toVolumeBars,
 } from "./layers";
 import type { ChartPalette } from "./palette";
 import { chartPalette } from "./palette";
@@ -103,8 +114,14 @@ export interface ChartAdapter {
    *  outside the loaded candles, or before any read has drawn a bar, calls nothing.
    *  One handler: a second call replaces the first. */
   onCandleClick(handler: (openTime: string) => void): void;
-  /** Fit the whole loaded window into view. */
-  fitAll(): void;
+  /** Call `handler` with the open of the loaded candle under the crosshair, or `null` when the crosshair is off
+   *  the loaded candles (r7.s2.w2, the OHLC legend). One handler: a second call replaces the first. */
+  onCrosshairMove(handler: (openTime: string | null) => void): void;
+  /** Take the crosshair off the chart (#505). */
+  clearCrosshair(): void;
+  /** Show the latest `DEFAULT_VISIBLE_BARS` loaded bars, canvas v9's default view (#456), or every loaded bar
+   *  when fewer are loaded. */
+  showLatest(): void;
   /** Scroll so the bar nearest `timeMs` sits in the middle of the pane. */
   centerOn(timeMs: string): void;
   /** Halve ("in") or double ("out") the visible bar range around its middle. */
@@ -131,6 +148,15 @@ const HOLDOUT_HATCH_WIDTH = 1.2;
 
 /** The band edge's dash, in CSS pixels (canvas v9's `4 3`). */
 const HOLDOUT_EDGE_DASH = [4, 3];
+
+/** How many bars the default view shows: canvas v9's chart (164 4h bars, about four weeks), where a bar is
+ *  several pixels wide and every one takes a click (#456). */
+const DEFAULT_VISIBLE_BARS = 164;
+
+/** The volume's own price scale, and the share of the candle pane above it: canvas v9's volume fills the
+ *  bottom 12% (`VOLH = PH * 0.12`). */
+const VOLUME_SCALE = "volume";
+const VOLUME_TOP_MARGIN = 0.88;
 
 /** One mapped marker, in the library's two marker shapes. */
 function toSeriesMarker(marker: ChartMarker): SeriesMarker<Time> {
@@ -178,54 +204,60 @@ interface HoldoutBand extends ISeriesPrimitive<Time> {
   setBars(bars: HoldoutBandBars | null): void;
 }
 
+/** Hatch `target` from `edge` (CSS pixels) to its right edge, with the dashed edge line: canvas v9's hatch. */
+function drawHatch(
+  target: Parameters<IPrimitivePaneRenderer["draw"]>[0],
+  edge: number,
+  palette: ChartPalette,
+): void {
+  target.useBitmapCoordinateSpace(({ context, bitmapSize, horizontalPixelRatio: ratio }) => {
+    const x = Math.max(0, Math.round(edge * ratio));
+    const width = bitmapSize.width - x;
+    if (width <= 0) return;
+    const height = bitmapSize.height;
+    context.save();
+    context.beginPath();
+    context.rect(x, 0, width, height);
+    context.clip();
+    context.globalAlpha = HOLDOUT_FILL_ALPHA;
+    context.fillStyle = palette.holdoutFill;
+    context.fillRect(x, 0, width, height);
+    context.globalAlpha = 1;
+    context.strokeStyle = palette.holdoutHatch;
+    context.lineWidth = HOLDOUT_HATCH_WIDTH * ratio;
+    context.beginPath();
+    for (let offset = x - height; offset < bitmapSize.width; offset += HOLDOUT_HATCH_STEP * ratio) {
+      context.moveTo(offset, height);
+      context.lineTo(offset + height, 0);
+    }
+    context.stroke();
+    context.strokeStyle = palette.holdoutEdge;
+    context.lineWidth = Math.max(1, Math.round(ratio));
+    context.setLineDash(HOLDOUT_EDGE_DASH.map((dash) => dash * ratio));
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+    context.restore();
+  });
+}
+
 /** The holdout band primitive. Its left edge is halfway between the last bar before the start and
  *  the first bar inside it (the pane's left edge when the first loaded bar is inside), so the hatch
- *  covers whole bars; it is drawn in the background, under the candles. */
+ *  covers whole bars; it is drawn over the candles, as canvas v9 does (PDR-0060 d1: the candles lie under the
+ *  band), and again across the time axis (r7.s2.w2). */
 function createHoldoutBand(palette: ChartPalette): HoldoutBand {
   let bars: HoldoutBandBars | null = null;
   let chart: SeriesAttachedParameter<Time>["chart"] | null = null;
   let requestUpdate: (() => void) | null = null;
   let left: number | null = null;
   const renderer: IPrimitivePaneRenderer = {
-    draw: () => {
-      // The band is background only.
-    },
-    drawBackground: (target) => {
-      const edge = left;
-      if (edge === null) return;
-      target.useBitmapCoordinateSpace(({ context, bitmapSize, horizontalPixelRatio: ratio }) => {
-        const x = Math.max(0, Math.round(edge * ratio));
-        const width = bitmapSize.width - x;
-        if (width <= 0) return;
-        const height = bitmapSize.height;
-        context.save();
-        context.beginPath();
-        context.rect(x, 0, width, height);
-        context.clip();
-        context.globalAlpha = HOLDOUT_FILL_ALPHA;
-        context.fillStyle = palette.holdoutFill;
-        context.fillRect(x, 0, width, height);
-        context.globalAlpha = 1;
-        context.strokeStyle = palette.holdoutHatch;
-        context.lineWidth = HOLDOUT_HATCH_WIDTH * ratio;
-        context.beginPath();
-        for (let offset = x - height; offset < bitmapSize.width; offset += HOLDOUT_HATCH_STEP * ratio) {
-          context.moveTo(offset, height);
-          context.lineTo(offset + height, 0);
-        }
-        context.stroke();
-        context.strokeStyle = palette.holdoutEdge;
-        context.lineWidth = Math.max(1, Math.round(ratio));
-        context.setLineDash(HOLDOUT_EDGE_DASH.map((dash) => dash * ratio));
-        context.beginPath();
-        context.moveTo(x, 0);
-        context.lineTo(x, height);
-        context.stroke();
-        context.restore();
-      });
+    draw: (target) => {
+      if (left !== null) drawHatch(target, left, palette);
     },
   };
-  const view: IPrimitivePaneView = { renderer: () => renderer, zOrder: () => "bottom" };
+  const view: IPrimitivePaneView = { renderer: () => renderer, zOrder: () => "top" };
+  const axisView: IPrimitivePaneView = { renderer: () => renderer, zOrder: () => "top" };
   return {
     attached(param) {
       chart = param.chart;
@@ -251,11 +283,26 @@ function createHoldoutBand(palette: ChartPalette): HoldoutBand {
     paneViews() {
       return [view];
     },
+    timeAxisPaneViews() {
+      return [axisView];
+    },
     setBars(next) {
       bars = next;
       requestUpdate?.();
     },
   };
+}
+
+/** The volume histogram (r7.s2.w2): canvas v9's bars in the candle pane's bottom 12%, on a price scale of their
+ *  own so they never move the candles' scale. */
+function createVolumeSeries(chart: IChartApi): ISeriesApi<"Histogram"> {
+  const volume = chart.addSeries(
+    HistogramSeries,
+    { priceScaleId: VOLUME_SCALE, priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false },
+    0,
+  );
+  volume.priceScale().applyOptions({ scaleMargins: { top: VOLUME_TOP_MARGIN, bottom: 0 } });
+  return volume;
 }
 
 /** Create the chart in `container` and return the handle the screen drives. */
@@ -295,12 +342,14 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
   let candleSeries: ISeriesApi<"Candlestick"> | null = null;
   let markerPlugin: ISeriesMarkersPluginApi<Time> | null = null;
   let holdoutBand: HoldoutBand | null = null;
+  let volumeSeries: ISeriesApi<"Histogram"> | null = null;
   let layerSeries: ISeriesApi<"Line">[] = [];
   /** The selected trade's stop line on the candle series, kept so it can be taken off. */
   let stopPriceLine: IPriceLine | null = null;
   /** The one click handler the screen subscribed, kept so `destroy` unsubscribes the
    *  EXACT function it subscribed rather than every handler on the chart. */
   let clickHandler: ((param: MouseEventParams<Time>) => void) | null = null;
+  let crosshairHandler: ((param: MouseEventParams<Time>) => void) | null = null;
 
   /** The candle series, created on the first candle draw. */
   const ensureCandles = (): ISeriesApi<"Candlestick"> => {
@@ -317,6 +366,7 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     markerPlugin = createSeriesMarkers(candleSeries, []);
     holdoutBand = createHoldoutBand(palette);
     candleSeries.attachPrimitive(holdoutBand);
+    volumeSeries = createVolumeSeries(chart);
     return candleSeries;
   };
 
@@ -327,13 +377,17 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
    *  last loaded candle, and a time inside a bar would otherwise resolve to the NEXT one. */
   const drawMarkers = (): void => {
     if (markerPlugin === null) return;
+    // Labels that would overlap at this zoom are dropped (#504).
     markerPlugin.setMarkers(
-      markersInWindow(
-        [
-          ...toMarkers(overlayDtos, tradeDtos, palette, markDtos),
-          ...setupMarkers(selectedTrade, selectedSeries, palette),
-        ],
-        candlePoints,
+      declutterTexts(
+        markersInWindow(
+          [
+            ...toMarkers(overlayDtos, tradeDtos, palette, markDtos),
+            ...setupMarkers(selectedTrade, selectedSeries, palette),
+          ],
+          candlePoints,
+        ),
+        (time) => chart.timeScale().timeToCoordinate(time as UTCTimestamp),
       ).map(toSeriesMarker),
     );
   };
@@ -357,11 +411,20 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
     logical >= 0 &&
     logical <= candlePoints.length - 1;
 
+  /** Re-thin the labels whenever the bars move under them (#504). */
+  const redrawMarkers = (): void => drawMarkers();
+  chart.timeScale().subscribeVisibleLogicalRangeChange(redrawMarkers);
+  chart.timeScale().subscribeSizeChange(redrawMarkers);
+  /** The pointer left the chart: no crosshair stays pinned behind it (#505). */
+  const onPointerLeave = (): void => chart.clearCrosshairPosition();
+  container.addEventListener("mouseleave", onPointerLeave);
+
   return {
     setCandles(next) {
       candleDtos = [...next];
       candlePoints = toCandles(candleDtos);
       ensureCandles().setData(candlePoints as CandlestickData<Time>[]);
+      volumeSeries?.setData(toVolumeBars(candleDtos, palette) as HistogramData<Time>[]);
       drawHoldout();
     },
 
@@ -468,8 +531,32 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       chart.subscribeClick(clickHandler);
     },
 
-    fitAll() {
-      chart.timeScale().fitContent();
+    onCrosshairMove(handler) {
+      if (crosshairHandler !== null) chart.unsubscribeCrosshairMove(crosshairHandler);
+      crosshairHandler = (param: MouseEventParams<Time>): void => {
+        // The same reading as a click's: the raw position decides, and off the loaded bars is no bar.
+        if (!loadedLogical(param.logical as number | undefined)) {
+          handler(null);
+          return;
+        }
+        handler(String(candlePoints[Math.round(param.logical as number)].time * 1000));
+      };
+      chart.subscribeCrosshairMove(crosshairHandler);
+    },
+
+    clearCrosshair() {
+      chart.clearCrosshairPosition();
+    },
+
+    showLatest() {
+      if (candlePoints.length <= DEFAULT_VISIBLE_BARS) {
+        chart.timeScale().fitContent();
+        return;
+      }
+      chart.timeScale().setVisibleLogicalRange({
+        from: candlePoints.length - DEFAULT_VISIBLE_BARS,
+        to: candlePoints.length - 1,
+      });
     },
 
     centerOn(timeMs) {
@@ -492,9 +579,12 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
       const centre = (range.from + range.to) / 2;
       const half = (range.to - range.from) / 2;
       const wanted = direction === "in" ? half / ZOOM_FACTOR : half * ZOOM_FACTOR;
-      // Never fewer than ten bars, never more than the whole loaded window.
+      // Never fewer than ten bars, never more than the whole loaded window, unless the view already is.
       const most = Math.max(MIN_ZOOM_HALF_BARS, candlePoints.length / 2);
-      const next = Math.min(Math.max(wanted, MIN_ZOOM_HALF_BARS), most);
+      const clamped = Math.min(Math.max(wanted, MIN_ZOOM_HALF_BARS), most);
+      // A step never moves against its direction (#501): zooming in never widens the view, and zooming out never
+      // narrows it, even from a view outside the clamp.
+      const next = direction === "in" ? Math.min(clamped, half) : Math.max(clamped, half);
       chart.timeScale().setVisibleLogicalRange({ from: centre - next, to: centre + next });
     },
 
@@ -505,10 +595,18 @@ export function createChartAdapter(container: HTMLElement): ChartAdapter {
         chart.unsubscribeClick(clickHandler);
         clickHandler = null;
       }
+      if (crosshairHandler !== null) {
+        chart.unsubscribeCrosshairMove(crosshairHandler);
+        crosshairHandler = null;
+      }
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(redrawMarkers);
+      chart.timeScale().unsubscribeSizeChange(redrawMarkers);
+      container.removeEventListener("mouseleave", onPointerLeave);
       chart.remove();
       candleSeries = null;
       markerPlugin = null;
       holdoutBand = null;
+      volumeSeries = null;
       holdoutStartMs = null;
       layerSeries = [];
       stopPriceLine = null;

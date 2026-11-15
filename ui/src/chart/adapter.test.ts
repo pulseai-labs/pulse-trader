@@ -16,7 +16,7 @@
 //    one that contains it;
 //  * a second draw replaces the layer series instead of stacking a second copy on
 //    top of the first;
-//  * fit, centre and destroy reach the chart's own API.
+//  * the default view, centre and destroy reach the chart's own API.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -26,7 +26,12 @@ const h = vi.hoisted(() => {
     setVisibleLogicalRange: vi.fn(),
     getVisibleLogicalRange: vi.fn(),
     timeToCoordinate: vi.fn(),
+    subscribeVisibleLogicalRangeChange: vi.fn(),
+    unsubscribeVisibleLogicalRangeChange: vi.fn(),
+    subscribeSizeChange: vi.fn(),
+    unsubscribeSizeChange: vi.fn(),
   };
+  const priceScale = { applyOptions: vi.fn() };
   const series: {
     definition: unknown;
     options: unknown;
@@ -36,6 +41,7 @@ const h = vi.hoisted(() => {
     attachPrimitive: ReturnType<typeof vi.fn>;
     createPriceLine: ReturnType<typeof vi.fn>;
     removePriceLine: ReturnType<typeof vi.fn>;
+    priceScale: ReturnType<typeof vi.fn>;
   }[] = [];
   // A library that keeps an empty pane (`preserveEmptyPane`) is the other branch of C2.
   const flags = { preserveEmptyPanes: false };
@@ -55,6 +61,7 @@ const h = vi.hoisted(() => {
         attachPrimitive: vi.fn(),
         createPriceLine: vi.fn((line: unknown) => ({ line })),
         removePriceLine: vi.fn(),
+        priceScale: vi.fn(() => priceScale),
       };
       series.push(created);
       return created;
@@ -75,10 +82,13 @@ const h = vi.hoisted(() => {
     timeScale: vi.fn(() => timeScale),
     subscribeClick: vi.fn(),
     unsubscribeClick: vi.fn(),
+    subscribeCrosshairMove: vi.fn(),
+    unsubscribeCrosshairMove: vi.fn(),
+    clearCrosshairPosition: vi.fn(),
     remove: vi.fn(),
   };
   const markersApi = { setMarkers: vi.fn() };
-  return { timeScale, chart, series, panes, makePane, markersApi, flags };
+  return { timeScale, priceScale, chart, series, panes, makePane, markersApi, flags };
 });
 
 vi.mock("lightweight-charts", () => ({
@@ -86,6 +96,7 @@ vi.mock("lightweight-charts", () => ({
   createSeriesMarkers: vi.fn(() => h.markersApi),
   CandlestickSeries: { type: "Candlestick" },
   LineSeries: { type: "Line" },
+  HistogramSeries: { type: "Histogram" },
   LineStyle: { Solid: 0, Dotted: 1, Dashed: 2 },
   LineType: { Simple: 0, WithSteps: 1 },
   ColorType: { Solid: "solid" },
@@ -97,7 +108,7 @@ import type { ChartCandleDto, ChartOverlayDto, ChartTradeDto, MarkDto } from "..
 import { createChartAdapter } from "./adapter";
 import { PALETTE_TOKENS } from "./palette";
 
-/** A container carrying the chart's twenty-one aliases, as the loaded sheet leaves it. */
+/** A container carrying the chart's twenty-three aliases, as the loaded sheet leaves it. */
 function container(): HTMLElement {
   const el = document.createElement("div");
   el.style.setProperty(PALETTE_TOKENS.bull, "bull");
@@ -121,6 +132,8 @@ function container(): HTMLElement {
   el.style.setProperty(PALETTE_TOKENS.holdoutFill, "holdout-fill");
   el.style.setProperty(PALETTE_TOKENS.holdoutHatch, "holdout-hatch");
   el.style.setProperty(PALETTE_TOKENS.holdoutEdge, "holdout-edge");
+  el.style.setProperty(PALETTE_TOKENS.volumeUp, "volume-up");
+  el.style.setProperty(PALETTE_TOKENS.volumeDown, "volume-down");
   document.body.append(el);
   return el;
 }
@@ -154,9 +167,9 @@ function candleSeries() {
   return h.series[0];
 }
 
-/** The layer series created after the candle series. */
+/** The layer (line) series, without the candles and the volume. */
 function layerSeries() {
-  return h.series.slice(1);
+  return h.series.filter((each) => (each.definition as { type: string }).type === "Line");
 }
 
 const CANDLES: ChartCandleDto[] = [
@@ -207,6 +220,14 @@ beforeEach(() => {
   h.chart.remove.mockClear();
   h.chart.subscribeClick.mockClear();
   h.chart.unsubscribeClick.mockClear();
+  h.chart.subscribeCrosshairMove.mockClear();
+  h.chart.unsubscribeCrosshairMove.mockClear();
+  h.chart.clearCrosshairPosition.mockClear();
+  h.timeScale.subscribeVisibleLogicalRangeChange.mockClear();
+  h.timeScale.unsubscribeVisibleLogicalRangeChange.mockClear();
+  h.timeScale.subscribeSizeChange.mockClear();
+  h.timeScale.unsubscribeSizeChange.mockClear();
+  h.priceScale.applyOptions.mockClear();
   h.markersApi.setMarkers.mockClear();
   h.timeScale.fitContent.mockClear();
   h.timeScale.setVisibleLogicalRange.mockClear();
@@ -238,7 +259,8 @@ describe("createChartAdapter", () => {
   it("draws the candles in the library's own units", () => {
     const adapter = createChartAdapter(container());
     adapter.setCandles(CANDLES);
-    expect(h.series).toHaveLength(1);
+    // The candle series, and the volume histogram that rides with it (r7.s2.w2).
+    expect(h.series).toHaveLength(2);
     expect(candleSeries().options).toMatchObject({ upColor: "bull", downColor: "bear" });
     expect(candleSeries().setData).toHaveBeenCalledWith([
       { time: 1735689600, open: 93548.8, high: 94449.2, low: 93460.2, close: 93810 },
@@ -547,12 +569,9 @@ describe("createChartAdapter", () => {
     expect(last).toHaveLength(3);
   });
 
-  it("fits the window, centres on a bar, and removes itself", () => {
+  it("centres on a bar, and removes itself", () => {
     const adapter = createChartAdapter(container());
     adapter.setCandles(CANDLES);
-    adapter.fitAll();
-    expect(h.timeScale.fitContent).toHaveBeenCalledTimes(1);
-
     adapter.centerOn("1735704000000");
     expect(h.timeScale.setVisibleLogicalRange).toHaveBeenCalledWith({ from: -59, to: 61 });
 
@@ -750,7 +769,7 @@ describe("the holdout band (r7.s2.w1)", () => {
   interface BandView {
     attached(param: unknown): void;
     updateAllViews(): void;
-    paneViews(): { renderer(): { drawBackground(target: unknown): void } }[];
+    paneViews(): { renderer(): { draw(target: unknown): void } }[];
   }
   /** The primitive the adapter attached to the candle series. */
   function band(): BandView {
@@ -762,7 +781,7 @@ describe("the holdout band (r7.s2.w1)", () => {
     band()
       .paneViews()[0]
       .renderer()
-      .drawBackground({
+      .draw({
         useBitmapCoordinateSpace: (draw: (scope: unknown) => void) =>
           draw({
             context: ctx,
@@ -842,5 +861,199 @@ describe("the holdout band (r7.s2.w1)", () => {
     adapter.setCandles(CANDLES);
     adapter.setHoldout(null);
     expect(candleSeries().attachPrimitive).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the chart canvas aligned to canvas v9 (r7.s2.w2)", () => {
+  /** 200 4h bars from 2025-01-01T00:00Z. */
+  const BARS_200: ChartCandleDto[] = Array.from({ length: 200 }, (_, index) => ({
+    t: String(1_735_689_600_000 + index * 14_400_000),
+    o: "100",
+    h: "101",
+    l: "99",
+    c: "100",
+    v: "1",
+  }));
+
+  /** The Histogram series the adapter created. */
+  function volumeSeries() {
+    return h.series.filter((each) => (each.definition as { type: string }).type === "Histogram");
+  }
+
+  /** The handler the adapter subscribed to the library's crosshair delegate. */
+  function crosshairHandler(): (param: { logical?: number }) => void {
+    const call = h.chart.subscribeCrosshairMove.mock.calls.at(-1);
+    expect(call, "the adapter never subscribed a crosshair handler").toBeDefined();
+    return call?.[0] as (param: { logical?: number }) => void;
+  }
+
+  interface BandView {
+    attached(param: unknown): void;
+    updateAllViews(): void;
+    paneViews(): { zOrder(): string }[];
+    timeAxisPaneViews(): { zOrder(): string; renderer(): { draw(target: unknown): void } }[];
+  }
+  /** The primitive the adapter attached to the candle series. */
+  function band(): BandView {
+    return candleSeries().attachPrimitive.mock.calls[0][0] as BandView;
+  }
+  /** A canvas context that records what the band draws. */
+  function recorder() {
+    return {
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      rect: vi.fn(),
+      clip: vi.fn(),
+      fillRect: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: vi.fn(),
+      setLineDash: vi.fn(),
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 0,
+      globalAlpha: 1,
+    };
+  }
+  /** `timeToCoordinate` as `pixels` px per 4h bar, from 5 px at 2025-01-01T00:00Z. */
+  function spacedBy(pixels: number): void {
+    h.timeScale.timeToCoordinate.mockImplementation(
+      (time: number) => ((time - 1735689600) / 14400) * pixels + 5,
+    );
+  }
+  /** The texts of the last markers handed to the library, those that have one. */
+  function lastTexts(): (string | undefined)[] {
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { text?: string }[];
+    return last.map((marker) => marker.text).filter((text) => text !== undefined);
+  }
+
+  it("draws the volume as a histogram on its own scale in the bottom 12% of the candle pane, once", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(CANDLES);
+    expect(volumeSeries()).toHaveLength(1);
+    const [volume] = volumeSeries();
+    expect(volume.pane).toBe(0);
+    expect(volume.options).toMatchObject({
+      priceScaleId: "volume",
+      priceFormat: { type: "volume" },
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+    expect(h.priceScale.applyOptions).toHaveBeenCalledWith({ scaleMargins: { top: 0.88, bottom: 0 } });
+    expect(volume.setData).toHaveBeenLastCalledWith([
+      { time: 1735689600, value: 13962.019, color: "volume-up" },
+      { time: 1735704000, value: 7852.483, color: "volume-down" },
+    ]);
+    adapter.setCandles(SPANNED_CANDLES);
+    expect(volumeSeries()).toHaveLength(1);
+  });
+
+  it("shows the latest 164 bars by default, and every bar when fewer are loaded (#456)", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(BARS_200);
+    adapter.showLatest();
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenCalledWith({ from: 36, to: 199 });
+    expect(h.timeScale.fitContent).not.toHaveBeenCalled();
+
+    const few = createChartAdapter(container());
+    few.setCandles(CANDLES);
+    few.showLatest();
+    expect(h.timeScale.fitContent).toHaveBeenCalledTimes(1);
+  });
+
+  it("never zooms out to fewer bars or in to more bars than in view (#501)", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(BARS_200);
+    h.timeScale.getVisibleLogicalRange.mockReturnValue({ from: -20, to: 220 });
+    adapter.zoom("out");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: -20, to: 220 });
+    h.timeScale.getVisibleLogicalRange.mockReturnValue({ from: 98, to: 102 });
+    adapter.zoom("in");
+    expect(h.timeScale.setVisibleLogicalRange).toHaveBeenLastCalledWith({ from: 98, to: 102 });
+  });
+
+  it("reports the loaded bar under the crosshair, and null off the bars", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(THREE_BARS);
+    const seen: (string | null)[] = [];
+    adapter.onCrosshairMove((open) => seen.push(open));
+    const handler = crosshairHandler();
+    handler({ logical: 0 });
+    handler({ logical: 1.4 });
+    handler({ logical: 3 });
+    handler({});
+    expect(seen).toEqual(["1735689600000", "1735704000000", null, null]);
+    adapter.onCrosshairMove(() => {});
+    expect(h.chart.unsubscribeCrosshairMove).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the crosshair, and clears it when the pointer leaves the chart (#505)", () => {
+    const el = container();
+    const adapter = createChartAdapter(el);
+    adapter.clearCrosshair();
+    expect(h.chart.clearCrosshairPosition).toHaveBeenCalledTimes(1);
+    el.dispatchEvent(new MouseEvent("mouseleave"));
+    expect(h.chart.clearCrosshairPosition).toHaveBeenCalledTimes(2);
+  });
+
+  it("draws the holdout band over the candles and across the time axis", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    band().attached({ chart: h.chart, series: candleSeries(), requestUpdate: vi.fn() });
+    spacedBy(10);
+    adapter.setHoldout("1735718400000");
+    band().updateAllViews();
+    expect(band().paneViews()[0].zOrder()).toBe("top");
+    expect(band().timeAxisPaneViews()[0].zOrder()).toBe("top");
+    const ctx = recorder();
+    band()
+      .timeAxisPaneViews()[0]
+      .renderer()
+      .draw({
+        useBitmapCoordinateSpace: (draw: (scope: unknown) => void) =>
+          draw({
+            context: ctx,
+            bitmapSize: { width: 100, height: 22 },
+            mediaSize: { width: 100, height: 22 },
+            horizontalPixelRatio: 1,
+            verticalPixelRatio: 1,
+          }),
+      });
+    expect(ctx.fillRect).toHaveBeenCalledWith(20, 0, 80, 22);
+  });
+
+  it("thins the marker labels on every visible-range and size change (#504)", () => {
+    const adapter = createChartAdapter(container());
+    adapter.setCandles(SPANNED_CANDLES);
+    spacedBy(10);
+    adapter.setTrades([TRADE, { ...TRADE, entryTime: "1735704000000", exitTime: "1735718400000" }]);
+    expect(lastTexts()).toEqual(["+2.00 R"]);
+    const last = h.markersApi.setMarkers.mock.calls.at(-1)?.[0] as { shape: string }[];
+    expect(last.filter((marker) => marker.shape === "circle")).toHaveLength(2);
+
+    spacedBy(100);
+    h.timeScale.subscribeVisibleLogicalRangeChange.mock.calls[0][0]();
+    expect(lastTexts()).toEqual(["+2.00 R", "+2.00 R"]);
+
+    spacedBy(10);
+    h.timeScale.subscribeSizeChange.mock.calls[0][0]();
+    expect(lastTexts()).toEqual(["+2.00 R"]);
+  });
+
+  it("unsubscribes its crosshair, range and size handlers when destroyed", () => {
+    const el = container();
+    const adapter = createChartAdapter(el);
+    adapter.onCrosshairMove(vi.fn());
+    const crosshair = h.chart.subscribeCrosshairMove.mock.calls[0][0];
+    const range = h.timeScale.subscribeVisibleLogicalRangeChange.mock.calls[0][0];
+    const size = h.timeScale.subscribeSizeChange.mock.calls[0][0];
+    adapter.destroy();
+    expect(h.chart.unsubscribeCrosshairMove).toHaveBeenCalledWith(crosshair);
+    expect(h.timeScale.unsubscribeVisibleLogicalRangeChange).toHaveBeenCalledWith(range);
+    expect(h.timeScale.unsubscribeSizeChange).toHaveBeenCalledWith(size);
+    h.chart.clearCrosshairPosition.mockClear();
+    el.dispatchEvent(new MouseEvent("mouseleave"));
+    expect(h.chart.clearCrosshairPosition).not.toHaveBeenCalled();
   });
 });

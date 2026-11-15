@@ -60,6 +60,10 @@ export const PALETTE_TOKENS = {
   holdoutHatch: "--chart-holdout-hatch",
   /** The holdout band's dashed left edge. */
   holdoutEdge: "--chart-holdout-edge",
+  /** A volume bar under a candle that closed up (r7.s2.w2). */
+  volumeUp: "--chart-volume-up",
+  /** A volume bar under a candle that closed down. */
+  volumeDown: "--chart-volume-down",
 } as const;
 
 /** Every colour the chart draws with, resolved to a value the canvas accepts. */
@@ -97,5 +101,7 @@ export function chartPalette(root: Element): ChartPalette {
     holdoutFill: read(PALETTE_TOKENS.holdoutFill),
     holdoutHatch: read(PALETTE_TOKENS.holdoutHatch),
     holdoutEdge: read(PALETTE_TOKENS.holdoutEdge),
+    volumeUp: read(PALETTE_TOKENS.volumeUp),
+    volumeDown: read(PALETTE_TOKENS.volumeDown),
   };
 }

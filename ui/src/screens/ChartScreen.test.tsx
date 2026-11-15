@@ -16,6 +16,17 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+/** The Node runtime globals vitest always runs on (the same pattern `chart/palette.test.ts` uses — this
+ *  toolchain ships no `@types/node`). */
+const nodeRuntime = (globalThis as unknown as {
+  process: { cwd(): string; getBuiltinModule(id: string): unknown };
+}).process;
+
+interface FsLike {
+  readFileSync(path: string, encoding: "utf8"): string;
+}
+const fs = nodeRuntime.getBuiltinModule("node:fs") as FsLike;
+
 const h = vi.hoisted(() => ({
   adapter: {
     setCandles: vi.fn(),
@@ -25,7 +36,9 @@ const h = vi.hoisted(() => ({
     setSelectedTrade: vi.fn(),
     setHoldout: vi.fn(),
     onCandleClick: vi.fn(),
-    fitAll: vi.fn(),
+    onCrosshairMove: vi.fn(),
+    clearCrosshair: vi.fn(),
+    showLatest: vi.fn(),
     centerOn: vi.fn(),
     zoom: vi.fn(),
     destroy: vi.fn(),
@@ -334,7 +347,7 @@ describe("opening the Chart tab", () => {
       }),
     );
     expect(commands.getBacktestRun).not.toHaveBeenCalled();
-    await waitFor(() => expect(h.adapter.fitAll).toHaveBeenCalled());
+    await waitFor(() => expect(h.adapter.showLatest).toHaveBeenCalled());
     expect(h.adapter.setCandles).toHaveBeenCalledWith(chartDto().candles);
     expect(h.adapter.setOverlays).toHaveBeenCalledWith([]);
     expect(
@@ -600,7 +613,7 @@ describe("a switch to another run (CR3)", () => {
     expect(h.adapter.setCandles).toHaveBeenLastCalledWith([]);
     expect(h.adapter.setOverlays).toHaveBeenLastCalledWith([]);
     expect(h.adapter.setTrades).toHaveBeenLastCalledWith([]);
-    expect(h.adapter.fitAll).toHaveBeenCalledTimes(1);
+    expect(h.adapter.showLatest).toHaveBeenCalledTimes(1);
     // The rows are run-new's own stored trades, and the table says so.
     const after = screen.getByRole("table", { name: "Trades in the run" });
     expect(within(after).queryByText("2025-04-11 00:00 UTC")).toBeNull();
@@ -2186,5 +2199,217 @@ describe("the strategy on the chart (r6.s4.w4)", () => {
         "This rule uses no S/R, pivot, candle-pattern, EMA, SMA or WaveTrend operand on 4h.",
       ),
     ).toBeTruthy();
+  });
+});
+
+describe("the chart canvas aligned to canvas v9 (r7.s2.w2)", () => {
+  /** The text between the first `${selector} {` and the next `}` of the Chart tab's sheet. */
+  function ruleBody(sheet: string, selector: string): string {
+    const start = sheet.indexOf(`${selector} {`);
+    expect(start, `chart-tab.css has no ${selector} rule`).toBeGreaterThanOrEqual(0);
+    return sheet.slice(start, sheet.indexOf("}", start));
+  }
+
+  /** The first class of each child of `parent`. */
+  function firstClasses(parent: Element): (string | undefined)[] {
+    return Array.from(parent.children).map((child) => child.classList[0]);
+  }
+
+  const TAG_HOLDOUT = { holdoutStartMs: String(ENTRY), barsWithheld: 0 };
+
+  it("fills the content track: the draw rail, then the canvas pane, then the strip region", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const region = screen.getByRole("region", { name: "Chart" });
+    expect(firstClasses(region)).toEqual(["cw-tool", "cw-markbar", "cw-body"]);
+    const body = region.querySelector(".cw-body") as Element;
+    expect(firstClasses(body)).toEqual(["draw-rail", "cw-main"]);
+    const main = body.querySelector(".cw-main") as Element;
+    expect(firstClasses(main)).toEqual(["cv-wrap", "cw-below"]);
+    expect(main.querySelector(".cv-wrap")?.firstElementChild?.classList.contains("cw-canvas")).toBe(true);
+
+    const sheet = fs.readFileSync(`${nodeRuntime.cwd()}/ui/src/styles/chart-tab.css`, "utf8");
+    expect(ruleBody(sheet, ".cw")).toContain("height: calc(100% + 2 * var(--sp-6))");
+    expect(ruleBody(sheet, ".cw")).toContain("margin: calc(-1 * var(--sp-6))");
+    expect(ruleBody(sheet, ".cv-wrap")).toContain("position: relative");
+    expect(ruleBody(sheet, ".cv-wrap")).toContain("flex: 1");
+    expect(ruleBody(sheet, ".cw-canvas")).toContain("position: absolute");
+    expect(ruleBody(sheet, ".cw-canvas")).toContain("inset: 0");
+    expect(ruleBody(sheet, ".cw-below")).toContain("max-height: 170px");
+  });
+
+  it("shows the drawing tools as not built yet in the draw rail", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const rail = document.querySelector(".draw-rail") as Element;
+    expect(rail.textContent).toBe("Drawing tools: not built yet");
+    expect(rail.querySelector(".not-built")?.getAttribute("title")).toBe("Drawing tools — not built yet");
+    expect(rail.querySelector("button")).toBeNull();
+  });
+
+  it("shows the last bar's OHLC in the legend, and the bar under the crosshair while it moves", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const legend = await screen.findByRole("group", { name: "OHLC legend" });
+    const line = legend.querySelector(".ro-l1") as Element;
+    for (const part of [
+      "BTCUSDT · 4h",
+      "2026-02-05 00:00 UTC",
+      "O 93,548.80",
+      "H 94,449.20",
+      "L 93,460.20",
+      "C 93,810.00",
+    ]) {
+      expect(line.textContent).toContain(part);
+    }
+    expect(line.querySelectorAll("b.bull")).toHaveLength(4);
+    expect(legend.querySelector('[data-exact="93548.8"]')).not.toBeNull();
+
+    const moved = h.adapter.onCrosshairMove.mock.calls.at(-1)?.[0] as (open: string | null) => void;
+    act(() => moved(String(FIRST)));
+    expect(line.textContent).toContain("2025-01-01 00:00 UTC");
+    act(() => moved(null));
+    expect(line.textContent).toContain("2026-02-05 00:00 UTC");
+  });
+
+  it("shows the change and the candle anatomy as not built yet, never a number", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    const legend = await screen.findByRole("group", { name: "OHLC legend" });
+    expect(legend.querySelector(".ro-l1 .not-built")?.getAttribute("title")).toBe(
+      "Change from the previous close — not built yet",
+    );
+    const row = legend.querySelector(".ro-row") as Element;
+    expect(row.textContent).toBe("AnatomyCandle anatomy: not built yet");
+    expect(row.querySelector(".not-built")?.getAttribute("title")).toBe("Candle anatomy — not built yet");
+    expect(legend.textContent).not.toContain("%");
+  });
+
+  it("tags the holdout band on the canvas of a free chart", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto({ holdout: TAG_HOLDOUT })));
+    await open("#/chart");
+    await screen.findByText("Holdout — from 2025-04-11 UTC · agents can't test here");
+    const tag = document.querySelector(".cv-wrap .cv-ho-tag") as Element;
+    expect(tag.getAttribute("role")).toBe("note");
+    expect(tag.textContent).toBe("Holdout — from 2025-04-11 UTC · agents can't test here");
+    expect(document.querySelector(".cw-notes")?.textContent).not.toContain("Holdout");
+  });
+
+  it("keeps the holdout sentence below the canvas when no loaded bar is inside", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ holdout: { holdoutStartMs: String(LAST + DAY), barsWithheld: 0 } })),
+    );
+    await open("#/chart");
+    await screen.findByText("Holdout — from 2026-02-06 UTC · agents can't test here");
+    expect(document.querySelector(".cv-ho-tag")).toBeNull();
+    expect(document.querySelector(".cw-notes")?.textContent).toContain(
+      "Holdout — from 2026-02-06 UTC · agents can't test here",
+    );
+  });
+
+  it("keeps a run's withheld note below the canvas, with no tag", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(
+      ok(chartDto({ run: runLayer(), holdout: { holdoutStartMs: String(ENTRY), barsWithheld: 12 } })),
+    );
+    await open("#/chart?run=run-1");
+    await screen.findByText("Holdout from 2025-04-11 UTC — 12 bars withheld");
+    expect(document.querySelector(".cv-ho-tag")).toBeNull();
+    expect(document.querySelector(".cw-notes")?.textContent).toContain(
+      "Holdout from 2025-04-11 UTC — 12 bars withheld",
+    );
+  });
+
+  it("opens on the latest bars, not the whole window (#456)", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.showLatest).toHaveBeenCalledTimes(1));
+    expect(h.adapter.centerOn).not.toHaveBeenCalled();
+  });
+
+  it("shows a refused date over the canvas without moving it, and clears the crosshair (#505)", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    await waitFor(() => expect(h.adapter.setCandles).toHaveBeenCalledTimes(1));
+    goTo("not a date");
+    const refusal = await screen.findByText("Type a UTC date as YYYY-MM-DD or YYYY-MM-DD HH:mm.");
+    const alerts = refusal.closest(".cv-alerts");
+    expect(alerts).not.toBeNull();
+    expect(alerts?.closest(".cv-wrap")).not.toBeNull();
+    expect(h.adapter.clearCrosshair).toHaveBeenCalledTimes(1);
+    expect(document.querySelector("section.cw > .cw-msg")).toBeNull();
+  });
+
+  it("shows the loading sentence over the canvas, not above it", async () => {
+    vi.mocked(commands.chartData).mockReturnValue(new Promise(() => {}) as never);
+    await open("#/chart");
+    const loading = await screen.findByText("Loading BTCUSDT 4h…");
+    expect(loading.closest(".cv-over")).not.toBeNull();
+  });
+
+  it("shows a refused read over the canvas, not above it", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(failure("refused") as never);
+    await open("#/chart");
+    const alert = await screen.findByRole("alert");
+    expect(alert.closest(".cv-over")).not.toBeNull();
+  });
+
+  it("carries every candle's exact open, high, low, close and volume, with no run (#420)", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto()));
+    await open("#/chart");
+    fireEvent.click(await screen.findByText("Candles — 2 bars (open, high, low, close, volume)"));
+    const table = await screen.findByRole("table", { name: "Candles — open, high, low, close, volume" });
+    expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "bar",
+      "open",
+      "high",
+      "low",
+      "close",
+      "volume",
+    ]);
+    const first = within(table).getAllByRole("row")[1];
+    expect(Array.from(first.querySelectorAll("td")).map((cell) => cell.textContent)).toEqual([
+      "2025-01-01 00:00 UTC",
+      "93,548.80",
+      "94,449.20",
+      "93,460.20",
+      "93,810.00",
+      "13962.019",
+    ]);
+    expect(Array.from(first.querySelectorAll("[data-exact]")).map((el) => el.getAttribute("data-exact"))).toEqual([
+      "93548.8",
+      "94449.2",
+      "93460.2",
+      "93810",
+      "13962.019",
+    ]);
+  });
+
+  it("carries the candle table on a run's chart too (#420)", async () => {
+    await open("#/chart?run=run-1");
+    expect(await screen.findByText("Candles — 2 bars (open, high, low, close, volume)")).toBeTruthy();
+  });
+
+  it("renders exactly the canvas strings this item adds", async () => {
+    vi.mocked(commands.chartData).mockResolvedValue(ok(chartDto({ holdout: TAG_HOLDOUT })));
+    await open("#/chart");
+    const legend = await screen.findByRole("group", { name: "OHLC legend" });
+    const candles = screen.getByRole("region", { name: "Candles" });
+    expect([
+      (document.querySelector(".draw-rail") as Element).textContent,
+      (legend.querySelector("b.mono") as Element).textContent,
+      (legend.querySelector(".ro-k") as Element).textContent,
+      ...Array.from(document.querySelectorAll(".cw-body .not-built")).map((el) => el.getAttribute("title")),
+      (document.querySelector(".cv-ho-tag") as Element).textContent,
+      (candles.querySelector("summary") as Element).textContent,
+    ]).toEqual([
+      "Drawing tools: not built yet",
+      "BTCUSDT · 4h",
+      "Anatomy",
+      "Drawing tools — not built yet",
+      "Change from the previous close — not built yet",
+      "Candle anatomy — not built yet",
+      "Holdout — from 2025-04-11 UTC · agents can't test here",
+      "Candles — 2 bars (open, high, low, close, volume)",
+    ]);
   });
 });

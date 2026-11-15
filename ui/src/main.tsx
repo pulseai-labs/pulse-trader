@@ -19,8 +19,8 @@
 // every screen. `chart-tab.css` (r5.s2.w2) is the Chart tab's, named after the
 // screen rather than after the mock's own `chart.css` for the reason
 // `check-design-system.sh` gives (`backtest.css` vs the mock's
-// `backtest-lab.css`); it also declares the ten `--chart-*` aliases the chart
-// adapter reads its colours from.
+// `backtest-lab.css`); it also declares the `--chart-*` aliases the chart adapter
+// reads its colours from.
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
