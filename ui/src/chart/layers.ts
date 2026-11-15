@@ -275,6 +275,14 @@ export function stopLine(trade: ChartTradeDto | null): { price: number; title: "
   return { price: decimal(trade.stopPrice), title: "stop" };
 }
 
+/** A trade's outcome, as the strip colours its R (r7.s2.w3): open while it has no exit, else a winner at or above
+ *  0 R and a loser below. The same rule `toMarkers` colours a trade's markers by; a comparison of the read's own
+ *  values, not a computed figure. */
+export function tradeOutcome(trade: Pick<ChartTradeDto, "exitTime" | "realizedR">): "bull" | "bear" | "open" {
+  if (trade.exitTime === null) return "open";
+  return decimal(trade.realizedR) >= 0 ? "bull" : "bear";
+}
+
 /** Every marker the window's overlays, trades and example marks draw, in ascending time
  *  — the order the library requires.
  *

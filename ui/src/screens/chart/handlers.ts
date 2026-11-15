@@ -25,6 +25,10 @@ export function chartHandlers(s: ChartState, view: ChartView) {
     run,
     free,
     anchorMs,
+    anchorWhat,
+    setAnchorWhat,
+    setRail,
+    setRailOpen,
     drawnReadRef,
     adapterRef,
   } = s;
@@ -51,7 +55,7 @@ export function chartHandlers(s: ChartState, view: ChartView) {
       ? timeframeOf(run, "htf")
       : run === null
         ? free.timeframe
-        : run.primaryTimeframe, anchorMs));
+        : run.primaryTimeframe, anchorMs, anchorWhat));
   };
 
   /** A trade row: centre the chart on its bar, or read a window around it. Two things
@@ -61,7 +65,11 @@ export function chartHandlers(s: ChartState, view: ChartView) {
    *  to one of those bars would scroll to nothing. */
   const selectTrade = (trade: ChartTradeDto) => {
     setSelectedKey(tradeKey(trade));
+    // A picked trade's stored fields are the Inspector's (canvas v9, r7.s2.w3).
+    setRail("inspector");
+    setRailOpen(true);
     setAnchorMs(trade.entryTime);
+    setAnchorWhat("entry");
     setUndrawn(null);
     const next = requestFor(run, run?.pair ?? free.pair, timeframe, trade.entryTime);
     const covered = covers(dto?.candles ?? [], trade.entryTime);
@@ -98,6 +106,7 @@ export function goToHandler(s: ChartState, view: ChartView): (text: string) => v
     setGoToNote,
     setUndrawn,
     setAnchorMs,
+    setAnchorWhat,
     adapterRef,
     free,
     drawnReadRef,
@@ -146,6 +155,7 @@ export function goToHandler(s: ChartState, view: ChartView): (text: string) => v
     setUndrawn(null);
     // A later leg switch reads around the same date.
     setAnchorMs(instant);
+    setAnchorWhat("date");
     if (dto !== null && drawnTimeframe === timeframe && covers(dto.candles, instant)) {
       adapterRef.current?.centerOn(instant);
       return;

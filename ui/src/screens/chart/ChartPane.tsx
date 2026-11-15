@@ -5,13 +5,15 @@
 
 import { useEffect, useState } from "react";
 
-import type { ChartDataDto } from "../../bindings";
+import type { ChartDataDto, ChartTradeDto } from "../../bindings";
 import type { ChartAdapter } from "../../chart/adapter";
 import { candleDirection } from "../../chart/layers";
 import { NotBuiltYet } from "../../components/NotBuiltYet";
 import { Figure } from "../../format/Figure";
 import { price } from "../../format/numbers";
 import { timeUtc } from "../../format/time";
+import type { Leg } from "./model";
+import { hasTwoLegs, timeframeOf } from "./model";
 import type { ChartState } from "./state";
 import type { ChartView } from "./view";
 import { legendBar } from "./view";
@@ -27,8 +29,18 @@ export function DrawRail() {
 
 /** Canvas v9's `.cv-wrap`: the library's canvas, with the legend, the holdout tag, the state cards and the
  *  refusals over it. A refusal here never moves the chart (#505). */
-export function ChartPane({ s, view }: { s: ChartState; view: ChartView }) {
-  const { containerRef, adapterRef, phase, notice, goToNote, markRefusal } = s;
+export function ChartPane({
+  s,
+  view,
+  onSelectTrade,
+  onSelectLeg,
+}: {
+  s: ChartState;
+  view: ChartView;
+  onSelectTrade: (trade: ChartTradeDto) => void;
+  onSelectLeg: (next: Leg) => void;
+}) {
+  const { containerRef, adapterRef, phase, goToNote, markRefusal } = s;
   const { dto, holdoutTag } = view;
   return (
     <div className="cv-wrap">
@@ -55,12 +67,7 @@ export function ChartPane({ s, view }: { s: ChartState; view: ChartView }) {
             {`No ${dto.timeframe} bars for ${dto.pair} in this window.`}
           </p>
         )}
-
-        {notice !== null && (
-          <p className="cw-msg" role="status">
-            {`The whole run at ${notice.timeframe} is ${notice.bars.toLocaleString("en-US")} bars — more than one read (the cap is 20,000). Pick a trade to load ${notice.timeframe} around it, or go to a date.`}
-          </p>
-        )}
+        <OverCapCard s={s} view={view} onSelectTrade={onSelectTrade} onSelectLeg={onSelectLeg} />
       </div>
       <div className="cv-alerts">
         {markRefusal !== null && (
@@ -72,6 +79,46 @@ export function ChartPane({ s, view }: { s: ChartState; view: ChartView }) {
           <p className="cw-msg" role="alert">
             {goToNote}
           </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Canvas v9's over-cap card (`chart.jsx:834-838`, r7.s2.w3): the leg asked for is over one read's cap, so nothing
+ *  was read. It offers the strip's first trade and, on a run with two legs, the other leg. */
+export function OverCapCard({
+  s,
+  view,
+  onSelectTrade,
+  onSelectLeg,
+}: {
+  s: ChartState;
+  view: ChartView;
+  onSelectTrade: (trade: ChartTradeDto) => void;
+  onSelectLeg: (next: Leg) => void;
+}) {
+  const { notice, run, leg } = s;
+  const { trades } = view;
+  if (notice === null) return null;
+  const first = trades.length > 0 ? trades[0] : null;
+  const other: Leg = leg === "primary" ? "htf" : "primary";
+  return (
+    <div className="cv-card nd" role="status">
+      <b>{`The whole run at ${notice.timeframe} is ${notice.bars.toLocaleString("en-US")} bars`}</b>
+      <p>
+        {`That is more than one read (the cap is 20,000). Pick a trade to load ${notice.timeframe} around it, or go to a date.`}
+      </p>
+      <div className="nd-acts">
+        {first !== null && (
+          <button type="button" className="btn-sec-sm" onClick={() => onSelectTrade(first)}>
+            Show trade 1
+          </button>
+        )}
+        {run !== null && hasTwoLegs(run) && (
+          <button type="button" className="btn-sec-sm" onClick={() => onSelectLeg(other)}>
+            {`Open the ${timeframeOf(run, other)} leg`}
+          </button>
         )}
       </div>
     </div>

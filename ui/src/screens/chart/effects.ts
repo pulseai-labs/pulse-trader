@@ -50,6 +50,9 @@ export function useMarkWriter(s: ChartState): void {
     setForm,
     setMarksSeq,
     liveHoldoutRef,
+    setFocusBar,
+    setRail,
+    setRailOpen,
   } = s;
   /** Write a mark on the clicked candle, through w1's `write_mark`. The pair, the
    *  timeframe and the bar time are all the ones on screen: the mark is written against
@@ -100,13 +103,22 @@ export function useMarkWriter(s: ChartState): void {
 
   // --- the candle click writes a mark (r5.s3.w3) ----------------------------
   // Subscribed once, on the chart's own life. `arm` is what makes a click a write:
-  // disarmed, a click on the chart is just a click.
+  // disarmed, a click shows the bar in the Inspector (r7.s2.w3).
   useEffect(() => {
     const adapter = adapterRef.current;
     if (adapter === null) return;
     adapter.onCandleClick((openTime) => {
       const live = markClickRef.current;
-      if (!live.form.armed || live.form.submitting || live.timeframe === null) return;
+      // Disarmed, a click is a look: the Inspector shows the clicked bar (canvas v9 `onBarClick`, r7.s2.w3). The
+      // focus carries the chart it was clicked on (CR1): `live` holds the drawn read's pair and timeframe, the
+      // ones a mark is written against; its timeframe is `null` only before a read has drawn a bar.
+      if (!live.form.armed) {
+        if (live.timeframe !== null) setFocusBar({ pair: live.pair, timeframe: live.timeframe, t: openTime });
+        setRail("inspector");
+        setRailOpen(true);
+        return;
+      }
+      if (live.form.submitting || live.timeframe === null) return;
       // `live.form.submitting` is state, and state reaches the ref only after the next
       // render — so two clicks in ONE render pass both read `false` on it. This ref is
       // set SYNCHRONOUSLY, before the write starts, so the second click is refused
@@ -248,14 +260,18 @@ export function useRunFragment(s: ChartState): void {
 
 /** The marks read and the withdraw (r5.s3.w3). */
 export function useMarksRead(s: ChartState, markPair: string): (mark: MarkDto) => Promise<void> {
-  const { setMarksPhase, marksSeq, setMarkRefusal, setMarksSeq } = s;
+  const { setMarksPhase, marksSeq, setMarkRefusal, setMarksSeq, withdrawInFlightRef } = s;
   // --- the marks read (r5.s3.w3) --------------------------------------------
   // ONE read for the pair on screen, partitioned below. Re-run whenever the pair
   // changes, and after each write or withdraw (`marksSeq`).
 
   useEffect(() => {
     let cancelled = false;
-    setMarksPhase({ kind: "loading" });
+    // A re-read of the same pair keeps the marks on screen until it answers (#439): only a new pair shows the
+    // loading sentence, because the marks shown belong to the old one.
+    setMarksPhase((current) =>
+      current.kind === "ready" && current.pair === markPair ? current : { kind: "loading" },
+    );
     void (async () => {
       try {
         const answer = await commands.listMarks({ pair: markPair });
@@ -270,6 +286,7 @@ export function useMarksRead(s: ChartState, markPair: string): (mark: MarkDto) =
         }
         setMarksPhase({
           kind: "ready",
+          pair: markPair,
           marks: answer.data.marks,
           hidden: answer.data.hiddenByHoldout,
         });
@@ -285,6 +302,10 @@ export function useMarksRead(s: ChartState, markPair: string): (mark: MarkDto) =
 
   /** Withdraw one mark, once. The row leaves the table and the layer together. */
   const withdraw = async (mark: MarkDto): Promise<void> => {
+    // One withdraw per mark at a time (#439): a second press while the first is in flight sends nothing, so a
+    // mark already withdrawn never earns a spurious refusal.
+    if (withdrawInFlightRef.current.has(mark.markId)) return;
+    withdrawInFlightRef.current.add(mark.markId);
     setMarkRefusal(null);
     try {
       const answer = await commands.withdrawMark({ markId: mark.markId });
@@ -302,6 +323,8 @@ export function useMarksRead(s: ChartState, markPair: string): (mark: MarkDto) =
       setMarksSeq((seq) => seq + 1);
     } catch (error) {
       setMarkRefusal(messageOf(error));
+    } finally {
+      withdrawInFlightRef.current.delete(mark.markId);
     }
   };
   return withdraw;
@@ -328,12 +351,11 @@ export function useChartRead(s: ChartState): void {
     // will refuse, only to render the refusal, would be worse than saying so.
     if (request.plan.kind === "needs-trade") {
       setNotice({ timeframe: request.timeframe, bars: request.plan.bars });
-      // This leg asks for nothing but a trade, so only that waiting is true of it. A
-      // READY drawing of the previous leg stays drawn (D4), and the loading sentence of
-      // the read that opened the run stays too (CR6) — but a FAILED read belongs to the
-      // leg that asked for it. Left standing, the last leg's error would sit under this
-      // leg's notice and read as this leg's failure, though no read was ever sent.
-      setPhase((current) => (current.kind === "failed" ? { kind: "idle" } : current));
+      // This leg asks for nothing but a trade, so only that waiting is true of it. A READY drawing of the previous
+      // leg stays drawn (D4). Anything else gives way to the over-cap card, which canvas v9 shows alone: a failed
+      // read of another leg, and a loading sentence for a read that will never answer for this leg, the run read's
+      // own included (CR6, r7.s2.w3).
+      setPhase((current) => (current.kind === "ready" ? current : { kind: "idle" }));
       return;
     }
     setNotice(null);

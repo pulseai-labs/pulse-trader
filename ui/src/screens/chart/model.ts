@@ -82,6 +82,8 @@ export type MarksPhase =
   | { readonly kind: "failed"; readonly message: string; readonly code: string }
   | {
       readonly kind: "ready";
+      /** The pair this read answered for: a re-read of the same pair keeps these marks on screen (#439, r7.s2.w3). */
+      readonly pair: string;
       readonly marks: readonly MarkDto[];
       readonly hidden: { readonly holdoutStartMs: string; readonly count: number } | null;
     };
@@ -274,4 +276,22 @@ export function readRun(dto: BacktestRunDto): RunContext {
 
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The right rail's tabs, in canvas v9's order (`chart.jsx` `RightRail`, r7.s2.w3). */
+export type RailTab = "inspector" | "layers" | "agent";
+
+/** Each rail tab and the label it shows. */
+export const RAIL_TABS: readonly (readonly [RailTab, string])[] = [
+  ["inspector", "Inspector"],
+  ["layers", "Layers"],
+  ["agent", "Agent"],
+];
+
+/** The bar the trader clicked with the mark control disarmed, tied to the chart it was clicked on: the drawn
+ *  read's pair and timeframe and the bar's open (CR1, r7.s2.w3). The Inspector shows it only on that chart. */
+export interface FocusBar {
+  readonly pair: string;
+  readonly timeframe: string;
+  readonly t: string;
 }
