@@ -348,10 +348,10 @@ describe("the Connect screen's states (r4.s3.w3)", () => {
     );
     const { container } = render(<App />);
     // The gate is gone — the app's own sidebar is back.
-    await screen.findByText(/server up/i, {}, { timeout: 3000 });
+    const pill = await screen.findByRole("button", { name: "server connected" }, { timeout: 3000 });
     expect(container.querySelector(".sidebar")).not.toBeNull();
-    const strip = await screen.findByText(/server up/i, {}, { timeout: 3000 });
-    expect(strip.textContent).toContain("0.1.0");
+    fireEvent.click(pill);
+    expect(screen.getByText("pulse 0.1.0")).toBeTruthy();
     expect(screen.queryByRole("heading", { name: "Connect to your Pulse server" })).toBeNull();
   });
 

@@ -42,6 +42,16 @@ vi.mock("./bindings", () => ({
     // r4.s3.w3: the Settings route is live, so `#/settings` mounts the screen
     // that reads the stored address and can disconnect.
     serverAddress: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    // r7.s2.w4: the Library nav count's read.
+    shellInfo: vi.fn().mockResolvedValue({
+      status: "ok",
+      data: {
+        appVersion: "0.0.0",
+        engineFingerprint: "0000000000000000",
+        targetTriple: "aarch64-apple-darwin",
+        strategyCount: 0,
+      },
+    }),
     serverDisconnect: vi.fn().mockResolvedValue({ status: "ok", data: null }),
     // r4.s3 fix round (C5): the Connect screen's own submit — the successful
     // "Change server" the epoch case drives.
@@ -155,7 +165,9 @@ describe("<App /> shell navigation", () => {
   it("renders the unbuilt pane, not fabricated content, for a destination with no route", async () => {
     setHash("#/journal");
     render(<App />);
-    expect(await screen.findByText(/not built/i)).toBeTruthy();
+    // The shell now shows lowercase "not built yet" chips (r7.s2.w4), so the
+    // exact string picks the pane.
+    expect(await screen.findByText("Not built yet.")).toBeTruthy();
   });
 });
 
@@ -247,7 +259,8 @@ describe("<App /> holds the shell through a dropped poll", () => {
         vi.advanceTimersByTime(POLL_MS);
       });
       expect(container.querySelector(".sidebar")).not.toBeNull();
-      expect(screen.getByText(/server down/i)).toBeTruthy();
+      expect(screen.getByText("reconnecting…")).toBeTruthy();
+      expect(container.querySelectorAll(".nav-count")).toHaveLength(0);
 
       // A second: still holding.
       await act(async () => {
@@ -620,5 +633,55 @@ describe("<App /> — the title strip's paper count (#335)", () => {
       requestPaperCountRefresh();
     });
     await waitFor(() => expect(commands.paperSessions).toHaveBeenCalledTimes(2));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r7.s2.w4 — the v9 shell's reads
+// ---------------------------------------------------------------------------
+
+describe("<App /> — the v9 shell's reads (r7.s2.w4)", () => {
+  const SHELL_INFO = {
+    appVersion: "0.0.0",
+    engineFingerprint: "0000000000000000",
+    targetTriple: "aarch64-apple-darwin",
+    strategyCount: 7,
+  };
+
+  beforeEach(() => {
+    setHash("");
+  });
+
+  afterEach(() => {
+    setHash("");
+  });
+
+  it("shows shell_info's strategy count on the Library row and the running paper count on the Deployment row", async () => {
+    vi.mocked(commands.shellInfo).mockResolvedValueOnce({ status: "ok", data: SHELL_INFO });
+    render(<App />);
+    const library = await screen.findByRole("link", { name: /strategy library/i });
+    await waitFor(() => expect(library.querySelector(".nav-count")?.textContent).toBe("7"));
+    const deploy = screen.getByRole("link", { name: /deployment dashboard/i });
+    expect(deploy.querySelector(".nav-count")?.textContent).toBe("0");
+    expect(document.querySelectorAll(".nav-count").length).toBe(2);
+  });
+
+  it("names the server from the stored address in the strip and the status card", async () => {
+    vi.mocked(commands.serverAddress).mockResolvedValueOnce({
+      status: "ok",
+      data: "http://draco-desk:17620",
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "draco-desk connected" });
+    expect(document.querySelector(".status-card .status-key")?.textContent).toBe("draco-desk");
+  });
+
+  it("claims no Library count when the shell_info read fails", async () => {
+    vi.mocked(commands.shellInfo).mockRejectedValueOnce(new Error("bus down"));
+    render(<App />);
+    const deploy = await screen.findByRole("link", { name: /deployment dashboard/i });
+    await waitFor(() => expect(deploy.querySelector(".nav-count")?.textContent).toBe("0"));
+    const library = screen.getByRole("link", { name: /strategy library/i });
+    expect(library.querySelector(".nav-count")).toBeNull();
   });
 });
